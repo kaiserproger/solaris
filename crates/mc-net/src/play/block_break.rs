@@ -24,10 +24,11 @@ use super::survival::{
     mining_target_for,
 };
 use super::{
-    BlockEdit, BlockEditPrecondition, BlockPlanningRead, InteractionState, PlayerPose, XpState,
-    air_state_id, commit_player_survival_update, schedule_fluid_ticks_for_interaction, splitmix64,
-    start_falling_blocks_after_edits, write_block_ack, write_block_resync,
-    write_inventory_slot_updates, write_loaded_block_resync_then_ack,
+    BlockEdit, BlockEditPrecondition, BlockPlanningRead, InteractionState, PlayerPose,
+    ScriptGameplayEventPublisher, XpState, air_state_id, commit_player_survival_update,
+    schedule_fluid_ticks_for_interaction, splitmix64, start_falling_blocks_after_edits,
+    write_block_ack, write_block_resync, write_inventory_slot_updates,
+    write_loaded_block_resync_then_ack,
 };
 
 const VANILLA_STOP_DESTROY_THRESHOLD: f32 = 0.7;
@@ -193,9 +194,13 @@ impl BreakAcknowledgement {
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn complete_block_break<W>(
     state: &mut InteractionState,
     writer: &mut W,
+    script_events: Option<&ScriptGameplayEventPublisher>,
+    game_mode: GameMode,
+    player_pose: PlayerPose,
     acknowledgement: BreakAcknowledgement,
     position: i64,
     drop_items: bool,
@@ -289,6 +294,17 @@ where
         state.inventory = committed.inventory;
         let changed_slots = committed.changed_slots;
         if let Some(destroyed_state) = destroyed_state {
+            if let Some(script_events) = script_events {
+                script_events
+                    .publish_block_broken(
+                        &state.blocks,
+                        destroyed_state,
+                        pos,
+                        player_pose,
+                        game_mode,
+                    )
+                    .await;
+            }
             broadcast_level_event(
                 state,
                 pos,
@@ -380,6 +396,11 @@ where
         .find(|edit| edit.pos == pos && edit.previous != edit.new_state)
         .map(|edit| edit.previous)
     {
+        if let Some(script_events) = script_events {
+            script_events
+                .publish_block_broken(&state.blocks, destroyed_state, pos, player_pose, game_mode)
+                .await;
+        }
         broadcast_level_event(
             state,
             pos,
@@ -626,9 +647,11 @@ pub(super) fn break_replacement_state_in_storage(
 
 /// Handles only destroy actions. Other player actions remain owned by the
 /// connection-level dispatcher in `play.rs`.
+#[allow(clippy::too_many_arguments)]
 pub(super) async fn handle_block_destroy_action<W>(
     state: &mut InteractionState,
     writer: &mut W,
+    script_events: Option<&ScriptGameplayEventPublisher>,
     game_mode: GameMode,
     survival_state: &mut SurvivalState,
     xp_state: &mut XpState,
@@ -674,6 +697,9 @@ where
             complete_block_break(
                 state,
                 writer,
+                script_events,
+                game_mode,
+                player_pose,
                 BreakAcknowledgement::Send(action.sequence),
                 action.position,
                 false,
@@ -696,6 +722,9 @@ where
                     let changed = complete_block_break(
                         state,
                         writer,
+                        script_events,
+                        game_mode,
+                        player_pose,
                         BreakAcknowledgement::Send(action.sequence),
                         action.position,
                         true,
@@ -808,6 +837,9 @@ where
                         let changed = complete_block_break(
                             state,
                             writer,
+                            script_events,
+                            game_mode,
+                            player_pose,
                             completion.acknowledgement,
                             completion.pending.position,
                             true,
@@ -863,9 +895,11 @@ where
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 pub(super) async fn tick_delayed_break<W>(
     state: &mut InteractionState,
     writer: &mut W,
+    script_events: Option<&ScriptGameplayEventPublisher>,
     game_mode: GameMode,
     survival_state: &mut SurvivalState,
     xp_state: &mut XpState,
@@ -912,6 +946,9 @@ where
     let changed = complete_block_break(
         state,
         writer,
+        script_events,
+        game_mode,
+        player_pose,
         completion.acknowledgement,
         completion.pending.position,
         true,

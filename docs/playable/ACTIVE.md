@@ -42,6 +42,13 @@ hardening. An already-open lower-priority diff does not override this order.
 
 ## Recent Evidence
 
+- The current production plugin slice publishes `player.block_broken` only
+  after an authoritative root block transition. A real packet/Lua wire gate
+  observes exact creative and survival events. FIFO command fences prove abort,
+  repeated-air attempts after both modes, and a two-client owner-stale survival
+  completion publish nothing. Focused `mc-script`, `mc-net`, and wire tests
+  pass. Full workspace tests, strict workspace Clippy, fmt, code-health
+  `0 fail / KEEP`, and diff-check also pass.
 - Checkpoint `5ea197b` makes the active save install its exact simulation
   barrier snapshot and makes accepted PvP attacks observable from the
   simulation owner. Full workspace tests, strict workspace Clippy, fmt,

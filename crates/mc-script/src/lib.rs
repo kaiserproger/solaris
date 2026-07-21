@@ -1065,6 +1065,23 @@ pub enum ScriptInventoryClick {
     ShiftSecondary,
 }
 
+/// Closed game-mode snapshot exposed by block-break events.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[non_exhaustive]
+pub enum ScriptGameMode {
+    Survival,
+    Creative,
+}
+
+impl ScriptGameMode {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Survival => "survival",
+            Self::Creative => "creative",
+        }
+    }
+}
+
 /// Immutable inbound event snapshots visible to script runtimes.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ScriptEvent {
@@ -1158,6 +1175,34 @@ impl ScriptEvent {
                 context,
             },
         }
+    }
+
+    /// Build a reliable block-break event after the authoritative world commit.
+    #[allow(clippy::too_many_arguments)]
+    pub fn try_player_block_broken_with_context(
+        player_id: ScriptPlayerId,
+        context: ScriptPlayerContext,
+        dimension: impl AsRef<str>,
+        block_id: impl AsRef<str>,
+        x: i32,
+        y: i32,
+        z: i32,
+        game_mode: ScriptGameMode,
+    ) -> Result<Self, ScriptDtoError> {
+        context.validate()?;
+        Ok(Self {
+            target_plugin_id: None,
+            kind: ScriptEventKind::PlayerBlockBroken {
+                player_id,
+                context,
+                dimension: validate_contract_resource_id(dimension.as_ref())?,
+                block_id: validate_contract_resource_id(block_id.as_ref())?,
+                x,
+                y,
+                z,
+                game_mode,
+            },
+        })
     }
 
     /// Build a bounded player command event with server-authoritative context.
@@ -1396,6 +1441,7 @@ impl ScriptEvent {
             ScriptEventKind::PlayerJoined { .. } => "player.joined",
             ScriptEventKind::PlayerLeft { .. } => "player.left",
             ScriptEventKind::PlayerChat { .. } => "player.chat",
+            ScriptEventKind::PlayerBlockBroken { .. } => "player.block_broken",
             ScriptEventKind::PlayerCommand { .. } => "player.command",
             ScriptEventKind::ServerTick { .. } => "server.tick",
             ScriptEventKind::PluginStorageGetResult { .. } => "plugin.storage.get_result",
@@ -1443,6 +1489,16 @@ impl ScriptEvent {
                     MAX_SCRIPT_CHAT_MESSAGE_BYTES,
                 )?;
                 context.validate()
+            }
+            ScriptEventKind::PlayerBlockBroken {
+                context,
+                dimension,
+                block_id,
+                ..
+            } => {
+                context.validate()?;
+                validate_contract_resource_id(dimension)?;
+                validate_contract_resource_id(block_id).map(drop)
             }
             ScriptEventKind::PlayerCommand {
                 username,
@@ -1585,6 +1641,16 @@ pub enum ScriptEventKind {
         player_id: ScriptPlayerId,
         message: String,
         context: ScriptPlayerContext,
+    },
+    PlayerBlockBroken {
+        player_id: ScriptPlayerId,
+        context: ScriptPlayerContext,
+        dimension: String,
+        block_id: String,
+        x: i32,
+        y: i32,
+        z: i32,
+        game_mode: ScriptGameMode,
     },
     PlayerCommand {
         player_id: ScriptPlayerId,
@@ -2304,12 +2370,11 @@ impl ScriptBoundary {
         })
     }
 
-    /// Deliver a targeted owner event, waiting for bounded host-queue capacity.
+    /// Deliver a required event, waiting for bounded host-queue capacity.
     ///
-    /// Result events are constructed from a consumed `AdmittedScriptCommand`,
-    /// so the caller cannot retarget them. This deliberately differs from
-    /// lossy telemetry submitted through [`Self::try_enqueue_event`].
-    pub async fn enqueue_targeted_event(&self, event: ScriptEvent) -> Result<(), ScriptQueueError> {
+    /// Capacity and closure wake this future through the channel. This deliberately
+    /// differs from lossy telemetry submitted through [`Self::try_enqueue_event`].
+    pub async fn enqueue_required_event(&self, event: ScriptEvent) -> Result<(), ScriptQueueError> {
         let Some(event_tx) = self.event_admission.sender() else {
             return Err(ScriptQueueError::Closed);
         };
@@ -2317,6 +2382,11 @@ impl ScriptBoundary {
             .send(event)
             .await
             .map_err(|_| ScriptQueueError::Closed)
+    }
+
+    /// Deliver a targeted owner event through the required-delivery path.
+    pub async fn enqueue_targeted_event(&self, event: ScriptEvent) -> Result<(), ScriptQueueError> {
+        self.enqueue_required_event(event).await
     }
 
     /// Stop accepting new host events while allowing already admitted events to drain.
@@ -3840,6 +3910,7 @@ fn is_supported_event_name(event_name: &str) -> bool {
             | "player.joined"
             | "player.left"
             | "player.chat"
+            | "player.block_broken"
             | "server.tick"
             | "plugin.storage.get_result"
             | "plugin.storage.cas_result"
@@ -4292,6 +4363,63 @@ mod tests {
         ));
     }
 
+    #[tokio::test]
+    async fn required_event_delivery_waits_for_receiver_capacity_notification() {
+        let (boundary, mut endpoint) = script_boundary_pair(nonzero(1), nonzero(1));
+        let first = ScriptEvent::server_started();
+        let second = ScriptEvent::server_tick(1);
+        boundary.try_enqueue_event(first.clone()).unwrap();
+        let (receiver_ready_tx, receiver_ready_rx) = tokio::sync::oneshot::channel();
+        let (release_receiver_tx, release_receiver_rx) = tokio::sync::oneshot::channel();
+        let (received_tx, received_rx) = tokio::sync::oneshot::channel();
+        tokio::spawn(async move {
+            receiver_ready_tx.send(()).unwrap();
+            release_receiver_rx.await.unwrap();
+            let first = endpoint.recv_event().await;
+            let second = endpoint.recv_event().await;
+            received_tx.send((first, second)).unwrap();
+        });
+
+        let delivery = boundary.enqueue_required_event(second.clone());
+        tokio::pin!(delivery);
+        tokio::select! {
+            result = &mut delivery => panic!("required delivery completed without capacity: {result:?}"),
+            result = receiver_ready_rx => result.unwrap(),
+        }
+
+        release_receiver_tx.send(()).unwrap();
+        delivery.await.unwrap();
+        assert_eq!(received_rx.await.unwrap(), (Some(first), Some(second)));
+    }
+
+    #[tokio::test]
+    async fn required_event_delivery_wakes_closed_when_saturated_receiver_closes() {
+        let (boundary, endpoint) = script_boundary_pair(nonzero(1), nonzero(1));
+        boundary
+            .try_enqueue_event(ScriptEvent::server_started())
+            .unwrap();
+        let (receiver_ready_tx, receiver_ready_rx) = tokio::sync::oneshot::channel();
+        let (close_receiver_tx, close_receiver_rx) = tokio::sync::oneshot::channel();
+        let (receiver_closed_tx, receiver_closed_rx) = tokio::sync::oneshot::channel();
+        tokio::spawn(async move {
+            receiver_ready_tx.send(()).unwrap();
+            close_receiver_rx.await.unwrap();
+            drop(endpoint);
+            receiver_closed_tx.send(()).unwrap();
+        });
+
+        let delivery = boundary.enqueue_required_event(ScriptEvent::server_tick(1));
+        tokio::pin!(delivery);
+        tokio::select! {
+            result = &mut delivery => panic!("required delivery completed before closure: {result:?}"),
+            result = receiver_ready_rx => result.unwrap(),
+        }
+
+        close_receiver_tx.send(()).unwrap();
+        receiver_closed_rx.await.unwrap();
+        assert_eq!(delivery.await, Err(ScriptQueueError::Closed));
+    }
+
     #[test]
     fn script_event_queue_errors_stay_below_the_result_size_threshold() {
         assert!(
@@ -4317,6 +4445,82 @@ mod tests {
         ));
         assert_eq!(ScriptPlayerId::new(42).value(), 42);
         assert_eq!(ScriptEntityId::new(99).value(), 99);
+    }
+
+    #[test]
+    fn player_block_broken_event_is_a_validated_post_commit_snapshot() {
+        let context = ScriptPlayerContext::new(
+            "123e4567-e89b-12d3-a456-426614174000",
+            "kaiser",
+            true,
+            12.25,
+            70.0,
+            -4.5,
+        );
+        let event = ScriptEvent::try_player_block_broken_with_context(
+            ScriptPlayerId::new(42),
+            context.clone(),
+            "minecraft:overworld",
+            "minecraft:deepslate/diamond_ore",
+            3,
+            -64,
+            -9,
+            ScriptGameMode::Survival,
+        )
+        .unwrap();
+
+        assert_eq!(event.event_name(), "player.block_broken");
+        assert_eq!(event.target_plugin_id(), None);
+        assert_eq!(event.validate(), Ok(()));
+        assert!(matches!(
+            event.kind(),
+            ScriptEventKind::PlayerBlockBroken {
+                player_id,
+                context: event_context,
+                dimension,
+                block_id,
+                x,
+                y,
+                z,
+                game_mode,
+            } if *player_id == ScriptPlayerId::new(42)
+                && event_context == &context
+                && dimension == "minecraft:overworld"
+                && block_id == "minecraft:deepslate/diamond_ore"
+                && (*x, *y, *z) == (3, -64, -9)
+                && *game_mode == ScriptGameMode::Survival
+        ));
+    }
+
+    #[test]
+    fn player_block_broken_rejects_invalid_resource_identifiers() {
+        let context = ScriptPlayerContext::new("player-42", "kaiser", false, 0.0, 64.0, 0.0);
+        let oversized_block_id = format!("minecraft:{}", "a".repeat(MAX_SCRIPT_RESOURCE_ID_BYTES));
+        for (dimension, block_id) in [
+            ("overworld", "minecraft:stone"),
+            ("minecraft:overworld", "minecraft:Stone"),
+            ("minecraft:overworld", oversized_block_id.as_str()),
+        ] {
+            assert!(
+                ScriptEvent::try_player_block_broken_with_context(
+                    ScriptPlayerId::new(42),
+                    context.clone(),
+                    dimension,
+                    block_id,
+                    0,
+                    64,
+                    0,
+                    ScriptGameMode::Creative,
+                )
+                .is_err()
+            );
+        }
+    }
+
+    #[test]
+    fn block_break_game_modes_are_closed_stable_strings() {
+        assert_eq!(ScriptGameMode::Survival.as_str(), "survival");
+        assert_eq!(ScriptGameMode::Creative.as_str(), "creative");
     }
 
     #[test]
@@ -4439,6 +4643,7 @@ mod tests {
     fn extended_plugin_contract_is_available_at_0_6_0() {
         assert_eq!(SCRIPT_API_VERSION, ScriptApiVersion::new(0, 6, 0));
         for event_name in [
+            "player.block_broken",
             "plugin.storage.get_result",
             "plugin.storage.cas_result",
             "plugin.storage.delete_result",

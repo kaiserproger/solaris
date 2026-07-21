@@ -381,6 +381,14 @@ Other accepted concrete boundaries in this staged migration are:
   rejects raw channels, spawned work, sleeps, polling and wildcard backedges;
   it also pins the production owner branch, peer-broadcast setting and
   resync-before-single-ack order.
+- `play::script_gameplay_events` is the protocol-to-plugin DTO projection for
+  committed gameplay facts. Block-break authority remains in `block_break` and
+  the simulation/world owner: only that path decides whether the root block
+  transition succeeded and which prior registry-backed block state was
+  destroyed. The publisher snapshots player identity and pose, maps the closed
+  game-mode set, and awaits required bounded event admission after commit. It
+  owns no player, session, world, inventory, or block mutation authority. Queue
+  closure reports publication failure but cannot roll back the committed block.
 - `play::session::player_state_adapter` owns selected-slot, respawn-pose and
   game-mode event commits plus player animation/entity-data recipient
   projection. Persistence/inventory/survival authority remains in

@@ -591,6 +591,13 @@ impl ScriptEventSink {
         self.boundary.enqueue_targeted_event(event).await
     }
 
+    pub(crate) async fn enqueue_required_event(
+        &self,
+        event: ScriptEvent,
+    ) -> Result<(), ScriptQueueError> {
+        self.boundary.enqueue_required_event(event).await
+    }
+
     pub(crate) fn close_event_admission(&self) {
         self.boundary.close_event_admission();
     }

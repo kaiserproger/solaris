@@ -1395,6 +1395,25 @@ fn event_table(lua: &Lua, event: &ScriptEvent) -> mlua::Result<Table> {
             table.set("message", message.as_str())?;
             set_player_context(&table, context)?;
         }
+        ScriptEventKind::PlayerBlockBroken {
+            player_id,
+            context,
+            dimension,
+            block_id,
+            x,
+            y,
+            z,
+            game_mode,
+        } => {
+            table.set("player_id", player_id.value())?;
+            set_player_context(&table, context)?;
+            table.set("dimension", dimension.as_str())?;
+            table.set("block_id", block_id.as_str())?;
+            table.set("x", *x)?;
+            table.set("y", *y)?;
+            table.set("z", *z)?;
+            table.set("game_mode", game_mode.as_str())?;
+        }
         ScriptEventKind::PlayerCommand {
             player_id,
             username,
@@ -1537,6 +1556,7 @@ fn handler_name(event: &ScriptEvent) -> &'static str {
         ScriptEventKind::PlayerJoined { .. } => "on_player_joined",
         ScriptEventKind::PlayerLeft { .. } => "on_player_left",
         ScriptEventKind::PlayerChat { .. } => "on_player_chat",
+        ScriptEventKind::PlayerBlockBroken { .. } => "on_player_block_broken",
         ScriptEventKind::PlayerCommand { .. } => "on_player_command",
         ScriptEventKind::ServerTick { .. } => "on_server_tick",
         ScriptEventKind::PluginStorageGetResult { .. } => "on_plugin_storage_get_result",
@@ -1579,7 +1599,8 @@ mod tests {
     use super::*;
     use crate::{
         MAX_SCRIPT_RESOURCE_ID_BYTES, PlayerCommandAdmission, RuntimeControls, SCRIPT_API_VERSION,
-        ScriptCommand, ScriptEvent, ScriptPlayerContext, ScriptPlayerId, ScriptPluginManifest,
+        ScriptCommand, ScriptEvent, ScriptGameMode, ScriptPlayerContext, ScriptPlayerId,
+        ScriptPluginManifest,
     };
 
     static TEST_TEMP_ID: AtomicU64 = AtomicU64::new(0);
@@ -1878,6 +1899,77 @@ mod tests {
                 }]
             );
         }
+    }
+
+    #[test]
+    fn lua_block_broken_subscription_dispatches_exact_post_commit_fields() {
+        let mut runtime = LuaScriptRuntime::from_source(
+            manifest(&["player.block_broken"]),
+            r#"
+                function on_player_block_broken(event)
+                    local expected = {
+                        name = true, player_id = true, context_verified = true,
+                        uuid = true, username = true, operator = true,
+                        dimension = true, block_id = true, x = true, y = true,
+                        z = true, game_mode = true,
+                    }
+                    local field_count = 0
+                    for field in pairs(event) do
+                        assert(expected[field] == true, "unexpected field: " .. field)
+                        field_count = field_count + 1
+                    end
+                    assert(field_count == 12)
+                    assert(event.name == "player.block_broken")
+                    assert(event.context_verified == true)
+                    assert(event.uuid == "123e4567-e89b-12d3-a456-426614174000")
+                    assert(event.username == "Alex")
+                    assert(event.operator == true)
+                    assert(event.dimension == "minecraft:the_nether")
+                    assert(event.block_id == "minecraft:ancient_debris")
+                    assert(math.type(event.x) == "integer" and event.x == -3)
+                    assert(math.type(event.y) == "integer" and event.y == 15)
+                    assert(math.type(event.z) == "integer" and event.z == 27)
+                    assert(event.game_mode == "creative")
+                    solaris.send_message(event.player_id, "block-broken")
+                end
+            "#,
+            LuaRuntimeLimits::default(),
+        )
+        .unwrap();
+        let controls = RuntimeControls::unrestricted();
+        let event = ScriptEvent::try_player_block_broken_with_context(
+            ScriptPlayerId::new(7),
+            ScriptPlayerContext::new(
+                "123e4567-e89b-12d3-a456-426614174000",
+                "Alex",
+                true,
+                1.5,
+                64.0,
+                -2.25,
+            ),
+            "minecraft:the_nether",
+            "minecraft:ancient_debris",
+            -3,
+            15,
+            27,
+            ScriptGameMode::Creative,
+        )
+        .unwrap();
+
+        let batch = runtime
+            .handle_event(
+                &event,
+                RuntimeContext::new(&controls, NonZeroUsize::new(1).unwrap()),
+            )
+            .unwrap();
+
+        assert_eq!(
+            batch.commands(),
+            &[ScriptCommand::SendChatMessage {
+                player_id: ScriptPlayerId::new(7),
+                message: "block-broken".to_owned(),
+            }]
+        );
     }
 
     #[test]

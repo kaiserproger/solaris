@@ -1,3 +1,4 @@
+use std::collections::HashSet;
 use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::Duration;
@@ -5,11 +6,13 @@ use std::time::Duration;
 use bytes::Bytes;
 use mc_protocol::packets::Packet;
 use mc_protocol::packets::play::{
-    ClientboundCommands, ClientboundContainerSetContent, ClientboundContainerSetSlot,
-    ClientboundOpenScreen, ClientboundSetTime, ClientboundSystemChat, CommandNodeKind,
-    ConfirmTeleportation, ContainerInput, GameEvent, GameMode, HashedStack,
-    HashedStackComponentHashes, MovePlayerFlags, ServerboundChat, ServerboundChatCommand,
-    ServerboundContainerClick, ServerboundMovePlayerPos, SetCenterChunk, SynchronizePlayerPosition,
+    BlockChangedAck, BlockUpdate, ClientboundCommands, ClientboundContainerSetContent,
+    ClientboundContainerSetSlot, ClientboundOpenScreen, ClientboundSetTime, ClientboundSystemChat,
+    CommandNodeKind, ConfirmTeleportation, ContainerInput, Direction, GameEvent, GameMode,
+    HashedStack, HashedStackComponentHashes, LevelChunkWithLight, MovePlayerFlags,
+    PlayerActionKind, ServerboundChat, ServerboundChatCommand, ServerboundContainerClick,
+    ServerboundMovePlayerPos, ServerboundMovePlayerStatusOnly, ServerboundPlayerAction,
+    SetCenterChunk, SynchronizePlayerPosition, pack_block_pos, unpack_block_pos,
 };
 use mc_test_harness::client::{Client, FrameWaitLimits};
 
@@ -322,6 +325,535 @@ async fn lua_0_6_player_command_reaches_the_server_chat_adapter() {
     );
 
     drop(client);
+    shutdown.request();
+    tokio::time::timeout(Duration::from_secs(5), server)
+        .await
+        .expect("server shutdown timeout")
+        .expect("server task")
+        .expect("server result");
+    tokio::task::spawn_blocking(move || host.join())
+        .await
+        .expect("Lua host join task")
+        .expect("Lua host thread");
+}
+
+#[tokio::test]
+async fn lua_block_break_event_follows_authoritative_creative_commit() {
+    let plugins = tempfile::tempdir().expect("plugin tempdir");
+    let plugin = plugins.path().join("block-jobs");
+    std::fs::create_dir(&plugin).expect("create plugin directory");
+    std::fs::write(
+        plugin.join("plugin.toml"),
+        r#"
+            id = "block-jobs"
+            name = "Block Jobs"
+            version = "0.1.0"
+            api = "0.6.0"
+            events = ["player.block_broken"]
+            player_commands = ["block-fence"]
+        "#,
+    )
+    .expect("write plugin manifest");
+    std::fs::write(
+        plugin.join("main.lua"),
+        r#"
+            function on_player_block_broken(event)
+                solaris.send_message(
+                    event.player_id,
+                    "block-broken:" .. event.block_id
+                        .. ":" .. event.dimension
+                        .. ":" .. event.x
+                        .. ":" .. event.y
+                        .. ":" .. event.z
+                        .. ":" .. event.game_mode
+                        .. ":" .. event.username
+                )
+            end
+
+            function on_player_command(event)
+                solaris.send_message(event.player_id, "block-fence:" .. event.arguments)
+            end
+        "#,
+    )
+    .expect("write plugin source");
+    let (boundary, host) = mc_script::start_lua_host(mc_script::LuaHostConfig::new(plugins.path()))
+        .expect("start Lua host");
+    assert_eq!(host.loaded_plugins(), 1);
+
+    let block_report = mc_data::blocks::solaris_required_blocks_report();
+    let blocks = Arc::new(
+        mc_world::BlockRegistry::from_report(&block_report).expect("embedded block registry"),
+    );
+    let air_state = blocks
+        .block(&mc_data::Identifier::parse("minecraft:air").unwrap())
+        .expect("air block")
+        .default
+        .0 as i32;
+    let items = Arc::new(mc_data::items::solaris_required_items());
+    let generator = Arc::new(mc_worldgen::TerrainGenerator::new(0, Arc::clone(&blocks)));
+    let world = mc_world::WorldStorage::in_memory_with_capacity(Arc::clone(&blocks), 49)
+        .with_item_registry(Arc::clone(&items))
+        .with_generator(generator);
+    let shutdown = mc_net::ShutdownHandle::default();
+    let cfg = mc_net::ServerConfig {
+        bind_address: "127.0.0.1:0".parse().unwrap(),
+        motd: "Lua block break event wire test".into(),
+        max_players: 2,
+        view_distance: 2,
+        data: Arc::new(mc_data::solaris_required_data()),
+        blocks,
+        world: Some(Arc::new(tokio::sync::Mutex::new(world))),
+        tags: Arc::new(mc_data::tags::solaris_required_item_tags(&items)),
+        recipes: Arc::new(mc_data::recipes::solaris_required_recipes()),
+        loot: Arc::new(mc_data::loot::builtin().clone()),
+        block_light: None,
+        items,
+        item_facts: Arc::new(mc_data::item_components::solaris_required_item_facts()),
+        block_facts: Arc::new(mc_data::block_facts::BlockFactsTable::from_blocks_report(
+            &block_report,
+        )),
+        entity_types: Arc::new(mc_data::entity_types::solaris_required_entity_types()),
+        biome_spawns: Arc::new(mc_data::biomes::solaris_required_biome_spawn_rules()),
+        chunk_pipeline: mc_net::ChunkPipelinePolicy::default(),
+        random_tick: mc_net::RandomTickPolicy::default(),
+        command_permissions: mc_net::CommandPermissionConfig::new(Vec::<String>::new(), true),
+        shutdown: shutdown.clone(),
+    };
+    let bound = mc_net::bind_with_scripts(cfg, boundary)
+        .await
+        .expect("bind scripted server");
+    let addr = bound.local_addr().expect("local address");
+    let server = tokio::spawn(async move { bound.serve().await });
+
+    let mut client = Client::connect(addr).await.expect("client connect");
+    let _ = client
+        .drive_login(addr, "BreakEvents")
+        .await
+        .expect("login");
+    client.drive_configuration().await.expect("configuration");
+    let _ = client.read_play_login().await.expect("play entry");
+    let _: ClientboundCommands = client.read_typed().await.expect("Commands");
+    let sync: SynchronizePlayerPosition = client.read_typed().await.expect("SyncPlayerPos");
+    client
+        .write_packet(&ConfirmTeleportation {
+            teleport_id: sync.teleport_id,
+        })
+        .await
+        .expect("ack teleport");
+    client
+        .write_packet(&ServerboundMovePlayerStatusOnly {
+            flags: MovePlayerFlags::new(true, false),
+        })
+        .await
+        .expect("report grounded spawn pose");
+
+    let mut chunks = HashSet::new();
+    while chunks.len() < 25 {
+        let outcome = client
+            .wait_for_frame_id_with_timeout_and_limits(
+                LevelChunkWithLight::ID,
+                Duration::from_secs(30),
+                LUA_TRANSACTION_FRAME_WAIT_LIMITS,
+            )
+            .await
+            .expect("initial chunk stream");
+        let chunk = LevelChunkWithLight::decode(&mut outcome.frame.body.clone())
+            .expect("decode initial chunk");
+        chunks.insert((chunk.chunk_x, chunk.chunk_z));
+    }
+
+    let mut peer = Client::connect(addr).await.expect("peer connect");
+    let _ = peer
+        .drive_login(addr, "BreakPeer")
+        .await
+        .expect("peer login");
+    peer.drive_configuration()
+        .await
+        .expect("peer configuration");
+    peer.wait_for_frame_id_with_timeout_and_limits(
+        ClientboundCommands::ID,
+        Duration::from_secs(5),
+        LUA_TRANSACTION_FRAME_WAIT_LIMITS,
+    )
+    .await
+    .expect("peer Commands");
+    let outcome = peer
+        .wait_for_frame_id_with_timeout_and_limits(
+            SynchronizePlayerPosition::ID,
+            Duration::from_secs(5),
+            LUA_TRANSACTION_FRAME_WAIT_LIMITS,
+        )
+        .await
+        .expect("peer SyncPlayerPos");
+    let peer_sync = SynchronizePlayerPosition::decode(&mut outcome.frame.body.clone())
+        .expect("decode peer SyncPlayerPos");
+    peer.write_packet(&ConfirmTeleportation {
+        teleport_id: peer_sync.teleport_id,
+    })
+    .await
+    .expect("ack peer teleport");
+    peer.write_packet(&ServerboundMovePlayerStatusOnly {
+        flags: MovePlayerFlags::new(true, false),
+    })
+    .await
+    .expect("report grounded peer pose");
+    let mut peer_chunks = HashSet::new();
+    while peer_chunks.len() < 25 {
+        let outcome = peer
+            .wait_for_frame_id_with_timeout_and_limits(
+                LevelChunkWithLight::ID,
+                Duration::from_secs(30),
+                LUA_TRANSACTION_FRAME_WAIT_LIMITS,
+            )
+            .await
+            .expect("peer initial chunk stream");
+        let chunk = LevelChunkWithLight::decode(&mut outcome.frame.body.clone())
+            .expect("decode peer initial chunk");
+        peer_chunks.insert((chunk.chunk_x, chunk.chunk_z));
+    }
+    peer.write_packet(&ServerboundChatCommand {
+        command: "gamemode creative".to_owned(),
+    })
+    .await
+    .expect("switch peer to creative");
+    loop {
+        let outcome = peer
+            .wait_for_frame_id_with_timeout_and_limits(
+                GameEvent::ID,
+                Duration::from_secs(5),
+                LUA_TRANSACTION_FRAME_WAIT_LIMITS,
+            )
+            .await
+            .expect("peer creative game mode event");
+        let event = GameEvent::decode(&mut outcome.frame.body.clone()).expect("decode GameEvent");
+        if event.event == GameEvent::EVENT_CHANGE_GAME_MODE
+            && event.value == GameMode::Creative.id() as f32
+        {
+            break;
+        }
+    }
+
+    client
+        .write_packet(&ServerboundChatCommand {
+            command: "gamemode creative".to_owned(),
+        })
+        .await
+        .expect("switch to creative");
+    loop {
+        let outcome = client
+            .wait_for_frame_id_with_timeout_and_limits(
+                GameEvent::ID,
+                Duration::from_secs(5),
+                LUA_TRANSACTION_FRAME_WAIT_LIMITS,
+            )
+            .await
+            .expect("creative game mode event");
+        let event = GameEvent::decode(&mut outcome.frame.body.clone()).expect("decode GameEvent");
+        if event.event == GameEvent::EVENT_CHANGE_GAME_MODE
+            && event.value == GameMode::Creative.id() as f32
+        {
+            break;
+        }
+    }
+
+    let target = (0, sync.y.floor() as i32 - 2, 0);
+    client
+        .write_packet(&ServerboundPlayerAction {
+            action: PlayerActionKind::AbortDestroyBlock,
+            position: pack_block_pos(target.0, target.1, target.2),
+            direction: Direction::Up,
+            sequence: 0,
+        })
+        .await
+        .expect("abort block break");
+    client
+        .write_packet(&ServerboundChatCommand {
+            command: "block-fence abort".to_owned(),
+        })
+        .await
+        .expect("send abort fence");
+    loop {
+        let message = next_lua_transaction_system_chat_text(&mut client).await;
+        assert!(
+            !message.starts_with("block-broken:"),
+            "abort published a committed block-break event: {message}"
+        );
+        if message == "block-fence:abort" {
+            break;
+        }
+    }
+
+    client
+        .write_packet(&ServerboundPlayerAction {
+            action: PlayerActionKind::StartDestroyBlock,
+            position: pack_block_pos(target.0, target.1, target.2),
+            direction: Direction::Up,
+            sequence: 1,
+        })
+        .await
+        .expect("break generated surface block");
+
+    let expected_message = format!(
+        "block-broken:minecraft:grass_block:minecraft:overworld:0:{}:0:creative:BreakEvents",
+        target.1
+    );
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+    let mut saw_committed_update = false;
+    let mut saw_plugin_event = false;
+    let mut observed_messages = Vec::new();
+    while !(saw_committed_update && saw_plugin_event) {
+        let result = client
+            .read_frame_with_timeout(
+                deadline.saturating_duration_since(tokio::time::Instant::now()),
+            )
+            .await;
+        let Ok(mut frame) = result else {
+            panic!(
+                "block break event wire response failed: committed_update={saw_committed_update}, \
+                 plugin_event={saw_plugin_event}, messages={observed_messages:?}, \
+                 target={target:?}, sync_y={}, error={result:?}",
+                sync.y
+            );
+        };
+        if frame.id == BlockUpdate::ID {
+            let update = BlockUpdate::decode(&mut frame.body).expect("decode BlockUpdate");
+            if unpack_block_pos(update.position) == target && update.state_id == air_state {
+                saw_committed_update = true;
+            }
+        } else if frame.id == ClientboundSystemChat::ID {
+            let chat = ClientboundSystemChat::decode(&mut frame.body).expect("decode SystemChat");
+            let message = text_component_text(&chat);
+            if message == expected_message {
+                saw_plugin_event = true;
+            }
+            observed_messages.push(message);
+        }
+    }
+
+    client
+        .write_packet(&ServerboundPlayerAction {
+            action: PlayerActionKind::StartDestroyBlock,
+            position: pack_block_pos(target.0, target.1, target.2),
+            direction: Direction::Up,
+            sequence: 2,
+        })
+        .await
+        .expect("repeat break against air");
+    client
+        .write_packet(&ServerboundChatCommand {
+            command: "block-fence stale".to_owned(),
+        })
+        .await
+        .expect("send stale-break fence");
+    loop {
+        let message = next_lua_transaction_system_chat_text(&mut client).await;
+        assert!(
+            !message.starts_with("block-broken:"),
+            "rejected repeated break published another event: {message}"
+        );
+        if message == "block-fence:stale" {
+            break;
+        }
+    }
+
+    client
+        .write_packet(&ServerboundChatCommand {
+            command: "gamemode survival".to_owned(),
+        })
+        .await
+        .expect("switch to survival");
+    loop {
+        let outcome = client
+            .wait_for_frame_id_with_timeout_and_limits(
+                GameEvent::ID,
+                Duration::from_secs(5),
+                LUA_TRANSACTION_FRAME_WAIT_LIMITS,
+            )
+            .await
+            .expect("survival game mode event");
+        let event = GameEvent::decode(&mut outcome.frame.body.clone()).expect("decode GameEvent");
+        if event.event == GameEvent::EVENT_CHANGE_GAME_MODE
+            && event.value == GameMode::Survival.id() as f32
+        {
+            break;
+        }
+    }
+
+    let survival_target = (1, target.1, 0);
+    client
+        .write_packet(&ServerboundPlayerAction {
+            action: PlayerActionKind::StartDestroyBlock,
+            position: pack_block_pos(survival_target.0, survival_target.1, survival_target.2),
+            direction: Direction::Up,
+            sequence: 3,
+        })
+        .await
+        .expect("start survival break");
+    let baseline = next_lua_time_update(&mut client).await.game_time;
+    loop {
+        let current = next_lua_time_update(&mut client).await.game_time;
+        if current.saturating_sub(baseline) >= 40 {
+            break;
+        }
+    }
+    client
+        .write_packet(&ServerboundPlayerAction {
+            action: PlayerActionKind::StopDestroyBlock,
+            position: pack_block_pos(survival_target.0, survival_target.1, survival_target.2),
+            direction: Direction::Up,
+            sequence: 4,
+        })
+        .await
+        .expect("finish survival break");
+
+    let expected_survival_message = format!(
+        "block-broken:minecraft:grass_block:minecraft:overworld:1:{}:0:survival:BreakEvents",
+        survival_target.1
+    );
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+    let mut saw_survival_update = false;
+    let mut saw_survival_event = false;
+    while !(saw_survival_update && saw_survival_event) {
+        let mut frame = client
+            .read_frame_with_timeout(
+                deadline.saturating_duration_since(tokio::time::Instant::now()),
+            )
+            .await
+            .expect("survival block break event wire response");
+        if frame.id == BlockUpdate::ID {
+            let update = BlockUpdate::decode(&mut frame.body).expect("decode BlockUpdate");
+            if unpack_block_pos(update.position) == survival_target && update.state_id == air_state
+            {
+                saw_survival_update = true;
+            }
+        } else if frame.id == ClientboundSystemChat::ID {
+            let chat = ClientboundSystemChat::decode(&mut frame.body).expect("decode SystemChat");
+            if text_component_text(&chat) == expected_survival_message {
+                saw_survival_event = true;
+            }
+        }
+    }
+
+    client
+        .write_packet(&ServerboundPlayerAction {
+            action: PlayerActionKind::StartDestroyBlock,
+            position: pack_block_pos(survival_target.0, survival_target.1, survival_target.2),
+            direction: Direction::Up,
+            sequence: 5,
+        })
+        .await
+        .expect("repeat survival break against air");
+    client
+        .write_packet(&ServerboundChatCommand {
+            command: "block-fence survival-repeat".to_owned(),
+        })
+        .await
+        .expect("send survival repeat fence");
+    loop {
+        let message = next_lua_transaction_system_chat_text(&mut client).await;
+        assert!(
+            !message.starts_with("block-broken:"),
+            "repeated survival break published another event: {message}"
+        );
+        if message == "block-fence:survival-repeat" {
+            break;
+        }
+    }
+
+    let stale_target = (2, target.1, 0);
+    client
+        .write_packet(&ServerboundPlayerAction {
+            action: PlayerActionKind::StartDestroyBlock,
+            position: pack_block_pos(stale_target.0, stale_target.1, stale_target.2),
+            direction: Direction::Up,
+            sequence: 6,
+        })
+        .await
+        .expect("start stale survival break");
+    loop {
+        let outcome = client
+            .wait_for_frame_id_with_timeout_and_limits(
+                BlockChangedAck::ID,
+                Duration::from_secs(5),
+                LUA_TRANSACTION_FRAME_WAIT_LIMITS,
+            )
+            .await
+            .expect("stale break start acknowledgement");
+        let ack = BlockChangedAck::decode(&mut outcome.frame.body.clone())
+            .expect("decode stale start acknowledgement");
+        if ack.sequence == 6 {
+            break;
+        }
+    }
+    let baseline = next_lua_time_update(&mut client).await.game_time;
+    loop {
+        let current = next_lua_time_update(&mut client).await.game_time;
+        if current.saturating_sub(baseline) >= 40 {
+            break;
+        }
+    }
+
+    peer.write_packet(&ServerboundPlayerAction {
+        action: PlayerActionKind::StartDestroyBlock,
+        position: pack_block_pos(stale_target.0, stale_target.1, stale_target.2),
+        direction: Direction::Up,
+        sequence: 1,
+    })
+    .await
+    .expect("peer invalidates survival break snapshot");
+    let expected_peer_message = format!(
+        "block-broken:minecraft:grass_block:minecraft:overworld:2:{}:0:creative:BreakPeer",
+        stale_target.1
+    );
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+    let mut saw_peer_update = false;
+    let mut saw_peer_event = false;
+    while !(saw_peer_update && saw_peer_event) {
+        let mut frame = peer
+            .read_frame_with_timeout(
+                deadline.saturating_duration_since(tokio::time::Instant::now()),
+            )
+            .await
+            .expect("peer block-break event wire response");
+        if frame.id == BlockUpdate::ID {
+            let update = BlockUpdate::decode(&mut frame.body).expect("decode peer BlockUpdate");
+            if unpack_block_pos(update.position) == stale_target && update.state_id == air_state {
+                saw_peer_update = true;
+            }
+        } else if frame.id == ClientboundSystemChat::ID {
+            let chat = ClientboundSystemChat::decode(&mut frame.body).expect("decode SystemChat");
+            if text_component_text(&chat) == expected_peer_message {
+                saw_peer_event = true;
+            }
+        }
+    }
+
+    client
+        .write_packet(&ServerboundPlayerAction {
+            action: PlayerActionKind::StopDestroyBlock,
+            position: pack_block_pos(stale_target.0, stale_target.1, stale_target.2),
+            direction: Direction::Up,
+            sequence: 7,
+        })
+        .await
+        .expect("finish stale survival break");
+    client
+        .write_packet(&ServerboundChatCommand {
+            command: "block-fence owner-stale".to_owned(),
+        })
+        .await
+        .expect("send owner-stale fence");
+    loop {
+        let message = next_lua_transaction_system_chat_text(&mut client).await;
+        assert!(
+            !message.starts_with("block-broken:"),
+            "owner-rejected stale break published an event: {message}"
+        );
+        if message == "block-fence:owner-stale" {
+            break;
+        }
+    }
+
     shutdown.request();
     tokio::time::timeout(Duration::from_secs(5), server)
         .await
@@ -1629,6 +2161,18 @@ async fn next_time_update(client: &mut Client) -> ClientboundSetTime {
     );
     let frame = outcome.frame;
     ClientboundSetTime::decode(&mut frame.body.clone()).expect("decode SetTime")
+}
+
+async fn next_lua_time_update(client: &mut Client) -> ClientboundSetTime {
+    let outcome = client
+        .wait_for_frame_id_with_timeout_and_limits(
+            ClientboundSetTime::ID,
+            Duration::from_secs(5),
+            LUA_TRANSACTION_FRAME_WAIT_LIMITS,
+        )
+        .await
+        .expect("Lua gameplay world time frame");
+    ClientboundSetTime::decode(&mut outcome.frame.body.clone()).expect("decode SetTime")
 }
 
 async fn wait_for_admin_day_effects(client: &mut Client) {

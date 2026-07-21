@@ -671,6 +671,7 @@ async fn start_tick_is_captured_before_owner_snapshot_queue_latency() {
     let mut request = Box::pin(handle_block_destroy_action(
         &mut state,
         &mut writer,
+        None,
         GameMode::Survival,
         &mut survival,
         &mut xp,

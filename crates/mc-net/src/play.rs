@@ -124,6 +124,9 @@ mod player_damage_adapter;
 mod random_ticks;
 mod recipes;
 mod scheduled_blocks;
+mod script_gameplay_events;
+#[cfg(test)]
+mod script_gameplay_events_tests;
 // Router and storage-owner wiring land separately; keep the bounded adapter
 // contract available without creating a second ingress path here.
 #[allow(dead_code)]
@@ -393,6 +396,7 @@ use scheduled_blocks::{
     HOPPER_TRANSFER_DELAY_TICKS, HOPPER_TRANSFER_MAX_STACK, container_redstone_signal_at,
     insert_hopper_stack_into_campfire,
 };
+use script_gameplay_events::ScriptGameplayEventPublisher;
 use session::{
     EntityAttackOutcome, OutboundCommand, OutboundLightUpdate, PlayerAttackResult,
     PlayerEntitySnapshot, ScriptMenuCloseRequest, ScriptMenuOpenRequest, ServerEntityMove,
@@ -6273,9 +6277,11 @@ where
 /// M5.d/M22.b: handle serverbound block-destroy actions. Creative keeps the
 /// historical instant edit path; survival now requires a server-timed start/stop
 /// pair before the shared mutation back-half can run.
+#[allow(clippy::too_many_arguments)]
 async fn handle_player_action<W>(
     state: &mut InteractionState,
     writer: &mut W,
+    script_events: Option<&ScriptGameplayEventPublisher>,
     game_mode: GameMode,
     survival_state: &mut SurvivalState,
     xp_state: &mut XpState,
@@ -6455,6 +6461,7 @@ where
     handle_block_destroy_action(
         state,
         writer,
+        script_events,
         game_mode,
         survival_state,
         xp_state,
@@ -11457,6 +11464,16 @@ where
         dimension: respawn.dimension_name.to_string(),
         revision: 0,
     });
+    let script_gameplay_events = scripts.as_ref().map(|sink| {
+        ScriptGameplayEventPublisher::new(
+            sink.clone(),
+            ScriptPlayerId::new(session_id),
+            player_uuid.clone(),
+            player_name.clone(),
+            permissions,
+            respawn.dimension_name.to_string(),
+        )
+    });
     if let Some(observer) = script_zone_observer.as_mut() {
         observer.observe(player_pose).await;
     }
@@ -11981,6 +11998,7 @@ where
                     tick_delayed_break(
                         state,
                         writer,
+                        script_gameplay_events.as_ref(),
                         game_mode,
                         &mut survival_state,
                         &mut xp_state,
@@ -12142,6 +12160,7 @@ where
                         handle_player_action(
                             state,
                             writer,
+                            script_gameplay_events.as_ref(),
                             game_mode,
                             &mut survival_state,
                             &mut xp_state,
