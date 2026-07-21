@@ -101,9 +101,13 @@ and is not startup context.
   count now covers water, lava, water plants and waterlogged states. An O3 real
   client entering source water reports `in_water=true` and
   `water_fluid_height=0.8888889`; 81 chunks streamed with measured
-  `chunk_data_ms=0`. Next: add one deterministic deep-water MCP gate for
-  ascent, diving, swimming pose and drowning before returning to the remaining
-  owner gameplay queue.
+  `chunk_data_ms=0`. The follow-up O3 MCP gate observed ascent, diving,
+  swimming pose, air depletion, drowning damage and connection continuity.
+  Evidence is
+  `.analysis/codex-logs/deep-water-real-client-final.json`. Next: rerun the
+  exact dense 5,132-entity owner-world disconnect path against the current
+  reliable-movement coalescing/autoscale build; after that, run manual real
+  client mob combat.
 - `7cdd917` fixes the ordinary active-game save path exposed by the natural
   furnace loop. A resident mutation during out-of-lock whole-region encoding
   now skips that Anvil region before filesystem installation and leaves it

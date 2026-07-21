@@ -41,10 +41,12 @@ hardening. An already-open lower-priority diff does not override this order.
    being corrected onto their former full-cube fallback. Chunk sections now
    publish the exact vanilla `fluid_count`, so the real client no longer skips
    entity/fluid overlap: entering source water reports `in_water=true` and a
-   fluid height of `0.8888889`. A deterministic deep-water ascent, dive and
-   drowning client gate remains open.
-3. After the disconnect, close the remaining owner-client reports: water
-   movement and manual mob-combat feel. The mob death core now has bounded O3
+   fluid height of `0.8888889`. The O3 deep-water client gate now covers
+   ascent, diving, swimming pose, air depletion and drowning damage without a
+   disconnect. The exact dense owner-world disconnect rerun is the next
+   playable gate; manual mob combat follows it.
+3. After the disconnect, close the remaining owner-client report: manual
+   mob-combat feel. The mob death core now has bounded O3
    load evidence, but this does not replace client/socket verification. Default
    block, entity-use and melee reach follow the 26.1.2 server verification
    contracts. Skeleton arrows and creeper explosions have real TCP coverage.
@@ -82,9 +84,12 @@ hardening. An already-open lower-priority diff does not override this order.
   In the O3 real-client rerun, entering a source block produced
   `in_water=true`, `water_fluid_height=0.8888889`, and no disconnect while 81
   chunks streamed with `chunk_data_ms=0`. Evidence is in
-  `.analysis/codex-logs/fluid-count-real-client.json`. This closes client-local
-  fluid contact; deep-water swimming, diving and drowning are not yet claimed
-  green.
+  `.analysis/codex-logs/fluid-count-real-client.json`. A second O3 real-client
+  run observed ascent, diving, horizontal movement with the swimming pose, air
+  depletion and drowning damage while remaining connected. Evidence is in
+  `.analysis/codex-logs/deep-water-real-client-final.json`. Client-local fluid
+  contact, movement and breathing are green for this representative survival
+  path; broader aquatic mechanics remain normal parity work.
 
 - The dense-world disconnect counter identified the reliable movement retry
   queue as the remaining failure path. Once a recipient's bounded channel is
