@@ -9,18 +9,20 @@ and is not startup context.
 
 - Date: 2026-07-21.
 - Branch: `dev/M100-client-agent`.
-- Latest checkpoint: `e09c6ec` (`feat(plugins): exercise shipped gameplay
-  examples`). Delivery-order checkpoint `5e2908a` remains binding.
+- Latest checkpoint: `aabea52` (`feat(plugins): publish committed entity
+  kills`). Delivery-order checkpoint `5e2908a` remains binding.
 - The worktree may contain unrelated owner files and local artifacts. Inspect
   exact ownership before editing; never clean or stage them by accident.
 - Full workspace tests, workspace all-target strict Clippy, fmt, code-health
-  `0 fail / KEEP`, and diff-check passed immediately before `e09c6ec`. The
-  shipped-plugin wire gate passed `2/2`, the colony router passed `17/17`, and
-  the exact example loader passed `1/1`. A final `sol high` review found no
-  blocker, high, or medium issue after its stale-token and readiness findings
-  were fixed. No manual/client or vanilla-oracle gate was run for this
-  plugin-only slice. Pre-existing entity-scale and local artifact changes were
-  not staged.
+  `0 fail / KEEP`, and diff-check passed immediately before `aabea52`. The real
+  TCP/Lua gate proved two exact direct-melee kill events without a delayed
+  duplicate; direct tests cover nonlethal, unreachable, stale-cost,
+  repeated-dying, moved-session-snapshot, and closed-outbox paths. A `sol high`
+  review found no blocker; its stale-position finding was fixed. Global ordering
+  against concurrent lossy/script producers remains outside the committed
+  outbox FIFO contract and was not broadened into a script-bus redesign. No
+  manual/client or vanilla-oracle gate was run for this plugin-only slice.
+  Pre-existing entity-scale and local artifact changes were not staged.
 - Ignored oracle/load/benchmark rows remain explicit. The P04 real-client soak
   ran; broad performance and dedicated concurrency gates did not.
 
@@ -86,9 +88,13 @@ two priorities unless it becomes a common-play blocker or corruption risk.
   client writes and drained before required `server.stopping`; nonlethal,
   shield-blocked, stale, unsupported-mode, already-dead, and respawn paths emit
   nothing. Killer/cause attribution remains deliberately absent until every
-  source carries exact facts. The owner-to-server outbox is unbounded to avoid
-  waiting under owner locks; do not revisit it before playable/Lua work unless a
-  measured hostile workload makes its memory material. Direct tests cover
+  source carries exact facts. Direct player melee entity kills publish a
+  separate exact `player.entity_killed` fact with target id/type and explicit
+  `source = melee`; nonlethal, unreachable, stale, repeated-dying, projectile,
+  explosion, environmental, and non-player paths do not claim attribution. The
+  shared owner-to-server outbox is unbounded to avoid waiting under owner locks;
+  do not revisit it before playable/Lua work unless a measured hostile workload
+  makes its memory material. Direct tests cover
   cursor mismatch, full output inventory,
   owner-stale rejection, no-op, queue closure after commit, aggregate counts
   above `u32`, invalid pickup identities/modes, transition-tick deduplication,
@@ -109,9 +115,11 @@ two priorities unless it becomes a common-play blocker or corruption risk.
 
 ### Playable And Client-Visible
 
-- Stair facing/half, slab top/bottom, adjacent matching-slab merge, and
-  waterlogging follow the inspected local 26.1.2 rule. The focused wire gate is
-  current at `feba79a`; stair neighbour shapes remain open.
+- Stair facing/half, slab top/bottom, adjacent matching-slab merge,
+  waterlogging, and stair neighbour-shape recomputation follow the inspected
+  local 26.1.2 rule. Unit and adapter coverage at `feba79a` includes all corner
+  shapes and stale dependency rejection; a dedicated raw-TCP corner assertion
+  remains absent.
 - Ordinary torches place as wall torches on horizontal conservative full-cube
   supports, remain standing on `UP`, and reject `DOWN` or known partial
   supports. Irregular sturdy-face parity and neighbour break cascades remain

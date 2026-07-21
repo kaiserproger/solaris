@@ -42,6 +42,20 @@ hardening. An already-open lower-priority diff does not override this order.
 
 ## Recent Evidence
 
+- Checkpoint `aabea52` adds the production `player.entity_killed` Lua event for
+  exact direct player-melee kills. It publishes only after target lethality and
+  attacker costs commit, captures the transaction pose, and does not attribute
+  nonlethal, unreachable, stale-cost, repeated-dying, projectile, explosion,
+  environmental, or non-player damage. The real TCP/Lua gate observes two
+  distinct kills from the same committed-event FIFO and proves no delayed
+  duplicate; direct tests also cover a moved session snapshot and closed
+  outbox. Full workspace tests, strict workspace Clippy, fmt, code-health
+  `0 fail / KEEP`, and diff-check pass. One overloaded workspace attempt exposed
+  unrelated existing probe/TNT timing failures; each focused rerun passed and a
+  clean single workspace run passed. A `sol high` review found no blocker; the
+  stale-position finding was fixed, while global cross-producer script ordering
+  remains explicitly outside the outbox FIFO contract. No manual/client or
+  vanilla-oracle gate was run for this plugin-only slice.
 - Checkpoint `e09c6ec` replaces smoke-only confidence in the shipped Lua
   examples with production wire evidence. The exact currency catalog files now
   pass zone activation, rendered menu contents, an atomic three-emerald/two-
@@ -131,8 +145,10 @@ hardening. An already-open lower-priority diff does not override this order.
 - Ordinary wall torches have registry-backed tests for four horizontal facings,
   standing `UP`, rejected `DOWN`, and partial support. Raw TCP proves one debit
   after accepted update/ack and unchanged held-stack resync before rejected ack.
-- Stair facing/half, slab top/bottom, matching-slab merge, and waterlogging use
-  the inspected local 26.1.2 rule. Stair neighbour-shape selection remains open.
+- Stair facing/half, slab top/bottom, matching-slab merge, waterlogging, and
+  stair neighbour-shape recomputation use the inspected local 26.1.2 rule.
+  Selector and real placement/break adapter tests cover every corner shape and
+  stale dependency rollback; a dedicated raw-TCP corner assertion remains open.
 - The regional mutation extraction is architecture-only and makes no gameplay
   or performance claim.
 - Latest P44 artifact is

@@ -80,6 +80,7 @@ targeted event does not need a broad subscription to reach its owner.
 | `player.block_placed` | `on_player_block_placed` | block player snapshot, `dimension`, `block_id`, `x`, `y`, `z`, `game_mode` |
 | `player.item_crafted` | `on_player_item_crafted` | `name`, `player_id`, `context_verified`, `uuid`, `username`, `operator`, `x`, `y`, `z`, `dimension`, `item_id`, `count`, `craft_count`, `source`, `game_mode` |
 | `player.item_picked_up` | `on_player_item_picked_up` | `name`, `player_id`, `context_verified`, `uuid`, `username`, `operator`, `x`, `y`, `z`, `dimension`, `item_id`, `count`, `source`, `game_mode` |
+| `player.entity_killed` | `on_player_entity_killed` | `name`, `player_id`, `context_verified`, `uuid`, `username`, `operator`, `x`, `y`, `z`, `dimension`, `entity_id`, `entity_type`, `source`, `game_mode` |
 | `player.died` | `on_player_died` | `name`, `player_id`, `context_verified`, `uuid`, `username`, `operator`, `x`, `y`, `z`, `dimension`, `game_mode` |
 | `server.tick` | `on_server_tick` | `tick` |
 | `player.command` | `on_player_command` | player snapshot, `root`, `arguments` |
@@ -138,14 +139,26 @@ campfire outputs enter this index only after their world-journal acknowledgement
 and entity publication, so an aborted output commit cannot publish a pickup or
 duplicate the item.
 
+`player.entity_killed` is published once after a direct player-melee attack
+commits the target's lethal entity transition and the attacker's survival and
+inventory costs. `entity_id` is the server entity id from that committed
+target, `entity_type` and `dimension` are namespaced resource ids, and `source`
+is currently `melee`. Nonlethal or hurt-resistant attacks, stale attacker
+costs, spectators, unreachable or missing targets, repeated attacks against
+the already-dying entity, arrows, explosions, environmental damage, and
+non-player damage publish nothing. Projectile attribution can extend this
+event only when its owner carries an exact player identity through the lethal
+commit; plugins must not infer it from nearby players or timing.
+
 `player.died` is published once after the simulation owner accepts a live-to-
 dead player survival transition, including the same atomic inventory drop and
 XP reset. The common fall, contact block, starvation, hostile, projectile, PvP,
 and operator damage paths use that transition. The owner snapshots the event
-into a push outbox before any fallible client write. One async worker forwards
-that immutable event into the bounded Lua queue, so victim disconnects, stale
-connection mirrors, and packet-write failures cannot erase or rewrite an
-accepted death. Nonlethal or shield-blocked damage, stale owner state,
+into the shared committed-gameplay push outbox before any fallible client
+write. One async worker forwards immutable death and direct-melee-kill events
+into the bounded Lua queue, so victim disconnects, stale connection mirrors,
+and packet-write failures cannot erase or rewrite an accepted death. Nonlethal
+or shield-blocked damage, stale owner state,
 unsupported Creative/Spectator damage, repeated damage against an already-dead
 player, and respawn publish nothing. The first contract deliberately omits
 killer and damage-source fields because those facts are not yet carried
@@ -159,7 +172,10 @@ so an admitted event keeps FIFO order without polling or guessed time. Closing
 the plugin queue cannot roll back an already committed world mutation;
 publication reports failure and the normal block result still reaches the
 client. Lossy telemetry such as `server.tick` remains nonblocking and may be
-dropped under pressure.
+dropped under pressure. The committed-gameplay FIFO guarantee applies inside
+that outbox; concurrent lossy events and player-command producers do not form a
+global causal order with it. Do not use `server.tick` as a completion fence for
+a committed gameplay event.
 
 ## Commands
 

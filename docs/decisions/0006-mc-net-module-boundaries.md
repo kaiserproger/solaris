@@ -396,18 +396,21 @@ Other accepted concrete boundaries in this staged migration are:
   committed crafted-item fact, or exact credited pickup to the publisher only
   after owner commit. Pickup facts
   distinguish world items from grounded arrows and report only the amount
-  merged into the player inventory. Player death is different because every
-  source converges on `session::player_state` authority. That owner snapshots
-  the exact live-to-dead fact, identity, mode, dimension, and commit position
-  into a nonblocking push outbox before any client write. A single async server
-  worker preserves outbox order and awaits required bounded Lua admission. PvP
-  and projectile death therefore do not depend on the victim connection
+  merged into the player inventory. Synchronous combat commits use
+  `play::session::script_commit_events`. Player death converges on
+  `session::player_state`; a direct player-melee entity kill converges on
+  `session::entity_combat` after both target damage and attacker costs commit.
+  These owners snapshot exact player, mode, dimension, position, and death or
+  target facts into one nonblocking push outbox before any client write. A
+  single async server worker preserves outbox order and awaits required bounded
+  Lua admission. PvP and projectile player death therefore do not depend on the victim connection
   consuming `PlayerDamageCommitted`, and a failed health/inventory packet write
   cannot erase an accepted event. The outbox is intentionally unbounded: a
   synchronous owner cannot await bounded capacity while holding state locks,
-  and dropping an already committed death would violate the plugin contract.
-  Its producer is fenced to one entry per live-to-dead transition; another
-  entry for that player requires an authoritative respawn first. The bounded
+  and dropping an already committed event would violate the plugin contract.
+  Death production is fenced to one entry per live-to-dead transition; direct
+  melee-kill production is fenced to the target's one lethal transition.
+  Another player-death entry requires an authoritative respawn. The bounded
   Lua queue remains the backpressure boundary. If measured hostile workloads
   make this outbox material, replace it with a reserved-permit or durable
   segmented outbox without moving waits under owner locks. No path invents
@@ -415,6 +418,9 @@ Other accepted concrete boundaries in this staged migration are:
   back the committed mutation. Shutdown fences connection and simulation
   producers before closing and draining the outbox; `server.stopping` then uses
   the same required admission path before event admission closes.
+  FIFO is guaranteed within this committed outbox, not globally against
+  concurrent lossy telemetry or player-command producers. A global script-event
+  sequencer is a separate API change and is not implied by this adapter.
 - `play::session::player_state_adapter` owns selected-slot, respawn-pose and
   game-mode event commits plus player animation/entity-data recipient
   projection. Persistence/inventory/survival authority remains in
@@ -585,7 +591,8 @@ transaction boundary.
 The existing `play::block_placement` boundary also selects stair facing and
 stair/slab top or bottom state from the player yaw and target-relative hit Y.
 The rule is pinned to the local 26.1.2 `StairBlock`/`SlabBlock` oracle. Slab
-merging and stair neighbour-shape selection remain explicit follow-up work. An
+merging and stair neighbour-shape selection are implemented, including
+neighbour recomputation and stale selector-dependency rejection. An
 ordinary torch placed against a horizontal full-cube support selects the exact
 wall-torch facing, while `UP` retains the standing state and `DOWN` is rejected.
 The support predicate is deliberately conservative; irregular sturdy faces,
