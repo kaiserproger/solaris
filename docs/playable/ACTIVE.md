@@ -42,6 +42,23 @@ hardening. An already-open lower-priority diff does not override this order.
 
 ## Recent Evidence
 
+- Checkpoint `9330336` adds required `player.died` events at the authoritative
+  live-to-dead survival commit. Operator, fall, starvation, contact, hostile,
+  PvP, and projectile paths converge there; nonlethal, shield-blocked, stale,
+  unsupported-mode, already-dead, and respawn paths publish nothing. The owner
+  snapshots the event before fallible client writes, shutdown drains all
+  producers and this outbox before required `server.stopping`, and Lua admission
+  remains bounded and push-driven. The owner outbox is intentionally unbounded
+  because its synchronous commit cannot await capacity while holding state
+  locks; revisit that debt only if measured workloads make it material. A real
+  packet/Lua gate observes health zero, one death event, respawn, and no
+  duplicate. Its prior pickup timeout was a genuine two-client race in the test:
+  both clients shared spawn and could claim the same dirt. Causally fenced peer
+  movement now isolates the collector without longer timeouts. Full workspace
+  tests, strict workspace Clippy, fmt, code-health `0 fail / KEEP`, and
+  diff-check pass; `commands` passes `14/14` and `mc-server --test play` passes
+  `16/16`. A final `sol high` review found no blocker, high, or medium issue. No
+  manual/client or vanilla-oracle gate was run for this plugin-only event slice.
 - Checkpoint `51b2659` adds required post-commit `player.item_picked_up`
   events for exact item-entity and grounded-arrow inventory credits. Partial
   pickup reports only the merged count. Stationary drops now wake nearby

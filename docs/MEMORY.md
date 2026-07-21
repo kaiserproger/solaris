@@ -9,19 +9,17 @@ and is not startup context.
 
 - Date: 2026-07-21.
 - Branch: `dev/M100-client-agent`.
-- Latest checkpoint: `51b2659` (`feat(plugins): publish committed item
-  pickups`). Delivery-order checkpoint `5e2908a` remains binding.
+- Latest checkpoint: `9330336` (`feat(plugins): publish committed player
+  deaths`). Delivery-order checkpoint `5e2908a` remains binding.
 - The worktree may contain unrelated owner files and local artifacts. Inspect
   exact ownership before editing; never clean or stage them by accident.
 - Full workspace tests, workspace all-target strict Clippy, fmt, code-health
-  `0 fail / KEEP`, and diff-check passed immediately before `51b2659`. Focused
-  evidence includes `mc-script` `95/95`, full `mc-net` `1555 passed / 1
-  ignored`, the command wire gate `14/14`, and `block_edit` `94/94`. A
-  `sol high` review found a pre-publication campfire pickup risk; it was fixed
-  before commit with a regression proving hidden outputs cannot become pickup
-  candidates. No manual/client or vanilla-oracle gate was run for this
-  plugin-only event slice. Pre-existing entity-scale and local artifact changes
-  were not staged.
+  `0 fail / KEEP`, and diff-check passed immediately before `9330336`. The
+  command wire gate passed `14/14` after isolating its two clients from a real
+  pickup race through causally fenced movement. `mc-server --test play` passed
+  `16/16`. A final `sol high` review found no blocker, high, or medium issue.
+  No manual/client or vanilla-oracle gate was run for this plugin-only event
+  slice. Pre-existing entity-scale and local artifact changes were not staged.
 - Ignored oracle/load/benchmark rows remain explicit. The P04 real-client soak
   ran; broad performance and dedicated concurrency gates did not.
 
@@ -81,7 +79,16 @@ two priorities unless it becomes a common-play blocker or corruption risk.
   item-entity and grounded-arrow credits, including partial stack pickup.
   Stationary item readiness is push-driven from an exact-tick index, and
   deferred campfire outputs enter that index only after durable acknowledgement
-  and publication. Direct tests cover cursor mismatch, full output inventory,
+  and publication. `player.died` now publishes one immutable event from the
+  authoritative live-to-dead owner commit for common operator, fall, starvation,
+  contact, hostile, PvP, and projectile damage. It is captured before fallible
+  client writes and drained before required `server.stopping`; nonlethal,
+  shield-blocked, stale, unsupported-mode, already-dead, and respawn paths emit
+  nothing. Killer/cause attribution remains deliberately absent until every
+  source carries exact facts. The owner-to-server outbox is unbounded to avoid
+  waiting under owner locks; do not revisit it before playable/Lua work unless a
+  measured hostile workload makes its memory material. Direct tests cover
+  cursor mismatch, full output inventory,
   owner-stale rejection, no-op, queue closure after commit, aggregate counts
   above `u32`, invalid pickup identities/modes, transition-tick deduplication,
   and unpublished campfire outputs; the wire gate covers exact committed event
