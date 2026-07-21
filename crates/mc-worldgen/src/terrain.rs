@@ -94,9 +94,6 @@ const ORE_DIRECTIONS: [[i8; 3]; 6] = [
     [0, 0, 1],
 ];
 const CAVE_SURFACE_CLEARANCE: i32 = 24;
-const CAVE_MOUTH_GRID: i32 = 128;
-const CAVE_MOUTH_RADIUS: i32 = CAVE_SURFACE_CLEARANCE;
-const CAVE_MOUTH_SPAWN_SAFE_RADIUS: i32 = 24;
 const CAVE_FREQUENCY: f64 = 1.0 / 34.0;
 const CAVE_THRESHOLD: f64 = 0.24;
 const CAVE_BRANCH_FREQUENCY: f64 = 1.0 / 58.0;
@@ -973,13 +970,11 @@ impl TerrainGenerator {
         if plan.dirt_start <= first_fill_y {
             return;
         }
-        let cave_mouth_depth = self.surface_cave_mouth_depth_for_plan(plan);
-        self.apply_caves(chunk, plan, cave_mouth_depth);
-        self.apply_surface_cave_mouth(chunk, plan, cave_mouth_depth);
+        self.apply_caves(chunk, plan);
     }
 
-    fn apply_caves(&self, chunk: &mut Chunk, plan: &ColumnPlan, cave_mouth_depth: i32) {
-        let Some((cave_min_y, cave_max_y)) = self.cave_y_bounds(plan, cave_mouth_depth) else {
+    fn apply_caves(&self, chunk: &mut Chunk, plan: &ColumnPlan) {
+        let Some((cave_min_y, cave_max_y)) = self.cave_y_bounds(plan) else {
             return;
         };
         let mut y = cave_min_y;
@@ -997,41 +992,10 @@ impl TerrainGenerator {
         }
     }
 
-    fn apply_surface_cave_mouth(
-        &self,
-        chunk: &mut Chunk,
-        plan: &ColumnPlan,
-        cave_mouth_depth: i32,
-    ) {
-        if cave_mouth_depth == 0 {
-            return;
-        }
-        let floor = (i64::from(plan.height) - i64::from(cave_mouth_depth))
-            .max(i64::from(self.geometry.min_y()) + 8);
-        let Ok(floor) = i32::try_from(floor) else {
-            return;
-        };
-        let Some(first_carved_y) = checked_y_offset(floor, 1) else {
-            return;
-        };
-        for y in first_carved_y..=plan.height {
-            let _ = chunk.set_block(plan.lx, y, plan.lz, self.air);
-        }
-    }
-
-    fn surface_cave_mouth_depth_for_plan(&self, plan: &ColumnPlan) -> i32 {
-        if plan.top_non_air != plan.height || self.biomes.is_surface_water(&plan.biome) {
-            0
-        } else {
-            self.surface_cave_mouth_depth(plan.wx, plan.wz)
-        }
-    }
-
-    fn cave_y_bounds(&self, plan: &ColumnPlan, cave_mouth_depth: i32) -> Option<(i32, i32)> {
-        let surface_clearance = i64::from(CAVE_SURFACE_CLEARANCE) - i64::from(cave_mouth_depth);
+    fn cave_y_bounds(&self, plan: &ColumnPlan) -> Option<(i32, i32)> {
         let cave_min_y = i64::from(self.geometry.min_y()) + 8;
-        let cave_max_y =
-            (i64::from(plan.height) - surface_clearance).min(i64::from(plan.dirt_start) - 1);
+        let cave_max_y = (i64::from(plan.height) - i64::from(CAVE_SURFACE_CLEARANCE))
+            .min(i64::from(plan.dirt_start) - 1);
         if cave_max_y < cave_min_y {
             return None;
         }
@@ -1282,18 +1246,7 @@ impl TerrainGenerator {
             return Some(self.bedrock);
         }
 
-        let cave_mouth_depth = self.surface_cave_mouth_depth_for_plan(&plan);
-        if cave_mouth_depth != 0 {
-            let floor = (i64::from(plan.height) - i64::from(cave_mouth_depth))
-                .max(i64::from(self.geometry.min_y()) + 8);
-            let Ok(floor) = i32::try_from(floor) else {
-                return None;
-            };
-            if y > floor {
-                return Some(self.air);
-            }
-        }
-        if let Some((cave_min_y, cave_max_y)) = self.cave_y_bounds(&plan, cave_mouth_depth)
+        if let Some((cave_min_y, cave_max_y)) = self.cave_y_bounds(&plan)
             && (cave_min_y..=cave_max_y).contains(&y)
         {
             let sample_y =
@@ -1361,6 +1314,10 @@ impl TerrainGenerator {
                 let biome = &plan.biome;
                 let surface = plan.surface;
                 let h = plan.hash;
+
+                if chunk.get_block(lx, height, lz) != Some(surface) {
+                    continue;
+                }
 
                 if self.is_spawn_stone_outcrop(plan.wx, height, plan.wz) {
                     continue;
@@ -1458,6 +1415,13 @@ impl TerrainGenerator {
             return false;
         };
         if !(2..=13).contains(&lx) || !(2..=13).contains(&lz) || top_y >= self.geometry.max_y() {
+            return false;
+        }
+        let Some(support_y) = checked_y_offset(base_y, -1) else {
+            return false;
+        };
+        if matches!(chunk.get_block(lx, support_y, lz), Some(state) if state == self.air || state == self.water)
+        {
             return false;
         }
         for y in base_y..=top_y {
@@ -1761,30 +1725,6 @@ impl TerrainGenerator {
         )
         .is_multiple_of(211);
         n > CAVE_THRESHOLD || branch > CAVE_BRANCH_THRESHOLD || room
-    }
-
-    fn surface_cave_mouth_depth(&self, x: i32, z: i32) -> i32 {
-        let grid_x = x.div_euclid(CAVE_MOUTH_GRID);
-        let grid_z = z.div_euclid(CAVE_MOUTH_GRID);
-        let hash = feature_hash(self.seed, grid_x, 0, grid_z, 0xC4A7_E001);
-        let offset_span = CAVE_MOUTH_GRID - CAVE_MOUTH_RADIUS * 2;
-        let center_x = grid_x * CAVE_MOUTH_GRID
-            + CAVE_MOUTH_RADIUS
-            + i32::try_from(hash % offset_span as u64).expect("cave mouth x offset fits i32");
-        let center_z = grid_z * CAVE_MOUTH_GRID
-            + CAVE_MOUTH_RADIUS
-            + i32::try_from((hash >> 16) % offset_span as u64)
-                .expect("cave mouth z offset fits i32");
-        let spawn_clearance = CAVE_MOUTH_SPAWN_SAFE_RADIUS + CAVE_MOUTH_RADIUS;
-        let center_distance_squared =
-            i64::from(center_x) * i64::from(center_x) + i64::from(center_z) * i64::from(center_z);
-        if center_distance_squared <= i64::from(spawn_clearance) * i64::from(spawn_clearance) {
-            return 0;
-        }
-        let dx = i64::from(x - center_x);
-        let dz = i64::from(z - center_z);
-        let distance = ((dx * dx + dz * dz) as f64).sqrt().ceil() as i32;
-        (CAVE_MOUTH_RADIUS - distance).max(0)
     }
 
     #[cfg(test)]

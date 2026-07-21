@@ -144,6 +144,8 @@ fn ocean_water_columns_contain_aquatic_vegetation_without_land_debris() {
 #[test]
 fn sampled_land_contains_tree_shapes() {
     let (generator, registry, _) = generator();
+    let air = default_state(&registry, "minecraft:air");
+    let mut found_tree = false;
 
     for cx in -16..=16 {
         for cz in -16..=16 {
@@ -188,7 +190,12 @@ fn sampled_land_contains_tree_shapes() {
                             })
                         });
                         if has_canopy {
-                            return;
+                            assert_ne!(
+                                chunk.get_block(lx, base_y - 1, lz),
+                                Some(air),
+                                "tree trunk is unsupported at {wx},{base_y},{wz}"
+                            );
+                            found_tree = true;
                         }
                     }
                 }
@@ -196,7 +203,10 @@ fn sampled_land_contains_tree_shapes() {
         }
     }
 
-    panic!("sampled land chunks should contain at least one log trunk with a leaf canopy");
+    assert!(
+        found_tree,
+        "sampled land chunks should contain at least one log trunk with a leaf canopy"
+    );
 }
 
 #[test]
