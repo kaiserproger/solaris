@@ -71,6 +71,7 @@ pub(in crate::play) enum OutboundCommand {
     MovePlayer(PlayerEntitySnapshot),
     DespawnPlayer(PlayerEntitySnapshot),
     SpawnEntity(ServerEntitySnapshot),
+    SpawnEntities(Vec<ServerEntitySnapshot>),
     UpdateEntityData(ServerEntitySnapshot),
     UpdateEntityHealth(ServerEntitySnapshot),
     MoveEntityRelative(ServerEntityMove),
@@ -196,6 +197,7 @@ impl OutboundCommand {
             | Self::MovePlayer(_)
             | Self::DespawnPlayer(_)
             | Self::SpawnEntity(_)
+            | Self::SpawnEntities(_)
             | Self::UpdateEntityData(_)
             | Self::UpdateEntityHealth(_)
             | Self::MoveEntityRelative(_)

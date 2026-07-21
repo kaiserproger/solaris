@@ -14,6 +14,13 @@ and is not startup context.
   Delivery-order checkpoint `5e2908a` remains binding.
 - The worktree may contain unrelated owner files and local artifacts. Inspect
   exact ownership before editing; never clean or stage them by accident.
+- The current owner-play checkpoint fixes dense-world disconnects caused by
+  per-entity spawn commands overflowing the reliable session queue. Loaded
+  chunk spawns are one ordered batch, chunk emission pauses at outbound
+  pressure, and the play loop writes at most 16 spawns per turn. The focused
+  capacity-1 regression and the full `mc-net` suite pass; an owner O3 rerun is
+  pending. The next reported playable gap is water movement, breathing,
+  swimming, and fish navigation at the surface.
 - `7cdd917` fixes the ordinary active-game save path exposed by the natural
   furnace loop. A resident mutation during out-of-lock whole-region encoding
   now skips that Anvil region before filesystem installation and leaves it

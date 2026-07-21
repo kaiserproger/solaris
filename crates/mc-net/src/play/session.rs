@@ -30,6 +30,8 @@ mod herd_spawn_authority;
 mod hostile_authority;
 mod interaction_geometry;
 mod outbound;
+#[cfg(test)]
+mod outbound_backpressure_tests;
 mod outbound_publication;
 mod passive_mobs;
 mod pathing;
@@ -1604,6 +1606,9 @@ fn record_entity_dispatches_locked(
     for dispatch in dispatches {
         match &dispatch.command {
             OutboundCommand::SpawnEntity(_) => inner.entity_dispatches.spawn += 1,
+            OutboundCommand::SpawnEntities(entities) => {
+                inner.entity_dispatches.spawn += entities.len() as u64;
+            }
             OutboundCommand::UpdateEntityData(_) | OutboundCommand::UpdateEntityHealth(_) => {
                 inner.entity_dispatches.data += 1;
             }

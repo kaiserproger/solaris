@@ -545,6 +545,7 @@ const SLOW_CLIENT_OUTBOUND_PRESSURE_TURNS: usize = 4;
 const SLOW_CLIENT_OUTBOUND_PRESSURE_NUMERATOR: usize = 3;
 const SLOW_CLIENT_OUTBOUND_PRESSURE_DENOMINATOR: usize = 4;
 const OUTBOUND_COMMANDS_PER_PLAYER_BURST: usize = 16;
+const ENTITY_SPAWNS_PER_WRITE_TURN: usize = 16;
 const TELEPORT_RESEND_DELAY_TICKS: u64 = 20;
 
 const SPAWN_X: f64 = 0.5;
@@ -11698,6 +11699,7 @@ where
             .as_ref()
             .is_some_and(|stream| !stream.is_complete());
         if chunk_stream_needs_step
+            && outbound_queue_at_shed_pressure(&outbound_rx, &pending_outbound).is_none()
             && let (Some(stream), Some(state)) = (chunk_stream.as_mut(), interaction.as_deref_mut())
             && !stream.is_complete()
         {
@@ -11799,6 +11801,15 @@ where
                     }
                     Some(OutboundCommand::SpawnEntity(entity)) => {
                         send_entity_spawn(writer, compression, &entity).await?;
+                    }
+                    Some(OutboundCommand::SpawnEntities(mut entities)) => {
+                        if entities.len() > ENTITY_SPAWNS_PER_WRITE_TURN {
+                            let remaining = entities.split_off(ENTITY_SPAWNS_PER_WRITE_TURN);
+                            pending_outbound.push_front(OutboundCommand::SpawnEntities(remaining));
+                        }
+                        for entity in &entities {
+                            send_entity_spawn(writer, compression, entity).await?;
+                        }
                     }
                     Some(OutboundCommand::UpdateEntityData(entity)) => {
                         send_entity_data(writer, compression, &entity).await?;

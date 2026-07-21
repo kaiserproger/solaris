@@ -31,6 +31,9 @@ hardening. An already-open lower-priority diff does not override this order.
 2. Treat failures from the owner session as the playable queue. Fix the first
    common player-visible blocker, then rerun the shortest real-client scenario
    that reproduces it.
+   The current blocker is reliable-queue disconnect under dense entity chunk
+   loading; the fix is implemented and awaits an owner rerun. Next, cover the
+   reported missing water movement, breathing, swimming, and fish navigation.
 3. If that session has no common blocker, move to the first production plugin
    API slice while keeping the playable gate fixed. Defer optimization unless
    play exposes a catastrophic stall.
@@ -45,6 +48,17 @@ hardening. An already-open lower-priority diff does not override this order.
 
 ## Recent Evidence
 
+- The owner-run O3 build exposed a server-triggered disconnect while loading a
+  dense world: 5,132 entities produced 5,702 per-entity spawn dispatches and
+  overflowed the bounded reliable queue (`reliable_command_drops=963`). Chunk
+  visibility now publishes one ordered spawn batch per loaded chunk, pauses
+  further chunk emission at outbound pressure, and writes at most 16 entity
+  spawns per play-loop turn so keepalive and timeout boundaries keep making
+  progress. The 17-entity/channel-capacity-1 regression passes with zero drops
+  and exact entity accounting; all 1,589 `mc-net` tests and three doc tests
+  pass. A `sol high` reviewer confirmed ordering and state-loss behavior and
+  requested the bounded write turns, which were added. Owner-client rerun on
+  the rebuilt O3 binary remains pending.
 - Checkpoint `7cdd917` fixes a normal active-game save conflict found by the
   natural furnace scenario. The first artifact
   `.analysis/real-client-runs/20260721T110747Z-real-client-playable-loop-yFIIqx`

@@ -3985,10 +3985,12 @@ fn ensure_chunk_herd_releases_session_lock_during_durable_unique_batch() {
     assert_eq!(
         bob_load_dispatches
             .iter()
-            .filter(|dispatch| matches!(
-                &dispatch.command,
-                OutboundCommand::SpawnEntity(snapshot) if snapshot.uuid == new_uuid
-            ))
+            .flat_map(|dispatch| match &dispatch.command {
+                OutboundCommand::SpawnEntity(snapshot) => std::slice::from_ref(snapshot),
+                OutboundCommand::SpawnEntities(snapshots) => snapshots.as_slice(),
+                _ => &[],
+            })
+            .filter(|snapshot| snapshot.uuid == new_uuid)
             .count(),
         1,
         "mark_loaded after phase three must use published herd indexes"

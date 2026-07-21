@@ -302,13 +302,18 @@ pub(in crate::play) fn server_entity_snapshot_from(entity: EntitySnapshot) -> Se
 pub(super) fn spawned_xp_observer_ids(dispatches: &[VisibilityDispatch]) -> Vec<SessionId> {
     dispatches
         .iter()
-        .filter_map(|dispatch| match &dispatch.command {
+        .flat_map(|dispatch| match &dispatch.command {
             OutboundCommand::SpawnEntity(entity)
                 if entity.experience_value.is_some_and(|value| value > 0) =>
             {
-                Some(dispatch.recipient.id)
+                vec![dispatch.recipient.id]
             }
-            _ => None,
+            OutboundCommand::SpawnEntities(entities) => entities
+                .iter()
+                .filter(|entity| entity.experience_value.is_some_and(|value| value > 0))
+                .map(|_| dispatch.recipient.id)
+                .collect(),
+            _ => Vec::new(),
         })
         .collect()
 }
@@ -476,13 +481,22 @@ pub(super) fn refresh_loaded_chunk_for_session_locked(
             });
         }
     }
+    let mut new_entities = Vec::with_capacity(entities.len());
     for snapshot in entities {
         if Arc::make_mut(&mut observer.visible_entities).insert(snapshot.id) {
-            dispatches.push(VisibilityDispatch {
-                recipient: ordered_spawn_session_recipient(observer_id, observer),
-                command: OutboundCommand::SpawnEntity(snapshot),
-            });
+            new_entities.push(snapshot);
         }
+    }
+    match new_entities.len() {
+        0 => {}
+        1 => dispatches.push(VisibilityDispatch {
+            recipient: ordered_spawn_session_recipient(observer_id, observer),
+            command: OutboundCommand::SpawnEntity(new_entities.pop().expect("one entity")),
+        }),
+        _ => dispatches.push(VisibilityDispatch {
+            recipient: ordered_spawn_session_recipient(observer_id, observer),
+            command: OutboundCommand::SpawnEntities(new_entities),
+        }),
     }
     record_entity_dispatches_locked(inner, &dispatches);
     dispatches
