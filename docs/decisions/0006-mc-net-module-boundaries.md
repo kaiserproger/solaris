@@ -418,20 +418,28 @@ Other accepted concrete boundaries in this staged migration are:
   targeted event delivery awaits queue admission. Lua never receives session,
   entity or registry handles, and rejected movement cannot publish zone entry.
 - `script::colony` owns the bounded, owner-scoped in-memory colony registry and
-  correlated `colony.record_result` publication. Registry keys include the
-  host-attached plugin identity, replacements remain possible at capacity, and
-  rejected admissions cannot mutate state. The registry mutex is released
-  before targeted delivery awaits queue admission. It also validates binding
-  ownership and the current single-world dimension, generates opaque random
-  tokens, and publishes correlated binding results. The separate
-  `play::session::script_colony_endpoint` moves the synchronous owner request
-  off the async router worker and calls only the bounded regional claim command;
-  it never scans session snapshots. Entity selection, duplicate exclusion and
-  simulation-tick expiry remain owned by `mc-entity`. Deterministic request
-  rejection, owner busy state, and claim-capacity exhaustion publish an empty
-  result and keep the router alive; broken owner availability still stops it.
-  Forced cancellation can orphan an already committed opaque claim, bounded by
-  the same 600-tick expiry; cooperative shutdown drains the active route.
+  correlated colony, binding, and villager-order result publication. Registry
+  keys include the host-attached plugin identity, replacements remain possible
+  at capacity, and rejected admissions cannot mutate state. The registry mutex
+  is released before targeted delivery awaits queue admission. The adapter
+  validates colony ownership and the current single-world dimension, generates
+  opaque random binding tokens, and retains a bounded token-to-plugin/colony/
+  expiry map. A foreign plugin cannot consume or invalidate an owner's token.
+  The separate `play::session::script_colony_endpoint` moves synchronous owner
+  requests off the async router worker and calls only bounded regional claim and
+  goal commands; it never scans session snapshots. Entity selection, duplicate
+  exclusion, exact simulation-tick expiry, villager liveness/type validation,
+  and journaled goal mutation remain owned by `mc-entity`. The public order
+  surface maps only `home` to a server-owned follow-position goal at speed `0.3`
+  and `hold` to idle. Deterministic request rejection, owner busy state, claim
+  capacity exhaustion, and stale bindings publish an unsuccessful targeted
+  result and keep the router alive; busy state retains the unexpired token for a
+  retry. A changed non-overworld colony record rejects before owner mutation.
+  Broken owner, lease, location, or journal authority still stops routing.
+  Forced cancellation can orphan an already committed claim or goal;
+  claims remain bounded by the same 600-tick expiry, and a committed goal is not
+  rolled back when result publication closes. Cooperative shutdown drains the
+  active route.
 - `play::containers::script_menu` owns the immutable plugin-menu layout,
   item resolution, fixed-slot click classification and plugin/menu/player
   identity fence. `play::session::script_menu_endpoint` consumes admitted Lua

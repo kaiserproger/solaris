@@ -6,7 +6,8 @@ use mc_script::{
 };
 
 use super::colony::{
-    ColonyAdapterError, ColonyLimits, PluginColonyAdapter, classify_binding_claim,
+    BindingGoalApplication, ColonyAdapterError, ColonyLimits, PluginColonyAdapter,
+    classify_binding_claim, classify_binding_goal_application,
 };
 use super::{ScriptRouter, ScriptRouterExit};
 use crate::server::ScriptEventSink;
@@ -359,6 +360,248 @@ async fn router_binds_nearest_villager_through_the_regional_owner() {
 }
 
 #[tokio::test]
+async fn owner_can_move_then_hold_bound_villager_but_foreign_plugin_cannot_use_token() {
+    let upsert = admitted_colony_command(
+        "owner",
+        r#"solaris.upsert_colony("register", "starter", "Starter", "minecraft:overworld", 8, 64, 2)"#,
+    )
+    .await;
+    let binding = admitted_colony_command(
+        "owner",
+        r#"solaris.bind_nearest_villager("bind", "starter", 0, 64, 0, 16)"#,
+    )
+    .await;
+    let foreign_upsert = admitted_colony_command(
+        "foreign",
+        r#"solaris.upsert_colony("register", "starter", "Foreign", "minecraft:overworld", -8, 64, -2)"#,
+    )
+    .await;
+    let (adapter, mut events) = adapter();
+    let sessions = crate::play::SessionRegistry::new();
+    let villager = sessions.spawn_script_villager_for_test(mc_entity::Vec3::new(3.0, 64.0, 0.0));
+
+    assert!(adapter.route_admitted(upsert).await.unwrap().accepted);
+    let _ = events.recv_event().await.expect("owner colony result");
+    assert!(
+        adapter
+            .route_binding_admitted(binding, &sessions)
+            .await
+            .unwrap()
+            .accepted
+    );
+    let token = match events.recv_event().await.expect("binding result").kind() {
+        ScriptEventKind::ColonyVillagerBindingResult {
+            binding: Some(binding),
+            ..
+        } => binding.token().to_owned(),
+        other => panic!("unexpected binding result: {other:?}"),
+    };
+
+    assert!(
+        adapter
+            .route_admitted(foreign_upsert)
+            .await
+            .unwrap()
+            .accepted
+    );
+    let _ = events.recv_event().await.expect("foreign colony result");
+    let foreign_home = admitted_colony_command(
+        "foreign",
+        &format!("solaris.set_villager_order('foreign-home', 'starter', '{token}', 'home')"),
+    )
+    .await;
+    assert!(
+        !adapter
+            .route_order_admitted(foreign_home, &sessions)
+            .await
+            .unwrap()
+            .accepted
+    );
+    assert!(matches!(
+        events.recv_event().await.expect("foreign order result").kind(),
+        ScriptEventKind::ColonyVillagerOrderResult {
+            request_id,
+            accepted: false,
+            ..
+        } if request_id == "foreign-home"
+    ));
+    assert_eq!(
+        sessions.script_entity_goal_for_test(villager),
+        Some(mc_entity::GoalState::Idle)
+    );
+
+    let home = admitted_colony_command(
+        "owner",
+        &format!("solaris.set_villager_order('home', 'starter', '{token}', 'home')"),
+    )
+    .await;
+    assert!(
+        adapter
+            .route_order_admitted(home, &sessions)
+            .await
+            .unwrap()
+            .accepted
+    );
+    assert!(matches!(
+        events.recv_event().await.expect("home order result").kind(),
+        ScriptEventKind::ColonyVillagerOrderResult {
+            request_id,
+            accepted: true,
+            ..
+        } if request_id == "home"
+    ));
+    assert_eq!(
+        sessions.script_entity_goal_for_test(villager),
+        Some(mc_entity::GoalState::FollowPosition {
+            target: mc_entity::Vec3::new(8.0, 64.0, 2.0),
+            speed: 0.3,
+        })
+    );
+
+    let hold = admitted_colony_command(
+        "owner",
+        &format!("solaris.set_villager_order('hold', 'starter', '{token}', 'hold')"),
+    )
+    .await;
+    assert!(
+        adapter
+            .route_order_admitted(hold, &sessions)
+            .await
+            .unwrap()
+            .accepted
+    );
+    assert!(matches!(
+        events.recv_event().await.expect("hold order result").kind(),
+        ScriptEventKind::ColonyVillagerOrderResult {
+            request_id,
+            accepted: true,
+            ..
+        } if request_id == "hold"
+    ));
+    assert_eq!(
+        sessions.script_entity_goal_for_test(villager),
+        Some(mc_entity::GoalState::Idle)
+    );
+}
+
+#[tokio::test]
+async fn replacing_bound_colony_dimension_rejects_order_without_moving_villager() {
+    let upsert = admitted_colony_command(
+        "owner",
+        r#"solaris.upsert_colony("register", "starter", "Starter", "minecraft:overworld", 8, 64, 2)"#,
+    )
+    .await;
+    let binding = admitted_colony_command(
+        "owner",
+        r#"solaris.bind_nearest_villager("bind", "starter", 0, 64, 0, 16)"#,
+    )
+    .await;
+    let replace = admitted_colony_command(
+        "owner",
+        r#"solaris.upsert_colony("replace", "starter", "Starter", "minecraft:the_nether", 8, 64, 2)"#,
+    )
+    .await;
+    let (adapter, mut events) = adapter();
+    let sessions = crate::play::SessionRegistry::new();
+    let villager = sessions.spawn_script_villager_for_test(mc_entity::Vec3::new(3.0, 64.0, 0.0));
+
+    assert!(adapter.route_admitted(upsert).await.unwrap().accepted);
+    let _ = events.recv_event().await.expect("colony result");
+    assert!(
+        adapter
+            .route_binding_admitted(binding, &sessions)
+            .await
+            .unwrap()
+            .accepted
+    );
+    let token = match events.recv_event().await.expect("binding result").kind() {
+        ScriptEventKind::ColonyVillagerBindingResult {
+            binding: Some(binding),
+            ..
+        } => binding.token().to_owned(),
+        other => panic!("unexpected binding result: {other:?}"),
+    };
+    assert!(adapter.route_admitted(replace).await.unwrap().accepted);
+    let _ = events.recv_event().await.expect("replacement result");
+
+    let home = admitted_colony_command(
+        "owner",
+        &format!("solaris.set_villager_order('home', 'starter', '{token}', 'home')"),
+    )
+    .await;
+    assert!(
+        !adapter
+            .route_order_admitted(home, &sessions)
+            .await
+            .unwrap()
+            .accepted
+    );
+    assert!(matches!(
+        events.recv_event().await.expect("order result").kind(),
+        ScriptEventKind::ColonyVillagerOrderResult {
+            accepted: false,
+            ..
+        }
+    ));
+    assert_eq!(
+        sessions.script_entity_goal_for_test(villager),
+        Some(mc_entity::GoalState::Idle)
+    );
+}
+
+#[tokio::test]
+async fn committed_villager_order_survives_result_publication_failure() {
+    let upsert = admitted_colony_command(
+        "owner",
+        r#"solaris.upsert_colony("register", "starter", "Starter", "minecraft:overworld", 8, 64, 2)"#,
+    )
+    .await;
+    let binding = admitted_colony_command(
+        "owner",
+        r#"solaris.bind_nearest_villager("bind", "starter", 0, 64, 0, 16)"#,
+    )
+    .await;
+    let (adapter, mut events) = adapter();
+    let sessions = crate::play::SessionRegistry::new();
+    let villager = sessions.spawn_script_villager_for_test(mc_entity::Vec3::new(3.0, 64.0, 0.0));
+
+    assert!(adapter.route_admitted(upsert).await.unwrap().accepted);
+    let _ = events.recv_event().await.expect("colony result");
+    assert!(
+        adapter
+            .route_binding_admitted(binding, &sessions)
+            .await
+            .unwrap()
+            .accepted
+    );
+    let token = match events.recv_event().await.expect("binding result").kind() {
+        ScriptEventKind::ColonyVillagerBindingResult {
+            binding: Some(binding),
+            ..
+        } => binding.token().to_owned(),
+        other => panic!("unexpected binding result: {other:?}"),
+    };
+    let home = admitted_colony_command(
+        "owner",
+        &format!("solaris.set_villager_order('home', 'starter', '{token}', 'home')"),
+    )
+    .await;
+    drop(events);
+
+    assert_eq!(
+        adapter.route_order_admitted(home, &sessions).await,
+        Err(ColonyAdapterError::PublicationClosed)
+    );
+    assert_eq!(
+        sessions.script_entity_goal_for_test(villager),
+        Some(mc_entity::GoalState::FollowPosition {
+            target: mc_entity::Vec3::new(8.0, 64.0, 2.0),
+            speed: 0.3,
+        })
+    );
+}
+
+#[tokio::test]
 async fn router_rejects_binding_to_another_plugins_colony_without_owner_mutation() {
     let upsert = admitted_colony_command(
         "owner-a",
@@ -575,4 +818,40 @@ fn binding_claim_classification_separates_rejection_from_owner_failure() {
             mc_entity::RegionOwnerLaneError::Closed
         ))
     );
+}
+
+#[test]
+fn binding_goal_classification_separates_rejection_from_owner_failure() {
+    assert_eq!(
+        classify_binding_goal_application(Ok(true)),
+        Ok(BindingGoalApplication::Applied)
+    );
+    assert_eq!(
+        classify_binding_goal_application(Ok(false)),
+        Ok(BindingGoalApplication::Rejected)
+    );
+    assert_eq!(
+        classify_binding_goal_application(Err(mc_entity::RegionOwnerLaneError::Busy)),
+        Ok(BindingGoalApplication::Retryable)
+    );
+    for rejection in [
+        mc_entity::RegionOwnerLaneError::InvalidQuery,
+        mc_entity::RegionOwnerLaneError::InvalidMutation,
+    ] {
+        assert_eq!(
+            classify_binding_goal_application(Err(rejection)),
+            Ok(BindingGoalApplication::Rejected)
+        );
+    }
+    for owner_failure in [
+        mc_entity::RegionOwnerLaneError::UnknownEntity,
+        mc_entity::RegionOwnerLaneError::UnknownRegion,
+        mc_entity::RegionOwnerLaneError::StaleLease,
+        mc_entity::RegionOwnerLaneError::Journal,
+    ] {
+        assert_eq!(
+            classify_binding_goal_application(Err(owner_failure)),
+            Err(ColonyAdapterError::BindingOwner(owner_failure))
+        );
+    }
 }

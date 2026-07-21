@@ -5,7 +5,8 @@ other version is rejected. There is no legacy manifest or Lua API compatibility
 path.
 
 `mc-net` provides the `0.6.0` plugin-storage, zone, inventory-menu,
-inventory/storage transaction, colony-record, and villager-binding adapters.
+inventory/storage transaction, colony-record, villager-binding, and bounded
+villager-order adapters.
 
 ## Package And Manifest
 
@@ -56,7 +57,7 @@ capabilities, 64 permissions, and 128 player or operator command roots.
 | `inventory_menus` | `open_inventory_menu`, `close_inventory_menu` |
 | `inventory_storage_transactions` | `inventory_storage_transaction` |
 | `zones` | `upsert_zone`, `remove_zone`, owned zone-entry events |
-| `colonies` | `upsert_colony`, `bind_nearest_villager` |
+| `colonies` | `upsert_colony`, `bind_nearest_villager`, `set_villager_order` |
 
 An undeclared privileged call fails synchronously in Lua before it enters the
 bounded command batch. Unknown capabilities reject the plugin during discovery.
@@ -85,6 +86,7 @@ targeted event does not need a broad subscription to reach its owner.
 | `player.zone_entered` | `on_player_zone_entered` | player snapshot, `zone_id` |
 | `colony.record_result` | `on_colony_record_result` | `request_id`, `colony_id`, `accepted` |
 | `colony.villager_binding_result` | `on_colony_villager_binding_result` | `request_id`, `colony_id`, `binding_token`, `binding_expires_at_tick` |
+| `colony.villager_order_result` | `on_colony_villager_order_result` | `request_id`, `colony_id`, `order`, `accepted` |
 
 A player snapshot contains only `player_id`, `uuid`, `username`, `operator`,
 `x`, `y`, and `z`, captured by the server at publication. It contains no
@@ -242,13 +244,17 @@ Colonies are bounded records, not world/entity access:
 solaris.upsert_colony("register-colony", "starter-colony", "Starter Colony",
     "minecraft:overworld", 0, 64, 0)
 solaris.bind_nearest_villager("bind-player-7", "starter-colony", 0, 64, 0, 16)
+solaris.set_villager_order("send-home", "starter-colony", binding_token, "home")
 ```
 
 Colony ids follow the 64-byte id rule and names are at most 128 bytes. A binding
 search radius must be finite, positive, and no greater than 64. The result token
 is ephemeral; it is not an entity id, pointer, or durable villager capability.
-There is deliberately no Lua API for villager goals, pathing, memory, inventory,
-or direct entity mutation.
+`set_villager_order` accepts only `home` and `hold`. `home` uses the current
+owned colony home and `hold` stops horizontal goal movement. Plugins cannot
+choose arbitrary coordinates or speeds. There is deliberately no Lua API for
+roles, general goals, pathing internals, memory, inventory, or direct entity
+mutation.
 
 Colony records are scoped by the host-attached plugin id and kept in a bounded
 in-memory registry. The process admits at most 4,096 records and 256 records per
@@ -274,6 +280,21 @@ failed owner, token generation failure, or result-queue closure stops the router
 instead of fabricating delivery. A claim committed before publication failure
 or forced task cancellation remains reserved until its normal simulation-tick
 expiry; normal cooperative shutdown drains the active route.
+
+The colony adapter retains a bounded mapping from each binding token to its
+owning plugin, colony, and exact simulation-tick expiry. Expired entries are
+purged from the current simulation tick; no wall-clock timer or polling loop is
+involved. A foreign plugin receives `accepted = false` and cannot consume or
+invalidate the owner's token. An owned `home` order resolves the colony's
+current home and installs a server-owned follow-position goal at speed `0.3`;
+`hold` installs the idle goal. Both mutations run through the blocking endpoint
+and the journaled regional entity owner. Missing, expired, removed, non-villager,
+or otherwise stale bindings return `accepted = false`. A broken owner or journal
+stops routing. If result publication closes after the owner commits the goal,
+the committed goal remains in effect; the router stops instead of pretending the
+mutation was rejected. Temporary owner pressure also returns `accepted = false`,
+but retains the unexpired token so the plugin may retry. Changing the colony to
+another dimension rejects the order before owner mutation.
 
 ## Isolation And Limits
 

@@ -997,6 +997,64 @@ impl ScriptVillagerBinding {
     }
 }
 
+/// Closed set of server-owned orders a plugin may issue to a bound villager.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum ScriptVillagerOrder {
+    Home,
+    Hold,
+}
+
+impl ScriptVillagerOrder {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Home => "home",
+            Self::Hold => "hold",
+        }
+    }
+}
+
+/// Bounded request to apply one order through a server-issued villager binding.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ScriptVillagerOrderRequest {
+    request_id: String,
+    colony_id: String,
+    binding_token: String,
+    order: ScriptVillagerOrder,
+}
+
+impl ScriptVillagerOrderRequest {
+    pub fn try_new(
+        request_id: impl AsRef<str>,
+        colony_id: impl AsRef<str>,
+        binding_token: impl AsRef<str>,
+        order: ScriptVillagerOrder,
+    ) -> Result<Self, ScriptDtoError> {
+        Ok(Self {
+            request_id: validate_script_id(request_id.as_ref())?,
+            colony_id: validate_script_id(colony_id.as_ref())?,
+            binding_token: validate_script_id(binding_token.as_ref())?,
+            order,
+        })
+    }
+
+    pub fn request_id(&self) -> &str {
+        &self.request_id
+    }
+
+    pub fn colony_id(&self) -> &str {
+        &self.colony_id
+    }
+
+    pub fn binding_token(&self) -> &str {
+        &self.binding_token
+    }
+
+    pub const fn order(&self) -> ScriptVillagerOrder {
+        self.order
+    }
+}
+
 /// Server-normalized inventory click kind. Plugins never receive slot stacks or packet state.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[non_exhaustive]
@@ -1303,6 +1361,23 @@ impl ScriptEvent {
         })
     }
 
+    /// Build a targeted result for one admitted villager order.
+    pub(crate) fn colony_villager_order_result(
+        target_plugin_id: impl AsRef<str>,
+        request: &ScriptVillagerOrderRequest,
+        accepted: bool,
+    ) -> Result<Self, ScriptDtoError> {
+        Ok(Self {
+            target_plugin_id: Some(validate_target_plugin_id(target_plugin_id.as_ref())?),
+            kind: ScriptEventKind::ColonyVillagerOrderResult {
+                request_id: request.request_id().to_owned(),
+                colony_id: request.colony_id().to_owned(),
+                order: request.order(),
+                accepted,
+            },
+        })
+    }
+
     /// Return the plugin id for an event that must not be broadcast to other runtimes.
     pub fn target_plugin_id(&self) -> Option<&str> {
         self.target_plugin_id.as_deref()
@@ -1333,6 +1408,7 @@ impl ScriptEvent {
             ScriptEventKind::PlayerZoneEntered { .. } => "player.zone_entered",
             ScriptEventKind::ColonyRecordResult { .. } => "colony.record_result",
             ScriptEventKind::ColonyVillagerBindingResult { .. } => "colony.villager_binding_result",
+            ScriptEventKind::ColonyVillagerOrderResult { .. } => "colony.villager_order_result",
         }
     }
 
@@ -1475,6 +1551,11 @@ impl ScriptEvent {
                 request_id,
                 colony_id,
                 ..
+            }
+            | ScriptEventKind::ColonyVillagerOrderResult {
+                request_id,
+                colony_id,
+                ..
             } => {
                 validate_script_id(request_id)?;
                 validate_script_id(colony_id).map(drop)
@@ -1562,6 +1643,12 @@ pub enum ScriptEventKind {
         colony_id: String,
         binding: Option<ScriptVillagerBinding>,
     },
+    ColonyVillagerOrderResult {
+        request_id: String,
+        colony_id: String,
+        order: ScriptVillagerOrder,
+        accepted: bool,
+    },
 }
 
 /// Outbound command requests emitted by script code.
@@ -1624,6 +1711,9 @@ pub enum ScriptCommand {
     },
     RequestVillagerBinding {
         request: ScriptVillagerBindingRequest,
+    },
+    SetVillagerOrder {
+        request: ScriptVillagerOrderRequest,
     },
 }
 
@@ -1919,6 +2009,18 @@ impl AdmittedScriptCommand {
         };
         ScriptEvent::colony_villager_binding_result(&self.plugin_id, request, binding)
     }
+
+    pub fn colony_villager_order_result(
+        self,
+        accepted: bool,
+    ) -> Result<ScriptEvent, ScriptDtoError> {
+        let ScriptCommand::SetVillagerOrder { request } = self.request.as_ref() else {
+            return Err(ScriptDtoError::InconsistentResult {
+                field: "villager order admission",
+            });
+        };
+        ScriptEvent::colony_villager_order_result(&self.plugin_id, request, accepted)
+    }
 }
 
 /// Opaque plugin target retained by a production adapter after accepting an
@@ -1996,9 +2098,9 @@ impl ScriptCommand {
             Self::UpsertZone { .. } | Self::RemoveZone { .. } => {
                 Some(RequiredCommandCapability::Zones)
             }
-            Self::UpsertColony { .. } | Self::RequestVillagerBinding { .. } => {
-                Some(RequiredCommandCapability::Colonies)
-            }
+            Self::UpsertColony { .. }
+            | Self::RequestVillagerBinding { .. }
+            | Self::SetVillagerOrder { .. } => Some(RequiredCommandCapability::Colonies),
         }
     }
 
@@ -2090,6 +2192,13 @@ impl ScriptCommand {
                 validate_script_id(request.colony_id())?;
                 Ok(())
             }
+            Self::SetVillagerOrder { request } => ScriptVillagerOrderRequest::try_new(
+                request.request_id(),
+                request.colony_id(),
+                request.binding_token(),
+                request.order(),
+            )
+            .map(drop),
         }
     }
 }
@@ -3740,6 +3849,7 @@ fn is_supported_event_name(event_name: &str) -> bool {
             | "player.zone_entered"
             | "colony.record_result"
             | "colony.villager_binding_result"
+            | "colony.villager_order_result"
     )
 }
 
@@ -5254,6 +5364,67 @@ mod tests {
     }
 
     #[test]
+    fn villager_order_requests_are_bounded_and_preserve_the_closed_order_set() {
+        let home = ScriptVillagerOrderRequest::try_new(
+            "order-home",
+            "starter",
+            "binding-1",
+            ScriptVillagerOrder::Home,
+        )
+        .unwrap();
+        assert_eq!(home.request_id(), "order-home");
+        assert_eq!(home.colony_id(), "starter");
+        assert_eq!(home.binding_token(), "binding-1");
+        assert_eq!(home.order(), ScriptVillagerOrder::Home);
+        assert_eq!(home.order().as_str(), "home");
+        assert_eq!(ScriptVillagerOrder::Hold.as_str(), "hold");
+
+        for rejected in [
+            ScriptVillagerOrderRequest::try_new(
+                "Order",
+                "starter",
+                "binding-1",
+                ScriptVillagerOrder::Hold,
+            ),
+            ScriptVillagerOrderRequest::try_new(
+                "order",
+                "Starter",
+                "binding-1",
+                ScriptVillagerOrder::Hold,
+            ),
+            ScriptVillagerOrderRequest::try_new(
+                "order",
+                "starter",
+                "Binding-1",
+                ScriptVillagerOrder::Hold,
+            ),
+            ScriptVillagerOrderRequest::try_new(
+                "x".repeat(MAX_SCRIPT_ID_BYTES + 1),
+                "starter",
+                "binding-1",
+                ScriptVillagerOrder::Hold,
+            ),
+            ScriptVillagerOrderRequest::try_new(
+                "order",
+                "x".repeat(MAX_SCRIPT_ID_BYTES + 1),
+                "binding-1",
+                ScriptVillagerOrder::Hold,
+            ),
+            ScriptVillagerOrderRequest::try_new(
+                "order",
+                "starter",
+                "x".repeat(MAX_SCRIPT_ID_BYTES + 1),
+                ScriptVillagerOrder::Hold,
+            ),
+        ] {
+            assert!(matches!(
+                rejected,
+                Err(ScriptDtoError::InvalidId { .. } | ScriptDtoError::ValueTooLong { .. })
+            ));
+        }
+    }
+
+    #[test]
     fn inventory_menu_and_transaction_reject_duplicate_ids_and_saturation() {
         let item = ScriptInventoryMenuItem::try_new("minecraft:apple", 1, None).unwrap();
         assert!(matches!(
@@ -5477,6 +5648,70 @@ mod tests {
             boundary.accept_host_command(replay),
             Err(ScriptCommandAcceptanceError::UnknownOrConsumed)
         ));
+    }
+
+    #[tokio::test]
+    async fn admitted_villager_order_builds_one_targeted_result() {
+        let (boundary, endpoint) = script_boundary_pair(nonzero(1), nonzero(1));
+        let manifest = ScriptPluginManifest::new("colony", "Colony", "0.1.0", SCRIPT_API_VERSION)
+            .declare_colonies()
+            .validate()
+            .unwrap();
+        let admission = HostCommandAdmission::from_manifest(&manifest);
+        let request = ScriptVillagerOrderRequest::try_new(
+            "order-1",
+            "starter",
+            "binding-1",
+            ScriptVillagerOrder::Hold,
+        )
+        .unwrap();
+        let command = ScriptCommand::SetVillagerOrder { request };
+        assert_eq!(
+            command.required_capability_kind(),
+            Some(ScriptCommandCapabilityKind::Colonies)
+        );
+        let mut batch = CommandBatch::new(nonzero(1));
+        batch
+            .try_push_authorized(command, &manifest.to_command_capabilities())
+            .unwrap();
+        endpoint.try_submit_plugin_batch(&admission, batch).unwrap();
+
+        let raw = boundary.recv_command().await.unwrap();
+        assert!(matches!(raw, ScriptCommand::HostAttached { .. }));
+        let admitted = boundary.accept_host_command(raw).unwrap();
+        let result = admitted.colony_villager_order_result(true).unwrap();
+        assert_eq!(result.target_plugin_id(), Some("colony"));
+        assert_eq!(result.event_name(), "colony.villager_order_result");
+        assert!(matches!(
+            result.kind(),
+            ScriptEventKind::ColonyVillagerOrderResult {
+                request_id,
+                colony_id,
+                order: ScriptVillagerOrder::Hold,
+                accepted: true,
+            } if request_id == "order-1" && colony_id == "starter"
+        ));
+    }
+
+    #[test]
+    fn villager_order_requires_declared_colonies_capability() {
+        let command = ScriptCommand::SetVillagerOrder {
+            request: ScriptVillagerOrderRequest::try_new(
+                "order-1",
+                "starter",
+                "binding-1",
+                ScriptVillagerOrder::Home,
+            )
+            .unwrap(),
+        };
+        let mut batch = CommandBatch::new(nonzero(1));
+        assert_eq!(
+            batch.try_push_authorized(command, &CommandCapabilities::default()),
+            Err(CommandBatchError::PermissionDenied {
+                capability: ScriptCommandCapabilityKind::Colonies,
+            })
+        );
+        assert!(batch.commands().is_empty());
     }
 
     #[tokio::test]

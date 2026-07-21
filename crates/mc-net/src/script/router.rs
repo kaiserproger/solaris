@@ -122,7 +122,8 @@ impl ScriptRouter {
             | ScriptCommand::UpsertZone { .. }
             | ScriptCommand::RemoveZone { .. }
             | ScriptCommand::UpsertColony { .. }
-            | ScriptCommand::RequestVillagerBinding { .. } => {
+            | ScriptCommand::RequestVillagerBinding { .. }
+            | ScriptCommand::SetVillagerOrder { .. } => {
                 debug!("unattested privileged script command rejected");
                 ScriptRouterExit::Continue
             }
@@ -219,7 +220,9 @@ impl ScriptRouter {
                 }
                 ScriptRouterExit::Continue
             }
-            ScriptCommand::UpsertColony { .. } | ScriptCommand::RequestVillagerBinding { .. } => {
+            ScriptCommand::UpsertColony { .. }
+            | ScriptCommand::RequestVillagerBinding { .. }
+            | ScriptCommand::SetVillagerOrder { .. } => {
                 self.route_colony_admitted(admitted, context.sessions).await
             }
             ScriptCommand::HostAttached { .. }
@@ -248,6 +251,9 @@ impl ScriptRouter {
                 self.colonies
                     .route_binding_admitted(admitted, sessions)
                     .await
+            }
+            ScriptCommand::SetVillagerOrder { .. } => {
+                self.colonies.route_order_admitted(admitted, sessions).await
             }
             _ => Err(ColonyAdapterError::WrongCommand),
         };

@@ -1,11 +1,9 @@
 -- Script API 0.6 acceptance fixture.
 --
--- Production supports UpsertZone/player.zone_entered and
--- UpsertColony/colony.record_result. RequestVillagerBinding and
--- colony.villager_binding_result remain fail-closed. API 0.6 also has no
--- villager task, role, order, pathfinding, memory, inventory, or durable entity
--- handle command. This fixture persists bounded colony intent, but never claims
--- that a stored role/order was applied to a villager.
+-- Production supports colony registration, ephemeral villager binding, and
+-- home/hold orders through the regional entity owner. Roles remain plugin
+-- metadata; API 0.6 exposes no durable entity handle, inventory, or arbitrary
+-- villager memory access.
 
 local config = {
     colony = {
@@ -23,7 +21,7 @@ local config = {
     default_role = "worker",
     default_order = "home",
     roles = { "worker", "builder", "farmer", "guard" },
-    orders = { "home", "work", "hold" },
+    orders = { "home", "hold" },
     max_active_players = 64,
     max_generation = 999999,
 }
@@ -43,6 +41,7 @@ local pending_gets = {}
 local pending_get_by_player = {}
 local pending_cas = {}
 local pending_bindings = {}
+local pending_orders = {}
 local records = {}
 local zone_seen = {}
 local deferred_notices = {}
@@ -188,6 +187,18 @@ local function queue_binding(player_id, uuid, key, version, record, x, y, z)
     )
 end
 
+local function queue_order(pending, binding_token)
+    local request_id = action_request_id("order", pending.player_id, pending.version)
+    pending_orders[request_id] = pending
+    last_batch = { kind = "order", request_id = request_id, player_id = pending.player_id }
+    solaris.set_villager_order(
+        request_id,
+        config.colony.id,
+        binding_token,
+        pending.record.order
+    )
+end
+
 local function split_arguments(arguments)
     local values = {}
     for value in string.gmatch(arguments, "%S+") do
@@ -218,9 +229,8 @@ local function status_message(record)
     if record.status == "rejected" then
         return "Recruitment rejected or unavailable; API 0.6 does not distinguish the cause."
     end
-    return "Recruited villager intent: role=" .. record.role
-        .. ", order=" .. record.order
-        .. ". API 0.6 cannot apply roles or orders."
+    return "Recruited villager: role metadata=" .. record.role
+        .. ", last accepted order=" .. record.order .. "."
 end
 
 local function handle_player_state(pending, value, version)
@@ -312,7 +322,7 @@ local function handle_player_state(pending, value, version)
         next_record.role = pending.argument
     elseif pending.action == "order" then
         if not order_allowed[pending.argument] then
-            send_message(player_id, "Order rejected: expected home, work, or hold.")
+            send_message(player_id, "Order rejected: expected home or hold.")
             return
         end
         next_record.order = pending.argument
@@ -345,6 +355,11 @@ local function clear_player(player_id)
     for request_id, pending in pairs(pending_bindings) do
         if pending.player_id == player_id then
             pending_bindings[request_id] = nil
+        end
+    end
+    for request_id, pending in pairs(pending_orders) do
+        if pending.player_id == player_id then
+            pending_orders[request_id] = nil
         end
     end
     records[player_id] = nil
@@ -421,6 +436,12 @@ function on_player_command(event)
         end
     end
     for _, pending in pairs(pending_bindings) do
+        if pending.player_id == event.player_id then
+            send_message(event.player_id, "Colony request rejected: another request is pending.")
+            return
+        end
+    end
+    for _, pending in pairs(pending_orders) do
         if pending.player_id == event.player_id then
             send_message(event.player_id, "Colony request rejected: another request is pending.")
             return
@@ -570,10 +591,7 @@ function on_plugin_storage_cas_result(event)
             pending.after.z
         )
     elseif pending.after.kind == "updated" then
-        send_message(
-            pending.player_id,
-            "Stored " .. pending.after.field .. " intent. API 0.6 cannot apply it to villager AI."
-        )
+        send_message(pending.player_id, "Stored " .. pending.after.field .. " intent.")
     elseif pending.after.kind == "binding_complete" then
         send_message(pending.player_id, "Villager recruitment recorded durably.")
     elseif pending.after.kind == "binding_rejected" then
@@ -600,13 +618,13 @@ function on_colony_villager_binding_result(event)
         return
     end
 
-    local next_record = copy_record(pending.record)
-    next_record.generation = next_record.generation + 1
-    if next_record.generation > config.max_generation then
-        send_message(pending.player_id, "Binding result rejected: generation limit reached.")
-        return
-    end
     if event.binding_token == nil then
+        local next_record = copy_record(pending.record)
+        next_record.generation = next_record.generation + 1
+        if next_record.generation > config.max_generation then
+            send_message(pending.player_id, "Binding result rejected: generation limit reached.")
+            return
+        end
         next_record.status = "rejected"
         queue_cas(
             pending.player_id,
@@ -618,6 +636,29 @@ function on_colony_villager_binding_result(event)
             "reject"
         )
     else
+        queue_order(pending, event.binding_token)
+    end
+end
+
+function on_colony_villager_order_result(event)
+    last_batch = nil
+    local pending = pending_orders[event.request_id]
+    if pending == nil then
+        return
+    end
+    pending_orders[event.request_id] = nil
+    if event.colony_id ~= config.colony.id or event.order ~= pending.record.order then
+        send_message(pending.player_id, "Villager order result rejected: correlation mismatch.")
+        return
+    end
+
+    local next_record = copy_record(pending.record)
+    next_record.generation = next_record.generation + 1
+    if next_record.generation > config.max_generation then
+        send_message(pending.player_id, "Villager order result rejected: generation limit reached.")
+        return
+    end
+    if event.accepted then
         next_record.status = "active"
         queue_cas(
             pending.player_id,
@@ -627,6 +668,17 @@ function on_colony_villager_binding_result(event)
             next_record,
             { kind = "binding_complete" },
             "activate"
+        )
+    else
+        next_record.status = "rejected"
+        queue_cas(
+            pending.player_id,
+            pending.uuid,
+            pending.key,
+            pending.version,
+            next_record,
+            { kind = "binding_rejected" },
+            "reject"
         )
     end
 end
@@ -660,6 +712,9 @@ function on_command_batch_rejected(result)
     elseif batch.kind == "binding" then
         pending_bindings[batch.request_id] = nil
         remember_notice(batch.player_id, "Villager binding request rejected: " .. result.reason .. ".")
+    elseif batch.kind == "order" then
+        pending_orders[batch.request_id] = nil
+        remember_notice(batch.player_id, "Villager order rejected: " .. result.reason .. ".")
     elseif batch.kind == "message" then
         remember_notice(batch.player_id, "Colony response rejected: " .. result.reason .. ".")
     end

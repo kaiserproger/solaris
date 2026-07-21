@@ -47,6 +47,12 @@ hardening. An already-open lower-priority diff does not override this order.
   simulation owner. Full workspace tests, strict workspace Clippy, fmt,
   code-health `0 fail / KEEP`, and diff-check pass. The broad `block_edit` gate
   passes `94/94`.
+- Real-client artifact
+  `.analysis/real-client-runs/20260720T234001Z-real-client-playable-loop-QHfB9Z`
+  passed natural log breaking with visible progress, drop pickup, and log-to-
+  planks crafting through the real Gradle client. With no new common blocker in
+  that focused loop, work moved to the production plugin API as required by the
+  queue above.
 - Checkpoint `feba79a` passes full workspace tests, workspace all-target strict
   Clippy, fmt, code-health `0 fail / KEEP`, and diff-check. The `block_edit`
   target also passes both parallel and sequential runs with 94/94 tests.
@@ -186,6 +192,15 @@ hardening. An already-open lower-priority diff does not override this order.
   coverage includes the real Lua admission path, and a TCP client wire gate
   observes colony upsert. Records remain in-memory and plugin storage is the
   durable intent source.
+- The first production villager-order slice accepts only `home` and `hold` for
+  an owner-scoped, unexpired binding token. It routes the mutation through the
+  regional entity owner, validates that the live entity is still a villager,
+  journals the goal, and publishes a correlated result only to the owning
+  plugin. Unit coverage includes stale, removed, foreign-owner, publication-
+  close, and owner-failure paths. A disk-backed Lua wire test proves bind ->
+  home order -> targeted result through an ordinary joined client. General
+  roles, work orders, and direct path or memory control remain deliberately
+  absent.
 - Restart evidence now requires the stopped server process to exit with status
   0. A recorded interrupt without a clean exit can no longer pass validation.
 - Multi-entity physics dispatch no longer sends one cached owner mutation per

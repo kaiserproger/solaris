@@ -2,7 +2,7 @@ use super::{
     MAX_ACTIVE_VILLAGER_BINDINGS, RegionOwnerLaneError, RegionalEntityStore,
     RegionalOwnerCoordinator, RegionalOwnerRuntime, VillagerBindingAuthority,
 };
-use crate::{EntityId, SpawnEntity, Vec3};
+use crate::{EntityId, GoalState, SpawnEntity, Vec3};
 use std::sync::{Arc, Barrier};
 
 fn entity(kind: &str, position: Vec3) -> SpawnEntity {
@@ -115,6 +115,119 @@ fn claim_nearest_villager_reports_closed_owner() {
         handle.claim_nearest_villager(Vec3::new(0.0, 64.0, 0.0), 16.0, "closed"),
         Err(RegionOwnerLaneError::Closed)
     );
+}
+
+#[test]
+fn binding_goal_applies_follow_position_and_idle_without_consuming_token() {
+    let runtime = RegionalOwnerRuntime::from_store(RegionalEntityStore::new(), 1)
+        .expect("regional owner runtime");
+    let handle = runtime.handle();
+    let villager = handle
+        .spawn(entity("minecraft:villager", Vec3::new(0.0, 64.0, 0.0)))
+        .expect("spawn villager");
+    handle
+        .claim_nearest_villager(Vec3::new(0.0, 64.0, 0.0), 16.0, "goal-token")
+        .expect("binding query")
+        .expect("binding claim");
+
+    let follow = GoalState::FollowPosition {
+        target: Vec3::new(8.0, 64.0, -4.0),
+        speed: 0.35,
+    };
+    assert_eq!(
+        handle.apply_villager_binding_goal("goal-token".to_owned(), follow.clone()),
+        Ok(true)
+    );
+    assert_eq!(handle.snapshot(villager).unwrap().unwrap().goal, follow);
+
+    assert_eq!(
+        handle.apply_villager_binding_goal("goal-token".to_owned(), GoalState::Idle),
+        Ok(true)
+    );
+    assert_eq!(
+        handle.snapshot(villager).unwrap().unwrap().goal,
+        GoalState::Idle
+    );
+
+    runtime.shutdown().expect("regional owner shutdown");
+}
+
+#[test]
+fn binding_goal_returns_false_for_missing_token() {
+    let runtime = RegionalOwnerRuntime::from_store(RegionalEntityStore::new(), 1)
+        .expect("regional owner runtime");
+    let handle = runtime.handle();
+
+    assert_eq!(
+        handle.apply_villager_binding_goal("missing".to_owned(), GoalState::Idle),
+        Ok(false)
+    );
+
+    runtime.shutdown().expect("regional owner shutdown");
+}
+
+#[test]
+fn binding_goal_expires_on_the_exact_lifecycle_tick() {
+    let runtime = RegionalOwnerRuntime::from_store(RegionalEntityStore::new(), 1)
+        .expect("regional owner runtime");
+    let handle = runtime.handle();
+    handle
+        .spawn(entity("minecraft:villager", Vec3::new(0.0, 64.0, 0.0)))
+        .expect("spawn villager");
+    handle
+        .claim_nearest_villager(Vec3::new(0.0, 64.0, 0.0), 16.0, "expiring")
+        .expect("binding query")
+        .expect("binding claim");
+
+    handle
+        .advance_lifecycle_epoch(599)
+        .expect("advance before expiry");
+    assert_eq!(
+        handle.apply_villager_binding_goal("expiring".to_owned(), GoalState::Idle),
+        Ok(true)
+    );
+
+    handle
+        .advance_lifecycle_epoch(600)
+        .expect("advance to exact expiry");
+    assert_eq!(
+        handle.apply_villager_binding_goal("expiring".to_owned(), GoalState::Idle),
+        Ok(false)
+    );
+
+    runtime.shutdown().expect("regional owner shutdown");
+}
+
+#[test]
+fn binding_goal_releases_claim_when_bound_entity_was_removed() {
+    let runtime = RegionalOwnerRuntime::from_store(RegionalEntityStore::new(), 1)
+        .expect("regional owner runtime");
+    let handle = runtime.handle();
+    let removed = handle
+        .spawn(entity("minecraft:villager", Vec3::new(0.0, 64.0, 0.0)))
+        .expect("spawn villager");
+    handle
+        .claim_nearest_villager(Vec3::new(0.0, 64.0, 0.0), 16.0, "reusable")
+        .expect("binding query")
+        .expect("binding claim");
+    handle.remove(removed).expect("remove bound villager");
+
+    assert_eq!(
+        handle.apply_villager_binding_goal("reusable".to_owned(), GoalState::Idle),
+        Ok(false)
+    );
+
+    handle
+        .spawn(entity("minecraft:villager", Vec3::new(1.0, 64.0, 0.0)))
+        .expect("spawn replacement villager");
+    assert!(
+        handle
+            .claim_nearest_villager(Vec3::new(0.0, 64.0, 0.0), 16.0, "reusable")
+            .expect("reused binding query")
+            .is_some()
+    );
+
+    runtime.shutdown().expect("regional owner shutdown");
 }
 
 #[test]

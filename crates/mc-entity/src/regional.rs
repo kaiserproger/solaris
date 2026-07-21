@@ -9,9 +9,10 @@ use uuid::Uuid;
 
 use crate::{
     AnimalBreedingState, EntityDamage, EntityDamageRequest, EntityEffectRequest,
-    EntityEffectResult, EntityId, EntityItemStack, EntityKinematics, EntityMotionState,
-    EntitySnapshot, EntityStore, EntityView, GoalState, GoalTickStats, PathingBudget, PathingProbe,
-    PreparedGoalTick, ResolvedGoalTick, SpawnEntity, Vec3, deterministic_uuid, snapshot_from_spawn,
+    EntityEffectResult, EntityId, EntityItemStack, EntityKinematics, EntityLifecycle,
+    EntityMotionState, EntitySnapshot, EntityStore, EntityView, GoalState, GoalTickStats,
+    PathingBudget, PathingProbe, PreparedGoalTick, ResolvedGoalTick, SpawnEntity, Vec3,
+    deterministic_uuid, snapshot_from_spawn,
 };
 
 mod owner_lane;
@@ -1203,6 +1204,11 @@ enum RegionalOwnerCommand {
         token: String,
         reply: std::sync::mpsc::Sender<Result<Option<VillagerBindingClaim>, RegionOwnerLaneError>>,
     },
+    ApplyVillagerBindingGoal {
+        token: String,
+        goal: GoalState,
+        reply: std::sync::mpsc::Sender<Result<bool, RegionOwnerLaneError>>,
+    },
     Status {
         reply: std::sync::mpsc::Sender<Result<RegionalOwnerStatus, RegionOwnerLaneError>>,
     },
@@ -1350,6 +1356,7 @@ impl RegionalOwnerCommand {
                 | Self::ReplaceSnapshotIfCurrent { .. }
                 | Self::ReplaceSnapshotsIfCurrent { .. }
                 | Self::SetAnimalStatesIfCurrent { .. }
+                | Self::ApplyVillagerBindingGoal { .. }
                 | Self::SetGoal { .. }
                 | Self::SetGoals { .. }
                 | Self::SetItemStack { .. }
@@ -1423,6 +1430,18 @@ impl RegionalOwnerHandle {
                 token,
                 reply,
             })
+            .map_err(|_| RegionOwnerLaneError::Closed)?;
+        result.recv().map_err(|_| RegionOwnerLaneError::Closed)?
+    }
+
+    pub fn apply_villager_binding_goal(
+        &self,
+        token: String,
+        goal: GoalState,
+    ) -> Result<bool, RegionOwnerLaneError> {
+        let (reply, result) = channel();
+        self.sender
+            .send(RegionalOwnerCommand::ApplyVillagerBindingGoal { token, goal, reply })
             .map_err(|_| RegionOwnerLaneError::Closed)?;
         result.recv().map_err(|_| RegionOwnerLaneError::Closed)?
     }
@@ -2686,6 +2705,9 @@ fn run_regional_owner_runtime(
             } => {
                 let _ = reply.send(coordinator.claim_nearest_villager(center, radius, token));
             }
+            RegionalOwnerCommand::ApplyVillagerBindingGoal { token, goal, reply } => {
+                let _ = reply.send(coordinator.apply_villager_binding_goal(token, goal));
+            }
             RegionalOwnerCommand::Status { reply } => {
                 let _ = reply.send(
                     coordinator
@@ -3465,6 +3487,52 @@ impl RegionalOwnerCoordinator {
         }))
     }
 
+    pub fn apply_villager_binding_goal(
+        &mut self,
+        token: String,
+        goal: GoalState,
+    ) -> Result<bool, RegionOwnerLaneError> {
+        self.commit_state.ensure_committed_state()?;
+        let current_tick = self.commit_state.lifecycle_epoch();
+        let Some((entity, expires_at_tick)) = self
+            .villager_bindings
+            .get(&token)
+            .map(|binding| (binding.entity, binding.expires_at_tick))
+        else {
+            return Ok(false);
+        };
+        if current_tick >= expires_at_tick {
+            self.remove_villager_binding(&token);
+            return Ok(false);
+        }
+
+        let Some(snapshot) = self.snapshot(entity)? else {
+            self.remove_villager_binding(&token);
+            return Ok(false);
+        };
+        if snapshot.lifecycle != EntityLifecycle::Alive
+            || snapshot.type_name != "minecraft:villager"
+        {
+            self.remove_villager_binding(&token);
+            return Ok(false);
+        }
+
+        self.set_goal(entity, goal)
+    }
+
+    fn remove_villager_binding(&mut self, token: &str) {
+        let Some(binding) = self.villager_bindings.remove(token) else {
+            return;
+        };
+        if self
+            .villager_binding_by_entity
+            .get(&binding.entity)
+            .is_some_and(|current| current == token)
+        {
+            self.villager_binding_by_entity.remove(&binding.entity);
+        }
+    }
+
     fn purge_expired_villager_bindings(&mut self, current_tick: u64) {
         let expired = self
             .villager_bindings
@@ -3473,16 +3541,7 @@ impl RegionalOwnerCoordinator {
             .map(|(token, _)| token.clone())
             .collect::<Vec<_>>();
         for token in expired {
-            let Some(binding) = self.villager_bindings.remove(&token) else {
-                continue;
-            };
-            if self
-                .villager_binding_by_entity
-                .get(&binding.entity)
-                .is_some_and(|current| current == &token)
-            {
-                self.villager_binding_by_entity.remove(&binding.entity);
-            }
+            self.remove_villager_binding(&token);
         }
     }
 

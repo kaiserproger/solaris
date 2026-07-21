@@ -23,8 +23,8 @@ use crate::{
     ScriptInventoryResourceDelta, ScriptInventoryStorageTransaction, ScriptPlayerId,
     ScriptPluginManifest, ScriptPluginStorageCompareAndSwapRequest,
     ScriptPluginStorageDeleteRequest, ScriptPluginStorageGetRequest, ScriptPosition, ScriptRuntime,
-    ScriptStorageMutation, ScriptVillagerBindingRequest, ValidatedScriptPluginManifest,
-    script_boundary_pair,
+    ScriptStorageMutation, ScriptVillagerBindingRequest, ScriptVillagerOrder,
+    ScriptVillagerOrderRequest, ValidatedScriptPluginManifest, script_boundary_pair,
 };
 
 const EVENT_QUEUE_CAPACITY: usize = 1_024;
@@ -990,6 +990,39 @@ fn install_solaris_api(
             },
         )?,
     )?;
+    let set_villager_order_invocation = Arc::clone(&invocation);
+    api.set(
+        "set_villager_order",
+        lua.create_function(
+            move |_,
+                  (request_id, colony_id, binding_token, order): (
+                LuaString,
+                LuaString,
+                LuaString,
+                LuaString,
+            )| {
+                let request_id = bounded_script_id(request_id, "request_id")?;
+                let colony_id = bounded_script_id(colony_id, "colony_id")?;
+                let binding_token = bounded_script_id(binding_token, "binding_token")?;
+                let order = match order.as_bytes().as_ref() {
+                    b"home" => ScriptVillagerOrder::Home,
+                    b"hold" => ScriptVillagerOrder::Hold,
+                    _ => return Err(lua_input_error("order", "invalid")),
+                };
+                let request = ScriptVillagerOrderRequest::try_new(
+                    request_id,
+                    colony_id,
+                    binding_token,
+                    order,
+                )
+                .map_err(dto_error)?;
+                push_command(
+                    &set_villager_order_invocation,
+                    ScriptCommand::SetVillagerOrder { request },
+                )
+            },
+        )?,
+    )?;
     lua.globals().set("solaris", api)
 }
 
@@ -1471,6 +1504,17 @@ fn event_table(lua: &Lua, event: &ScriptEvent) -> mlua::Result<Table> {
                 }
             }
         }
+        ScriptEventKind::ColonyVillagerOrderResult {
+            request_id,
+            colony_id,
+            order,
+            accepted,
+        } => {
+            table.set("request_id", request_id.as_str())?;
+            table.set("colony_id", colony_id.as_str())?;
+            table.set("order", order.as_str())?;
+            table.set("accepted", *accepted)?;
+        }
     }
     Ok(table)
 }
@@ -1505,6 +1549,7 @@ fn handler_name(event: &ScriptEvent) -> &'static str {
         ScriptEventKind::PlayerZoneEntered { .. } => "on_player_zone_entered",
         ScriptEventKind::ColonyRecordResult { .. } => "on_colony_record_result",
         ScriptEventKind::ColonyVillagerBindingResult { .. } => "on_colony_villager_binding_result",
+        ScriptEventKind::ColonyVillagerOrderResult { .. } => "on_colony_villager_order_result",
     }
 }
 
@@ -2735,6 +2780,138 @@ mod tests {
             error,
             RuntimeError::Trap { message } if message.contains("command limit 1 exceeded")
         ));
+    }
+
+    #[test]
+    fn lua_villager_order_api_emits_only_valid_colony_commands() {
+        let manifest = ScriptPluginManifest::new("orders", "Orders", "0.1.0", SCRIPT_API_VERSION)
+            .subscribe_event("server.tick")
+            .declare_colonies()
+            .validate()
+            .unwrap();
+        let controls = RuntimeControls::unrestricted();
+        let mut runtime = LuaScriptRuntime::from_source(
+            manifest,
+            r#"
+                function on_server_tick(_event)
+                    solaris.set_villager_order("home-1", "starter", "binding-1", "home")
+                    solaris.set_villager_order("hold-1", "starter", "binding-2", "hold")
+                end
+            "#,
+            LuaRuntimeLimits::default(),
+        )
+        .unwrap();
+
+        let batch = runtime
+            .handle_event(
+                &ScriptEvent::server_tick(1),
+                RuntimeContext::new(&controls, NonZeroUsize::new(2).unwrap()),
+            )
+            .unwrap();
+        assert!(matches!(
+            batch.commands(),
+            [
+                ScriptCommand::SetVillagerOrder { request: home },
+                ScriptCommand::SetVillagerOrder { request: hold },
+            ] if home.order() == crate::ScriptVillagerOrder::Home
+                && hold.order() == crate::ScriptVillagerOrder::Hold
+                && home.binding_token() == "binding-1"
+                && hold.binding_token() == "binding-2"
+        ));
+    }
+
+    #[test]
+    fn lua_villager_order_rejections_are_synchronous_and_emit_no_command() {
+        let controls = RuntimeControls::unrestricted();
+        let cases = [
+            (
+                true,
+                "solaris.set_villager_order('order', 'starter', 'binding-1', 'wander')",
+            ),
+            (
+                true,
+                "solaris.set_villager_order(string.rep('x', 65), 'starter', 'binding-1', 'home')",
+            ),
+            (
+                true,
+                "solaris.set_villager_order('order', string.rep('x', 65), 'binding-1', 'home')",
+            ),
+            (
+                true,
+                "solaris.set_villager_order('order', 'starter', string.rep('x', 65), 'home')",
+            ),
+            (
+                false,
+                "solaris.set_villager_order('order', 'starter', 'binding-1', 'hold')",
+            ),
+        ];
+
+        for (declare_colonies, call) in cases {
+            let mut manifest =
+                ScriptPluginManifest::new("orders", "Orders", "0.1.0", SCRIPT_API_VERSION)
+                    .subscribe_event("server.tick");
+            if declare_colonies {
+                manifest = manifest.declare_colonies();
+            }
+            let source = format!(
+                "function on_server_tick(_event) local accepted = pcall(function() {call} end); assert(not accepted) end"
+            );
+            let mut runtime = LuaScriptRuntime::from_source(
+                manifest.validate().unwrap(),
+                &source,
+                LuaRuntimeLimits::default(),
+            )
+            .unwrap();
+            let batch = runtime
+                .handle_event(
+                    &ScriptEvent::server_tick(1),
+                    RuntimeContext::new(&controls, NonZeroUsize::new(1).unwrap()),
+                )
+                .unwrap();
+            assert!(
+                batch.commands().is_empty(),
+                "rejected call emitted {batch:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn lua_villager_order_result_uses_targeted_callback_and_exact_fields() {
+        let manifest = ScriptPluginManifest::new("orders", "Orders", "0.1.0", SCRIPT_API_VERSION)
+            .subscribe_event("colony.villager_order_result")
+            .validate()
+            .unwrap();
+        let mut runtime = LuaScriptRuntime::from_source(
+            manifest,
+            r#"
+                function on_colony_villager_order_result(event)
+                    solaris.broadcast(event.request_id .. ":" .. event.colony_id .. ":" .. event.order .. ":" .. tostring(event.accepted))
+                end
+            "#,
+            LuaRuntimeLimits::default(),
+        )
+        .unwrap();
+        let request = crate::ScriptVillagerOrderRequest::try_new(
+            "order-1",
+            "starter",
+            "binding-1",
+            crate::ScriptVillagerOrder::Home,
+        )
+        .unwrap();
+        let event = ScriptEvent::colony_villager_order_result("orders", &request, false).unwrap();
+        let controls = RuntimeControls::unrestricted();
+        let batch = runtime
+            .handle_event(
+                &event,
+                RuntimeContext::new(&controls, NonZeroUsize::new(1).unwrap()),
+            )
+            .unwrap();
+        assert_eq!(
+            batch.commands(),
+            &[ScriptCommand::BroadcastChatMessage {
+                message: "order-1:starter:home:false".to_owned(),
+            }]
+        );
     }
 
     #[tokio::test]
