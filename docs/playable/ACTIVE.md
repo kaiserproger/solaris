@@ -42,6 +42,20 @@ hardening. An already-open lower-priority diff does not override this order.
 
 ## Recent Evidence
 
+- Checkpoint `e09c6ec` replaces smoke-only confidence in the shipped Lua
+  examples with production wire evidence. The exact currency catalog files now
+  pass zone activation, rendered menu contents, an atomic three-emerald/two-
+  apple purchase, insufficient-funds rejection with unchanged ledger, and a
+  refund. The exact colony scaffold files now pass `/colony recruit worker`,
+  durable activation, initial `home`, a later owner-accepted `hold`, and status
+  reload. The gate then removes the bound villager, proves cached-token owner
+  rejection, one fresh binding attempt, and the explicit no-villager result.
+  Plugin-emitted readiness messages and exact combat-cooldown tick events are
+  push barriers; no elapsed-time success condition is used. Full workspace
+  tests, strict workspace Clippy, fmt, code-health `0 fail / KEEP`, diff-check,
+  focused plugin `2/2`, colony router `17/17`, and exact loader `1/1` pass. A
+  final `sol high` review found no blocker, high, or medium issue. This is
+  server/wire plugin evidence, not a manual-client or vanilla-oracle gate.
 - Checkpoint `9330336` adds required `player.died` events at the authoritative
   live-to-dead survival commit. Operator, fall, starvation, contact, hostile,
   PvP, and projectile paths converge there; nonlethal, shield-blocked, stale,

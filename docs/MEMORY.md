@@ -9,17 +9,18 @@ and is not startup context.
 
 - Date: 2026-07-21.
 - Branch: `dev/M100-client-agent`.
-- Latest checkpoint: `9330336` (`feat(plugins): publish committed player
-  deaths`). Delivery-order checkpoint `5e2908a` remains binding.
+- Latest checkpoint: `e09c6ec` (`feat(plugins): exercise shipped gameplay
+  examples`). Delivery-order checkpoint `5e2908a` remains binding.
 - The worktree may contain unrelated owner files and local artifacts. Inspect
   exact ownership before editing; never clean or stage them by accident.
 - Full workspace tests, workspace all-target strict Clippy, fmt, code-health
-  `0 fail / KEEP`, and diff-check passed immediately before `9330336`. The
-  command wire gate passed `14/14` after isolating its two clients from a real
-  pickup race through causally fenced movement. `mc-server --test play` passed
-  `16/16`. A final `sol high` review found no blocker, high, or medium issue.
-  No manual/client or vanilla-oracle gate was run for this plugin-only event
-  slice. Pre-existing entity-scale and local artifact changes were not staged.
+  `0 fail / KEEP`, and diff-check passed immediately before `e09c6ec`. The
+  shipped-plugin wire gate passed `2/2`, the colony router passed `17/17`, and
+  the exact example loader passed `1/1`. A final `sol high` review found no
+  blocker, high, or medium issue after its stale-token and readiness findings
+  were fixed. No manual/client or vanilla-oracle gate was run for this
+  plugin-only slice. Pre-existing entity-scale and local artifact changes were
+  not staged.
 - Ignored oracle/load/benchmark rows remain explicit. The P04 real-client soak
   ran; broad performance and dedicated concurrency gates did not.
 
@@ -93,7 +94,15 @@ two priorities unless it becomes a common-play blocker or corruption risk.
   above `u32`, invalid pickup identities/modes, transition-tick deduplication,
   and unpublished campfire outputs; the wire gate covers exact committed event
   fields and rejected retries. Block DTOs expose player pose separately from
-  integer block coordinates. General villager roles/work orders and durable
+  integer block coordinates. The exact shipped currency catalog now has a
+  production wire gate for zone activation, buy, insufficient-funds rejection,
+  unchanged ledger, and refund. The exact shipped colony scaffold has a
+  production wire gate for durable recruit, `home`, later accepted `hold`, and
+  removed-villager recovery. It retains the active binding token in Lua memory,
+  retries one rejected cached token through a fresh binding, and reports an
+  applied order only after the targeted owner result. Plugin readiness and the
+  combat-cooldown fixture are push-fenced by exact Lua messages and simulation
+  ticks; timeouts only fail. General villager roles/work orders and durable
   entity handles remain absent.
 - Production and test waits must remain event-driven. Timeouts only fail stuck
   work and never prove success.
