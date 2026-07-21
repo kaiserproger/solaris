@@ -9,15 +9,17 @@ and is not startup context.
 
 - Date: 2026-07-21.
 - Branch: `dev/M100-client-agent`.
-- Latest checkpoint: `5ea197b` (`fix(server): close playable save and pvp
-  races`).
+- Latest checkpoint: `35792ef` (`feat(plugins): order bound villagers through
+  regional owners`). Delivery-order checkpoint `5e2908a` remains binding.
 - The worktree may contain unrelated owner files and local artifacts. Inspect
   exact ownership before editing; never clean or stage them by accident.
 - Full workspace tests, workspace all-target strict Clippy, fmt, code-health
-  `0 fail / KEEP`, and diff-check passed immediately before `5ea197b`. The
-  worktree also contained pre-existing uncommitted entity-scale work, which was
-  not staged. The committed save/PvP files additionally pass focused dirty
-  flush, active-save, `mc-net`, and `block_edit 94/94` gates.
+  `0 fail / KEEP`, and diff-check passed immediately before `35792ef`. Focused
+  evidence includes `mc-entity` villager binding `10/10`, `mc-script` `79/79`,
+  `mc-net` colony `17/17`, full `mc-net` `1537 passed / 1 ignored`, and the
+  disk-backed command wire gate `13/13`. A `sol high` re-review found no
+  remaining blocker, high, or medium issue. Pre-existing entity-scale and local
+  artifact changes were not staged.
 - Ignored oracle/load/benchmark rows remain explicit. The P04 real-client soak
   ran; broad performance and dedicated concurrency gates did not.
 
@@ -67,8 +69,11 @@ two priorities unless it becomes a common-play blocker or corruption risk.
   fingerprint. The algorithm remains Solaris-owned rather than Mojang
   NoiseRouter parity.
 - Lua API 0.6 has bounded DTO/files/batches, one-shot host admission, an
-  attested `mc-net` router, and durable plugin storage. Menu, transaction,
-  zones, colonies, and villager adapters remain incomplete production work.
+  attested `mc-net` router, and durable plugin storage. Production adapters now
+  cover menus, inventory/storage transactions, zones, colony records, ephemeral
+  villager binding, and owner-scoped `home`/`hold` orders through journaled
+  regional goals. General villager roles/work orders and durable entity handles
+  remain absent.
 - Production and test waits must remain event-driven. Timeouts only fail stuck
   work and never prove success.
 
