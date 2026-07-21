@@ -22,6 +22,8 @@ mod lua;
 
 #[cfg(test)]
 mod item_pickup_tests;
+#[cfg(test)]
+mod player_death_tests;
 
 #[cfg(feature = "lua-runtime")]
 pub use lua::{LuaHost, LuaHostConfig, LuaHostError, start_lua_host};
@@ -1332,6 +1334,25 @@ impl ScriptEvent {
         })
     }
 
+    /// Build a reliable player-death event after the authoritative survival commit.
+    pub fn try_player_died_with_context(
+        player_id: ScriptPlayerId,
+        context: ScriptPlayerContext,
+        dimension: impl AsRef<str>,
+        game_mode: ScriptGameMode,
+    ) -> Result<Self, ScriptDtoError> {
+        context.validate()?;
+        Ok(Self {
+            target_plugin_id: None,
+            kind: ScriptEventKind::PlayerDied {
+                player_id,
+                context,
+                dimension: validate_contract_resource_id(dimension.as_ref())?,
+                game_mode,
+            },
+        })
+    }
+
     /// Build a bounded player command event with server-authoritative context.
     pub fn try_player_command_with_context(
         target_plugin_id: impl AsRef<str>,
@@ -1572,6 +1593,7 @@ impl ScriptEvent {
             ScriptEventKind::PlayerBlockPlaced { .. } => "player.block_placed",
             ScriptEventKind::PlayerItemCrafted { .. } => "player.item_crafted",
             ScriptEventKind::PlayerItemPickedUp { .. } => "player.item_picked_up",
+            ScriptEventKind::PlayerDied { .. } => "player.died",
             ScriptEventKind::PlayerCommand { .. } => "player.command",
             ScriptEventKind::ServerTick { .. } => "server.tick",
             ScriptEventKind::PluginStorageGetResult { .. } => "plugin.storage.get_result",
@@ -1665,6 +1687,13 @@ impl ScriptEvent {
                 if *count == 0 {
                     return Err(ScriptDtoError::InvalidAmount);
                 }
+                Ok(())
+            }
+            ScriptEventKind::PlayerDied {
+                context, dimension, ..
+            } => {
+                context.validate()?;
+                validate_contract_resource_id(dimension)?;
                 Ok(())
             }
             ScriptEventKind::PlayerCommand {
@@ -1846,6 +1875,12 @@ pub enum ScriptEventKind {
         item_id: String,
         count: u64,
         source: ScriptItemPickupSource,
+        game_mode: ScriptGameMode,
+    },
+    PlayerDied {
+        player_id: ScriptPlayerId,
+        context: ScriptPlayerContext,
+        dimension: String,
         game_mode: ScriptGameMode,
     },
     PlayerCommand {
@@ -4110,6 +4145,7 @@ fn is_supported_event_name(event_name: &str) -> bool {
             | "player.block_placed"
             | "player.item_crafted"
             | "player.item_picked_up"
+            | "player.died"
             | "server.tick"
             | "plugin.storage.get_result"
             | "plugin.storage.cas_result"
@@ -4998,6 +5034,7 @@ mod tests {
             "player.block_placed",
             "player.item_crafted",
             "player.item_picked_up",
+            "player.died",
             "plugin.storage.get_result",
             "plugin.storage.cas_result",
             "plugin.storage.delete_result",

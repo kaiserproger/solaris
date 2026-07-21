@@ -47,6 +47,8 @@ impl SessionRegistry {
             tx,
             pose,
             max_sessions: usize::MAX,
+            script_operator: false,
+            dimension: "minecraft:overworld",
         })
         .expect("unbounded session registration should not fail")
     }
@@ -95,6 +97,8 @@ impl SessionRegistry {
                 pressure,
                 ordered_dispatch: Arc::new(OrderedDispatchState::default()),
                 script_transaction_active: Arc::new(Mutex::new(true)),
+                script_operator: registration.script_operator,
+                dimension: registration.dimension.to_owned(),
             },
         );
         {

@@ -394,13 +394,27 @@ Other accepted concrete boundaries in this staged migration are:
   decide whether the block transition or inventory candidate succeeded. They
   pass the prior destroyed state, actual applied placement root state,
   committed crafted-item fact, or exact credited pickup to the publisher only
-  after owner commit. Pickup facts distinguish world items from grounded
-  arrows and report only the amount merged into the player inventory. The
-  publisher snapshots player identity and pose, resolves registry identities,
-  maps the closed source and game-mode sets, and awaits required bounded event
-  admission. It owns no player, session, world, inventory, recipe, or block
-  mutation authority. Queue closure reports publication failure but cannot
-  roll back the committed mutation.
+  after owner commit. Pickup facts
+  distinguish world items from grounded arrows and report only the amount
+  merged into the player inventory. Player death is different because every
+  source converges on `session::player_state` authority. That owner snapshots
+  the exact live-to-dead fact, identity, mode, dimension, and commit position
+  into a nonblocking push outbox before any client write. A single async server
+  worker preserves outbox order and awaits required bounded Lua admission. PvP
+  and projectile death therefore do not depend on the victim connection
+  consuming `PlayerDamageCommitted`, and a failed health/inventory packet write
+  cannot erase an accepted event. The outbox is intentionally unbounded: a
+  synchronous owner cannot await bounded capacity while holding state locks,
+  and dropping an already committed death would violate the plugin contract.
+  Its producer is fenced to one entry per live-to-dead transition; another
+  entry for that player requires an authoritative respawn first. The bounded
+  Lua queue remains the backpressure boundary. If measured hostile workloads
+  make this outbox material, replace it with a reserved-permit or durable
+  segmented outbox without moving waits under owner locks. No path invents
+  incomplete killer or damage-source attribution. Queue closure cannot roll
+  back the committed mutation. Shutdown fences connection and simulation
+  producers before closing and draining the outbox; `server.stopping` then uses
+  the same required admission path before event admission closes.
 - `play::session::player_state_adapter` owns selected-slot, respawn-pose and
   game-mode event commits plus player animation/entity-data recipient
   projection. Persistence/inventory/survival authority remains in

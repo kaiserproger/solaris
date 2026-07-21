@@ -19772,6 +19772,55 @@ async fn lit_campfire_contact_damage_uses_survival_death_path() {
 }
 
 #[tokio::test]
+async fn committed_campfire_death_survives_client_write_failure() {
+    let mut state = campfire_test_interaction_state(mc_world::BlockPos { x: 0, y: 64, z: 0 }).await;
+    let mut deaths = state.sessions.install_player_death_event_outbox();
+    let mut survival_state = SurvivalState {
+        health: 1.0,
+        ..SurvivalState::FULL
+    };
+    let mut xp_state = XpState::default();
+    let (simulation_stop, simulation_task) =
+        start_survival_test_owner(&mut state, "CampfireFail", survival_state, &xp_state);
+    let (mut writer, reader) = tokio::io::duplex(64);
+    drop(reader);
+
+    let result = apply_contact_block_damage(
+        Some(&mut state),
+        &mut writer,
+        Compression::Disabled,
+        &mut survival_state,
+        &mut xp_state,
+        GameMode::Survival,
+        PlayerPose::new(0.5, 65.0, 0.5),
+    )
+    .await;
+    simulation_stop.send(()).unwrap();
+    simulation_task.await.unwrap();
+
+    assert!(
+        result.is_err(),
+        "closed client transport must reject publication"
+    );
+    assert!(survival_state.is_dead());
+    let event = deaths
+        .try_recv()
+        .expect("owner commit must publish death before client transport");
+    assert!(matches!(
+        event.kind(),
+        mc_script::ScriptEventKind::PlayerDied {
+            context,
+            game_mode: mc_script::ScriptGameMode::Survival,
+            ..
+        } if context.username() == "CampfireFail"
+    ));
+    assert!(matches!(
+        deaths.try_recv(),
+        Err(mpsc::error::TryRecvError::Empty)
+    ));
+}
+
+#[tokio::test]
 async fn lit_campfire_contact_damage_uses_player_width_edge_overlap() {
     let mut state = campfire_test_interaction_state(mc_world::BlockPos { x: 0, y: 64, z: 0 }).await;
     let mut survival_state = SurvivalState::FULL;

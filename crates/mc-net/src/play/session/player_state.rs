@@ -1,3 +1,4 @@
+use super::player_death_events::push_player_death_event_locked;
 use super::sleep::SleepWakeReason;
 use super::{
     PlayerInventoryCommitError, SessionEntityGuards, SessionId, SessionRegistry,
@@ -271,7 +272,8 @@ impl SessionRegistry {
                 self.stage_sleep_wake_locked(&mut inner, actor_session, SleepWakeReason::Damage)
             })
             .flatten();
-        let mut committed = apply_player_survival_plan_locked(&mut inner, &mut player_state, plan);
+        let mut committed =
+            apply_player_survival_plan_locked(&mut inner, actor_session, &mut player_state, plan);
         if let Some(transition) = &plan.active_shield {
             if let Some(shield) = &transition.updated {
                 inner.active_shields.insert(actor_session, shield.clone());
@@ -323,6 +325,7 @@ pub(super) fn player_attack_cost_plan_matches(
 
 pub(super) fn apply_player_survival_plan_locked(
     inner: &mut SessionEntityGuards<'_>,
+    actor_session: SessionId,
     player_state: &mut PlayerPersistedState,
     plan: &PlayerSurvivalPlan,
 ) -> CommittedPlayerSurvival {
@@ -381,6 +384,9 @@ pub(super) fn apply_player_survival_plan_locked(
     player_state.replace_xp(xp.clone());
     if let Some(input) = &plan.enchanting_table_input {
         player_state.enchanting_table_input = input.updated.clone();
+    }
+    if died {
+        push_player_death_event_locked(inner, actor_session, player_state, plan.position);
     }
     CommittedPlayerSurvival {
         survival: plan.updated_survival,

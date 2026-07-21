@@ -685,6 +685,16 @@ impl ScriptEventSink {
     }
 }
 
+async fn forward_committed_player_deaths(
+    mut events: tokio::sync::mpsc::UnboundedReceiver<ScriptEvent>,
+    scripts: ScriptEventSink,
+) -> Result<(), ScriptQueueError> {
+    while let Some(event) = events.recv().await {
+        scripts.enqueue_required_event(event).await?;
+    }
+    Ok(())
+}
+
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct OutboundPressureSnapshot {
     pub best_effort_animation_drops: u64,
@@ -899,6 +909,10 @@ impl BoundServer {
         if let Some(scripts) = scripts.as_ref() {
             scripts.enqueue_event(ScriptEvent::server_started());
         }
+        let mut player_death_event_worker = scripts.clone().map(|scripts| {
+            let events = sessions.install_player_death_event_outbox();
+            tokio::spawn(forward_committed_player_deaths(events, scripts))
+        });
         let mut connections = tokio::task::JoinSet::new();
         let (entity_world_root, entity_scheduled_ticks) = if let Some(world) = config.world.as_ref()
         {
@@ -1910,17 +1924,6 @@ impl BoundServer {
                 }
             };
         }
-        if let Some(scripts) = scripts.as_ref() {
-            scripts.enqueue_event(ScriptEvent::server_stopping("server stopping"));
-            scripts.close_event_admission();
-        }
-        while let Some(result) = command_tasks.join_next().await {
-            if let Err(error) = log_command_task_exit(result, true)
-                && command_drain_error.is_none()
-            {
-                command_drain_error = Some(error);
-            }
-        }
         let connection_drain_result = drain_connections(&mut connections).await;
         if let Some(watcher) = runtime_control_signal_watcher
             && let Err(error) = watcher.await
@@ -1946,6 +1949,38 @@ impl BoundServer {
                 simulation_barrier_result.and(ticker_result)
             }
         };
+        sessions.close_player_death_event_outbox();
+        let player_death_event_drain_result = match player_death_event_worker.take() {
+            Some(worker) => match worker.await {
+                Ok(Ok(())) => Ok(()),
+                Ok(Err(error)) => Err(std::io::Error::other(format!(
+                    "committed player death event drain failed: {error:?}"
+                ))),
+                Err(error) => Err(std::io::Error::other(format!(
+                    "committed player death event worker failed: {error}"
+                ))),
+            },
+            None => Ok(()),
+        };
+        let server_stopping_event_result = if let Some(scripts) = scripts.as_ref() {
+            let result = scripts
+                .enqueue_required_event(ScriptEvent::server_stopping("server stopping"))
+                .await
+                .map_err(|error| {
+                    std::io::Error::other(format!("server stopping script event failed: {error:?}"))
+                });
+            scripts.close_event_admission();
+            result
+        } else {
+            Ok(())
+        };
+        while let Some(result) = command_tasks.join_next().await {
+            if let Err(error) = log_command_task_exit(result, true)
+                && command_drain_error.is_none()
+            {
+                command_drain_error = Some(error);
+            }
+        }
         if let Some(error) = accept_error {
             return Err(error);
         }
@@ -1954,7 +1989,9 @@ impl BoundServer {
         }
         connection_drain_result?;
         entity_drain_result?;
-        periodic_save_drain_result
+        periodic_save_drain_result?;
+        player_death_event_drain_result?;
+        server_stopping_event_result
     }
 
     /// Serve until shutdown, drain every admitted mutation, and perform the
@@ -4557,7 +4594,8 @@ mod tests {
     use super::*;
     use mc_data::blocks::{BlockReport, BlockStateReport};
     use mc_script::{
-        LuaHostConfig, ScriptEventKind, ScriptPlayerId, script_boundary_pair, start_lua_host,
+        LuaHostConfig, ScriptEventKind, ScriptGameMode, ScriptPlayerContext, ScriptPlayerId,
+        script_boundary_pair, start_lua_host,
     };
     use std::collections::BTreeMap;
     use std::num::NonZeroUsize;
@@ -4639,6 +4677,48 @@ mod tests {
             mc_script::PlayerCommandAdmission::NotOwned
         );
         assert!(sink.player_command_roots().is_empty());
+    }
+
+    #[tokio::test]
+    async fn committed_death_worker_waits_for_exact_queue_capacity_notification() {
+        let one = NonZeroUsize::new(1).unwrap();
+        let (boundary, mut endpoint) = script_boundary_pair(one, one);
+        boundary
+            .try_enqueue_event(ScriptEvent::server_started())
+            .unwrap();
+        let sink = ScriptEventSink::new(boundary);
+        let (sender, receiver) = tokio::sync::mpsc::unbounded_channel();
+        sender
+            .send(
+                ScriptEvent::try_player_died_with_context(
+                    ScriptPlayerId::new(7),
+                    ScriptPlayerContext::new(
+                        "123e4567-e89b-12d3-a456-426614174000",
+                        "Alex",
+                        false,
+                        1.5,
+                        64.0,
+                        -2.5,
+                    ),
+                    "minecraft:overworld",
+                    ScriptGameMode::Survival,
+                )
+                .unwrap(),
+            )
+            .unwrap();
+        drop(sender);
+        let worker = tokio::spawn(forward_committed_player_deaths(receiver, sink));
+
+        assert!(matches!(
+            endpoint.recv_event().await.unwrap().kind(),
+            ScriptEventKind::ServerStarted
+        ));
+        assert!(matches!(
+            endpoint.recv_event().await.unwrap().kind(),
+            ScriptEventKind::PlayerDied { player_id, .. }
+                if *player_id == ScriptPlayerId::new(7)
+        ));
+        worker.await.unwrap().unwrap();
     }
 
     #[tokio::test]

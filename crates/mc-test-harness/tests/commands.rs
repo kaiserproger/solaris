@@ -6,14 +6,15 @@ use std::time::Duration;
 use bytes::Bytes;
 use mc_protocol::packets::Packet;
 use mc_protocol::packets::play::{
-    BlockChangedAck, BlockUpdate, ClientboundCommands, ClientboundContainerSetContent,
-    ClientboundContainerSetSlot, ClientboundOpenScreen, ClientboundSetTime, ClientboundSystemChat,
+    BlockChangedAck, BlockUpdate, ClientCommandAction, ClientboundCommands,
+    ClientboundContainerSetContent, ClientboundContainerSetSlot, ClientboundOpenScreen,
+    ClientboundRespawn, ClientboundSetHealth, ClientboundSetTime, ClientboundSystemChat,
     CommandNodeKind, ConfirmTeleportation, ContainerInput, Direction, GameEvent, GameMode,
     HashedStack, HashedStackComponentHashes, InteractionHand, LevelChunkWithLight, MovePlayerFlags,
-    PlayerActionKind, ServerboundChat, ServerboundChatCommand, ServerboundContainerClick,
-    ServerboundMovePlayerPos, ServerboundMovePlayerStatusOnly, ServerboundPlaceRecipe,
-    ServerboundPlayerAction, ServerboundUseItemOn, SetCenterChunk, SynchronizePlayerPosition,
-    pack_block_pos, unpack_block_pos,
+    PlayerActionKind, ServerboundChat, ServerboundChatCommand, ServerboundClientCommand,
+    ServerboundContainerClick, ServerboundMovePlayerPos, ServerboundMovePlayerStatusOnly,
+    ServerboundPlaceRecipe, ServerboundPlayerAction, ServerboundUseItemOn, SetCenterChunk,
+    SynchronizePlayerPosition, pack_block_pos, unpack_block_pos,
 };
 use mc_test_harness::client::{Client, FrameWaitLimits};
 
@@ -350,7 +351,7 @@ async fn lua_gameplay_events_follow_authoritative_commits() {
             name = "Block Jobs"
             version = "0.1.0"
             api = "0.6.0"
-            events = ["player.block_broken", "player.block_placed", "player.item_crafted", "player.item_picked_up"]
+            events = ["player.block_broken", "player.block_placed", "player.item_crafted", "player.item_picked_up", "player.died"]
             player_commands = ["block-fence"]
         "#,
     )
@@ -404,6 +405,15 @@ async fn lua_gameplay_events_follow_authoritative_commits() {
                         .. ":" .. event.count
                         .. ":" .. event.source
                         .. ":" .. event.game_mode
+                        .. ":" .. event.dimension
+                        .. ":" .. event.username
+                )
+            end
+
+            function on_player_died(event)
+                solaris.send_message(
+                    event.player_id,
+                    "player-died:" .. event.game_mode
                         .. ":" .. event.dimension
                         .. ":" .. event.username
                 )
@@ -830,6 +840,25 @@ async fn lua_gameplay_events_follow_authoritative_commits() {
         }
     }
 
+    peer.write_packet(&ServerboundMovePlayerPos {
+        x: peer_sync.x - 8.0,
+        y: peer_sync.y,
+        z: peer_sync.z,
+        flags: MovePlayerFlags::new(true, false),
+    })
+    .await
+    .expect("move peer away from survival drop");
+    peer.write_packet(&ServerboundChatCommand {
+        command: "block-fence peer-away".to_owned(),
+    })
+    .await
+    .expect("fence peer movement away from survival drop");
+    loop {
+        if next_lua_transaction_system_chat_text(&mut peer).await == "block-fence:peer-away" {
+            break;
+        }
+    }
+
     let survival_target = (1, target.1, 0);
     client
         .write_packet(&ServerboundPlayerAction {
@@ -1046,6 +1075,25 @@ async fn lua_gameplay_events_follow_authoritative_commits() {
         }
     }
 
+    peer.write_packet(&ServerboundMovePlayerPos {
+        x: peer_sync.x,
+        y: peer_sync.y,
+        z: peer_sync.z,
+        flags: MovePlayerFlags::new(true, false),
+    })
+    .await
+    .expect("return peer for stale-break race");
+    peer.write_packet(&ServerboundChatCommand {
+        command: "block-fence peer-returned".to_owned(),
+    })
+    .await
+    .expect("fence peer return for stale-break race");
+    loop {
+        if next_lua_transaction_system_chat_text(&mut peer).await == "block-fence:peer-returned" {
+            break;
+        }
+    }
+
     peer.write_packet(&ServerboundPlayerAction {
         action: PlayerActionKind::StartDestroyBlock,
         position: pack_block_pos(stale_target.0, stale_target.1, stale_target.2),
@@ -1193,6 +1241,88 @@ async fn lua_gameplay_events_follow_authoritative_commits() {
         );
         if message == "block-fence:craft-repeat" {
             break;
+        }
+    }
+
+    client
+        .write_packet(&ServerboundChatCommand {
+            command: "debug survival damage 1".to_owned(),
+        })
+        .await
+        .expect("apply nonlethal survival damage");
+    client
+        .write_packet(&ServerboundChatCommand {
+            command: "block-fence nonlethal-damage".to_owned(),
+        })
+        .await
+        .expect("send nonlethal damage fence");
+    loop {
+        let message = next_lua_transaction_system_chat_text(&mut client).await;
+        assert!(
+            !message.starts_with("player-died:"),
+            "nonlethal damage published a death event: {message}"
+        );
+        if message == "block-fence:nonlethal-damage" {
+            break;
+        }
+    }
+
+    client
+        .write_packet(&ServerboundChatCommand {
+            command: "debug survival damage 100".to_owned(),
+        })
+        .await
+        .expect("apply lethal survival damage");
+    let expected_death_message = "player-died:survival:minecraft:overworld:BreakEvents";
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+    let mut saw_zero_health = false;
+    let mut saw_death_event = false;
+    while !(saw_zero_health && saw_death_event) {
+        let mut frame = client
+            .read_frame_with_timeout(
+                deadline.saturating_duration_since(tokio::time::Instant::now()),
+            )
+            .await
+            .expect("player death health and Lua wire response");
+        if frame.id == ClientboundSetHealth::ID {
+            let health =
+                ClientboundSetHealth::decode(&mut frame.body).expect("decode lethal SetHealth");
+            if health.health == 0.0 {
+                saw_zero_health = true;
+            }
+        } else if frame.id == ClientboundSystemChat::ID {
+            let chat = ClientboundSystemChat::decode(&mut frame.body).expect("decode SystemChat");
+            let message = text_component_text(&chat);
+            if message == expected_death_message {
+                saw_death_event = true;
+            }
+        }
+    }
+
+    client
+        .write_packet(&ServerboundClientCommand {
+            action: ClientCommandAction::PerformRespawn,
+        })
+        .await
+        .expect("respawn after committed death");
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+    loop {
+        let mut frame = client
+            .read_frame_with_timeout(
+                deadline.saturating_duration_since(tokio::time::Instant::now()),
+            )
+            .await
+            .expect("respawn response after death event");
+        if frame.id == ClientboundRespawn::ID {
+            break;
+        }
+        if frame.id == ClientboundSystemChat::ID {
+            let chat = ClientboundSystemChat::decode(&mut frame.body).expect("decode SystemChat");
+            let message = text_component_text(&chat);
+            assert!(
+                !message.starts_with("player-died:"),
+                "death or respawn published another event: {message}"
+            );
         }
     }
 

@@ -80,6 +80,7 @@ targeted event does not need a broad subscription to reach its owner.
 | `player.block_placed` | `on_player_block_placed` | block player snapshot, `dimension`, `block_id`, `x`, `y`, `z`, `game_mode` |
 | `player.item_crafted` | `on_player_item_crafted` | `name`, `player_id`, `context_verified`, `uuid`, `username`, `operator`, `x`, `y`, `z`, `dimension`, `item_id`, `count`, `craft_count`, `source`, `game_mode` |
 | `player.item_picked_up` | `on_player_item_picked_up` | `name`, `player_id`, `context_verified`, `uuid`, `username`, `operator`, `x`, `y`, `z`, `dimension`, `item_id`, `count`, `source`, `game_mode` |
+| `player.died` | `on_player_died` | `name`, `player_id`, `context_verified`, `uuid`, `username`, `operator`, `x`, `y`, `z`, `dimension`, `game_mode` |
 | `server.tick` | `on_server_tick` | `tick` |
 | `player.command` | `on_player_command` | player snapshot, `root`, `arguments` |
 | `plugin.storage.get_result` | `on_plugin_storage_get_result` | `request_id`, `key`, `value`, `version`, `failure` |
@@ -136,6 +137,20 @@ moving; it does not depend on a polling loop or guessed elapsed time. Hidden
 campfire outputs enter this index only after their world-journal acknowledgement
 and entity publication, so an aborted output commit cannot publish a pickup or
 duplicate the item.
+
+`player.died` is published once after the simulation owner accepts a live-to-
+dead player survival transition, including the same atomic inventory drop and
+XP reset. The common fall, contact block, starvation, hostile, projectile, PvP,
+and operator damage paths use that transition. The owner snapshots the event
+into a push outbox before any fallible client write. One async worker forwards
+that immutable event into the bounded Lua queue, so victim disconnects, stale
+connection mirrors, and packet-write failures cannot erase or rewrite an
+accepted death. Nonlethal or shield-blocked damage, stale owner state,
+unsupported Creative/Spectator damage, repeated damage against an already-dead
+player, and respawn publish nothing. The first contract deliberately omits
+killer and damage-source fields because those facts are not yet carried
+consistently through every death source; plugins must not infer them from timing
+or nearby entities.
 
 An aborted break, stale precondition, rejected mutation, repeated break of air,
 blocked placement, or empty-hand placement publishes nothing. Required

@@ -446,15 +446,23 @@ impl SessionRegistry {
             let mut effective = costs.clone();
             effective.expected_survival = attacker_state.survival;
             effective.updated_survival.health = attacker_state.survival.health;
-            let committed =
-                apply_player_survival_plan_locked(&mut inner, &mut attacker_state, &effective);
+            let committed = apply_player_survival_plan_locked(
+                &mut inner,
+                attacker_session,
+                &mut attacker_state,
+                &effective,
+            );
             CommittedPlayerAttackCosts {
                 survival: committed.survival,
                 inventory: committed.inventory,
             }
         });
-        let mut committed_target =
-            apply_player_survival_plan_locked(&mut inner, &mut target_state, target_plan);
+        let mut committed_target = apply_player_survival_plan_locked(
+            &mut inner,
+            target_session,
+            &mut target_state,
+            target_plan,
+        );
         if let Some(shield_after_block) = shield_after_block {
             match shield_after_block {
                 ShieldAfterBlock::Refresh(shield) => {
@@ -733,7 +741,8 @@ pub(super) fn commit_projectile_player_damage_locked(
         < target_plan.expected_survival.health)
         .then(|| stage_sleep_wake_locked(inner, target_session, SleepWakeReason::Damage))
         .flatten();
-    let mut committed = apply_player_survival_plan_locked(inner, &mut target_state, &target_plan);
+    let mut committed =
+        apply_player_survival_plan_locked(inner, target_session, &mut target_state, &target_plan);
     if let Some(shield_after_block) = shield_after_block {
         match shield_after_block {
             ShieldAfterBlock::Refresh(shield) => {
@@ -852,6 +861,7 @@ mod tests {
     use mc_data::item_components::{ItemFacts, ItemFactsTable};
     use mc_data::items::{ItemRegistry, ItemReport};
     use mc_protocol::packets::play::{InteractionHand, ItemStack};
+    use mc_script::{ScriptEventKind, ScriptGameMode};
     use tokio::sync::mpsc;
 
     use super::{
@@ -867,7 +877,7 @@ mod tests {
     use crate::play::persistence::PlayerPersistedState;
     use crate::play::session::SessionRegistry;
     use crate::play::simulation::{PlayerSurvivalPlan, SimulationAuthority};
-    use crate::play::{GameMode, PlayerPose};
+    use crate::play::{GameMode, PlayerPose, SurvivalState};
 
     fn shield_items() -> (ItemRegistry, ItemFactsTable, u32, u32) {
         let shield = Identifier::parse("minecraft:shield").unwrap();
@@ -1162,6 +1172,106 @@ mod tests {
             &dispatch.command,
             OutboundCommand::PlayerDamageCommitted { .. }
         )));
+    }
+
+    #[test]
+    fn lethal_pvp_pushes_death_even_when_target_outbound_is_closed() {
+        let registry = SessionRegistry::new();
+        let mut deaths = registry.install_player_death_event_outbox();
+        let attacker_pose = PlayerPose::new(0.5, 64.0, 0.5);
+        let target_pose = PlayerPose::new(1.0, 64.0, 0.5);
+        let attacker = register_player(
+            &registry,
+            "PvpDeathAttacker",
+            attacker_pose,
+            PlayerPersistedState::new_default(attacker_pose),
+        );
+        let target = register_player(
+            &registry,
+            "PvpDeathTarget",
+            target_pose,
+            PlayerPersistedState::new_default(target_pose),
+        );
+        let target_entity = {
+            let inner = registry.lock_inner("read lethal PvP target entity id");
+            EntityId(inner.sessions[&target].entity_id)
+        };
+
+        let result = registry.player_attack_entity(
+            &SimulationAuthority::for_test(),
+            PlayerEntityAttack {
+                attacker_session: attacker,
+                entity_id: target_entity,
+                amount: SurvivalState::MAX_HEALTH,
+                attacker_costs: None,
+                authority_tick: registry.simulation_tick(),
+            },
+        );
+        assert!(matches!(result, PlayerAttackResult::Damaged(_)));
+        let event = deaths
+            .try_recv()
+            .expect("PvP owner commit must not depend on target outbound");
+        assert!(matches!(
+            event.kind(),
+            ScriptEventKind::PlayerDied {
+                player_id,
+                context,
+                game_mode: ScriptGameMode::Survival,
+                ..
+            } if player_id.value() == target && context.username() == "PvpDeathTarget"
+        ));
+        assert!(matches!(
+            deaths.try_recv(),
+            Err(mpsc::error::TryRecvError::Empty)
+        ));
+    }
+
+    #[test]
+    fn lethal_projectile_pushes_death_from_the_same_owner_commit() {
+        let registry = SessionRegistry::new();
+        let mut deaths = registry.install_player_death_event_outbox();
+        let target_pose = PlayerPose::new(1.0, 64.0, 0.5);
+        let target_state = PlayerPersistedState::new_default(target_pose);
+        let target = register_player(&registry, "ArrowDeath", target_pose, target_state.clone());
+        let mut target_plan =
+            survival_plan(&target_state, target_state.inventory.clone(), target_pose);
+        target_plan
+            .updated_survival
+            .apply_damage(SurvivalState::MAX_HEALTH);
+        let prepared = PreparedProjectilePlayerDamage {
+            target_session: target,
+            expected_shield: None,
+            shield_after_block: None,
+            next_resistance: None,
+            target_plan,
+            damage_applied: true,
+            fresh_hurt: true,
+            shield_blocked: false,
+            source_origin: None,
+        };
+        let mut dispatches = Vec::new();
+        let mut inner = registry.lock_session_entities("commit lethal projectile damage test");
+        assert!(commit_projectile_player_damage_locked(
+            &mut inner,
+            prepared,
+            |_| true,
+            &mut dispatches,
+        ));
+        drop(inner);
+
+        assert!(matches!(
+            deaths.try_recv().unwrap().kind(),
+            ScriptEventKind::PlayerDied {
+                player_id,
+                context,
+                game_mode: ScriptGameMode::Survival,
+                ..
+            } if player_id.value() == target && context.username() == "ArrowDeath"
+        ));
+        assert!(matches!(
+            deaths.try_recv(),
+            Err(mpsc::error::TryRecvError::Empty)
+        ));
     }
 
     #[test]

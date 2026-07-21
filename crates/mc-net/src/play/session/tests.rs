@@ -4,12 +4,73 @@ use mc_protocol::State;
 use mc_protocol::frame::Compression;
 use mc_protocol::packets::login::GameProfileProperty;
 use mc_protocol::packets::play::PlayerInfoUpdate;
+use mc_script::{ScriptEventKind, ScriptGameMode};
 use std::collections::{BTreeMap, HashMap};
 use std::sync::{Barrier, Mutex};
 use tokio::io::duplex;
 use tokio::sync::mpsc;
 
 use crate::connection::{ConnectionReader, PRE_PLAY_READ_TIMEOUT, read_packet_with_timeout};
+
+#[test]
+fn lethal_survival_commit_pushes_immutable_player_death_before_session_cleanup() {
+    let registry = SessionRegistry::new();
+    let mut deaths = registry.install_player_death_event_outbox();
+    let session = register_test_session(&registry, "CommittedDeath");
+    let pose = PlayerPose::new(2.5, 70.0, -4.5);
+    let persisted = PlayerPersistedState::new_default(pose);
+    let expected_survival = persisted.survival;
+    let expected_inventory = persisted.inventory.clone();
+    let expected_carried_item = persisted.carried_item.clone();
+    let expected_xp = persisted.xp.clone();
+    registry.register_player_persistence(session, Arc::new(Mutex::new(persisted)));
+
+    let mut dead = expected_survival;
+    dead.apply_damage(SurvivalState::MAX_HEALTH);
+    let committed = registry.commit_player_survival(
+        &SimulationAuthority::for_test(),
+        session,
+        &PlayerSurvivalPlan {
+            expected_survival,
+            updated_survival: dead,
+            expected_inventory: expected_inventory.clone(),
+            updated_inventory: expected_inventory,
+            expected_carried_item,
+            expected_xp: expected_xp.clone(),
+            updated_xp: expected_xp,
+            active_shield: None,
+            enchanting_table_input: None,
+            item_entity_type_id: None,
+            xp_orb_entity_type_id: None,
+            position: Vec3::new(pose.x, pose.y, pose.z),
+        },
+    );
+    assert!(matches!(
+        committed,
+        Some(PlayerSurvivalCommitOutcome::Committed(committed)) if committed.died
+    ));
+
+    registry.unregister(session);
+    let event = deaths
+        .try_recv()
+        .expect("authoritative death must survive session cleanup");
+    assert!(matches!(
+        event.kind(),
+        ScriptEventKind::PlayerDied {
+            player_id,
+            context,
+            dimension,
+            game_mode: ScriptGameMode::Survival,
+        } if player_id.value() == session
+            && context.username() == "CommittedDeath"
+            && (context.x(), context.y(), context.z()) == (pose.x, pose.y, pose.z)
+            && dimension == "minecraft:overworld"
+    ));
+    assert!(matches!(
+        deaths.try_recv(),
+        Err(mpsc::error::TryRecvError::Empty)
+    ));
+}
 
 #[test]
 fn respawn_commit_clears_player_hurt_resistance() {
@@ -7588,6 +7649,8 @@ fn registration<'a>(
         tx,
         pose: PlayerPose::new(0.5, 64.0, 0.5),
         max_sessions,
+        script_operator: false,
+        dimension: "minecraft:overworld",
     }
 }
 
@@ -7638,6 +7701,8 @@ async fn profile_properties_reach_observer_player_info_wire_packet() {
             tx: profiled_tx,
             pose: PlayerPose::new(1.5, 64.0, 0.5),
             max_sessions: usize::MAX,
+            script_operator: false,
+            dimension: "minecraft:overworld",
         })
         .unwrap();
 

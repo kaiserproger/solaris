@@ -1462,6 +1462,8 @@ where
         tx: outbound_tx,
         pose: initial_pose,
         max_sessions: config.max_players as usize,
+        script_operator: permissions.op,
+        dimension: dim_name.as_str(),
     }) {
         Ok(registered) => registered,
         Err(err) => {

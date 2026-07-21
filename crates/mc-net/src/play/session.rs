@@ -35,6 +35,7 @@ mod passive_mobs;
 mod pathing;
 mod pickups;
 mod player_combat;
+mod player_death_events;
 mod player_item_action_authority;
 mod player_pose_adapter;
 mod player_pose_authority;
@@ -262,6 +263,8 @@ pub(super) struct SessionRegistration<'a> {
     pub(super) tx: mpsc::Sender<OutboundCommand>,
     pub(super) pose: PlayerPose,
     pub(super) max_sessions: usize,
+    pub(super) script_operator: bool,
+    pub(super) dimension: &'a str,
 }
 
 #[derive(Debug)]
@@ -281,6 +284,8 @@ struct PlaySession {
     pressure: Arc<OutboundPressureMetrics>,
     ordered_dispatch: Arc<OrderedDispatchState>,
     script_transaction_active: Arc<Mutex<bool>>,
+    script_operator: bool,
+    dimension: String,
 }
 
 #[derive(Debug, Clone)]
@@ -315,6 +320,7 @@ struct SessionRegistryInner {
     entity_dispatches: EntityDispatchCounters,
     arrow_kill_rewards: ArrowKillRewards,
     player_combat: PlayerCombatResources,
+    player_death_events: Option<tokio::sync::mpsc::UnboundedSender<ScriptEvent>>,
 }
 
 #[derive(Debug, Default)]
@@ -1163,6 +1169,23 @@ impl SessionRegistry {
 
     pub(crate) fn subscribe_simulation_ticks(&self) -> tokio::sync::watch::Receiver<u64> {
         self.simulation_tick_sender.subscribe()
+    }
+
+    pub(crate) fn install_player_death_event_outbox(
+        &self,
+    ) -> tokio::sync::mpsc::UnboundedReceiver<ScriptEvent> {
+        let (sender, receiver) = tokio::sync::mpsc::unbounded_channel();
+        let mut inner = self.lock_inner("install player death event outbox");
+        assert!(
+            inner.player_death_events.replace(sender).is_none(),
+            "player death event outbox may only be installed once"
+        );
+        receiver
+    }
+
+    pub(crate) fn close_player_death_event_outbox(&self) {
+        self.lock_inner("close player death event outbox")
+            .player_death_events = None;
     }
 
     pub(crate) fn subscribe_player_attacks(

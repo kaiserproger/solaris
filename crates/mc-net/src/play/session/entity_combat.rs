@@ -136,20 +136,23 @@ impl SessionRegistry {
         else {
             return PlayerAttackResult::AcceptedNoDamage;
         };
-        let committed_attacker =
-            attacker
-                .zip(attacker_state.as_mut())
-                .map(|((_, costs), attacker_state)| {
-                    let mut effective = costs.clone();
-                    effective.expected_survival = attacker_state.survival;
-                    effective.updated_survival.health = attacker_state.survival.health;
-                    let committed =
-                        apply_player_survival_plan_locked(&mut inner, attacker_state, &effective);
-                    CommittedPlayerAttackCosts {
-                        survival: committed.survival,
-                        inventory: committed.inventory,
-                    }
-                });
+        let committed_attacker = attacker.zip(attacker_state.as_mut()).map(
+            |((attacker_session, costs), attacker_state)| {
+                let mut effective = costs.clone();
+                effective.expected_survival = attacker_state.survival;
+                effective.updated_survival.health = attacker_state.survival.health;
+                let committed = apply_player_survival_plan_locked(
+                    &mut inner,
+                    attacker_session,
+                    attacker_state,
+                    &effective,
+                );
+                CommittedPlayerAttackCosts {
+                    survival: committed.survival,
+                    inventory: committed.inventory,
+                }
+            },
+        );
         match &mut outcome {
             EntityAttackOutcome::Damaged { attacker_costs, .. }
             | EntityAttackOutcome::Killed { attacker_costs, .. } => {
