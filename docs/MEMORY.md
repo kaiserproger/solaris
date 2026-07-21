@@ -9,16 +9,17 @@ and is not startup context.
 
 - Date: 2026-07-21.
 - Branch: `dev/M100-client-agent`.
-- Latest checkpoint: `878ec73` (`feat(plugins): publish committed block
-  placements`). Delivery-order checkpoint `5e2908a` remains binding.
+- Latest checkpoint: `60d082e` (`feat(plugins): publish committed item
+  crafts`). Delivery-order checkpoint `5e2908a` remains binding.
 - The worktree may contain unrelated owner files and local artifacts. Inspect
   exact ownership before editing; never clean or stage them by accident.
 - Full workspace tests, workspace all-target strict Clippy, fmt, code-health
-  `0 fail / KEEP`, and diff-check passed immediately before `878ec73`. Focused
-  evidence includes `mc-script` `88/88`, full `mc-net` `1541 passed / 1
-  ignored`, the disk-backed command wire gate `14/14`, and `block_edit` `94/94`.
-  A `sol high` re-review found no remaining blocker, high, or medium issue.
-  Pre-existing entity-scale and local artifact changes were not staged.
+  `0 fail / KEEP`, and diff-check passed immediately before `60d082e`. Focused
+  evidence includes `mc-script` `92/92`, full `mc-net` `1548 passed / 1
+  ignored`, and the disk-backed command wire gate `14/14`. A `sol high`
+  re-review found no remaining blocker, high, or medium issue. No manual/client
+  or vanilla-oracle gate was run for this plugin-only event slice. Pre-existing
+  entity-scale and local artifact changes were not staged.
 - Ignored oracle/load/benchmark rows remain explicit. The P04 real-client soak
   ran; broad performance and dedicated concurrency gates did not.
 
@@ -72,9 +73,12 @@ two priorities unless it becomes a common-play blocker or corruption risk.
   cover menus, inventory/storage transactions, zones, colony records, ephemeral
   villager binding, owner-scoped `home`/`hold` orders through journaled regional
   goals, and required post-commit `player.block_broken` and
-  `player.block_placed` events. The shared block-event wire gate covers creative
-  and survival commits, repeated-air/blocked/empty-hand paths, abort, and
-  owner-stale rejection. Block DTOs expose player pose separately from integer
+  `player.block_placed` events. `player.item_crafted` now covers committed 2x2,
+  3x3, and recipe-book crafts with aggregate max-craft counts and required
+  queue admission. Direct tests cover cursor mismatch, full output inventory,
+  owner-stale rejection, no-op, queue closure after commit, and aggregate counts
+  above `u32`; the wire gate covers exact inventory commit/event fields plus a
+  missing-input retry. Block DTOs expose player pose separately from integer
   block coordinates. General villager roles/work orders and durable entity
   handles remain absent.
 - Production and test waits must remain event-driven. Timeouts only fail stuck
