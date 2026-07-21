@@ -2779,6 +2779,44 @@ fn hostile_forgets_target_when_last_player_unregisters() {
 }
 
 #[test]
+fn fish_physics_queries_use_aquatic_water_rules() {
+    let registry = SessionRegistry::new();
+    let alice = register_test_session(&registry, "FishPhysicsAlice");
+    assert!(registry.mark_loaded(alice, (0, 0)).is_empty());
+    registry.spawn_command_entity(
+        &SimulationAuthority::for_test(),
+        1,
+        "minecraft:cod".to_string(),
+        Vec3::new(4.5, 62.0, 0.5),
+    );
+
+    let queries = registry.tick_entities_and_collect_physics_queries(1);
+
+    assert_eq!(queries.len(), 1);
+    assert_eq!(queries[0].kind, EntityPhysicsKind::AquaticLiving);
+}
+
+#[test]
+fn all_living_aquatic_and_amphibious_classes_use_aquatic_water_rules() {
+    for type_name in [
+        "minecraft:guardian",
+        "minecraft:elder_guardian",
+        "minecraft:tadpole",
+        "minecraft:nautilus",
+        "minecraft:zombie_nautilus",
+        "minecraft:axolotl",
+        "minecraft:frog",
+        "minecraft:turtle",
+    ] {
+        assert!(
+            super::entity_physics_class::entity_type_uses_aquatic_physics(type_name),
+            "{type_name}"
+        );
+    }
+    assert!(!super::entity_physics_class::entity_type_uses_aquatic_physics("minecraft:zombie"));
+}
+
+#[test]
 fn empty_entity_goal_tick_skips_regional_owner_request() {
     let registry = SessionRegistry::new();
     registry.entities.reset_owner_requests_for_test();

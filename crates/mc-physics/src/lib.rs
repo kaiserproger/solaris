@@ -259,6 +259,17 @@ impl PhysicsConfig {
         }
     }
 
+    /// Vanilla fish propel themselves through water instead of receiving the
+    /// generic floating-item buoyancy used by the shared body kernel.
+    #[must_use]
+    pub fn aquatic_entity() -> Self {
+        Self {
+            water_drag: 0.9,
+            water_buoyancy: 0.0,
+            ..Self::living_entity()
+        }
+    }
+
     #[must_use]
     pub fn arrow_projectile() -> Self {
         Self {
@@ -1956,3 +1967,6 @@ mod tests {
         assert!(!body.on_ground);
     }
 }
+
+#[cfg(test)]
+mod aquatic_physics_tests;

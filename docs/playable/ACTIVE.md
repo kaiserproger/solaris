@@ -31,23 +31,39 @@ hardening. An already-open lower-priority diff does not override this order.
 2. Treat failures from the owner session as the playable queue. Fix the first
    common player-visible blocker, then rerun the shortest real-client scenario
    that reproduces it.
-   The current blocker is reliable-queue disconnect under dense entity chunk
-   loading; the fix is implemented and awaits an owner rerun. Next, cover the
-   reported missing water movement, breathing, swimming, and fish navigation.
-3. If that session has no common blocker, move to the first production plugin
-   API slice while keeping the playable gate fixed. Defer optimization unless
-   play exposes a catastrophic stall.
-4. Checkpoint `d9c0804` closes the ordinary furnace-fuel gap. Include it in the
-   next owner-played survival session, but do not delay the production plugin
-   API for more isolated fuel polishing when that session finds no blocker.
-5. Defer deterministic livestock climbing and earned stonecutter hardening
-   until they block ordinary survival or the plugin-backed gameplay loop.
-6. Keep the rare multi-region save recovery `fsync`/metrics issue documented
+   The owner rerun still disconnected periodically in the dense 5,132-entity
+   world, so that remains the next blocker to isolate. The reported water gap
+   now has server-owned air/drowning, vanilla swimming metadata, and aquatic
+   physics that no longer pushes fish to the surface; owner-client verification
+   remains pending.
+3. After the disconnect, close the remaining common-play reports: dry-land
+   random-seed spawn, player water movement, vanilla reach, and lag-free mob
+   damage/death plus skeleton-arrow and creeper-explosion paths.
+4. Ship the requested basic economy and land-claim plugins on the production
+   Lua API, then document operator TOML options beside their values.
+5. Improve terrain generation toward the concrete Tellus/Tectonic traits that
+   can be measured without breaking vanilla world persistence. Then run a
+   bounded explosion load benchmark and record the exact envelope.
+6. Close this owner batch with an MCP-driven, unscripted survival session run
+   by one fast subagent. Treat its visible failures as the next playable queue.
+7. Keep the rare multi-region save recovery `fsync`/metrics issue documented
    but deferred. Do not resume it unless it becomes ordinary save corruption or
    blocks the playable or plugin path.
 
 ## Recent Evidence
 
+- This checkpoint adds the ordinary water survival path. Player eye immersion
+  now consumes the vanilla 300-tick air supply, publishes metadata index 1,
+  deals two drowning damage at the vanilla `-20` boundary, and recovers four
+  air per tick outside water or in invulnerable modes. Swimming publishes the
+  shared entity flag `0x10`. Aquatic entity queries use fish water drag without
+  generic buoyancy, so canonical 26.1.2 aquatic and amphibious mobs are no
+  longer driven to the surface by the shared body kernel. Focused breathing,
+  metadata, classification, and sampled-water
+  physics regressions and full workspace tests, strict Clippy, fmt, and
+  code-health pass. The independent reviewer found incomplete aquatic class
+  coverage, Adventure immunity, respawn air carryover, and a rejected-commit
+  damage loss; all four were fixed. Owner-client verification is pending.
 - The owner-run O3 build exposed a server-triggered disconnect while loading a
   dense world: 5,132 entities produced 5,702 per-entity spawn dispatches and
   overflowed the bounded reliable queue (`reliable_command_drops=963`). Chunk

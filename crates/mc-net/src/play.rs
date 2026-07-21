@@ -123,6 +123,9 @@ mod lighting;
 mod movement;
 pub(crate) mod persistence;
 mod plants;
+mod player_breathing;
+#[cfg(test)]
+mod player_breathing_tests;
 mod player_damage_adapter;
 mod player_teleport;
 #[cfg(test)]
@@ -133,6 +136,8 @@ mod scheduled_blocks;
 mod script_gameplay_events;
 #[cfg(test)]
 mod script_gameplay_events_tests;
+
+use player_breathing::{PlayerBreathingState, player_can_drown};
 // Router and storage-owner wiring land separately; keep the bounded adapter
 // contract available without creating a second ingress path here.
 #[allow(dead_code)]
@@ -848,6 +853,7 @@ pub(crate) struct EntityPhysicsQuery {
 pub(crate) enum EntityPhysicsKind {
     Default,
     Living,
+    AquaticLiving,
     ArrowProjectile {
         revision: Option<u64>,
         embedded_block: Option<mc_entity::projectile_26_1_2::BlockPosition>,
@@ -1296,6 +1302,9 @@ impl PlayerPose {
         }
         if self.sprinting {
             flags |= 0x08;
+        }
+        if self.swimming {
+            flags |= 0x10;
         }
         flags as i8
     }
@@ -10224,6 +10233,17 @@ async fn refresh_player_water_state(state: Option<&InteractionState>, pose: &mut
     pose.swimming = pose.in_water && pose.sprinting && (pose.input.forward || pose.eye_in_water);
 }
 
+fn publish_player_air_supply(
+    sessions: &SessionRegistry,
+    session_id: SessionId,
+    breathing: PlayerBreathingState,
+) {
+    dispatch_visibility_commands(
+        sessions
+            .broadcast_player_entity_data_including_self(session_id, vec![breathing.metadata()]),
+    );
+}
+
 async fn player_water_overlap(state: &InteractionState, pose: PlayerPose) -> (bool, bool) {
     let half_width = 0.3;
     let snapshot = player_body_block_snapshot(state, pose, half_width);
@@ -11674,6 +11694,7 @@ where
         observer.observe(player_pose).await;
     }
     let mut food_tick_timer: u32 = 0;
+    let mut breathing_state = PlayerBreathingState::default();
     let mut next_teleport_id: i32 = 2;
     let mut pending_teleport = Some(PendingTeleport::new(1, sessions.simulation_tick()));
     let mut client_brand: Option<String> = None;
@@ -12172,9 +12193,27 @@ where
                         "unconfirmed teleport synchronization resent"
                     );
                 }
-                if game_mode == GameMode::Survival {
+                let (next_breathing, breathing_tick) = breathing_state.tick(
+                    player_pose.eye_in_water,
+                    player_can_drown(game_mode, survival_state.is_dead()),
+                );
+                let breathing_requires_damage_commit = breathing_tick.drowning_damage > 0.0;
+                if !breathing_requires_damage_commit {
+                    breathing_state = next_breathing;
+                    if breathing_tick.air_changed {
+                        publish_player_air_supply(&sessions, session_id, breathing_state);
+                    }
+                }
+
+                let mut breathing_damage_committed = false;
+                if matches!(game_mode, GameMode::Survival | GameMode::Adventure) {
                     let mut updated_survival = survival_state;
-                    let health_tick = updated_survival.tick_health(&mut food_tick_timer);
+                    let health_tick = if game_mode == GameMode::Survival {
+                        updated_survival.tick_health(&mut food_tick_timer)
+                    } else {
+                        food_tick_timer = 0;
+                        SurvivalHealthTick::Unchanged
+                    };
                     if let SurvivalHealthTick::StarvationDamage(amount) = health_tick {
                         updated_survival.apply_damage(survival_damage_after_equipment(
                             interaction.as_deref(),
@@ -12182,11 +12221,20 @@ where
                             PlayerDamageKind::Starvation,
                         ));
                     }
-                    if health_tick != SurvivalHealthTick::Unchanged {
+                    if breathing_tick.drowning_damage > 0.0 {
+                        updated_survival.apply_damage(survival_damage_after_equipment(
+                            interaction.as_deref(),
+                            breathing_tick.drowning_damage,
+                            PlayerDamageKind::Drowning,
+                        ));
+                    }
+                    if health_tick != SurvivalHealthTick::Unchanged
+                        || breathing_tick.drowning_damage > 0.0
+                    {
                         if let Some(state) = interaction.as_deref_mut() {
                             let expected_inventory = state.inventory.clone();
                             let updated_xp = xp_state.clone();
-                            commit_player_survival_update(
+                            breathing_damage_committed = commit_player_survival_update(
                                 state,
                                 writer,
                                 &mut survival_state,
@@ -12202,9 +12250,10 @@ where
                         } else {
                             survival_state = updated_survival;
                             write_packet(writer, &survival_state.as_packet(), compression).await?;
+                            breathing_damage_committed = true;
                         }
                     }
-                    if current_tick.is_multiple_of(20) {
+                    if game_mode == GameMode::Survival && current_tick.is_multiple_of(20) {
                         apply_contact_block_damage(
                             interaction.as_deref_mut(),
                             writer,
@@ -12218,6 +12267,10 @@ where
                     }
                 } else {
                     food_tick_timer = 0;
+                }
+                if breathing_requires_damage_commit && breathing_damage_committed {
+                    breathing_state = next_breathing;
+                    publish_player_air_supply(&sessions, session_id, breathing_state);
                 }
                 if let Some(state) = interaction.as_deref_mut() {
                     tick_delayed_break(
@@ -12674,6 +12727,7 @@ where
                 } else if frame.id == ServerboundClientCommand::ID {
                     let mut body = frame.body;
                     let command = ServerboundClientCommand::decode(&mut body)?;
+                    let was_dead = survival_state.is_dead();
                     handle_client_command(
                         writer,
                         compression,
@@ -12690,6 +12744,9 @@ where
                         command,
                     )
                     .await?;
+                    if was_dead && !survival_state.is_dead() && breathing_state.reset() {
+                        publish_player_air_supply(&sessions, session_id, breathing_state);
+                    }
                     commit_authoritative_player_pose(&simulation, player_pose).await?;
                 } else if frame.id == ServerboundClientInformation::ID {
                     let mut body = frame.body;

@@ -3614,7 +3614,10 @@ fn step_sampled_entity(input: EntityPhysicsInput) -> play::EntityPhysicsStep {
         velocity: entity_vec(result.body.velocity),
         on_ground: result.body.on_ground,
         horizontal_collision: result.horizontal_collision
-            && matches!(input.query.kind, play::EntityPhysicsKind::Living),
+            && matches!(
+                input.query.kind,
+                play::EntityPhysicsKind::Living | play::EntityPhysicsKind::AquaticLiving
+            ),
     }
 }
 
@@ -3622,6 +3625,7 @@ fn physics_config_for_query(query: play::EntityPhysicsQuery) -> PhysicsConfig {
     match query.kind {
         play::EntityPhysicsKind::Default => PhysicsConfig::default(),
         play::EntityPhysicsKind::Living => PhysicsConfig::living_entity(),
+        play::EntityPhysicsKind::AquaticLiving => PhysicsConfig::aquatic_entity(),
         play::EntityPhysicsKind::ArrowProjectile { .. } => {
             let mut config = PhysicsConfig::arrow_projectile();
             // Retained projectile velocity is blocks per Minecraft tick. This

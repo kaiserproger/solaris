@@ -13,6 +13,7 @@ use crate::play::{
 
 use super::entity_lifecycle::track_entity_chunk_locked;
 use super::entity_owner::owner_result;
+use super::entity_physics_class::entity_type_uses_aquatic_physics;
 use super::interaction_geometry::{distance_sq, entity_aabb};
 use super::outbound::VisibilityDispatch;
 use super::visibility::{
@@ -396,7 +397,7 @@ fn build_herd_spawn_candidates(
                 speed: HOSTILE_WANDER_SPEED,
                 period_ticks: 20,
             }
-        } else if entity_type_is_aquatic(&entity.type_name) {
+        } else if entity_type_uses_aquatic_physics(&entity.type_name) {
             entity.on_ground = false;
             GoalState::AquaticWander {
                 speed: PASSIVE_WANDER_SPEED * 0.9,
@@ -425,21 +426,6 @@ fn spawn_far_enough_from_players(player_positions: &[Vec3], position: Vec3) -> b
     player_positions
         .iter()
         .all(|player| distance_sq(position, *player) > min_distance_sq)
-}
-
-fn entity_type_is_aquatic(type_name: &str) -> bool {
-    matches!(
-        type_name,
-        "minecraft:cod"
-            | "minecraft:salmon"
-            | "minecraft:tropical_fish"
-            | "minecraft:pufferfish"
-            | "minecraft:squid"
-            | "minecraft:glow_squid"
-            | "minecraft:dolphin"
-            | "minecraft:axolotl"
-            | "minecraft:turtle"
-    )
 }
 
 pub(in crate::play::session) fn install_committed_herd_spawns_locked(

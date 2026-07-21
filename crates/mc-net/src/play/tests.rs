@@ -123,6 +123,7 @@ fn player_pose_metadata_reports_swimming_and_shared_flags() {
 
     assert_eq!(pose.entity_pose(), EntityPose::Swimming);
     assert_eq!(pose.shared_flags() & 0x08, 0x08);
+    assert_eq!(pose.shared_flags() & 0x10, 0x10);
 }
 
 #[test]

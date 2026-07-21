@@ -10,6 +10,7 @@ pub(in crate::play) enum PlayerDamageKind {
     Projectile,
     Fall,
     Campfire,
+    Drowning,
     Starvation,
     Generic,
     GenericKill,

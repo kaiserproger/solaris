@@ -24,6 +24,7 @@ mod container_views;
 mod entity_combat;
 mod entity_lifecycle;
 mod entity_owner;
+mod entity_physics_class;
 mod entity_simulation;
 mod explosion_authority;
 mod herd_spawn_authority;

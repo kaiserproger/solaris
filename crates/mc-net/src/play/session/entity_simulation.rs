@@ -1,6 +1,7 @@
 use super::entity_lifecycle::{
     move_entity_chunk_locked, remove_server_entity_locked, track_entity_chunk_locked,
 };
+use super::entity_physics_class::entity_type_uses_aquatic_physics;
 use super::interaction_geometry::{
     distance_sq, entity_aabb, entity_geometry, entity_is_near_player_chunk,
 };
@@ -23,7 +24,9 @@ fn entity_physics_query_matches(current: EntityMotionState, expected: &EntityPhy
                 && current.arrow_revision == revision
                 && current.arrow_embedded_block == embedded_block
         }
-        EntityPhysicsKind::Default | EntityPhysicsKind::Living => true,
+        EntityPhysicsKind::Default
+        | EntityPhysicsKind::Living
+        | EntityPhysicsKind::AquaticLiving => true,
     };
     current.position == expected.position
         && current.velocity == expected.velocity
@@ -262,6 +265,8 @@ impl SessionRegistry {
                                     .filter(|state| state.in_ground)
                                     .and_then(|state| state.last_block_position),
                             }
+                        } else if entity_type_uses_aquatic_physics(entity.type_name) {
+                            EntityPhysicsKind::AquaticLiving
                         } else if entity.item_stack.is_none()
                             && entity.experience_value.is_none()
                             && entity.block_state.is_none()
@@ -390,6 +395,8 @@ impl SessionRegistry {
                             .filter(|state| state.in_ground)
                             .and_then(|state| state.last_block_position),
                     }
+                } else if entity_type_uses_aquatic_physics(entity.type_name) {
+                    EntityPhysicsKind::AquaticLiving
                 } else if entity.item_stack.is_none()
                     && entity.experience_value.is_none()
                     && entity.block_state.is_none()
