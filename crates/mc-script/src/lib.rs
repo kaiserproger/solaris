@@ -29,6 +29,8 @@ mod item_pickup_tests;
 #[cfg(test)]
 mod player_death_tests;
 #[cfg(test)]
+mod player_inventory_tests;
+#[cfg(test)]
 mod player_teleport_tests;
 
 #[cfg(feature = "lua-runtime")]
@@ -923,6 +925,81 @@ impl ScriptInventoryStorageTransaction {
     }
 }
 
+/// Bounded atomic mutation of one connected player's main inventory and hotbar.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ScriptPlayerInventoryTransaction {
+    request_id: String,
+    player_id: ScriptPlayerId,
+    deltas: Vec<ScriptInventoryResourceDelta>,
+}
+
+impl ScriptPlayerInventoryTransaction {
+    pub fn try_new(
+        request_id: impl AsRef<str>,
+        player_id: ScriptPlayerId,
+        deltas: Vec<ScriptInventoryResourceDelta>,
+    ) -> Result<Self, ScriptDtoError> {
+        if deltas.is_empty() {
+            return Err(ScriptDtoError::EmptyTransaction);
+        }
+        if deltas.len() > MAX_INVENTORY_STORAGE_MUTATIONS {
+            return Err(ScriptDtoError::TooManyEntries {
+                field: "player inventory transaction",
+                max: MAX_INVENTORY_STORAGE_MUTATIONS,
+            });
+        }
+        let mut resource_ids = BTreeMap::new();
+        for delta in &deltas {
+            if resource_ids.insert(delta.resource_id(), ()).is_some() {
+                return Err(ScriptDtoError::DuplicateId {
+                    field: "inventory resource id",
+                    actual_bytes: delta.resource_id().len(),
+                });
+            }
+        }
+        Ok(Self {
+            request_id: validate_script_id(request_id.as_ref())?,
+            player_id,
+            deltas,
+        })
+    }
+
+    pub fn request_id(&self) -> &str {
+        &self.request_id
+    }
+
+    pub const fn player_id(&self) -> ScriptPlayerId {
+        self.player_id
+    }
+
+    pub fn deltas(&self) -> &[ScriptInventoryResourceDelta] {
+        &self.deltas
+    }
+}
+
+/// Exact reason why an admitted player inventory transaction did not commit.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum ScriptPlayerInventoryFailure {
+    PlayerUnavailable,
+    RuntimeUnavailable,
+    UnknownResource,
+    InsufficientResource,
+    InventoryFull,
+}
+
+impl ScriptPlayerInventoryFailure {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::PlayerUnavailable => "player_unavailable",
+            Self::RuntimeUnavailable => "runtime_unavailable",
+            Self::UnknownResource => "unknown_resource",
+            Self::InsufficientResource => "insufficient_resource",
+            Self::InventoryFull => "inventory_full",
+        }
+    }
+}
+
 /// Server-owned colony record requested by a plugin.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ScriptColonyRecord {
@@ -1649,6 +1726,22 @@ impl ScriptEvent {
         })
     }
 
+    /// Build the targeted result of one admitted player inventory transaction.
+    pub(crate) fn player_inventory_transaction_result(
+        target_plugin_id: impl AsRef<str>,
+        transaction: &ScriptPlayerInventoryTransaction,
+        failure: Option<ScriptPlayerInventoryFailure>,
+    ) -> Result<Self, ScriptDtoError> {
+        Ok(Self {
+            target_plugin_id: Some(validate_target_plugin_id(target_plugin_id.as_ref())?),
+            kind: ScriptEventKind::PlayerInventoryTransactionResult {
+                request_id: transaction.request_id().to_owned(),
+                player_id: transaction.player_id(),
+                failure,
+            },
+        })
+    }
+
     /// Build a targeted zone-entry snapshot owned by the plugin that registered the zone.
     pub(crate) fn player_zone_entered(
         target_plugin_id: impl AsRef<str>,
@@ -1782,6 +1875,9 @@ impl ScriptEvent {
             ScriptEventKind::InventoryMenuClicked { .. } => "inventory.menu.clicked",
             ScriptEventKind::InventoryStorageTransactionResult { .. } => {
                 "inventory.storage_transaction.result"
+            }
+            ScriptEventKind::PlayerInventoryTransactionResult { .. } => {
+                "player.inventory_transaction_result"
             }
             ScriptEventKind::PlayerZoneEntered { .. } => "player.zone_entered",
             ScriptEventKind::PlayerZoneExited { .. } => "player.zone_exited",
@@ -1995,7 +2091,8 @@ impl ScriptEvent {
                 context.validate()?;
                 validate_script_id(zone_id).map(drop)
             }
-            ScriptEventKind::PlayerTeleportResult { request_id, .. } => {
+            ScriptEventKind::PlayerInventoryTransactionResult { request_id, .. }
+            | ScriptEventKind::PlayerTeleportResult { request_id, .. } => {
                 validate_script_id(request_id).map(drop)
             }
             ScriptEventKind::ColonyRecordResult {
@@ -2148,6 +2245,11 @@ pub enum ScriptEventKind {
         request_id: String,
         committed: bool,
     },
+    PlayerInventoryTransactionResult {
+        request_id: String,
+        player_id: ScriptPlayerId,
+        failure: Option<ScriptPlayerInventoryFailure>,
+    },
     PlayerZoneEntered {
         player_id: ScriptPlayerId,
         context: ScriptPlayerContext,
@@ -2230,6 +2332,9 @@ pub enum ScriptCommand {
     },
     InventoryStorageTransaction {
         transaction: ScriptInventoryStorageTransaction,
+    },
+    PlayerInventoryTransaction {
+        transaction: ScriptPlayerInventoryTransaction,
     },
     UpsertZone {
         zone: ScriptAxisAlignedZone,
@@ -2523,6 +2628,19 @@ impl AdmittedScriptCommand {
         ScriptEvent::inventory_storage_transaction_result(&self.plugin_id, transaction, committed)
     }
 
+    pub fn player_inventory_transaction_result(
+        self,
+        failure: Option<ScriptPlayerInventoryFailure>,
+    ) -> Result<ScriptEvent, ScriptDtoError> {
+        let ScriptCommand::PlayerInventoryTransaction { transaction } = self.request.as_ref()
+        else {
+            return Err(ScriptDtoError::InconsistentResult {
+                field: "player inventory transaction admission",
+            });
+        };
+        ScriptEvent::player_inventory_transaction_result(&self.plugin_id, transaction, failure)
+    }
+
     pub fn colony_record_result(self, accepted: bool) -> Result<ScriptEvent, ScriptDtoError> {
         let ScriptCommand::UpsertColony { request } = self.request.as_ref() else {
             return Err(ScriptDtoError::InconsistentResult {
@@ -2650,6 +2768,9 @@ impl ScriptCommand {
             Self::InventoryStorageTransaction { .. } => {
                 Some(RequiredCommandCapability::InventoryStorageTransactions)
             }
+            Self::PlayerInventoryTransaction { .. } => {
+                Some(RequiredCommandCapability::PlayerInventory)
+            }
             Self::UpsertZone { .. } | Self::RemoveZone { .. } => {
                 Some(RequiredCommandCapability::Zones)
             }
@@ -2735,6 +2856,14 @@ impl ScriptCommand {
                     transaction.player_id(),
                     transaction.inventory().to_vec(),
                     transaction.storage().to_vec(),
+                )
+                .map(drop)
+            }
+            Self::PlayerInventoryTransaction { transaction } => {
+                ScriptPlayerInventoryTransaction::try_new(
+                    transaction.request_id(),
+                    transaction.player_id(),
+                    transaction.deltas().to_vec(),
                 )
                 .map(drop)
             }
@@ -3281,6 +3410,7 @@ pub enum ScriptCommandCapability {
     PluginStorage,
     InventoryMenus,
     InventoryStorageTransactions,
+    PlayerInventory,
     Zones,
     Colonies,
     PlayerTeleport,
@@ -3295,6 +3425,7 @@ pub enum ScriptCommandCapabilityKind {
     PluginStorage,
     InventoryMenus,
     InventoryStorageTransactions,
+    PlayerInventory,
     Zones,
     Colonies,
     PlayerTeleport,
@@ -3308,6 +3439,7 @@ impl ScriptCommandCapabilityKind {
             Self::PluginStorage => "plugin_storage",
             Self::InventoryMenus => "inventory_menus",
             Self::InventoryStorageTransactions => "inventory_storage_transactions",
+            Self::PlayerInventory => "player_inventory",
             Self::Zones => "zones",
             Self::Colonies => "colonies",
             Self::PlayerTeleport => "player_teleport",
@@ -3321,6 +3453,7 @@ impl ScriptCommandCapabilityKind {
             Self::PluginStorage => "plugin storage",
             Self::InventoryMenus => "inventory menu",
             Self::InventoryStorageTransactions => "inventory storage transaction",
+            Self::PlayerInventory => "player inventory transaction",
             Self::Zones => "zone",
             Self::Colonies => "colony",
             Self::PlayerTeleport => "player teleport",
@@ -3335,6 +3468,7 @@ enum RequiredCommandCapability<'a> {
     PluginStorage,
     InventoryMenus,
     InventoryStorageTransactions,
+    PlayerInventory,
     Zones,
     Colonies,
     PlayerTeleport,
@@ -3350,6 +3484,7 @@ impl RequiredCommandCapability<'_> {
             Self::InventoryStorageTransactions => {
                 ScriptCommandCapabilityKind::InventoryStorageTransactions
             }
+            Self::PlayerInventory => ScriptCommandCapabilityKind::PlayerInventory,
             Self::Zones => ScriptCommandCapabilityKind::Zones,
             Self::Colonies => ScriptCommandCapabilityKind::Colonies,
             Self::PlayerTeleport => ScriptCommandCapabilityKind::PlayerTeleport,
@@ -3581,6 +3716,12 @@ impl ScriptPluginManifest {
     /// Declare access to atomic player-inventory and plugin-storage requests.
     pub fn declare_inventory_storage_transactions(mut self) -> Self {
         self.push_capability(ScriptCommandCapability::InventoryStorageTransactions);
+        self
+    }
+
+    /// Declare access to atomic player main-inventory and hotbar mutations.
+    pub fn declare_player_inventory(mut self) -> Self {
+        self.push_capability(ScriptCommandCapability::PlayerInventory);
         self
     }
 
@@ -3923,6 +4064,7 @@ impl ScriptPluginManifest {
                 ScriptCommandCapability::PluginStorage
                 | ScriptCommandCapability::InventoryMenus
                 | ScriptCommandCapability::InventoryStorageTransactions
+                | ScriptCommandCapability::PlayerInventory
                 | ScriptCommandCapability::Zones
                 | ScriptCommandCapability::Colonies
                 | ScriptCommandCapability::PlayerTeleport => {
@@ -4065,6 +4207,9 @@ impl ValidatedScriptPluginManifest {
                 }
                 ScriptCommandCapability::InventoryStorageTransactions => {
                     capabilities = capabilities.allow_inventory_storage_transactions();
+                }
+                ScriptCommandCapability::PlayerInventory => {
+                    capabilities = capabilities.allow_player_inventory();
                 }
                 ScriptCommandCapability::Zones => {
                     capabilities = capabilities.allow_zones();
@@ -4219,6 +4364,7 @@ pub struct CommandCapabilities {
     plugin_storage: bool,
     inventory_menus: bool,
     inventory_storage_transactions: bool,
+    player_inventory: bool,
     zones: bool,
     colonies: bool,
     player_teleport: bool,
@@ -4275,6 +4421,12 @@ impl CommandCapabilities {
     }
 
     #[cfg(any(test, feature = "lua-runtime"))]
+    pub(crate) fn allow_player_inventory(mut self) -> Self {
+        self.player_inventory = true;
+        self
+    }
+
+    #[cfg(any(test, feature = "lua-runtime"))]
     pub(crate) fn allow_zones(mut self) -> Self {
         self.zones = true;
         self
@@ -4307,6 +4459,7 @@ impl CommandCapabilities {
             RequiredCommandCapability::InventoryStorageTransactions => {
                 self.inventory_storage_transactions
             }
+            RequiredCommandCapability::PlayerInventory => self.player_inventory,
             RequiredCommandCapability::Zones => self.zones,
             RequiredCommandCapability::Colonies => self.colonies,
             RequiredCommandCapability::PlayerTeleport => self.player_teleport,
@@ -4443,6 +4596,7 @@ fn is_supported_event_name(event_name: &str) -> bool {
             | "plugin.storage.delete_result"
             | "inventory.menu.clicked"
             | "inventory.storage_transaction.result"
+            | "player.inventory_transaction_result"
             | "player.zone_entered"
             | "player.zone_exited"
             | "player.teleport_result"

@@ -21,10 +21,11 @@ use crate::{
     ScriptCommand, ScriptDtoError, ScriptEvent, ScriptEventKind, ScriptHostEndpoint,
     ScriptInventoryMenu, ScriptInventoryMenuItem, ScriptInventoryMenuSlot,
     ScriptInventoryResourceDelta, ScriptInventoryStorageTransaction, ScriptPlayerId,
-    ScriptPlayerTeleportRequest, ScriptPluginManifest, ScriptPluginStorageCompareAndSwapRequest,
-    ScriptPluginStorageDeleteRequest, ScriptPluginStorageGetRequest, ScriptPosition, ScriptRuntime,
-    ScriptStorageMutation, ScriptVillagerBindingRequest, ScriptVillagerOrder,
-    ScriptVillagerOrderRequest, ValidatedScriptPluginManifest, script_boundary_pair,
+    ScriptPlayerInventoryTransaction, ScriptPlayerTeleportRequest, ScriptPluginManifest,
+    ScriptPluginStorageCompareAndSwapRequest, ScriptPluginStorageDeleteRequest,
+    ScriptPluginStorageGetRequest, ScriptPosition, ScriptRuntime, ScriptStorageMutation,
+    ScriptVillagerBindingRequest, ScriptVillagerOrder, ScriptVillagerOrderRequest,
+    ValidatedScriptPluginManifest, script_boundary_pair,
 };
 
 const EVENT_QUEUE_CAPACITY: usize = 1_024;
@@ -308,6 +309,7 @@ fn declare_disk_capability(
         "storage" => Ok(manifest.declare_plugin_storage()),
         "inventory_menus" => Ok(manifest.declare_inventory_menus()),
         "inventory_storage_transactions" => Ok(manifest.declare_inventory_storage_transactions()),
+        "player_inventory" => Ok(manifest.declare_player_inventory()),
         "zones" => Ok(manifest.declare_zones()),
         "colonies" => Ok(manifest.declare_colonies()),
         "player_teleport" => Ok(manifest.declare_player_teleport()),
@@ -901,6 +903,25 @@ fn install_solaris_api(
                 push_command(
                     &transaction_invocation,
                     ScriptCommand::InventoryStorageTransaction { transaction },
+                )
+            },
+        )?,
+    )?;
+    let player_inventory_invocation = Arc::clone(&invocation);
+    api.set(
+        "inventory_transaction",
+        lua.create_function(
+            move |_, (player_id, request_id, inventory): (u64, LuaString, Table)| {
+                let request_id = bounded_script_id(request_id, "request_id")?;
+                let transaction = ScriptPlayerInventoryTransaction::try_new(
+                    request_id,
+                    ScriptPlayerId::new(player_id),
+                    parse_inventory_deltas(inventory)?,
+                )
+                .map_err(dto_error)?;
+                push_command(
+                    &player_inventory_invocation,
+                    ScriptCommand::PlayerInventoryTransaction { transaction },
                 )
             },
         )?,
@@ -1605,6 +1626,16 @@ fn event_table(lua: &Lua, event: &ScriptEvent) -> mlua::Result<Table> {
             table.set("request_id", request_id.as_str())?;
             table.set("committed", *committed)?;
         }
+        ScriptEventKind::PlayerInventoryTransactionResult {
+            request_id,
+            player_id,
+            failure,
+        } => {
+            table.set("request_id", request_id.as_str())?;
+            table.set("player_id", player_id.value())?;
+            table.set("committed", failure.is_none())?;
+            table.set("failure", failure.map(|failure| failure.as_str()))?;
+        }
         ScriptEventKind::PlayerZoneEntered {
             player_id,
             context,
@@ -1709,6 +1740,9 @@ fn handler_name(event: &ScriptEvent) -> &'static str {
         ScriptEventKind::InventoryStorageTransactionResult { .. } => {
             "on_inventory_storage_transaction_result"
         }
+        ScriptEventKind::PlayerInventoryTransactionResult { .. } => {
+            "on_player_inventory_transaction_result"
+        }
         ScriptEventKind::PlayerZoneEntered { .. } => "on_player_zone_entered",
         ScriptEventKind::PlayerZoneExited { .. } => "on_player_zone_exited",
         ScriptEventKind::PlayerTeleportResult { .. } => "on_player_teleport_result",
@@ -1736,6 +1770,9 @@ fn runtime_error(error: mlua::Error) -> RuntimeError {
         message: error.to_string(),
     }
 }
+
+#[cfg(test)]
+mod player_inventory_tests;
 
 #[cfg(test)]
 mod tests {

@@ -3,11 +3,11 @@ use std::time::Instant;
 
 use mc_data::item_components::ItemFactsTable;
 use mc_data::items::ItemRegistry;
-use mc_script::ScriptInventoryStorageTransaction;
+use mc_script::{ScriptPlayerInventoryFailure, ScriptPlayerInventoryTransaction};
 use tracing::warn;
 
 use crate::play::script_inventory_transaction::{
-    ScriptStoragePrepareOutcome, ScriptStorageTransactionPrepare, plan_script_inventory_transaction,
+    ScriptInventoryPlanError, plan_script_inventory_deltas,
 };
 
 use super::SessionRegistry;
@@ -15,32 +15,23 @@ use super::outbound::{OutboundCommand, dispatch_visibility_command};
 use super::visibility::ordered_session_recipient;
 
 impl SessionRegistry {
-    /// Commits the plugin ledger and the canonical player inventory while the
-    /// same player-state lock excludes every other inventory mutation. Storage
-    /// I/O is intentionally allowed under this lock: plugin purchases are a
-    /// cold path, and releasing it would make the two commits observable apart.
-    pub(crate) fn commit_script_inventory_storage_transaction<S>(
+    pub(crate) fn commit_script_player_inventory_transaction(
         &self,
-        plugin_id: &str,
-        transaction: &ScriptInventoryStorageTransaction,
+        transaction: &ScriptPlayerInventoryTransaction,
         items: &ItemRegistry,
         item_facts: &ItemFactsTable,
-        storage: &mut S,
-    ) -> Result<bool, S::Error>
-    where
-        S: ScriptStorageTransactionPrepare,
-    {
+    ) -> Result<(), ScriptPlayerInventoryFailure> {
         let (player_state, recipient, transaction_active) = {
-            let inner = self.lock_inner("prepare script inventory transaction");
+            let inner = self.lock_inner("prepare script player inventory transaction");
             let player_id = transaction.player_id().value();
             let Some(session) = inner.sessions.get(&player_id) else {
-                return Ok(false);
+                return Err(ScriptPlayerInventoryFailure::PlayerUnavailable);
             };
             if session.tx.is_closed() {
-                return Ok(false);
+                return Err(ScriptPlayerInventoryFailure::PlayerUnavailable);
             }
             let Some(player_state) = inner.player_persistence.get(&player_id).cloned() else {
-                return Ok(false);
+                return Err(ScriptPlayerInventoryFailure::PlayerUnavailable);
             };
             (
                 player_state,
@@ -55,42 +46,35 @@ impl SessionRegistry {
         let transaction_active = transaction_active.lock().unwrap_or_else(|poisoned| {
             warn!(
                 player_id = transaction.player_id().value(),
-                "script transaction gate was poisoned during commit; recovering state"
+                "script transaction gate was poisoned during player inventory commit; recovering state"
             );
             poisoned.into_inner()
         });
         if !*transaction_active {
-            return Ok(false);
+            return Err(ScriptPlayerInventoryFailure::PlayerUnavailable);
         }
 
         let wait_started = Instant::now();
         let guard = player_state.lock().unwrap_or_else(|poisoned| {
             warn!(
                 player_id = transaction.player_id().value(),
-                "player persistence mutex was poisoned during script inventory transaction; recovering state"
+                "player persistence mutex was poisoned during script inventory commit; recovering state"
             );
             poisoned.into_inner()
         });
         let mut player_state = crate::lock_metrics::timed_guard(
             crate::lock_metrics::LockMetricKind::PlayerPersistence,
-            "commit script inventory transaction",
+            "commit script player inventory transaction",
             wait_started,
             guard,
         );
-        let plan = match plan_script_inventory_transaction(
-            transaction,
+        let plan = plan_script_inventory_deltas(
+            transaction.deltas(),
             &player_state.inventory,
             items,
             item_facts,
-        ) {
-            Ok(plan) => plan,
-            Err(_) => return Ok(false),
-        };
-        let prepared = match storage.prepare(plugin_id, transaction.storage())? {
-            ScriptStoragePrepareOutcome::Prepared(prepared) => prepared,
-            ScriptStoragePrepareOutcome::Rejected => return Ok(false),
-        };
-        storage.commit(prepared)?;
+        )
+        .map_err(map_plan_failure)?;
         player_state.replace_inventory(plan.updated.clone());
         let carried_item = player_state.carried_item.clone();
         drop(player_state);
@@ -102,19 +86,18 @@ impl SessionRegistry {
                 carried_item,
             },
         );
-        Ok(true)
+        Ok(())
     }
+}
 
-    #[cfg(test)]
-    pub(super) fn pause_script_transaction_after_capture_for_test(&self) {
-        let probe = self
-            .script_transaction_capture_probe
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .take();
-        if let Some(probe) = probe {
-            probe.reached.send(()).expect("capture probe receiver");
-            probe.resume.recv().expect("capture probe resume");
+fn map_plan_failure(error: ScriptInventoryPlanError) -> ScriptPlayerInventoryFailure {
+    match error {
+        ScriptInventoryPlanError::UnknownResource(_) => {
+            ScriptPlayerInventoryFailure::UnknownResource
         }
+        ScriptInventoryPlanError::InsufficientResource(_) => {
+            ScriptPlayerInventoryFailure::InsufficientResource
+        }
+        ScriptInventoryPlanError::InventoryFull(_) => ScriptPlayerInventoryFailure::InventoryFull,
     }
 }

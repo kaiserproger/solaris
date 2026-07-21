@@ -1,5 +1,6 @@
 mod colony;
 mod events;
+mod inventory;
 mod router;
 mod storage;
 mod teleport;
@@ -7,6 +8,8 @@ mod zone;
 
 #[cfg(test)]
 mod colony_tests;
+#[cfg(test)]
+mod inventory_tests;
 #[cfg(test)]
 mod storage_tests;
 #[cfg(test)]

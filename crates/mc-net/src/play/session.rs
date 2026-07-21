@@ -55,6 +55,9 @@ mod script_inventory_transaction_endpoint_tests;
 mod script_menu_endpoint;
 #[cfg(test)]
 mod script_menu_endpoint_tests;
+mod script_player_inventory_endpoint;
+#[cfg(test)]
+mod script_player_inventory_endpoint_tests;
 mod script_teleport_endpoint;
 #[cfg(test)]
 mod script_teleport_endpoint_tests;

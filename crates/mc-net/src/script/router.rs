@@ -3,6 +3,7 @@ use tracing::{debug, warn};
 
 use super::colony::{ColonyAdapterError, PluginColonyAdapter};
 use super::events::{TargetedEventDelivery, deliver_required_targeted_event};
+use super::inventory::{InventoryAdapterError, PluginInventoryAdapter};
 use super::storage::{PluginStorageHandle, storage_failure_event};
 use super::teleport::{PluginTeleportAdapter, TeleportAdapterError};
 use super::zone::PluginZoneAdapter;
@@ -32,6 +33,7 @@ pub(crate) struct ScriptRouterContext<'a> {
 
 pub(crate) struct ScriptRouter {
     scripts: ScriptEventSink,
+    inventories: PluginInventoryAdapter,
     storage: Option<PluginStorageHandle>,
     zones: PluginZoneAdapter,
     colonies: PluginColonyAdapter,
@@ -50,10 +52,12 @@ impl ScriptRouter {
         storage: Option<PluginStorageHandle>,
         zones: PluginZoneAdapter,
     ) -> Self {
+        let inventories = PluginInventoryAdapter::new(scripts.clone());
         let colonies = PluginColonyAdapter::new(scripts.clone());
         let teleports = PluginTeleportAdapter::new(scripts.clone());
         Self {
             scripts,
+            inventories,
             storage,
             zones,
             colonies,
@@ -123,6 +127,7 @@ impl ScriptRouter {
             | ScriptCommand::OpenInventoryMenu { .. }
             | ScriptCommand::CloseInventoryMenu { .. }
             | ScriptCommand::InventoryStorageTransaction { .. }
+            | ScriptCommand::PlayerInventoryTransaction { .. }
             | ScriptCommand::UpsertZone { .. }
             | ScriptCommand::RemoveZone { .. }
             | ScriptCommand::UpsertColony { .. }
@@ -218,6 +223,26 @@ impl ScriptRouter {
                     debug!(?error, "admitted script menu command rejected");
                 }
                 ScriptRouterExit::Continue
+            }
+            ScriptCommand::PlayerInventoryTransaction { .. } => {
+                match self
+                    .inventories
+                    .route_admitted(
+                        admitted,
+                        context.sessions,
+                        &context.config.items,
+                        &context.config.item_facts,
+                        context.config.world.is_some(),
+                    )
+                    .await
+                {
+                    Ok(()) => ScriptRouterExit::Continue,
+                    Err(InventoryAdapterError::PublicationClosed) => ScriptRouterExit::Stop,
+                    Err(error) => {
+                        warn!(?error, "admitted player inventory transaction rejected");
+                        ScriptRouterExit::Continue
+                    }
+                }
             }
             ScriptCommand::UpsertZone { .. } | ScriptCommand::RemoveZone { .. } => {
                 if let Err(error) = self.zones.route_admitted(admitted) {
