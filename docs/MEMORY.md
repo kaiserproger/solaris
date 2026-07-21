@@ -62,8 +62,21 @@ and is not startup context.
   owner/operator bypass, stranger rejection, and unchanged world blocks. The
   adapter convention is intentionally temporary and protects direct break and
   placement only; containers, fluids, pistons, explosions, fire, and entity
-  interaction remain open. No manual-client gate has run. Next: run manual
-  real-client mob combat before terrain expansion.
+  interaction remain open. No manual-client gate has run.
+- The agent-run real-client hostile-combat functional gate is closed on an
+  isolated O3 server. Ordinary 26.1.2 client actions selected an iron sword,
+  killed a zombie, observed and collected its rotten-flesh drop, observed a
+  skeleton arrow and player damage, then observed creeper damage and removal
+  while remaining `in_play=true`; this is consistent with the exact explosion
+  path already proved by the TCP regression. The retained harness shows that
+  operator commands only created the deterministic fixture. The server logged
+  one `57.474 ms` tick after processing 62 simulation commands with 10 still
+  queued and no reliable drop, retry, or disconnect warning. Evidence:
+  `.analysis/mcp-combat-check.py`,
+  `.analysis/codex-logs/mcp-hostile-combat-result-v2.json` and
+  `.analysis/codex-logs/mcp-hostile-combat-server-v2.log`. Next: run a
+  20-minute MCP survival session with subagent-made decisions, no deterministic
+  scenario runner, and no operator setup; subjective combat feel remains open.
 - The exact dense 5,132-cow O3 gate is closed. The final reproduced cause was
   an unanswered keepalive challenge while valid movement packets still proved
   the client alive. Solaris now preserves one pending challenge, requires both
@@ -97,8 +110,8 @@ and is not startup context.
   `water_fluid_height=0.8888889`; 81 chunks streamed with measured
   `chunk_data_ms=0`. The follow-up O3 MCP gate observed ascent, diving,
   swimming pose, air depletion, drowning damage and connection continuity.
-  Evidence is `.analysis/codex-logs/deep-water-real-client-final.json`. Next:
-  run manual real-client mob combat.
+  Evidence is `.analysis/codex-logs/deep-water-real-client-final.json`. The
+  hostile-combat functional follow-up is recorded above.
 - `7cdd917` fixes the ordinary active-game save path exposed by the natural
   furnace loop. A resident mutation during out-of-lock whole-region encoding
   now skips that Anvil region before filesystem installation and leaves it
@@ -365,12 +378,14 @@ two priorities unless it becomes a common-play blocker or corruption risk.
 
 ## Active Risks
 
-1. Run an owner-played survival session and fix its first common client-visible
-   blocker before isolated parity or performance work.
-2. Include the `d9c0804` fuel contract in the next owner-played survival
-   session; fix a concrete common client-visible regression if one appears.
-3. If owner play finds no common blocker, advance the production Lua plugin API
-   before returning to broad optimization work.
+1. Run the requested 20-minute MCP survival session with subagent-made
+   decisions, no deterministic scenario runner, and no operator setup. Fix its
+   first common client-visible blocker before isolated parity or performance
+   work; an owner-played subjective-feel gate remains separately pending.
+2. Include the `d9c0804` fuel contract in that survival session; fix a concrete
+   common client-visible regression if one appears.
+3. If the session finds no common blocker, advance the production Lua plugin
+   API before returning to broad optimization work.
 4. Only after those priorities, continue reducing `simulation.rs` through
    explicit ownership boundaries; avoid moves that retain `use super::*` or
    duplicate authority.

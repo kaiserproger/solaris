@@ -26,11 +26,13 @@ This queue is binding across context compaction: common vanilla gameplay first,
 then production plugin API, then measured optimization, and only then rare
 hardening. An already-open lower-priority diff does not override this order.
 
-1. Get one owner-played survival session on the current build. Record concrete
-   client-visible failures; do not substitute isolated parity probes for it.
-2. Treat failures from the owner session as the playable queue. Fix the first
-   common player-visible blocker, then rerun the shortest real-client scenario
-   that reproduces it.
+1. Run the requested 20-minute MCP survival session on the current build, with
+   one fast subagent making the decisions and no deterministic scenario runner
+   or operator setup. Record concrete client-visible failures; an owner-played
+   subjective-feel gate remains separately pending.
+2. Treat failures from that session as the playable queue. Fix the first common
+   player-visible blocker, then rerun the shortest real-client path that
+   reproduces it.
    The exact dense-world failure is closed on an O3 server with 5,132 injected
    cows and 5,227 total entities. Solaris keeps one outstanding keepalive,
    treats other valid inbound packets as connection-liveness evidence, uses
@@ -46,14 +48,15 @@ hardening. An already-open lower-priority diff does not override this order.
    entity/fluid overlap: entering source water reports `in_water=true` and a
    fluid height of `0.8888889`. The O3 deep-water client gate now covers
    ascent, diving, swimming pose, air depletion and drowning damage without a
-   disconnect. Manual mob combat is the next playable gate.
-3. Close the remaining owner-client report: manual mob-combat feel. The mob
-   death core now has bounded O3
-   load evidence, but this does not replace client/socket verification. Default
-   block, entity-use and melee reach follow the 26.1.2 server verification
-   contracts. Skeleton arrows and creeper explosions have real TCP coverage.
-   Dry-land random-seed spawn has focused server evidence and an initial
-   real-client non-water observation.
+   disconnect.
+3. The agent-run 26.1.2 hostile-combat gate is closed. Ordinary client action
+   packets killed a zombie with an iron sword and collected its rotten-flesh
+   drop; a skeleton published a visible arrow and damaged the player; a
+   creeper damaged the player and was removed, consistent with its explosion
+   path already proved by the TCP regression. The retained harness shows that
+   local operator commands only created the deterministic night-time fixture
+   and summoned the three mobs. This proves the functional client/server
+   paths, not subjective combat feel or natural survival progression.
 4. Basic economy and whole-chunk land claims now run on the production Lua API.
    Close the remaining claim surfaces (containers, fluids, explosions and
    entity interaction) through a first-class zone protection policy after the
@@ -61,13 +64,31 @@ hardening. An already-open lower-priority diff does not override this order.
 5. Improve terrain generation toward the concrete Tellus/Tectonic traits that
    can be measured without breaking vanilla world persistence. Then run a
    bounded explosion load benchmark and record the exact envelope.
-6. Close this owner batch with an MCP-driven, unscripted survival session run
-   by one fast subagent. Treat its visible failures as the next playable queue.
+6. Close this owner batch with a 20-minute MCP-driven survival session whose
+   decisions are made by one fast subagent. Do not use the deterministic
+   scenario runner or operator setup. Treat its visible failures as the next
+   playable queue.
 7. Keep the rare multi-region save recovery `fsync`/metrics issue documented
    but deferred. Do not resume it unless it becomes ordinary save corruption or
    blocks the playable or plugin path.
 
 ## Recent Evidence
+
+- A fresh isolated O3 server and real 26.1.2 client completed the hostile-mob
+  functional gate through embedded MCP. The client selected an iron sword,
+  approached zombie `1000079`, killed it, saw the rotten-flesh drop, and
+  restored the pickup. Skeleton `1000082` published arrow `1000083` and reduced
+  player health from `13.833334` to `10.333335`. Creeper `1000084` reduced
+  health from `10.333335` to `9.333335` and disappeared, consistent with the
+  explosion path already proved by the TCP regression; the client remained
+  `in_play=true`. The server recorded one `57.474 ms` over-budget tick after
+  processing 62 simulation commands with 10 still queued, with zero reliable
+  drops, retries, or disconnect warnings. Evidence harness and results:
+  `.analysis/mcp-combat-check.py`,
+  `.analysis/codex-logs/mcp-hostile-combat-result-v2.json` and
+  `.analysis/codex-logs/mcp-hostile-combat-server-v2.log`. This was an
+  agent-run deterministic functional gate; subjective animation/feel and a
+  natural no-operator survival run remain unproven.
 
 - Water diagnosis now uses structured MCP state rather than screenshots. The
   26.1.2 client exposes fluid tags/type/height/collision, player water flags,
