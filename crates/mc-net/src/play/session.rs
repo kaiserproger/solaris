@@ -1287,6 +1287,7 @@ impl SessionRegistry {
         self.outbound_pressure.record_slow_client_write_timeout();
     }
 
+    #[cfg(test)]
     pub(super) fn record_slow_client_pressure_shed(&self) {
         self.outbound_pressure.record_slow_client_pressure_shed();
     }
@@ -1610,6 +1611,7 @@ fn apply_player_melee_knockback_locked(
                 recipient: ordered_session_recipient(observer_id, observer),
                 command: OutboundCommand::MoveEntityRelative(ServerEntityMove {
                     id: target_id,
+                    position: snapshot.position,
                     wire_move: None,
                     velocity: snapshot.velocity,
                     rotation: snapshot.rotation,

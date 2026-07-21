@@ -546,11 +546,11 @@ pub const KEEPALIVE_TIMEOUT: Duration = Duration::from_secs(30);
 const SLOW_CLIENT_OUTBOUND_WRITE_TIMEOUT: Duration = Duration::from_secs(5);
 #[cfg(test)]
 const SLOW_CLIENT_OUTBOUND_WRITE_TIMEOUT: Duration = Duration::from_millis(10);
-const SLOW_CLIENT_OUTBOUND_PRESSURE_TURNS: usize = 4;
 const SLOW_CLIENT_OUTBOUND_PRESSURE_NUMERATOR: usize = 3;
 const SLOW_CLIENT_OUTBOUND_PRESSURE_DENOMINATOR: usize = 4;
 const OUTBOUND_COMMANDS_PER_PLAYER_BURST: usize = 16;
 const ENTITY_SPAWNS_PER_WRITE_TURN: usize = 16;
+const ENTITY_MOVEMENTS_PER_WRITE_TURN: usize = 256;
 const TELEPORT_RESEND_DELAY_TICKS: u64 = 20;
 
 const SPAWN_X: f64 = 0.5;
@@ -11319,6 +11319,14 @@ fn collect_light_update_batch(
     updates
 }
 
+fn take_entity_movement_write_turn(
+    mut movements: Vec<ServerEntityMove>,
+) -> (Vec<ServerEntityMove>, Option<Vec<ServerEntityMove>>) {
+    let remaining = (movements.len() > ENTITY_MOVEMENTS_PER_WRITE_TURN)
+        .then(|| movements.split_off(ENTITY_MOVEMENTS_PER_WRITE_TURN));
+    (movements, remaining)
+}
+
 fn outbound_queue_at_shed_pressure(
     rx: &mpsc::Receiver<OutboundCommand>,
     pending: &VecDeque<OutboundCommand>,
@@ -11706,7 +11714,6 @@ where
     let mut client_preferences: Option<ClientPreferences> = None;
     let mut effective_client_view_distance = server_view_distance;
     let mut pending_outbound = VecDeque::new();
-    let mut outbound_pressure_turns = 0usize;
     let mut simulation_ticks = sessions.subscribe_simulation_ticks();
     send_world_time(writer, compression, &sessions).await?;
     write_packet(writer, &survival_state.as_packet(), compression).await?;
@@ -11721,9 +11728,6 @@ where
 
     loop {
         let mut stream_finished = false;
-        let chunk_stream_active = chunk_stream
-            .as_ref()
-            .is_some_and(|stream| !stream.is_complete());
         if chunk_stream_needs_step
             && outbound_queue_at_shed_pressure(&outbound_rx, &pending_outbound).is_none()
             && let (Some(stream), Some(state)) = (chunk_stream.as_mut(), interaction.as_deref_mut())
@@ -11760,30 +11764,6 @@ where
         if stream_finished && let Some(stream) = chunk_stream.as_mut() {
             stream.log_summary_once();
         }
-        if let Some((queued, capacity, threshold)) =
-            outbound_queue_at_shed_pressure(&outbound_rx, &pending_outbound)
-        {
-            if chunk_stream_active || permissions.op {
-                outbound_pressure_turns = 0;
-            } else {
-                outbound_pressure_turns += 1;
-                if outbound_pressure_turns >= SLOW_CLIENT_OUTBOUND_PRESSURE_TURNS {
-                    sessions.record_slow_client_pressure_shed();
-                    warn!(
-                        session_id,
-                        queued,
-                        capacity,
-                        threshold,
-                        turns = outbound_pressure_turns,
-                        "slow client outbound queue stayed above pressure threshold; closing play session"
-                    );
-                    return Ok(());
-                }
-            }
-        } else {
-            outbound_pressure_turns = 0;
-        }
-
         let chunk_stream_waiting = chunk_stream
             .as_ref()
             .is_some_and(|stream| !stream.is_complete());
@@ -11847,6 +11827,12 @@ where
                         send_entity_relative_move(writer, compression, &movement).await?;
                     }
                     Some(OutboundCommand::MoveEntitiesRelative(movements)) => {
+                        let (movements, remaining) =
+                            take_entity_movement_write_turn(movements);
+                        if let Some(remaining) = remaining {
+                            pending_outbound
+                                .push_front(OutboundCommand::MoveEntitiesRelative(remaining));
+                        }
                         for movement in &movements {
                             send_entity_relative_move(writer, compression, movement).await?;
                         }

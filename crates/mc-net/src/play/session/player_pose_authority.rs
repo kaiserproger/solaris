@@ -438,6 +438,7 @@ pub(super) fn publish_player_body_pushes_locked(
                         recipient: ordered_session_recipient(*observer_id, observer),
                         command: OutboundCommand::MoveEntityRelative(ServerEntityMove {
                             id: entity_id,
+                            position: snapshot.position,
                             wire_move: Option::<ServerEntityWireMove>::None,
                             velocity,
                             rotation: snapshot.rotation,

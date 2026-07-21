@@ -10565,7 +10565,7 @@ async fn reliable_visibility_backlog_preserves_distinct_commands_in_order() {
 }
 
 #[tokio::test]
-async fn entity_movement_uses_ordered_backlog_when_channel_is_full() {
+async fn entity_movement_backlog_coalesces_to_latest_absolute_position() {
     let registry = SessionRegistry::new();
     let (tx, mut rx) = mpsc::channel(1);
     tx.try_send(OutboundCommand::AnimatePlayer { entity_id: 1 })
@@ -10573,6 +10573,7 @@ async fn entity_movement_uses_ordered_backlog_when_channel_is_full() {
     let recipient = test_recipient(&registry, 96, tx);
     let movement = |delta_x| ServerEntityMove {
         id: EntityId(42),
+        position: Vec3::new(delta_x, 64.0, 0.0),
         wire_move: Some(crate::play::wire_entities::ServerEntityWireMove::Position {
             delta: Vec3::new(delta_x, 0.0, 0.0),
         }),
@@ -10598,27 +10599,23 @@ async fn entity_movement_uses_ordered_backlog_when_channel_is_full() {
         rx.recv().await,
         Some(OutboundCommand::AnimatePlayer { entity_id: 1 })
     ));
-    let deltas = tokio::time::timeout(Duration::from_secs(1), async {
-        let mut deltas = Vec::new();
-        for _ in 0..2 {
-            match rx.recv().await {
-                Some(OutboundCommand::MoveEntityRelative(movement)) => {
-                    let Some(crate::play::wire_entities::ServerEntityWireMove::Position { delta }) =
-                        movement.wire_move
-                    else {
-                        panic!("expected relative position movement");
-                    };
-                    deltas.push(delta.x);
-                }
-                other => panic!("expected ordered entity movement, got {other:?}"),
-            }
-        }
-        deltas
-    })
-    .await
-    .expect("movement backlog must progress before the failure timeout");
-
-    assert_eq!(deltas, vec![0.25, 0.5]);
+    let movement = tokio::time::timeout(Duration::from_secs(1), rx.recv())
+        .await
+        .expect("movement backlog must progress before the failure timeout");
+    assert!(matches!(
+        movement,
+        Some(OutboundCommand::MoveEntitiesRelative(movements))
+            if matches!(
+                movements.as_slice(),
+                [ServerEntityMove {
+                    wire_move: Some(crate::play::wire_entities::ServerEntityWireMove::Absolute {
+                        position
+                    }),
+                    ..
+                }] if *position == Vec3::new(0.5, 64.0, 0.0)
+            )
+    ));
+    assert!(rx.try_recv().is_err());
     assert_eq!(registry.pressure_snapshot().reliable_command_drops, 0);
 }
 

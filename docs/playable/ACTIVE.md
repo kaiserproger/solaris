@@ -32,8 +32,9 @@ hardening. An already-open lower-priority diff does not override this order.
    common player-visible blocker, then rerun the shortest real-client scenario
    that reproduces it.
    The owner rerun still disconnected periodically in the dense 5,132-entity
-   world. A clean O3 real-client rerun on a fresh small world did not reproduce
-   it, so the dense owner-world gate remains open. The reported water gap
+   world. The reliable movement backlog now coalesces to one latest absolute
+   state per entity instead of disconnecting after 16 queued tick batches, but
+   the exact dense owner-world rerun remains open. The reported water gap
    now has server-owned air/drowning, vanilla swimming metadata, and aquatic
    physics that no longer pushes fish to the surface; owner-client verification
    remains pending.
@@ -58,6 +59,28 @@ hardening. An already-open lower-priority diff does not override this order.
    blocks the playable or plugin path.
 
 ## Recent Evidence
+
+- The dense-world disconnect counter identified the reliable movement retry
+  queue as the remaining failure path. Once a recipient's bounded channel is
+  full, consecutive movement batches in its retry lane
+  coalesce by entity into the newest absolute position while retaining
+  pending velocity and head-rotation publication. Non-movement commands keep
+  their order and bounded fail-closed behavior. The socket writer emits at
+  most 256 entity movements per play-loop turn, and mere bounded queue
+  occupancy no longer disconnects a client while writes continue. A regression
+  repeats 64 movement batches for all 5,132 entities behind a saturated
+  capacity-16 channel, forces the retry-worker dequeue race, and proves every
+  latest position plus retained velocity/head flags with zero reliable drops
+  or pressure sheds.
+  All 1,621 `mc-net` tests pass. A rebuilt O3 server
+  (`d5aa446aeb99a15a38d472c4f6d82af0e430a151f46b9ff466df21b98589d5d2`)
+  passed a real 26.1.2 MCP connect/input smoke with 351 persisted entities.
+  A later structured observation still reported `in_play=true`; the player
+  had died during the unattended run but was not disconnected. Retained
+  evidence is `.analysis/codex-logs/dense-disconnect-mcp-smoke.json`,
+  `.analysis/codex-logs/dense-disconnect-mcp-observe.json`, and the client's
+  `latest.log`. This proves an ordinary real-client socket path, not the
+  owner's exact 5,132-entity world, whose rerun remains required.
 
 - The shipped `basic-economy` plugin now provides durable virtual balances,
   operator self-grants, and an inventory shop whose item grant and balance CAS
@@ -164,7 +187,7 @@ hardening. An already-open lower-priority diff does not override this order.
   and exact entity accounting; all 1,589 `mc-net` tests and three doc tests
   pass. A `sol high` reviewer confirmed ordering and state-loss behavior and
   requested the bounded write turns, which were added. Owner-client rerun on
-  the rebuilt O3 binary remains pending.
+  that earlier binary was superseded by the movement-backlog checkpoint above.
 - Checkpoint `7cdd917` fixes a normal active-game save conflict found by the
   natural furnace scenario. The first artifact
   `.analysis/real-client-runs/20260721T110747Z-real-client-playable-loop-yFIIqx`

@@ -9,8 +9,9 @@ and is not startup context.
 
 - Date: 2026-07-22.
 - Branch: `dev/M100-client-agent`.
-- Latest recorded checkpoint: shipped basic economy and land claims (this
-  checkpoint). The prior mob death deadline checkpoint is
+- Latest recorded checkpoint: dense outbound movement backlog fixed and
+  awaiting commit (this checkpoint). Basic economy and land claims shipped in
+  `1c2ba4a`. The prior mob death deadline checkpoint is
   `45ff133` (`fix(play): index mob death deadlines`).
   The reach checkpoint is `5146926`, creeper checkpoint is `9af1309`,
   dry-spawn checkpoint is `6b0dcec`, autoscale checkpoint is `5b7017a`, and
@@ -64,18 +65,28 @@ and is not startup context.
   interaction remain open. No manual-client gate has run. Next: return to the
   owner batch's ordinary-play queue, starting with the remaining dense-world
   disconnect evidence before terrain expansion.
-- The owner O3 rerun still disconnected periodically in the dense 5,132-entity
-  world, so a dense owner-world rerun remains an open playable gate. A short
-  real 26.1.2-client run against the current O3 binary passed join, play, block
-  load, 53 visible entities, and forward-input dispatch on a fresh small world
-  with no server warning; it does not prove movement, the dense case, or a
-  clean-tree build provenance. That
-  run spawned over `minecraft:water` on seed `20260721`, making dry-land spawn
-  selection the next concrete reproducible checkpoint. The current
+- The owner O3 rerun disconnected in a dense 5,132-entity world because
+  movement tick batches filled the bounded reliable retry queue. Once the
+  recipient channel saturates, adjacent movement batches in that lane
+  coalesce by entity to the latest absolute position while retaining
+  velocity/head-rotation publication. The writer emits at most 256 movements
+  per turn; bounded queue occupancy alone no longer closes a progressing
+  client. A 64-tick, 5,132-entity saturated capacity-16 regression forces the
+  worker race and checks every latest position plus retained velocity/head
+  flags with zero reliable drops/sheds. O3 binary
+  `d5aa446aeb99a15a38d472c4f6d82af0e430a151f46b9ff466df21b98589d5d2`
+  passed a real 26.1.2 MCP connect/input smoke with 351 persisted entities.
+  A later structured observation still reported `in_play=true`; retained
+  evidence is in `.analysis/codex-logs/dense-disconnect-mcp-smoke.json`,
+  `.analysis/codex-logs/dense-disconnect-mcp-observe.json`, and the client
+  `latest.log`. The player died during the unattended run but was not
+  disconnected. The
+  owner's exact 5,132-entity world remains a manual rerun, so do not call that
+  gate closed. The current
   autoscaler slice removes per-tick owner-lane reconfiguration on `Hold`, skips
   capacity-capped no-op actions, requires 20% recovery headroom, and coalesces
   continuous slow-tick warnings to the 100-tick metrics cadence. Focused and
-  full workspace L2 gates pass; this does not yet prove the disconnect fixed. The
+  full workspace L2 gates pass. The
   current water slice adds vanilla swimming metadata and server-owned
   air/drowning/recovery. Aquatic entity physics uses fish drag without generic
   buoyancy, removing the force that held fish at the surface. Canonical

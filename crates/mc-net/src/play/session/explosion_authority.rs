@@ -436,6 +436,7 @@ fn apply_explosion_knockback_locked(
                 recipient: ordered_session_recipient(observer_id, observer),
                 command: OutboundCommand::MoveEntityRelative(ServerEntityMove {
                     id: target_id,
+                    position: snapshot.position,
                     wire_move: None,
                     velocity: snapshot.velocity,
                     rotation: snapshot.rotation,

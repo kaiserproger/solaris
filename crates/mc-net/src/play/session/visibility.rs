@@ -372,6 +372,7 @@ pub(super) fn publish_entity_movement_locked(
                 recipient: ordered_session_recipient(*observer_id, observer),
                 command: OutboundCommand::MoveEntityRelative(ServerEntityMove {
                     id: entity_id,
+                    position,
                     wire_move,
                     velocity: snapshot.velocity,
                     rotation: snapshot.rotation,

@@ -55,6 +55,7 @@ pub(in crate::play) struct ServerEntitySnapshot {
 #[derive(Debug, Clone, Copy)]
 pub(in crate::play) struct ServerEntityMove {
     pub(in crate::play) id: EntityId,
+    pub(in crate::play) position: Vec3,
     pub(in crate::play) wire_move: Option<ServerEntityWireMove>,
     pub(in crate::play) velocity: Vec3,
     pub(in crate::play) rotation: Rotation,
@@ -441,6 +442,8 @@ pub(super) struct OutboundPressureMetrics {
     reliable_retry_queues: Mutex<HashMap<SessionId, ReliableRetryQueue>>,
     #[cfg(test)]
     pub(super) reliable_retry_completed: tokio::sync::Notify,
+    #[cfg(test)]
+    pub(super) reliable_retry_dequeued: tokio::sync::Notify,
 }
 
 impl Default for OutboundPressureMetrics {
@@ -458,6 +461,8 @@ impl Default for OutboundPressureMetrics {
             reliable_retry_queues: Mutex::new(HashMap::new()),
             #[cfg(test)]
             reliable_retry_completed: tokio::sync::Notify::new(),
+            #[cfg(test)]
+            reliable_retry_dequeued: tokio::sync::Notify::new(),
         }
     }
 }
@@ -581,6 +586,13 @@ impl ReliableRetryQueue {
         if self.closing {
             return ReliableEnqueueResult::Dropped;
         }
+        let command = match self.pending.back_mut() {
+            Some(pending) => match try_coalesce_entity_movements(pending, command) {
+                None => return ReliableEnqueueResult::Queued,
+                Some(command) => command,
+            },
+            None => command,
+        };
         if self.pending.len() < self.capacity {
             self.closing = matches!(command, OutboundCommand::DisconnectPlayer { .. });
             self.pending.push_back(command);
@@ -595,6 +607,75 @@ impl ReliableRetryQueue {
         self.closing = true;
         ReliableEnqueueResult::Shed { dropped }
     }
+}
+
+fn try_coalesce_entity_movements(
+    pending: &mut OutboundCommand,
+    command: OutboundCommand,
+) -> Option<OutboundCommand> {
+    let (incoming, was_single) = match command {
+        OutboundCommand::MoveEntityRelative(movement) => (vec![movement], true),
+        OutboundCommand::MoveEntitiesRelative(movements) => (movements, false),
+        command => return Some(command),
+    };
+    let existing = match pending {
+        OutboundCommand::MoveEntityRelative(movement) => {
+            let movement = *movement;
+            *pending = OutboundCommand::MoveEntitiesRelative(vec![movement]);
+            let OutboundCommand::MoveEntitiesRelative(existing) = pending else {
+                unreachable!();
+            };
+            existing
+        }
+        OutboundCommand::MoveEntitiesRelative(existing) => existing,
+        _ if was_single => return Some(OutboundCommand::MoveEntityRelative(incoming[0])),
+        _ => return Some(OutboundCommand::MoveEntitiesRelative(incoming)),
+    };
+
+    if existing.len() == incoming.len()
+        && existing
+            .iter()
+            .zip(&incoming)
+            .all(|(left, right)| left.id == right.id)
+    {
+        for (existing, incoming) in existing.iter_mut().zip(incoming) {
+            merge_entity_movement(existing, incoming);
+        }
+        return None;
+    }
+
+    let by_id = existing
+        .iter()
+        .enumerate()
+        .map(|(index, movement)| (movement.id, index))
+        .collect::<HashMap<_, _>>();
+    if incoming
+        .iter()
+        .any(|movement| !by_id.contains_key(&movement.id))
+    {
+        return Some(if was_single {
+            OutboundCommand::MoveEntityRelative(incoming[0])
+        } else {
+            OutboundCommand::MoveEntitiesRelative(incoming)
+        });
+    }
+    for incoming in incoming {
+        let index = by_id[&incoming.id];
+        merge_entity_movement(&mut existing[index], incoming);
+    }
+    None
+}
+
+fn merge_entity_movement(existing: &mut ServerEntityMove, mut incoming: ServerEntityMove) {
+    let send_position_or_rotation = existing.wire_move.is_some() || incoming.wire_move.is_some();
+    incoming.send_velocity |= existing.send_velocity;
+    incoming.send_head_rotation |= existing.send_head_rotation;
+    if send_position_or_rotation {
+        incoming.wire_move = Some(ServerEntityWireMove::Absolute {
+            position: incoming.position,
+        });
+    }
+    *existing = incoming;
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -987,33 +1068,69 @@ fn dispatch_reliable_command(recipient: &SessionRecipient, command: OutboundComm
     let tx = recipient.tx.clone();
     let recipient_id = recipient.id;
     let pressure = Arc::clone(&recipient.pressure);
-    tokio::spawn(async move {
-        let _guard = ReliableRetryWorkerGuard {
-            recipient_id,
-            worker_id,
-            pressure: Arc::clone(&pressure),
-        };
-        loop {
-            let command = {
-                let mut queues = pressure.lock_reliable_retry_queues();
-                let command = queues
-                    .get_mut(&recipient_id)
-                    .and_then(|queue| queue.pending.pop_front());
-                if command.is_none() {
-                    queues.remove(&recipient_id);
+    let guard = ReliableRetryWorkerGuard {
+        recipient_id,
+        worker_id,
+        pressure: Arc::clone(&pressure),
+    };
+    if let Ok(runtime) = tokio::runtime::Handle::try_current() {
+        runtime.spawn(async move {
+            let _guard = guard;
+            loop {
+                let Some(command) = pop_reliable_retry_command(&pressure, recipient_id) else {
+                    return;
+                };
+                if tx.send(command).await.is_err() {
+                    debug!(
+                        recipient = recipient_id,
+                        "reliable outbound retry target closed"
+                    );
+                    return;
                 }
-                command
-            };
-            let Some(command) = command else {
-                return;
-            };
-            if tx.send(command).await.is_err() {
-                debug!(
-                    recipient = recipient_id,
-                    "reliable outbound retry target closed"
-                );
-                return;
             }
+        });
+        return;
+    }
+
+    if let Err(error) = std::thread::Builder::new()
+        .name(format!("solaris-outbound-{recipient_id}"))
+        .spawn(move || {
+            let _guard = guard;
+            loop {
+                let Some(command) = pop_reliable_retry_command(&pressure, recipient_id) else {
+                    return;
+                };
+                if tx.blocking_send(command).is_err() {
+                    debug!(
+                        recipient = recipient_id,
+                        "blocking reliable outbound retry target closed"
+                    );
+                    return;
+                }
+            }
+        })
+    {
+        warn!(recipient = recipient_id, %error, "failed to start reliable outbound retry worker");
+    }
+}
+
+fn pop_reliable_retry_command(
+    pressure: &OutboundPressureMetrics,
+    recipient_id: SessionId,
+) -> Option<OutboundCommand> {
+    let command = {
+        let mut queues = pressure.lock_reliable_retry_queues();
+        let command = queues
+            .get_mut(&recipient_id)
+            .and_then(|queue| queue.pending.pop_front());
+        if command.is_none() {
+            queues.remove(&recipient_id);
         }
-    });
+        command
+    };
+    #[cfg(test)]
+    if command.is_some() {
+        pressure.reliable_retry_dequeued.notify_waiters();
+    }
+    command
 }

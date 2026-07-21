@@ -1492,7 +1492,7 @@ async fn play_loop_exits_when_outbound_channel_closes() {
 }
 
 #[tokio::test]
-async fn play_loop_sheds_slow_client_when_outbound_queue_stays_full_before_write_timeout() {
+async fn play_loop_drains_bounded_outbound_pressure_without_shedding() {
     let (_client, mut reader) = tokio::io::duplex(64);
     let mut writer = tokio::io::sink();
     let mut buf = BytesMut::new();
@@ -1507,16 +1507,11 @@ async fn play_loop_sheds_slow_client_when_outbound_queue_stays_full_before_write
             .expect("prefill outbound pressure queue");
     }
     let producer = tokio::spawn(async move {
-        let mut entity_id = 17;
-        loop {
-            if outbound_tx
+        for entity_id in 17..=80 {
+            outbound_tx
                 .send(OutboundCommand::AnimatePlayer { entity_id })
                 .await
-                .is_err()
-            {
-                break;
-            }
-            entity_id += 1;
+                .expect("play loop remains available while draining");
         }
     });
     let pose = PlayerPose::new(0.5, 64.0, 0.5);
@@ -1567,20 +1562,56 @@ async fn play_loop_sheds_slow_client_when_outbound_queue_stays_full_before_write
         ),
     )
     .await
-    .expect("sustained outbound pressure should shed before socket write timeout");
+    .expect("bounded outbound pressure should drain before the failure timeout");
 
-    result.expect("slow outbound pressure shed should close session cleanly");
+    result.expect("closed outbound producer should close session cleanly");
     producer
         .await
         .expect("producer task should stop when receiver closes");
     let pressure = sessions.pressure_snapshot();
     assert_eq!(
         pressure.slow_client_write_timeouts, start.slow_client_write_timeouts,
-        "pre-timeout pressure shedding should not be reported as a socket write timeout"
+        "bounded queue pressure should not be reported as a socket write timeout"
     );
     assert_eq!(
-        pressure.slow_client_pressure_sheds,
-        start.slow_client_pressure_sheds + 1
+        pressure.slow_client_pressure_sheds, start.slow_client_pressure_sheds,
+        "bounded queue pressure must not disconnect a client while writes progress"
+    );
+}
+
+#[test]
+fn entity_movement_write_turn_preserves_order_across_the_budget_boundary() {
+    let movements = (0..=ENTITY_MOVEMENTS_PER_WRITE_TURN)
+        .map(|index| ServerEntityMove {
+            id: EntityId(index as i32),
+            position: Vec3::new(index as f64, 64.0, 0.0),
+            wire_move: Some(crate::play::wire_entities::ServerEntityWireMove::Absolute {
+                position: Vec3::new(index as f64, 64.0, 0.0),
+            }),
+            velocity: Vec3::ZERO,
+            rotation: Rotation::ZERO,
+            on_ground: true,
+            send_velocity: false,
+            send_head_rotation: false,
+        })
+        .collect();
+
+    let (current, remaining) = take_entity_movement_write_turn(movements);
+
+    assert_eq!(current.len(), ENTITY_MOVEMENTS_PER_WRITE_TURN);
+    assert_eq!(
+        current.first().map(|movement| movement.id),
+        Some(EntityId(0))
+    );
+    assert_eq!(
+        current.last().map(|movement| movement.id),
+        Some(EntityId(ENTITY_MOVEMENTS_PER_WRITE_TURN as i32 - 1))
+    );
+    let remaining = remaining.expect("one movement remains after the write-turn budget");
+    assert_eq!(remaining.len(), 1);
+    assert_eq!(
+        remaining[0].id,
+        EntityId(ENTITY_MOVEMENTS_PER_WRITE_TURN as i32)
     );
 }
 

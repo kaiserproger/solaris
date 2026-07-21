@@ -967,6 +967,7 @@ fn non_living_ecs_snapshot_has_no_health_projection() {
 fn movement(wire_move: Option<ServerEntityWireMove>) -> ServerEntityMove {
     ServerEntityMove {
         id: EntityId(17),
+        position: Vec3::new(4.0, 65.0, -3.0),
         wire_move,
         velocity: Vec3::new(1.0, 0.0, -2.0),
         rotation: Rotation {

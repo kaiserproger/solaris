@@ -977,6 +977,7 @@ impl SessionRegistry {
             }
             let movement = ServerEntityMove {
                 id: motion.id,
+                position: motion.position,
                 wire_move,
                 velocity: motion.velocity,
                 rotation,

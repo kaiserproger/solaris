@@ -902,6 +902,7 @@ fn publish_arrow_knockback_locked(
                 recipient: ordered_session_recipient(observer_id, observer),
                 command: OutboundCommand::MoveEntityRelative(ServerEntityMove {
                     id: accepted.id,
+                    position: snapshot.position,
                     wire_move: None,
                     velocity: snapshot.velocity,
                     rotation: snapshot.rotation,

@@ -168,8 +168,16 @@ Other accepted concrete boundaries in this staged migration are:
   per-session atomic assigns the sequence; only out-of-order delivery uses the
   bounded per-session FIFO mutex. Dropped reservations publish an explicit
   cancellation entry, so an early return cannot leave a permanent sequence
-  hole. Overflow fails closed through the existing slow-client disconnect
-  path.
+  hole. Non-coalescible overflow still fails closed through the existing
+  slow-client disconnect path. Entity movement is last-state reliable: once a
+  recipient channel is full, adjacent movement batches in the per-session
+  retry lane coalesce by entity to the newest absolute
+  position, velocity, rotation, and ground state. This preserves command order
+  without retaining every obsolete relative delta. The play-loop writer caps
+  each movement write turn. Channel/retry limits bound command-count growth,
+  and coalescing never grows a movement vector with previously absent entity
+  IDs. The socket stall timeout remains the dead-peer fence. Queue occupancy
+  alone is not a disconnect condition while writes continue.
   Wire position state follows the 26.1.2 `ServerEntity` tracking contract.
   Position is dirty when unquantized displacement squared is at least
   `7.62939453125E-6` or the global tracking-update count is divisible by 60;
