@@ -239,6 +239,76 @@ fn sync_dirty_flush_replans_when_competing_writer_creates_region() {
 }
 
 #[test]
+fn synchronous_dirty_flush_replans_a_resident_conflict() {
+    let tmp = tempfile::tempdir().unwrap();
+    std::fs::create_dir_all(tmp.path().join("region")).unwrap();
+    let registry = single_air_registry();
+    let position = ChunkPos { x: 0, z: 0 };
+    let mut chunk = Chunk::empty(
+        position,
+        BlockStateId(0),
+        Identifier::parse("minecraft:plains").unwrap(),
+    );
+    chunk.mark_dirty();
+    let mut world = WorldStorage::open_with_capacity(tmp.path(), registry, 4).unwrap();
+    world.insert_chunk(position, chunk).unwrap();
+    let resident = world.resident.clone();
+    let mut mutate_once = true;
+
+    let flushed = world
+        .flush_dirty_at_tick_with_pre_write_hook(0, |_| {
+            if mutate_once {
+                mutate_once = false;
+                resident
+                    .mutate(position, |chunk| chunk.mark_dirty())
+                    .expect("planned resident chunk");
+            }
+        })
+        .unwrap();
+
+    assert_eq!(flushed, 1);
+    assert_eq!(world.dirty_count(), 0);
+}
+
+#[test]
+fn synchronous_dirty_flush_reports_continuous_resident_conflicts() {
+    let tmp = tempfile::tempdir().unwrap();
+    std::fs::create_dir_all(tmp.path().join("region")).unwrap();
+    let registry = single_air_registry();
+    let position = ChunkPos { x: 0, z: 0 };
+    let mut chunk = Chunk::empty(
+        position,
+        BlockStateId(0),
+        Identifier::parse("minecraft:plains").unwrap(),
+    );
+    chunk.mark_dirty();
+    let mut world = WorldStorage::open_with_capacity(tmp.path(), registry, 4).unwrap();
+    world.insert_chunk(position, chunk).unwrap();
+    let resident = world.resident.clone();
+    let mut attempts = 0usize;
+
+    let error = world
+        .flush_dirty_at_tick_with_pre_write_hook(0, |_| {
+            attempts += 1;
+            resident
+                .mutate(position, |chunk| chunk.mark_dirty())
+                .expect("planned resident chunk");
+        })
+        .unwrap_err();
+
+    assert_eq!(attempts, 4);
+    assert!(matches!(
+        error,
+        WorldError::ResidentChangedDuringFlush {
+            attempts: 4,
+            remaining_dirty: 1,
+        }
+    ));
+    assert_eq!(world.dirty_count(), 1);
+    assert!(!tmp.path().join("region/r.0.0.mca").exists());
+}
+
+#[test]
 fn new_region_install_rejects_concurrent_create() {
     let tmp_world = tempfile::tempdir().unwrap();
     let region_path = tmp_world.path().join("r.0.0.mca");
@@ -257,7 +327,7 @@ fn new_region_install_rejects_concurrent_create() {
 }
 
 #[test]
-fn dirty_flush_commit_preserves_chunks_changed_after_planning() {
+fn dirty_flush_commit_skips_a_region_changed_after_planning() {
     use crate::chunk::ChunkGenerator;
     use mc_data::Identifier;
 
@@ -330,11 +400,18 @@ fn dirty_flush_commit_preserves_chunks_changed_after_planning() {
         .unwrap()
         .unwrap();
     let commit = plan.write().unwrap();
-    assert!(matches!(
-        world.commit_dirty_flush(commit),
-        Err(WorldError::StaleRegion(_))
-    ));
+    assert_eq!(world.commit_dirty_flush(commit).unwrap(), 0);
     assert_eq!(world.dirty_count(), 1);
+    assert!(
+        std::fs::read_dir(tmp_world.path().join("region"))
+            .unwrap()
+            .all(|entry| !entry
+                .unwrap()
+                .file_name()
+                .to_string_lossy()
+                .contains(".tmp.")),
+        "a skipped region must release its temporary image"
+    );
 
     let mut fresh =
         WorldStorage::open_with_capacity(tmp_world.path(), Arc::clone(&registry), 16).unwrap();
@@ -347,15 +424,16 @@ fn dirty_flush_commit_preserves_chunks_changed_after_planning() {
 }
 
 #[test]
-fn multi_region_commit_recovers_installed_prefix_before_later_stale_region() {
+fn multi_region_commit_installs_stable_region_and_skips_changed_region() {
     let tmp = tempfile::tempdir().unwrap();
     std::fs::create_dir_all(tmp.path().join("region")).unwrap();
     let registry = air_stone_registry();
     let mut world = WorldStorage::open_with_capacity(tmp.path(), Arc::clone(&registry), 2).unwrap();
     let biome = Identifier::parse("minecraft:plains").unwrap();
-    let first = ChunkPos { x: 0, z: 0 };
-    let second = ChunkPos { x: 32, z: 0 };
-    for position in [first, second] {
+    let changed_region_first = ChunkPos { x: 0, z: 0 };
+    let changed_region_second = ChunkPos { x: 1, z: 0 };
+    let stable_region = ChunkPos { x: 32, z: 0 };
+    for position in [changed_region_first, changed_region_second, stable_region] {
         world
             .insert_generated_chunk(
                 position,
@@ -368,7 +446,7 @@ fn multi_region_commit_recovers_installed_prefix_before_later_stale_region() {
     world
         .set_block_at(
             BlockPos {
-                x: second.x * 16,
+                x: changed_region_second.x * 16,
                 y: 0,
                 z: 0,
             },
@@ -376,17 +454,15 @@ fn multi_region_commit_recovers_installed_prefix_before_later_stale_region() {
         )
         .unwrap();
 
-    assert!(matches!(
-        world.commit_dirty_flush(commit),
-        Err(WorldError::StaleRegion(path)) if path.ends_with("r.1.0.mca")
-    ));
-    assert_eq!(world.dirty_count(), 1);
-    assert_eq!(world.plan_dirty_flush().unwrap().chunk_count(), 1);
-    assert!(tmp.path().join("region/r.0.0.mca").is_file());
-    assert!(!tmp.path().join("region/r.1.0.mca").exists());
+    assert_eq!(world.commit_dirty_flush(commit).unwrap(), 1);
+    assert_eq!(world.dirty_count(), 2);
+    assert_eq!(world.plan_dirty_flush().unwrap().chunk_count(), 2);
+    assert!(!tmp.path().join("region/r.0.0.mca").exists());
+    assert!(tmp.path().join("region/r.1.0.mca").is_file());
 
     let mut reopened = WorldStorage::open_with_capacity(tmp.path(), registry, 2).unwrap();
-    assert!(reopened.get_chunk(first).unwrap().is_some());
+    assert!(reopened.get_chunk(stable_region).unwrap().is_some());
+    assert!(reopened.get_chunk(changed_region_first).unwrap().is_none());
 }
 
 #[test]
@@ -626,7 +702,7 @@ fn dirty_flush_mutable_fork_after_plan_bumps_generation() {
 }
 
 #[test]
-fn dirty_flush_mutable_alias_after_plan_invalidates_planned_generation() {
+fn dirty_flush_mutable_alias_after_plan_skips_install_and_stays_dirty() {
     let tmp = tempfile::tempdir().unwrap();
     std::fs::create_dir_all(tmp.path().join("region")).unwrap();
     let registry = single_air_registry();
@@ -648,10 +724,7 @@ fn dirty_flush_mutable_alias_after_plan_invalidates_planned_generation() {
 
     let commit = plan.write().unwrap();
 
-    assert!(matches!(
-        world.commit_dirty_flush(commit),
-        Err(WorldError::StaleRegion(_))
-    ));
+    assert_eq!(world.commit_dirty_flush(commit).unwrap(), 0);
     assert_eq!(world.dirty_count(), 1);
 }
 
@@ -706,7 +779,7 @@ fn dirty_flush_commit_fast_path_clears_without_copying_unchanged_chunk() {
 }
 
 #[test]
-fn dirty_flush_commit_rejects_a_defensive_snapshot_change() {
+fn dirty_flush_commit_skips_a_defensive_snapshot_change() {
     let tmp = tempfile::tempdir().unwrap();
     std::fs::create_dir_all(tmp.path().join("region")).unwrap();
     let registry = air_stone_registry();
@@ -735,15 +808,12 @@ fn dirty_flush_commit_rejects_a_defensive_snapshot_change() {
     assert!(!Arc::ptr_eq(&live_snapshot, &planned_snapshot));
     assert_eq!(planned_snapshot.highest_opaque_y(1, 1), None);
     assert_eq!(live_snapshot.highest_opaque_y(1, 1), Some(0));
-    assert!(matches!(
-        world.commit_dirty_flush(commit),
-        Err(WorldError::StaleRegion(_))
-    ));
+    assert_eq!(world.commit_dirty_flush(commit).unwrap(), 0);
     assert_eq!(world.dirty_count(), 1);
 }
 
 #[test]
-fn dirty_flush_commit_keeps_post_plan_unmarked_chunk_mutation_dirty() {
+fn dirty_flush_commit_skips_post_plan_unmarked_chunk_mutation() {
     let tmp = tempfile::tempdir().unwrap();
     std::fs::create_dir_all(tmp.path().join("region")).unwrap();
     let registry = air_stone_registry();
@@ -765,10 +835,7 @@ fn dirty_flush_commit_keeps_post_plan_unmarked_chunk_mutation_dirty() {
 
     let commit = plan.write().unwrap();
 
-    assert!(matches!(
-        world.commit_dirty_flush(commit),
-        Err(WorldError::StaleRegion(_))
-    ));
+    assert_eq!(world.commit_dirty_flush(commit).unwrap(), 0);
     assert_eq!(world.dirty_count(), 1);
     assert_eq!(
         world.get_block(BlockPos { x: 1, y: 0, z: 1 }).unwrap(),
@@ -777,7 +844,7 @@ fn dirty_flush_commit_keeps_post_plan_unmarked_chunk_mutation_dirty() {
 }
 
 #[test]
-fn dirty_flush_commit_keeps_nonzero_generation_mismatch_dirty() {
+fn dirty_flush_commit_skips_nonzero_generation_mismatch() {
     let tmp = tempfile::tempdir().unwrap();
     std::fs::create_dir_all(tmp.path().join("region")).unwrap();
     let registry = single_air_registry();
@@ -792,9 +859,6 @@ fn dirty_flush_commit_keeps_nonzero_generation_mismatch_dirty() {
     world.get_chunk_mut(cpos).unwrap().unwrap().mark_dirty();
     let commit = plan.write().unwrap();
 
-    assert!(matches!(
-        world.commit_dirty_flush(commit),
-        Err(WorldError::StaleRegion(_))
-    ));
+    assert_eq!(world.commit_dirty_flush(commit).unwrap(), 0);
     assert_eq!(world.dirty_count(), 1);
 }

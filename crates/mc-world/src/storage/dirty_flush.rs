@@ -589,8 +589,9 @@ impl WorldStorage {
                 }
             };
             if !current {
-                self.recover_partial_dirty_flush_install(installed_regions, installed_chunks)?;
-                return Err(WorldError::StaleRegion(region.region_path.clone()));
+                // A live chunk changed while this whole-region image encoded.
+                // Drop removes the temp image; the region stays dirty for replan.
+                continue;
             }
             installed_chunks += chunks.len();
             installed_regions.push(DirtyFlushInstalledRegion {
@@ -657,6 +658,7 @@ impl WorldStorage {
         mut pre_write: impl FnMut(&DirtyFlushPlan),
     ) -> Result<usize, WorldError> {
         let mut stale_retries = 0usize;
+        let mut flushed_chunks = 0usize;
         loop {
             let plan = self.plan_dirty_flush_at_tick(current_tick)?;
             if !plan.captures_all_dirty_chunks() {
@@ -666,14 +668,28 @@ impl WorldStorage {
                 });
             }
             if plan.is_empty() {
-                return Ok(0);
+                return Ok(flushed_chunks);
             }
+            let planned_chunks = plan.chunk_count();
             pre_write(&plan);
             match plan
                 .write()
                 .and_then(|commit| self.commit_dirty_flush(commit))
             {
-                Ok(cleaned) => return Ok(cleaned),
+                Ok(cleaned) => {
+                    flushed_chunks = flushed_chunks.saturating_add(cleaned);
+                    if cleaned == planned_chunks {
+                        return Ok(flushed_chunks);
+                    }
+                    if stale_retries < DIRTY_FLUSH_STALE_REGION_RETRIES {
+                        stale_retries += 1;
+                        continue;
+                    }
+                    return Err(WorldError::ResidentChangedDuringFlush {
+                        attempts: stale_retries.saturating_add(1),
+                        remaining_dirty: self.dirty_count(),
+                    });
+                }
                 Err(WorldError::StaleRegion(_))
                     if stale_retries < DIRTY_FLUSH_STALE_REGION_RETRIES =>
                 {

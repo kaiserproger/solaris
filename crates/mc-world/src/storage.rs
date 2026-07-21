@@ -74,6 +74,13 @@ pub enum WorldError {
     #[error("region changed before replace: {0}")]
     StaleRegion(PathBuf),
     #[error(
+        "resident chunks kept changing during dirty flush after {attempts} attempts; {remaining_dirty} chunks remain dirty"
+    )]
+    ResidentChangedDuringFlush {
+        attempts: usize,
+        remaining_dirty: usize,
+    },
+    #[error(
         "dirty flush captured {dirty_chunks} dirty chunks but only {flushable_chunks} were journal-ready"
     )]
     JournalPendingDirtyChunks {

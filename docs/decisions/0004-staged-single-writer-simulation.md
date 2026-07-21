@@ -281,18 +281,23 @@ producer notification that releases or fails that fence and then captures a
 new complete owner snapshot. It never acknowledges a partial plan based on a
 retry count or elapsed time.
 
-Dirty region writes produce temporary files outside world ownership. A normal
-background flush validates the resident snapshot before replacing the region
-file and replans stale work. An active barrier save instead installs the exact
-planned region image; chunks changed after the barrier remain dirty in memory
-and are covered by their later journal records. The final post-drain save must
-reach zero dirty chunks. A remaining journal-pending chunk is an invariant
-error because no producer remains to release it. Region installation itself is
-still serialized with resident publication. Directory sync runs on a blocking
-worker after releasing resident and world locks; a short finalization turn then
-marks only snapshots that still match as clean. This is an ordered world and
-simulation snapshot, not a global transaction across playerdata, entity data,
-region files, and every journal.
+Dirty region writes produce temporary files outside world ownership. Before a
+normal background flush replaces one whole Anvil region, it validates every
+resident snapshot represented by that image. If any represented chunk changed
+while the image encoded, that region is skipped before filesystem installation
+and remains dirty for a later plan; stable independent regions in the same
+batch continue. Only a filesystem version mismatch is a `StaleRegion`. The
+synchronous wrapper replans resident conflicts within a bounded attempt budget
+and reports a typed failure if the region never stabilizes. An active barrier
+save instead installs the exact planned region image; chunks changed after the
+barrier remain dirty in memory and are covered by their later journal records.
+The final post-drain save must reach zero dirty chunks. A remaining
+journal-pending chunk is an invariant error because no producer remains to
+release it. Region installation itself is still serialized with resident
+publication. Directory sync runs on a blocking worker after releasing resident
+and world locks; a short finalization turn then marks only snapshots that still
+match as clean. This is an ordered world and simulation snapshot, not a global
+transaction across playerdata, entity data, region files, and every journal.
 
 Prompt 04 introduced a standalone `bevy_ecs 0.18.1` runtime inside
 `EntityStore`. The dependency is pinned below the 0.19 line because Solaris is
