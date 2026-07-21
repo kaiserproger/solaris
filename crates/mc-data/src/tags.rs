@@ -23,7 +23,10 @@ use serde::Deserialize;
 use thiserror::Error;
 use tracing::{debug, warn};
 
-use crate::{Identifier, VanillaData, items::ItemRegistry, read_json_file, visit_json_files};
+use crate::{
+    Identifier, VanillaData, fuel_values::FuelValues, items::ItemRegistry, read_json_file,
+    visit_json_files,
+};
 
 const REQUIRED_ITEM_TAGS: &str = include_str!("../data/required_item_tags.json");
 
@@ -1155,9 +1158,32 @@ pub enum TagError {
 #[derive(Debug, Clone, Default)]
 pub struct TagsData {
     pub registries: BTreeMap<Identifier, BTreeMap<Identifier, Vec<i32>>>,
+    fuel_values: FuelValues,
 }
 
 impl TagsData {
+    #[must_use]
+    pub fn from_registries(
+        registries: BTreeMap<Identifier, BTreeMap<Identifier, Vec<i32>>>,
+    ) -> Self {
+        Self {
+            registries,
+            fuel_values: FuelValues::default(),
+        }
+    }
+
+    /// Attach the immutable default-feature-set furnace-fuel snapshot.
+    #[must_use]
+    pub fn with_vanilla_fuel_values(mut self, items: &ItemRegistry) -> Self {
+        self.fuel_values = FuelValues::vanilla_26_1_2(items, &self);
+        self
+    }
+
+    #[must_use]
+    pub fn fuel_values(&self) -> &FuelValues {
+        &self.fuel_values
+    }
+
     /// Number of `(registry, tag)` pairs the packet will emit.
     #[must_use]
     pub fn total_tags(&self) -> usize {
@@ -1201,9 +1227,8 @@ pub fn solaris_required_item_tags(items: &ItemRegistry) -> TagsData {
         );
     }
 
-    TagsData {
-        registries: BTreeMap::from([(item_registry, item_tags)]),
-    }
+    TagsData::from_registries(BTreeMap::from([(item_registry, item_tags)]))
+        .with_vanilla_fuel_values(items)
 }
 
 /// Embedded tag set used when no full vanilla sidecar is configured.
@@ -1473,7 +1498,7 @@ pub fn load(vanilla_dir: &Path, ours: &VanillaData) -> Result<TagsData, TagError
             .insert(tag_ident, seen.into_iter().collect());
     }
 
-    let data = TagsData { registries };
+    let data = TagsData::from_registries(registries);
     debug!(
         registries = data.registries.len(),
         tags = data.total_tags(),
@@ -1637,6 +1662,52 @@ mod tests {
                 .unwrap()
                 .contains(&38)
         );
+    }
+
+    #[test]
+    fn embedded_fuel_snapshot_covers_canonical_vanilla_2612_set() {
+        let items = crate::items::solaris_required_items();
+        let tags = solaris_required_item_tags(&items).with_vanilla_fuel_values(&items);
+        let fuels = tags.fuel_values();
+
+        assert_eq!(
+            items
+                .iter()
+                .filter(|(_, item_id)| fuels.is_fuel(*item_id))
+                .count(),
+            280
+        );
+        for (name, duration) in [
+            ("minecraft:lava_bucket", 20_000),
+            ("minecraft:oak_log", 300),
+            ("minecraft:oak_slab", 150),
+            ("minecraft:oak_hanging_sign", 800),
+            ("minecraft:oak_boat", 1_200),
+            ("minecraft:white_carpet", 67),
+            ("minecraft:dried_kelp_block", 4_001),
+            ("minecraft:bamboo", 50),
+        ] {
+            let item_id = items
+                .id_of(&Identifier::parse(name).unwrap())
+                .expect("embedded registry contains canonical fuel");
+            assert_eq!(fuels.burn_duration(item_id), Some(duration), "{name}");
+        }
+
+        let crimson_planks = items
+            .id_of(&Identifier::parse("minecraft:crimson_planks").unwrap())
+            .unwrap();
+        assert!(!fuels.is_fuel(crimson_planks));
+    }
+
+    #[test]
+    fn fuel_snapshot_does_not_change_wire_registries() {
+        let items = crate::items::solaris_required_items();
+        let tags = solaris_required_item_tags(&items);
+        let registries = tags.registries.clone();
+
+        let tags = tags.with_vanilla_fuel_values(&items);
+
+        assert_eq!(tags.registries, registries);
     }
 
     #[test]

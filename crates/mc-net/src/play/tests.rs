@@ -1,4 +1,5 @@
 use super::block_placement::plan_block_placement;
+use super::containers::furnace_fuel_ticks;
 use super::falling_blocks::{FallingBlockStart, LandedFallingBlock, plan_falling_block_starts};
 use super::use_item_on_adapter::cursor_y_relative_to_target;
 use super::*;
@@ -10693,7 +10694,7 @@ async fn scheduled_hopper_tick_feeds_valid_input_into_furnace_below() {
 
 #[tokio::test]
 async fn scheduled_hopper_tick_feeds_side_fuel_into_furnace() {
-    let coal = Identifier::parse("minecraft:coal").unwrap();
+    let oak_stairs = Identifier::parse("minecraft:oak_stairs").unwrap();
     let blocks = Arc::new(
         mc_world::BlockRegistry::from_report(&[
             simple_block(0, "minecraft:air"),
@@ -10708,7 +10709,7 @@ async fn scheduled_hopper_tick_feeds_side_fuel_into_furnace() {
         .unwrap(),
     );
     let items = Arc::new(ItemRegistry::from_report(&[ItemReport {
-        id: coal,
+        id: oak_stairs,
         protocol_id: 44,
     }]));
     let recipes: Arc<Vec<mc_data::recipes::Recipe>> = Arc::new(Vec::new());
@@ -10754,11 +10755,12 @@ async fn scheduled_hopper_tick_feeds_side_fuel_into_furnace() {
         .unwrap();
 
     let world = Arc::new(tokio::sync::Mutex::new(storage));
+    let tags = mc_data::tags::solaris_required_item_tags(&items);
     let config = ServerConfig {
         world: Some(Arc::clone(&world)),
         blocks,
         items,
-        tags: Arc::new(TagsData::default()),
+        tags: Arc::new(tags),
         recipes,
         ..play_loop_slow_client_test_config()
     };
@@ -13644,6 +13646,7 @@ fn interaction_state_for_items(items: Arc<ItemRegistry>) -> InteractionState {
     let world_read = storage.read_view();
     let world = Arc::new(tokio::sync::Mutex::new(storage));
     let item_to_block = ItemToBlockTable::build(&items, &blocks);
+    let tags = Arc::new(mc_data::tags::solaris_required_item_tags(&items));
     InteractionState {
         world,
         world_read,
@@ -13666,7 +13669,7 @@ fn interaction_state_for_items(items: Arc<ItemRegistry>) -> InteractionState {
         item_facts: Arc::new(ItemFactsTable::default()),
         entity_types: Arc::new(mc_data::entity_types::solaris_required_entity_types()),
         item_to_block,
-        tags: Arc::new(TagsData::default()),
+        tags,
         recipes: Vec::new(),
         loot: Arc::new(mc_data::loot::LootTables::default()),
         next_container_id: FURNACE_CONTAINER_ID_MIN,
@@ -15929,7 +15932,17 @@ fn furnace_uses_vanilla_common_fuel_times_and_returns_lava_bucket() {
         Identifier::parse("minecraft:coal").unwrap(),
         Identifier::parse("minecraft:lava_bucket").unwrap(),
         Identifier::parse("minecraft:bucket").unwrap(),
+        Identifier::parse("minecraft:oak_stairs").unwrap(),
+        Identifier::parse("minecraft:oak_slab").unwrap(),
+        Identifier::parse("minecraft:chest").unwrap(),
+        Identifier::parse("minecraft:oak_door").unwrap(),
+        Identifier::parse("minecraft:oak_boat").unwrap(),
+        Identifier::parse("minecraft:white_wool").unwrap(),
+        Identifier::parse("minecraft:white_carpet").unwrap(),
+        Identifier::parse("minecraft:dried_kelp_block").unwrap(),
+        Identifier::parse("minecraft:bamboo").unwrap(),
         Identifier::parse("minecraft:warped_planks").unwrap(),
+        Identifier::parse("minecraft:warped_stairs").unwrap(),
     ];
     let reports = item_names
         .iter()
@@ -15956,7 +15969,7 @@ fn furnace_uses_vanilla_common_fuel_times_and_returns_lava_bucket() {
             count: 1,
         },
     };
-    let tags = mc_data::tags::TagsData::default();
+    let tags = mc_data::tags::solaris_required_item_tags(&items);
 
     for (fuel_name, expected_ticks) in [
         ("minecraft:stick", 100),
@@ -15964,6 +15977,15 @@ fn furnace_uses_vanilla_common_fuel_times_and_returns_lava_bucket() {
         ("minecraft:wooden_pickaxe", 200),
         ("minecraft:coal", 1600),
         ("minecraft:lava_bucket", 20_000),
+        ("minecraft:oak_stairs", 300),
+        ("minecraft:oak_slab", 150),
+        ("minecraft:chest", 300),
+        ("minecraft:oak_door", 200),
+        ("minecraft:oak_boat", 1_200),
+        ("minecraft:white_wool", 100),
+        ("minecraft:white_carpet", 67),
+        ("minecraft:dried_kelp_block", 4_001),
+        ("minecraft:bamboo", 50),
     ] {
         let fuel_id = items.id_of(&Identifier::parse(fuel_name).unwrap()).unwrap();
         let mut furnace = FurnaceBlockEntity {
@@ -16001,6 +16023,18 @@ fn furnace_uses_vanilla_common_fuel_times_and_returns_lava_bucket() {
         }
     }
 
+    let coal_id = items
+        .id_of(&Identifier::parse("minecraft:coal").unwrap())
+        .unwrap();
+    assert_eq!(
+        furnace_fuel_ticks(&tags, FurnaceKind::Smoker, coal_id),
+        Some(800)
+    );
+    assert_eq!(
+        furnace_fuel_ticks(&tags, FurnaceKind::BlastFurnace, coal_id),
+        Some(800)
+    );
+
     let warped_planks = items
         .id_of(&Identifier::parse("minecraft:warped_planks").unwrap())
         .unwrap();
@@ -16021,6 +16055,23 @@ fn furnace_uses_vanilla_common_fuel_times_and_returns_lava_bucket() {
     assert_eq!(
         furnace_slot_to_stack(&furnace.slots[1]),
         ItemStack::new(warped_planks, 1)
+    );
+
+    let warped_stairs = items
+        .id_of(&Identifier::parse("minecraft:warped_stairs").unwrap())
+        .unwrap();
+    furnace.slots[1] = stack_to_furnace_slot(&ItemStack::new(warped_stairs, 1));
+    let _ = tick_furnace(
+        std::slice::from_ref(&recipe),
+        &items,
+        &tags,
+        &mut furnace,
+        FurnaceKind::Furnace,
+    );
+    assert_eq!(furnace.burn_total, 0);
+    assert_eq!(
+        furnace_slot_to_stack(&furnace.slots[1]),
+        ItemStack::new(warped_stairs, 1)
     );
 }
 

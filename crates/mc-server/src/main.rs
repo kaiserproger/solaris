@@ -1233,7 +1233,8 @@ fn load_effective_tags(
 ) -> Result<EffectiveTags> {
     if let Some(vanilla_data_dir) = vanilla_data_dir {
         let tags = mc_data::tags::load(vanilla_data_dir, data)
-            .with_context(|| format!("loading vanilla tags from {}", vanilla_data_dir.display()))?;
+            .with_context(|| format!("loading vanilla tags from {}", vanilla_data_dir.display()))?
+            .with_vanilla_fuel_values(items);
         if tags.total_tags() == 0 {
             bail!(
                 "vanilla tags from {} were empty; run tools/extract-vanilla-data.sh with tag data",
@@ -1252,6 +1253,13 @@ fn load_effective_tags(
                     vanilla_data_dir.display()
                 );
             }
+        }
+        if !tags.fuel_values().matches_default_vanilla_26_1_2(items) {
+            bail!(
+                "vanilla tags from {} resolved {} furnace fuels instead of the canonical 26.1.2 default set; regenerate the sidecar",
+                vanilla_data_dir.display(),
+                tags.fuel_values().fuel_count(),
+            );
         }
         return Ok(EffectiveTags {
             tags,
@@ -1861,6 +1869,106 @@ mod tests {
 
         assert!(err.to_string().contains("vanilla tags"));
         assert!(err.to_string().contains("were empty"));
+    }
+
+    #[test]
+    fn effective_tags_attach_fuel_values_to_embedded_startup_data() {
+        let items = mc_data::items::solaris_required_items();
+        let blocks = mc_data::blocks::solaris_required_blocks_report();
+
+        let effective =
+            load_effective_tags(None, &mc_data::solaris_required_data(), &items, &blocks).unwrap();
+        let oak_stairs = items
+            .id_of(&Identifier::parse("minecraft:oak_stairs").unwrap())
+            .unwrap();
+        let warped_stairs = items
+            .id_of(&Identifier::parse("minecraft:warped_stairs").unwrap())
+            .unwrap();
+
+        assert_eq!(
+            effective.tags.fuel_values().burn_duration(oak_stairs),
+            Some(300)
+        );
+        assert!(!effective.tags.fuel_values().is_fuel(warped_stairs));
+    }
+
+    #[test]
+    fn effective_tags_reject_partial_fuel_membership_with_all_required_keys() {
+        let tmp = tempfile::tempdir().unwrap();
+        let reports = tmp.path().join("reports");
+        std::fs::create_dir_all(&reports).unwrap();
+        std::fs::write(
+            reports.join("registries.json"),
+            r#"{
+                "minecraft:block":{"entries":{"minecraft:stone":{"protocol_id":0}}},
+                "minecraft:item":{"entries":{"minecraft:coal":{"protocol_id":10}}},
+                "minecraft:entity_type":{"entries":{"minecraft:pig":{"protocol_id":1}}}
+            }"#,
+        )
+        .unwrap();
+        for (registry, entry) in [
+            ("block", "minecraft:stone"),
+            ("entity_type", "minecraft:pig"),
+        ] {
+            let root = tmp.path().join("data/minecraft/tags").join(registry);
+            std::fs::create_dir_all(&root).unwrap();
+            std::fs::write(
+                root.join("sample.json"),
+                format!(r#"{{"values":["{entry}"]}}"#),
+            )
+            .unwrap();
+        }
+        let item_tags = tmp.path().join("data/minecraft/tags/item");
+        std::fs::create_dir_all(&item_tags).unwrap();
+        for tag in [
+            "logs",
+            "bamboo_blocks",
+            "planks",
+            "wooden_stairs",
+            "wooden_slabs",
+            "wooden_trapdoors",
+            "wooden_pressure_plates",
+            "wooden_shelves",
+            "wooden_fences",
+            "fence_gates",
+            "banners",
+            "signs",
+            "hanging_signs",
+            "wooden_doors",
+            "boats",
+            "wool",
+            "wooden_buttons",
+            "saplings",
+            "wool_carpets",
+            "non_flammable_wood",
+        ] {
+            let values = if tag == "logs" {
+                r#"["minecraft:coal"]"#
+            } else {
+                "[]"
+            };
+            std::fs::write(
+                item_tags.join(format!("{tag}.json")),
+                format!(r#"{{"values":{values}}}"#),
+            )
+            .unwrap();
+        }
+        let items = mc_data::items::ItemRegistry::from_report(&[mc_data::items::ItemReport {
+            id: Identifier::parse("minecraft:coal").unwrap(),
+            protocol_id: 10,
+        }]);
+
+        let err = match load_effective_tags(
+            Some(tmp.path()),
+            &mc_data::VanillaData::from_registries("", vec![]),
+            &items,
+            &[],
+        ) {
+            Ok(_) => panic!("partial canonical fuel membership must fail startup"),
+            Err(err) => err,
+        };
+
+        assert!(err.to_string().contains("canonical 26.1.2 default set"));
     }
 
     #[test]

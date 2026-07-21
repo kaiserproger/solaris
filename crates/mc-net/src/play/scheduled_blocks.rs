@@ -1019,15 +1019,16 @@ fn insert_hopper_stack_into_furnace(
             moving,
         );
     }
-    insert_hopper_fuel_into_furnace(items, furnace, moving)
+    insert_hopper_fuel_into_furnace(tags, furnace_kind, furnace, moving)
 }
 
 fn insert_hopper_fuel_into_furnace(
-    items: &ItemRegistry,
+    tags: &TagsData,
+    furnace_kind: FurnaceKind,
     furnace: &mut FurnaceBlockEntity,
     moving: &FurnaceSlot,
 ) -> Option<()> {
-    if moving.is_empty() || !is_fuel_item_id(items, moving.item_id) {
+    if moving.is_empty() || !is_fuel_item_id(tags, furnace_kind, moving.item_id) {
         return None;
     }
     let target = &mut furnace.slots[1];
@@ -1127,3 +1128,6 @@ pub(super) const HOPPER_TRANSFER_DELAY_TICKS: u64 = 8;
 pub(super) const HOPPER_TICK_DELAY_TICKS: u64 = 1;
 // 26.1.2 ComparatorBlock#getDelay.
 pub(super) const COMPARATOR_TICK_DELAY_TICKS: u64 = 2;
+
+#[cfg(test)]
+mod tests;

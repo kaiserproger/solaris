@@ -1158,12 +1158,10 @@ mod tests {
         )]);
         let block_registry = Identifier::parse("minecraft:block").unwrap();
         let pickaxe_tag = Identifier::parse("minecraft:mineable/pickaxe").unwrap();
-        let tags = TagsData {
-            registries: BTreeMap::from([(
-                block_registry,
-                BTreeMap::from([(pickaxe_tag, vec![1])]),
-            )]),
-        };
+        let tags = TagsData::from_registries(BTreeMap::from([(
+            block_registry,
+            BTreeMap::from([(pickaxe_tag, vec![1])]),
+        )]));
         let mut grounded = PlayerPose::new(0.0, 64.0, 0.0);
         grounded.flags = MovePlayerFlags::new(true, false);
 

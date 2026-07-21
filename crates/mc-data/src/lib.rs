@@ -44,6 +44,7 @@ pub mod damage_types;
 mod entity_contract_26_1_2;
 pub mod entity_types;
 pub mod food;
+pub mod fuel_values;
 pub mod identifier;
 pub mod item_components;
 pub mod items;

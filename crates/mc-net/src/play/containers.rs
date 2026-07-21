@@ -246,8 +246,8 @@ pub(super) fn find_campfire_recipe_in(
     })
 }
 
-pub(super) fn is_fuel_item_id(items: &ItemRegistry, item_id: u32) -> bool {
-    furnace_fuel_ticks(items, item_id).is_some()
+pub(super) fn is_fuel_item_id(tags: &TagsData, kind: FurnaceKind, item_id: u32) -> bool {
+    furnace_fuel_ticks(tags, kind, item_id).is_some()
 }
 
 pub(super) fn furnace_menu_title_nbt(title: &str) -> Result<Vec<u8>, mc_protocol::CodecError> {
@@ -351,7 +351,7 @@ pub(super) async fn store_active_container(
 mod tests {
     use mc_data::Identifier;
 
-    use super::is_fuel_item_id;
+    use super::{FurnaceKind, is_fuel_item_id};
 
     #[test]
     fn generated_wood_items_are_playable_furnace_fuel() {
@@ -366,8 +366,9 @@ mod tests {
             .id_of(&Identifier::parse("minecraft:wooden_pickaxe").unwrap())
             .expect("wooden pickaxe item");
 
-        assert!(is_fuel_item_id(&items, birch_planks));
-        assert!(is_fuel_item_id(&items, birch_log));
-        assert!(is_fuel_item_id(&items, wooden_pickaxe));
+        let tags = mc_data::tags::solaris_required_item_tags(&items);
+        assert!(is_fuel_item_id(&tags, FurnaceKind::Furnace, birch_planks));
+        assert!(is_fuel_item_id(&tags, FurnaceKind::Furnace, birch_log));
+        assert!(is_fuel_item_id(&tags, FurnaceKind::Furnace, wooden_pickaxe));
     }
 }

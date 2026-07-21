@@ -44,9 +44,13 @@ async fn two_clients_stale_furnace_click_after_peer_update_resyncs() {
         .set_furnace_block_entity(furnace_pos, mc_world::FurnaceBlockEntity::default())
         .expect("seed furnace entity");
     let world = Some(Arc::new(tokio::sync::Mutex::new(storage)));
-    let tags = Arc::new(mc_data::tags::load(&vanilla_dir, &data).expect("tags load"));
     let items_report = mc_data::items::load_items_report(&registries_json).expect("items report");
     let items = Arc::new(mc_data::items::ItemRegistry::from_report(&items_report));
+    let tags = Arc::new(
+        mc_data::tags::load(&vanilla_dir, &data)
+            .expect("tags load")
+            .with_vanilla_fuel_values(&items),
+    );
     let raw_iron_id = items
         .id_of(&mc_data::Identifier::parse("minecraft:raw_iron").unwrap())
         .expect("raw_iron item");
@@ -228,9 +232,13 @@ async fn malformed_furnace_clicks_resync_without_trusting_client_slots() {
         .block(&mc_data::Identifier::parse("minecraft:air").unwrap())
         .map(|block| block.default)
         .expect("air in registry");
-    let tags = Arc::new(mc_data::tags::load(&vanilla_dir, &data).expect("tags load"));
     let items_report = mc_data::items::load_items_report(&registries_json).expect("items report");
     let items = Arc::new(mc_data::items::ItemRegistry::from_report(&items_report));
+    let tags = Arc::new(
+        mc_data::tags::load(&vanilla_dir, &data)
+            .expect("tags load")
+            .with_vanilla_fuel_values(&items),
+    );
     let raw_iron_id = items
         .id_of(&mc_data::Identifier::parse("minecraft:raw_iron").unwrap())
         .expect("raw_iron item");
@@ -431,15 +439,19 @@ async fn survival_furnace_container_smelts_input_with_fuel() {
         .set_furnace_block_entity(furnace_pos, mc_world::FurnaceBlockEntity::default())
         .expect("seed furnace entity");
     let world = Some(Arc::new(tokio::sync::Mutex::new(storage)));
-    let tags = Arc::new(mc_data::tags::load(&vanilla_dir, &data).expect("tags load"));
     let items_report = mc_data::items::load_items_report(&registries_json).expect("items report");
     let items = Arc::new(mc_data::items::ItemRegistry::from_report(&items_report));
+    let tags = Arc::new(
+        mc_data::tags::load(&vanilla_dir, &data)
+            .expect("tags load")
+            .with_vanilla_fuel_values(&items),
+    );
     let raw_iron = mc_data::Identifier::parse("minecraft:raw_iron").unwrap();
     let iron_ingot = mc_data::Identifier::parse("minecraft:iron_ingot").unwrap();
     let raw_iron_id = items.id_of(&raw_iron).expect("raw_iron item");
-    let coal_id = items
-        .id_of(&mc_data::Identifier::parse("minecraft:coal").unwrap())
-        .expect("coal item");
+    let oak_stairs_id = items
+        .id_of(&mc_data::Identifier::parse("minecraft:oak_stairs").unwrap())
+        .expect("oak stairs item");
     let iron_ingot_id = items.id_of(&iron_ingot).expect("iron_ingot item");
     let recipes = Arc::new(vec![mc_data::recipes::Recipe {
         id: mc_data::Identifier::parse("minecraft:test_raw_iron_smelting").unwrap(),
@@ -524,11 +536,11 @@ async fn survival_furnace_container_smelts_input_with_fuel() {
     wait_for_slot_stack(&mut client, raw_iron_id, 1).await;
     client
         .write_packet(&ServerboundChatCommand {
-            command: "debug give minecraft:coal 1 1".into(),
+            command: "debug give minecraft:oak_stairs 1 1".into(),
         })
         .await
-        .expect("give coal");
-    wait_for_slot_stack(&mut client, coal_id, 1).await;
+        .expect("give oak stairs");
+    wait_for_slot_stack(&mut client, oak_stairs_id, 1).await;
 
     client
         .write_packet(&ServerboundUseItemOn {
@@ -628,15 +640,15 @@ async fn survival_furnace_container_smelts_input_with_fuel() {
             container_input: ContainerInput::Pickup,
             changed_slots: Vec::new(),
             carried_item: HashedStack::Actual {
-                item_id: coal_id,
+                item_id: oak_stairs_id,
                 count: 1,
                 components: HashedStackComponentHashes::empty(),
             },
         })
         .await
-        .expect("pick up coal");
+        .expect("pick up oak stairs");
     let content = wait_for_furnace_content(&mut client, opened.container_id, |pkt| {
-        pkt.carried_item.item_id == coal_id && pkt.carried_item.count == 1
+        pkt.carried_item.item_id == oak_stairs_id && pkt.carried_item.count == 1
     })
     .await;
     client
@@ -650,9 +662,9 @@ async fn survival_furnace_container_smelts_input_with_fuel() {
             carried_item: HashedStack::empty(),
         })
         .await
-        .expect("place coal fuel");
+        .expect("place oak stairs fuel");
     wait_for_container_slot(&mut observer, observer_opened.container_id, 1, |stack| {
-        stack.item_id == coal_id && stack.count == 1
+        stack.item_id == oak_stairs_id && stack.count == 1
     })
     .await;
 
@@ -815,9 +827,13 @@ async fn survival_specialized_furnaces_open_vanilla_menu_types() {
             .expect("seed specialized furnace entity");
     }
     let world = Some(Arc::new(tokio::sync::Mutex::new(storage)));
-    let tags = Arc::new(mc_data::tags::load(&vanilla_dir, &data).expect("tags load"));
     let items_report = mc_data::items::load_items_report(&registries_json).expect("items report");
     let items = Arc::new(mc_data::items::ItemRegistry::from_report(&items_report));
+    let tags = Arc::new(
+        mc_data::tags::load(&vanilla_dir, &data)
+            .expect("tags load")
+            .with_vanilla_fuel_values(&items),
+    );
     let cfg = mc_net::ServerConfig {
         bind_address: "127.0.0.1:0".parse().unwrap(),
         motd: "M71 specialized furnaces".into(),

@@ -107,29 +107,16 @@ pub(in crate::play) fn find_cooking_recipe_for_item(
     })
 }
 
-pub(in crate::play) fn furnace_fuel_ticks(items: &ItemRegistry, item_id: u32) -> Option<i16> {
-    let name = items.name_of(item_id)?.as_str();
-    let ticks = match name {
-        "minecraft:lava_bucket" => 20_000,
-        "minecraft:coal_block" => 16_000,
-        "minecraft:blaze_rod" => 2_400,
-        "minecraft:coal" | "minecraft:charcoal" => 1_600,
-        "minecraft:wooden_shovel"
-        | "minecraft:wooden_sword"
-        | "minecraft:wooden_spear"
-        | "minecraft:wooden_hoe"
-        | "minecraft:wooden_axe"
-        | "minecraft:wooden_pickaxe" => 200,
-        "minecraft:stick" | "minecraft:bowl" => 100,
-        "minecraft:crimson_planks" | "minecraft:warped_planks" => return None,
-        _ if name.starts_with("minecraft:")
-            && (name.ends_with("_planks") || name.ends_with("_log") || name.ends_with("_wood")) =>
-        {
-            300
-        }
-        _ => return None,
-    };
-    Some(ticks)
+pub(in crate::play) fn furnace_fuel_ticks(
+    tags: &TagsData,
+    kind: FurnaceKind,
+    item_id: u32,
+) -> Option<i16> {
+    let ticks = tags.fuel_values().burn_duration(item_id)?;
+    Some(match kind {
+        FurnaceKind::Furnace => ticks,
+        FurnaceKind::Smoker | FurnaceKind::BlastFurnace => ticks / 2,
+    })
 }
 
 pub(in crate::play) fn furnace_slot_to_stack(slot: &FurnaceSlot) -> ItemStack {
@@ -346,7 +333,7 @@ pub(in crate::play) fn tick(
 
     if furnace.burn_remaining <= 0
         && !furnace.slots[1].is_empty()
-        && let Some(fuel_ticks) = furnace_fuel_ticks(items, furnace.slots[1].item_id)
+        && let Some(fuel_ticks) = furnace_fuel_ticks(tags, kind, furnace.slots[1].item_id)
     {
         consume_furnace_fuel(items, &mut furnace.slots[1]);
         furnace.burn_total = fuel_ticks;
@@ -441,7 +428,7 @@ fn can_place_in_furnace_menu_slot(
     }
     match menu_slot {
         0 => find_cooking_recipe_for_item(recipes, items, tags, kind, stack.item_id).is_some(),
-        1 => furnace_fuel_ticks(items, stack.item_id).is_some(),
+        1 => furnace_fuel_ticks(tags, kind, stack.item_id).is_some(),
         2 => false,
         3..=38 => true,
         _ => false,
@@ -564,7 +551,7 @@ fn apply_quick_move_click(
                     .is_some()
                 {
                     Some(0)
-                } else if furnace_fuel_ticks(items, original.item_id).is_some() {
+                } else if furnace_fuel_ticks(tags, kind, original.item_id).is_some() {
                     Some(1)
                 } else {
                     None
@@ -802,6 +789,9 @@ fn add_furnace_output(furnace: &mut FurnaceBlockEntity, item_id: u32, count: i32
         furnace.slots[2].count += count;
     }
 }
+
+#[cfg(test)]
+mod tests;
 
 pub(in crate::play) fn decrement_furnace_slot(stack: &mut FurnaceSlot) {
     stack.count -= 1;

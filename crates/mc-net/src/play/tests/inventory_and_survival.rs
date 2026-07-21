@@ -1269,12 +1269,10 @@ fn recipe_ingredient_matching_resolves_item_tags() {
             protocol_id: 12,
         },
     ]);
-    let tags = TagsData {
-        registries: BTreeMap::from([(
+    let tags = TagsData::from_registries(BTreeMap::from([(
             mc_data::Identifier::parse("minecraft:item").unwrap(),
             BTreeMap::from([(logs.clone(), vec![10, 11])]),
-        )]),
-    };
+        )]));
     let ingredient = Ingredient {
         alternatives: vec![IngredientAlternative::Tag(logs)],
     };
@@ -1367,15 +1365,13 @@ fn inventory_crafting_grid_crafts_birch_logs_to_planks() {
             protocol_id: 12,
         },
     ]);
-    let tags = TagsData {
-        registries: BTreeMap::from([(
+    let tags = TagsData::from_registries(BTreeMap::from([(
             mc_data::Identifier::parse("minecraft:item").unwrap(),
             BTreeMap::from([(
                 mc_data::Identifier::parse("minecraft:birch_logs").unwrap(),
                 vec![11],
             )]),
-        )]),
-    };
+        )]));
     let mut inventory = PlayerInventory::empty();
     inventory.slots[1] = ItemStack::new(11, 1);
 
