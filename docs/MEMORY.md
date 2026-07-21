@@ -9,20 +9,22 @@ and is not startup context.
 
 - Date: 2026-07-21.
 - Branch: `dev/M100-client-agent`.
-- Latest checkpoint: `99b9879` (`feat(plugins): publish accepted entity
-  interactions`). Delivery-order checkpoint `5e2908a` remains binding.
+- Latest checkpoint: `d9c0804` (`feat(gameplay): match vanilla furnace fuels`).
+  Delivery-order checkpoint `5e2908a` remains binding.
 - The worktree may contain unrelated owner files and local artifacts. Inspect
   exact ownership before editing; never clean or stage them by accident.
-- Full workspace tests, workspace all-target strict Clippy, fmt, code-health
-  `0 fail / KEEP`, and diff-check passed immediately before `99b9879`. The real
-  TCP/Lua gate rejected far and missing targets, then observed exact off-hand
-  and main-hand interaction snapshots. Direct tests cover nonliving, dying,
-  dead-actor, Spectator, Creative/Adventure, queue-closure, DTO, and Lua-table
-  paths. A `sol high` review found two delivery-order issues; both were fixed so
-  vanilla work and writes complete before required Lua admission, while write
-  errors still return immediately. No manual-client or vanilla-oracle gate was
-  run for this plugin-only slice. Pre-existing entity-scale and local artifacts
-  were not staged.
+- `d9c0804` derives the default 26.1.2 furnace contract from the complete
+  resolved item-tag graph and carries a pinned 280-item fallback for embedded
+  startup. Startup rejects a partial or drifted sidecar. Furnace, smoker,
+  blast-furnace, container, and hopper paths share that immutable snapshot;
+  specialized furnaces halve duration and non-flammable wood remains rejected.
+  The local decompiled oracle and full sidecar match the fallback for all 280
+  ids and durations. The real TCP container test smelts with oak stairs, and
+  sad-path tests prove rejected menu/hopper transfers do not mutate state. Full
+  workspace tests, strict workspace Clippy, fmt, code-health `0 fail / KEEP`,
+  and diff-check pass. A `sol high` re-review found no remaining blocker. No
+  manual Prism-client gate was run. Pre-existing entity-scale and local
+  artifacts were not staged.
 - Ignored oracle/load/benchmark rows remain explicit. The P04 real-client soak
   ran; broad performance and dedicated concurrency gates did not.
 
@@ -177,10 +179,8 @@ two priorities unless it becomes a common-play blocker or corruption risk.
 
 1. Run an owner-played survival session and fix its first common client-visible
    blocker before isolated parity or performance work.
-2. In autonomous playable work, close the common furnace-fuel gap before the
-   next plugin event: replace the narrow hardcoded fuel set with the existing
-   data/tag-backed vanilla contract and prove ordinary valid and invalid fuels
-   through the real container path.
+2. Include the `d9c0804` fuel contract in the next owner-played survival
+   session; fix a concrete common client-visible regression if one appears.
 3. If owner play finds no common blocker, advance the production Lua plugin API
    before returning to broad optimization work.
 4. Only after those priorities, continue reducing `simulation.rs` through

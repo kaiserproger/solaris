@@ -34,10 +34,9 @@ hardening. An already-open lower-priority diff does not override this order.
 3. If that session has no common blocker, move to the first production plugin
    API slice while keeping the playable gate fixed. Defer optimization unless
    play exposes a catastrophic stall.
-4. The next autonomous common-playable slice is ordinary furnace fuel parity:
-   replace the narrow hardcoded fuel set with the existing data/tag-backed
-   contract and exercise accepted and rejected fuels through the real container
-   path.
+4. Checkpoint `d9c0804` closes the ordinary furnace-fuel gap. Include it in the
+   next owner-played survival session, but do not delay the production plugin
+   API for more isolated fuel polishing when that session finds no blocker.
 5. Defer deterministic livestock climbing and earned stonecutter hardening
    until they block ordinary survival or the plugin-backed gameplay loop.
 6. Keep the rare multi-region save recovery `fsync`/metrics issue documented
@@ -46,6 +45,20 @@ hardening. An already-open lower-priority diff does not override this order.
 
 ## Recent Evidence
 
+- Checkpoint `d9c0804` replaces the narrow furnace-fuel matcher with the exact
+  default-feature 26.1.2 builder order over resolved item tags plus a complete
+  repo-owned 280-item fallback. Sidecar startup rejects membership or duration
+  drift instead of silently accepting a partial fuel graph. Furnace, smoker,
+  blast-furnace, menu, quick-move/swap/pickup, and hopper paths share the same
+  immutable snapshot; smoker and blast-furnace durations are halved, while
+  crimson/warped wood is removed after all additions. The local decompiled
+  `FuelValues` oracle and full sidecar match the fallback for all 280 ids and
+  durations. The real TCP container gate smelts iron with oak stairs; focused
+  tests also prove accepted hopper transfer and mutation-free rejected menu and
+  hopper transfers. Full workspace tests, strict workspace Clippy, fmt,
+  code-health `0 fail / KEEP`, and diff-check pass. A `sol high` review found a
+  partial-sidecar acceptance gap and missing transaction sad paths; both were
+  fixed and the re-review found no blocker. No manual Prism-client gate was run.
 - Checkpoint `99b9879` adds production `player.entity_interacted` Lua events for
   authoritative reachable right-click gestures against alive server-owned
   living entities. The exact event carries actor identity/pose/mode, target

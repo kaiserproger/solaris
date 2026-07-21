@@ -118,6 +118,14 @@ Other accepted concrete boundaries in this staged migration are:
 - `play::containers::furnace` and `play::containers::chest` own pure menu
   state, slot mapping, and click rules. `play.rs` retains packet translation,
   owner requests, and outbound publication.
+- `mc_data::fuel_values` owns the immutable default-feature 26.1.2 furnace-fuel
+  snapshot. A complete sidecar is resolved in vanilla builder order and must
+  match the canonical 280-item membership and durations; embedded startup uses
+  the equivalent repo-owned derived table. `play::containers::furnace` and the
+  scheduled hopper path consume this one snapshot rather than matching item
+  names independently. Smoker/blast-furnace halving and final non-flammable
+  wood removal therefore cannot drift between menu admission, ticking, and
+  automation.
 - `play::campfire` owns cooking state transitions, recipe projection, block
   identity, persistent NBT compatibility, and client block-entity NBT.
   `play.rs` retains ticking and recovery coordination, storage writes, packet
