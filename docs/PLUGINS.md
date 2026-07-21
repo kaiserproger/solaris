@@ -112,6 +112,7 @@ targeted event does not need a broad subscription to reach its owner.
 | `player.entity_interacted` | `on_player_entity_interacted` | `name`, `player_id`, `context_verified`, `uuid`, `username`, `operator`, `x`, `y`, `z`, `dimension`, `entity_id`, `entity_type`, `hand`, `secondary_action`, `game_mode` |
 | `player.died` | `on_player_died` | `name`, `player_id`, `context_verified`, `uuid`, `username`, `operator`, `x`, `y`, `z`, `dimension`, `game_mode` |
 | `server.tick` | `on_server_tick` | `tick` |
+| `plugin.timer` | `on_plugin_timer` | `name`, `timer_id`, `scheduled_tick`, `fired_tick` |
 | `player.command` | `on_player_command` | player snapshot, `root`, `arguments` |
 | `plugin.storage.get_result` | `on_plugin_storage_get_result` | `request_id`, `key`, `value`, `version`, `failure` |
 | `plugin.storage.cas_result` | `on_plugin_storage_cas_result` | `request_id`, `key`, `applied`, `version`, `failure` |
@@ -217,11 +218,49 @@ gameplay-event delivery waits for an exact bounded-queue capacity notification,
 so an admitted event keeps FIFO order without polling or guessed time. Closing
 the plugin queue cannot roll back an already committed world mutation;
 publication reports failure and the normal block result still reaches the
-client. Lossy telemetry such as `server.tick` remains nonblocking and may be
-dropped under pressure. The committed-gameplay FIFO guarantee applies inside
-that outbox; concurrent lossy events and player-command producers do not form a
-global causal order with it. Do not use `server.tick` as a completion fence for
-a committed gameplay event.
+client. Subscribed `server.tick` telemetry remains nonblocking and can be
+coalesced under pressure. The latest monotonic tick is retained for host timer
+progress, but intermediate tick callbacks are not guaranteed. The
+committed-gameplay FIFO guarantee applies inside that outbox; concurrent tick
+events and player-command producers do not form a global causal order with it.
+Do not use `server.tick` as a completion fence for a committed gameplay event.
+
+## Simulation Timers
+
+Plugins schedule one-shot host-local callbacks in simulation ticks:
+
+```lua
+local scheduled_tick = solaris.schedule_timer("catalog-refresh", 20)
+local removed = solaris.cancel_timer("catalog-refresh")
+
+function on_plugin_timer(event)
+    assert(event.name == "plugin.timer")
+    assert(event.fired_tick >= event.scheduled_tick)
+end
+```
+
+`timer_id` uses the normal lowercase script-id grammar and is at most 64 bytes.
+`delay_ticks` must be an integer from 1 through 630,720,000. Each plugin may
+retain at most 256 pending timers. Scheduling an existing id replaces its
+deadline without consuming another slot; cancellation returns `true` only when
+that id was pending. Timer changes are staged with the current Lua handler and
+commit only when it returns successfully.
+
+`on_plugin_timer` is host-local and does not require `plugin.timer` or
+`server.tick` in the manifest event list. A plugin receives at most eight due
+timer callbacks for each pushed simulation tick. Due timers are ordered by
+scheduled tick and then timer id; an earlier callback may cancel a later timer
+that is due on the same tick. Remaining due timers stay pending until the next
+pushed tick. All timer callbacks and an optional subscribed `on_server_tick`
+handler share one 100,000-instruction budget and one 32-command batch for that
+input tick.
+
+Timers use the monotonic simulation tick, never wall-clock time, polling, or a
+guessed delay. Queue pressure can make a callback late but cannot make it early:
+`fired_tick >= scheduled_tick`. Timers are in memory only and disappear on
+server restart or plugin disable. A successful handler commits timer changes
+before its outbound command batch is routed; later command-queue rejection does
+not roll those timer changes back.
 
 ## Commands
 

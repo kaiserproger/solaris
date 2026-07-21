@@ -45,6 +45,18 @@ hardening. An already-open lower-priority diff does not override this order.
 
 ## Recent Evidence
 
+- Checkpoint `5e0d93b` adds bounded host-local Lua timers driven by pushed
+  monotonic simulation ticks. Queue pressure coalesces the newest tick instead
+  of blocking the simulation thread or requiring plugin polling. Timer
+  callbacks are ordered, capped at eight per pushed tick, and share one command
+  and instruction budget with `on_server_tick`. Focused tests cover replacement,
+  cancellation, invalid input, exact capacity, stale/coalesced ticks, handler
+  rollback, same-tick cancellation, close/drain, and shared-budget failure. A
+  real TCP/Lua gate proves a player command schedules a timer and receives its
+  targeted result without subscribing to `server.tick`. Full workspace tests,
+  strict workspace Clippy, fmt, code-health `0 fail / KEEP`, and diff-check
+  pass. A `sol high` re-review found no blocker/high/medium issue. No
+  manual-client or vanilla-oracle gate was run for this plugin-only slice.
 - Checkpoint `d59bd57` adds optional bounded `config.toml` snapshots to Lua API
   `0.6.0`. Configuration is validated before command ownership, read once, and
   returned as a fresh recursive Lua table. The shipped currency catalog now

@@ -9,11 +9,24 @@ and is not startup context.
 
 - Date: 2026-07-21.
 - Branch: `dev/M100-client-agent`.
-- Latest checkpoint: `d59bd57` (`feat(plugins): add bounded plugin
-  configuration`).
+- Latest checkpoint: `5e0d93b` (`feat(plugins): add push-driven simulation
+  timers`).
   Delivery-order checkpoint `5e2908a` remains binding.
 - The worktree may contain unrelated owner files and local artifacts. Inspect
   exact ownership before editing; never clean or stage them by accident.
+- `5e0d93b` adds bounded host-local Lua timers driven by pushed monotonic
+  simulation ticks. Tick admission coalesces the newest tick under queue
+  pressure without blocking the simulation thread; due callbacks run in
+  deterministic deadline/id order, at most eight per pushed tick, and share
+  one instruction and command budget with an optional `on_server_tick` handler.
+  Replacement, cancellation, capacity/input rejection, handler rollback,
+  same-tick cancellation, stale ticks, queue pressure, close/drain, and shared
+  fuel failure have focused coverage. A real TCP/Lua gate proves command ->
+  timer -> targeted client message without a `server.tick` subscription. Full
+  workspace tests, strict workspace Clippy, fmt, code-health `0 fail / KEEP`,
+  and diff-check pass. A `sol high` re-review found no remaining
+  blocker/high/medium issue. No manual-client or vanilla-oracle gate was run
+  for this plugin-only slice.
 - `d59bd57` adds optional per-plugin `config.toml`, loaded and recursively
   bounded before plugin registration, plus a fresh-copy `solaris.config()` Lua
   API. The shipped currency catalog now reads currency, zone, and products from
@@ -108,8 +121,9 @@ two priorities unless it becomes a common-play blocker or corruption risk.
   fingerprint. The algorithm remains Solaris-owned rather than Mojang
   NoiseRouter parity.
 - Lua API 0.6 has bounded DTO/files/batches, optional bounded startup-only TOML
-  configuration with fresh Lua copies, one-shot host admission, an attested
-  `mc-net` router, and durable plugin storage. Production adapters now
+  configuration with fresh Lua copies, push-driven bounded simulation timers,
+  one-shot host admission, an attested `mc-net` router, and durable plugin
+  storage. Production adapters now
   cover menus, inventory/storage transactions, zones, same-dimension player
   teleports, colony records, ephemeral villager binding, owner-scoped
   `home`/`hold` orders through journaled regional goals, and required

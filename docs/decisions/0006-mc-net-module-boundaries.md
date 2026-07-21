@@ -475,6 +475,16 @@ Other accepted concrete boundaries in this staged migration are:
   handlers perform no configuration I/O. Live reload, environment expansion,
   defaults, and cross-plugin configuration access require a separate contract
   and are not implied by this boundary.
+- The `mc-script` Lua host owns bounded in-memory plugin timers and deterministic
+  due-callback dispatch. `mc-net` only pushes the authoritative simulation tick
+  through a monotonic latest-value admission lane. When the normal script queue
+  is full, that lane coalesces to the newest tick and wakes the existing host;
+  it does not block simulation, create another task or thread, poll state, or
+  wait on wall-clock time. The host suppresses stale queued ticks, drains at
+  most eight due callbacks per pushed tick in deadline/id order, and shares the
+  input tick's Lua fuel and command batch across callbacks and `on_server_tick`.
+  Timers are host-local, non-durable plugin state; durable scheduling requires a
+  separate storage/recovery contract.
 - `script::colony` owns the bounded, owner-scoped in-memory colony registry and
   correlated colony, binding, and villager-order result publication. Registry
   keys include the host-attached plugin identity, replacements remain possible
