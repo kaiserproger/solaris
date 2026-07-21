@@ -9,13 +9,20 @@ and is not startup context.
 
 - Date: 2026-07-21.
 - Branch: `dev/M100-client-agent`.
-- Latest closed checkpoint: `547525e` (`feat(play): add water survival
-  physics`).
+- Latest code checkpoint: `5b7017a` (`fix(net): stabilize runtime
+  autoscaling`). The preceding water checkpoint is `547525e` (`feat(play): add
+  water survival physics`).
   Delivery-order checkpoint `5e2908a` remains binding.
 - The worktree may contain unrelated owner files and local artifacts. Inspect
   exact ownership before editing; never clean or stage them by accident.
 - The owner O3 rerun still disconnected periodically in the dense 5,132-entity
-  world, so an owner rerun remains the next playable gate. The current
+  world, so a dense owner-world rerun remains an open playable gate. A short
+  real 26.1.2-client run against the current O3 binary passed join, play, block
+  load, 53 visible entities, and forward-input dispatch on a fresh small world
+  with no server warning; it does not prove movement, the dense case, or a
+  clean-tree build provenance. That
+  run spawned over `minecraft:water` on seed `20260721`, making dry-land spawn
+  selection the next concrete reproducible checkpoint. The current
   autoscaler slice removes per-tick owner-lane reconfiguration on `Hold`, skips
   capacity-capped no-op actions, requires 20% recovery headroom, and coalesces
   continuous slow-tick warnings to the 100-tick metrics cadence. Focused and

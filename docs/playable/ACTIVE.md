@@ -32,7 +32,8 @@ hardening. An already-open lower-priority diff does not override this order.
    common player-visible blocker, then rerun the shortest real-client scenario
    that reproduces it.
    The owner rerun still disconnected periodically in the dense 5,132-entity
-   world, so that remains the next blocker to isolate. The reported water gap
+   world. A clean O3 real-client rerun on a fresh small world did not reproduce
+   it, so the dense owner-world gate remains open. The reported water gap
    now has server-owned air/drowning, vanilla swimming metadata, and aquatic
    physics that no longer pushes fish to the surface; owner-client verification
    remains pending.
@@ -52,6 +53,16 @@ hardening. An already-open lower-priority diff does not override this order.
 
 ## Recent Evidence
 
+- The current O3 binary (`f299a01c1dd281cf6cb82b587b40390be2a35a8f294de32f199f45048d0fb60f`)
+  passed a short embedded-MCP real-client
+  gate on an isolated fresh world: the 26.1.2 client joined, reached play,
+  loaded blocks, observed 53 entities, and accepted a forward-input request.
+  Server logs contained no slow-tick, autoscale, reliable-drop, or disconnect
+  warning. This proves the ordinary small-world path only; it does not replace
+  the pending 5,132-entity owner-world rerun and does not establish binary
+  provenance from a clean tracked tree. The same gate found the player
+  standing over `minecraft:water` on fresh seed `20260721`, directly confirming
+  dry-land spawn selection as the next reproducible playable checkpoint.
 - This checkpoint fixes two concrete hot-path faults from the owner's dense
   5,132-entity O3 run. Autoscale recovery now requires 20% tick headroom, so
   50-57 ms boundary jitter cannot alternate `ScaleDown` and `ScaleUp`.
