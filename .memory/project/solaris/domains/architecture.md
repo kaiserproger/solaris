@@ -19,6 +19,9 @@ Current runtime facts:
   and bounded admissions; operator worker-percentage knobs are forbidden.
 - SIMD and fast paths require a measured bottleneck, a scalar/correctness
   fence, and evidence for only the measured workload.
+- Overworld terrain shape is owned by `terrain::overworld::DensityRouter`;
+  route worldgen topology, climate, river, cave, or stage extraction work
+  through ADR 0008.
 - Uncontrolled heavy host load invalidates performance attribution. Record the
   build, workload, host contention, p95/p99, and maximum; repeat the same gate
   on a clean host. A contaminated run may retain functional evidence only.

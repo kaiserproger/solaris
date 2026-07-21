@@ -3,8 +3,6 @@ use mc_data::biomes::BiomeWorldgenData;
 
 use crate::noise::fbm_2d;
 
-use super::feature_hash;
-
 const BIOME_PICK_WARP_SCALE: f64 = 520.0;
 const BIOME_PICK_WARP_AMPLITUDE: f64 = 54.0;
 const BIOME_PICK_NOISE_SCALE: f64 = 460.0;
@@ -262,10 +260,23 @@ impl BiomeRules {
             3,
             0.55,
         );
-        let band = (((value + 1.0) * 0.5).clamp(0.0, 0.999_999) * bucket.len() as f64) as usize;
-        let offset = feature_hash(0, bucket.len() as i32, 0, 0, salt) as usize % bucket.len();
-        let idx = (band + offset) % bucket.len();
-        bucket[idx].clone()
+        let band = (((value + 0.72) / 1.44).clamp(0.0, 0.999_999) * bucket.len() as f64) as usize;
+        bucket[band].clone()
+    }
+
+    pub(super) fn pick_region_band(&self, bucket: &[Identifier], x: i32, z: i32) -> Identifier {
+        if bucket.is_empty() {
+            return self.default.clone();
+        }
+        let value = fbm_2d(
+            x as f64 / 180.0,
+            z as f64 / 180.0,
+            0x4445_4550_4F43,
+            4,
+            0.55,
+        );
+        let band = (((value + 0.68) / 1.36).clamp(0.0, 0.999_999) * bucket.len() as f64) as usize;
+        bucket[band].clone()
     }
 
     pub(super) fn is_ocean(&self, biome: &Identifier) -> bool {

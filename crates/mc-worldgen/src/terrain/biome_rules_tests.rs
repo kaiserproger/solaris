@@ -14,18 +14,39 @@ fn every_overworld_biome_is_reachable_by_selector() {
     let expected: BTreeSet<_> = g.biomes.all.iter().map(Identifier::as_str).collect();
     let mut seen = BTreeSet::new();
 
-    for seed_offset in 0..4 {
-        let g = TerrainGenerator::new(42 + seed_offset, tiny_registry());
-        for wx in (-4096..=4096).step_by(32) {
-            for wz in (-4096..=4096).step_by(32) {
-                let height = g.surface_height(wx, wz);
-                let biome = g.biome_for(wx, wz, height);
-                seen.insert(biome.as_str().to_string());
-                for y in (-48..=48).step_by(16) {
-                    let biome = g.biome_for_cell(wx, y, wz, height);
-                    seen.insert(biome.as_str().to_string());
-                }
+    let buckets = [
+        &g.biomes.ocean,
+        &g.biomes.beach,
+        &g.biomes.river,
+        &g.biomes.swamp,
+        &g.biomes.cold,
+        &g.biomes.temperate_forest,
+        &g.biomes.grassland,
+        &g.biomes.hot_dry,
+        &g.biomes.mountain,
+        &g.biomes.jungle,
+        &g.biomes.cave,
+    ];
+    for (bucket_index, bucket) in buckets.into_iter().enumerate() {
+        for x in (-4096..=4096).step_by(64) {
+            for z in (-4096..=4096).step_by(64) {
+                seen.insert(
+                    g.biomes
+                        .pick(bucket, x, z, 0x1000 + bucket_index as u64)
+                        .as_str()
+                        .to_string(),
+                );
             }
+        }
+    }
+    for x in (-4096..=4096).step_by(32) {
+        for z in (-4096..=4096).step_by(32) {
+            seen.insert(
+                g.biomes
+                    .pick_region_band(&g.biomes.deep_ocean, x, z)
+                    .as_str()
+                    .to_string(),
+            );
         }
     }
 

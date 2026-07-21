@@ -1,10 +1,8 @@
-//! Baseline terrain generator (M7).
+//! Overworld chunk assembly.
 //!
-//! Produces a fully-formed [`Chunk`] from `(ChunkPos, seed)` using
-//! Solaris's own hash-noise — no vanilla algorithm involved (per
-//! ADR 0001 / PROJECT_SPEC §8.1). M20 starts an earth-like generator
-//! shape with large land/ocean masks, beaches, forests, caves, ores,
-//! fluid placement primitives, and optional data-backed structure markers.
+//! The density router owns continents, erosion, mountain ridges, rivers,
+//! climate, and caves. This module resolves block palettes and assembles
+//! chunks from that deterministic field.
 //! Vertical base layers:
 //!
 //! - `y = geometry.min_y()` → bedrock
@@ -13,9 +11,8 @@
 //! - `y = height` → grass_block
 //! - `y > height` → air
 //!
-//! `height` is sampled from the multi-octave noise centred on
-//! `BASE_HEIGHT` with `±HEIGHT_AMPLITUDE` swing. The result is
-//! deterministic in `(seed, world_x, world_z)`.
+//! Output is deterministic in `(seed, world_x, world_z)` and independent of
+//! chunk generation order.
 
 use std::sync::Arc;
 
@@ -31,6 +28,7 @@ use crate::structures::{StructureRules, StructureTemplate};
 
 mod biome_rules;
 mod ore_rules;
+mod overworld;
 
 pub use biome_rules::BiomeRules;
 pub use ore_rules::{
@@ -40,6 +38,7 @@ pub use ore_rules::{
 use ore_rules::{
     MAX_ORE_ANCHORS_PER_CELL, MAX_ORE_VEIN_SIZE, ORE_ANCHOR_CELL_EDGE, ORE_ANCHOR_CELL_VOLUME,
 };
+use overworld::DensityRouter;
 
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 pub enum TerrainGeneratorError {
@@ -47,36 +46,13 @@ pub enum TerrainGeneratorError {
     MissingRequiredBlock { name: &'static str },
 }
 
-/// Default terrain centre. Chosen so the player spawns on top of
-/// the surface without needing to fall.
-const BASE_HEIGHT: f64 = 70.0;
-/// Peak-to-trough amplitude of the height field (in blocks above /
-/// below `BASE_HEIGHT`).
-const HEIGHT_AMPLITUDE: f64 = 12.0;
-/// Lattice spacing of the noise. Smaller = lumpier; this gives
-/// broad hills instead of one-chunk bumps.
-const NOISE_FREQUENCY: f64 = 1.0 / 40.0;
-/// Octaves of fbm noise. Three is enough to round off the smooth
-/// blobs of single-octave value-noise into something hill-shaped.
-const NOISE_OCTAVES: u32 = 3;
-const NOISE_PERSISTENCE: f64 = 0.5;
 pub const SEA_LEVEL: i32 = 63;
 const METERS_PER_DEGREE: f64 = 111_319.491_666_666_67;
 const MAX_MERCATOR_LATITUDE: f64 = 85.051_128_78;
-const CONTINENT_FREQUENCY: f64 = 1.0 / 420.0;
-const COAST_DETAIL_FREQUENCY: f64 = 1.0 / 96.0;
-const FOREST_FREQUENCY: f64 = 1.0 / 520.0;
-const TEMPERATURE_SCALE: f64 = 900.0;
-const RIVER_SIGNAL_SCALE: f64 = 360.0;
-const RIVER_TERRAIN_CORE_WIDTH: f64 = 0.04;
-const RIVER_TERRAIN_WIDTH: f64 = 0.16;
-const RIVER_BIOME_WIDTH: f64 = 0.09;
-const OCEAN_THRESHOLD: f64 = -0.16;
+const RIVER_BIOME_WIDTH: f64 = 0.025;
 const BEACH_HEIGHT_ABOVE_SEA: i32 = 2;
-const COAST_BLEND_WIDTH: f64 = 0.28;
 const TELLUS_CONTINENT_SCALE: f64 = 22_000.0;
 const TELLUS_COAST_SCALE: f64 = 6_500.0;
-const TELLUS_HILL_SCALE: f64 = 2_400.0;
 const TELLUS_CLIMATE_SCALE: f64 = 18_000.0;
 const TELLUS_MOISTURE_SCALE: f64 = 16_000.0;
 const TELLUS_MOUNTAIN_MASK_SCALE: f64 = 24_000.0;
@@ -94,10 +70,6 @@ const ORE_DIRECTIONS: [[i8; 3]; 6] = [
     [0, 0, 1],
 ];
 const CAVE_SURFACE_CLEARANCE: i32 = 24;
-const CAVE_FREQUENCY: f64 = 1.0 / 34.0;
-const CAVE_THRESHOLD: f64 = 0.24;
-const CAVE_BRANCH_FREQUENCY: f64 = 1.0 / 58.0;
-const CAVE_BRANCH_THRESHOLD: f64 = 0.32;
 const DEEPSLATE_TOP_Y: i32 = 0;
 const DEEPSLATE_SOLID_Y: i32 = -8;
 
@@ -431,86 +403,11 @@ impl TerrainGenerator {
     /// function the generator does.
     #[must_use]
     pub fn surface_height(&self, world_x: i32, world_z: i32) -> i32 {
-        match self.worldgen_mode {
-            WorldgenMode::VanillaLike => self.vanilla_surface_height(world_x, world_z),
-            WorldgenMode::TellusLike(settings) => {
-                self.tellus_surface_height(world_x, world_z, settings)
-            }
-        }
+        self.density_router().sample(world_x, world_z).surface_y
     }
 
-    fn clamp_surface_height(&self, raw: f64) -> i32 {
-        let min = checked_y_offset(self.geometry.min_y(), 2).unwrap_or(self.geometry.min_y());
-        let max = checked_y_offset(self.geometry.max_y(), -2)
-            .unwrap_or(self.geometry.max_y())
-            .min(250)
-            .max(min);
-        raw.round().clamp(min as f64, max as f64) as i32
-    }
-
-    fn vanilla_surface_height(&self, world_x: i32, world_z: i32) -> i32 {
-        let hills = fbm_2d(
-            world_x as f64 * NOISE_FREQUENCY,
-            world_z as f64 * NOISE_FREQUENCY,
-            self.seed,
-            NOISE_OCTAVES,
-            NOISE_PERSISTENCE,
-        );
-        let continental = self.continentalness(world_x, world_z);
-        let river = self.river_signal(world_x, world_z);
-        let depth = (OCEAN_THRESHOLD - COAST_BLEND_WIDTH - continental).max(0.0) * 40.0;
-        let ocean = SEA_LEVEL as f64 - 5.0 - depth + hills * 4.0;
-        let uplift = continental.max(0.0) * 20.0;
-        let river_blend = river_valley_blend(river);
-        let upland =
-            BASE_HEIGHT + uplift + hills * HEIGHT_AMPLITUDE + self.ridges(world_x, world_z) * 18.0;
-        let river_floor = SEA_LEVEL as f64 - 4.0 + hills.abs() * 2.0;
-        let land = upland * (1.0 - river_blend) + river_floor * river_blend;
-        let coast_t = ((continental - (OCEAN_THRESHOLD - COAST_BLEND_WIDTH))
-            / (COAST_BLEND_WIDTH * 2.0))
-            .clamp(0.0, 1.0);
-        let smooth = smoothstep01(coast_t);
-        let raw = ocean * (1.0 - smooth) + land * smooth;
-        // Guard against extreme outputs even though fbm_2d is bounded.
-        self.clamp_surface_height(raw)
-    }
-
-    fn tellus_surface_height(
-        &self,
-        world_x: i32,
-        world_z: i32,
-        settings: TellusWorldgenSettings,
-    ) -> i32 {
-        let projection = MercatorProjection::from_settings(settings);
-        let latitude = projection.latitude_from_block_z(world_z as f64);
-        let equator_weight = (1.0 - latitude.abs() / MAX_MERCATOR_LATITUDE).clamp(0.0, 1.0);
-        let land_mask = self.tellus_land_mask(world_x, world_z, settings);
-        let ridges = self.ridges(world_x / 8, world_z / 8);
-        let hills = fbm_2d(
-            world_x as f64 / TELLUS_HILL_SCALE,
-            world_z as f64 / TELLUS_HILL_SCALE,
-            self.seed ^ 0x454C_4556,
-            4,
-            0.52,
-        );
-        let mountain = self.tellus_mountain_factor(world_x, world_z);
-        let shore = ((land_mask + 0.14) / 0.42).clamp(0.0, 1.0);
-        let shore = shore * shore * (3.0 - 2.0 * shore);
-        let equatorial_uplift = (equator_weight - 0.5).max(0.0) * 4.0;
-        let terrestrial = settings.sea_level as f64
-            + 5.0
-            + equatorial_uplift
-            + (land_mask.max(0.0) * 38.0
-                + ridges * 14.0
-                + hills * 8.0
-                + mountain * (270.0 + ridges * 180.0))
-                * settings.terrestrial_height_scale.max(0.0);
-        let oceanic = settings.sea_level as f64
-            - 7.0
-            - ((-land_mask).max(0.0) * 42.0 + hills.abs() * 4.0)
-                * settings.oceanic_height_scale.max(0.0);
-        let raw = oceanic * (1.0 - shore) + terrestrial * shore;
-        self.clamp_surface_height(raw)
+    fn density_router(&self) -> DensityRouter {
+        DensityRouter::new(self.seed, self.geometry, self.worldgen_mode)
     }
 
     fn tellus_land_mask(
@@ -573,21 +470,9 @@ impl TerrainGenerator {
     }
 
     fn continentalness(&self, world_x: i32, world_z: i32) -> f64 {
-        let broad = fbm_2d(
-            world_x as f64 * CONTINENT_FREQUENCY,
-            world_z as f64 * CONTINENT_FREQUENCY,
-            self.seed ^ 0x0043_4F41_5354,
-            4,
-            0.52,
-        );
-        let coast = fbm_2d(
-            world_x as f64 * COAST_DETAIL_FREQUENCY,
-            world_z as f64 * COAST_DETAIL_FREQUENCY,
-            self.seed ^ 0x0053_484F_5245,
-            2,
-            0.5,
-        );
-        broad + coast * 0.28
+        self.density_router()
+            .sample(world_x, world_z)
+            .continentalness
     }
 
     fn biome_for(&self, world_x: i32, world_z: i32, height: i32) -> Identifier {
@@ -606,12 +491,12 @@ impl TerrainGenerator {
         let ridges = self.ridges(world_x, world_z);
         let river = self.river_signal(world_x, world_z);
 
-        if height < SEA_LEVEL - 14 {
+        if height < SEA_LEVEL - 8 {
             return self
                 .biomes
-                .pick(&self.biomes.deep_ocean, world_x, world_z, 0x4445_4550);
+                .pick_region_band(&self.biomes.deep_ocean, world_x, world_z);
         }
-        if river.abs() < RIVER_BIOME_WIDTH && continental > -0.08 {
+        if river.abs() < RIVER_BIOME_WIDTH && continental > -0.05 {
             return self
                 .biomes
                 .pick(&self.biomes.river, world_x, world_z, 0x5249_5645);
@@ -757,34 +642,15 @@ impl TerrainGenerator {
     }
 
     fn moisture(&self, world_x: i32, world_z: i32) -> f64 {
-        fbm_2d(
-            world_x as f64 * FOREST_FREQUENCY,
-            world_z as f64 * FOREST_FREQUENCY,
-            self.seed ^ 0x464F_5245_5354,
-            3,
-            0.55,
-        )
+        self.density_router().sample(world_x, world_z).moisture
     }
 
     fn temperature(&self, world_x: i32, world_z: i32) -> f64 {
-        fbm_2d(
-            world_x as f64 / TEMPERATURE_SCALE,
-            world_z as f64 / TEMPERATURE_SCALE,
-            self.seed ^ 0x5445_4D50,
-            3,
-            0.55,
-        )
+        self.density_router().sample(world_x, world_z).temperature
     }
 
     fn ridges(&self, world_x: i32, world_z: i32) -> f64 {
-        fbm_2d(
-            world_x as f64 / 180.0,
-            world_z as f64 / 180.0,
-            self.seed ^ 0x5249_4447,
-            4,
-            0.5,
-        )
-        .abs()
+        self.density_router().sample(world_x, world_z).ridges
     }
 
     fn tellus_mountain_factor(&self, world_x: i32, world_z: i32) -> f64 {
@@ -810,13 +676,7 @@ impl TerrainGenerator {
     }
 
     fn river_signal(&self, world_x: i32, world_z: i32) -> f64 {
-        fbm_2d(
-            world_x as f64 / RIVER_SIGNAL_SCALE,
-            world_z as f64 / RIVER_SIGNAL_SCALE,
-            self.seed ^ 0x5249_5645_5200,
-            2,
-            0.5,
-        )
+        self.density_router().sample(world_x, world_z).river
     }
 
     fn plan_column(&self, pos: ChunkPos, lx: u8, lz: u8) -> ColumnPlan {
@@ -1324,8 +1184,9 @@ impl TerrainGenerator {
                 }
                 if (self.biomes.temperate_forest.contains(biome)
                     || self.biomes.cold.contains(biome)
-                    || self.biomes.jungle.contains(biome))
-                    && h.is_multiple_of(83)
+                    || self.biomes.jungle.contains(biome)
+                    || self.biomes.grassland.contains(biome))
+                    && h.is_multiple_of(47)
                     && self.place_tree(
                         chunk,
                         lx,
@@ -1702,29 +1563,7 @@ impl TerrainGenerator {
     }
 
     fn is_cave_cell(&self, x: i32, y: i32, z: i32) -> bool {
-        let n = fbm_2d(
-            x as f64 * CAVE_FREQUENCY,
-            (z as f64 + y as f64 * 0.73) * CAVE_FREQUENCY,
-            self.seed ^ 0x4341_5645,
-            3,
-            0.55,
-        );
-        let branch = fbm_2d(
-            (x as f64 + y as f64 * 0.41) * CAVE_BRANCH_FREQUENCY,
-            z as f64 * CAVE_BRANCH_FREQUENCY,
-            self.seed ^ 0x4252_414E_4348,
-            2,
-            0.5,
-        );
-        let room = feature_hash(
-            self.seed,
-            x.div_euclid(4),
-            y.div_euclid(3),
-            z.div_euclid(4),
-            0xC4A7,
-        )
-        .is_multiple_of(211);
-        n > CAVE_THRESHOLD || branch > CAVE_BRANCH_THRESHOLD || room
+        self.density_router().is_cave(x, y, z)
     }
 
     #[cfg(test)]
@@ -1756,24 +1595,6 @@ impl TerrainGenerator {
         } else {
             stone_ore
         }
-    }
-}
-
-fn smoothstep01(t: f64) -> f64 {
-    let t = t.clamp(0.0, 1.0);
-    t * t * (3.0 - 2.0 * t)
-}
-
-fn river_valley_blend(signal: f64) -> f64 {
-    let distance = signal.abs();
-    if distance <= RIVER_TERRAIN_CORE_WIDTH {
-        1.0
-    } else if distance < RIVER_TERRAIN_WIDTH {
-        let bank =
-            (RIVER_TERRAIN_WIDTH - distance) / (RIVER_TERRAIN_WIDTH - RIVER_TERRAIN_CORE_WIDTH);
-        smoothstep01(bank)
-    } else {
-        0.0
     }
 }
 

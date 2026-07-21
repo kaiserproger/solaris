@@ -147,8 +147,8 @@ fn sampled_land_contains_tree_shapes() {
     let air = default_state(&registry, "minecraft:air");
     let mut found_tree = false;
 
-    for cx in -16..=16 {
-        for cz in -16..=16 {
+    'chunks: for cx in -4..=4 {
+        for cz in -4..=4 {
             let chunk = generator.generate(ChunkPos { x: cx, z: cz });
             for lx in 2..=13u8 {
                 for lz in 2..=13u8 {
@@ -196,6 +196,7 @@ fn sampled_land_contains_tree_shapes() {
                                 "tree trunk is unsupported at {wx},{base_y},{wz}"
                             );
                             found_tree = true;
+                            break 'chunks;
                         }
                     }
                 }

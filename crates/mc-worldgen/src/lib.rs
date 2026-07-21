@@ -2,9 +2,9 @@
 //!
 //! Generation pipeline, biomes, structures.
 //!
-//! Solaris-owned hash-noise terrain with data-fed biomes, caves, ores,
-//! decorations, and optional structure markers. This crate does not
-//! implement Mojang's vanilla worldgen algorithms.
+//! Solaris-owned density-routed terrain with data-fed biomes, caves, ores,
+//! decorations, and optional structures. Generation is deterministic from
+//! seed and world coordinates and does not depend on chunk generation order.
 
 pub mod noise;
 pub mod structures;
