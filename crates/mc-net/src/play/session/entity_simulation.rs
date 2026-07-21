@@ -865,21 +865,21 @@ impl SessionRegistry {
                 &mut inner, entity_id, old_chunk, new_chunk,
             ));
         }
-        let tracker_states = if tick.is_multiple_of(ENTITY_MOVE_SEND_INTERVAL_TICKS) {
-            let mut tracker_states = Vec::with_capacity(steps.len());
-            for step in steps {
-                let Some(motion) = inner.entities.motion_state(step.id) else {
-                    continue;
-                };
-                if !inner.last_sent_entity_states.contains_key(&step.id) {
-                    initialize_entity_wire_state_locked(&mut inner, step.id);
-                }
-                tracker_states.push(motion);
+        let ordinary_tracking_turn = tick.is_multiple_of(ENTITY_MOVE_SEND_INTERVAL_TICKS);
+        let mut tracker_states = Vec::with_capacity(steps.len());
+        for step in steps {
+            let Some(motion) = inner.entities.motion_state(step.id) else {
+                continue;
+            };
+            let latency_sensitive = motion.is_arrow || motion.is_item || motion.is_experience;
+            if !ordinary_tracking_turn && !latency_sensitive {
+                continue;
             }
-            tracker_states
-        } else {
-            Vec::new()
-        };
+            if !inner.last_sent_entity_states.contains_key(&step.id) {
+                initialize_entity_wire_state_locked(&mut inner, step.id);
+            }
+            tracker_states.push(motion);
+        }
         let lifecycle_tick = inner.entity_lifecycle_tick;
         let pickup_ready_items = steps
             .iter()
@@ -932,15 +932,36 @@ impl SessionRegistry {
                 .collect::<Vec<_>>()
         };
         pickup_sessions.extend(spawned_xp_observer_ids(&dispatches));
-        if !tick.is_multiple_of(ENTITY_MOVE_SEND_INTERVAL_TICKS) {
+        if tracker_states.is_empty() {
             drop(inner);
             dispatches.extend(self.pickup_candidate_dispatches(pickup_sessions));
             dispatch_visibility_commands(dispatches);
             return steps.to_vec();
         }
 
-        let mut movements = Vec::with_capacity(tracker_states.len());
+        let ordinary_tracker_count = tracker_states
+            .iter()
+            .filter(|motion| !(motion.is_arrow || motion.is_item || motion.is_experience))
+            .count();
+        let mut movements = Vec::with_capacity(
+            tracker_states
+                .len()
+                .min(ENTITY_MOVEMENT_TARGET_UPDATES_PER_TRACKING_TURN),
+        );
+        let mut ordinary_ordinal = 0;
         for motion in tracker_states {
+            let latency_sensitive = motion.is_arrow || motion.is_item || motion.is_experience;
+            if !latency_sensitive
+                && !ordinary_entity_is_due_for_movement_tracking(
+                    ordinary_ordinal,
+                    tick,
+                    ordinary_tracker_count,
+                )
+            {
+                ordinary_ordinal += 1;
+                continue;
+            }
+            ordinary_ordinal += usize::from(!latency_sensitive);
             let Some(last_sent) = inner.last_sent_entity_states.get(&motion.id).copied() else {
                 continue;
             };

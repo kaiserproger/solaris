@@ -31,11 +31,14 @@ hardening. An already-open lower-priority diff does not override this order.
 2. Treat failures from the owner session as the playable queue. Fix the first
    common player-visible blocker, then rerun the shortest real-client scenario
    that reproduces it.
-   The owner rerun still disconnected periodically in the dense 5,132-entity
-   world. The reliable movement backlog now coalesces to one latest absolute
-   state per entity instead of disconnecting after 16 queued tick batches, but
-   the exact dense owner-world rerun remains open. The reported water gap
-   now has server-owned air/drowning, vanilla swimming metadata, and aquatic
+   The exact dense-world failure is closed on an O3 server with 5,132 injected
+   cows and 5,227 total entities. Solaris keeps one outstanding keepalive,
+   treats other valid inbound packets as connection-liveness evidence, uses
+   vanilla's three-tick default movement interval, and rotates a bounded
+   movement-publication shard under extreme entity counts. A real 26.1.2 MCP
+   client remained in play for 975 client ticks with no keepalive mismatch,
+   timeout, reliable drop, or retry. The reported water gap now has
+   server-owned air/drowning, vanilla swimming metadata, and aquatic
    physics that no longer pushes fish to the surface. The client now receives
    the vanilla enabled-feature packet and can cross kelp/seagrass instead of
    being corrected onto their former full-cube fallback. Chunk sections now
@@ -43,10 +46,9 @@ hardening. An already-open lower-priority diff does not override this order.
    entity/fluid overlap: entering source water reports `in_water=true` and a
    fluid height of `0.8888889`. The O3 deep-water client gate now covers
    ascent, diving, swimming pose, air depletion and drowning damage without a
-   disconnect. The exact dense owner-world disconnect rerun is the next
-   playable gate; manual mob combat follows it.
-3. After the disconnect, close the remaining owner-client report: manual
-   mob-combat feel. The mob death core now has bounded O3
+   disconnect. Manual mob combat is the next playable gate.
+3. Close the remaining owner-client report: manual mob-combat feel. The mob
+   death core now has bounded O3
    load evidence, but this does not replace client/socket verification. Default
    block, entity-use and melee reach follow the 26.1.2 server verification
    contracts. Skeleton arrows and creeper explosions have real TCP coverage.
@@ -91,27 +93,20 @@ hardening. An already-open lower-priority diff does not override this order.
   contact, movement and breathing are green for this representative survival
   path; broader aquatic mechanics remain normal parity work.
 
-- The dense-world disconnect counter identified the reliable movement retry
-  queue as the remaining failure path. Once a recipient's bounded channel is
-  full, consecutive movement batches in its retry lane
-  coalesce by entity into the newest absolute position while retaining
-  pending velocity and head-rotation publication. Non-movement commands keep
-  their order and bounded fail-closed behavior. The socket writer emits at
-  most 256 entity movements per play-loop turn, and mere bounded queue
-  occupancy no longer disconnects a client while writes continue. A regression
-  repeats 64 movement batches for all 5,132 entities behind a saturated
-  capacity-16 channel, forces the retry-worker dequeue race, and proves every
-  latest position plus retained velocity/head flags with zero reliable drops
-  or pressure sheds.
-  All 1,621 `mc-net` tests pass. A rebuilt O3 server
-  (`d5aa446aeb99a15a38d472c4f6d82af0e430a151f46b9ff466df21b98589d5d2`)
-  passed a real 26.1.2 MCP connect/input smoke with 351 persisted entities.
-  A later structured observation still reported `in_play=true`; the player
-  had died during the unattended run but was not disconnected. Retained
-  evidence is `.analysis/codex-logs/dense-disconnect-mcp-smoke.json`,
-  `.analysis/codex-logs/dense-disconnect-mcp-observe.json`, and the client's
-  `latest.log`. This proves an ordinary real-client socket path, not the
-  owner's exact 5,132-entity world, whose rerun remains required.
+- The exact dense-world rerun reproduced the final disconnect as an unanswered
+  keepalive challenge while the client was still sending valid movement. The
+  tracker no longer replaces an unanswered challenge and only closes when both
+  the challenge and all inbound client activity exceed the deadline. Ordinary
+  entities use vanilla's default three-tick tracking interval; above 512
+  candidates a rotating shard bounds each tracking turn, while arrows, items,
+  and experience orbs remain latency-sensitive. On the O3 5,132-cow fixture
+  (5,227 total entities), a real 26.1.2 client completed 720 movement ticks and
+  255 additional ticks, remained `in_play=true`, and recorded zero keepalive
+  mismatches, timeout closes, reliable drops, or retries. Evidence is
+  `.analysis/codex-logs/dense-5132-spawn.json`,
+  `.analysis/codex-logs/dense-5132-release-build-v5.log`,
+  `.analysis/codex-logs/dense-5132-keepalive-fixed-v5.json`, and
+  `.analysis/codex-logs/dense-5132-fixed-v5-server.log`.
 
 - The shipped `basic-economy` plugin now provides durable virtual balances,
   operator self-grants, and an inventory shop whose item grant and balance CAS
@@ -194,8 +189,8 @@ hardening. An already-open lower-priority diff does not override this order.
   tick. Direct tests preserve memory shedding and drain-to-one behavior; all
   1,600 `mc-net` tests and all workspace L2 gates pass. The independent review found the
   missing application-path coverage, which was added. This removes observed
-  autoscaler churn but does not yet prove or claim that the separate periodic
-  client disconnect is fixed; an owner-client rerun is required.
+  autoscaler churn; the later exact dense-world gate above closes the separate
+  periodic disconnect.
 - This checkpoint adds the ordinary water survival path. Player eye immersion
   now consumes the vanilla 300-tick air supply, publishes metadata index 1,
   deals two drowning damage at the vanilla `-20` boundary, and recovers four

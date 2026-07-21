@@ -8765,7 +8765,7 @@ fn pressure_snapshot_counts_entity_spawn_move_and_pickup_dispatches() {
         entities.snapshots().next().expect("spawned entity").id
     };
     registry.apply_entity_physics_and_dispatch(
-        1,
+        ENTITY_MOVE_SEND_INTERVAL_TICKS,
         &[EntityPhysicsStep {
             id: entity_id,
             position: Vec3::new(0.75, 64.0, 0.5),
@@ -10047,6 +10047,91 @@ fn moving_mobs_share_one_relative_move_batch_per_observer() {
     assert_eq!(movements[0].id, entity_ids[0]);
     assert_eq!(movements[1].id, entity_ids[1]);
     assert!(rx.try_recv().is_err());
+}
+
+#[test]
+fn dense_movement_shard_publishes_latest_state_when_entity_becomes_due() {
+    let registry = SessionRegistry::new();
+    let (tx, mut rx) = mpsc::channel(2048);
+    let (alice, _) = registry.register(
+        &profile("DenseMovementAlice"),
+        (0, 0),
+        2,
+        HashSet::from([(0, 0)]),
+        tx,
+        PlayerPose::new(0.5, 64.0, 0.5),
+    );
+    assert!(registry.mark_loaded(alice, (0, 0)).is_empty());
+
+    let entity_count = ENTITY_MOVEMENT_TARGET_UPDATES_PER_TRACKING_TURN + 1;
+    let mut entity_ids = Vec::with_capacity(entity_count);
+    for _ in 0..entity_count {
+        let dispatches = registry.spawn_command_entity(
+            &SimulationAuthority::for_test(),
+            1,
+            "minecraft:zombie".to_string(),
+            Vec3::new(0.5, 64.0, 0.5),
+        );
+        entity_ids.push(
+            dispatches
+                .iter()
+                .find_map(|dispatch| match &dispatch.command {
+                    OutboundCommand::SpawnEntity(entity) => Some(entity.id),
+                    _ => None,
+                })
+                .expect("spawned zombie is visible"),
+        );
+        dispatch_visibility_commands(dispatches);
+        assert!(matches!(rx.try_recv(), Ok(OutboundCommand::SpawnEntity(_))));
+    }
+
+    let target_index = ENTITY_MOVEMENT_TARGET_UPDATES_PER_TRACKING_TURN - 1;
+    let target_id = entity_ids[target_index];
+    let steps = |target_x| {
+        entity_ids
+            .iter()
+            .enumerate()
+            .map(|(index, &id)| EntityPhysicsStep {
+                id,
+                position: Vec3::new(
+                    if index == target_index { target_x } else { 0.5 },
+                    64.0,
+                    0.5,
+                ),
+                velocity: Vec3::ZERO,
+                on_ground: false,
+                horizontal_collision: false,
+            })
+            .collect::<Vec<_>>()
+    };
+
+    registry.apply_entity_physics_and_dispatch(ENTITY_MOVE_SEND_INTERVAL_TICKS, &steps(0.75));
+    if let Ok(command) = rx.try_recv() {
+        let target_was_published = match command {
+            OutboundCommand::MoveEntityRelative(movement) => movement.id == target_id,
+            OutboundCommand::MoveEntitiesRelative(movements) => {
+                movements.iter().any(|movement| movement.id == target_id)
+            }
+            command => panic!("unexpected movement command: {command:?}"),
+        };
+        assert!(
+            !target_was_published,
+            "target is outside the first rotating window"
+        );
+    }
+    assert!(rx.try_recv().is_err());
+
+    registry.apply_entity_physics_and_dispatch(ENTITY_MOVE_SEND_INTERVAL_TICKS * 2, &steps(1.0));
+    let movement = match rx.try_recv().expect("target becomes due on the next turn") {
+        OutboundCommand::MoveEntityRelative(movement) => movement,
+        OutboundCommand::MoveEntitiesRelative(mut movements) => movements
+            .drain(..)
+            .find(|movement| movement.id == target_id)
+            .expect("movement batch contains target"),
+        command => panic!("unexpected movement command: {command:?}"),
+    };
+    assert_eq!(movement.id, target_id);
+    assert_eq!(movement.position, Vec3::new(1.0, 64.0, 0.5));
 }
 
 #[test]

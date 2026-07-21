@@ -542,7 +542,7 @@ thread_local! {
 
 /// How often we ping the client. Vanilla's value.
 pub const KEEPALIVE_PERIOD: Duration = Duration::from_secs(15);
-/// How long we wait for the client's echo before disconnecting. Vanilla's value.
+/// How long both a pending echo and all inbound traffic may remain idle.
 pub const KEEPALIVE_TIMEOUT: Duration = Duration::from_secs(30);
 #[cfg(not(test))]
 const SLOW_CLIENT_OUTBOUND_WRITE_TIMEOUT: Duration = Duration::from_secs(5);
@@ -553,6 +553,7 @@ const SLOW_CLIENT_OUTBOUND_PRESSURE_DENOMINATOR: usize = 4;
 const OUTBOUND_COMMANDS_PER_PLAYER_BURST: usize = 16;
 const ENTITY_SPAWNS_PER_WRITE_TURN: usize = 16;
 const ENTITY_MOVEMENTS_PER_WRITE_TURN: usize = 256;
+const ENTITY_MOVEMENT_TARGET_UPDATES_PER_TRACKING_TURN: usize = 512;
 const TELEPORT_RESEND_DELAY_TICKS: u64 = 20;
 
 const SPAWN_X: f64 = 0.5;
@@ -621,7 +622,23 @@ pub(crate) fn configure_session_player_combat(sessions: &SessionRegistry, config
         Arc::clone(&config.item_facts),
     );
 }
-const ENTITY_MOVE_SEND_INTERVAL_TICKS: u64 = 1;
+// Vanilla's default EntityType tracking interval is three ticks; individual
+// fast projectiles can override it once Solaris carries that registry fact.
+const ENTITY_MOVE_SEND_INTERVAL_TICKS: u64 = 3;
+
+fn ordinary_entity_is_due_for_movement_tracking(
+    ordinal: usize,
+    tick: u64,
+    entity_count: usize,
+) -> bool {
+    if entity_count <= ENTITY_MOVEMENT_TARGET_UPDATES_PER_TRACKING_TURN {
+        return true;
+    }
+    let turn = tick / ENTITY_MOVE_SEND_INTERVAL_TICKS;
+    let start = (turn as usize * ENTITY_MOVEMENT_TARGET_UPDATES_PER_TRACKING_TURN) % entity_count;
+    (ordinal + entity_count - start) % entity_count
+        < ENTITY_MOVEMENT_TARGET_UPDATES_PER_TRACKING_TURN
+}
 const WORLD_TIME_SYNC_PERIOD: Duration = Duration::from_secs(1);
 struct RegisteredSessionCleanup {
     sessions: Arc<SessionRegistry>,
@@ -11464,31 +11481,37 @@ where
 
 struct KeepAliveTracker {
     next_id: i64,
-    last_response_at: Instant,
     pending_id: Option<i64>,
+    pending_since: Option<Instant>,
+    last_inbound_at: Instant,
 }
 
 impl KeepAliveTracker {
     fn new() -> Self {
         Self {
             next_id: 0,
-            last_response_at: Instant::now(),
             pending_id: None,
+            pending_since: None,
+            last_inbound_at: Instant::now(),
         }
     }
 
-    fn record_request(&mut self) -> i64 {
+    fn record_request(&mut self) -> Option<i64> {
+        if self.pending_id.is_some() {
+            return None;
+        }
         self.next_id = self.next_id.wrapping_add(1).max(1);
         self.pending_id = Some(self.next_id);
-        self.next_id
+        self.pending_since = Some(Instant::now());
+        Some(self.next_id)
     }
 
     fn record_response(&mut self, id: i64) -> bool {
         if self.pending_id != Some(id) {
             return false;
         }
-        self.last_response_at = Instant::now();
         self.pending_id = None;
+        self.pending_since = None;
         true
     }
 
@@ -11496,8 +11519,18 @@ impl KeepAliveTracker {
         self.pending_id
     }
 
-    fn elapsed_since_response(&self) -> Duration {
-        self.last_response_at.elapsed()
+    fn pending_elapsed(&self) -> Option<Duration> {
+        self.pending_since.map(|started| started.elapsed())
+    }
+
+    fn record_inbound_activity(&mut self) {
+        self.last_inbound_at = Instant::now();
+    }
+
+    fn timed_out(&self, timeout: Duration) -> Option<Duration> {
+        let pending_elapsed = self.pending_elapsed()?;
+        (pending_elapsed > timeout && self.last_inbound_at.elapsed() > timeout)
+            .then_some(pending_elapsed)
     }
 }
 
@@ -12171,20 +12204,21 @@ where
                 }
             }
             _ = ticker.tick() => {
-                if keepalive.elapsed_since_response() > KEEPALIVE_TIMEOUT {
+                if let Some(elapsed) = keepalive.timed_out(KEEPALIVE_TIMEOUT) {
                     warn!(
-                        elapsed_ms = keepalive.elapsed_since_response().as_millis() as u64,
+                        elapsed_ms = elapsed.as_millis() as u64,
                         "client missed keepalive deadline; closing"
                     );
                     return Ok(());
                 }
-                let keepalive_id = keepalive.record_request();
-                write_packet(
-                    writer,
-                    &ClientboundKeepAlive { id: keepalive_id },
-                    compression,
-                )
-                .await?;
+                if let Some(keepalive_id) = keepalive.record_request() {
+                    write_packet(
+                        writer,
+                        &ClientboundKeepAlive { id: keepalive_id },
+                        compression,
+                    )
+                    .await?;
+                }
             }
             changed = simulation_ticks.changed() => {
                 if changed.is_err() {
@@ -12316,6 +12350,7 @@ where
             }
             result = read_frame(reader, buf, compression) => {
                 let frame = result?;
+                keepalive.record_inbound_activity();
                 if frame.id == ServerboundKeepAlive::ID {
                     let mut body = frame.body;
                     let echo = ServerboundKeepAlive::decode(&mut body)?;

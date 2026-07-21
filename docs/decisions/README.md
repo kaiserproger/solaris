@@ -12,6 +12,7 @@ notes record progress; they do not silently change an ADR.
 | [0004](0004-staged-single-writer-simulation.md) | Accepted, staged migration | Single-writer authority, commands, publication, and migration fences |
 | [0005](0005-regional-simulation.md) | Accepted, staged migration | Regional ownership, phases, transfers, WAL, and cross-region rules |
 | [0006](0006-mc-net-module-boundaries.md) | Accepted, staged migration | `mc-net` module ownership and extraction boundaries |
+| [0007](0007-connection-liveness-under-outbound-pressure.md) | Accepted | Keepalive liveness and bounded entity movement publication under pressure |
 
 ## Routing
 
@@ -21,6 +22,7 @@ notes record progress; they do not silently change an ADR.
 - Simulation authority, commit, or publication: 0004.
 - Regional ownership, transfer, ECS cutover interaction, or WAL ordering: 0005.
 - `play.rs`, `session.rs`, or `simulation.rs` modularization: 0006.
+- Connection liveness, keepalive timeout, or client movement pressure: 0007.
 
 Update the owning ADR in the same slice when authority, threading, waiting,
 persistence ordering, or module policy changes. State non-goals and staged

@@ -536,12 +536,55 @@ async fn chunk_stream_write_timeout_sheds_stalled_client() {
 #[test]
 fn keepalive_tracker_only_accepts_the_matching_echo() {
     let mut keepalive = KeepAliveTracker::new();
-    let request_id = keepalive.record_request();
+    let request_id = keepalive.record_request().expect("first request");
 
     assert!(!keepalive.record_response(request_id + 1));
     assert_eq!(keepalive.pending_id(), Some(request_id));
     assert!(keepalive.record_response(request_id));
     assert_eq!(keepalive.pending_id(), None);
+}
+
+#[test]
+fn keepalive_tracker_never_replaces_an_unanswered_request() {
+    let mut keepalive = KeepAliveTracker::new();
+    let request_id = keepalive.record_request().expect("first request");
+
+    assert_eq!(keepalive.record_request(), None);
+    assert_eq!(keepalive.pending_id(), Some(request_id));
+    assert!(keepalive.record_response(request_id));
+    assert!(keepalive.record_request().is_some());
+}
+
+#[test]
+fn keepalive_timeout_requires_the_whole_connection_to_be_idle() {
+    let mut keepalive = KeepAliveTracker::new();
+    keepalive.record_request().expect("first request");
+    keepalive.pending_since = Some(Instant::now() - KEEPALIVE_TIMEOUT - Duration::from_secs(1));
+
+    keepalive.record_inbound_activity();
+    assert_eq!(keepalive.timed_out(KEEPALIVE_TIMEOUT), None);
+
+    keepalive.last_inbound_at = Instant::now() - KEEPALIVE_TIMEOUT - Duration::from_secs(1);
+    assert!(keepalive.timed_out(KEEPALIVE_TIMEOUT).is_some());
+}
+
+#[test]
+fn dense_entity_movement_tracking_rotates_bounded_shards() {
+    let entity_count = ENTITY_MOVEMENT_TARGET_UPDATES_PER_TRACKING_TURN * 10;
+    let mut visits = vec![0; entity_count];
+
+    for turn in 0..10 {
+        let tick = turn * ENTITY_MOVE_SEND_INTERVAL_TICKS;
+        let mut due = 0;
+        for (ordinal, visits) in visits.iter_mut().enumerate() {
+            if ordinary_entity_is_due_for_movement_tracking(ordinal, tick, entity_count) {
+                *visits += 1;
+                due += 1;
+            }
+        }
+        assert_eq!(due, ENTITY_MOVEMENT_TARGET_UPDATES_PER_TRACKING_TURN);
+    }
+    assert!(visits.into_iter().all(|visits| visits == 1));
 }
 
 #[test]
@@ -3602,7 +3645,7 @@ async fn toggle_planning_does_not_wait_for_world_writer() {
 fn entity_tick_cadence_matches_vanilla_cow_tracking() {
     assert_eq!(ENTITY_TICK_PERIOD, Duration::from_millis(50));
     assert_eq!(mc_physics::TICK_SECONDS, 0.05);
-    assert_eq!(ENTITY_MOVE_SEND_INTERVAL_TICKS, 1);
+    assert_eq!(ENTITY_MOVE_SEND_INTERVAL_TICKS, 3);
 }
 
 #[test]
