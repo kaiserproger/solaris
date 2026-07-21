@@ -8,11 +8,11 @@ contains the rules; this file contains the local wiring.
 | Tool | Status | Use |
 |---|---|---|
 | CodeGraph | installed globally via npm as `@colbymchenry/codegraph@1.2.0`; Codex MCP server `codegraph` registered; telemetry disabled; Solaris index lives in ignored `.codegraph/` | Targeted symbol graph questions: callers/callees, mutation paths, lock holders, affected tests, and blast-radius checks. Refresh with `codegraph sync .` after edits before relying on it. |
-| Serena | enabled globally through opencode MCP | Symbol search/editing and project memories. Prefer it for Rust code navigation before full-file reads. |
+| Serena | enabled globally through opencode MCP | Optional targeted Rust symbol search/editing and project memories; do not use it as mandatory startup context. |
 | Context7 | enabled globally through opencode MCP and verified 2026-06-11 | External library/framework docs. Use `resolve-library-id` before `query-docs`. |
 | RTK | installed at `/home/kaiserroman/.cargo/bin/rtk` | Compact shell output. OpenCode plugin installed globally at `~/.config/opencode/plugins/rtk.ts`; restart opencode before relying on auto-rewrite. |
 | Headroom | installed by `uv tool install "headroom-ai[all]"` at `/home/kaiserroman/.local/bin/headroom` | Optional context compression/proxy/MCP/learning. Do not route opencode provider traffic through Headroom unless explicitly asked. |
-| Agent harness | installed globally under `~/.config/opencode/bin/agent-harness` | Spec-first implementation, refactor, cleanup, and slop-review flows. Prefer native opencode slash commands over external LLM subprocesses. |
+| Agent harness | installed globally under `~/.config/opencode/bin/agent-harness` | Optional opencode workflow only when explicitly requested; normal Codex work uses the repo rules and exactly one final reviewer. |
 | Minecraft client MCP | embedded in the repo's NeoForge 26.1.2 development mod; loopback Streamable HTTP endpoint | Structured real-client observation, connection, inventory/entity waits, input, selected-item drop, and reusable multi-client core gates without screenshot assertions. |
 
 ## Minecraft Client MCP
@@ -75,12 +75,6 @@ Global commands already present in `~/.config/opencode/commands/`:
 | `/harness-preflight` | Deterministic agent/config/repo checks. |
 | `/harness-dry-run` | Generate harness prompts/artifacts without LLM phases. |
 
-Project command added here:
-
-| Command | Purpose |
-|---|---|
-| `/negative-code-review` | Read-only review of the current diff for negative-code, fake abstraction, and slop issues. |
-
 ## Headroom Notes
 
 Headroom's own CLI help says `headroom wrap opencode` does not exist. The
@@ -94,10 +88,13 @@ check startup cost before leaving it enabled.
 
 ## Session Logs
 
-Use both layers when prior-session evidence matters:
+Inspect metadata before content and select at most three sessions whose recorded
+`cwd` matches this repository. Large JSONL logs must be stream-filtered rather
+than dumped into model context.
 
 | Source | Command |
 |---|---|
+| Codex CLI JSONL | inspect `~/.codex/sessions/YYYY/MM/DD/rollout-*.jsonl`; verify `session_meta.payload.cwd` first |
 | OpenCode session list | `opencode session list` from `/home/kaiserroman/solaris` |
 | OpenCode SQLite DB | `sqlite3 ~/.local/share/opencode/opencode.db` |
 | Text parts | Query `part` joined with `message`/`session`; useful content is usually in `part.data` where `$.type == "text"`. |
@@ -107,12 +104,13 @@ redacts the text/tool payloads that usually contain the useful facts.
 
 ## Negative-Code Gate
 
-For any non-trivial code/config/doc change, finish with a negative-code review:
+For any non-trivial change, include negative-code checks in the one independent
+final review required by `AGENTS.md`:
 
 | Diff size | Gate |
 |---|---|
-| Small/single-file | Self-review the diff for deletion opportunities, one-use helpers, fake abstractions, wider-than-needed config, and stale docs. |
-| Non-trivial or risky | Use the `harness-slop-reviewer` subagent or `/negative-code-review`. |
-| Harness flow | Keep the existing `harness-slop-reviewer` and `harness-reviewer` phases; do not replace them with self-review. |
+| Small/single-file | Self-review, then ask one concise independent reviewer to check scope, duplication, fake abstractions, wider-than-needed config, and stale docs. |
+| Non-trivial or risky | Give the same single reviewer the concrete behavior, diff scope, and validation evidence. Do not add a separate slop-review agent. |
+| Explicit harness request | Adapt the harness to one final review phase; do not run multiple reviewer roles unless the owner explicitly asks. |
 
 Final reports should say whether the negative-code review ran and what it found.

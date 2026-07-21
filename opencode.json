@@ -17,9 +17,6 @@
       "hidden": true
     }
   },
-  "plugin": [
-    "./.opencode/plugins/negative-code-guard.ts"
-  ],
   "permission": {
     "*": {
       "*": "allow"

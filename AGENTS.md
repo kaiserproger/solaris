@@ -6,6 +6,62 @@ written in Rust. `CLAUDE.md` is a symlink to this file.
 Owner/local git identity: `kaiserproger <kaisergrobe@gmail.com>`.
 Do not change git config.
 
+## Working Contract
+
+Preserve and apply these owner rules exactly:
+
+"Do not overthink/overengineer every possible case until you explain exactly WHY it is needed and user agrees with you. Write as simple and clear as possible. Always ask user first what they fucking want."
+
+"Always double-check your work. Spawn another agent to give clear, concise second POV on your work. Do not do anything that isn't needed right now as it probably won't ever be needed."
+
+"On receiving new user request, first finish what you've started before taking new user request UNTIL it is explicitly required by user to take right now."
+
+Operational meaning:
+
+- The explicit user request is the source of truth. Do not invent scope, cases,
+  abstractions, compatibility promises, or requirements.
+- An explicit request already says what the user wants. Ask only when an
+  unresolved material choice would change the result; do not ask the user to
+  repeat an unambiguous request.
+- Prefer the smallest boring local change that completes the current request.
+  Do not add speculative abstraction, extensibility, configuration, or
+  impossible-case handling. Avoid unrelated refactors, formatting churn,
+  renaming, and comment rewrites. Remove only dead code/imports caused by the
+  current change.
+- Finish the active request before starting a later request. A new request is
+  queued unless the owner explicitly replaces or interrupts the active work.
+- `Stop`, `стоп`, `забей`, `поправка`, or an explicit replacement request means
+  switch now: stop active processes safely, inspect partial work and worktree
+  state, then follow the replacement request. `Retry` or `продолжай` means
+  recheck current state and references before resuming.
+- Do not stop at an intermediate plan, generated artifact, worktree result, or
+  partial implementation when the request asks for a working result.
+- Self-check every completed task, then use exactly one independent review
+  agent for a concise second opinion. Do not start a larger agent pipeline
+  unless the owner explicitly requests it. If review agents are unavailable,
+  check capability once, perform the same checklist yourself, and disclose
+  that independent review was unavailable.
+
+For non-trivial code or configuration work, state before editing:
+
+- Goal.
+- Assumptions.
+- Minimal plan.
+- Verification steps.
+
+After implementation, report:
+
+- What changed.
+- Why that is sufficient for the request.
+- What intentionally was not changed.
+- Exact verification results and skipped gates.
+
+Use the named surface as the starting point: route, field, screen, component,
+mechanic, error, merge request, CI symptom, or observed behavior. For a bug,
+reproduce and verify the same path. For a feature, define observable acceptance
+checks and prove them. For a refactor, preserve behavior and prove it with
+focused tests or an equivalent executable check.
+
 ## Operating Mode
 
 Default to autonomous, terse, evidence-first engineering.
@@ -60,14 +116,15 @@ as deferred debt and return to the highest unfinished item. A blocker may move
 ahead only when it breaks the common playable loop, corrupts ordinary saves, or
 prevents plugin API progress.
 
-The `superpowers` Codex plugin is intentionally left alone. Do not add
-project instructions that require extra local plugin layers unless the
-owner explicitly asks.
+Solaris does not require the `superpowers` plugin or a mandatory TDD workflow.
+Do not add process plugins or extra local tooling layers unless the owner asks
+for that exact workflow.
 
 ## Context Routing
 
-Start from the prompt, `git status`, and `rg`. Read one primary document below;
-follow its links only when the task needs them.
+Start from the prompt, `git status`, and `rg`. Read `.memory/MEMORY.md` before
+broad exploration, then open only its best matching route. Read one primary
+document below; follow its links only when the task needs them.
 
 - Long-goal recovery after compaction: `docs/MEMORY.md`.
 - No specific owner prompt: `docs/NEXT_SESSION.md`.
@@ -165,6 +222,9 @@ Local-only paths that must not be staged unless the owner explicitly asks:
 
 ## Repo Map
 
+- `.` - the only Git repository in this workspace: the Solaris Rust workspace
+  and its Minecraft client tooling. `crates/*` are Cargo members, not separate
+  repositories.
 - `crates/` - workspace members.
 - `crates/mc-test-harness/tests/` - wire-level integration tests and the
   canonical harness gate.
@@ -174,8 +234,14 @@ Local-only paths that must not be staged unless the owner explicitly asks:
 
 ## Validation
 
-Full baseline before commits, release-ready language, and final milestone
-closeout:
+During implementation, run the narrowest check that answers the current
+question. Do not repeatedly run workspace-wide gates after every edit or use
+test-first ceremony when a direct implementation and later focused check are
+clear.
+
+At the end of every completed code feature, bug fix, or refactor, run the full
+baseline once before its commit or handoff. The same baseline is required for
+release-ready language and final milestone closeout:
 
 ```sh
 cargo run -p xtask -- code-health
@@ -184,10 +250,11 @@ cargo clippy --workspace --all-targets -- -D warnings
 cargo fmt --all -- --check
 ```
 
-For inner-loop work, run the focused real-path tests first, plus
-`cargo fmt --all -- --check` and `cargo run -p xtask -- code-health`
-when practical. Run workspace `test`/`clippy` after the final slice or
-before a checkpoint commit.
+For the inner loop, use focused real-path tests only when they shorten feedback
+or prove the changed behavior. Group related edits into one coherent feature
+checkpoint, then run the full baseline once. For Markdown/instruction-only
+changes, do not run application test suites; run path/link/static/diff checks
+and say that application gates were intentionally skipped.
 
 If a higher-level gate was not run, say exactly that. Use the DoD labels
 for vanilla oracle, harness, manual/client, performance, and concurrency;
@@ -198,6 +265,10 @@ claims.
 
 `xtask code-health` is a fail-only architecture tripwire. It is useful,
 but it is not gameplay, oracle, client, performance, or soak evidence.
+Structural checks may enforce coarse ownership and dependency rules, using an
+AST when exact structure matters. Never test runtime behavior, statement order,
+or semantics by comparing Rust source text or line positions; use executable
+unit, wire, integration, or runtime tests.
 
 ## Development Workflow
 
@@ -205,12 +276,13 @@ For non-trivial code changes:
 
 1. Scout the exact files/symbols.
 2. Choose one independently revertible slice.
-3. Identify focused real-path tests before editing.
-4. Implement the smallest defensible diff.
-5. Enumerate and test every reachable failure branch changed by the slice, not
-   only the happy path: stale preconditions, owner rejection, partial/failed
-   mutation, empty/no-op input, mode-specific behavior, and cleanup/publication
-   failure where applicable.
+3. Define the observable success condition and the cheapest real-path check.
+4. Implement the smallest direct diff. Tests may be added before or after the
+   implementation; they are evidence, not a required TDD ritual.
+5. Enumerate and test the reachable material failure branches changed by the
+   slice, not only the happy path: stale preconditions, owner rejection,
+   partial/failed mutation, empty/no-op input, mode-specific behavior, and
+   cleanup/publication failure where applicable.
 6. Review the diff for negative-code issues: duplication, fake
    abstractions, broad config, unrelated churn, and unsupported claims.
 7. Run focused validation, then broader gates at the checkpoint.
@@ -225,20 +297,20 @@ and bounded. Keep substantial unit-test modules in sibling `*_tests.rs` files;
 do not grow `play/tests.rs`, `session/tests.rs`, or inline production-file test
 blocks further.
 
-Subagents are useful for scouting, implementation, and review when file
-ownership is separable. The main agent remains responsible for inspecting
-their diff and reporting exact validation evidence.
-
-Keep subagent usage bounded: never run more than four agents concurrently.
-Prefer two independent workers plus one reviewer, and use a fourth only for a
-clearly disjoint critical-path slice. Use `sol` at medium/high reasoning or
-`luna` at xhigh reasoning; do not use `terra`. Close finished agents before
-replacing them so the concurrency count stays explicit.
+Default to local implementation plus exactly one independent read-only reviewer
+after the task is complete. Use additional scout or worker agents only when the
+owner explicitly requests parallel work; give them disjoint scopes and never
+delegate the immediate blocking step. The main agent inspects every returned
+diff and owns final verification. Never run more than four agents concurrently.
+Use `sol` at medium/high reasoning or `luna` at xhigh reasoning; do not use
+`terra`. Reviewers must not edit files or spawn subagents. Close finished agents
+before replacing them, and do not spawn a second reviewer after fixing findings.
 
 Timebox each concrete independently revertible task to 90-120 minutes. If the
-scope will not fit, split it early into disjoint write sets and delegate those
-slices to subagents instead of stretching one task indefinitely. The timebox
-limits scope; it never permits skipped correctness fences or fake validation.
+scope will not fit, split it early into smaller sequential slices. Delegate
+disjoint slices only when the owner has explicitly authorized parallel work.
+The timebox limits scope; it never permits skipped correctness fences or fake
+validation.
 
 Clean up old worktrees after their task ends. Remove clean worktrees immediately;
 for dirty worktrees, first verify or archive any unique source changes, then remove
@@ -278,10 +350,11 @@ automation, or not run.
 
 ## Memory And Tooling
 
-Do not treat Codex, Serena, opencode session logs, or generated memories
-as mandatory startup context. Load memory only for a concrete need:
-recovering prior project state, validating an owner preference, finding
-local oracle/tool paths, or continuing a long goal after compaction.
+Use `.memory/MEMORY.md` as the compact routing entrypoint, not as mandatory
+broad context. Load deeper memory only for a concrete need: recovering prior
+project state, validating an owner preference, finding local oracle/tool paths,
+or continuing a long goal after compaction. Current code, tests, docs,
+configuration, and runtime behavior override memory.
 
 Update memory only for durable future value: milestone state, oracle
 paths, validation workflow, owner preferences, or stable tooling setup.
@@ -297,6 +370,11 @@ commands and focused searches over extra always-on guardrails.
 
 Be terse. Updates to the owner are 1-3 sentences. If a command runs for
 more than about 5 minutes, report the wait and keep useful work moving.
+
+When asked for progress since a prior prompt or time, report only that bounded
+interval: commits, observable capabilities, gates, unresolved work, and major
+time sinks. Do not answer with generic lifetime progress or only the latest
+micro-step.
 
 Before saying work is ready/done/parity/replacement-ready, state what was
 actually proved and what was not. Hard readiness language requires the

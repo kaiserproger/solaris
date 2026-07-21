@@ -1,0 +1,30 @@
+# Plugin Route
+
+Read `docs/PLUGINS.md` for the exact current API and ADR 0006 for ownership.
+Do not infer plugin contracts from examples or old milestone notes.
+
+Ownership:
+
+- `crates/mc-script/` owns manifest/config validation, Lua VM limits, immutable
+  DTO conversion, handler execution, command admission, and host-local timers.
+- `crates/mc-net/src/script/` owns bounded server adapters and registries.
+- Focused play/session endpoint modules own mutations requiring a connected
+  player or authoritative simulation turn.
+- `examples/plugins/` are shipped consumers. Their real behavior is exercised
+  through `crates/mc-test-harness/tests/plugin_*.rs`.
+
+Stable contract rules:
+
+- Privileged calls require declared capabilities. Plugin identity comes from
+  the attached host, never a Lua-supplied id.
+- Events describe committed facts. Rejected, preview, stale, no-op, or partial
+  paths must not fabricate success events.
+- Owner/result events are targeted and correlated; do not replace exact result
+  events with polling, elapsed time, or `server.tick` as a generic fence.
+- Mutations cross the existing session/simulation/storage authority. Lua never
+  receives live Rust references, locks, packet state, or direct ECS access.
+
+For a new API slice, prove Lua validation, capability rejection, authoritative
+success and material rejection paths, targeted isolation, and one production
+TCP/Lua path. Run all workspace gates once when the completed slice is ready to
+commit.

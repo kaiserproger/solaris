@@ -1,0 +1,36 @@
+# Architecture Route
+
+Read `docs/decisions/README.md`, then only the owning ADR. Use
+`docs/CORE_INTERNALS_FOR_OWNER.md` when a deeper current-code map is required.
+
+Current runtime facts:
+
+- Solaris is a modular monolith, but `mc-net` orchestration remains only partly
+  extracted. `play.rs`, `simulation.rs`, and related roots still contain real
+  behavior; ADR 0006 records the staged boundary rather than completed purity.
+- `EntityStore` is the production ECS authority. Regional ownership and
+  transfers are staged; gameplay-significant side maps and global coordination
+  still exist. ADR 0004/0005 are authoritative.
+- Migrated world mutation and persistence paths use owned snapshots,
+  prepare/commit/finalize, and explicit publication fences. Legacy/staged paths
+  remain; verify the exact caller against ADR 0004. Do not hold locks across
+  socket progress or guessed waits.
+- Runtime capacity is derived from the machine. Autoscaling uses measurements
+  and bounded admissions; operator worker-percentage knobs are forbidden.
+- SIMD and fast paths require a measured bottleneck, a scalar/correctness
+  fence, and evidence for only the measured workload.
+- Uncontrolled heavy host load invalidates performance attribution. Record the
+  build, workload, host contention, p95/p99, and maximum; repeat the same gate
+  on a clean host. A contaminated run may retain functional evidence only.
+
+Routing:
+
+- Protocol ids/layouts: ADR 0002 plus local `wire-probe`/`javap` evidence.
+- Authority or persistence ordering: ADR 0004.
+- Regional ownership/transfers/ECS interaction: ADR 0005.
+- `mc-net` extraction and publication adapters: ADR 0006.
+- Performance claims: the exact milestone and documented metric definition;
+  narrow benchmarks never prove the full scaling envelope.
+
+Desired migration is not runtime truth. Verify callers, mutation authority,
+tests, and publication before claiming a boundary has moved.

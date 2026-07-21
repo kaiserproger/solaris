@@ -105,6 +105,21 @@ is not included in aggregate flush metrics. The normal save path and ordinary
 crash-safety fences are covered. Do not resume this hardening before the first
 two priorities unless it becomes a common-play blocker or corruption risk.
 
+## Workflow Lock
+
+- Route exact surfaces through `.memory/MEMORY.md`; do not load the whole docs
+  stack or raw session history after compaction.
+- Finish the active request before accepting a later one unless the owner
+  explicitly interrupts or replaces it. On retry, verify current process and
+  worktree state before resuming.
+- Keep implementation direct and local. Ask only about a material ambiguity;
+  an explicit request does not need reconfirmation.
+- Use focused checks during implementation. Run all workspace code gates once
+  after a complete code feature, bug fix, or refactor, not after every edit.
+  Markdown/instruction-only work gets static/path/diff checks, not Cargo tests.
+- Self-check every completed task and use exactly one independent read-only
+  reviewer. Extra workers require an explicit owner request.
+
 ## Current Head
 
 ### Core And Ownership
