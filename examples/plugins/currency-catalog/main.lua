@@ -211,6 +211,10 @@ function on_server_started(_event)
     )
 end
 
+function on_player_joined(event)
+    send_message(event.player_id, "Currency Catalog ready.")
+end
+
 function on_player_zone_entered(event)
     last_batch = nil
     if event.zone_id ~= config.zone.id then

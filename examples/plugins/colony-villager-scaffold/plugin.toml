@@ -1,7 +1,7 @@
 id = "colony-villager-scaffold"
 name = "Colony Villager Scaffold"
-version = "0.2.0"
+version = "0.3.0"
 api = "0.6.0"
-events = ["server.started", "player.left"]
+events = ["server.started", "player.joined", "player.left"]
 capabilities = ["storage", "zones", "colonies"]
 player_commands = ["colony"]

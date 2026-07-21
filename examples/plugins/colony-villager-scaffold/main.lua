@@ -42,6 +42,7 @@ local pending_get_by_player = {}
 local pending_cas = {}
 local pending_bindings = {}
 local pending_orders = {}
+local active_bindings = {}
 local records = {}
 local zone_seen = {}
 local deferred_notices = {}
@@ -128,6 +129,12 @@ local function send_notice(player_id)
     end
 end
 
+local function publish_colony_ready()
+    colony_outcome = "ready"
+    last_batch = { kind = "message" }
+    solaris.broadcast("Colony plugin ready.")
+end
+
 local function action_request_id(prefix, player_id, version)
     return prefix
         .. "-" .. tostring(player_id)
@@ -167,7 +174,7 @@ local function queue_cas(player_id, uuid, key, expected_version, next_record, af
     solaris.storage_cas(request_id, key, expected_version, encode_record(next_record))
 end
 
-local function queue_binding(player_id, uuid, key, version, record, x, y, z)
+local function queue_binding(player_id, uuid, key, version, record, x, y, z, purpose)
     local request_id = action_request_id("bind", player_id, version)
     pending_bindings[request_id] = {
         player_id = player_id,
@@ -175,6 +182,7 @@ local function queue_binding(player_id, uuid, key, version, record, x, y, z)
         key = key,
         version = version,
         record = record,
+        purpose = purpose,
     }
     last_batch = { kind = "binding", request_id = request_id, player_id = player_id }
     solaris.bind_nearest_villager(
@@ -189,6 +197,7 @@ end
 
 local function queue_order(pending, binding_token)
     local request_id = action_request_id("order", pending.player_id, pending.version)
+    pending.binding_token = binding_token
     pending_orders[request_id] = pending
     last_batch = { kind = "order", request_id = request_id, player_id = pending.player_id }
     solaris.set_villager_order(
@@ -230,7 +239,7 @@ local function status_message(record)
         return "Recruitment rejected or unavailable; API 0.6 does not distinguish the cause."
     end
     return "Recruited villager: role metadata=" .. record.role
-        .. ", last accepted order=" .. record.order .. "."
+        .. ", stored order intent=" .. record.order .. "."
 end
 
 local function handle_player_state(pending, value, version)
@@ -276,7 +285,8 @@ local function handle_player_state(pending, value, version)
                 record,
                 pending.x,
                 pending.y,
-                pending.z
+                pending.z,
+                "recruit"
             )
             return
         end
@@ -336,7 +346,14 @@ local function handle_player_state(pending, value, version)
         pending.key,
         version,
         next_record,
-        { kind = "updated", field = pending.action },
+        pending.action == "order"
+            and {
+                kind = "apply_order",
+                x = pending.x,
+                y = pending.y,
+                z = pending.z,
+            }
+            or { kind = "updated", field = pending.action },
         pending.action
     )
 end
@@ -362,6 +379,7 @@ local function clear_player(player_id)
             pending_orders[request_id] = nil
         end
     end
+    active_bindings[player_id] = nil
     records[player_id] = nil
     zone_seen[player_id] = nil
     deferred_notices[player_id] = nil
@@ -390,6 +408,12 @@ function on_server_started(_event)
         config.zone.maximum.y,
         config.zone.maximum.z
     )
+end
+
+function on_player_joined(event)
+    if colony_outcome == "ready" then
+        send_message(event.player_id, "Colony plugin ready.")
+    end
 end
 
 function on_colony_record_result(event)
@@ -525,7 +549,7 @@ function on_plugin_storage_get_result(event)
             }
             queue_cas(nil, nil, pending.key, event.version, record, { kind = "colony_record" }, "persist-colony")
         elseif event.value == "v1|active|worker|home|1" then
-            colony_outcome = "ready"
+            publish_colony_ready()
         else
             colony_outcome = "invalid_colony_record"
         end
@@ -569,7 +593,7 @@ function on_plugin_storage_cas_result(event)
         return
     end
     if pending.after.kind == "colony_record" then
-        colony_outcome = "ready"
+        publish_colony_ready()
         return
     end
 
@@ -588,8 +612,38 @@ function on_plugin_storage_cas_result(event)
             pending.next_record,
             pending.after.x,
             pending.after.y,
-            pending.after.z
+            pending.after.z,
+            "recruit"
         )
+    elseif pending.after.kind == "apply_order" then
+        local binding = active_bindings[pending.player_id]
+        if binding == nil then
+            queue_binding(
+                pending.player_id,
+                pending.uuid,
+                pending.key,
+                event.version,
+                pending.next_record,
+                pending.after.x,
+                pending.after.y,
+                pending.after.z,
+                "apply_order"
+            )
+        else
+            queue_order({
+                player_id = pending.player_id,
+                uuid = pending.uuid,
+                key = pending.key,
+                version = event.version,
+                record = pending.next_record,
+                purpose = "apply_order",
+                binding_expires_at_tick = binding.expires_at_tick,
+                retry_binding = true,
+                x = pending.after.x,
+                y = pending.after.y,
+                z = pending.after.z,
+            }, binding.token)
+        end
     elseif pending.after.kind == "updated" then
         send_message(pending.player_id, "Stored " .. pending.after.field .. " intent.")
     elseif pending.after.kind == "binding_complete" then
@@ -619,6 +673,13 @@ function on_colony_villager_binding_result(event)
     end
 
     if event.binding_token == nil then
+        if pending.purpose == "apply_order" then
+            send_message(
+                pending.player_id,
+                "Stored order intent, but no villager was available to apply it."
+            )
+            return
+        end
         local next_record = copy_record(pending.record)
         next_record.generation = next_record.generation + 1
         if next_record.generation > config.max_generation then
@@ -636,6 +697,8 @@ function on_colony_villager_binding_result(event)
             "reject"
         )
     else
+        pending.binding_expires_at_tick = event.binding_expires_at_tick
+        pending.retry_binding = false
         queue_order(pending, event.binding_token)
     end
 end
@@ -652,6 +715,39 @@ function on_colony_villager_order_result(event)
         return
     end
 
+    if pending.purpose == "apply_order" then
+        if event.accepted then
+            active_bindings[pending.player_id] = {
+                token = pending.binding_token,
+                expires_at_tick = pending.binding_expires_at_tick,
+            }
+        else
+            active_bindings[pending.player_id] = nil
+            if pending.retry_binding then
+                queue_binding(
+                    pending.player_id,
+                    pending.uuid,
+                    pending.key,
+                    pending.version,
+                    pending.record,
+                    pending.x,
+                    pending.y,
+                    pending.z,
+                    "apply_order"
+                )
+                return
+            end
+        end
+        send_message(
+            pending.player_id,
+            event.accepted
+                and ("Applied villager order " .. pending.record.order .. ".")
+                or ("Stored order intent, but villager order "
+                    .. pending.record.order .. " was rejected.")
+        )
+        return
+    end
+
     local next_record = copy_record(pending.record)
     next_record.generation = next_record.generation + 1
     if next_record.generation > config.max_generation then
@@ -659,6 +755,10 @@ function on_colony_villager_order_result(event)
         return
     end
     if event.accepted then
+        active_bindings[pending.player_id] = {
+            token = pending.binding_token,
+            expires_at_tick = pending.binding_expires_at_tick,
+        }
         next_record.status = "active"
         queue_cas(
             pending.player_id,
@@ -670,6 +770,7 @@ function on_colony_villager_order_result(event)
             "activate"
         )
     else
+        active_bindings[pending.player_id] = nil
         next_record.status = "rejected"
         queue_cas(
             pending.player_id,

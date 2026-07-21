@@ -363,6 +363,18 @@ mutation was rejected. Temporary owner pressure also returns `accepted = false`,
 but retains the unexpired token so the plugin may retry. Changing the colony to
 another dimension rejects the order before owner mutation.
 
+The shipped colony scaffold retains an accepted token only in Lua memory for
+the active player session and reuses it for later `home` or `hold` updates.
+It reports `Applied villager order ...` only after the targeted owner result is
+accepted. If a cached token is rejected, the scaffold clears it and performs
+one fresh binding attempt; a result from that attempt is never recursively
+retried. Plugin storage records the bounded role and order intent, not the
+ephemeral token or a fabricated entity-mutation result; `/colony status` labels
+that field as stored intent. Disconnect cleanup drops the Lua-side token, while
+the regional owner keeps its claim only until the documented simulation-tick
+expiry. Durable entity handles, general roles, and work-order execution remain
+outside API `0.6.0`.
+
 ## Isolation And Limits
 
 Each plugin has one Lua VM on the dedicated host thread with a 16 MiB memory
@@ -405,3 +417,16 @@ network, process, debug, paths, locks, NBT, sessions, or entity pointers.
 
 See [the contract examples](../examples/plugins/) for the configurable currency
 catalog and the intentionally limited colony/villager scaffold.
+
+`crates/mc-test-harness/tests/plugin_examples.rs` copies those exact shipped
+files into an isolated plugin directory and runs them through the production
+Lua host, server router, storage actor, regional owner, and wire client. The
+catalog gate proves zone entry, menu contents, atomic purchase, insufficient
+funds rejection, unchanged ledger, and refund. The colony gate proves command
+registration, durable recruitment, initial `home`, a later accepted `hold`, and
+the resulting durable status. It then removes the bound villager and proves
+that rejected cached-token application causes one fresh bind and an explicit
+no-villager result. Plugin-emitted readiness messages causally fence startup;
+timeouts only fail missing packets. These are integration checks of the
+examples; they are not vanilla-oracle or broad plugin-ecosystem readiness
+evidence.
