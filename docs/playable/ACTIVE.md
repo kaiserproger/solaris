@@ -34,14 +34,31 @@ hardening. An already-open lower-priority diff does not override this order.
 3. If that session has no common blocker, move to the first production plugin
    API slice while keeping the playable gate fixed. Defer optimization unless
    play exposes a catastrophic stall.
-4. Defer deterministic livestock climbing and earned stonecutter hardening
+4. The next autonomous common-playable slice is ordinary furnace fuel parity:
+   replace the narrow hardcoded fuel set with the existing data/tag-backed
+   contract and exercise accepted and rejected fuels through the real container
+   path.
+5. Defer deterministic livestock climbing and earned stonecutter hardening
    until they block ordinary survival or the plugin-backed gameplay loop.
-5. Keep the rare multi-region save recovery `fsync`/metrics issue documented
+6. Keep the rare multi-region save recovery `fsync`/metrics issue documented
    but deferred. Do not resume it unless it becomes ordinary save corruption or
    blocks the playable or plugin path.
 
 ## Recent Evidence
 
+- Checkpoint `99b9879` adds production `player.entity_interacted` Lua events for
+  authoritative reachable right-click gestures against alive server-owned
+  living entities. The exact event carries actor identity/pose/mode, target
+  id/type, hand, and secondary-action state; it does not claim a vanilla side
+  effect. Missing, far, nonliving, dying, Spectator, and dead-actor paths emit
+  nothing. Vanilla feed/shear handling and client writes complete before
+  required Lua admission can wait, and write errors retain immediate cleanup.
+  The production TCP/Lua gate proves rejected far/missing attempts followed by
+  exact off-hand/secondary and main-hand events without a quiet-window success
+  condition. Full workspace tests, strict workspace Clippy, fmt, code-health
+  `0 fail / KEEP`, and diff-check pass. A `sol high` review found and verified
+  the delivery-order fixes. No manual-client or vanilla-oracle gate was run for
+  this plugin-only slice.
 - Checkpoint `aabea52` adds the production `player.entity_killed` Lua event for
   exact direct player-melee kills. It publishes only after target lethality and
   attacker costs commit, captures the transaction pose, and does not attribute

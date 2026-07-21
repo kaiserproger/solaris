@@ -81,6 +81,7 @@ targeted event does not need a broad subscription to reach its owner.
 | `player.item_crafted` | `on_player_item_crafted` | `name`, `player_id`, `context_verified`, `uuid`, `username`, `operator`, `x`, `y`, `z`, `dimension`, `item_id`, `count`, `craft_count`, `source`, `game_mode` |
 | `player.item_picked_up` | `on_player_item_picked_up` | `name`, `player_id`, `context_verified`, `uuid`, `username`, `operator`, `x`, `y`, `z`, `dimension`, `item_id`, `count`, `source`, `game_mode` |
 | `player.entity_killed` | `on_player_entity_killed` | `name`, `player_id`, `context_verified`, `uuid`, `username`, `operator`, `x`, `y`, `z`, `dimension`, `entity_id`, `entity_type`, `source`, `game_mode` |
+| `player.entity_interacted` | `on_player_entity_interacted` | `name`, `player_id`, `context_verified`, `uuid`, `username`, `operator`, `x`, `y`, `z`, `dimension`, `entity_id`, `entity_type`, `hand`, `secondary_action`, `game_mode` |
 | `player.died` | `on_player_died` | `name`, `player_id`, `context_verified`, `uuid`, `username`, `operator`, `x`, `y`, `z`, `dimension`, `game_mode` |
 | `server.tick` | `on_server_tick` | `tick` |
 | `player.command` | `on_player_command` | player snapshot, `root`, `arguments` |
@@ -149,6 +150,20 @@ the already-dying entity, arrows, explosions, environmental damage, and
 non-player damage publish nothing. Projectile attribution can extend this
 event only when its owner carries an exact player identity through the lethal
 commit; plugins must not infer it from nearby players or timing.
+
+`player.entity_interacted` represents an accepted right-click gesture, not a
+claim that a vanilla side effect occurred. The session owner accepts only a
+reachable, alive, server-owned living entity for a live non-Spectator player;
+`entity_id`, `entity_type`, player pose, dimension, game mode, hand, and
+`secondary_action` come from that accepted snapshot. `hand` is `main_hand` or
+`off_hand`; `game_mode` is `survival`, `creative`, or `adventure`. Missing,
+nonliving, dying, dead, unreachable, or non-finite interactions publish
+nothing. The normal feed, shear, or unsupported-interaction path completes
+first, including fallible inventory writes; only then may required Lua queue
+admission wait for capacity. Queue closure cannot roll back or reject the
+already completed vanilla path. Plugins may use this event to open an NPC menu
+or start a dialogue, but must not infer feeding, shearing, trading, or another
+vanilla mutation from the gesture alone.
 
 `player.died` is published once after the simulation owner accepts a live-to-
 dead player survival transition, including the same atomic inventory drop and

@@ -9,20 +9,20 @@ and is not startup context.
 
 - Date: 2026-07-21.
 - Branch: `dev/M100-client-agent`.
-- Latest checkpoint: `aabea52` (`feat(plugins): publish committed entity
-  kills`). Delivery-order checkpoint `5e2908a` remains binding.
+- Latest checkpoint: `99b9879` (`feat(plugins): publish accepted entity
+  interactions`). Delivery-order checkpoint `5e2908a` remains binding.
 - The worktree may contain unrelated owner files and local artifacts. Inspect
   exact ownership before editing; never clean or stage them by accident.
 - Full workspace tests, workspace all-target strict Clippy, fmt, code-health
-  `0 fail / KEEP`, and diff-check passed immediately before `aabea52`. The real
-  TCP/Lua gate proved two exact direct-melee kill events without a delayed
-  duplicate; direct tests cover nonlethal, unreachable, stale-cost,
-  repeated-dying, moved-session-snapshot, and closed-outbox paths. A `sol high`
-  review found no blocker; its stale-position finding was fixed. Global ordering
-  against concurrent lossy/script producers remains outside the committed
-  outbox FIFO contract and was not broadened into a script-bus redesign. No
-  manual/client or vanilla-oracle gate was run for this plugin-only slice.
-  Pre-existing entity-scale and local artifact changes were not staged.
+  `0 fail / KEEP`, and diff-check passed immediately before `99b9879`. The real
+  TCP/Lua gate rejected far and missing targets, then observed exact off-hand
+  and main-hand interaction snapshots. Direct tests cover nonliving, dying,
+  dead-actor, Spectator, Creative/Adventure, queue-closure, DTO, and Lua-table
+  paths. A `sol high` review found two delivery-order issues; both were fixed so
+  vanilla work and writes complete before required Lua admission, while write
+  errors still return immediately. No manual-client or vanilla-oracle gate was
+  run for this plugin-only slice. Pre-existing entity-scale and local artifacts
+  were not staged.
 - Ignored oracle/load/benchmark rows remain explicit. The P04 real-client soak
   ran; broad performance and dedicated concurrency gates did not.
 
@@ -91,8 +91,14 @@ two priorities unless it becomes a common-play blocker or corruption risk.
   source carries exact facts. Direct player melee entity kills publish a
   separate exact `player.entity_killed` fact with target id/type and explicit
   `source = melee`; nonlethal, unreachable, stale, repeated-dying, projectile,
-  explosion, environmental, and non-player paths do not claim attribution. The
-  shared owner-to-server outbox is unbounded to avoid waiting under owner locks;
+  explosion, environmental, and non-player paths do not claim attribution.
+  Accepted right-clicks now publish `player.entity_interacted` with an exact
+  reachable living target, actor pose/mode, hand, and secondary-action
+  snapshot. It is a gesture event, not proof of feeding, shearing, trading, or
+  another vanilla side effect. The vanilla interaction and client writes finish
+  before required Lua admission can wait; missing, nonliving, dying, far,
+  Spectator, and dead-actor paths publish nothing. The death/kill
+  owner-to-server outbox is unbounded to avoid waiting under owner locks;
   do not revisit it before playable/Lua work unless a measured hostile workload
   makes its memory material. Direct tests cover
   cursor mismatch, full output inventory,
@@ -171,13 +177,18 @@ two priorities unless it becomes a common-play blocker or corruption risk.
 
 1. Run an owner-played survival session and fix its first common client-visible
    blocker before isolated parity or performance work.
-2. If owner play finds no common blocker, advance the production Lua plugin API
+2. In autonomous playable work, close the common furnace-fuel gap before the
+   next plugin event: replace the narrow hardcoded fuel set with the existing
+   data/tag-backed vanilla contract and prove ordinary valid and invalid fuels
+   through the real container path.
+3. If owner play finds no common blocker, advance the production Lua plugin API
    before returning to broad optimization work.
-3. Only after those two priorities, continue reducing `simulation.rs` through explicit ownership boundaries;
-   avoid moves that retain `use super::*` or duplicate authority.
-4. Then advance regional ownership/ECS only with exact CAS, WAL, publication, and
+4. Only after those priorities, continue reducing `simulation.rs` through
+   explicit ownership boundaries; avoid moves that retain `use super::*` or
+   duplicate authority.
+5. Then advance regional ownership/ECS only with exact CAS, WAL, publication, and
    cross-region failure fences.
-5. Broaden playable progression by the Pareto rule before polishing rare parity
+6. Broaden playable progression by the Pareto rule before polishing rare parity
    or save-error edges.
 
 ## Canonical Routes

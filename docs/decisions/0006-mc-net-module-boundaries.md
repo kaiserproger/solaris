@@ -517,6 +517,16 @@ Other accepted concrete boundaries in this staged migration are:
   existing session children. Consumers use direct sibling imports; the module
   has no registry/world access, lock, async work, packet publication or cached
   duplicate facts.
+- `play::session::script_entity_interaction` owns the authoritative snapshot
+  used by `player.entity_interacted`: actor mode/liveness, target
+  liveness/type, current pose, and canonical reach are checked in one existing
+  session/entity owner turn. Living projection follows the entity behavior
+  archetype rather than `MobCategory`, so living `MISC` entities such as
+  villagers retain health. `play::script_gameplay_events` owns only the Lua DTO
+  mapping and required queue admission. `play.rs` completes the existing
+  vanilla interaction and client writes before awaiting that admission, while
+  write errors keep their original immediate return. This boundary adds no
+  lock class, task, channel, polling loop, sleep, or gameplay mutation.
 - `play::campfire_adapter` owns campfire use responses, cooking-tick
   orchestration, persisted hydration, pending-output recovery and block-entity
   packet projection. Campfire rules/NBT remain in `campfire`; session CAS stays
