@@ -7,11 +7,13 @@ and is not startup context.
 
 ## Current Checkpoint
 
-- Date: 2026-07-21.
+- Date: 2026-07-22.
 - Branch: `dev/M100-client-agent`.
-- Latest code checkpoint: current `HEAD` (`fix(play): align reach with 26.1.2`).
-  The preceding creeper checkpoint is `9af1309`, dry-spawn checkpoint is
-  `6b0dcec`, autoscale checkpoint is `5b7017a`, and water checkpoint is `547525e`.
+- Latest recorded checkpoint: mob death deadline indexing
+  (`fix(play): index mob death deadlines`).
+  The reach checkpoint is `5146926`, creeper checkpoint is `9af1309`,
+  dry-spawn checkpoint is `6b0dcec`, autoscale checkpoint is `5b7017a`, and
+  water checkpoint is `547525e`.
   Delivery-order checkpoint `5e2908a` remains binding.
 - The worktree may contain unrelated owner files and local artifacts. Inspect
   exact ownership before editing; never clean or stage them by accident.
@@ -42,6 +44,14 @@ and is not startup context.
   non-finite inputs fail closed. Focused reach, mob damage/death, death timing,
   and skeleton tests plus the full `mc-net` suite pass. A manual client gate
   remains open.
+- Mob death completion is indexed by exact retained deadline instead of an
+  unconditional full entity scan. Lethal melee/projectile/effect paths and
+  persisted restore populate the index. Cleanup drains at most four deaths per
+  tick, keeping mass-death overload bounded. The explicit `-O3` 4,096-cow load
+  measured idle p99 11 us, sustained four-kill p99 13,668 us, and bounded
+  four-removal p99 24,367 us. Focused death/effect/arrow/restart tests pass;
+  this does not prove real socket throughput or manual combat feel. The next
+  checkpoint is the requested basic economy and land-claim plugins.
 - The owner O3 rerun still disconnected periodically in the dense 5,132-entity
   world, so a dense owner-world rerun remains an open playable gate. A short
   real 26.1.2-client run against the current O3 binary passed join, play, block

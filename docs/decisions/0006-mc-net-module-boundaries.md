@@ -302,7 +302,11 @@ Other accepted concrete boundaries in this staged migration are:
   `session.rs` retains registry fields, EntityStore -> SessionRegistry guard
   acquisition, public wrappers, specialized entity domains, and delivery.
   Consumers import lifecycle helpers directly rather than through the parent
-  facade; mutation and visibility plans retain stable entity-ID order.
+  facade. Lethal mutation owners enqueue exact removal deadlines, and restore
+  rebuilds that index from retained snapshots. The tick path drains at most
+  four due entities, preserving exact timing for ordinary deaths while bounding
+  overload work; later due entries remain queued without scanning live
+  entities. Mutation and visibility plans retain stable entity-ID order.
 - `play::containers::crafting` owns synchronous 2x2 and 3x3 menu mutation,
   pickup, swap, throw, quick-move, result taking, ingredient consumption, and
   container remainders. Shared slot and cursor primitives live beside

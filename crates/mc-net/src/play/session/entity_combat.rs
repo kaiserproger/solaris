@@ -1,3 +1,4 @@
+use super::entity_lifecycle::schedule_entity_death_locked;
 use super::interaction_geometry::{entity_geometry, within_entity_attack_reach};
 use super::player_combat::held_attack_range;
 use super::player_state::{apply_player_survival_plan_locked, player_attack_cost_plan_matches};
@@ -205,7 +206,11 @@ impl SessionRegistry {
         amount: f32,
     ) -> Option<mc_entity::EntityDamage> {
         let mut inner = self.lock_session_entities("damage server entity test");
-        damage_server_entity_locked(&mut inner, entity_id, amount)
+        let damage = damage_server_entity_locked(&mut inner, entity_id, amount)?;
+        if damage.killed {
+            schedule_entity_death_locked(&mut inner, &damage.snapshot);
+        }
+        Some(damage)
     }
 
     #[cfg(test)]
@@ -246,6 +251,7 @@ fn apply_server_entity_effect_request_locked(
     let result = inner.entities.apply_effect_if_current(expected, request);
     let dispatches = match &result {
         EntityEffectResult::Applied(applied) => {
+            schedule_entity_death_locked(inner, &applied.snapshot);
             publish_accepted_entity_health_locked(inner, &applied.snapshot)
         }
         EntityEffectResult::Rejected(_) => Vec::new(),
@@ -296,6 +302,7 @@ pub(super) fn begin_server_entity_death_locked(
     rewards: &EntityKillRewards,
 ) -> (ServerEntitySnapshot, Vec<VisibilityDispatch>) {
     let entity_id = damage.snapshot.id;
+    schedule_entity_death_locked(inner, &damage.snapshot);
     let entity = server_entity_snapshot_from(damage.snapshot.clone());
     let mut dispatches = Vec::new();
     for (entity_type_id, stack) in &rewards.items {

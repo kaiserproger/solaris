@@ -37,12 +37,13 @@ hardening. An already-open lower-priority diff does not override this order.
    now has server-owned air/drowning, vanilla swimming metadata, and aquatic
    physics that no longer pushes fish to the surface; owner-client verification
    remains pending.
-3. After the disconnect, close the remaining common-play reports: owner-client
-   water movement and lag-free mob damage/death. Default block, entity-use and
-   melee reach now follow the 26.1.2 server verification contracts. Skeleton
-   arrows and creeper explosions have real TCP coverage. Dry-land random-seed
-   spawn has focused server evidence and an initial real-client non-water
-   observation.
+3. After the disconnect, close the remaining owner-client reports: water
+   movement and manual mob-combat feel. The mob death core now has bounded O3
+   load evidence, but this does not replace client/socket verification. Default
+   block, entity-use and melee reach follow the 26.1.2 server verification
+   contracts. Skeleton arrows and creeper explosions have real TCP coverage.
+   Dry-land random-seed spawn has focused server evidence and an initial
+   real-client non-water observation.
 4. Ship the requested basic economy and land-claim plugins on the production
    Lua API, then document operator TOML options beside their values.
 5. Improve terrain generation toward the concrete Tellus/Tectonic traits that
@@ -55,6 +56,17 @@ hardening. An already-open lower-priority diff does not override this order.
    blocks the playable or plugin path.
 
 ## Recent Evidence
+
+- Mob death completion no longer scans every server entity every tick. Lethal
+  melee, projectile/effect damage, test ingress, and persisted restore enqueue
+  exact retained deadlines; the tick path drains four due deaths per tick so a
+  mass-death spike cannot monopolize one tick. An explicit `-O3` benchmark with
+  4,096 cows measured idle death ticks at 7 us p50 / 11 us p99, sustained
+  four-kill batches at 11,664 us p50 / 13,668 us p99, and four-removal batches
+  at 10,147 us p50 / 24,367 us p99. Focused tests cover an empty index,
+  multi-tick backlog, lethal effects, arrows, normal death timing, and restart
+  reconstruction. This is in-process owner/publication evidence, not real
+  socket throughput or manual combat feel.
 
 - Reach now uses the 26.1.2 server contracts instead of one shared
   center-distance rule. Block checks measure eye-to-block AABB at 5.5 survival

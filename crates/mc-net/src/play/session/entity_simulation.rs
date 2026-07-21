@@ -1,5 +1,6 @@
 use super::entity_lifecycle::{
-    move_entity_chunk_locked, remove_server_entity_locked, track_entity_chunk_locked,
+    move_entity_chunk_locked, remove_server_entity_locked, schedule_entity_death_locked,
+    track_entity_chunk_locked,
 };
 use super::entity_physics_class::entity_type_uses_aquatic_physics;
 use super::interaction_geometry::{
@@ -490,6 +491,7 @@ impl SessionRegistry {
             let type_id = entity.type_id;
             let entity_id = entity.id;
             let position = entity.position;
+            schedule_entity_death_locked(&mut inner, &entity);
             if entity.item_stack.is_some()
                 && let Some(ready_tick) = entity.retained.item_pickup_ready_tick
                 && ready_tick > lifecycle_clock

@@ -19,6 +19,9 @@ use std::sync::{Mutex, MutexGuard};
 
 mod campfire_authority;
 mod chunk_view_authority;
+#[cfg(test)]
+#[path = "session/combat_load_tests.rs"]
+mod combat_load_tests;
 mod container_state;
 mod container_views;
 mod entity_combat;
@@ -334,6 +337,8 @@ struct SessionRegistryInner {
     spawned_entity_chunks: HashSet<(i32, i32)>,
     pending_hostile_spawns: BTreeMap<(i32, i32), Vec<HerdSpawn>>,
     item_pickup_ready: BTreeMap<u64, Vec<EntityId>>,
+    dying_entity_deadlines: BTreeMap<u64, VecDeque<EntityId>>,
+    dying_entity_deadline_by_id: HashMap<EntityId, u64>,
     player_persistence: HashMap<SessionId, Arc<Mutex<PlayerPersistedState>>>,
     player_hurt_resistance: HashMap<SessionId, PlayerHurtResistance>,
     active_shields: HashMap<SessionId, ActiveShield>,

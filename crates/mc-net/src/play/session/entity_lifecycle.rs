@@ -1,6 +1,4 @@
-use mc_entity::{EntityId, SpawnEntity, Vec3};
-#[cfg(test)]
-use mc_entity::{EntityLifecycle, EntitySnapshot};
+use mc_entity::{EntityId, EntityLifecycle, EntitySnapshot, SpawnEntity, Vec3};
 use mc_world::BlockStateId;
 use std::sync::atomic::Ordering;
 
@@ -19,6 +17,7 @@ use super::visibility::{
 use super::{SessionEntityGuards, SessionRegistry, SessionRegistryInner, apply_entity_facts};
 
 pub(super) const ENTITY_EVENT_DEATH_COMPLETE: i8 = 60;
+pub(super) const DEATH_REMOVALS_PER_TICK: usize = 4;
 
 impl SessionRegistry {
     pub(crate) fn synchronize_entity_lifecycle_epoch(&self, lifecycle_epoch: u64) {
@@ -127,36 +126,111 @@ pub(super) fn finish_dying_entities_locked(
     inner: &mut SessionEntityGuards<'_>,
     current_tick: u64,
 ) -> Vec<VisibilityDispatch> {
-    let mut due = inner
-        .entities
-        .snapshots_vec()
-        .into_iter()
-        .filter(|snapshot| {
-            snapshot.lifecycle == mc_entity::EntityLifecycle::Despawning
-                && snapshot
-                    .retained
-                    .death_remove_tick
-                    .is_some_and(|remove_tick| remove_tick <= current_tick)
-        })
-        .collect::<Vec<_>>();
-    due.sort_unstable_by_key(|snapshot| snapshot.id);
+    let mut due_ids = Vec::with_capacity(DEATH_REMOVALS_PER_TICK);
+    while due_ids.len() < DEATH_REMOVALS_PER_TICK {
+        let Some((&deadline, _)) = inner.dying_entity_deadlines.first_key_value() else {
+            break;
+        };
+        if deadline > current_tick {
+            break;
+        }
+        let queue = inner
+            .dying_entity_deadlines
+            .get_mut(&deadline)
+            .expect("first death deadline exists");
+        let entity_id = queue
+            .pop_front()
+            .expect("death deadline queue is non-empty");
+        let remove_deadline = queue.is_empty();
+        if remove_deadline {
+            inner.dying_entity_deadlines.remove(&deadline);
+        }
+        if inner.dying_entity_deadline_by_id.get(&entity_id) != Some(&deadline) {
+            continue;
+        }
+        inner.dying_entity_deadline_by_id.remove(&entity_id);
+        due_ids.push(entity_id);
+    }
 
     let mut dispatches = Vec::new();
-    for expected in due {
-        let entity_id = expected.id;
-        if let Some(removed) = inner.entities.remove_if_current(expected) {
-            let snapshot = server_entity_snapshot_from(removed);
-            dispatches.extend(entity_event_dispatches_locked(
-                inner,
-                entity_id,
-                ENTITY_EVENT_DEATH_COMPLETE,
-            ));
-            clear_removed_entity_tracking_locked(inner, entity_id);
-            let removal = despawn_entity_visibility_locked(inner, &snapshot);
-            dispatches.extend(removal);
-        }
+    for entity_id in due_ids {
+        let Some(expected) = inner.entities.snapshot(entity_id) else {
+            continue;
+        };
+        dispatches.extend(finish_one_dying_entity_locked(
+            inner,
+            current_tick,
+            expected,
+        ));
     }
     dispatches
+}
+
+pub(super) fn finish_one_dying_entity_locked(
+    inner: &mut SessionEntityGuards<'_>,
+    current_tick: u64,
+    expected: EntitySnapshot,
+) -> Vec<VisibilityDispatch> {
+    let entity_id = expected.id;
+    if expected.lifecycle != EntityLifecycle::Despawning
+        || expected
+            .retained
+            .death_remove_tick
+            .is_none_or(|remove_tick| remove_tick > current_tick)
+    {
+        schedule_entity_death_locked(inner, &expected);
+        return Vec::new();
+    }
+    if let Some(removed) = inner.entities.remove_if_current(expected) {
+        let snapshot = server_entity_snapshot_from(removed);
+        let mut dispatches =
+            entity_event_dispatches_locked(inner, entity_id, ENTITY_EVENT_DEATH_COMPLETE);
+        clear_removed_entity_tracking_locked(inner, entity_id);
+        dispatches.extend(despawn_entity_visibility_locked(inner, &snapshot));
+        return dispatches;
+    }
+    if let Some(current) = inner.entities.snapshot(entity_id) {
+        if current.lifecycle == EntityLifecycle::Despawning
+            && current
+                .retained
+                .death_remove_tick
+                .is_some_and(|deadline| deadline <= current_tick)
+        {
+            enqueue_entity_death_deadline_locked(inner, current_tick.saturating_add(1), entity_id);
+        } else {
+            schedule_entity_death_locked(inner, &current);
+        }
+    }
+    Vec::new()
+}
+
+pub(super) fn schedule_entity_death_locked(
+    inner: &mut SessionRegistryInner,
+    entity: &EntitySnapshot,
+) {
+    if entity.lifecycle == EntityLifecycle::Despawning
+        && let Some(remove_tick) = entity.retained.death_remove_tick
+    {
+        enqueue_entity_death_deadline_locked(inner, remove_tick, entity.id);
+    }
+}
+
+fn enqueue_entity_death_deadline_locked(
+    inner: &mut SessionRegistryInner,
+    remove_tick: u64,
+    entity_id: EntityId,
+) {
+    if inner.dying_entity_deadline_by_id.get(&entity_id) == Some(&remove_tick) {
+        return;
+    }
+    inner
+        .dying_entity_deadline_by_id
+        .insert(entity_id, remove_tick);
+    inner
+        .dying_entity_deadlines
+        .entry(remove_tick)
+        .or_default()
+        .push_back(entity_id);
 }
 
 #[cfg(test)]
