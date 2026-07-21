@@ -1,3 +1,4 @@
+use super::chunk_stream::passable_block_name;
 use super::*;
 
 /// Pack `(x, y, z)` into vanilla's `BlockPos` `i64` representation.
@@ -26,8 +27,116 @@ pub(super) fn spawn_position(
     config: &ServerConfig,
     world_read: Option<&mc_world::WorldReadView>,
 ) -> (f64, f64, f64) {
-    let y = adaptive_spawn_y(config, world_read).unwrap_or(DEFAULT_SPAWN_Y);
-    (SPAWN_X, y, SPAWN_Z)
+    safe_spawn_position(config, world_read).unwrap_or_else(|| {
+        let y = adaptive_spawn_y(config, world_read).unwrap_or(DEFAULT_SPAWN_Y);
+        (SPAWN_X, y, SPAWN_Z)
+    })
+}
+
+const SPAWN_SEARCH_RADIUS_BLOCKS: i32 = 80;
+const SPAWN_SEARCH_RADIUS_CHUNKS: i32 = SPAWN_SEARCH_RADIUS_BLOCKS / 16;
+
+fn safe_spawn_position(
+    config: &ServerConfig,
+    world_read: Option<&mc_world::WorldReadView>,
+) -> Option<(f64, f64, f64)> {
+    let world_read = world_read?;
+    let chunk_radius = SPAWN_SEARCH_RADIUS_CHUNKS;
+    let mut positions = Vec::with_capacity(((chunk_radius * 2 + 1).pow(2)) as usize);
+    for chunk_z in -chunk_radius..=chunk_radius {
+        for chunk_x in -chunk_radius..=chunk_radius {
+            positions.push(ChunkPos {
+                x: chunk_x,
+                z: chunk_z,
+            });
+        }
+    }
+    let snapshot = world_read.snapshot_chunks(&positions);
+    let mut best: Option<(i64, i32, i32, i32)> = None;
+
+    for z in -SPAWN_SEARCH_RADIUS_BLOCKS..=SPAWN_SEARCH_RADIUS_BLOCKS {
+        for x in -SPAWN_SEARCH_RADIUS_BLOCKS..=SPAWN_SEARCH_RADIUS_BLOCKS {
+            let distance_squared = i64::from(x) * i64::from(x) + i64::from(z) * i64::from(z);
+            if best.is_some_and(|(best_distance, ..)| best_distance <= distance_squared) {
+                continue;
+            }
+            let Some(y) = safe_spawn_y(config, &snapshot, x, z) else {
+                continue;
+            };
+            best = Some((distance_squared, x, y, z));
+        }
+    }
+
+    best.map(|(_, x, y, z)| (f64::from(x) + 0.5, f64::from(y), f64::from(z) + 0.5))
+}
+
+fn safe_spawn_y(
+    config: &ServerConfig,
+    snapshot: &mc_world::WorldReadSnapshot,
+    x: i32,
+    z: i32,
+) -> Option<i32> {
+    let chunk_pos = ChunkPos {
+        x: x.div_euclid(16),
+        z: z.div_euclid(16),
+    };
+    let chunk = snapshot.chunk(chunk_pos)?;
+    let local_x = x.rem_euclid(16) as u8;
+    let local_z = z.rem_euclid(16) as u8;
+    let top = chunk.highest_opaque_y(local_x, local_z)?;
+    let spawn_y = top.checked_add(2)?;
+
+    let support = chunk.get_block(local_x, top, local_z)?;
+    if !safe_spawn_support(config, support) {
+        return None;
+    }
+    for y in [top.checked_add(1)?, spawn_y, spawn_y.checked_add(1)?] {
+        let state = chunk.get_block(local_x, y, local_z)?;
+        if !clear_spawn_body_cell(config, state) {
+            return None;
+        }
+    }
+    Some(spawn_y)
+}
+
+fn safe_spawn_support(config: &ServerConfig, state_id: mc_world::BlockStateId) -> bool {
+    if config.block_facts.fluid(state_id.0).is_some() {
+        return false;
+    }
+    let Some(state) = config.blocks.by_id(state_id) else {
+        return false;
+    };
+    if hazardous_spawn_block(state.block.id.path()) {
+        return false;
+    }
+    !passable_block_name(state.block.id.as_str())
+}
+
+fn clear_spawn_body_cell(config: &ServerConfig, state_id: mc_world::BlockStateId) -> bool {
+    if config.block_facts.fluid(state_id.0).is_some() {
+        return false;
+    }
+    let Some(state) = config.blocks.by_id(state_id) else {
+        return false;
+    };
+    if hazardous_spawn_block(state.block.id.path()) {
+        return false;
+    }
+    passable_block_name(state.block.id.as_str())
+}
+
+fn hazardous_spawn_block(path: &str) -> bool {
+    matches!(
+        path,
+        "cactus"
+            | "campfire"
+            | "fire"
+            | "magma_block"
+            | "powder_snow"
+            | "soul_campfire"
+            | "soul_fire"
+            | "sweet_berry_bush"
+    )
 }
 
 fn adaptive_spawn_y(

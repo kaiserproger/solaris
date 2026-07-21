@@ -723,6 +723,83 @@ async fn spawn_position_reads_published_chunk_while_world_writer_is_held() {
     assert_eq!(position, (SPAWN_X, 74.0, SPAWN_Z));
 }
 
+#[tokio::test]
+async fn spawn_position_chooses_nearest_dry_column_instead_of_origin_water() {
+    let blocks = Arc::new(fluid_test_registry());
+    let mut world = mc_world::WorldStorage::in_memory(Arc::clone(&blocks));
+    let mut chunk = Chunk::empty(
+        ChunkPos { x: 0, z: 0 },
+        mc_world::BlockStateId(0),
+        Identifier::parse("minecraft:plains").unwrap(),
+    );
+    chunk.set_block(0, 60, 0, mc_world::BlockStateId(1));
+    for y in 61..=63 {
+        chunk.set_block(0, y, 0, mc_world::BlockStateId(2));
+    }
+    chunk
+        .highest_opaque
+        .set(0, 0, (60 - mc_world::MIN_Y + 1) as u32);
+    chunk.set_block(2, 64, 0, mc_world::BlockStateId(1));
+    chunk
+        .highest_opaque
+        .set(2, 0, (64 - mc_world::MIN_Y + 1) as u32);
+    world
+        .commit_chunk_snapshot(ChunkPos { x: 0, z: 0 }, chunk)
+        .unwrap();
+    let world_read = world.read_view();
+    let config = simulation_tick_test_config(
+        blocks,
+        world,
+        RandomTickPolicy::default(),
+        Arc::new(fluid_test_facts()),
+    );
+
+    assert_eq!(spawn_position(&config, Some(&world_read)), (2.5, 66.0, 0.5));
+}
+
+#[tokio::test]
+async fn spawn_position_skips_collidable_body_space_and_hazardous_support() {
+    let reports = solaris_required_blocks_report();
+    let blocks = Arc::new(BlockRegistry::from_report(&reports).unwrap());
+    let state = |name: &str| {
+        blocks
+            .block(&Identifier::parse(name).unwrap())
+            .unwrap()
+            .default
+    };
+    let air = state("minecraft:air");
+    let stone = state("minecraft:stone");
+    let glass = state("minecraft:glass");
+    let magma = state("minecraft:magma_block");
+    let mut world = mc_world::WorldStorage::in_memory(Arc::clone(&blocks));
+    let mut chunk = Chunk::empty(
+        ChunkPos { x: 0, z: 0 },
+        air,
+        Identifier::parse("minecraft:plains").unwrap(),
+    );
+    for (x, support) in [(0, stone), (1, magma), (2, stone)] {
+        chunk.set_block(x, 64, 0, support);
+        chunk
+            .highest_opaque
+            .set(x, 0, (64 - mc_world::MIN_Y + 1) as u32);
+    }
+    chunk.set_block(0, 66, 0, glass);
+    world
+        .commit_chunk_snapshot(ChunkPos { x: 0, z: 0 }, chunk)
+        .unwrap();
+    let world_read = world.read_view();
+    let config = simulation_tick_test_config(
+        blocks,
+        world,
+        RandomTickPolicy::default(),
+        Arc::new(mc_data::block_facts::BlockFactsTable::from_blocks_report(
+            &reports,
+        )),
+    );
+
+    assert_eq!(spawn_position(&config, Some(&world_read)), (2.5, 66.0, 0.5));
+}
+
 #[test]
 fn break_replacement_next_to_water_uses_flowing_state() {
     let facts = fluid_test_facts();

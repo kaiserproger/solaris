@@ -9,12 +9,19 @@ and is not startup context.
 
 - Date: 2026-07-21.
 - Branch: `dev/M100-client-agent`.
-- Latest code checkpoint: `5b7017a` (`fix(net): stabilize runtime
-  autoscaling`). The preceding water checkpoint is `547525e` (`feat(play): add
-  water survival physics`).
+- Latest code checkpoint: current `HEAD` (`fix(play): choose dry player spawn`).
+  The preceding autoscale checkpoint is `5b7017a` and the water checkpoint is
+  `547525e`.
   Delivery-order checkpoint `5e2908a` remains binding.
 - The worktree may contain unrelated owner files and local artifacts. Inspect
   exact ownership before editing; never clean or stage them by accident.
+- Fresh-player spawn now chooses the nearest non-hazardous collidable support
+  with collision-free, non-fluid body space in the resident 11x11 spawn window.
+  Focused tests cover water, transparent collision, and magma support. A new
+  real 26.1.2 client on seed `20260721` changed the initial sampled cell below
+  spawn from water to air; this observation alone does not prove settled
+  landing. The final tested O3 binary is
+  `6be274ad51f43129e4949ad2a5eea39444d50d580bd694f5340e300b59b105d9`.
 - The owner O3 rerun still disconnected periodically in the dense 5,132-entity
   world, so a dense owner-world rerun remains an open playable gate. A short
   real 26.1.2-client run against the current O3 binary passed join, play, block
