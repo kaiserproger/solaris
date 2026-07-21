@@ -78,6 +78,7 @@ targeted event does not need a broad subscription to reach its owner.
 | `player.chat` | `on_player_chat` | player snapshot, `message` |
 | `player.block_broken` | `on_player_block_broken` | block player snapshot, `dimension`, `block_id`, `x`, `y`, `z`, `game_mode` |
 | `player.block_placed` | `on_player_block_placed` | block player snapshot, `dimension`, `block_id`, `x`, `y`, `z`, `game_mode` |
+| `player.item_crafted` | `on_player_item_crafted` | `name`, `player_id`, `context_verified`, `uuid`, `username`, `operator`, `x`, `y`, `z`, `dimension`, `item_id`, `count`, `craft_count`, `source`, `game_mode` |
 | `server.tick` | `on_server_tick` | `tick` |
 | `player.command` | `on_player_command` | player snapshot, `root`, `arguments` |
 | `plugin.storage.get_result` | `on_plugin_storage_get_result` | `request_id`, `key`, `value`, `version`, `failure` |
@@ -107,6 +108,18 @@ coordinates; `game_mode` is `survival` or `creative`. Placement reports the
 actual final registry-backed root state. Door halves and stair-neighbour edits
 do not create extra events. Bonemeal, hoe, bucket, cauldron, toggle, and plant
 harvest interactions are not block-placement events.
+
+`player.item_crafted` is published after the authoritative player-inventory or
+crafting-table commit. `item_id` and `dimension` are namespaced resource ids;
+`count` is the total output count and `craft_count` is the number of recipe
+applications represented by the event. Recipe-book max crafting publishes one
+aggregate event. `source` is `inventory` for the 2x2 player grid and
+`crafting_table` for the 3x3 table; `game_mode` is `survival`, `creative`, or
+`adventure`. Preview refreshes, drag distribution, cursor mismatch, missing
+ingredients, full output inventory, no-op clicks, and rejected owner
+preconditions publish nothing. Window-0 may accept a lagging client `state_id`
+when the asserted cursor and current owner precondition still match; that is a
+real committed craft and does publish the event.
 
 An aborted break, stale precondition, rejected mutation, repeated break of air,
 blocked placement, or empty-hand placement publishes nothing. Required

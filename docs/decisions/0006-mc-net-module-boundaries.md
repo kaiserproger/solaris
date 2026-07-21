@@ -384,13 +384,17 @@ Other accepted concrete boundaries in this staged migration are:
 - `play::script_gameplay_events` is the protocol-to-plugin DTO projection for
   committed gameplay facts. Block-break authority remains in `block_break`;
   placement planning and validation remain in `use_item_on_adapter`; mutation
-  remains in the simulation/world owner. Those paths alone decide whether the
-  root transition succeeded. They pass the prior destroyed state or actual
-  applied placement root state to the publisher only after commit. The
-  publisher snapshots player identity and pose, maps the closed game-mode set,
-  and awaits required bounded event admission. It owns no player, session,
-  world, inventory, or block mutation authority. Queue closure reports
-  publication failure but cannot roll back the committed block.
+  remains in the simulation/world owner. Crafting mutation remains in the 2x2
+  inventory and 3x3 crafting-table container rules, while `play::recipes`
+  returns the aggregate result of recipe-book crafting. Those paths alone
+  decide whether the block transition or inventory candidate succeeded. They
+  pass the prior destroyed state, actual applied placement root state, or
+  committed crafted-item fact to the publisher only after owner commit. The
+  publisher snapshots player identity and pose, resolves registry identities,
+  maps the closed source and game-mode sets, and awaits required bounded event
+  admission. It owns no player, session, world, inventory, recipe, or block
+  mutation authority. Queue closure reports publication failure but cannot
+  roll back the committed mutation.
 - `play::session::player_state_adapter` owns selected-slot, respawn-pose and
   game-mode event commits plus player animation/entity-data recipient
   projection. Persistence/inventory/survival authority remains in

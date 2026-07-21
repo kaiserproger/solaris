@@ -70,7 +70,7 @@ use mc_protocol::packets::play::{
     SynchronizePlayerPosition, pack_section_pos, pack_section_relative_pos, unpack_block_pos,
 };
 use mc_protocol::packets::{CustomPayload, Packet};
-use mc_script::{ScriptEvent, ScriptPlayerContext, ScriptPlayerId};
+use mc_script::{ScriptCraftingSource, ScriptEvent, ScriptPlayerContext, ScriptPlayerId};
 #[cfg(test)]
 use mc_world::FurnaceSlot;
 use mc_world::light::{ChunkLight, LightCache, LightWorkspace};
@@ -382,7 +382,9 @@ use random_ticks::{
 };
 #[cfg(test)]
 use recipes::ingredient_accepts_item;
-use recipes::{craft_recipe, initial_recipe_book, initial_recipe_update, recipe_fits_grid};
+use recipes::{
+    CraftedItem, craft_recipe, initial_recipe_book, initial_recipe_update, recipe_fits_grid,
+};
 use scheduled_blocks::{
     COMPARATOR_TICK_DELAY_TICKS, HOPPER_TICK_DELAY_TICKS, HopperTransferContext,
     HopperTransferUpdate, ScheduledBlockTickPlan, backfill_loaded_hopper_ticks,
@@ -2259,6 +2261,8 @@ async fn handle_crafting_container_click<W>(
     state: &mut InteractionState,
     writer: &mut W,
     mut window: Box<CraftingTableWindow>,
+    script_events: Option<&ScriptGameplayEventPublisher>,
+    game_mode: GameMode,
     player_pose: PlayerPose,
     packet: ServerboundContainerClick,
 ) -> Result<Box<CraftingTableWindow>, ConnectionError>
@@ -2279,6 +2283,13 @@ where
     let mut dropped = None;
     let mut discarded_remainders = Vec::new();
     let mut quickcraft_outcome = None;
+    let crafted = match &action {
+        ContainerClickAction::Pickup { slot: 0, .. }
+        | ContainerClickAction::QuickMove { slot: 0 } => {
+            CraftedItem::from_single_result(&before_window.result)
+        }
+        _ => None,
+    };
     let changed = match action {
         ContainerClickAction::Pickup { slot, button } => {
             let (changed, discarded) = window.apply_pickup_click(
@@ -2391,6 +2402,19 @@ where
     )
     .await?
     {
+        if let (Some(script_events), Some(crafted)) = (script_events, crafted) {
+            script_events
+                .publish_item_crafted(
+                    &state.items,
+                    crafted.item_id,
+                    crafted.count,
+                    crafted.craft_count,
+                    ScriptCraftingSource::CraftingTable,
+                    player_pose,
+                    game_mode,
+                )
+                .await;
+        }
         window.state_id = window.state_id.wrapping_add(1);
     }
     write_crafting_content(state, writer, &window).await?;
@@ -3336,6 +3360,7 @@ where
 async fn handle_place_recipe<W>(
     state: &mut InteractionState,
     writer: &mut W,
+    script_events: Option<&ScriptGameplayEventPublisher>,
     player_pose: PlayerPose,
     game_mode: GameMode,
     survival_state: SurvivalState,
@@ -3410,7 +3435,7 @@ where
 
     let expected_inventory = state.inventory.clone();
     let expected_carried_item = state.carried_item.clone();
-    if let Some(changed) = craft_recipe(state, &recipe, packet.use_max_items) {
+    if let Some(outcome) = craft_recipe(state, &recipe, packet.use_max_items) {
         if commit_player_inventory_candidate(
             state,
             expected_inventory,
@@ -3420,7 +3445,25 @@ where
         )
         .await?
         {
-            write_inventory_slot_updates(state, writer, changed).await?;
+            if let Some(script_events) = script_events {
+                let source = if packet.container_id == 0 {
+                    ScriptCraftingSource::Inventory
+                } else {
+                    ScriptCraftingSource::CraftingTable
+                };
+                script_events
+                    .publish_item_crafted(
+                        &state.items,
+                        outcome.crafted.item_id,
+                        outcome.crafted.count,
+                        outcome.crafted.craft_count,
+                        source,
+                        player_pose,
+                        game_mode,
+                    )
+                    .await;
+            }
+            write_inventory_slot_updates(state, writer, outcome.changed_slots).await?;
         } else {
             write_inventory_content_resync(state, writer).await?;
         }
@@ -5157,6 +5200,7 @@ struct ContainerClickContext<'a> {
     survival_state: SurvivalState,
     xp_state: &'a XpState,
     player_pose: PlayerPose,
+    script_events: Option<&'a ScriptGameplayEventPublisher>,
     scripts: Option<&'a ScriptEventSink>,
     script_player_id: ScriptPlayerId,
     script_context: ScriptPlayerContext,
@@ -5176,6 +5220,7 @@ where
         survival_state,
         xp_state,
         player_pose,
+        script_events,
         scripts,
         script_player_id,
         script_context,
@@ -5231,9 +5276,16 @@ where
             ActiveContainer::CraftingTable(crafting)
                 if crafting.container_id == packet.container_id =>
             {
-                let crafting =
-                    handle_crafting_container_click(state, writer, crafting, player_pose, packet)
-                        .await?;
+                let crafting = handle_crafting_container_click(
+                    state,
+                    writer,
+                    crafting,
+                    script_events,
+                    game_mode,
+                    player_pose,
+                    packet,
+                )
+                .await?;
                 state.active_container = Some(ActiveContainer::CraftingTable(crafting));
             }
             ActiveContainer::EnchantingTable(enchanting)
@@ -5335,6 +5387,13 @@ where
     if !matches!(action, ContainerClickAction::QuickCraft(_)) {
         state.inventory_quickcraft.reset();
     }
+    let crafted = match &action {
+        ContainerClickAction::Pickup { slot: 0, .. }
+        | ContainerClickAction::QuickMove { slot: 0 } => {
+            CraftedItem::from_single_result(&before_inventory.slots[0])
+        }
+        _ => None,
+    };
     let changed = match action {
         ContainerClickAction::Pickup { slot, button } => {
             let (changed, discarded) = state.inventory.apply_crafting_pickup_click(
@@ -5444,6 +5503,19 @@ where
     )
     .await?
     {
+        if let (Some(script_events), Some(crafted)) = (script_events, crafted) {
+            script_events
+                .publish_item_crafted(
+                    &state.items,
+                    crafted.item_id,
+                    crafted.count,
+                    crafted.craft_count,
+                    ScriptCraftingSource::Inventory,
+                    player_pose,
+                    game_mode,
+                )
+                .await;
+        }
         write_inventory_content(state, writer).await
     } else {
         write_inventory_content_resync(state, writer).await
@@ -12311,6 +12383,7 @@ where
                         handle_place_recipe(
                             state,
                             writer,
+                            script_gameplay_events.as_ref(),
                             player_pose,
                             game_mode,
                             survival_state,
@@ -12356,6 +12429,7 @@ where
                                 survival_state,
                                 xp_state: &xp_state,
                                 player_pose,
+                                script_events: script_gameplay_events.as_ref(),
                                 scripts: scripts.as_ref(),
                                 script_player_id: ScriptPlayerId::new(session_id),
                                 script_context: script_player_context_from_values(

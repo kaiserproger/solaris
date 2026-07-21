@@ -11,9 +11,9 @@ use mc_protocol::packets::play::{
     CommandNodeKind, ConfirmTeleportation, ContainerInput, Direction, GameEvent, GameMode,
     HashedStack, HashedStackComponentHashes, InteractionHand, LevelChunkWithLight, MovePlayerFlags,
     PlayerActionKind, ServerboundChat, ServerboundChatCommand, ServerboundContainerClick,
-    ServerboundMovePlayerPos, ServerboundMovePlayerStatusOnly, ServerboundPlayerAction,
-    ServerboundUseItemOn, SetCenterChunk, SynchronizePlayerPosition, pack_block_pos,
-    unpack_block_pos,
+    ServerboundMovePlayerPos, ServerboundMovePlayerStatusOnly, ServerboundPlaceRecipe,
+    ServerboundPlayerAction, ServerboundUseItemOn, SetCenterChunk, SynchronizePlayerPosition,
+    pack_block_pos, unpack_block_pos,
 };
 use mc_test_harness::client::{Client, FrameWaitLimits};
 
@@ -339,7 +339,7 @@ async fn lua_0_6_player_command_reaches_the_server_chat_adapter() {
 }
 
 #[tokio::test]
-async fn lua_block_events_follow_authoritative_commits() {
+async fn lua_gameplay_events_follow_authoritative_commits() {
     let plugins = tempfile::tempdir().expect("plugin tempdir");
     let plugin = plugins.path().join("block-jobs");
     std::fs::create_dir(&plugin).expect("create plugin directory");
@@ -350,7 +350,7 @@ async fn lua_block_events_follow_authoritative_commits() {
             name = "Block Jobs"
             version = "0.1.0"
             api = "0.6.0"
-            events = ["player.block_broken", "player.block_placed"]
+            events = ["player.block_broken", "player.block_placed", "player.item_crafted"]
             player_commands = ["block-fence"]
         "#,
     )
@@ -384,6 +384,19 @@ async fn lua_block_events_follow_authoritative_commits() {
                 )
             end
 
+            function on_player_item_crafted(event)
+                solaris.send_message(
+                    event.player_id,
+                    "item-crafted:" .. event.item_id
+                        .. ":" .. event.count
+                        .. ":" .. event.craft_count
+                        .. ":" .. event.source
+                        .. ":" .. event.game_mode
+                        .. ":" .. event.dimension
+                        .. ":" .. event.username
+                )
+            end
+
             function on_player_command(event)
                 solaris.send_message(event.player_id, "block-fence:" .. event.arguments)
             end
@@ -407,6 +420,18 @@ async fn lua_block_events_follow_authoritative_commits() {
     let dirt_item_id = items
         .id_of(&mc_data::Identifier::parse("minecraft:dirt").unwrap())
         .expect("dirt item");
+    let oak_log_item_id = items
+        .id_of(&mc_data::Identifier::parse("minecraft:oak_log").unwrap())
+        .expect("oak log item");
+    let oak_planks_item_id = items
+        .id_of(&mc_data::Identifier::parse("minecraft:oak_planks").unwrap())
+        .expect("oak planks item");
+    let recipes = Arc::new(mc_data::recipes::solaris_required_recipes());
+    let oak_planks_recipe = recipes
+        .iter()
+        .position(|recipe| recipe.id.as_str() == "minecraft:oak_planks")
+        .and_then(|index| i32::try_from(index).ok())
+        .expect("embedded oak planks recipe display id");
     let generator = Arc::new(mc_worldgen::TerrainGenerator::new(0, Arc::clone(&blocks)));
     let world = mc_world::WorldStorage::in_memory_with_capacity(Arc::clone(&blocks), 49)
         .with_item_registry(Arc::clone(&items))
@@ -421,7 +446,7 @@ async fn lua_block_events_follow_authoritative_commits() {
         blocks,
         world: Some(Arc::new(tokio::sync::Mutex::new(world))),
         tags: Arc::new(mc_data::tags::solaris_required_item_tags(&items)),
-        recipes: Arc::new(mc_data::recipes::solaris_required_recipes()),
+        recipes,
         loot: Arc::new(mc_data::loot::builtin().clone()),
         block_light: None,
         items,
@@ -1038,6 +1063,95 @@ async fn lua_block_events_follow_authoritative_commits() {
             "owner-rejected stale break published an event: {message}"
         );
         if message == "block-fence:owner-stale" {
+            break;
+        }
+    }
+
+    client
+        .write_packet(&ServerboundChatCommand {
+            command: "debug give minecraft:oak_log 2 0".to_owned(),
+        })
+        .await
+        .expect("give exact recipe-book ingredients");
+    loop {
+        let outcome = client
+            .wait_for_frame_id_with_timeout_and_limits(
+                ClientboundContainerSetSlot::ID,
+                Duration::from_secs(5),
+                LUA_TRANSACTION_FRAME_WAIT_LIMITS,
+            )
+            .await
+            .expect("oak log inventory commit");
+        let slot = ClientboundContainerSetSlot::decode(&mut outcome.frame.body.clone())
+            .expect("decode oak log inventory commit");
+        if slot.container_id == 0
+            && slot.slot == 36
+            && slot.item_stack.item_id == oak_log_item_id
+            && slot.item_stack.count == 2
+        {
+            break;
+        }
+    }
+
+    client
+        .write_packet(&ServerboundPlaceRecipe {
+            container_id: 0,
+            recipe_display_id: oak_planks_recipe,
+            use_max_items: true,
+        })
+        .await
+        .expect("craft maximum oak planks from player inventory");
+    let expected_craft_message =
+        "item-crafted:minecraft:oak_planks:8:2:inventory:survival:minecraft:overworld:BreakEvents";
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+    let mut saw_input_commit = false;
+    let mut saw_output_commit = false;
+    let mut saw_craft_event = false;
+    while !(saw_input_commit && saw_output_commit && saw_craft_event) {
+        let mut frame = client
+            .read_frame_with_timeout(
+                deadline.saturating_duration_since(tokio::time::Instant::now()),
+            )
+            .await
+            .expect("item craft inventory and Lua wire response");
+        if frame.id == ClientboundContainerSetSlot::ID {
+            let slot = ClientboundContainerSetSlot::decode(&mut frame.body)
+                .expect("decode item craft inventory commit");
+            assert_eq!(slot.container_id, 0, "craft updated a non-player container");
+            if slot.slot == 36 && slot.item_stack.is_empty() {
+                saw_input_commit = true;
+            } else if slot.item_stack.item_id == oak_planks_item_id && slot.item_stack.count == 8 {
+                saw_output_commit = true;
+            }
+        } else if frame.id == ClientboundSystemChat::ID {
+            let chat = ClientboundSystemChat::decode(&mut frame.body).expect("decode SystemChat");
+            if text_component_text(&chat) == expected_craft_message {
+                saw_craft_event = true;
+            }
+        }
+    }
+
+    client
+        .write_packet(&ServerboundPlaceRecipe {
+            container_id: 0,
+            recipe_display_id: oak_planks_recipe,
+            use_max_items: true,
+        })
+        .await
+        .expect("repeat recipe request without inputs");
+    client
+        .write_packet(&ServerboundChatCommand {
+            command: "block-fence craft-repeat".to_owned(),
+        })
+        .await
+        .expect("send missing-input craft fence");
+    loop {
+        let message = next_lua_transaction_system_chat_text(&mut client).await;
+        assert!(
+            !message.starts_with("item-crafted:"),
+            "missing-input recipe request published another event: {message}"
+        );
+        if message == "block-fence:craft-repeat" {
             break;
         }
     }

@@ -1427,6 +1427,25 @@ fn event_table(lua: &Lua, event: &ScriptEvent) -> mlua::Result<Table> {
             table.set("z", *z)?;
             table.set("game_mode", game_mode.as_str())?;
         }
+        ScriptEventKind::PlayerItemCrafted {
+            player_id,
+            context,
+            dimension,
+            item_id,
+            count,
+            craft_count,
+            source,
+            game_mode,
+        } => {
+            table.set("player_id", player_id.value())?;
+            set_player_context(&table, context)?;
+            table.set("dimension", dimension.as_str())?;
+            table.set("item_id", item_id.as_str())?;
+            table.set("count", *count)?;
+            table.set("craft_count", *craft_count)?;
+            table.set("source", source.as_str())?;
+            table.set("game_mode", game_mode.as_str())?;
+        }
         ScriptEventKind::PlayerCommand {
             player_id,
             username,
@@ -1571,6 +1590,7 @@ fn handler_name(event: &ScriptEvent) -> &'static str {
         ScriptEventKind::PlayerChat { .. } => "on_player_chat",
         ScriptEventKind::PlayerBlockBroken { .. } => "on_player_block_broken",
         ScriptEventKind::PlayerBlockPlaced { .. } => "on_player_block_placed",
+        ScriptEventKind::PlayerItemCrafted { .. } => "on_player_item_crafted",
         ScriptEventKind::PlayerCommand { .. } => "on_player_command",
         ScriptEventKind::ServerTick { .. } => "on_server_tick",
         ScriptEventKind::PluginStorageGetResult { .. } => "on_plugin_storage_get_result",
@@ -1613,8 +1633,8 @@ mod tests {
     use super::*;
     use crate::{
         MAX_SCRIPT_RESOURCE_ID_BYTES, PlayerCommandAdmission, RuntimeControls, SCRIPT_API_VERSION,
-        ScriptCommand, ScriptEvent, ScriptGameMode, ScriptPlayerContext, ScriptPlayerId,
-        ScriptPluginManifest,
+        ScriptCommand, ScriptCraftingSource, ScriptEvent, ScriptGameMode, ScriptPlayerContext,
+        ScriptPlayerId, ScriptPluginManifest,
     };
 
     static TEST_TEMP_ID: AtomicU64 = AtomicU64::new(0);
@@ -2061,6 +2081,82 @@ mod tests {
             &[ScriptCommand::SendChatMessage {
                 player_id: ScriptPlayerId::new(7),
                 message: "block-placed".to_owned(),
+            }]
+        );
+    }
+
+    #[test]
+    fn lua_item_crafted_subscription_dispatches_exact_fields() {
+        let mut runtime = LuaScriptRuntime::from_source(
+            manifest(&["player.item_crafted"]),
+            r#"
+                function on_player_item_crafted(event)
+                    local expected = {
+                        name = true, player_id = true, context_verified = true,
+                        uuid = true, username = true, operator = true,
+                        x = true, y = true, z = true, dimension = true,
+                        item_id = true, count = true, craft_count = true,
+                        source = true, game_mode = true,
+                    }
+                    local field_count = 0
+                    for field in pairs(event) do
+                        assert(expected[field] == true, "unexpected field: " .. field)
+                        field_count = field_count + 1
+                    end
+                    assert(field_count == 15)
+                    assert(event.name == "player.item_crafted")
+                    assert(event.player_id == 7)
+                    assert(event.context_verified == true)
+                    assert(event.uuid == "123e4567-e89b-12d3-a456-426614174000")
+                    assert(event.username == "Alex")
+                    assert(event.operator == true)
+                    assert(event.x == 1.5)
+                    assert(event.y == 64.0)
+                    assert(event.z == -2.25)
+                    assert(event.dimension == "minecraft:overworld")
+                    assert(event.item_id == "minecraft:oak_planks")
+                    assert(math.type(event.count) == "integer" and event.count == 12)
+                    assert(math.type(event.craft_count) == "integer" and event.craft_count == 3)
+                    assert(event.source == "crafting_table")
+                    assert(event.game_mode == "adventure")
+                    solaris.send_message(event.player_id, "item-crafted")
+                end
+            "#,
+            LuaRuntimeLimits::default(),
+        )
+        .unwrap();
+        let controls = RuntimeControls::unrestricted();
+        let event = ScriptEvent::try_player_item_crafted_with_context(
+            ScriptPlayerId::new(7),
+            ScriptPlayerContext::new(
+                "123e4567-e89b-12d3-a456-426614174000",
+                "Alex",
+                true,
+                1.5,
+                64.0,
+                -2.25,
+            ),
+            "minecraft:overworld",
+            "minecraft:oak_planks",
+            12,
+            3,
+            ScriptCraftingSource::CraftingTable,
+            ScriptGameMode::Adventure,
+        )
+        .unwrap();
+
+        let batch = runtime
+            .handle_event(
+                &event,
+                RuntimeContext::new(&controls, NonZeroUsize::new(1).unwrap()),
+            )
+            .unwrap();
+
+        assert_eq!(
+            batch.commands(),
+            &[ScriptCommand::SendChatMessage {
+                player_id: ScriptPlayerId::new(7),
+                message: "item-crafted".to_owned(),
             }]
         );
     }

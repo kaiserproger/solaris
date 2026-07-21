@@ -42,6 +42,18 @@ hardening. An already-open lower-priority diff does not override this order.
 
 ## Recent Evidence
 
+- The current plugin slice adds post-commit `player.item_crafted` events for
+  2x2 inventory crafting, 3x3 crafting-table result clicks, and recipe-book
+  crafting. Max crafting reports one aggregate output/count pair. Direct tests
+  prove stale owner state, mismatched/no-op clicks, missing ingredients, and
+  unsupported game modes publish nothing before pushed FIFO fences. The real
+  packet/Lua gate observes an inventory commit of two oak logs into eight
+  planks and one exact `craft_count = 2` event, then proves a missing-input
+  retry emits no event. Focused `mc-script`, `mc-net`, and wire tests pass.
+  Full workspace tests, strict workspace Clippy, fmt, code-health
+  `0 fail / KEEP`, and diff-check pass. A `sol high` re-review found no
+  remaining blocker, high, or medium issue. No manual/client or vanilla-oracle
+  gate was run for this plugin-only event slice.
 - The current plugin slice adds required post-commit `player.block_placed`
   events for the actual registry-backed root state. The shared real packet/Lua
   gate observes creative and survival commits and FIFO-fences blocked and

@@ -409,13 +409,47 @@ fn craft_recipe_once(
     Some(changed.into_iter().collect())
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) struct CraftedItem {
+    pub(super) item_id: u32,
+    pub(super) count: u64,
+    pub(super) craft_count: u32,
+}
+
+impl CraftedItem {
+    pub(super) fn from_single_result(result: &ItemStack) -> Option<Self> {
+        if result.is_empty() {
+            return None;
+        }
+        Some(Self {
+            item_id: result.item_id,
+            count: u64::try_from(result.count).ok()?,
+            craft_count: 1,
+        })
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(super) struct CraftRecipeOutcome {
+    pub(super) changed_slots: Vec<(usize, ItemStack)>,
+    pub(super) crafted: CraftedItem,
+}
+
 pub(super) fn craft_recipe(
     state: &mut InteractionState,
     recipe: &mc_data::recipes::Recipe,
     use_max_items: bool,
-) -> Option<Vec<(usize, ItemStack)>> {
+) -> Option<CraftRecipeOutcome> {
+    let item_id = state.items.id_of(&recipe.result.item)?;
     if !use_max_items {
-        return craft_recipe_once(state, recipe);
+        return Some(CraftRecipeOutcome {
+            changed_slots: craft_recipe_once(state, recipe)?,
+            crafted: CraftedItem {
+                item_id,
+                count: u64::from(recipe.result.count),
+                craft_count: 1,
+            },
+        });
     }
 
     let max_crafts = state.inventory.slots[9..=44]
@@ -426,15 +460,25 @@ pub(super) fn craft_recipe(
         })
         .fold(0usize, usize::saturating_add);
     let mut all_changed = BTreeMap::new();
+    let mut craft_count = 0_u32;
     for _ in 0..max_crafts {
         let Some(changed) = craft_recipe_once(state, recipe) else {
             break;
         };
+        craft_count += 1;
         for (slot, stack) in changed {
             all_changed.insert(slot, stack);
         }
     }
-    (!all_changed.is_empty()).then(|| all_changed.into_iter().collect())
+    let count = u64::from(recipe.result.count) * u64::from(craft_count);
+    (!all_changed.is_empty()).then(|| CraftRecipeOutcome {
+        changed_slots: all_changed.into_iter().collect(),
+        crafted: CraftedItem {
+            item_id,
+            count,
+            craft_count,
+        },
+    })
 }
 
 #[cfg(test)]

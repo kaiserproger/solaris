@@ -3,6 +3,7 @@ use super::falling_blocks::{FallingBlockStart, LandedFallingBlock, plan_falling_
 use super::use_item_on_adapter::cursor_y_relative_to_target;
 use super::*;
 use std::collections::{BTreeMap, HashSet};
+use std::num::NonZeroUsize;
 use std::pin::Pin;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::task::{Context, Poll};
@@ -595,6 +596,7 @@ async fn rejected_inventory_drag_resyncs_without_mutation_or_owner_publication()
                 survival_state: SurvivalState::FULL,
                 xp_state: &xp,
                 player_pose: PlayerPose::new(0.5, 64.0, 0.5),
+                script_events: None,
                 scripts: None,
                 script_player_id,
                 script_context: script_context.clone(),
@@ -670,6 +672,7 @@ async fn stale_inventory_drag_resyncs_exact_owner_state_without_loss_or_publicat
                 survival_state: SurvivalState::FULL,
                 xp_state: &xp,
                 player_pose: pose,
+                script_events: None,
                 scripts: None,
                 script_player_id,
                 script_context: script_context.clone(),
@@ -697,6 +700,7 @@ async fn stale_inventory_drag_resyncs_exact_owner_state_without_loss_or_publicat
             survival_state: SurvivalState::FULL,
             xp_state: &xp,
             player_pose: pose,
+            script_events: None,
             scripts: None,
             script_player_id,
             script_context,
@@ -14161,6 +14165,8 @@ async fn disconnect_recovers_crafting_grid_after_connection_projection_is_lost()
         &mut state,
         &mut writer,
         Box::new(CraftingTableWindow::new(7)),
+        None,
+        GameMode::Survival,
         pose,
         ServerboundContainerClick {
             container_id: 7,
@@ -14178,6 +14184,8 @@ async fn disconnect_recovers_crafting_grid_after_connection_projection_is_lost()
         &mut state,
         &mut writer,
         window,
+        None,
+        GameMode::Survival,
         pose,
         ServerboundContainerClick {
             container_id: 7,
@@ -14302,23 +14310,49 @@ async fn disconnect_recovers_enchanting_inputs_after_connection_projection_is_lo
 
 #[tokio::test]
 async fn stale_crafting_click_rebuilds_grid_from_owner_projection() {
+    use mc_data::recipes::{
+        Ingredient, IngredientAlternative, Recipe, RecipeKind, RecipeResult, ShapelessRecipe,
+    };
+
+    let dirt = Identifier::parse("minecraft:dirt").unwrap();
+    let stone = Identifier::parse("minecraft:stone").unwrap();
+    let output = Identifier::parse("minecraft:test_output").unwrap();
     let items = Arc::new(ItemRegistry::from_report(&[
         ItemReport {
-            id: Identifier::parse("minecraft:dirt").unwrap(),
+            id: dirt.clone(),
             protocol_id: 10,
         },
         ItemReport {
-            id: Identifier::parse("minecraft:stone").unwrap(),
+            id: stone.clone(),
             protocol_id: 11,
+        },
+        ItemReport {
+            id: output.clone(),
+            protocol_id: 12,
         },
     ]));
     let mut state = interaction_state_for_items(items);
-    state.inventory.slots[9] = ItemStack::new(11, 1);
+    state.recipes.push(Recipe {
+        id: Identifier::parse("minecraft:test_recipe").unwrap(),
+        kind: RecipeKind::Shapeless(ShapelessRecipe {
+            ingredients: vec![Ingredient {
+                alternatives: vec![IngredientAlternative::Item(stone)],
+            }],
+        }),
+        result: RecipeResult {
+            item: output,
+            count: 1,
+        },
+    });
+    let mut local_window = CraftingTableWindow::new(7);
+    local_window.input[0] = ItemStack::new(11, 1);
+    refresh_crafting_result(&state, &mut local_window);
+    assert_eq!(local_window.result, ItemStack::new(12, 1));
 
     let pose = PlayerPose::new(4.5, 65.0, 6.5);
     let profile = LoggedInProfile {
-        uuid: crate::login::offline_uuid("StaleCraftingProjection"),
-        name: "StaleCraftingProjection".to_owned(),
+        uuid: crate::login::offline_uuid("StaleCraftOwner"),
+        name: "StaleCraftOwner".to_owned(),
     };
     let (tx, _rx) = mpsc::channel(8);
     let (session_id, _) = state
@@ -14336,21 +14370,37 @@ async fn stale_crafting_click_rebuilds_grid_from_owner_projection() {
     state.session_id = session_id;
     let (simulation, stop, task) = spawn_test_simulation_owner(Arc::clone(&state.sessions));
     state.simulation = simulation.for_session(session_id);
+    let one = NonZeroUsize::new(1).unwrap();
+    let (script_boundary, mut script_endpoint) = mc_script::script_boundary_pair(one, one);
+    let script_events = ScriptGameplayEventPublisher::new(
+        ScriptEventSink::new(script_boundary.clone()),
+        ScriptPlayerId::new(session_id),
+        profile.uuid.to_string(),
+        &profile.name,
+        CommandPermissions::from_op(false),
+        "minecraft:overworld",
+    );
 
     let mut writer = Vec::new();
     let window = handle_crafting_container_click(
         &mut state,
         &mut writer,
-        Box::new(CraftingTableWindow::new(7)),
+        Box::new(local_window),
+        Some(&script_events),
+        GameMode::Survival,
         pose,
         ServerboundContainerClick {
             container_id: 7,
             state_id: 1,
-            slot_num: 10,
+            slot_num: 0,
             button_num: 0,
             container_input: ContainerInput::Pickup,
             changed_slots: Vec::new(),
-            carried_item: mc_protocol::packets::play::HashedStack::empty(),
+            carried_item: mc_protocol::packets::play::HashedStack::Actual {
+                item_id: 12,
+                count: 1,
+                components: mc_protocol::packets::play::HashedStackComponentHashes::empty(),
+            },
         },
     )
     .await
@@ -14360,8 +14410,380 @@ async fn stale_crafting_click_rebuilds_grid_from_owner_projection() {
 
     assert_eq!(window.state_id, 1);
     assert_eq!(window.input, authoritative_input);
-    assert_eq!(state.inventory.slots[9], ItemStack::new(11, 1));
     assert!(state.carried_item.is_empty());
+    script_boundary
+        .try_enqueue_event(ScriptEvent::server_tick(89))
+        .unwrap();
+    assert!(matches!(
+        script_endpoint.recv_event().await.unwrap().kind(),
+        mc_script::ScriptEventKind::ServerTick { tick: 89 }
+    ));
+}
+
+#[tokio::test]
+async fn crafting_table_result_commit_publishes_once_before_fifo_fence() {
+    use mc_data::recipes::{
+        Ingredient, IngredientAlternative, Recipe, RecipeKind, RecipeResult, ShapelessRecipe,
+    };
+
+    let ingredient = Identifier::parse("minecraft:test_ingredient").unwrap();
+    let output = Identifier::parse("minecraft:test_output").unwrap();
+    let items = Arc::new(ItemRegistry::from_report(&[
+        ItemReport {
+            id: ingredient.clone(),
+            protocol_id: 1,
+        },
+        ItemReport {
+            id: output.clone(),
+            protocol_id: 2,
+        },
+    ]));
+    let mut state = interaction_state_for_items(items);
+    state.recipes.push(Recipe {
+        id: Identifier::parse("minecraft:test_recipe").unwrap(),
+        kind: RecipeKind::Shapeless(ShapelessRecipe {
+            ingredients: vec![Ingredient {
+                alternatives: vec![IngredientAlternative::Item(ingredient)],
+            }],
+        }),
+        result: RecipeResult {
+            item: output,
+            count: 4,
+        },
+    });
+    let mut window = CraftingTableWindow::new(7);
+    window.input[0] = ItemStack::new(1, 1);
+    refresh_crafting_result(&state, &mut window);
+    assert_eq!(window.result, ItemStack::new(2, 4));
+
+    let pose = PlayerPose::new(4.5, 65.0, 6.5);
+    let profile = LoggedInProfile {
+        uuid: crate::login::offline_uuid("CraftEventOwner"),
+        name: "CraftEventOwner".to_owned(),
+    };
+    let (tx, _rx) = mpsc::channel(8);
+    let (session_id, _) = state
+        .sessions
+        .register(&profile, (0, 0), 0, HashSet::new(), tx, pose);
+    let mut saved = PlayerPersistedState::new_default(pose);
+    saved.inventory = state.inventory.clone();
+    saved.crafting_table_input = crafting_table_input_projection(&window.input);
+    let saved = Arc::new(Mutex::new(saved));
+    state
+        .sessions
+        .register_player_persistence(session_id, Arc::clone(&saved));
+    state.session_id = session_id;
+    let (simulation, stop, task) = spawn_test_simulation_owner(Arc::clone(&state.sessions));
+    state.simulation = simulation.for_session(session_id);
+
+    let one = NonZeroUsize::new(1).unwrap();
+    let (script_boundary, mut script_endpoint) = mc_script::script_boundary_pair(one, one);
+    let script_events = ScriptGameplayEventPublisher::new(
+        ScriptEventSink::new(script_boundary.clone()),
+        ScriptPlayerId::new(session_id),
+        profile.uuid.to_string(),
+        &profile.name,
+        CommandPermissions::from_op(false),
+        "minecraft:overworld",
+    );
+    let carried = mc_protocol::packets::play::HashedStack::Actual {
+        item_id: 2,
+        count: 4,
+        components: mc_protocol::packets::play::HashedStackComponentHashes::empty(),
+    };
+    let mut writer = Vec::new();
+    let window = handle_crafting_container_click(
+        &mut state,
+        &mut writer,
+        Box::new(window),
+        Some(&script_events),
+        GameMode::Survival,
+        pose,
+        ServerboundContainerClick {
+            container_id: 7,
+            state_id: 1,
+            slot_num: 0,
+            button_num: 0,
+            container_input: ContainerInput::Pickup,
+            changed_slots: Vec::new(),
+            carried_item: carried.clone(),
+        },
+    )
+    .await
+    .unwrap();
+    assert_eq!(window.state_id, 2);
+    assert!(window.input.iter().all(ItemStack::is_empty));
+    assert_eq!(state.carried_item, ItemStack::new(2, 4));
+    assert!(matches!(
+        script_endpoint.recv_event().await.unwrap().kind(),
+        mc_script::ScriptEventKind::PlayerItemCrafted {
+            item_id,
+            count: 4,
+            craft_count: 1,
+            source: ScriptCraftingSource::CraftingTable,
+            ..
+        } if item_id == "minecraft:test_output"
+    ));
+
+    let mut window = handle_crafting_container_click(
+        &mut state,
+        &mut writer,
+        window,
+        Some(&script_events),
+        GameMode::Survival,
+        pose,
+        ServerboundContainerClick {
+            container_id: 7,
+            state_id: 2,
+            slot_num: 0,
+            button_num: 0,
+            container_input: ContainerInput::Pickup,
+            changed_slots: Vec::new(),
+            carried_item: carried.clone(),
+        },
+    )
+    .await
+    .unwrap();
+    script_boundary
+        .try_enqueue_event(ScriptEvent::server_tick(90))
+        .unwrap();
+    assert!(matches!(
+        script_endpoint.recv_event().await.unwrap().kind(),
+        mc_script::ScriptEventKind::ServerTick { tick: 90 }
+    ));
+
+    window.input[0] = ItemStack::new(1, 1);
+    refresh_crafting_result(&state, &mut window);
+    saved.lock().unwrap().crafting_table_input = crafting_table_input_projection(&window.input);
+    script_boundary.close_event_admission();
+    window = handle_crafting_container_click(
+        &mut state,
+        &mut writer,
+        window,
+        Some(&script_events),
+        GameMode::Survival,
+        pose,
+        ServerboundContainerClick {
+            container_id: 7,
+            state_id: 2,
+            slot_num: 0,
+            button_num: 0,
+            container_input: ContainerInput::Pickup,
+            changed_slots: Vec::new(),
+            carried_item: mc_protocol::packets::play::HashedStack::Actual {
+                item_id: 2,
+                count: 8,
+                components: mc_protocol::packets::play::HashedStackComponentHashes::empty(),
+            },
+        },
+    )
+    .await
+    .unwrap();
+    assert_eq!(window.state_id, 3);
+    assert!(window.input.iter().all(ItemStack::is_empty));
+    assert_eq!(state.carried_item, ItemStack::new(2, 8));
+
+    let _ = stop.send(());
+    task.await.unwrap();
+}
+
+#[tokio::test]
+async fn inventory_result_paths_publish_only_after_owner_commit() {
+    use mc_data::recipes::{
+        Ingredient, IngredientAlternative, Recipe, RecipeKind, RecipeResult, ShapelessRecipe,
+    };
+
+    let ingredient = Identifier::parse("minecraft:test_ingredient").unwrap();
+    let output = Identifier::parse("minecraft:test_output").unwrap();
+    let items = Arc::new(ItemRegistry::from_report(&[
+        ItemReport {
+            id: ingredient.clone(),
+            protocol_id: 1,
+        },
+        ItemReport {
+            id: output.clone(),
+            protocol_id: 2,
+        },
+    ]));
+    let mut state = interaction_state_for_items(items);
+    state.recipes.push(Recipe {
+        id: Identifier::parse("minecraft:test_recipe").unwrap(),
+        kind: RecipeKind::Shapeless(ShapelessRecipe {
+            ingredients: vec![Ingredient {
+                alternatives: vec![IngredientAlternative::Item(ingredient)],
+            }],
+        }),
+        result: RecipeResult {
+            item: output,
+            count: 4,
+        },
+    });
+    state.inventory.slots[1] = ItemStack::new(1, 1);
+    refresh_inventory_crafting_result(&mut state);
+    assert_eq!(state.inventory.slots[0], ItemStack::new(2, 4));
+
+    let pose = PlayerPose::new(1.5, 65.0, 2.5);
+    let profile = LoggedInProfile {
+        uuid: crate::login::offline_uuid("InvCraftOwner"),
+        name: "InvCraftOwner".to_owned(),
+    };
+    let (tx, _rx) = mpsc::channel(8);
+    let (session_id, _) = state
+        .sessions
+        .register(&profile, (0, 0), 0, HashSet::new(), tx, pose);
+    let mut saved = PlayerPersistedState::new_default(pose);
+    saved.inventory = state.inventory.clone();
+    let saved = Arc::new(Mutex::new(saved));
+    state
+        .sessions
+        .register_player_persistence(session_id, Arc::clone(&saved));
+    state.session_id = session_id;
+    let (simulation, stop, task) = spawn_test_simulation_owner(Arc::clone(&state.sessions));
+    state.simulation = simulation.for_session(session_id);
+
+    let one = NonZeroUsize::new(1).unwrap();
+    let (script_boundary, mut script_endpoint) = mc_script::script_boundary_pair(one, one);
+    let script_events = ScriptGameplayEventPublisher::new(
+        ScriptEventSink::new(script_boundary.clone()),
+        ScriptPlayerId::new(session_id),
+        profile.uuid.to_string(),
+        &profile.name,
+        CommandPermissions::from_op(false),
+        "minecraft:overworld",
+    );
+    let xp = XpState::default();
+    let script_player_id = ScriptPlayerId::new(session_id);
+    let script_context = no_script_player_context(session_id);
+    let mut writer = Vec::new();
+    let mismatch_state_id = state.inventory_state_id;
+
+    handle_container_click(
+        &mut state,
+        &mut writer,
+        ContainerClickContext {
+            game_mode: GameMode::Survival,
+            survival_state: SurvivalState::FULL,
+            xp_state: &xp,
+            player_pose: pose,
+            script_events: Some(&script_events),
+            scripts: None,
+            script_player_id,
+            script_context: script_context.clone(),
+        },
+        ServerboundContainerClick {
+            container_id: 0,
+            state_id: mismatch_state_id,
+            slot_num: 0,
+            button_num: 0,
+            container_input: ContainerInput::Pickup,
+            changed_slots: Vec::new(),
+            carried_item: mc_protocol::packets::play::HashedStack::Actual {
+                item_id: 1,
+                count: 1,
+                components: mc_protocol::packets::play::HashedStackComponentHashes::empty(),
+            },
+        },
+    )
+    .await
+    .unwrap();
+    assert_eq!(state.inventory.slots[1], ItemStack::new(1, 1));
+    assert!(state.carried_item.is_empty());
+    script_boundary
+        .try_enqueue_event(ScriptEvent::server_tick(91))
+        .unwrap();
+    assert!(matches!(
+        script_endpoint.recv_event().await.unwrap().kind(),
+        mc_script::ScriptEventKind::ServerTick { tick: 91 }
+    ));
+
+    for slot in 9..=44 {
+        state.inventory.slots[slot] = ItemStack::new(99, 64);
+    }
+    saved.lock().unwrap().inventory = state.inventory.clone();
+    let full_state_id = state.inventory_state_id;
+    handle_container_click(
+        &mut state,
+        &mut writer,
+        ContainerClickContext {
+            game_mode: GameMode::Survival,
+            survival_state: SurvivalState::FULL,
+            xp_state: &xp,
+            player_pose: pose,
+            script_events: Some(&script_events),
+            scripts: None,
+            script_player_id,
+            script_context: script_context.clone(),
+        },
+        ServerboundContainerClick {
+            container_id: 0,
+            state_id: full_state_id,
+            slot_num: 0,
+            button_num: 0,
+            container_input: ContainerInput::QuickMove,
+            changed_slots: Vec::new(),
+            carried_item: mc_protocol::packets::play::HashedStack::empty(),
+        },
+    )
+    .await
+    .unwrap();
+    assert_eq!(state.inventory.slots[1], ItemStack::new(1, 1));
+    script_boundary
+        .try_enqueue_event(ScriptEvent::server_tick(92))
+        .unwrap();
+    assert!(matches!(
+        script_endpoint.recv_event().await.unwrap().kind(),
+        mc_script::ScriptEventKind::ServerTick { tick: 92 }
+    ));
+
+    for slot in 9..=44 {
+        state.inventory.slots[slot] = ItemStack::EMPTY;
+    }
+    saved.lock().unwrap().inventory = state.inventory.clone();
+    let success_state_id = state.inventory_state_id;
+    handle_container_click(
+        &mut state,
+        &mut writer,
+        ContainerClickContext {
+            game_mode: GameMode::Survival,
+            survival_state: SurvivalState::FULL,
+            xp_state: &xp,
+            player_pose: pose,
+            script_events: Some(&script_events),
+            scripts: None,
+            script_player_id,
+            script_context,
+        },
+        ServerboundContainerClick {
+            container_id: 0,
+            state_id: success_state_id.wrapping_sub(1),
+            slot_num: 0,
+            button_num: 0,
+            container_input: ContainerInput::Pickup,
+            changed_slots: Vec::new(),
+            carried_item: mc_protocol::packets::play::HashedStack::Actual {
+                item_id: 2,
+                count: 4,
+                components: mc_protocol::packets::play::HashedStackComponentHashes::empty(),
+            },
+        },
+    )
+    .await
+    .unwrap();
+    assert!(state.inventory.slots[1].is_empty());
+    assert_eq!(state.carried_item, ItemStack::new(2, 4));
+    assert!(matches!(
+        script_endpoint.recv_event().await.unwrap().kind(),
+        mc_script::ScriptEventKind::PlayerItemCrafted {
+            item_id,
+            count: 4,
+            craft_count: 1,
+            source: ScriptCraftingSource::Inventory,
+            ..
+        } if item_id == "minecraft:test_output"
+    ));
+
+    let _ = stop.send(());
+    task.await.unwrap();
 }
 
 fn stonecutter_test_recipe() -> mc_data::recipes::Recipe {
@@ -15091,14 +15513,78 @@ fn use_max_recipe_is_bounded_when_output_recreates_ingredient() {
         result: RecipeResult { item, count: 1 },
     };
 
-    let changed = craft_recipe(&mut state, &recipe, true).expect("one bounded craft");
+    let outcome = craft_recipe(&mut state, &recipe, true).expect("one bounded craft");
 
-    assert!(!changed.is_empty());
+    assert!(!outcome.changed_slots.is_empty());
+    assert_eq!(
+        outcome.crafted,
+        CraftedItem {
+            item_id: 1,
+            count: 1,
+            craft_count: 1,
+        }
+    );
     assert_eq!(state.inventory.slots[9], ItemStack::new(1, 1));
 }
 
+#[test]
+fn use_max_recipe_reports_large_aggregate_without_partial_mutation_failure() {
+    use mc_data::recipes::{
+        Ingredient, IngredientAlternative, Recipe, RecipeKind, RecipeResult, ShapelessRecipe,
+    };
+
+    let ingredient = Identifier::parse("minecraft:test_ingredient").unwrap();
+    let output = Identifier::parse("minecraft:test_output").unwrap();
+    let items = Arc::new(ItemRegistry::from_report(&[
+        ItemReport {
+            id: ingredient.clone(),
+            protocol_id: 1,
+        },
+        ItemReport {
+            id: output.clone(),
+            protocol_id: 2,
+        },
+    ]));
+    let mut state = interaction_state_for_items(items);
+    state.item_facts = Arc::new(ItemFactsTable::from_entries([(
+        output.clone(),
+        mc_data::item_components::ItemFacts {
+            max_stack_size: Some(2_000_000_000),
+            ..mc_data::item_components::ItemFacts::default()
+        },
+    )]));
+    for slot in 9..=11 {
+        state.inventory.slots[slot] = ItemStack::new(1, 1);
+    }
+    let recipe = Recipe {
+        id: Identifier::parse("minecraft:test_large_output").unwrap(),
+        kind: RecipeKind::Shapeless(ShapelessRecipe {
+            ingredients: vec![Ingredient {
+                alternatives: vec![IngredientAlternative::Item(ingredient)],
+            }],
+        }),
+        result: RecipeResult {
+            item: output,
+            count: 1_500_000_000,
+        },
+    };
+
+    let outcome = craft_recipe(&mut state, &recipe, true).expect("three complete crafts");
+
+    assert_eq!(outcome.crafted.item_id, 2);
+    assert_eq!(outcome.crafted.count, 4_500_000_000);
+    assert_eq!(outcome.crafted.craft_count, 3);
+    assert_eq!(
+        state.inventory.slots[9..=44]
+            .iter()
+            .map(|stack| i64::from(stack.count.max(0)))
+            .sum::<i64>(),
+        4_500_000_000
+    );
+}
+
 #[tokio::test]
-async fn placed_recipe_commits_inventory_through_simulation_owner() {
+async fn placed_recipe_commits_inventory_and_publishes_aggregate_craft() {
     use mc_data::recipes::{
         Ingredient, IngredientAlternative, Recipe, RecipeKind, RecipeResult, ShapelessRecipe,
     };
@@ -15134,10 +15620,21 @@ async fn placed_recipe_commits_inventory_through_simulation_owner() {
     let simulation_probe = simulation.clone();
     state.simulation = simulation.for_session(session_id);
     let mut writer = Vec::new();
+    let one = NonZeroUsize::new(1).unwrap();
+    let (script_boundary, mut script_endpoint) = mc_script::script_boundary_pair(one, one);
+    let script_events = ScriptGameplayEventPublisher::new(
+        ScriptEventSink::new(script_boundary.clone()),
+        ScriptPlayerId::new(session_id),
+        "recipe-owner",
+        "RecipeOwner",
+        CommandPermissions::from_op(false),
+        "minecraft:overworld",
+    );
 
     handle_place_recipe(
         &mut state,
         &mut writer,
+        Some(&script_events),
         PlayerPose::new(0.5, 64.0, 0.5),
         GameMode::Survival,
         SurvivalState::FULL,
@@ -15161,6 +15658,40 @@ async fn placed_recipe_commits_inventory_through_simulation_owner() {
     assert_eq!(state.inventory.slots[9], ItemStack::new(2, 1));
     assert_eq!(owner_inventory.slots, state.inventory.slots);
     assert_eq!(owner_carried_item, state.carried_item);
+    assert!(matches!(
+        script_endpoint.recv_event().await.unwrap().kind(),
+        mc_script::ScriptEventKind::PlayerItemCrafted {
+            item_id,
+            count: 1,
+            craft_count: 1,
+            source: ScriptCraftingSource::Inventory,
+            game_mode: mc_script::ScriptGameMode::Survival,
+            ..
+        } if item_id == "minecraft:test_output"
+    ));
+
+    handle_place_recipe(
+        &mut state,
+        &mut writer,
+        Some(&script_events),
+        PlayerPose::new(0.5, 64.0, 0.5),
+        GameMode::Survival,
+        SurvivalState::FULL,
+        ServerboundPlaceRecipe {
+            container_id: 0,
+            recipe_display_id: 0,
+            use_max_items: true,
+        },
+    )
+    .await
+    .unwrap();
+    script_boundary
+        .try_enqueue_event(ScriptEvent::server_tick(88))
+        .unwrap();
+    assert!(matches!(
+        script_endpoint.recv_event().await.unwrap().kind(),
+        mc_script::ScriptEventKind::ServerTick { tick: 88 }
+    ));
 }
 
 fn register_interaction_player(state: &mut InteractionState, name: &str) -> SessionId {

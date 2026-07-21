@@ -1065,12 +1065,30 @@ pub enum ScriptInventoryClick {
     ShiftSecondary,
 }
 
-/// Closed game-mode snapshot exposed by block-break events.
+/// Closed crafting source snapshot exposed by item-crafted events.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[non_exhaustive]
+pub enum ScriptCraftingSource {
+    Inventory,
+    CraftingTable,
+}
+
+impl ScriptCraftingSource {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Inventory => "inventory",
+            Self::CraftingTable => "crafting_table",
+        }
+    }
+}
+
+/// Closed game-mode snapshot exposed by gameplay events.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 #[non_exhaustive]
 pub enum ScriptGameMode {
     Survival,
     Creative,
+    Adventure,
 }
 
 impl ScriptGameMode {
@@ -1078,6 +1096,7 @@ impl ScriptGameMode {
         match self {
             Self::Survival => "survival",
             Self::Creative => "creative",
+            Self::Adventure => "adventure",
         }
     }
 }
@@ -1228,6 +1247,37 @@ impl ScriptEvent {
                 x,
                 y,
                 z,
+                game_mode,
+            },
+        })
+    }
+
+    /// Build a reliable item-crafted event after the authoritative inventory commit.
+    #[allow(clippy::too_many_arguments)]
+    pub fn try_player_item_crafted_with_context(
+        player_id: ScriptPlayerId,
+        context: ScriptPlayerContext,
+        dimension: impl AsRef<str>,
+        item_id: impl AsRef<str>,
+        count: u64,
+        craft_count: u32,
+        source: ScriptCraftingSource,
+        game_mode: ScriptGameMode,
+    ) -> Result<Self, ScriptDtoError> {
+        context.validate()?;
+        if count == 0 || craft_count == 0 {
+            return Err(ScriptDtoError::InvalidAmount);
+        }
+        Ok(Self {
+            target_plugin_id: None,
+            kind: ScriptEventKind::PlayerItemCrafted {
+                player_id,
+                context,
+                dimension: validate_contract_resource_id(dimension.as_ref())?,
+                item_id: validate_contract_resource_id(item_id.as_ref())?,
+                count,
+                craft_count,
+                source,
                 game_mode,
             },
         })
@@ -1471,6 +1521,7 @@ impl ScriptEvent {
             ScriptEventKind::PlayerChat { .. } => "player.chat",
             ScriptEventKind::PlayerBlockBroken { .. } => "player.block_broken",
             ScriptEventKind::PlayerBlockPlaced { .. } => "player.block_placed",
+            ScriptEventKind::PlayerItemCrafted { .. } => "player.item_crafted",
             ScriptEventKind::PlayerCommand { .. } => "player.command",
             ScriptEventKind::ServerTick { .. } => "server.tick",
             ScriptEventKind::PluginStorageGetResult { .. } => "plugin.storage.get_result",
@@ -1534,6 +1585,22 @@ impl ScriptEvent {
                 context.validate()?;
                 validate_contract_resource_id(dimension)?;
                 validate_contract_resource_id(block_id).map(drop)
+            }
+            ScriptEventKind::PlayerItemCrafted {
+                context,
+                dimension,
+                item_id,
+                count,
+                craft_count,
+                ..
+            } => {
+                context.validate()?;
+                validate_contract_resource_id(dimension)?;
+                validate_contract_resource_id(item_id)?;
+                if *count == 0 || *craft_count == 0 {
+                    return Err(ScriptDtoError::InvalidAmount);
+                }
+                Ok(())
             }
             ScriptEventKind::PlayerCommand {
                 username,
@@ -1695,6 +1762,16 @@ pub enum ScriptEventKind {
         x: i32,
         y: i32,
         z: i32,
+        game_mode: ScriptGameMode,
+    },
+    PlayerItemCrafted {
+        player_id: ScriptPlayerId,
+        context: ScriptPlayerContext,
+        dimension: String,
+        item_id: String,
+        count: u64,
+        craft_count: u32,
+        source: ScriptCraftingSource,
         game_mode: ScriptGameMode,
     },
     PlayerCommand {
@@ -3957,6 +4034,7 @@ fn is_supported_event_name(event_name: &str) -> bool {
             | "player.chat"
             | "player.block_broken"
             | "player.block_placed"
+            | "player.item_crafted"
             | "server.tick"
             | "plugin.storage.get_result"
             | "plugin.storage.cas_result"
@@ -4637,6 +4715,88 @@ mod tests {
     fn block_break_game_modes_are_closed_stable_strings() {
         assert_eq!(ScriptGameMode::Survival.as_str(), "survival");
         assert_eq!(ScriptGameMode::Creative.as_str(), "creative");
+        assert_eq!(ScriptGameMode::Adventure.as_str(), "adventure");
+    }
+
+    #[test]
+    fn player_item_crafted_event_is_a_validated_snapshot_without_integer_caps() {
+        let context = ScriptPlayerContext::new(
+            "123e4567-e89b-12d3-a456-426614174000",
+            "kaiser",
+            true,
+            12.25,
+            70.0,
+            -4.5,
+        );
+        let event = ScriptEvent::try_player_item_crafted_with_context(
+            ScriptPlayerId::new(42),
+            context.clone(),
+            "minecraft:overworld",
+            "minecraft:oak_planks",
+            u64::from(u32::MAX) + 1,
+            u32::MAX,
+            ScriptCraftingSource::CraftingTable,
+            ScriptGameMode::Adventure,
+        )
+        .unwrap();
+
+        assert_eq!(event.event_name(), "player.item_crafted");
+        assert_eq!(event.target_plugin_id(), None);
+        assert_eq!(event.validate(), Ok(()));
+        assert!(matches!(
+            event.kind(),
+            ScriptEventKind::PlayerItemCrafted {
+                player_id,
+                context: event_context,
+                dimension,
+                item_id,
+                count,
+                craft_count,
+                source,
+                game_mode,
+            } if *player_id == ScriptPlayerId::new(42)
+                && event_context == &context
+                && dimension == "minecraft:overworld"
+                && item_id == "minecraft:oak_planks"
+                && *count == u64::from(u32::MAX) + 1
+                && *craft_count == u32::MAX
+                && *source == ScriptCraftingSource::CraftingTable
+                && *game_mode == ScriptGameMode::Adventure
+        ));
+    }
+
+    #[test]
+    fn player_item_crafted_rejects_invalid_ids_and_zero_counts() {
+        let context = ScriptPlayerContext::new("player-42", "kaiser", false, 0.0, 64.0, 0.0);
+        for (dimension, item_id, count, craft_count) in [
+            ("overworld", "minecraft:stick", 1, 1),
+            ("minecraft:overworld", "minecraft:Stick", 1, 1),
+            ("minecraft:overworld", "minecraft:stick", 0, 1),
+            ("minecraft:overworld", "minecraft:stick", 1, 0),
+        ] {
+            assert!(
+                ScriptEvent::try_player_item_crafted_with_context(
+                    ScriptPlayerId::new(42),
+                    context.clone(),
+                    dimension,
+                    item_id,
+                    count,
+                    craft_count,
+                    ScriptCraftingSource::Inventory,
+                    ScriptGameMode::Survival,
+                )
+                .is_err()
+            );
+        }
+    }
+
+    #[test]
+    fn crafting_sources_are_closed_stable_strings() {
+        assert_eq!(ScriptCraftingSource::Inventory.as_str(), "inventory");
+        assert_eq!(
+            ScriptCraftingSource::CraftingTable.as_str(),
+            "crafting_table"
+        );
     }
 
     #[test]
@@ -4761,6 +4921,7 @@ mod tests {
         for event_name in [
             "player.block_broken",
             "player.block_placed",
+            "player.item_crafted",
             "plugin.storage.get_result",
             "plugin.storage.cas_result",
             "plugin.storage.delete_result",
