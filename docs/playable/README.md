@@ -45,8 +45,10 @@ unless the owner explicitly asks for readiness or ledger work.
 
 ## Navigation
 
-- Use `rg`/`rg --files` first.
-- Use CodeGraph MCP when targeted graph context beats reading broad files.
+- Use one CodeGraph call for symbols, callers/callees, mutation paths, and
+  blast radius when available.
+- Use bounded `rg`/reads for docs, config, logs, generated artifacts, and stale
+  files. Do not run both discovery paths by default.
 - Good CodeGraph questions: callers of block mutation, inventory truth,
   chunk-send/light-update emitters, world/session lock holders, and blast
   radius of chunk streaming changes.

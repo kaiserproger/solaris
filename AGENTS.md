@@ -1,14 +1,12 @@
 # Agent Guide - Solaris
 
-Solaris is a custom Minecraft Java Edition 26.1-compatible server,
-written in Rust. `CLAUDE.md` is a symlink to this file.
+Solaris is a custom Minecraft Java Edition 26.1-compatible server written in
+Rust. `CLAUDE.md` is a symlink to this file.
 
-Owner/local git identity: `kaiserproger <kaisergrobe@gmail.com>`.
-Do not change git config.
+Owner/local git identity: `kaiserproger <kaisergrobe@gmail.com>`. Do not change
+git config.
 
-## Working Contract
-
-Preserve and apply these owner rules exactly:
+## Owner Contract
 
 "Do not overthink/overengineer every possible case until you explain exactly WHY it is needed and user agrees with you. Write as simple and clear as possible. Always ask user first what they fucking want."
 
@@ -18,230 +16,97 @@ Preserve and apply these owner rules exactly:
 
 Operational meaning:
 
-- The explicit user request is the source of truth. Do not invent scope, cases,
-  abstractions, compatibility promises, or requirements.
-- An explicit request already says what the user wants. Ask only when an
-  unresolved material choice would change the result; do not ask the user to
-  repeat an unambiguous request.
-- Prefer the smallest boring local change that completes the current request.
-  Do not add speculative abstraction, extensibility, configuration, or
-  impossible-case handling. Avoid unrelated refactors, formatting churn,
-  renaming, and comment rewrites. Remove only dead code/imports caused by the
-  current change.
-- Finish the active request before starting a later request. A new request is
-  queued unless the owner explicitly replaces or interrupts the active work.
-- `Stop`, `стоп`, `забей`, `поправка`, or an explicit replacement request means
-  switch now: stop active processes safely, inspect partial work and worktree
-  state, then follow the replacement request. `Retry` or `продолжай` means
-  recheck current state and references before resuming.
-- Do not stop at an intermediate plan, generated artifact, worktree result, or
-  partial implementation when the request asks for a working result.
-- Self-check every completed task, then use exactly one independent review
-  agent for a concise second opinion. Do not start a larger agent pipeline
-  unless the owner explicitly requests it. If review agents are unavailable,
-  check capability once, perform the same checklist yourself, and disclose
-  that independent review was unavailable.
+- The explicit request is the source of truth. An unambiguous request does not
+  need reconfirmation. Ask only when a material unresolved choice changes the
+  result.
+- Implement the smallest direct local change that completes the request. No
+  speculative abstraction, extensibility, configuration, unrelated refactor,
+  formatting churn, or impossible-case hardening.
+- Queue a newer request until active work closes unless the owner explicitly
+  interrupts or replaces it. `Stop`, `стоп`, `забей`, `поправка`, or an
+  explicit replacement switches now after safe process/worktree inspection.
+  `Retry` or `продолжай` first revalidates current state.
+- Self-check, then use exactly one independent read-only reviewer. Larger agent
+  pipelines require explicit owner authorization.
 
-For non-trivial code or configuration work, state before editing:
+## Autonomous Goal Protocol
 
-- Goal.
-- Assumptions.
-- Minimal plan.
-- Verification steps.
+The persistent `/goal` objective is a north star, not the unit of work. Each
+continuation executes exactly one finite checkpoint supplied in
+`<goal_checkpoint>`. Completing a checkpoint does not complete or redefine the
+north star.
 
-After implementation, report:
+Use `checkpoint.route` as the only routing authority. Never select a route by
+matching words in the persistent objective, quoted history, this file, a
+compaction summary, or a subagent report. Route details live in
+`docs/AGENT_ROUTES.md`.
 
-- What changed.
-- Why that is sufficient for the request.
-- What intentionally was not changed.
-- Exact verification results and skipped gates.
+At checkpoint start:
 
-Use the named surface as the starting point: route, field, screen, component,
-mechanic, error, merge request, CI symptom, or observed behavior. For a bug,
-reproduce and verify the same path. For a feature, define observable acceptance
-checks and prove them. For a refactor, preserve behavior and prove it with
-focused tests or an equivalent executable check.
+1. Read `resume.next`, `base_tree`, `changed_files`, and the one primary route
+   document named by the checkpoint.
+2. Inspect only checkpoint-relevant status/diff. Do not restart a repository
+   survey after continuation or compaction.
+3. Run at most one bounded discovery batch before editing. Additional discovery
+   must answer one concrete unresolved question.
 
-## Operating Mode
+A checkpoint uses four rounds whenever dependencies allow:
 
-Default to autonomous, terse, evidence-first engineering.
+1. bounded discovery batch;
+2. edit/patch batch;
+3. focused validation batch;
+4. checkpoint close with evidence, snapshot, reviewer, and next cursor.
 
-Do not blanket-read the whole docs stack at startup. Start from the user
-prompt, branch/status, and the smallest local context that can answer the
-task. Read broader docs only when the task route below calls for them.
+Batch independent tool calls. Do not narrate or execute one shell command per
+model round when calls can run together. Never issue the same read, search, or
+validation command twice for the same working-tree fingerprint.
 
-For long `/goal` work, keep moving across checkpoints instead of stopping
-on every uncertainty. Make a reasonable local decision, record the
-assumption in the next update or milestone note, run validation at slice
-boundaries, and continue on independent work when one gate is degraded.
-Mark a task blocked only after repeated concrete attempts cannot make
-meaningful progress without owner input or an external state change.
+Default checkpoint budget unless the wrapper supplies another value:
 
-Keep the quality bar high without turning it into ceremony: no protocol
-guesses, no fake validation, no hidden parity claims, no unrelated
-rewrites, no untracked local artifacts in commits, and no invented
-abstractions that tests do not need.
+```yaml
+model_roundtrips_soft: 80
+model_roundtrips_hard: 120
+shell_batches: 24
+subagents: 2
+l2_validation_runs: 1
+context_compactions: 1
+```
 
-Solaris has no released compatibility surface. Do not preserve old Solaris
-APIs, persistence schemas, duplicate authorities, adapters, feature flags, or
-fallback paths merely because they already exist. Delete superseded code in the
-same slice once callers move. Compatibility targets are vanilla protocol and
-behavior (with deliberate bug fixes) plus vanilla world load/save formats, not
-historical Solaris internals. A compatibility layer may remain only when an
-explicit current external contract and test require it.
+At the hard budget, stop expanding scope. Record evidence and a precise resume
+cursor, close the checkpoint as `complete`, `partial`, or `checkpoint-blocked`,
+and let runtime start a fresh continuation. These checkpoint states do not
+complete or block the persistent `/goal`.
 
-Optimization hacks and deliberately narrow fast paths are allowed when they
-move a measured bottleneck. Document the reason, applicability boundary,
-correctness fence, measured effect, and removal or fallback path in the same
-slice. Prefer a reversible local hack over a broad speculative abstraction.
-This permission does not override the non-negotiables below.
+## Discovery Contract
 
-Apply the Pareto rule to delivery. Prioritize the small set of changes that
-unlocks most real gameplay, multiplayer correctness, and scaling value.
-Cover common and costly edge cases, but do not spend extended time polishing
-rare cases while the next critical gameplay or core-architecture path is still
-missing. Stop a hardening pass once its dominant risks are proved and move the
-main objective forward.
+Choose one source-navigation path per question:
 
-Until the owner changes it, the delivery order is fixed:
+- Indexed symbols, callers/callees, mutation paths, or blast radius: one
+  targeted CodeGraph call when available.
+- Docs, configuration, logs, generated artifacts, or unindexed/stale files:
+  bounded `rg`/direct read.
 
-1. Prove and improve common vanilla-client gameplay and multiplayer behavior.
-2. Build the production Lua plugin API and gameplay adapters.
-3. Optimize measured bottlenecks and advance regional/ECS/autoscale work.
-4. Harden rare error interleavings and uncommon parity edges.
+Do not run CodeGraph and broad `rg` merely to reconfirm the same answer. After
+CodeGraph, raw read is for a specifically stale, missing, or edited file.
 
-Do not promote item 3 or 4 because its code is already open, a review found a
-non-blocking issue, or a focused test suggests more hardening. Record such work
-as deferred debt and return to the highest unfinished item. A blocker may move
-ahead only when it breaks the common playable loop, corrupts ordinary saves, or
-prevents plugin API progress.
+Bound output before execution:
 
-Solaris does not require the `superpowers` plugin or a mandatory TDD workflow.
-Do not add process plugins or extra local tooling layers unless the owner asks
-for that exact workflow.
+- use `rg -l`, path filters, and `-m` limits;
+- use `git diff --stat` or `--name-only` before targeted hunks;
+- project JSON with `jq`; do not pretty-print large artifacts;
+- write verbose test/client output to ignored `.analysis/codex-logs/` and return
+  only status, failures, short tail, and log path;
+- treat truncation as a failed query strategy and narrow the next query.
 
-## Context Routing
+## Validation Tiers
 
-Start from the prompt, `git status`, and `rg`. Read `.memory/MEMORY.md` before
-broad exploration, then open only its best matching route. Read one primary
-document below; follow its links only when the task needs them.
+Validation identity is `(command, tree fingerprint, environment, covered
+scope)`. Never rerun an unchanged successful gate for the same identity.
 
-- Long-goal recovery after compaction: `docs/MEMORY.md`.
-- No specific owner prompt: `docs/NEXT_SESSION.md`.
-- Playable or 20-minute-loop work: `docs/playable/README.md`, then the current
-  queue in `docs/playable/ACTIVE.md`.
-- Milestone implementation: only the file matching the active milestone
-  (currently `docs/milestones/M100.md`).
-- Closeout or readiness claim: `docs/DEFINITION_OF_DONE.md`, the relevant
-  milestone, and `docs/VALIDATION_LEDGER.md`.
-- Roadmap or target shape: the relevant `docs/PROJECT_SPEC.md` section. Use
-  `docs/CORE_M77_M100_ROADMAP.md` only for M77-M100 sequencing.
-- Architecture, ownership, threading, or policy: `docs/decisions/README.md`,
-  then the exact ADR. Update that ADR in the same slice.
-- Detailed owner-facing explanation of the current core, module responsibilities,
-  execution paths, and known pitfalls: `docs/CORE_INTERNALS_FOR_OWNER.md`.
-- Performance, regional ownership, ECS, or autoscale: the exact active
-  milestone plus ADR 0004/0005. Use `docs/M52_OPERATOR_PERFORMANCE_NOTES.md`
-  only for metric definitions.
-- Minecraft client MCP or agent-tool wiring: read `docs/AGENT_TOOLING.md` and
-  `client-mod/solaris-client-agent/README.md`.
-- Server Lua plugin/API work: `docs/PLUGINS.md` and the exact ownership ADR.
-- Protocol or packet work: read ADR 0002, use
-  `.analysis/protocol-dump.txt`, `tools/dump-vanilla-protocol.sh`, and
-  `crates/mc-test-harness/src/bin/wire_probe.rs` as needed.
-- Build/run questions: read `README.md` and `example.toml`.
-
-Never read milestone ranges or `docs/archive/` as startup context. Archives are
-for targeted evidence lookup only.
-
-Prefer `rg`/`rg --files` for discovery. Use Serena or other symbol tools
-when they are already useful, not as mandatory startup work.
-
-## Playable Spike Mode
-
-When the owner says "playable", "20-minute loop", "играбельно", or
-"start over", route to `docs/playable/README.md` and
-`docs/playable/ACTIVE.md`.
-
-In this mode:
-
-- Optimize for a real-client 20-minute playable loop, not M100 replacement
-  readiness.
-- Do not read `docs/NEXT_SESSION.md`, `docs/VALIDATION_LEDGER.md`,
-  `docs/VALIDATION_COVERAGE_AUDIT.md`, or
-  `docs/REPLACEMENT_READINESS.md` unless the task explicitly asks for
-  readiness/ledger work.
-- Do not edit readiness/ledger docs unless the owner asks.
-- Use focused runtime tests and real-client/manual checks as feedback, but
-  do not try to promote rows to `ready`.
-- Prefer deleting/de-scoping broken breadth over adding new subsystems.
-- Manual/client checks in this mode use
-  `cargo run --bin mc-server -- --config playable.toml` unless the owner
-  asks for another config.
-- Navigation starts with `rg`. CodeGraph MCP is configured for Codex and may
-  be used for targeted callers/callees, mutation paths, and blast-radius
-  checks; do not use it as mandatory startup context.
-
-## Non-Negotiables
-
-- Agents never `git push`, merge into `main`, or create tags unless the
-  owner explicitly instructs it.
-- Never use wall-clock sleeps (`std::thread::sleep`, `tokio::time::sleep`,
-  Python `time.sleep`, shell `sleep`, or equivalents) in production code,
-  tests, harnesses, or tools. Synchronize through channels, notifications,
-  process readiness, observed protocol/world state, or simulation events.
-- All waiting must be push-driven: await the exact channel message,
-  notification, socket packet, process-state change, or simulation event that
-  proves readiness. Never treat guessed elapsed time, a quiet period, polling,
-  or an arbitrary tick count as success. A timeout may only fail a stuck
-  operation; it must never be the success condition. Waiting for simulation
-  ticks is allowed only when tick progression itself is the behavior being
-  tested or a protocol rule, not as a proxy for some other event.
-- Use push, not pull: the producer that changes state must notify its consumers.
-  Waiting code must block on that notification instead of periodically reading
-  state to discover that something may have happened.
-- Do not reintroduce operator-configured worker-thread percentages. Derive the
-  process capacity once, then let runtime measurements and the autoscaler shift
-  bounded work budgets and admissions between subsystems.
-- Prefer the simplest direct implementation that is easy to read and prove,
-  even when it takes more lines. Do not introduce indirection, generic helpers,
-  or compact abstractions merely to make the diff shorter.
-- Mojang bytes never enter the repo. Keep `.analysis/*` and
-  `data/vanilla/*` gitignored.
-- Packet IDs and field layouts come from `wire-probe`/`javap` against the
-  bundled Mojang server, never memory or guesses.
-- Gameplay parity claims need an oracle: vanilla capture, decompiled
-  source inspection, or side-by-side harness evidence.
-- Do not use `--release` for the dev loop; debug builds are the default.
-- Do not skip hooks/signing flags unless the owner asks.
-- Do not commit `Cargo.lock` changes without a concrete dependency reason.
-
-Local-only paths that must not be staged unless the owner explicitly asks:
-`.analysis/`, `data/vanilla/`, `.serena/`, `.opencode/`, `x-ui-pro/`,
-`YOLO_MODE.md`, `log.log`, and local `opencode.json` overlays.
-
-## Repo Map
-
-- `.` - the only Git repository in this workspace: the Solaris Rust workspace
-  and its Minecraft client tooling. `crates/*` are Cargo members, not separate
-  repositories.
-- `crates/` - workspace members.
-- `crates/mc-test-harness/tests/` - wire-level integration tests and the
-  canonical harness gate.
-- `docs/` - design notes, milestone plans/closeouts, ADRs, and DoD.
-- `tools/` - vanilla extraction and protocol dump scripts.
-- `example.toml` - development config, pointing at local vanilla sidecars.
-
-## Validation
-
-During implementation, run the narrowest check that answers the current
-question. Do not repeatedly run workspace-wide gates after every edit or use
-test-first ceremony when a direct implementation and later focused check are
-clear.
-
-At the end of every completed code feature, bug fix, or refactor, run the full
-baseline once before its commit or handoff. The same baseline is required for
-release-ready language and final milestone closeout:
+- **L0 - edit loop:** affected focused tests and targeted diff/syntax check.
+- **L1 - checkpoint close:** affected crate/package tests, formatter, and
+  `cargo run -p xtask -- code-health`.
+- **L2 - code commit/release/milestone close:** run once:
 
 ```sh
 cargo run -p xtask -- code-health
@@ -250,132 +115,151 @@ cargo clippy --workspace --all-targets -- -D warnings
 cargo fmt --all -- --check
 ```
 
-For the inner loop, use focused real-path tests only when they shorten feedback
-or prove the changed behavior. Group related edits into one coherent feature
-checkpoint, then run the full baseline once. For Markdown/instruction-only
-changes, do not run application test suites; run path/link/static/diff checks
-and say that application gates were intentionally skipped.
+After failure, rerun only the failed gate and only after a relevant change.
+Markdown/instruction-only checkpoints use static/path/link/diff checks and
+explicitly skip Cargo gates. A broad green gate proves only its covered scope.
+`code-health` is a fail-only architecture tripwire, not gameplay/parity/client/
+performance evidence. Structural checks may enforce ownership/dependencies,
+preferably through AST; never test behavior or statement order by comparing
+Rust source text or line positions.
 
-If a higher-level gate was not run, say exactly that. Use the DoD labels
-for vanilla oracle, harness, manual/client, performance, and concurrency;
-never compress skipped or manual-pending coverage into "green". When a
-state is degraded only because a gate was skipped or stale, proactively
-restore normal by rerunning or replacing that gate before making readiness
-claims.
+## Long-Running Work
 
-`xtask code-health` is a fail-only architecture tripwire. It is useful,
-but it is not gameplay, oracle, client, performance, or soak evidence.
-Structural checks may enforce coarse ownership and dependency rules, using an
-AST when exact structure matters. Never test runtime behavior, statement order,
-or semantics by comparing Rust source text or line positions; use executable
-unit, wire, integration, or runtime tests.
+Long-running work is event-driven. Launch once and continue independent work.
+Do not poll with `wait`, `write_stdin`, process listings, repeated status, or
+agent waits. Consume completion/actionable notification once. A timeout may
+fail stuck work; elapsed time is never success.
 
-## Development Workflow
+Never add wall-clock sleeps in production, tests, harnesses, or tools. Wait for
+the exact channel message, notification, packet, process state, world state, or
+simulation event. The producer must wake consumers; use push, not pull.
 
-For non-trivial code changes:
+## Subagents
 
-1. Scout the exact files/symbols.
-2. Choose one independently revertible slice.
-3. Define the observable success condition and the cheapest real-path check.
-4. Implement the smallest direct diff. Tests may be added before or after the
-   implementation; they are evidence, not a required TDD ritual.
-5. Enumerate and test the reachable material failure branches changed by the
-   slice, not only the happy path: stale preconditions, owner rejection,
-   partial/failed mutation, empty/no-op input, mode-specific behavior, and
-   cleanup/publication failure where applicable.
-6. Review the diff for negative-code issues: duplication, fake
-   abstractions, broad config, unrelated churn, and unsupported claims.
-7. Run focused validation, then broader gates at the checkpoint.
+Use subagents only when owner/runtime authorizes delegation. At most two may run
+concurrently, with disjoint responsibilities and write sets. Do not delegate
+the immediate blocker and then wait for it. Prefer `sol` medium/high or `luna`
+xhigh; do not use `terra`.
 
-Treat `mc-net` as a modular monolith. Root orchestration files such as
-`play.rs`, `session.rs`, and their aggregate test files route work but do not
-own new domain behavior. Put each state machine, authority boundary, and
-transaction policy in a focused domain module with a narrow explicit interface.
-When changing legacy behavior still embedded in a root file, move that touched
-domain into its own module in the same slice when the extraction is mechanical
-and bounded. Keep substantial unit-test modules in sibling `*_tests.rs` files;
-do not grow `play/tests.rs`, `session/tests.rs`, or inline production-file test
-blocks further.
+One agent returns one compact result per revision:
 
-Default to local implementation plus exactly one independent read-only reviewer
-after the task is complete. Use additional scout or worker agents only when the
-owner explicitly requests parallel work; give them disjoint scopes and never
-delegate the immediate blocking step. The main agent inspects every returned
-diff and owns final verification. Never run more than four agents concurrently.
-Use `sol` at medium/high reasoning or `luna` at xhigh reasoning; do not use
-`terra`. Reviewers must not edit files or spawn subagents. Close finished agents
-before replacing them, and do not spawn a second reviewer after fixing findings.
+```yaml
+verdict: pass | changes | blocked
+findings: [maximum 8 bullets]
+changed_files: [...]
+validation: [...]
+report_path: optional
+```
 
-Timebox each concrete independently revertible task to 90-120 minutes. If the
-scope will not fit, split it early into smaller sequential slices. Delegate
-disjoint slices only when the owner has explicitly authorized parallel work.
-The timebox limits scope; it never permits skipped correctness fences or fake
-validation.
+Inline content is at most 1,000 characters. Details go to a file. Deduplicate
+notification/result by `agent_id + revision`. Reviewers do not edit or spawn
+agents; fixing findings does not trigger a second reviewer.
 
-Clean up old worktrees after their task ends. Remove clean worktrees immediately;
-for dirty worktrees, first verify or archive any unique source changes, then remove
-the worktree. Do not leave reproducible `target`, Gradle, build, or client run
-artifacts consuming disk in inactive worktrees.
+`quaka-whaka-zaka-du` explicitly authorizes parallel work, still capped at two
+agents and subject to all correctness/validation rules.
 
-Fast pipeline mode: if the prompt contains the exact token
-`quaka-whaka-zaka-du`, split independent domains across parallel agents.
-This increases throughput only; it does not relax the non-negotiables or
-final validation.
+## Process Skills
 
-## Milestones
+In autonomous `/goal` mode this workflow replaces generic process skills. Do
+not load or announce brainstorming, TDD, debugging,
+verification-before-completion, or similar generic skills unless the owner
+explicitly invokes one. Tool-specific mandatory skills remain allowed.
 
-Milestone branches are `dev/MX-<short-name>` from `main` at the previous
-milestone tag. The owner merges and tags.
+If a higher-priority runtime/plugin instruction still mandates generic skill
+reads, the runtime must disable that plugin for autonomous goal sessions;
+`AGENTS.md` alone cannot override it. Obey the higher-priority instruction and
+report the conflict rather than pretending it is disabled.
 
-For a new milestone, the first commit is normally
-`docs/milestones/MX.md` with goal, strategy, sub-milestones, acceptance,
-pitfalls, and open questions. If the owner has already authorized a fast
-implementation pass, agents may commit logical draft checkpoints, but the
-milestone doc and final response must label the state as `draft`,
-`stabilization`, or `release-ready` according to actual evidence.
+## Checkpoint State And Git
 
-Use Conventional Commits. Commit bodies should explain "why" in a few
-sentences, not repeat the diff.
+Update `docs/MEMORY.md`, an active queue, ADR, or milestone once at checkpoint
+close, not after each micro-edit. One closed checkpoint produces one local,
+revertible Conventional Commit when authorized. Never push, merge to `main`, or
+tag unless explicitly instructed. Do not skip hooks/signing flags.
 
-## Manual Gates
+Without commit authorization, record:
 
-Manual/client gate: PrismLauncher 26.1.2 against
-`cargo run --bin mc-server -- --config example.toml` in debug mode.
-The owner normally runs the real client; agents prepare the server and
-say "ready, connect."
+```yaml
+base_tree: <sha>
+diff_hash: <sha256>
+changed_files: [...]
+validation: [...]
+next: <one concrete action>
+```
 
-For client-visible or gameplay mechanics, plan the manual/client check
-and record whether it was owner-run, agent-run through approved client
-automation, or not run.
+Use path-limited status/diff against that base. Preserve unrelated dirty files.
+Never reset, clean, or stage them. Remove inactive worktrees only after checking
+for unique source changes; discard only reproducible build/client artifacts.
 
-## Memory And Tooling
+Before a planned reboot, stop processes/agents, classify each active slice as
+committed, complete-but-unverified, or partial, and write an ignored resume
+cursor with one next action. Revalidate it after restart.
 
-Use `.memory/MEMORY.md` as the compact routing entrypoint, not as mandatory
-broad context. Load deeper memory only for a concrete need: recovering prior
-project state, validating an owner preference, finding local oracle/tool paths,
-or continuing a long goal after compaction. Current code, tests, docs,
-configuration, and runtime behavior override memory.
+## Solaris Priorities
 
-Update memory only for durable future value: milestone state, oracle
-paths, validation workflow, owner preferences, or stable tooling setup.
-Do not store transient command output, guessed parity, secrets, or
-Mojang/vendor artifacts.
+Apply Pareto delivery in this owner-defined order:
 
-Keep local plugin/tooling surface lean. Project-specific `.opencode`
-plugins, MCP overlays, and large node_modules trees should stay disabled
-unless the owner asks for that exact workflow. Prefer repo-native
-commands and focused searches over extra always-on guardrails.
+1. common vanilla-client gameplay and multiplayer behavior;
+2. production Lua plugin API and gameplay adapters;
+3. measured optimization, regional ownership, ECS, and autoscaling;
+4. rare error interleavings and uncommon parity edges.
+
+Do not promote a lower item because its diff is open or review found a
+non-blocking edge. Move ahead only when it blocks ordinary play, corrupts normal
+saves, or prevents plugin progress.
+
+Solaris has no released compatibility surface. Delete superseded Solaris APIs,
+schemas, duplicate authorities, adapters, feature flags, and fallbacks once
+callers move. Compatibility targets are vanilla protocol/behavior (with
+deliberate bug fixes) and vanilla world format, not historical Solaris code.
+
+Measured narrow optimization hacks are allowed. Document the bottleneck,
+boundary, correctness fence, measured effect, and fallback/removal path. Never
+reintroduce operator worker-thread percentages; derive capacity once and let
+measurements/autoscaling move bounded budgets.
+
+## Project Invariants
+
+- Mojang bytes never enter Git. `.analysis/*` and `data/vanilla/*` stay ignored.
+- Packet ids/layouts come from local `wire-probe`/`javap`, never memory.
+- Gameplay parity needs vanilla capture, decompiled-source inspection, or
+  side-by-side harness evidence.
+- Debug builds are the development loop; do not use `--release` unless the
+  checkpoint explicitly requires a performance/release gate.
+- Do not commit `Cargo.lock` without a concrete dependency reason.
+- Local-only paths never staged unless explicitly requested: `.analysis/`,
+  `data/vanilla/`, `.serena/`, `.opencode/`, `x-ui-pro/`, `YOLO_MODE.md`,
+  `log.log`, and local `opencode.json` overlays.
+
+Treat `mc-net` as a modular monolith. Root orchestration files route work but do
+not own new domain behavior. Put touched state machines, authority boundaries,
+and transaction policy in focused modules with narrow interfaces. Mechanically
+extract a touched legacy domain when bounded. Keep substantial tests in sibling
+`*_tests.rs`; do not grow aggregate root or inline production test modules.
+
+Architecture, authority, threading, waiting, persistence ordering, or module
+policy changes update the owning ADR in the same checkpoint. Desired migration
+is not current runtime truth.
+
+## Routes And Evidence
+
+Read `.memory/MEMORY.md`, then one route in `docs/AGENT_ROUTES.md`. Current code,
+tests, configuration, and runtime evidence override memory. Do not read milestone
+ranges, archives, raw sessions, or readiness ledgers as startup context.
+
+Manual/client gate: PrismLauncher 26.1.2 against the route's documented debug
+config. Record whether it was owner-run, agent-run through approved client MCP,
+or not run. Hard readiness language requires `docs/DEFINITION_OF_DONE.md` and
+the exact evidence matrix; skipped/manual-pending gates are never "green".
 
 ## Communication
 
-Be terse. Updates to the owner are 1-3 sentences. If a command runs for
-more than about 5 minutes, report the wait and keep useful work moving.
+At most three substantive owner updates per checkpoint:
 
-When asked for progress since a prior prompt or time, report only that bounded
-interval: commits, observable capabilities, gates, unresolved work, and major
-time sinks. Do not answer with generic lifetime progress or only the latest
-micro-step.
+1. selected outcome, only when not obvious;
+2. critical finding, material scope change, or genuine blocker;
+3. closeout with exact evidence and next checkpoint.
 
-Before saying work is ready/done/parity/replacement-ready, state what was
-actually proved and what was not. Hard readiness language requires the
-DoD evidence matrix.
+Do not announce routine reads, commands, skills, polling, or every test. When
+asked for progress since a prior prompt/time, report only that interval's
+commits, observable capabilities, gates, unresolved work, and major time sinks.

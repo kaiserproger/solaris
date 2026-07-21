@@ -5,15 +5,16 @@ Use this note after compaction, interruption, retry, or a long unattended run.
 1. Re-read the active request, any newer queued request, and
    `git status --short --branch`. A newer request replaces active work only when
    the owner explicitly interrupts or replaces it.
-2. Read `docs/MEMORY.md` for the current checkpoint and delivery priority.
+2. Read the Autonomous Goal Protocol in `AGENTS.md`, then `docs/MEMORY.md` for
+   current evidence and delivery priority.
 3. Inspect the exact diff before assuming which changes belong to the agent.
 4. Resume the active request. Within that request, choose its highest-priority
    unfinished slice; do not switch to unrelated older work because its files
    are already open.
 5. Stop active processes safely on an explicit interruption. On `Retry` or
    `продолжай`, verify process, worktree, and external state before resuming.
-6. Keep progress in coherent feature checkpoints. Use narrow checks while
-   editing; run the full workspace baseline once at the end of code work.
+6. Resume the checkpoint phase and validation tier from its cursor. Do not
+   repeat successful gates for an unchanged working-tree fingerprint.
 7. Self-review, then request exactly one independent read-only second opinion.
 8. Commit only owned files when the owner has authorized commits.
 
