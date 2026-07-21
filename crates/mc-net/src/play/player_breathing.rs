@@ -1,6 +1,6 @@
-use mc_protocol::packets::play::{EntityDataValue, GameMode};
+use mc_protocol::packets::play::{ENTITY_DATA_AIR_SUPPLY_INDEX, EntityDataValue, GameMode};
 
-pub(super) const PLAYER_AIR_SUPPLY_METADATA_INDEX: u8 = 1;
+pub(super) const PLAYER_AIR_SUPPLY_METADATA_INDEX: u8 = ENTITY_DATA_AIR_SUPPLY_INDEX;
 
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub(super) struct PlayerBreathingTick {

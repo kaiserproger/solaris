@@ -3659,7 +3659,7 @@ fn build_chunk_packet(
     let mut timing = ChunkBuildTiming::default();
 
     let chunk_data_started = Instant::now();
-    let data = encode_chunk_data(centre, biomes)?;
+    let data = encode_chunk_data(centre, biomes, blocks)?;
     timing.chunk_data_ms = chunk_data_started.elapsed().as_millis() as u64;
 
     let heightmap_started = Instant::now();

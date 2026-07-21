@@ -11,13 +11,14 @@ use mc_protocol::packets::Packet;
 use mc_protocol::packets::play::{
     AddEntity, BlockChangedAck, BlockUpdate, ClientboundContainerSetSlot, ClientboundKeepAlive,
     ClientboundSetEntityData, ClientboundSetHealth, ClientboundSetTime, ClientboundSystemChat,
-    ConfirmTeleportation, Direction, GameEvent, GameMode, InteractionHand, LevelChunkWithLight,
-    LightUpdate, LoginPlay, MovePlayerFlags, PlayerActionKind, PlayerCommandAction, PlayerInput,
-    RemoveEntities, SectionBlocksUpdate, ServerboundChangeGameMode, ServerboundChatCommand,
-    ServerboundClientTickEnd, ServerboundKeepAlive, ServerboundMovePlayerPosRot,
-    ServerboundPlayerAction, ServerboundPlayerCommand, ServerboundPlayerInput,
-    ServerboundPlayerLoaded, ServerboundUseItemOn, SetCenterChunk, SetEntityMotion,
-    SynchronizePlayerPosition, pack_block_pos, pack_section_relative_pos, unpack_block_pos,
+    ConfirmTeleportation, Direction, ENTITY_DATA_AIR_SUPPLY_INDEX, EntityDataValue, GameEvent,
+    GameMode, InteractionHand, LevelChunkWithLight, LightUpdate, LoginPlay, MovePlayerFlags,
+    PlayerActionKind, PlayerCommandAction, PlayerInput, RemoveEntities, SectionBlocksUpdate,
+    ServerboundChangeGameMode, ServerboundChatCommand, ServerboundClientTickEnd,
+    ServerboundKeepAlive, ServerboundMovePlayerPosRot, ServerboundPlayerAction,
+    ServerboundPlayerCommand, ServerboundPlayerInput, ServerboundPlayerLoaded,
+    ServerboundUseItemOn, SetCenterChunk, SetEntityMotion, SynchronizePlayerPosition,
+    pack_block_pos, pack_section_relative_pos, unpack_block_pos,
 };
 use mc_test_harness::client::Client;
 use mc_world::{BlockPos, BlockRegistry, BlockStateId, WorldStorage};
@@ -1245,10 +1246,20 @@ async fn assert_no_self_authoritative_water_frames(client: &mut Client, player_e
         } else if frame.id == ClientboundSetEntityData::ID {
             let mut body = frame.body;
             let data = ClientboundSetEntityData::decode(&mut body).expect("decode entity data");
-            assert_ne!(
-                data.entity_id, player_entity_id,
-                "vanilla does not send self pose metadata during local water movement"
-            );
+            if data.entity_id == player_entity_id {
+                let unexpected = data
+                    .values
+                    .iter()
+                    .filter(|value| {
+                        !matches!(value, EntityDataValue::Int { .. })
+                            || value.index() != ENTITY_DATA_AIR_SUPPLY_INDEX
+                    })
+                    .collect::<Vec<_>>();
+                assert!(
+                    unexpected.is_empty(),
+                    "vanilla keeps local pose client-predicted; unexpected self metadata: {unexpected:?}"
+                );
+            }
         } else if frame.id == SynchronizePlayerPosition::ID {
             panic!("water movement window should not require a player correction");
         }

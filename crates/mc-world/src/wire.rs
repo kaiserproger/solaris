@@ -18,7 +18,7 @@
 //! ```text
 //! for each of 24 sections, concatenated:
 //!     i16  non_air_block_count    (vanilla's `nonEmptyBlockCount`)
-//!     i16  fluid_count            (always 0 — we don't model fluids yet)
+//!     i16  fluid_count            (states with non-empty fluid state)
 //!     PalettedContainer<BlockState>:
 //!         u8       bits_per_entry
 //!         Palette  (see below)
@@ -320,19 +320,51 @@ fn item_list_tag(slots: &[FurnaceSlot], items: &ItemRegistry) -> Tag {
 /// `biomes` is the `worldgen/biome` registry; the chunk's biome
 /// palette stores identifiers and the wire format needs numeric
 /// registry indices, so the registry has to be supplied.
-pub fn encode_chunk_data(chunk: &Chunk, biomes: &Registry) -> Result<Vec<u8>, WireError> {
+pub fn encode_chunk_data(
+    chunk: &Chunk,
+    biomes: &Registry,
+    blocks: &BlockRegistry,
+) -> Result<Vec<u8>, WireError> {
     debug_assert_eq!(chunk.sections.len(), chunk.geometry().section_count());
     debug_assert_eq!(chunk.biomes.len(), chunk.geometry().section_count());
     let mut buf = Vec::with_capacity(chunk.geometry().section_count() * 16);
     for (sec, bsec) in chunk.sections.iter().zip(chunk.biomes.iter()) {
-        // i16 non_air_block_count + i16 fluid_count (we don't model
-        // fluids yet, so always 0). Both big-endian on the wire.
+        // Both section counters are big-endian on the wire. The client uses
+        // fluid_count as a fast gate before scanning entity/fluid overlap.
         buf.extend_from_slice(&(sec.non_air_count() as i16).to_be_bytes());
-        buf.extend_from_slice(&0i16.to_be_bytes());
+        buf.extend_from_slice(&(section_fluid_count(sec, blocks) as i16).to_be_bytes());
         encode_block_palette(&mut buf, sec);
         encode_biome_palette(&mut buf, bsec, biomes)?;
     }
     Ok(buf)
+}
+
+fn section_fluid_count(section: &ChunkSection, blocks: &BlockRegistry) -> u16 {
+    let Some(palette) = section.palette() else {
+        return if blocks
+            .by_id(section.get(0, 0, 0))
+            .is_some_and(crate::block::BlockState::has_fluid)
+        {
+            SECTION_VOLUME as u16
+        } else {
+            0
+        };
+    };
+    let indices = section
+        .indices()
+        .expect("indirect section carries packed palette indices");
+    let has_fluid = |state| {
+        blocks
+            .by_id(state)
+            .is_some_and(crate::block::BlockState::has_fluid)
+    };
+    if !palette.iter().copied().any(has_fluid) {
+        return 0;
+    }
+    let fluid_palette = palette.iter().copied().map(has_fluid).collect::<Vec<_>>();
+    (0..indices.len())
+        .filter(|&index| fluid_palette[indices.get(index) as usize])
+        .count() as u16
 }
 
 fn encode_block_palette(buf: &mut Vec<u8>, section: &ChunkSection) {
@@ -652,6 +684,47 @@ mod tests {
         .unwrap()
     }
 
+    fn fluid_block_registry() -> BlockRegistry {
+        let single = |id: u32, name: &str| BlockReport {
+            id: Identifier::parse(name).unwrap(),
+            properties: BTreeMap::new(),
+            states: vec![BlockStateReport {
+                id,
+                default: true,
+                properties: BTreeMap::new(),
+            }],
+        };
+        let waterlogged = BlockReport {
+            id: Identifier::parse("minecraft:oak_fence").unwrap(),
+            properties: BTreeMap::from([(
+                "waterlogged".to_string(),
+                vec!["false".to_string(), "true".to_string()],
+            )]),
+            states: [false, true]
+                .into_iter()
+                .enumerate()
+                .map(|(offset, value)| BlockStateReport {
+                    id: 3 + offset as u32,
+                    default: !value,
+                    properties: BTreeMap::from([("waterlogged".to_string(), value.to_string())]),
+                })
+                .collect(),
+        };
+        BlockRegistry::from_report(&[
+            single(0, "minecraft:air"),
+            single(1, "minecraft:water"),
+            single(2, "minecraft:kelp"),
+            waterlogged,
+            single(5, "minecraft:stone"),
+            single(6, "minecraft:lava"),
+            single(7, "minecraft:bubble_column"),
+            single(8, "minecraft:kelp_plant"),
+            single(9, "minecraft:seagrass"),
+            single(10, "minecraft:tall_seagrass"),
+        ])
+        .unwrap()
+    }
+
     fn item_registry() -> ItemRegistry {
         ItemRegistry::from_report(&[ItemReport {
             id: Identifier::parse("minecraft:stone").unwrap(),
@@ -664,7 +737,7 @@ mod tests {
     #[test]
     fn empty_chunk_emits_single_value_air_sections() {
         let chunk = empty_chunk();
-        let bytes = encode_chunk_data(&chunk, &biome_registry()).unwrap();
+        let bytes = encode_chunk_data(&chunk, &biome_registry(), &air_chest_registry()).unwrap();
 
         // Per section: i16(0) i16(0) | u8(0) VarInt(0) | u8(0) VarInt(1)
         //            = 2 + 2 + 1 + 1 + 1 + 1 = 8 bytes.
@@ -690,6 +763,40 @@ mod tests {
     }
 
     #[test]
+    fn chunk_section_reports_exact_fluid_count_to_client() {
+        let geometry = ChunkGeometry::new(0, 16).unwrap();
+        let mut chunk = Chunk::empty_with_geometry(
+            ChunkPos { x: 0, z: 0 },
+            AIR,
+            Identifier::parse("minecraft:plains").unwrap(),
+            geometry,
+        );
+        chunk.set_block(0, 0, 0, BlockStateId(1)).unwrap(); // water
+        chunk.set_block(1, 0, 0, BlockStateId(2)).unwrap(); // kelp
+        chunk.set_block(2, 0, 0, BlockStateId(3)).unwrap(); // dry fence
+        chunk.set_block(3, 0, 0, BlockStateId(4)).unwrap(); // waterlogged fence
+        chunk.set_block(4, 0, 0, BlockStateId(5)).unwrap(); // stone
+        chunk.set_block(5, 0, 0, BlockStateId(6)).unwrap(); // lava
+        chunk.set_block(6, 0, 0, BlockStateId(7)).unwrap(); // bubble column
+        chunk.set_block(7, 0, 0, BlockStateId(8)).unwrap(); // kelp plant
+        chunk.set_block(8, 0, 0, BlockStateId(9)).unwrap(); // seagrass
+        chunk.set_block(9, 0, 0, BlockStateId(10)).unwrap(); // tall seagrass
+
+        let bytes = encode_chunk_data(&chunk, &biome_registry(), &fluid_block_registry()).unwrap();
+
+        assert_eq!(i16::from_be_bytes([bytes[0], bytes[1]]), 10);
+        assert_eq!(i16::from_be_bytes([bytes[2], bytes[3]]), 8);
+    }
+
+    #[test]
+    fn single_state_fluid_section_reports_full_count() {
+        use crate::section::ChunkSection;
+
+        let section = ChunkSection::filled(BlockStateId(1), AIR);
+        assert_eq!(section_fluid_count(&section, &fluid_block_registry()), 4096);
+    }
+
+    #[test]
     fn custom_geometry_encodes_chunk_data_and_baked_light_sections() {
         let geometry = ChunkGeometry::new(0, 256).expect("valid custom geometry");
         let mut chunk = Chunk::empty_with_geometry(
@@ -699,7 +806,8 @@ mod tests {
             geometry,
         );
 
-        let data = encode_chunk_data(&chunk, &biome_registry()).expect("encode chunk data");
+        let data = encode_chunk_data(&chunk, &biome_registry(), &air_chest_registry())
+            .expect("encode chunk data");
         assert_eq!(data.len(), geometry.section_count() * 8);
 
         chunk.section_lights[15].block = Some(vec![0x0F; LIGHT_LAYER_BYTES]);
@@ -809,7 +917,7 @@ mod tests {
         let mut chunk = empty_chunk();
         chunk.set_block(0, -64, 0, BEDROCK).unwrap();
 
-        let bytes = encode_chunk_data(&chunk, &biome_registry()).unwrap();
+        let bytes = encode_chunk_data(&chunk, &biome_registry(), &air_chest_registry()).unwrap();
 
         // Section 0 is now indirect:
         //   i16 non_air = 1, i16 fluid = 0          (4 bytes)
@@ -895,7 +1003,7 @@ mod tests {
             AIR,
             Identifier::parse("minecraft:nope").unwrap(),
         );
-        let err = encode_chunk_data(&chunk, &biome_registry()).unwrap_err();
+        let err = encode_chunk_data(&chunk, &biome_registry(), &air_chest_registry()).unwrap_err();
         assert_eq!(
             err,
             WireError::UnknownBiome(Identifier::parse("minecraft:nope").unwrap())
@@ -956,7 +1064,7 @@ mod tests {
             crate::BlockRegistry::from_report(&report).expect("block registry builds"),
         );
 
-        let mut storage = match WorldStorage::open(&world_dir, registry) {
+        let mut storage = match WorldStorage::open(&world_dir, std::sync::Arc::clone(&registry)) {
             Ok(storage) => storage,
             Err(err) => {
                 eprintln!("skipping: {} ({err})", world_dir.display());
@@ -977,10 +1085,10 @@ mod tests {
                 return;
             }
         };
-        let registry = data
+        let biome_registry = data
             .registry("worldgen/biome")
             .expect("vanilla data carries biome registry");
-        let bytes = encode_chunk_data(&chunk, registry).expect("encode");
+        let bytes = encode_chunk_data(&chunk, biome_registry, registry.as_ref()).expect("encode");
 
         // Structural checks: 24 sections, each ≥ minimum length.
         // Minimum per section = 4 (counts) + 2 (single-value block:

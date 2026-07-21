@@ -119,6 +119,12 @@ Negative:
   encoding, and ordering come from the local 26.1.2
   `ConfigurationProtocols`, `ClientboundUpdateEnabledFeaturesPacket`, and
   `ServerConfigurationPacketListenerImpl` sources.
+- Chunk section encoding publishes both `nonEmptyBlockCount` and the exact
+  non-empty fluid-state count. Local 26.1.2 `LevelChunkSection.read` stores the
+  second short in `fluidCount`; `EntityFluidInteraction.hasFluidAndLoaded`
+  checks `LevelChunkSection.hasFluid()` before scanning entity overlap. Sending
+  zero therefore disables all client-local water contact even when the block
+  palette itself contains valid source-water states.
 
 ## Notes
 

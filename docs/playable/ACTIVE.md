@@ -38,10 +38,11 @@ hardening. An already-open lower-priority diff does not override this order.
    now has server-owned air/drowning, vanilla swimming metadata, and aquatic
    physics that no longer pushes fish to the surface. The client now receives
    the vanilla enabled-feature packet and can cross kelp/seagrass instead of
-   being corrected onto their former full-cube fallback. The remaining direct
-   blocker is client-local fluid contact: a loaded source-water state reports
-   the correct tag, height, empty collision and NeoForge water type while the
-   local player still reports zero fluid height and applies air movement.
+   being corrected onto their former full-cube fallback. Chunk sections now
+   publish the exact vanilla `fluid_count`, so the real client no longer skips
+   entity/fluid overlap: entering source water reports `in_water=true` and a
+   fluid height of `0.8888889`. A deterministic deep-water ascent, dive and
+   drowning client gate remains open.
 3. After the disconnect, close the remaining owner-client reports: water
    movement and manual mob-combat feel. The mob death core now has bounded O3
    load evidence, but this does not replace client/socket verification. Default
@@ -74,14 +75,16 @@ hardening. An already-open lower-priority diff does not override this order.
   body and eye heights now share one pose contract, so one-block water can
   submerge a swimming player's eyes. Focused Rust and client Gradle gates pass,
   and an O3 real client entered the ocean without the prior kelp correction.
-  The same gate still measured `water_fluid_height=0`, `in_water=false`, and
-  air gravity while its current block was source water with height `0.8888889`,
-  empty collision, loaded neighbours and the canonical NeoForge water type.
-  The server-air/client-flag trace is retained as
-  `.analysis/codex-logs/water5-real-client-movement.json`, with the water-below
-  observation in `.analysis/codex-logs/water5-passable-smoke.json`;
-  client-local fluid contact remains the next playable blocker and swimming is
-  not claimed green.
+  The zero-contact cause was the second section counter: Solaris encoded
+  `fluid_count=0`, so 26.1.2 `LevelChunkSection.hasFluid()` prevented
+  `EntityFluidInteraction` from scanning otherwise-correct water states. The
+  encoder now counts water, lava, water plants and `waterlogged=true` states.
+  In the O3 real-client rerun, entering a source block produced
+  `in_water=true`, `water_fluid_height=0.8888889`, and no disconnect while 81
+  chunks streamed with `chunk_data_ms=0`. Evidence is in
+  `.analysis/codex-logs/fluid-count-real-client.json`. This closes client-local
+  fluid contact; deep-water swimming, diving and drowning are not yet claimed
+  green.
 
 - The dense-world disconnect counter identified the reliable movement retry
   queue as the remaining failure path. Once a recipient's bounded channel is

@@ -41,6 +41,29 @@ pub struct BlockState {
     pub properties: Vec<(String, String)>,
 }
 
+impl BlockState {
+    /// Whether vanilla exposes a non-empty fluid state for this block state.
+    #[must_use]
+    pub fn has_fluid(&self) -> bool {
+        if matches!(
+            self.block.id.path(),
+            "water"
+                | "lava"
+                | "bubble_column"
+                | "kelp"
+                | "kelp_plant"
+                | "seagrass"
+                | "tall_seagrass"
+        ) {
+            return true;
+        }
+
+        self.properties
+            .iter()
+            .any(|(name, value)| name == "waterlogged" && value == "true")
+    }
+}
+
 #[derive(Debug, Error)]
 pub enum RegistryError {
     #[error("duplicate block id {0}")]

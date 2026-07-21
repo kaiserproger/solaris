@@ -9,9 +9,9 @@ and is not startup context.
 
 - Date: 2026-07-22.
 - Branch: `dev/M100-client-agent`.
-- Latest recorded checkpoint: water/client fluid-contact diagnosis and the
-  bounded protocol, pose, and water-plant fixes are awaiting commit. Basic
-  economy and land claims shipped in `1c2ba4a`. The prior mob death deadline checkpoint is
+- Latest recorded checkpoint: the client fluid-contact blocker is fixed after
+  the bounded protocol, pose, and water-plant commit `7ac0fa6`. Basic economy
+  and land claims shipped in `1c2ba4a`. The prior mob death deadline checkpoint is
   `45ff133` (`fix(play): index mob death deadlines`).
   The reach checkpoint is `5146926`, creeper checkpoint is `9af1309`,
   dry-spawn checkpoint is `6b0dcec`, autoscale checkpoint is `5b7017a`, and
@@ -95,10 +95,15 @@ and is not startup context.
   four prior reviewer findings were fixed. The follow-up sends the vanilla
   enabled-feature packet before known packs, makes water plants passable, and
   uses swimming/crouching body and eye heights for water/collision queries.
-  Real-client MCP evidence still shows zero client-local fluid height inside a
-  loaded canonical source-water block, so swimming remains open. Next: isolate
-  why `LocalPlayer.baseTick` leaves fluid contact empty despite the correct
-  block state; do not widen into worldgen or rare aquatic edges first.
+  The follow-up fixes the root cause of zero client-local fluid height: chunk
+  encoding always published `fluid_count=0`, causing 26.1.2
+  `LevelChunkSection.hasFluid()` to skip `EntityFluidInteraction`. The wire
+  count now covers water, lava, water plants and waterlogged states. An O3 real
+  client entering source water reports `in_water=true` and
+  `water_fluid_height=0.8888889`; 81 chunks streamed with measured
+  `chunk_data_ms=0`. Next: add one deterministic deep-water MCP gate for
+  ascent, diving, swimming pose and drowning before returning to the remaining
+  owner gameplay queue.
 - `7cdd917` fixes the ordinary active-game save path exposed by the natural
   furnace loop. A resident mutation during out-of-lock whole-region encoding
   now skips that Anvil region before filesystem installation and leaves it
