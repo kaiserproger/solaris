@@ -97,10 +97,10 @@ Controls:
   `minecraft_disconnect`.
 - Player: `minecraft_set_hotbar_slot`, `minecraft_select_hotbar_item`,
   `minecraft_drop_selected_item`, `minecraft_navigate_to_block`, `minecraft_approach_entity`,
-  `minecraft_attack_entity_until_drop_collected`, `minecraft_look`,
+  `minecraft_attack_entity_once`, `minecraft_attack_entity_until_drop_collected`, `minecraft_look`,
   `minecraft_look_at_block`, `minecraft_use_item_on`.
 - Input: `minecraft_press_inputs`, `minecraft_wait_ticks`,
-  `minecraft_close_screen`, `minecraft_send_chat`.
+  `minecraft_open_inventory`, `minecraft_close_screen`, `minecraft_send_chat`.
 - Containers: `minecraft_quick_move_container_slot`,
   `minecraft_click_container_slot`, and `minecraft_click_container_button`;
   ordinary clicks accept primary or secondary input and also confirm a

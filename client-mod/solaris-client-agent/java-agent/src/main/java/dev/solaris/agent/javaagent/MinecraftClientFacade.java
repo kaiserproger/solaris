@@ -9,6 +9,7 @@ import net.minecraft.client.KeyMapping;
 import net.minecraft.client.Minecraft;
 import net.minecraft.client.Screenshot;
 import net.minecraft.client.gui.screens.ConnectScreen;
+import net.minecraft.client.gui.screens.inventory.InventoryScreen;
 import net.minecraft.client.multiplayer.ClientPacketListener;
 import net.minecraft.client.multiplayer.ServerData;
 import net.minecraft.client.multiplayer.TransferState;
@@ -18,6 +19,8 @@ import net.minecraft.core.BlockPos;
 import net.minecraft.core.registries.BuiltInRegistries;
 import net.minecraft.network.Connection;
 import net.minecraft.network.protocol.game.ServerboundMovePlayerPacket;
+import net.minecraft.world.InteractionHand;
+import net.minecraft.world.entity.LivingEntity;
 import net.minecraft.world.phys.Vec3;
 
 import java.lang.reflect.Method;
@@ -527,6 +530,38 @@ public final class MinecraftClientFacade implements ClientFacade {
     }
 
     @Override
+    public JsonObject attackEntityOnce(int entityId, UUID entityUuid, String entityType)
+        throws Exception {
+        return new MinecraftClientExecutor().callOnClientThread(() -> {
+            Minecraft minecraft = requireInPlay();
+            var entity = minecraft.level.getEntity(entityId);
+            if (entity == null) {
+                throw new IllegalStateException("entity is not client-visible: " + entityId);
+            }
+            String actualType = BuiltInRegistries.ENTITY_TYPE.getKey(entity.getType()).toString();
+            if (!entity.getUUID().equals(entityUuid) || !actualType.equals(entityType)) {
+                throw new IllegalStateException("entity identity changed before attack: " + entityId);
+            }
+            minecraft.player.lookAt(EntityAnchorArgument.Anchor.EYES, entity.getBoundingBox().getCenter());
+            float healthBefore = entity instanceof LivingEntity living ? living.getHealth() : -1.0F;
+            float attackStrengthBefore = minecraft.player.getAttackStrengthScale(0.0F);
+            minecraft.gameMode.attack(minecraft.player, entity);
+            minecraft.player.swing(InteractionHand.MAIN_HAND);
+
+            JsonObject result = new JsonObject();
+            result.addProperty("entity_id", entityId);
+            result.addProperty("entity_uuid", entityUuid.toString());
+            result.addProperty("entity_type", entityType);
+            result.addProperty("dispatched", true);
+            if (healthBefore >= 0.0F) {
+                result.addProperty("health_before", healthBefore);
+            }
+            result.addProperty("attack_strength_before", attackStrengthBefore);
+            return result;
+        });
+    }
+
+    @Override
     public JsonObject attackEntityUntilDropCollected(
         int entityId,
         String expectedDropItemId,
@@ -821,6 +856,12 @@ public final class MinecraftClientFacade implements ClientFacade {
     public void closeCurrentScreen() {
         Minecraft minecraft = requireInPlay();
         MinecraftScenarioClient.closeCurrentScreenOnClientThread(minecraft);
+    }
+
+    @Override
+    public void openInventory() {
+        Minecraft minecraft = requireInPlay();
+        minecraft.setScreen(new InventoryScreen(minecraft.player));
     }
 
     @Override

@@ -38,6 +38,7 @@ final class ClientMcpToolsTest {
             "minecraft_navigate_to_block",
             "minecraft_approach_entity",
             "minecraft_interact_entity",
+            "minecraft_attack_entity_once",
             "minecraft_attack_entity_until_drop_collected",
             "minecraft_look",
             "minecraft_look_at_block",
@@ -45,6 +46,7 @@ final class ClientMcpToolsTest {
             "minecraft_press_inputs",
             "minecraft_wait_ticks",
             "minecraft_close_screen",
+            "minecraft_open_inventory",
             "minecraft_respawn",
             "minecraft_quick_move_container_slot",
             "minecraft_click_container_slot",
@@ -64,6 +66,7 @@ final class ClientMcpToolsTest {
         assertTrue(find(tools, "minecraft_read_recipe_book").readOnly());
         assertFalse(find(tools, "minecraft_connect").readOnly());
         assertFalse(find(tools, "minecraft_press_inputs").readOnly());
+        assertFalse(find(tools, "minecraft_open_inventory").readOnly());
     }
 
     @Test
@@ -299,6 +302,7 @@ final class ClientMcpToolsTest {
         assertTrue(find(tools, "minecraft_navigate_to_block").destructive());
         assertTrue(find(tools, "minecraft_approach_entity").destructive());
         assertTrue(find(tools, "minecraft_interact_entity").destructive());
+        assertTrue(find(tools, "minecraft_attack_entity_once").destructive());
         assertTrue(find(tools, "minecraft_attack_entity_until_drop_collected").destructive());
         assertTrue(find(tools, "minecraft_drop_selected_item").destructive());
         assertTrue(find(tools, "minecraft_quick_move_container_slot").destructive());

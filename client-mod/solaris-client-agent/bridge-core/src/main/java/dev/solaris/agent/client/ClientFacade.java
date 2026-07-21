@@ -72,6 +72,8 @@ public interface ClientFacade {
 
     JsonObject interactEntity(int entityId, UUID entityUuid, String entityType, String hand) throws Exception;
 
+    JsonObject attackEntityOnce(int entityId, UUID entityUuid, String entityType) throws Exception;
+
     JsonObject attackEntityUntilDropCollected(
         int entityId,
         String expectedDropItemId,
@@ -96,6 +98,8 @@ public interface ClientFacade {
     void look(int yawDeg, int pitchDeg);
 
     void closeCurrentScreen() throws Exception;
+
+    void openInventory() throws Exception;
 
     void respawn(Duration timeout) throws Exception;
 

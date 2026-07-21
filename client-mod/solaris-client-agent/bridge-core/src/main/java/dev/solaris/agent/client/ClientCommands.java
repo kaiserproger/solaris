@@ -214,6 +214,14 @@ public final class ClientCommands {
                 entityInteractionHand(payload)
             );
         });
+        registry.register("attack_entity_once", request -> {
+            JsonObject payload = request.payload();
+            return client.attackEntityOnce(
+                boundedInt(payload, "entity_id", 0, Integer.MAX_VALUE),
+                boundedUuid(payload, "entity_uuid"),
+                boundedString(payload, "entity_type", 128)
+            );
+        });
         registry.register("attack_entity_until_drop_collected", request -> {
             JsonObject payload = request.payload();
             return client.attackEntityUntilDropCollected(
@@ -275,6 +283,10 @@ public final class ClientCommands {
         });
         registry.register("close_screen", request -> executor.callOnClientThread(() -> {
             client.closeCurrentScreen();
+            return ok();
+        }));
+        registry.register("open_inventory", request -> executor.callOnClientThread(() -> {
+            client.openInventory();
             return ok();
         }));
         registry.register("respawn", request -> {

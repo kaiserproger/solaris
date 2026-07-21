@@ -531,6 +531,7 @@ final class ClientCommandsTest {
         FakeClient client = new FakeClient();
         CommandRegistry registry = ClientCommands.create(executor, client);
         BridgeCommand approach = registry.find("approach_entity").orElseThrow();
+        BridgeCommand attackOnce = registry.find("attack_entity_once").orElseThrow();
         BridgeCommand attack = registry.find("attack_entity_until_drop_collected").orElseThrow();
 
         JsonObject approachResult = approach.execute(request(
@@ -540,6 +541,17 @@ final class ClientCommandsTest {
         assertTrue(approachResult.get("in_reach").getAsBoolean());
         assertEquals(42, client.approachedEntityId);
         assertEquals(Duration.ofSeconds(12), client.approachEntityTimeout);
+
+        UUID entityUuid = UUID.fromString("00000000-0000-0000-0000-000000000042");
+        JsonObject attackOnceResult = attackOnce.execute(request(
+            "attack_entity_once",
+            "{\"entity_id\":42,\"entity_uuid\":\"" + entityUuid
+                + "\",\"entity_type\":\"minecraft:zombie\"}"
+        ));
+        assertTrue(attackOnceResult.get("dispatched").getAsBoolean());
+        assertEquals(42, client.attackedOnceEntityId);
+        assertEquals(entityUuid, client.attackedOnceEntityUuid);
+        assertEquals("minecraft:zombie", client.attackedOnceEntityType);
 
         JsonObject attackResult = attack.execute(request(
             "attack_entity_until_drop_collected",
@@ -848,6 +860,19 @@ final class ClientCommandsTest {
     }
 
     @Test
+    void openInventoryRunsOnClientThread() throws Exception {
+        ImmediateExecutor executor = new ImmediateExecutor();
+        FakeClient client = new FakeClient();
+        CommandRegistry registry = ClientCommands.create(executor, client);
+
+        BridgeCommand openInventory = registry.find("open_inventory").orElseThrow();
+
+        assertEquals("ok", openInventory.execute(request("open_inventory", "{}")).get("status").getAsString());
+        assertEquals(1, client.openInventoryCalls);
+        assertEquals(1, executor.calls);
+    }
+
+    @Test
     void runScenarioReturnsStructuredScenarioReport() throws Exception {
         ImmediateExecutor executor = new ImmediateExecutor();
         FakeClient client = new FakeClient();
@@ -986,6 +1011,7 @@ final class ClientCommandsTest {
         int lookYawDeg;
         int lookPitchDeg;
         int closeScreenCalls;
+        int openInventoryCalls;
         List<Integer> readBlockPosition;
         List<Integer> scanArguments;
         double entityRadius;
@@ -1037,6 +1063,9 @@ final class ClientCommandsTest {
         Duration navigationTimeout;
         boolean navigationTimesOut;
         int attackedEntityId;
+        int attackedOnceEntityId;
+        UUID attackedOnceEntityUuid;
+        String attackedOnceEntityType;
         String expectedDropItemId;
         int expectedDropCount;
         Duration attackEntityTimeout;
@@ -1219,6 +1248,16 @@ final class ClientCommandsTest {
         }
 
         @Override
+        public JsonObject attackEntityOnce(int entityId, UUID entityUuid, String entityType) {
+            attackedOnceEntityId = entityId;
+            attackedOnceEntityUuid = entityUuid;
+            attackedOnceEntityType = entityType;
+            JsonObject result = new JsonObject();
+            result.addProperty("dispatched", true);
+            return result;
+        }
+
+        @Override
         public JsonObject interactEntity(int entityId, UUID entityUuid, String entityType, String hand) {
             interactedEntityId = entityId;
             interactedEntityUuid = entityUuid;
@@ -1369,6 +1408,11 @@ final class ClientCommandsTest {
         @Override
         public void closeCurrentScreen() {
             closeScreenCalls += 1;
+        }
+
+        @Override
+        public void openInventory() {
+            openInventoryCalls += 1;
         }
 
         @Override

@@ -185,6 +185,12 @@ public final class ClientMcpTools {
             entityInteractionSchema()
         ),
         mutating(
+            "minecraft_attack_entity_once",
+            "Dispatch one ordinary vanilla attack against a UUID- and type-fenced visible entity.",
+            "attack_entity_once",
+            entityIdentitySchema()
+        ),
+        mutating(
             "minecraft_attack_entity_until_drop_collected",
             "Attack one client-visible entity and collect its expected visible item drop.",
             "attack_entity_until_drop_collected",
@@ -230,6 +236,12 @@ public final class ClientMcpTools {
             "minecraft_close_screen",
             "Close the current client GUI screen or container.",
             "close_screen",
+            objectSchema(properties(), List.of())
+        ),
+        control(
+            "minecraft_open_inventory",
+            "Open the vanilla survival inventory and 2x2 crafting screen.",
+            "open_inventory",
             objectSchema(properties(), List.of())
         ),
         nonIdempotentControl(
@@ -513,6 +525,17 @@ public final class ClientMcpTools {
                 "entity_uuid", string(36),
                 "entity_type", string(128),
                 "hand", hand
+            ),
+            List.of("entity_id", "entity_uuid", "entity_type")
+        );
+    }
+
+    private static JsonObject entityIdentitySchema() {
+        return objectSchema(
+            properties(
+                "entity_id", integer(0, Integer.MAX_VALUE),
+                "entity_uuid", string(36),
+                "entity_type", string(128)
             ),
             List.of("entity_id", "entity_uuid", "entity_type")
         );
