@@ -2640,6 +2640,10 @@ impl SimulationOwner {
         let (_, pending) = sessions.advance_world_time_owned(&self.authority, ticks);
         self.release_retryable_herd_requests(pending.retryable_chunks());
         dispatch_visibility_commands(pending.into_dispatches());
+        dispatch_visibility_commands(
+            sessions
+                .item_pickup_ready_dispatches_owned(&self.authority, sessions.simulation_tick()),
+        );
         dispatch_visibility_commands(sessions.tick_sleep_owned(&self.authority));
         sessions.world_time()
     }

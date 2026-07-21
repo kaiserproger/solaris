@@ -79,6 +79,7 @@ targeted event does not need a broad subscription to reach its owner.
 | `player.block_broken` | `on_player_block_broken` | block player snapshot, `dimension`, `block_id`, `x`, `y`, `z`, `game_mode` |
 | `player.block_placed` | `on_player_block_placed` | block player snapshot, `dimension`, `block_id`, `x`, `y`, `z`, `game_mode` |
 | `player.item_crafted` | `on_player_item_crafted` | `name`, `player_id`, `context_verified`, `uuid`, `username`, `operator`, `x`, `y`, `z`, `dimension`, `item_id`, `count`, `craft_count`, `source`, `game_mode` |
+| `player.item_picked_up` | `on_player_item_picked_up` | `name`, `player_id`, `context_verified`, `uuid`, `username`, `operator`, `x`, `y`, `z`, `dimension`, `item_id`, `count`, `source`, `game_mode` |
 | `server.tick` | `on_server_tick` | `tick` |
 | `player.command` | `on_player_command` | player snapshot, `root`, `arguments` |
 | `plugin.storage.get_result` | `on_plugin_storage_get_result` | `request_id`, `key`, `value`, `version`, `failure` |
@@ -120,6 +121,21 @@ ingredients, full output inventory, no-op clicks, and rejected owner
 preconditions publish nothing. Window-0 may accept a lagging client `state_id`
 when the asserted cursor and current owner precondition still match; that is a
 real committed craft and does publish the event.
+
+`player.item_picked_up` is published only after the simulation owner has
+atomically claimed the entity and credited the player inventory. `count` is the
+exact credited amount, including a partial world-stack pickup. `source` is
+`item_entity` for a world item or `arrow` for a grounded arrow; `game_mode` is
+`survival`, `creative`, or `adventure`. XP orbs, crafting, container transfers,
+and plugin inventory transactions are separate operations and never publish
+this event. Full inventory, pickup delay, owner block, stale or concurrent
+claims, invalid selected slots, dead players, and spectators publish nothing.
+Item pickup readiness is indexed by its exact simulation tick and pushes a
+candidate notification to nearby sessions even after the item has stopped
+moving; it does not depend on a polling loop or guessed elapsed time. Hidden
+campfire outputs enter this index only after their world-journal acknowledgement
+and entity publication, so an aborted output commit cannot publish a pickup or
+duplicate the item.
 
 An aborted break, stale precondition, rejected mutation, repeated break of air,
 blocked placement, or empty-hand placement publishes nothing. Required

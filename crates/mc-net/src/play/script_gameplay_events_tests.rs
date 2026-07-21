@@ -3,7 +3,8 @@ use std::num::NonZeroUsize;
 use mc_data::items::{ItemRegistry, ItemReport};
 use mc_protocol::packets::play::GameMode;
 use mc_script::{
-    ScriptCraftingSource, ScriptEvent, ScriptEventKind, ScriptPlayerId, script_boundary_pair,
+    ScriptCraftingSource, ScriptEvent, ScriptEventKind, ScriptItemPickupSource, ScriptPlayerId,
+    script_boundary_pair,
 };
 use mc_world::{BlockPos, BlockRegistry};
 
@@ -36,6 +37,10 @@ fn items() -> ItemRegistry {
         ItemReport {
             id: mc_data::Identifier::parse("minecraft:oak_planks").unwrap(),
             protocol_id: 5,
+        },
+        ItemReport {
+            id: mc_data::Identifier::parse("minecraft:arrow").unwrap(),
+            protocol_id: 6,
         },
     ])
 }
@@ -286,5 +291,139 @@ async fn invalid_or_spectator_craft_publishes_nothing_before_fifo_fence() {
     assert!(matches!(
         endpoint.recv_event().await.unwrap().kind(),
         ScriptEventKind::ServerTick { tick: 77 }
+    ));
+}
+
+#[tokio::test]
+async fn committed_partial_item_pickup_waits_for_capacity_and_publishes_exact_credit() {
+    let one = NonZeroUsize::new(1).unwrap();
+    let (boundary, mut endpoint) = script_boundary_pair(one, one);
+    boundary
+        .try_enqueue_event(ScriptEvent::server_started())
+        .unwrap();
+    let publisher = publisher(ScriptEventSink::new(boundary));
+    let items = items();
+
+    let delivery = tokio::spawn(async move {
+        publisher
+            .publish_item_picked_up(
+                &items,
+                5,
+                2,
+                ScriptItemPickupSource::ItemEntity,
+                PlayerPose::new(7.5, 64.0, -3.5),
+                GameMode::Survival,
+            )
+            .await
+    });
+    assert!(matches!(
+        endpoint.recv_event().await.unwrap().kind(),
+        ScriptEventKind::ServerStarted
+    ));
+    assert!(delivery.await.unwrap());
+    assert!(matches!(
+        endpoint.recv_event().await.unwrap().kind(),
+        ScriptEventKind::PlayerItemPickedUp {
+            player_id,
+            context,
+            dimension,
+            item_id,
+            count: 2,
+            source: ScriptItemPickupSource::ItemEntity,
+            game_mode: mc_script::ScriptGameMode::Survival,
+        } if *player_id == ScriptPlayerId::new(9)
+            && (context.x(), context.y(), context.z()) == (7.5, 64.0, -3.5)
+            && dimension == "minecraft:overworld"
+            && item_id == "minecraft:oak_planks"
+    ));
+}
+
+#[tokio::test]
+async fn committed_arrow_pickup_publishes_arrow_source() {
+    let one = NonZeroUsize::new(1).unwrap();
+    let (boundary, mut endpoint) = script_boundary_pair(one, one);
+    let publisher = publisher(ScriptEventSink::new(boundary));
+
+    assert!(
+        publisher
+            .publish_item_picked_up(
+                &items(),
+                6,
+                1,
+                ScriptItemPickupSource::Arrow,
+                PlayerPose::new(0.5, 64.0, 0.5),
+                GameMode::Adventure,
+            )
+            .await
+    );
+    assert!(matches!(
+        endpoint.recv_event().await.unwrap().kind(),
+        ScriptEventKind::PlayerItemPickedUp {
+            count: 1,
+            source: ScriptItemPickupSource::Arrow,
+            game_mode: mc_script::ScriptGameMode::Adventure,
+            ..
+        }
+    ));
+}
+
+#[tokio::test]
+async fn closed_script_queue_does_not_claim_committed_pickup_delivery() {
+    let one = NonZeroUsize::new(1).unwrap();
+    let (boundary, _endpoint) = script_boundary_pair(one, one);
+    let publisher = publisher(ScriptEventSink::new(boundary.clone()));
+    boundary.close_event_admission();
+
+    assert!(
+        !publisher
+            .publish_item_picked_up(
+                &items(),
+                5,
+                1,
+                ScriptItemPickupSource::ItemEntity,
+                PlayerPose::new(0.5, 64.0, 0.5),
+                GameMode::Survival,
+            )
+            .await
+    );
+}
+
+#[tokio::test]
+async fn invalid_or_spectator_pickup_publishes_nothing_before_fifo_fence() {
+    let one = NonZeroUsize::new(1).unwrap();
+    let (boundary, mut endpoint) = script_boundary_pair(one, one);
+    let publisher = publisher(ScriptEventSink::new(boundary.clone()));
+    let items = items();
+
+    assert!(
+        !publisher
+            .publish_item_picked_up(
+                &items,
+                99,
+                1,
+                ScriptItemPickupSource::ItemEntity,
+                PlayerPose::new(0.5, 64.0, 0.5),
+                GameMode::Survival,
+            )
+            .await
+    );
+    assert!(
+        !publisher
+            .publish_item_picked_up(
+                &items,
+                5,
+                1,
+                ScriptItemPickupSource::ItemEntity,
+                PlayerPose::new(0.5, 64.0, 0.5),
+                GameMode::Spectator,
+            )
+            .await
+    );
+    boundary
+        .try_enqueue_event(ScriptEvent::server_tick(78))
+        .unwrap();
+    assert!(matches!(
+        endpoint.recv_event().await.unwrap().kind(),
+        ScriptEventKind::ServerTick { tick: 78 }
     ));
 }

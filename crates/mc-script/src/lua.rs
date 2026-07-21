@@ -1446,6 +1446,23 @@ fn event_table(lua: &Lua, event: &ScriptEvent) -> mlua::Result<Table> {
             table.set("source", source.as_str())?;
             table.set("game_mode", game_mode.as_str())?;
         }
+        ScriptEventKind::PlayerItemPickedUp {
+            player_id,
+            context,
+            dimension,
+            item_id,
+            count,
+            source,
+            game_mode,
+        } => {
+            table.set("player_id", player_id.value())?;
+            set_player_context(&table, context)?;
+            table.set("dimension", dimension.as_str())?;
+            table.set("item_id", item_id.as_str())?;
+            table.set("count", *count)?;
+            table.set("source", source.as_str())?;
+            table.set("game_mode", game_mode.as_str())?;
+        }
         ScriptEventKind::PlayerCommand {
             player_id,
             username,
@@ -1591,6 +1608,7 @@ fn handler_name(event: &ScriptEvent) -> &'static str {
         ScriptEventKind::PlayerBlockBroken { .. } => "on_player_block_broken",
         ScriptEventKind::PlayerBlockPlaced { .. } => "on_player_block_placed",
         ScriptEventKind::PlayerItemCrafted { .. } => "on_player_item_crafted",
+        ScriptEventKind::PlayerItemPickedUp { .. } => "on_player_item_picked_up",
         ScriptEventKind::PlayerCommand { .. } => "on_player_command",
         ScriptEventKind::ServerTick { .. } => "on_server_tick",
         ScriptEventKind::PluginStorageGetResult { .. } => "on_plugin_storage_get_result",

@@ -127,10 +127,12 @@ use passive_mobs::{sheep_breeding_color, sheep_recipe_mix};
 use pathing::*;
 #[cfg(test)]
 pub(in crate::play) use pickups::ITEM_PICKUP_DELAY_TICKS;
+#[cfg(test)]
+use pickups::item_pickup_ready_locked;
 pub(in crate::play) use pickups::{
     CreditedArrowPickup, CreditedExperiencePickup, CreditedItemPickup, ENTITY_PICKUP_RADIUS,
 };
-use pickups::{item_pickup_ready_locked, spawn_item_drop_locked, spawn_xp_orb_locked};
+use pickups::{spawn_item_drop_locked, spawn_xp_orb_locked};
 pub(super) use player_combat::PlayerEntityAttack;
 use player_pose_authority::filter_current_expected_entity_snapshots;
 use projectiles::resolve_arrow_entity_hits_locked;
@@ -302,6 +304,7 @@ struct SessionRegistryInner {
     arrow_tick_scratch: projectiles::ArrowTickScratch,
     spawned_entity_chunks: HashSet<(i32, i32)>,
     pending_hostile_spawns: BTreeMap<(i32, i32), Vec<HerdSpawn>>,
+    item_pickup_ready: BTreeMap<u64, Vec<EntityId>>,
     player_persistence: HashMap<SessionId, Arc<Mutex<PlayerPersistedState>>>,
     player_hurt_resistance: HashMap<SessionId, PlayerHurtResistance>,
     active_shields: HashMap<SessionId, ActiveShield>,

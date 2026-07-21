@@ -483,6 +483,16 @@ impl SessionRegistry {
             let type_id = entity.type_id;
             let entity_id = entity.id;
             let position = entity.position;
+            if entity.item_stack.is_some()
+                && let Some(ready_tick) = entity.retained.item_pickup_ready_tick
+                && ready_tick > lifecycle_clock
+            {
+                inner
+                    .item_pickup_ready
+                    .entry(ready_tick)
+                    .or_default()
+                    .push(entity_id);
+            }
             inner.entity_type_aabbs.entry(type_id).or_insert(aabb);
             track_entity_chunk_locked(&mut inner, entity_id, position);
             initialize_entity_wire_state_locked(&mut inner, entity_id);
@@ -868,7 +878,12 @@ impl SessionRegistry {
                 old_motion
                     .get(&step.id)
                     .is_some_and(|motion| motion.is_item)
-                    && item_pickup_ready_locked(&inner, step.id, lifecycle_tick)
+                    && inner.entities.snapshot(step.id).is_some_and(|entity| {
+                        entity
+                            .retained
+                            .item_pickup_ready_tick
+                            .is_none_or(|ready_tick| ready_tick < lifecycle_tick)
+                    })
             })
             .map(|step| step.id)
             .collect::<HashSet<_>>();

@@ -20,6 +20,9 @@ use tokio::sync::{Mutex, mpsc};
 #[cfg(feature = "lua-runtime")]
 mod lua;
 
+#[cfg(test)]
+mod item_pickup_tests;
+
 #[cfg(feature = "lua-runtime")]
 pub use lua::{LuaHost, LuaHostConfig, LuaHostError, start_lua_host};
 
@@ -1082,6 +1085,23 @@ impl ScriptCraftingSource {
     }
 }
 
+/// Closed pickup source snapshot exposed by item-picked-up events.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[non_exhaustive]
+pub enum ScriptItemPickupSource {
+    ItemEntity,
+    Arrow,
+}
+
+impl ScriptItemPickupSource {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::ItemEntity => "item_entity",
+            Self::Arrow => "arrow",
+        }
+    }
+}
+
 /// Closed game-mode snapshot exposed by gameplay events.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 #[non_exhaustive]
@@ -1277,6 +1297,35 @@ impl ScriptEvent {
                 item_id: validate_contract_resource_id(item_id.as_ref())?,
                 count,
                 craft_count,
+                source,
+                game_mode,
+            },
+        })
+    }
+
+    /// Build a reliable item-pickup event after the authoritative inventory commit.
+    #[allow(clippy::too_many_arguments)]
+    pub fn try_player_item_picked_up_with_context(
+        player_id: ScriptPlayerId,
+        context: ScriptPlayerContext,
+        dimension: impl AsRef<str>,
+        item_id: impl AsRef<str>,
+        count: u64,
+        source: ScriptItemPickupSource,
+        game_mode: ScriptGameMode,
+    ) -> Result<Self, ScriptDtoError> {
+        context.validate()?;
+        if count == 0 {
+            return Err(ScriptDtoError::InvalidAmount);
+        }
+        Ok(Self {
+            target_plugin_id: None,
+            kind: ScriptEventKind::PlayerItemPickedUp {
+                player_id,
+                context,
+                dimension: validate_contract_resource_id(dimension.as_ref())?,
+                item_id: validate_contract_resource_id(item_id.as_ref())?,
+                count,
                 source,
                 game_mode,
             },
@@ -1522,6 +1571,7 @@ impl ScriptEvent {
             ScriptEventKind::PlayerBlockBroken { .. } => "player.block_broken",
             ScriptEventKind::PlayerBlockPlaced { .. } => "player.block_placed",
             ScriptEventKind::PlayerItemCrafted { .. } => "player.item_crafted",
+            ScriptEventKind::PlayerItemPickedUp { .. } => "player.item_picked_up",
             ScriptEventKind::PlayerCommand { .. } => "player.command",
             ScriptEventKind::ServerTick { .. } => "server.tick",
             ScriptEventKind::PluginStorageGetResult { .. } => "plugin.storage.get_result",
@@ -1598,6 +1648,21 @@ impl ScriptEvent {
                 validate_contract_resource_id(dimension)?;
                 validate_contract_resource_id(item_id)?;
                 if *count == 0 || *craft_count == 0 {
+                    return Err(ScriptDtoError::InvalidAmount);
+                }
+                Ok(())
+            }
+            ScriptEventKind::PlayerItemPickedUp {
+                context,
+                dimension,
+                item_id,
+                count,
+                ..
+            } => {
+                context.validate()?;
+                validate_contract_resource_id(dimension)?;
+                validate_contract_resource_id(item_id)?;
+                if *count == 0 {
                     return Err(ScriptDtoError::InvalidAmount);
                 }
                 Ok(())
@@ -1772,6 +1837,15 @@ pub enum ScriptEventKind {
         count: u64,
         craft_count: u32,
         source: ScriptCraftingSource,
+        game_mode: ScriptGameMode,
+    },
+    PlayerItemPickedUp {
+        player_id: ScriptPlayerId,
+        context: ScriptPlayerContext,
+        dimension: String,
+        item_id: String,
+        count: u64,
+        source: ScriptItemPickupSource,
         game_mode: ScriptGameMode,
     },
     PlayerCommand {
@@ -4035,6 +4109,7 @@ fn is_supported_event_name(event_name: &str) -> bool {
             | "player.block_broken"
             | "player.block_placed"
             | "player.item_crafted"
+            | "player.item_picked_up"
             | "server.tick"
             | "plugin.storage.get_result"
             | "plugin.storage.cas_result"
@@ -4922,6 +4997,7 @@ mod tests {
             "player.block_broken",
             "player.block_placed",
             "player.item_crafted",
+            "player.item_picked_up",
             "plugin.storage.get_result",
             "plugin.storage.cas_result",
             "plugin.storage.delete_result",
@@ -4933,6 +5009,15 @@ mod tests {
         ] {
             assert!(is_supported_event_name(event_name), "missing {event_name}");
         }
+
+        let manifest = ScriptPluginManifest::new("pickup", "Pickup", "0.1.0", SCRIPT_API_VERSION)
+            .subscribe_event(" PLAYER.ITEM_PICKED_UP ")
+            .validate()
+            .unwrap();
+        assert_eq!(
+            manifest.event_subscriptions()[0].event_name(),
+            "player.item_picked_up"
+        );
     }
 
     #[test]

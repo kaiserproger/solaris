@@ -1,8 +1,8 @@
 use mc_data::items::ItemRegistry;
 use mc_protocol::packets::play::GameMode;
 use mc_script::{
-    ScriptCraftingSource, ScriptEvent, ScriptGameMode, ScriptPlayerContext, ScriptPlayerId,
-    ScriptQueueError,
+    ScriptCraftingSource, ScriptEvent, ScriptGameMode, ScriptItemPickupSource, ScriptPlayerContext,
+    ScriptPlayerId, ScriptQueueError,
 };
 use mc_world::{BlockPos, BlockRegistry, BlockStateId};
 use tracing::warn;
@@ -227,6 +227,68 @@ impl ScriptGameplayEventPublisher {
             }
             Err(error) => {
                 warn!(?error, "committed craft script event was rejected");
+                false
+            }
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(super) async fn publish_item_picked_up(
+        &self,
+        items: &ItemRegistry,
+        item_id: u32,
+        count: u64,
+        source: ScriptItemPickupSource,
+        pose: PlayerPose,
+        game_mode: GameMode,
+    ) -> bool {
+        let Some(item) = items.name_of(item_id) else {
+            warn!(item_id, "committed item pickup has no registry identity");
+            return false;
+        };
+        let game_mode = match game_mode {
+            GameMode::Survival => ScriptGameMode::Survival,
+            GameMode::Creative => ScriptGameMode::Creative,
+            GameMode::Adventure => ScriptGameMode::Adventure,
+            _ => {
+                warn!(
+                    ?game_mode,
+                    "committed item pickup has unsupported script game mode"
+                );
+                return false;
+            }
+        };
+        let context = ScriptPlayerContext::new(
+            &self.uuid,
+            &self.username,
+            self.permissions.op,
+            pose.x,
+            pose.y,
+            pose.z,
+        );
+        let event = match ScriptEvent::try_player_item_picked_up_with_context(
+            self.player_id,
+            context,
+            &self.dimension,
+            item.as_str(),
+            count,
+            source,
+            game_mode,
+        ) {
+            Ok(event) => event,
+            Err(error) => {
+                warn!(?error, "committed item pickup script event is invalid");
+                return false;
+            }
+        };
+        match self.sink.enqueue_required_event(event).await {
+            Ok(()) => true,
+            Err(ScriptQueueError::Closed) => {
+                warn!("script event queue closed after committed item pickup");
+                false
+            }
+            Err(error) => {
+                warn!(?error, "committed item pickup script event was rejected");
                 false
             }
         }

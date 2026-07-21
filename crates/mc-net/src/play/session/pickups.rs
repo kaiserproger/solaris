@@ -195,6 +195,60 @@ impl SessionRegistry {
         dispatches.extend(self.pickup_candidate_dispatches(session_ids));
     }
 
+    pub(in crate::play) fn item_pickup_ready_dispatches_owned(
+        &self,
+        _authority: &SimulationAuthority,
+        tick: u64,
+    ) -> Vec<VisibilityDispatch> {
+        let session_ids = {
+            let mut inner = self.lock_session_entities("publish item pickup readiness");
+            let due_ticks = inner
+                .item_pickup_ready
+                .range(..=tick)
+                .map(|(&ready_tick, _)| ready_tick)
+                .collect::<Vec<_>>();
+            let entity_ids = due_ticks
+                .into_iter()
+                .flat_map(|ready_tick| {
+                    inner
+                        .item_pickup_ready
+                        .remove(&ready_tick)
+                        .unwrap_or_default()
+                })
+                .collect::<Vec<_>>();
+            let positions = entity_ids
+                .into_iter()
+                .filter_map(|entity_id| inner.entities.snapshot(entity_id))
+                .filter(|entity| {
+                    entity.lifecycle == EntityLifecycle::Alive
+                        && entity.item_stack.is_some()
+                        && entity
+                            .retained
+                            .item_pickup_ready_tick
+                            .is_some_and(|ready_tick| ready_tick <= tick)
+                })
+                .map(|entity| entity.position)
+                .collect::<Vec<_>>();
+            if positions.is_empty() {
+                Vec::new()
+            } else {
+                let radius_sq = ENTITY_PICKUP_RADIUS * ENTITY_PICKUP_RADIUS;
+                inner
+                    .sessions
+                    .iter()
+                    .filter_map(|(&session_id, session)| {
+                        let player = Vec3::new(session.pose.x, session.pose.y, session.pose.z);
+                        positions
+                            .iter()
+                            .any(|position| distance_sq(*position, player) <= radius_sq)
+                            .then_some(session_id)
+                    })
+                    .collect::<Vec<_>>()
+            }
+        };
+        self.pickup_candidate_dispatches(session_ids)
+    }
+
     pub(in crate::play) fn spawn_item_drop_owned(
         &self,
         _authority: &SimulationAuthority,
@@ -223,13 +277,13 @@ impl SessionRegistry {
 
         let mut inner = self.lock_session_entities("spawn item drop batch");
         let lifecycle_tick = inner.entity_lifecycle_tick;
+        let ready_tick = lifecycle_tick.saturating_add(ITEM_PICKUP_DELAY_TICKS);
         let entities = drops.iter().map(|(entity_type_id, position, stack)| {
             let mut entity = SpawnEntity::new(*entity_type_id, "minecraft:item", *position);
             entity.velocity = item_drop_velocity(*position, stack, lifecycle_tick);
             entity.item_stack = Some(stack.clone());
             entity.retained.spawn_tick = lifecycle_tick;
-            entity.retained.item_pickup_ready_tick =
-                Some(lifecycle_tick.saturating_add(ITEM_PICKUP_DELAY_TICKS));
+            entity.retained.item_pickup_ready_tick = Some(ready_tick);
             entity
         });
         let ids = inner.entities.try_spawn_batch(entities)?;
@@ -241,6 +295,11 @@ impl SessionRegistry {
 
         let mut dispatches = Vec::new();
         for (id, (entity_type_id, position, _)) in ids.into_iter().zip(drops) {
+            inner
+                .item_pickup_ready
+                .entry(ready_tick)
+                .or_default()
+                .push(id);
             inner
                 .entity_type_aabbs
                 .entry(entity_type_id)
@@ -269,14 +328,14 @@ impl SessionRegistry {
         );
         let mut inner = self.lock_session_entities("materialize pending campfire outputs");
         let lifecycle_tick = inner.entity_lifecycle_tick;
+        let ready_tick = lifecycle_tick.saturating_add(ITEM_PICKUP_DELAY_TICKS);
         let candidates = outputs.iter().map(|output| {
             let mut entity = SpawnEntity::new(entity_type_id, "minecraft:item", drop_position);
             entity.uuid = Some(output.uuid);
             entity.velocity = item_drop_velocity(drop_position, &output.stack, lifecycle_tick);
             entity.item_stack = Some(output.stack.clone());
             entity.retained.spawn_tick = lifecycle_tick;
-            entity.retained.item_pickup_ready_tick =
-                Some(lifecycle_tick.saturating_add(ITEM_PICKUP_DELAY_TICKS));
+            entity.retained.item_pickup_ready_tick = Some(ready_tick);
             entity
         });
         inner.entities.spawn_unique_batch(candidates);
@@ -310,12 +369,30 @@ impl SessionRegistry {
     ) -> Vec<VisibilityDispatch> {
         let mut inner = self.lock_session_entities("publish materialized campfire outputs");
         let mut dispatches = Vec::new();
+        let mut ready_sessions = Vec::new();
+        let lifecycle_tick = inner.entity_lifecycle_tick;
         for snapshot in snapshots {
-            dispatches.extend(spawn_entity_visibility_from_snapshot_locked(
+            let published = spawn_entity_visibility_from_snapshot_locked(
                 &mut inner,
                 server_entity_snapshot_from(snapshot.clone()),
-            ));
+            );
+            if snapshot
+                .retained
+                .item_pickup_ready_tick
+                .is_some_and(|ready_tick| ready_tick <= lifecycle_tick)
+            {
+                ready_sessions.extend(published.iter().map(|dispatch| dispatch.recipient.id));
+            } else if let Some(ready_tick) = snapshot.retained.item_pickup_ready_tick {
+                inner
+                    .item_pickup_ready
+                    .entry(ready_tick)
+                    .or_default()
+                    .push(snapshot.id);
+            }
+            dispatches.extend(published);
         }
+        drop(inner);
+        dispatches.extend(self.pickup_candidate_dispatches(ready_sessions));
         dispatches
     }
 
@@ -767,16 +844,20 @@ fn spawn_item_drop_entity_locked_inner(
     entity.velocity = item_drop_velocity(position, &stack, inner.entity_lifecycle_tick);
     entity.item_stack = Some(stack);
     entity.retained.spawn_tick = inner.entity_lifecycle_tick;
-    entity.retained.item_pickup_ready_tick = Some(
-        inner
-            .entity_lifecycle_tick
-            .saturating_add(ITEM_PICKUP_DELAY_TICKS),
-    );
+    let ready_tick = inner
+        .entity_lifecycle_tick
+        .saturating_add(ITEM_PICKUP_DELAY_TICKS);
+    entity.retained.item_pickup_ready_tick = Some(ready_tick);
     let id = if journal_commit {
         inner.entities.spawn(entity)
     } else {
         inner.entities.spawn_deferred_journal(entity)
     };
+    inner
+        .item_pickup_ready
+        .entry(ready_tick)
+        .or_default()
+        .push(id);
     inner
         .entity_type_aabbs
         .entry(entity_type_id)

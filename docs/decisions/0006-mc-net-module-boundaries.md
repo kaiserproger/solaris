@@ -125,12 +125,16 @@ Other accepted concrete boundaries in this staged migration are:
   ordering.
 - `play::session::pickups` owns item, arrow, and experience pickup claims,
   inventory/XP credit, pickup candidate planning, item/XP materialization, and
-  pickup-specific dispatch construction. `SessionRegistryInner` keeps the
-  authoritative maps and lock acquisition in `session.rs`; generic entity
-  cleanup and selected-item authority also remain there. The pickup module
-  currently imports the concrete outbound DTO because publication extraction
-  is staged; it does not acquire a new lock or send while authority locks are
-  held.
+  pickup-specific dispatch construction. It also owns the exact-tick readiness
+  index that pushes item candidates when a stationary item becomes collectible;
+  this avoids both a full entity scan and movement-dependent polling. Deferred
+  entities such as campfire outputs are indexed only when their durable owner
+  commit has succeeded and the entity is published.
+  `SessionRegistryInner` keeps the authoritative maps and lock acquisition in
+  `session.rs`; generic entity cleanup and selected-item authority also remain
+  there. The pickup module currently imports the concrete outbound DTO because
+  publication extraction is staged; it releases authority locks before the
+  indexed readiness dispatch is sent.
 - `play::containers::crafting` owns crafting-table window state, slot maps,
   shaped/shapeless/repair result rules, inventory projections, and wire-item
   construction. Click application, active-container ownership, packet I/O, and
@@ -388,8 +392,10 @@ Other accepted concrete boundaries in this staged migration are:
   inventory and 3x3 crafting-table container rules, while `play::recipes`
   returns the aggregate result of recipe-book crafting. Those paths alone
   decide whether the block transition or inventory candidate succeeded. They
-  pass the prior destroyed state, actual applied placement root state, or
-  committed crafted-item fact to the publisher only after owner commit. The
+  pass the prior destroyed state, actual applied placement root state,
+  committed crafted-item fact, or exact credited pickup to the publisher only
+  after owner commit. Pickup facts distinguish world items from grounded
+  arrows and report only the amount merged into the player inventory. The
   publisher snapshots player identity and pose, resolves registry identities,
   maps the closed source and game-mode sets, and awaits required bounded event
   admission. It owns no player, session, world, inventory, recipe, or block

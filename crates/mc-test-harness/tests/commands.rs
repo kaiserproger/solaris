@@ -350,7 +350,7 @@ async fn lua_gameplay_events_follow_authoritative_commits() {
             name = "Block Jobs"
             version = "0.1.0"
             api = "0.6.0"
-            events = ["player.block_broken", "player.block_placed", "player.item_crafted"]
+            events = ["player.block_broken", "player.block_placed", "player.item_crafted", "player.item_picked_up"]
             player_commands = ["block-fence"]
         "#,
     )
@@ -390,6 +390,18 @@ async fn lua_gameplay_events_follow_authoritative_commits() {
                     "item-crafted:" .. event.item_id
                         .. ":" .. event.count
                         .. ":" .. event.craft_count
+                        .. ":" .. event.source
+                        .. ":" .. event.game_mode
+                        .. ":" .. event.dimension
+                        .. ":" .. event.username
+                )
+            end
+
+            function on_player_item_picked_up(event)
+                solaris.send_message(
+                    event.player_id,
+                    "item-picked-up:" .. event.item_id
+                        .. ":" .. event.count
                         .. ":" .. event.source
                         .. ":" .. event.game_mode
                         .. ":" .. event.dimension
@@ -849,9 +861,12 @@ async fn lua_gameplay_events_follow_authoritative_commits() {
         "block-broken:minecraft:grass_block:minecraft:overworld:1:{}:0:survival:BreakEvents",
         survival_target.1
     );
+    let expected_pickup_message =
+        "item-picked-up:minecraft:dirt:1:item_entity:survival:minecraft:overworld:BreakEvents";
     let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
     let mut saw_survival_update = false;
     let mut saw_survival_event = false;
+    let mut saw_pickup_event = false;
     while !(saw_survival_update && saw_survival_event) {
         let mut frame = client
             .read_frame_with_timeout(
@@ -867,8 +882,29 @@ async fn lua_gameplay_events_follow_authoritative_commits() {
             }
         } else if frame.id == ClientboundSystemChat::ID {
             let chat = ClientboundSystemChat::decode(&mut frame.body).expect("decode SystemChat");
-            if text_component_text(&chat) == expected_survival_message {
+            let message = text_component_text(&chat);
+            if message == expected_survival_message {
                 saw_survival_event = true;
+            } else if message == expected_pickup_message {
+                saw_pickup_event = true;
+            }
+        }
+    }
+
+    if !saw_pickup_event {
+        client
+            .write_packet(&ServerboundMovePlayerPos {
+                x: f64::from(survival_target.0) + 0.5,
+                y: f64::from(survival_target.1) + 1.0,
+                z: f64::from(survival_target.2) + 0.5,
+                flags: MovePlayerFlags::new(true, false),
+            })
+            .await
+            .expect("walk onto the committed survival drop");
+        loop {
+            let message = next_lua_transaction_system_chat_text(&mut client).await;
+            if message == expected_pickup_message {
+                break;
             }
         }
     }
@@ -893,6 +929,10 @@ async fn lua_gameplay_events_follow_authoritative_commits() {
         assert!(
             !message.starts_with("block-broken:"),
             "repeated survival break published another event: {message}"
+        );
+        assert!(
+            !message.starts_with("item-picked-up:"),
+            "repeated survival break published another pickup event: {message}"
         );
         if message == "block-fence:survival-repeat" {
             break;

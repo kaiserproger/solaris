@@ -70,7 +70,9 @@ use mc_protocol::packets::play::{
     SynchronizePlayerPosition, pack_section_pos, pack_section_relative_pos, unpack_block_pos,
 };
 use mc_protocol::packets::{CustomPayload, Packet};
-use mc_script::{ScriptCraftingSource, ScriptEvent, ScriptPlayerContext, ScriptPlayerId};
+use mc_script::{
+    ScriptCraftingSource, ScriptEvent, ScriptItemPickupSource, ScriptPlayerContext, ScriptPlayerId,
+};
 #[cfg(test)]
 use mc_world::FurnaceSlot;
 use mc_world::light::{ChunkLight, LightCache, LightWorkspace};
@@ -5641,12 +5643,31 @@ async fn pickup_candidate_entities<W>(
     writer: &mut W,
     xp_state: &mut XpState,
     candidates: Vec<ServerEntitySnapshot>,
+    script_events: Option<&ScriptGameplayEventPublisher>,
+    player_pose: PlayerPose,
+    game_mode: GameMode,
 ) -> Result<(), ConnectionError>
 where
     W: AsyncWriteExt + Unpin,
 {
-    pickup_item_candidates(state, writer, &candidates).await?;
-    pickup_arrow_candidates(state, writer, &candidates).await?;
+    pickup_item_candidates(
+        state,
+        writer,
+        &candidates,
+        script_events,
+        player_pose,
+        game_mode,
+    )
+    .await?;
+    pickup_arrow_candidates(
+        state,
+        writer,
+        &candidates,
+        script_events,
+        player_pose,
+        game_mode,
+    )
+    .await?;
     pickup_experience_candidates(state, writer, xp_state, &candidates).await
 }
 
@@ -5654,6 +5675,9 @@ async fn pickup_item_candidates<W>(
     state: &mut InteractionState,
     writer: &mut W,
     candidates: &[ServerEntitySnapshot],
+    script_events: Option<&ScriptGameplayEventPublisher>,
+    player_pose: PlayerPose,
+    game_mode: GameMode,
 ) -> Result<(), ConnectionError>
 where
     W: AsyncWriteExt + Unpin,
@@ -5698,6 +5722,27 @@ where
             count = credited.credited.count,
             "simulation credited item pickup"
         );
+        if let Some(script_events) = script_events {
+            match u64::try_from(credited.credited.count) {
+                Ok(count) if count > 0 => {
+                    script_events
+                        .publish_item_picked_up(
+                            &state.items,
+                            credited.credited.item_id,
+                            count,
+                            ScriptItemPickupSource::ItemEntity,
+                            player_pose,
+                            game_mode,
+                        )
+                        .await;
+                }
+                _ => warn!(
+                    entity_id = entity.id.0,
+                    count = credited.credited.count,
+                    "committed item pickup has invalid credited count"
+                ),
+            }
+        }
         state.inventory = credited.inventory;
         write_inventory_slot_updates(state, writer, credited.changed_slots).await?;
     }
@@ -5708,6 +5753,9 @@ async fn pickup_arrow_candidates<W>(
     state: &mut InteractionState,
     writer: &mut W,
     candidates: &[ServerEntitySnapshot],
+    script_events: Option<&ScriptGameplayEventPublisher>,
+    player_pose: PlayerPose,
+    game_mode: GameMode,
 ) -> Result<(), ConnectionError>
 where
     W: AsyncWriteExt + Unpin,
@@ -5742,6 +5790,18 @@ where
             entity_id = entity.id.0,
             item_id, "simulation credited arrow pickup"
         );
+        if let Some(script_events) = script_events {
+            script_events
+                .publish_item_picked_up(
+                    &state.items,
+                    item_id,
+                    1,
+                    ScriptItemPickupSource::Arrow,
+                    player_pose,
+                    game_mode,
+                )
+                .await;
+        }
         state.inventory = credited.inventory;
         write_inventory_slot_updates(state, writer, credited.changed_slots).await?;
     }
@@ -5806,7 +5866,15 @@ where
     let candidates = state
         .sessions
         .nearby_item_entities(position, ENTITY_PICKUP_RADIUS);
-    pickup_item_candidates(state, writer, &candidates).await
+    pickup_item_candidates(
+        state,
+        writer,
+        &candidates,
+        None,
+        player_pose,
+        GameMode::Survival,
+    )
+    .await
 }
 
 #[cfg(test)]
@@ -5822,7 +5890,15 @@ where
     let candidates = state
         .sessions
         .nearby_grounded_arrows(position, ENTITY_PICKUP_RADIUS);
-    pickup_arrow_candidates(state, writer, &candidates).await
+    pickup_arrow_candidates(
+        state,
+        writer,
+        &candidates,
+        None,
+        player_pose,
+        GameMode::Survival,
+    )
+    .await
 }
 
 #[cfg(test)]
@@ -11787,6 +11863,9 @@ where
                                 writer,
                                 &mut xp_state,
                                 candidates,
+                                script_gameplay_events.as_ref(),
+                                player_pose,
+                                game_mode,
                             )
                             .await?;
                         }
