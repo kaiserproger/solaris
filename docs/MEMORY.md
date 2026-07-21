@@ -9,10 +9,19 @@ and is not startup context.
 
 - Date: 2026-07-21.
 - Branch: `dev/M100-client-agent`.
-- Latest checkpoint: `d9c0804` (`feat(gameplay): match vanilla furnace fuels`).
+- Latest checkpoint: `0969620` (`feat(plugins): publish zone exit events`).
   Delivery-order checkpoint `5e2908a` remains binding.
 - The worktree may contain unrelated owner files and local artifacts. Inspect
   exact ownership before editing; never clean or stage them by accident.
+- `0969620` completes owner-targeted Lua zone membership events. Accepted
+  absolute movement now publishes deterministic exits before entries with the
+  authoritative new pose. Stale, rejected, no-op, disconnect, and zone-removal
+  paths publish nothing. The production TCP/Lua gate proves movement rejection,
+  entry, exit, re-entry, no duplicate outside transition, and no cross-plugin
+  leak using exact pushed chat fences. Full workspace tests, strict workspace
+  Clippy, fmt, code-health `0 fail / KEEP`, and diff-check pass. A `sol high`
+  review found no blocker after the rejected-movement fence was added. No
+  manual-client or vanilla-oracle gate was run for this plugin-only slice.
 - `d9c0804` derives the default 26.1.2 furnace contract from the complete
   resolved item-tag graph and carries a pinned 280-item fallback for embedded
   startup. Startup rejects a partial or drifted sidecar. Furnace, smoker,

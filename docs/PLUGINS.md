@@ -6,7 +6,8 @@ path.
 
 `mc-net` provides the `0.6.0` plugin-storage, zone, inventory-menu,
 inventory/storage transaction, colony-record, villager-binding, and bounded
-villager-order adapters. It also publishes committed player block breaks.
+villager-order adapters. It also publishes committed player block breaks and
+owner-targeted zone membership transitions.
 
 ## Package And Manifest
 
@@ -24,7 +25,7 @@ id = "currency-catalog"
 name = "Currency Catalog"
 version = "0.1.0"
 api = "0.6.0"
-events = ["server.started", "player.zone_entered", "inventory.menu.clicked"]
+events = ["server.started", "player.zone_entered", "player.zone_exited", "inventory.menu.clicked"]
 capabilities = ["storage", "inventory_menus", "inventory_storage_transactions", "zones"]
 player_commands = ["catalog"]
 operator_commands = ["catalogadmin"]
@@ -56,7 +57,7 @@ capabilities, 64 permissions, and 128 player or operator command roots.
 | `storage` | `storage_get`, `storage_cas`, `storage_delete` |
 | `inventory_menus` | `open_inventory_menu`, `close_inventory_menu` |
 | `inventory_storage_transactions` | `inventory_storage_transaction` |
-| `zones` | `upsert_zone`, `remove_zone`, owned zone-entry events |
+| `zones` | `upsert_zone`, `remove_zone`, owned zone entry/exit events |
 | `colonies` | `upsert_colony`, `bind_nearest_villager`, `set_villager_order` |
 
 An undeclared privileged call fails synchronously in Lua before it enters the
@@ -91,6 +92,7 @@ targeted event does not need a broad subscription to reach its owner.
 | `inventory.menu.clicked` | `on_inventory_menu_clicked` | player snapshot, `menu_id`, `slot`, `click` |
 | `inventory.storage_transaction.result` | `on_inventory_storage_transaction_result` | `request_id`, `committed` |
 | `player.zone_entered` | `on_player_zone_entered` | player snapshot, `zone_id` |
+| `player.zone_exited` | `on_player_zone_exited` | player snapshot, `zone_id` |
 | `colony.record_result` | `on_colony_record_result` | `request_id`, `colony_id`, `accepted` |
 | `colony.villager_binding_result` | `on_colony_villager_binding_result` | `request_id`, `colony_id`, `binding_token`, `binding_expires_at_tick` |
 | `colony.villager_order_result` | `on_colony_villager_order_result` | `request_id`, `colony_id`, `order`, `accepted` |
@@ -325,11 +327,15 @@ solaris.remove_zone("catalog-square")
 
 All six coordinates must be finite, within the existing script coordinate
 limits, and ordered minimum-to-maximum on every axis. The zone adapter owns
-membership tracking and publishes `player.zone_entered` only to the plugin that
-owns the zone. It observes the initial player pose and every accepted absolute
-movement; rejected movement cannot create an entry. Disconnect removes the
-player immediately. Changing a zone keeps an existing membership when the
-player remains inside, so an edit cannot repeat entry side effects.
+membership tracking and publishes `player.zone_entered` and
+`player.zone_exited` only to the plugin that owns the zone. It observes the
+initial player pose and every accepted absolute movement. Each event carries
+the authoritative pose after that movement. A mixed transition publishes all
+exits before entries, with each group ordered by plugin id and zone id.
+Rejected, stale, and membership-preserving movement publishes nothing. Zone
+removal and disconnect are silent cleanup, not player movement events. Changing
+a zone keeps an existing membership when the player remains inside, so an edit
+cannot repeat entry side effects.
 
 The process admits at most 4,096 zones, 256 zones per plugin, 16,384 tracked
 players, and 262,144 memberships. A request beyond a bound is rejected without

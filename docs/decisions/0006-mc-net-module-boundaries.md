@@ -458,13 +458,16 @@ Other accepted concrete boundaries in this staged migration are:
   dispatch; direct, all-session and missing-recipient behavior has focused
   coverage.
 - `script::zone` owns the bounded plugin-zone registry, per-player membership
-  snapshots, monotonic observation fencing and targeted entry-event creation.
+  snapshots, monotonic observation fencing and targeted entry/exit event
+  creation.
   One adapter is created at server bind and shared with the admitted script
   command router and play connections. The router alone mutates zone
   definitions; an accepted absolute player movement pushes a pose observation;
   session cleanup forgets the player. The registry mutex is released before
   targeted event delivery awaits queue admission. Lua never receives session,
-  entity or registry handles, and rejected movement cannot publish zone entry.
+  entity or registry handles. Accepted mixed transitions publish deterministic
+  exits before entries; rejected movement and cleanup cannot publish membership
+  events.
 - `script::colony` owns the bounded, owner-scoped in-memory colony registry and
   correlated colony, binding, and villager-order result publication. Registry
   keys include the host-attached plugin identity, replacements remain possible
