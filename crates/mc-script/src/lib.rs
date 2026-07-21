@@ -1611,6 +1611,23 @@ impl ScriptEvent {
         })
     }
 
+    /// Build a targeted zone-exit snapshot owned by the plugin that registered the zone.
+    pub(crate) fn player_zone_exited(
+        target_plugin_id: impl AsRef<str>,
+        player_id: ScriptPlayerId,
+        context: ScriptPlayerContext,
+        zone: &ScriptAxisAlignedZone,
+    ) -> Result<Self, ScriptDtoError> {
+        Ok(Self {
+            target_plugin_id: Some(validate_target_plugin_id(target_plugin_id.as_ref())?),
+            kind: ScriptEventKind::PlayerZoneExited {
+                player_id,
+                context,
+                zone_id: zone.id().to_owned(),
+            },
+        })
+    }
+
     /// Build a targeted server-owned colony record completion event.
     pub(crate) fn colony_record_result(
         target_plugin_id: impl AsRef<str>,
@@ -1695,6 +1712,7 @@ impl ScriptEvent {
                 "inventory.storage_transaction.result"
             }
             ScriptEventKind::PlayerZoneEntered { .. } => "player.zone_entered",
+            ScriptEventKind::PlayerZoneExited { .. } => "player.zone_exited",
             ScriptEventKind::ColonyRecordResult { .. } => "colony.record_result",
             ScriptEventKind::ColonyVillagerBindingResult { .. } => "colony.villager_binding_result",
             ScriptEventKind::ColonyVillagerOrderResult { .. } => "colony.villager_order_result",
@@ -1897,6 +1915,9 @@ impl ScriptEvent {
             }
             ScriptEventKind::PlayerZoneEntered {
                 context, zone_id, ..
+            }
+            | ScriptEventKind::PlayerZoneExited {
+                context, zone_id, ..
             } => {
                 context.validate()?;
                 validate_script_id(zone_id).map(drop)
@@ -2052,6 +2073,11 @@ pub enum ScriptEventKind {
         committed: bool,
     },
     PlayerZoneEntered {
+        player_id: ScriptPlayerId,
+        context: ScriptPlayerContext,
+        zone_id: String,
+    },
+    PlayerZoneExited {
         player_id: ScriptPlayerId,
         context: ScriptPlayerContext,
         zone_id: String,
@@ -2476,6 +2502,15 @@ impl ScriptPluginTarget {
         zone: &ScriptAxisAlignedZone,
     ) -> Result<ScriptEvent, ScriptDtoError> {
         ScriptEvent::player_zone_entered(&self.plugin_id, player_id, context, zone)
+    }
+
+    pub fn player_zone_exited(
+        &self,
+        player_id: ScriptPlayerId,
+        context: ScriptPlayerContext,
+        zone: &ScriptAxisAlignedZone,
+    ) -> Result<ScriptEvent, ScriptDtoError> {
+        ScriptEvent::player_zone_exited(&self.plugin_id, player_id, context, zone)
     }
 }
 
@@ -4281,6 +4316,7 @@ fn is_supported_event_name(event_name: &str) -> bool {
             | "inventory.menu.clicked"
             | "inventory.storage_transaction.result"
             | "player.zone_entered"
+            | "player.zone_exited"
             | "colony.record_result"
             | "colony.villager_binding_result"
             | "colony.villager_order_result"
@@ -5170,6 +5206,7 @@ mod tests {
             "inventory.menu.clicked",
             "inventory.storage_transaction.result",
             "player.zone_entered",
+            "player.zone_exited",
             "colony.record_result",
             "colony.villager_binding_result",
         ] {

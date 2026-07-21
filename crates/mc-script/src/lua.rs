@@ -1587,6 +1587,11 @@ fn event_table(lua: &Lua, event: &ScriptEvent) -> mlua::Result<Table> {
             player_id,
             context,
             zone_id,
+        }
+        | ScriptEventKind::PlayerZoneExited {
+            player_id,
+            context,
+            zone_id,
         } => {
             table.set("player_id", player_id.value())?;
             table.set("zone_id", zone_id.as_str())?;
@@ -1669,6 +1674,7 @@ fn handler_name(event: &ScriptEvent) -> &'static str {
             "on_inventory_storage_transaction_result"
         }
         ScriptEventKind::PlayerZoneEntered { .. } => "on_player_zone_entered",
+        ScriptEventKind::PlayerZoneExited { .. } => "on_player_zone_exited",
         ScriptEventKind::ColonyRecordResult { .. } => "on_colony_record_result",
         ScriptEventKind::ColonyVillagerBindingResult { .. } => "on_colony_villager_binding_result",
         ScriptEventKind::ColonyVillagerOrderResult { .. } => "on_colony_villager_order_result",

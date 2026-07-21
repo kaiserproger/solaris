@@ -225,19 +225,33 @@ impl ZoneRegistry {
             .filter(|key| previous_zones.is_none_or(|zones| !zones.contains(*key)))
             .cloned()
             .collect::<Vec<_>>();
-        let exited = previous_zones.map_or(0, |zones| zones.difference(&next_zones).count());
-        let events = entered
-            .iter()
-            .map(|key| {
-                let registered = self
-                    .zones
-                    .get(key)
-                    .expect("observed zone must remain registered under registry lock");
-                registered
-                    .owner
-                    .player_zone_entered(player_id, context.clone(), &registered.zone)
-                    .map_err(ZoneAdapterError::InvalidEvent)
-            })
+        let exited = previous_zones
+            .into_iter()
+            .flat_map(|zones| zones.difference(&next_zones))
+            .cloned()
+            .collect::<Vec<_>>();
+        let exited_events = exited.iter().map(|key| {
+            let registered = self
+                .zones
+                .get(key)
+                .expect("observed zone must remain registered under registry lock");
+            registered
+                .owner
+                .player_zone_exited(player_id, context.clone(), &registered.zone)
+                .map_err(ZoneAdapterError::InvalidEvent)
+        });
+        let entered_events = entered.iter().map(|key| {
+            let registered = self
+                .zones
+                .get(key)
+                .expect("observed zone must remain registered under registry lock");
+            registered
+                .owner
+                .player_zone_entered(player_id, context.clone(), &registered.zone)
+                .map_err(ZoneAdapterError::InvalidEvent)
+        });
+        let events = exited_events
+            .chain(entered_events)
             .collect::<Result<Vec<_>, _>>()?;
 
         self.membership_count = next_membership_count;
@@ -248,12 +262,12 @@ impl ZoneRegistry {
                 zones: next_zones,
             },
         );
-        let outcome = if entered.is_empty() && exited == 0 {
+        let outcome = if entered.is_empty() && exited.is_empty() {
             ZoneObservationOutcome::NoOp
         } else {
             ZoneObservationOutcome::Changed {
                 entered: entered.len(),
-                exited,
+                exited: exited.len(),
             }
         };
         Ok((outcome, events))

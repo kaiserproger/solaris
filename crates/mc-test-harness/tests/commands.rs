@@ -1339,7 +1339,7 @@ async fn lua_gameplay_events_follow_authoritative_commits() {
 }
 
 #[tokio::test]
-async fn lua_zone_entry_reaches_the_owning_plugin_from_normal_player_movement() {
+async fn lua_zone_membership_events_reach_only_the_owner_from_normal_player_movement() {
     let plugins = tempfile::tempdir().expect("plugin tempdir");
     let plugin = plugins.path().join("spawn-zone");
     std::fs::create_dir(&plugin).expect("create plugin directory");
@@ -1350,7 +1350,7 @@ async fn lua_zone_entry_reaches_the_owning_plugin_from_normal_player_movement() 
             name = "Spawn Zone"
             version = "0.1.0"
             api = "0.6.0"
-            events = ["player.joined", "player.zone_entered"]
+            events = ["player.joined", "player.zone_entered", "player.zone_exited"]
             capabilities = ["zones"]
         "#,
     )
@@ -1366,12 +1366,46 @@ async fn lua_zone_entry_reaches_the_owning_plugin_from_normal_player_movement() 
             function on_player_zone_entered(event)
                 solaris.send_message(event.player_id, "entered:" .. event.zone_id .. ":" .. event.username)
             end
+
+            function on_player_zone_exited(event)
+                if event.x ~= 5 or event.y ~= -59 or event.z ~= 1 then
+                    solaris.send_message(event.player_id, "bad-exit-context")
+                    return
+                end
+                solaris.send_message(event.player_id, "exited:" .. event.zone_id .. ":" .. event.username)
+            end
         "#,
     )
     .expect("write plugin source");
+    let observer = plugins.path().join("zone-observer");
+    std::fs::create_dir(&observer).expect("create observer plugin directory");
+    std::fs::write(
+        observer.join("plugin.toml"),
+        r#"
+            id = "zone-observer"
+            name = "Zone Observer"
+            version = "0.1.0"
+            api = "0.6.0"
+            events = ["player.zone_entered", "player.zone_exited"]
+        "#,
+    )
+    .expect("write observer manifest");
+    std::fs::write(
+        observer.join("main.lua"),
+        r#"
+            function on_player_zone_entered(event)
+                solaris.send_message(event.player_id, "leaked-entry")
+            end
+
+            function on_player_zone_exited(event)
+                solaris.send_message(event.player_id, "leaked-exit")
+            end
+        "#,
+    )
+    .expect("write observer source");
     let (boundary, host) = mc_script::start_lua_host(mc_script::LuaHostConfig::new(plugins.path()))
         .expect("start Lua host");
-    assert_eq!(host.loaded_plugins(), 1);
+    assert_eq!(host.loaded_plugins(), 2);
 
     let shutdown = mc_net::ShutdownHandle::default();
     let cfg = mc_net::ServerConfig {
@@ -1408,13 +1442,22 @@ async fn lua_zone_entry_reaches_the_owning_plugin_from_normal_player_movement() 
     let _ = client.read_play_login().await.expect("play entry");
     let _: ClientboundCommands = client.read_typed().await.expect("Commands");
     let sync: SynchronizePlayerPosition = client.read_typed().await.expect("SyncPlayerPos");
+    assert_eq!(next_system_chat_text(&mut client).await, "zone-ready");
+    client
+        .write_packet(&ServerboundMovePlayerPos {
+            x: 3.0,
+            y: -59.0,
+            z: 1.0,
+            flags: MovePlayerFlags::new(true, false),
+        })
+        .await
+        .expect("attempt zone entry before teleport acknowledgement");
     client
         .write_packet(&ConfirmTeleportation {
             teleport_id: sync.teleport_id,
         })
         .await
         .expect("ack teleport");
-    assert_eq!(next_system_chat_text(&mut client).await, "zone-ready");
     client
         .write_packet(&ServerboundMovePlayerPos {
             x: 3.0,
@@ -1427,7 +1470,44 @@ async fn lua_zone_entry_reaches_the_owning_plugin_from_normal_player_movement() 
 
     assert_eq!(
         next_system_chat_text(&mut client).await,
-        "entered:market:ZonePlayer"
+        "entered:market:ZonePlayer",
+        "movement rejected before teleport acknowledgement must not update zone membership"
+    );
+    client
+        .write_packet(&ServerboundMovePlayerPos {
+            x: 5.0,
+            y: -59.0,
+            z: 1.0,
+            flags: MovePlayerFlags::new(true, false),
+        })
+        .await
+        .expect("exit plugin zone");
+    assert_eq!(
+        next_system_chat_text(&mut client).await,
+        "exited:market:ZonePlayer"
+    );
+    client
+        .write_packet(&ServerboundMovePlayerPos {
+            x: 6.0,
+            y: -59.0,
+            z: 1.0,
+            flags: MovePlayerFlags::new(true, false),
+        })
+        .await
+        .expect("remain outside plugin zone");
+    client
+        .write_packet(&ServerboundMovePlayerPos {
+            x: 3.0,
+            y: -59.0,
+            z: 1.0,
+            flags: MovePlayerFlags::new(true, false),
+        })
+        .await
+        .expect("re-enter plugin zone");
+    assert_eq!(
+        next_system_chat_text(&mut client).await,
+        "entered:market:ZonePlayer",
+        "duplicate or leaked zone events must not overtake the owner re-entry fence"
     );
 
     drop(client);

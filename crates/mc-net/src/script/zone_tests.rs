@@ -378,6 +378,12 @@ async fn membership_transitions_are_deterministic_once_only_and_stale_fenced() {
             exited: 2,
         })
     );
+    for expected in ["alpha", "zulu"] {
+        assert!(matches!(
+            events.recv_event().await.unwrap().kind(),
+            ScriptEventKind::PlayerZoneExited { zone_id, .. } if zone_id == expected
+        ));
+    }
     assert_eq!(
         adapter
             .observe_player(
@@ -499,6 +505,28 @@ async fn dimension_boundaries_and_player_cleanup_drive_fresh_entries() {
         ScriptEventKind::PlayerZoneEntered { zone_id, .. } if zone_id == "overworld"
     ));
     assert_eq!(
+        adapter
+            .observe_player(
+                ScriptPlayerId::new(1),
+                2,
+                "minecraft:the_nether",
+                context(0.0, 0.0, 0.0),
+            )
+            .await,
+        Ok(ZoneObservationOutcome::Changed {
+            entered: 1,
+            exited: 1,
+        })
+    );
+    assert!(matches!(
+        events.recv_event().await.unwrap().kind(),
+        ScriptEventKind::PlayerZoneExited { zone_id, .. } if zone_id == "overworld"
+    ));
+    assert!(matches!(
+        events.recv_event().await.unwrap().kind(),
+        ScriptEventKind::PlayerZoneEntered { zone_id, .. } if zone_id == "nether"
+    ));
+    assert_eq!(
         adapter.forget_player(ScriptPlayerId::new(1)),
         Ok(ZoneCommandOutcome::Applied)
     );
@@ -511,7 +539,7 @@ async fn dimension_boundaries_and_player_cleanup_drive_fresh_entries() {
             .observe_player(
                 ScriptPlayerId::new(1),
                 1,
-                "minecraft:the_nether",
+                "minecraft:overworld",
                 context(0.0, 0.0, 0.0),
             )
             .await,
@@ -522,7 +550,7 @@ async fn dimension_boundaries_and_player_cleanup_drive_fresh_entries() {
     );
     assert!(matches!(
         events.recv_event().await.unwrap().kind(),
-        ScriptEventKind::PlayerZoneEntered { zone_id, .. } if zone_id == "nether"
+        ScriptEventKind::PlayerZoneEntered { zone_id, .. } if zone_id == "overworld"
     ));
 }
 
