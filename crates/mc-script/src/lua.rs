@@ -1463,6 +1463,23 @@ fn event_table(lua: &Lua, event: &ScriptEvent) -> mlua::Result<Table> {
             table.set("source", source.as_str())?;
             table.set("game_mode", game_mode.as_str())?;
         }
+        ScriptEventKind::PlayerEntityKilled {
+            player_id,
+            context,
+            dimension,
+            entity_id,
+            entity_type,
+            source,
+            game_mode,
+        } => {
+            table.set("player_id", player_id.value())?;
+            set_player_context(&table, context)?;
+            table.set("dimension", dimension.as_str())?;
+            table.set("entity_id", entity_id.value())?;
+            table.set("entity_type", entity_type.as_str())?;
+            table.set("source", source.as_str())?;
+            table.set("game_mode", game_mode.as_str())?;
+        }
         ScriptEventKind::PlayerDied {
             player_id,
             context,
@@ -1620,6 +1637,7 @@ fn handler_name(event: &ScriptEvent) -> &'static str {
         ScriptEventKind::PlayerBlockPlaced { .. } => "on_player_block_placed",
         ScriptEventKind::PlayerItemCrafted { .. } => "on_player_item_crafted",
         ScriptEventKind::PlayerItemPickedUp { .. } => "on_player_item_picked_up",
+        ScriptEventKind::PlayerEntityKilled { .. } => "on_player_entity_killed",
         ScriptEventKind::PlayerDied { .. } => "on_player_died",
         ScriptEventKind::PlayerCommand { .. } => "on_player_command",
         ScriptEventKind::ServerTick { .. } => "on_server_tick",

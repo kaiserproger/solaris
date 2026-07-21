@@ -1,4 +1,4 @@
-use super::player_death_events::push_player_death_event_locked;
+use super::script_commit_events::push_player_death_event_locked;
 use super::sleep::SleepWakeReason;
 use super::{
     PlayerInventoryCommitError, SessionEntityGuards, SessionId, SessionRegistry,

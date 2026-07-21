@@ -35,7 +35,6 @@ mod passive_mobs;
 mod pathing;
 mod pickups;
 mod player_combat;
-mod player_death_events;
 mod player_item_action_authority;
 mod player_pose_adapter;
 mod player_pose_authority;
@@ -46,6 +45,7 @@ mod position_sync_tests;
 mod prepared_chunks;
 mod projectiles;
 mod script_colony_endpoint;
+mod script_commit_events;
 mod script_inventory_transaction_endpoint;
 #[cfg(test)]
 mod script_inventory_transaction_endpoint_tests;
@@ -320,7 +320,7 @@ struct SessionRegistryInner {
     entity_dispatches: EntityDispatchCounters,
     arrow_kill_rewards: ArrowKillRewards,
     player_combat: PlayerCombatResources,
-    player_death_events: Option<tokio::sync::mpsc::UnboundedSender<ScriptEvent>>,
+    script_commit_events: Option<tokio::sync::mpsc::UnboundedSender<ScriptEvent>>,
 }
 
 #[derive(Debug, Default)]
@@ -1171,21 +1171,21 @@ impl SessionRegistry {
         self.simulation_tick_sender.subscribe()
     }
 
-    pub(crate) fn install_player_death_event_outbox(
+    pub(crate) fn install_script_commit_event_outbox(
         &self,
     ) -> tokio::sync::mpsc::UnboundedReceiver<ScriptEvent> {
         let (sender, receiver) = tokio::sync::mpsc::unbounded_channel();
-        let mut inner = self.lock_inner("install player death event outbox");
+        let mut inner = self.lock_inner("install script commit event outbox");
         assert!(
-            inner.player_death_events.replace(sender).is_none(),
-            "player death event outbox may only be installed once"
+            inner.script_commit_events.replace(sender).is_none(),
+            "script commit event outbox may only be installed once"
         );
         receiver
     }
 
-    pub(crate) fn close_player_death_event_outbox(&self) {
-        self.lock_inner("close player death event outbox")
-            .player_death_events = None;
+    pub(crate) fn close_script_commit_event_outbox(&self) {
+        self.lock_inner("close script commit event outbox")
+            .script_commit_events = None;
     }
 
     pub(crate) fn subscribe_player_attacks(

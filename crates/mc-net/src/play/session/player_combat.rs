@@ -1177,7 +1177,7 @@ mod tests {
     #[test]
     fn lethal_pvp_pushes_death_even_when_target_outbound_is_closed() {
         let registry = SessionRegistry::new();
-        let mut deaths = registry.install_player_death_event_outbox();
+        let mut deaths = registry.install_script_commit_event_outbox();
         let attacker_pose = PlayerPose::new(0.5, 64.0, 0.5);
         let target_pose = PlayerPose::new(1.0, 64.0, 0.5);
         let attacker = register_player(
@@ -1229,7 +1229,7 @@ mod tests {
     #[test]
     fn lethal_projectile_pushes_death_from_the_same_owner_commit() {
         let registry = SessionRegistry::new();
-        let mut deaths = registry.install_player_death_event_outbox();
+        let mut deaths = registry.install_script_commit_event_outbox();
         let target_pose = PlayerPose::new(1.0, 64.0, 0.5);
         let target_state = PlayerPersistedState::new_default(target_pose);
         let target = register_player(&registry, "ArrowDeath", target_pose, target_state.clone());

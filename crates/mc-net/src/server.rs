@@ -685,7 +685,7 @@ impl ScriptEventSink {
     }
 }
 
-async fn forward_committed_player_deaths(
+async fn forward_committed_script_events(
     mut events: tokio::sync::mpsc::UnboundedReceiver<ScriptEvent>,
     scripts: ScriptEventSink,
 ) -> Result<(), ScriptQueueError> {
@@ -909,9 +909,9 @@ impl BoundServer {
         if let Some(scripts) = scripts.as_ref() {
             scripts.enqueue_event(ScriptEvent::server_started());
         }
-        let mut player_death_event_worker = scripts.clone().map(|scripts| {
-            let events = sessions.install_player_death_event_outbox();
-            tokio::spawn(forward_committed_player_deaths(events, scripts))
+        let mut script_commit_event_worker = scripts.clone().map(|scripts| {
+            let events = sessions.install_script_commit_event_outbox();
+            tokio::spawn(forward_committed_script_events(events, scripts))
         });
         let mut connections = tokio::task::JoinSet::new();
         let (entity_world_root, entity_scheduled_ticks) = if let Some(world) = config.world.as_ref()
@@ -1949,15 +1949,15 @@ impl BoundServer {
                 simulation_barrier_result.and(ticker_result)
             }
         };
-        sessions.close_player_death_event_outbox();
-        let player_death_event_drain_result = match player_death_event_worker.take() {
+        sessions.close_script_commit_event_outbox();
+        let script_commit_event_drain_result = match script_commit_event_worker.take() {
             Some(worker) => match worker.await {
                 Ok(Ok(())) => Ok(()),
                 Ok(Err(error)) => Err(std::io::Error::other(format!(
-                    "committed player death event drain failed: {error:?}"
+                    "committed script event drain failed: {error:?}"
                 ))),
                 Err(error) => Err(std::io::Error::other(format!(
-                    "committed player death event worker failed: {error}"
+                    "committed script event worker failed: {error}"
                 ))),
             },
             None => Ok(()),
@@ -1990,7 +1990,7 @@ impl BoundServer {
         connection_drain_result?;
         entity_drain_result?;
         periodic_save_drain_result?;
-        player_death_event_drain_result?;
+        script_commit_event_drain_result?;
         server_stopping_event_result
     }
 
@@ -4680,7 +4680,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn committed_death_worker_waits_for_exact_queue_capacity_notification() {
+    async fn committed_script_event_worker_waits_for_exact_queue_capacity_notification() {
         let one = NonZeroUsize::new(1).unwrap();
         let (boundary, mut endpoint) = script_boundary_pair(one, one);
         boundary
@@ -4707,7 +4707,7 @@ mod tests {
             )
             .unwrap();
         drop(sender);
-        let worker = tokio::spawn(forward_committed_player_deaths(receiver, sink));
+        let worker = tokio::spawn(forward_committed_script_events(receiver, sink));
 
         assert!(matches!(
             endpoint.recv_event().await.unwrap().kind(),

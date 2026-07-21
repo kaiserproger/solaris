@@ -19774,7 +19774,7 @@ async fn lit_campfire_contact_damage_uses_survival_death_path() {
 #[tokio::test]
 async fn committed_campfire_death_survives_client_write_failure() {
     let mut state = campfire_test_interaction_state(mc_world::BlockPos { x: 0, y: 64, z: 0 }).await;
-    let mut deaths = state.sessions.install_player_death_event_outbox();
+    let mut deaths = state.sessions.install_script_commit_event_outbox();
     let mut survival_state = SurvivalState {
         health: 1.0,
         ..SurvivalState::FULL

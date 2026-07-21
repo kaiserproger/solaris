@@ -1,5 +1,6 @@
 use super::interaction_geometry::{entity_geometry, within_entity_reach};
 use super::player_state::{apply_player_survival_plan_locked, player_attack_cost_plan_matches};
+use super::script_commit_events::push_player_entity_killed_event_locked;
 use super::{
     CommittedPlayerAttackCosts, ENTITY_DEATH_TICKS, ENTITY_EVENT_DEATH,
     ENTITY_HURT_INVULNERABLE_TICKS, EntityAttackOutcome, EntityKillRewards, OutboundCommand,
@@ -159,6 +160,17 @@ impl SessionRegistry {
                 *attacker_costs = committed_attacker;
             }
             EntityAttackOutcome::PlayerDamaged { .. } => unreachable!("server entity outcome"),
+        }
+        if let (Some((attacker_session, _)), EntityAttackOutcome::Killed { entity, .. }) =
+            (attacker, &outcome)
+        {
+            push_player_entity_killed_event_locked(
+                &inner,
+                attacker_session,
+                game_mode,
+                player_pose,
+                entity,
+            );
         }
         drop(inner);
         self.append_spawned_xp_pickup_candidates(outcome.dispatches_mut());

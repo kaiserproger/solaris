@@ -15,7 +15,7 @@ use crate::connection::{ConnectionReader, PRE_PLAY_READ_TIMEOUT, read_packet_wit
 #[test]
 fn lethal_survival_commit_pushes_immutable_player_death_before_session_cleanup() {
     let registry = SessionRegistry::new();
-    let mut deaths = registry.install_player_death_event_outbox();
+    let mut deaths = registry.install_script_commit_event_outbox();
     let session = register_test_session(&registry, "CommittedDeath");
     let pose = PlayerPose::new(2.5, 70.0, -4.5);
     let persisted = PlayerPersistedState::new_default(pose);
@@ -5736,6 +5736,203 @@ fn player_attack_contract_distinguishes_rejection_immunity_and_damage() {
             },
         ),
         PlayerAttackResult::ValidationRejected
+    ));
+}
+
+#[test]
+fn direct_player_melee_kill_pushes_one_authoritative_script_event() {
+    fn attack_costs(state: &PlayerPersistedState, position: Vec3) -> PlayerSurvivalPlan {
+        let mut updated_survival = state.survival;
+        updated_survival.add_exhaustion(SurvivalState::ENTITY_ATTACK_EXHAUSTION);
+        PlayerSurvivalPlan {
+            expected_survival: state.survival,
+            updated_survival,
+            expected_inventory: state.inventory.clone(),
+            updated_inventory: state.inventory.clone(),
+            expected_carried_item: state.carried_item.clone(),
+            expected_xp: state.xp.clone(),
+            updated_xp: state.xp.clone(),
+            active_shield: None,
+            enchanting_table_input: None,
+            item_entity_type_id: None,
+            xp_orb_entity_type_id: None,
+            position,
+        }
+    }
+
+    let registry = SessionRegistry::new();
+    let mut events = registry.install_script_commit_event_outbox();
+    let session_id = register_test_session(&registry, "EntityKillAlice");
+    assert!(registry.mark_loaded(session_id, (0, 0)).is_empty());
+    let persisted = Arc::new(Mutex::new(PlayerPersistedState::new_default(
+        PlayerPose::new(0.5, 64.0, 0.5),
+    )));
+    registry.register_player_persistence(session_id, Arc::clone(&persisted));
+    let spawn = |position| {
+        let before = registry
+            .persisted_entity_records()
+            .into_iter()
+            .map(|record| record.snapshot.id)
+            .collect::<HashSet<_>>();
+        registry.spawn_command_entity(
+            &SimulationAuthority::for_test(),
+            5,
+            "minecraft:cow".to_owned(),
+            position,
+        );
+        registry
+            .persisted_entity_records()
+            .into_iter()
+            .map(|record| record.snapshot.id)
+            .find(|id| !before.contains(id))
+            .expect("spawned cow remains authoritative")
+    };
+    let nonlethal = spawn(Vec3::new(0.5, 64.0, 1.5));
+    let lethal = spawn(Vec3::new(1.5, 64.0, 1.5));
+    let unreachable = spawn(Vec3::new(0.5, 64.0, 20.5));
+    let pose = PlayerPose::new(0.5, 64.0, 0.5);
+    let authority = SimulationAuthority::for_test();
+    let next_costs = || {
+        let state = persisted
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        attack_costs(&state, Vec3::new(pose.x, pose.y, pose.z))
+    };
+
+    let costs = next_costs();
+    assert!(matches!(
+        registry.player_attack_server_entity(
+            &authority,
+            ServerEntityPlayerAttack {
+                entity_id: nonlethal,
+                amount: 1.0,
+                game_mode: GameMode::Survival,
+                player_pose: pose,
+                attacker: Some((session_id, &costs)),
+            },
+        ),
+        PlayerAttackResult::Damaged(outcome)
+            if matches!(*outcome, EntityAttackOutcome::Damaged { .. })
+    ));
+    assert!(matches!(
+        events.try_recv(),
+        Err(mpsc::error::TryRecvError::Empty)
+    ));
+
+    let stale_costs = next_costs();
+    persisted
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .survival
+        .add_exhaustion(0.25);
+    assert!(matches!(
+        registry.player_attack_server_entity(
+            &authority,
+            ServerEntityPlayerAttack {
+                entity_id: lethal,
+                amount: 100.0,
+                game_mode: GameMode::Survival,
+                player_pose: pose,
+                attacker: Some((session_id, &stale_costs)),
+            },
+        ),
+        PlayerAttackResult::ValidationRejected
+    ));
+    assert!(matches!(
+        events.try_recv(),
+        Err(mpsc::error::TryRecvError::Empty)
+    ));
+
+    let _ = registry.update_pose(session_id, PlayerPose::new(4.5, 64.0, 0.5));
+    let costs = next_costs();
+    assert!(matches!(
+        registry.player_attack_server_entity(
+            &authority,
+            ServerEntityPlayerAttack {
+                entity_id: unreachable,
+                amount: 100.0,
+                game_mode: GameMode::Survival,
+                player_pose: pose,
+                attacker: Some((session_id, &costs)),
+            },
+        ),
+        PlayerAttackResult::ValidationRejected
+    ));
+    assert!(matches!(
+        events.try_recv(),
+        Err(mpsc::error::TryRecvError::Empty)
+    ));
+
+    let costs = next_costs();
+    assert!(matches!(
+        registry.player_attack_server_entity(
+            &authority,
+            ServerEntityPlayerAttack {
+                entity_id: lethal,
+                amount: 100.0,
+                game_mode: GameMode::Survival,
+                player_pose: pose,
+                attacker: Some((session_id, &costs)),
+            },
+        ),
+        PlayerAttackResult::Damaged(outcome)
+            if matches!(*outcome, EntityAttackOutcome::Killed { .. })
+    ));
+    let event = events.try_recv().expect("lethal melee commit event");
+    assert!(matches!(
+        event.kind(),
+        ScriptEventKind::PlayerEntityKilled {
+            player_id,
+            context,
+            dimension,
+            entity_id,
+            entity_type,
+            source,
+            game_mode: ScriptGameMode::Survival,
+        } if player_id.value() == session_id
+            && context.username() == "EntityKillAlice"
+            && (context.x(), context.y(), context.z()) == (pose.x, pose.y, pose.z)
+            && dimension == "minecraft:overworld"
+            && entity_id.value() == u64::try_from(lethal.0).unwrap()
+            && entity_type == "minecraft:cow"
+            && source.as_str() == "melee"
+    ));
+
+    let costs = next_costs();
+    assert!(matches!(
+        registry.player_attack_server_entity(
+            &authority,
+            ServerEntityPlayerAttack {
+                entity_id: lethal,
+                amount: 100.0,
+                game_mode: GameMode::Survival,
+                player_pose: pose,
+                attacker: Some((session_id, &costs)),
+            },
+        ),
+        PlayerAttackResult::AcceptedNoDamage
+    ));
+    assert!(matches!(
+        events.try_recv(),
+        Err(mpsc::error::TryRecvError::Empty)
+    ));
+
+    drop(events);
+    let closed_outbox_target = spawn(Vec3::new(1.5, 64.0, 1.5));
+    let costs = next_costs();
+    assert!(matches!(
+        registry.player_attack_server_entity(
+            &authority,
+            ServerEntityPlayerAttack {
+                entity_id: closed_outbox_target,
+                amount: 100.0,
+                game_mode: GameMode::Survival,
+                player_pose: pose,
+                attacker: Some((session_id, &costs)),
+            },
+        ),
+        PlayerAttackResult::Damaged(outcome)
+            if matches!(*outcome, EntityAttackOutcome::Killed { .. })
     ));
 }
 

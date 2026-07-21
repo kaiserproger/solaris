@@ -21,6 +21,8 @@ use tokio::sync::{Mutex, mpsc};
 mod lua;
 
 #[cfg(test)]
+mod entity_kill_tests;
+#[cfg(test)]
 mod item_pickup_tests;
 #[cfg(test)]
 mod player_death_tests;
@@ -1104,6 +1106,21 @@ impl ScriptItemPickupSource {
     }
 }
 
+/// Closed source snapshot exposed by player entity-kill events.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[non_exhaustive]
+pub enum ScriptEntityKillSource {
+    Melee,
+}
+
+impl ScriptEntityKillSource {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Melee => "melee",
+        }
+    }
+}
+
 /// Closed game-mode snapshot exposed by gameplay events.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 #[non_exhaustive]
@@ -1328,6 +1345,31 @@ impl ScriptEvent {
                 dimension: validate_contract_resource_id(dimension.as_ref())?,
                 item_id: validate_contract_resource_id(item_id.as_ref())?,
                 count,
+                source,
+                game_mode,
+            },
+        })
+    }
+
+    /// Build a reliable direct player-melee kill event after the entity commit.
+    pub fn try_player_entity_killed_with_context(
+        player_id: ScriptPlayerId,
+        context: ScriptPlayerContext,
+        dimension: impl AsRef<str>,
+        entity_id: ScriptEntityId,
+        entity_type: impl AsRef<str>,
+        source: ScriptEntityKillSource,
+        game_mode: ScriptGameMode,
+    ) -> Result<Self, ScriptDtoError> {
+        context.validate()?;
+        Ok(Self {
+            target_plugin_id: None,
+            kind: ScriptEventKind::PlayerEntityKilled {
+                player_id,
+                context,
+                dimension: validate_contract_resource_id(dimension.as_ref())?,
+                entity_id,
+                entity_type: validate_contract_resource_id(entity_type.as_ref())?,
                 source,
                 game_mode,
             },
@@ -1593,6 +1635,7 @@ impl ScriptEvent {
             ScriptEventKind::PlayerBlockPlaced { .. } => "player.block_placed",
             ScriptEventKind::PlayerItemCrafted { .. } => "player.item_crafted",
             ScriptEventKind::PlayerItemPickedUp { .. } => "player.item_picked_up",
+            ScriptEventKind::PlayerEntityKilled { .. } => "player.entity_killed",
             ScriptEventKind::PlayerDied { .. } => "player.died",
             ScriptEventKind::PlayerCommand { .. } => "player.command",
             ScriptEventKind::ServerTick { .. } => "server.tick",
@@ -1688,6 +1731,16 @@ impl ScriptEvent {
                     return Err(ScriptDtoError::InvalidAmount);
                 }
                 Ok(())
+            }
+            ScriptEventKind::PlayerEntityKilled {
+                context,
+                dimension,
+                entity_type,
+                ..
+            } => {
+                context.validate()?;
+                validate_contract_resource_id(dimension)?;
+                validate_contract_resource_id(entity_type).map(drop)
             }
             ScriptEventKind::PlayerDied {
                 context, dimension, ..
@@ -1875,6 +1928,15 @@ pub enum ScriptEventKind {
         item_id: String,
         count: u64,
         source: ScriptItemPickupSource,
+        game_mode: ScriptGameMode,
+    },
+    PlayerEntityKilled {
+        player_id: ScriptPlayerId,
+        context: ScriptPlayerContext,
+        dimension: String,
+        entity_id: ScriptEntityId,
+        entity_type: String,
+        source: ScriptEntityKillSource,
         game_mode: ScriptGameMode,
     },
     PlayerDied {
@@ -4145,6 +4207,7 @@ fn is_supported_event_name(event_name: &str) -> bool {
             | "player.block_placed"
             | "player.item_crafted"
             | "player.item_picked_up"
+            | "player.entity_killed"
             | "player.died"
             | "server.tick"
             | "plugin.storage.get_result"
@@ -5034,6 +5097,7 @@ mod tests {
             "player.block_placed",
             "player.item_crafted",
             "player.item_picked_up",
+            "player.entity_killed",
             "player.died",
             "plugin.storage.get_result",
             "plugin.storage.cas_result",
