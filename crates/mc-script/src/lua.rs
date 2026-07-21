@@ -1,4 +1,4 @@
-use std::collections::HashSet;
+use std::collections::{BTreeSet, HashMap, HashSet};
 use std::fmt;
 use std::fs;
 use std::io::Read;
@@ -43,6 +43,9 @@ const MAX_PLUGIN_CONFIG_STRING_BYTES: usize = 4 * 1024;
 const MAX_PLUGIN_SOURCE_BYTES: usize = 1024 * 1024;
 const MAX_PLUGIN_DIRECTORIES: usize = 128;
 const MAX_API_VERSION_BYTES: usize = 16;
+const MAX_PENDING_PLUGIN_TIMERS: usize = 256;
+const MAX_PLUGIN_TIMER_CALLBACKS_PER_TICK: usize = 8;
+const MAX_PLUGIN_TIMER_DELAY_TICKS: u64 = 630_720_000;
 
 /// Filesystem configuration for the built-in Lua plugin host.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -565,7 +568,9 @@ impl LuaPlugin {
             if target_plugin_id != self.id {
                 return Ok(empty_lua_command_batch());
             }
-        } else if !self.subscriptions.contains(event.event_name()) {
+        } else if !matches!(event.kind(), ScriptEventKind::ServerTick { .. })
+            && !self.subscriptions.contains(event.event_name())
+        {
             return Ok(empty_lua_command_batch());
         }
         let controls = crate::RuntimeControls::unrestricted();
@@ -613,6 +618,45 @@ impl Default for LuaRuntimeLimits {
 struct InvocationState {
     batch: CommandBatch,
     capabilities: Arc<CommandCapabilities>,
+    timers: TimerSchedule,
+    current_tick: u64,
+}
+
+#[derive(Clone, Default)]
+struct TimerSchedule {
+    by_id: HashMap<String, u64>,
+    by_deadline: BTreeSet<(u64, String)>,
+}
+
+impl TimerSchedule {
+    fn schedule(&mut self, timer_id: String, deadline: u64) -> Result<(), ()> {
+        if !self.by_id.contains_key(&timer_id) && self.by_id.len() >= MAX_PENDING_PLUGIN_TIMERS {
+            return Err(());
+        }
+        if let Some(previous) = self.by_id.insert(timer_id.clone(), deadline) {
+            self.by_deadline.remove(&(previous, timer_id.clone()));
+        }
+        self.by_deadline.insert((deadline, timer_id));
+        Ok(())
+    }
+
+    fn cancel(&mut self, timer_id: &str) -> bool {
+        let Some(deadline) = self.by_id.remove(timer_id) else {
+            return false;
+        };
+        self.by_deadline.remove(&(deadline, timer_id.to_owned()));
+        true
+    }
+
+    fn take_next_due(&mut self, current_tick: u64) -> Option<(u64, String)> {
+        let (deadline, timer_id) = self.by_deadline.first()?.clone();
+        if deadline > current_tick {
+            return None;
+        }
+        self.by_deadline.remove(&(deadline, timer_id.clone()));
+        self.by_id.remove(&timer_id);
+        Some((deadline, timer_id))
+    }
 }
 
 struct LuaScriptRuntime {
@@ -620,6 +664,8 @@ struct LuaScriptRuntime {
     manifest: ValidatedScriptPluginManifest,
     invocation: Arc<Mutex<Option<InvocationState>>>,
     capabilities: Arc<CommandCapabilities>,
+    timers: TimerSchedule,
+    current_tick: u64,
     limits: LuaRuntimeLimits,
 }
 
@@ -655,8 +701,15 @@ impl LuaScriptRuntime {
             manifest,
             invocation,
             capabilities,
+            timers: TimerSchedule::default(),
+            current_tick: 0,
             limits,
         })
+    }
+
+    #[cfg(test)]
+    fn pending_timer_count(&self) -> usize {
+        self.timers.by_id.len()
     }
 
     fn notify_batch_rejected(
@@ -682,16 +735,69 @@ impl LuaScriptRuntime {
         })
         .map_err(runtime_error)
     }
-}
 
-impl ScriptRuntime for LuaScriptRuntime {
-    fn handle_event(
+    fn invoke_handler(
+        &mut self,
+        handler_name: &str,
+        event_table: Table,
+        batch: CommandBatch,
+    ) -> RuntimeResult<CommandBatch> {
+        let handler = self
+            .lua
+            .globals()
+            .get::<Option<Function>>(handler_name)
+            .map_err(runtime_error)?;
+        let Some(handler) = handler else {
+            return Ok(batch);
+        };
+        *lock_invocation(&self.invocation).map_err(runtime_error)? = Some(InvocationState {
+            batch,
+            capabilities: Arc::clone(&self.capabilities),
+            timers: self.timers.clone(),
+            current_tick: self.current_tick,
+        });
+        let result = handler.call::<()>(event_table);
+        let invocation = lock_invocation(&self.invocation)
+            .map_err(runtime_error)?
+            .take()
+            .expect("Lua invocation state exists while a handler runs");
+        match result {
+            Ok(()) => {
+                self.timers = invocation.timers;
+                Ok(invocation.batch)
+            }
+            Err(error) => Err(runtime_error(error)),
+        }
+    }
+
+    fn dispatch_event(
         &mut self,
         event: &ScriptEvent,
         context: RuntimeContext<'_>,
     ) -> RuntimeResult<CommandBatch> {
-        if context.controls().shutdown_requested() {
-            return Err(RuntimeError::ShutdownRequested);
+        if let ScriptEventKind::ServerTick { tick } = event.kind() {
+            self.current_tick = self.current_tick.max(*tick);
+            let mut batch = context.command_batch();
+            for _ in 0..MAX_PLUGIN_TIMER_CALLBACKS_PER_TICK {
+                let Some((scheduled_tick, timer_id)) = self.timers.take_next_due(self.current_tick)
+                else {
+                    break;
+                };
+                let timer_event =
+                    timer_event_table(&self.lua, &timer_id, scheduled_tick, self.current_tick)
+                        .map_err(runtime_error)?;
+                batch = self.invoke_handler("on_plugin_timer", timer_event, batch)?;
+            }
+            if self
+                .manifest
+                .event_subscriptions()
+                .iter()
+                .any(|subscription| subscription.event_name() == event.event_name())
+            {
+                let event_table = event_table(&self.lua, event).map_err(runtime_error)?;
+                batch = self.invoke_handler(handler_name(event), event_table, batch)?;
+            }
+            return Ok(batch);
         }
         if let Some(target_plugin_id) = event.target_plugin_id() {
             if target_plugin_id != self.manifest.plugin_id() {
@@ -705,36 +811,29 @@ impl ScriptRuntime for LuaScriptRuntime {
         {
             return Ok(context.command_batch());
         }
-        let handler_name = handler_name(event);
-        let handler = self
-            .lua
-            .globals()
-            .get::<Option<Function>>(handler_name)
-            .map_err(runtime_error)?;
-        let Some(handler) = handler else {
-            return Ok(context.command_batch());
-        };
         let event_table = event_table(&self.lua, event).map_err(runtime_error)?;
-        *lock_invocation(&self.invocation).map_err(runtime_error)? = Some(InvocationState {
-            batch: context.command_batch(),
-            capabilities: Arc::clone(&self.capabilities),
-        });
+        self.invoke_handler(handler_name(event), event_table, context.command_batch())
+    }
+}
+
+impl ScriptRuntime for LuaScriptRuntime {
+    fn handle_event(
+        &mut self,
+        event: &ScriptEvent,
+        context: RuntimeContext<'_>,
+    ) -> RuntimeResult<CommandBatch> {
+        if context.controls().shutdown_requested() {
+            return Err(RuntimeError::ShutdownRequested);
+        }
         let configured_budget = self.limits.instructions_per_event;
         let budget = context.controls().fuel().map_or(configured_budget, |fuel| {
             NonZeroU64::new(fuel.get().min(configured_budget.get()))
                 .expect("minimum of non-zero budgets is non-zero")
         });
-        let result =
-            run_with_instruction_budget(&self.lua, budget, || handler.call::<()>(event_table));
-        let invocation = lock_invocation(&self.invocation)
-            .map_err(runtime_error)?
-            .take();
-        match result {
-            Ok(()) => Ok(invocation
-                .expect("Lua invocation state exists while a handler runs")
-                .batch),
-            Err(error) => Err(runtime_error(error)),
-        }
+        install_instruction_budget_hook(&self.lua, budget).map_err(runtime_error)?;
+        let result = self.dispatch_event(event, context);
+        self.lua.remove_hook();
+        result
     }
 }
 
@@ -747,6 +846,47 @@ fn install_solaris_api(
     api.set(
         "config",
         lua.create_function(move |lua, ()| config_table_to_lua(lua, &config))?,
+    )?;
+    let schedule_timer_invocation = Arc::clone(&invocation);
+    api.set(
+        "schedule_timer",
+        lua.create_function(
+            move |_, (timer_id, delay): (LuaString, Value)| -> mlua::Result<u64> {
+                let timer_id = bounded_script_id(timer_id, "timer_id")?;
+                let delay = match delay {
+                    Value::Integer(delay) => u64::try_from(delay)
+                        .ok()
+                        .filter(|delay| (1..=MAX_PLUGIN_TIMER_DELAY_TICKS).contains(delay))
+                        .ok_or_else(|| lua_input_error("timer_delay_ticks", "range"))?,
+                    _ => return Err(lua_input_error("timer_delay_ticks", "type")),
+                };
+                let mut invocation = lock_invocation(&schedule_timer_invocation)?;
+                let invocation = invocation.as_mut().ok_or_else(|| {
+                    mlua::Error::runtime("Solaris API called outside an event handler")
+                })?;
+                let deadline = invocation
+                    .current_tick
+                    .checked_add(delay)
+                    .ok_or_else(|| lua_input_error("timer_delay_ticks", "range"))?;
+                invocation
+                    .timers
+                    .schedule(timer_id, deadline)
+                    .map_err(|()| lua_input_error("plugin_timers", "too_many"))?;
+                Ok(deadline)
+            },
+        )?,
+    )?;
+    let cancel_timer_invocation = Arc::clone(&invocation);
+    api.set(
+        "cancel_timer",
+        lua.create_function(move |_, timer_id: LuaString| {
+            let timer_id = bounded_script_id(timer_id, "timer_id")?;
+            let mut invocation = lock_invocation(&cancel_timer_invocation)?;
+            let invocation = invocation.as_mut().ok_or_else(|| {
+                mlua::Error::runtime("Solaris API called outside an event handler")
+            })?;
+            Ok(invocation.timers.cancel(&timer_id))
+        })?,
     )?;
     let send_invocation = Arc::clone(&invocation);
     api.set(
@@ -1511,6 +1651,13 @@ fn run_with_instruction_budget<T>(
     budget: NonZeroU64,
     run: impl FnOnce() -> mlua::Result<T>,
 ) -> mlua::Result<T> {
+    install_instruction_budget_hook(lua, budget)?;
+    let result = run();
+    lua.remove_hook();
+    result
+}
+
+fn install_instruction_budget_hook(lua: &Lua, budget: NonZeroU64) -> mlua::Result<()> {
     let consumed = Arc::new(AtomicU64::new(0));
     let hook_consumed = Arc::clone(&consumed);
     let step =
@@ -1526,9 +1673,21 @@ fn run_with_instruction_budget<T>(
             Ok(VmState::Continue)
         },
     )?;
-    let result = run();
-    lua.remove_hook();
-    result
+    Ok(())
+}
+
+fn timer_event_table(
+    lua: &Lua,
+    timer_id: &str,
+    scheduled_tick: u64,
+    fired_tick: u64,
+) -> mlua::Result<Table> {
+    let table = lua.create_table()?;
+    table.set("name", "plugin.timer")?;
+    table.set("timer_id", timer_id)?;
+    table.set("scheduled_tick", scheduled_tick)?;
+    table.set("fired_tick", fired_tick)?;
+    Ok(table)
 }
 
 fn event_table(lua: &Lua, event: &ScriptEvent) -> mlua::Result<Table> {
@@ -1896,6 +2055,8 @@ fn runtime_error(error: mlua::Error) -> RuntimeError {
 mod player_inventory_tests;
 #[cfg(test)]
 mod plugin_config_tests;
+#[cfg(test)]
+mod timer_tests;
 
 #[cfg(test)]
 mod tests {

@@ -584,6 +584,12 @@ impl ScriptEventSink {
         }
     }
 
+    pub(crate) fn enqueue_server_tick(&self, tick: u64) {
+        if let Err(ScriptQueueError::Closed) = self.boundary.try_enqueue_latest_server_tick(tick) {
+            warn!("script event queue closed; server tick unavailable");
+        }
+    }
+
     pub(crate) async fn enqueue_targeted_event(
         &self,
         event: ScriptEvent,
@@ -1199,7 +1205,7 @@ impl BoundServer {
                 let tick_started = Instant::now();
                 tick = entity_sessions.simulation_tick().saturating_add(1);
                 if let Some(scripts) = entity_scripts.as_ref() {
-                    scripts.enqueue_event(ScriptEvent::server_tick(tick));
+                    scripts.enqueue_server_tick(tick);
                 }
                 let work_budgets = entity_runtime_control
                     .as_ref()

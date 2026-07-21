@@ -32,6 +32,8 @@ mod player_death_tests;
 mod player_inventory_tests;
 #[cfg(test)]
 mod player_teleport_tests;
+#[cfg(test)]
+mod tick_delivery_tests;
 
 #[cfg(feature = "lua-runtime")]
 pub use lua::{LuaHost, LuaHostConfig, LuaHostError, start_lua_host};
@@ -2959,6 +2961,13 @@ struct ScriptEventAdmission {
     closed: AtomicBool,
     sender: StdMutex<Option<mpsc::Sender<ScriptEvent>>>,
     weak_sender: mpsc::WeakSender<ScriptEvent>,
+    coalesced_server_tick: Arc<StdMutex<CoalescedServerTick>>,
+}
+
+#[derive(Debug, Default)]
+struct CoalescedServerTick {
+    pending: Option<u64>,
+    highest_seen: Option<u64>,
 }
 
 impl ScriptEventAdmission {
@@ -2993,6 +3002,40 @@ impl ScriptBoundary {
             mpsc::error::TrySendError::Full(_) => ScriptQueueError::Full,
             mpsc::error::TrySendError::Closed(_) => ScriptQueueError::Closed,
         })
+    }
+
+    /// Push the latest simulation tick without blocking or losing timer progress.
+    ///
+    /// When the normal event queue is full, newer ticks replace the one pending
+    /// coalesced tick. The host drains ordinary queued events first, then observes
+    /// the latest tick before blocking again.
+    pub fn try_enqueue_latest_server_tick(&self, tick: u64) -> Result<(), ScriptQueueError> {
+        let Some(event_tx) = self.event_admission.sender() else {
+            return Err(ScriptQueueError::Closed);
+        };
+        let mut coalesced = match self.event_admission.coalesced_server_tick.lock() {
+            Ok(coalesced) => coalesced,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        if coalesced
+            .highest_seen
+            .is_some_and(|highest| tick <= highest)
+        {
+            return Ok(());
+        }
+        coalesced.highest_seen = Some(tick);
+        let latest_tick = coalesced
+            .pending
+            .take()
+            .map_or(tick, |pending| pending.max(tick));
+        match event_tx.try_send(ScriptEvent::server_tick(latest_tick)) {
+            Ok(()) => Ok(()),
+            Err(mpsc::error::TrySendError::Full(_)) => {
+                coalesced.pending = Some(latest_tick);
+                Ok(())
+            }
+            Err(mpsc::error::TrySendError::Closed(_)) => Err(ScriptQueueError::Closed),
+        }
     }
 
     /// Deliver a required event, waiting for bounded host-queue capacity.
@@ -3094,6 +3137,9 @@ impl ScriptBoundary {
 #[derive(Debug)]
 pub struct ScriptHostEndpoint {
     event_rx: mpsc::Receiver<ScriptEvent>,
+    coalesced_server_tick: Arc<StdMutex<CoalescedServerTick>>,
+    coalesced_tick_due: bool,
+    highest_delivered_tick: Option<u64>,
     command_tx: mpsc::Sender<ScriptCommand>,
     player_command_owners: PlayerCommandOwners,
     #[cfg(any(test, feature = "lua-runtime"))]
@@ -3103,12 +3149,108 @@ pub struct ScriptHostEndpoint {
 impl ScriptHostEndpoint {
     /// Wait asynchronously until an event arrives or the server side closes.
     pub async fn recv_event(&mut self) -> Option<ScriptEvent> {
-        self.event_rx.recv().await
+        loop {
+            if self.coalesced_tick_due {
+                self.coalesced_tick_due = false;
+                if let Some(event) = take_coalesced_server_tick(&self.coalesced_server_tick) {
+                    if let Some(event) = self.accept_monotonic_event(event) {
+                        return Some(event);
+                    }
+                    continue;
+                }
+            }
+            match self.event_rx.try_recv() {
+                Ok(event) => {
+                    self.coalesced_tick_due =
+                        has_coalesced_server_tick(&self.coalesced_server_tick);
+                    if let Some(event) = self.accept_monotonic_event(event) {
+                        return Some(event);
+                    }
+                    continue;
+                }
+                Err(mpsc::error::TryRecvError::Empty) => {}
+                Err(mpsc::error::TryRecvError::Disconnected) => {
+                    let event = take_coalesced_server_tick(&self.coalesced_server_tick)?;
+                    if let Some(event) = self.accept_monotonic_event(event) {
+                        return Some(event);
+                    }
+                    continue;
+                }
+            }
+            if let Some(event) = take_coalesced_server_tick(&self.coalesced_server_tick) {
+                if let Some(event) = self.accept_monotonic_event(event) {
+                    return Some(event);
+                }
+                continue;
+            }
+            let Some(event) = self.event_rx.recv().await else {
+                continue;
+            };
+            self.coalesced_tick_due = has_coalesced_server_tick(&self.coalesced_server_tick);
+            if let Some(event) = self.accept_monotonic_event(event) {
+                return Some(event);
+            }
+        }
     }
 
     /// Block the dedicated host thread until an event arrives or the server side closes.
     pub fn recv_event_blocking(&mut self) -> Option<ScriptEvent> {
-        self.event_rx.blocking_recv()
+        loop {
+            if self.coalesced_tick_due {
+                self.coalesced_tick_due = false;
+                if let Some(event) = take_coalesced_server_tick(&self.coalesced_server_tick) {
+                    if let Some(event) = self.accept_monotonic_event(event) {
+                        return Some(event);
+                    }
+                    continue;
+                }
+            }
+            match self.event_rx.try_recv() {
+                Ok(event) => {
+                    self.coalesced_tick_due =
+                        has_coalesced_server_tick(&self.coalesced_server_tick);
+                    if let Some(event) = self.accept_monotonic_event(event) {
+                        return Some(event);
+                    }
+                    continue;
+                }
+                Err(mpsc::error::TryRecvError::Empty) => {}
+                Err(mpsc::error::TryRecvError::Disconnected) => {
+                    let event = take_coalesced_server_tick(&self.coalesced_server_tick)?;
+                    if let Some(event) = self.accept_monotonic_event(event) {
+                        return Some(event);
+                    }
+                    continue;
+                }
+            }
+            if let Some(event) = take_coalesced_server_tick(&self.coalesced_server_tick) {
+                if let Some(event) = self.accept_monotonic_event(event) {
+                    return Some(event);
+                }
+                continue;
+            }
+            let Some(event) = self.event_rx.blocking_recv() else {
+                continue;
+            };
+            self.coalesced_tick_due = has_coalesced_server_tick(&self.coalesced_server_tick);
+            if let Some(event) = self.accept_monotonic_event(event) {
+                return Some(event);
+            }
+        }
+    }
+
+    fn accept_monotonic_event(&mut self, event: ScriptEvent) -> Option<ScriptEvent> {
+        let ScriptEventKind::ServerTick { tick } = event.kind() else {
+            return Some(event);
+        };
+        if self
+            .highest_delivered_tick
+            .is_some_and(|highest| *tick <= highest)
+        {
+            return None;
+        }
+        self.highest_delivered_tick = Some(*tick);
+        Some(event)
     }
 
     /// Submit a command without blocking the host thread.
@@ -3379,6 +3521,7 @@ pub fn script_boundary_pair(
     let (command_tx, command_rx) = mpsc::channel(command_capacity);
     let player_command_owners = PlayerCommandOwners::default();
     let host_admissions = Arc::new(HostAdmissionLedger::default());
+    let coalesced_server_tick = Arc::new(StdMutex::new(CoalescedServerTick::default()));
     let weak_event_tx = event_tx.downgrade();
     (
         ScriptBoundary {
@@ -3386,6 +3529,7 @@ pub fn script_boundary_pair(
                 closed: AtomicBool::new(false),
                 sender: StdMutex::new(Some(event_tx)),
                 weak_sender: weak_event_tx,
+                coalesced_server_tick: Arc::clone(&coalesced_server_tick),
             }),
             command_rx: Arc::new(Mutex::new(command_rx)),
             player_command_owners: player_command_owners.clone(),
@@ -3393,12 +3537,30 @@ pub fn script_boundary_pair(
         },
         ScriptHostEndpoint {
             event_rx,
+            coalesced_server_tick,
+            coalesced_tick_due: false,
+            highest_delivered_tick: None,
             command_tx,
             player_command_owners,
             #[cfg(any(test, feature = "lua-runtime"))]
             host_admissions,
         },
     )
+}
+
+fn take_coalesced_server_tick(slot: &StdMutex<CoalescedServerTick>) -> Option<ScriptEvent> {
+    let tick = match slot.lock() {
+        Ok(mut slot) => slot.pending.take(),
+        Err(poisoned) => poisoned.into_inner().pending.take(),
+    }?;
+    Some(ScriptEvent::server_tick(tick))
+}
+
+fn has_coalesced_server_tick(slot: &StdMutex<CoalescedServerTick>) -> bool {
+    match slot.lock() {
+        Ok(slot) => slot.pending.is_some(),
+        Err(poisoned) => poisoned.into_inner().pending.is_some(),
+    }
 }
 
 /// Host capability required by privileged outbound script commands.
