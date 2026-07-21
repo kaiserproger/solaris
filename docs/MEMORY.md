@@ -205,10 +205,13 @@ two priorities unless it becomes a common-play blocker or corruption risk.
   capability-gated `list_online_players` query. It returns a
   targeted, sorted, bounded point-in-time identity/pose/dimension snapshot and
   marks truncation; closed session owners are excluded and no live handles are
-  exposed. Plugin readiness and the
-  combat-cooldown fixture are push-fenced by exact Lua messages and simulation
-  ticks; timeouts only fail. General villager roles/work orders and durable
-  entity handles remain absent.
+  exposed. The shipped `online-roster` plugin consumes that result for `/who`
+  and renders it through a server-owned inventory menu; its production TCP/Lua
+  gate checks the connected player's exact name and dimension. Focused Lua
+  coverage proves queue-rejection retry and the 128-byte menu-label bound.
+  Plugin readiness and the combat-cooldown fixture are push-fenced by exact Lua
+  messages and simulation ticks; timeouts only fail. General villager
+  roles/work orders and durable entity handles remain absent.
 - Production and test waits must remain event-driven. Timeouts only fail stuck
   work and never prove success.
 

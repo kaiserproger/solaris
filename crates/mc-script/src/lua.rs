@@ -3773,6 +3773,7 @@ mod tests {
         for (name, expected_commands) in [
             ("currency-catalog", 1_usize),
             ("colony-villager-scaffold", 2_usize),
+            ("online-roster", 0_usize),
         ] {
             let source = read_plugin_source(&examples.join(name)).unwrap();
             assert_eq!(source.manifest.requested_api_version(), SCRIPT_API_VERSION);
@@ -3791,6 +3792,71 @@ mod tests {
                 .unwrap();
             assert_eq!(batch.commands().len(), expected_commands, "{name}");
         }
+    }
+
+    #[test]
+    fn online_roster_recovers_rejected_queries_and_bounds_menu_labels() {
+        let examples = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../examples/plugins");
+        let source = read_plugin_source(&examples.join("online-roster")).unwrap();
+        let mut runtime = LuaScriptRuntime::from_source_with_config(
+            source.manifest,
+            &source.source,
+            source.config,
+            LuaRuntimeLimits::default(),
+        )
+        .unwrap();
+        let controls = RuntimeControls::unrestricted();
+        let command = ScriptEvent::try_player_command_with_context(
+            "online-roster",
+            ScriptPlayerId::new(7),
+            player_context("SixteenCharName1"),
+            "who",
+            "",
+        )
+        .unwrap();
+
+        let first = runtime
+            .handle_event(
+                &command,
+                RuntimeContext::new(&controls, NonZeroUsize::new(1).unwrap()),
+            )
+            .unwrap();
+        assert!(matches!(
+            first.commands(),
+            [ScriptCommand::ListOnlinePlayers { .. }]
+        ));
+        runtime.notify_batch_rejected("queue_full", 1).unwrap();
+
+        let second = runtime
+            .handle_event(
+                &command,
+                RuntimeContext::new(&controls, NonZeroUsize::new(1).unwrap()),
+            )
+            .unwrap();
+        let [ScriptCommand::ListOnlinePlayers { request }] = second.commands() else {
+            panic!("rejected query must be retryable");
+        };
+        let request = request.clone();
+        let dimension = format!("minecraft:{}", "a".repeat(118));
+        let player = crate::ScriptOnlinePlayerSnapshot::try_new(
+            ScriptPlayerId::new(7),
+            player_context("SixteenCharName1"),
+            &dimension,
+        )
+        .unwrap();
+        let result =
+            ScriptEvent::online_players_result("online-roster", &request, vec![player], false)
+                .unwrap();
+        let menu = runtime
+            .handle_event(
+                &result,
+                RuntimeContext::new(&controls, NonZeroUsize::new(1).unwrap()),
+            )
+            .unwrap();
+        let [ScriptCommand::OpenInventoryMenu { menu, .. }] = menu.commands() else {
+            panic!("online result must open one roster menu");
+        };
+        assert_eq!(menu.slots()[0].item().label().unwrap().len(), 128);
     }
 
     #[test]

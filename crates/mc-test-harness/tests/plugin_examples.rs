@@ -26,9 +26,10 @@ struct CatalogMenu {
 }
 
 #[tokio::test]
-async fn shipped_currency_catalog_uses_external_config_over_wire() {
+async fn shipped_inventory_plugins_work_over_wire() {
     let plugins = tempfile::tempdir().expect("plugin tempdir");
     copy_example_plugin("currency-catalog", plugins.path());
+    copy_example_plugin("online-roster", plugins.path());
     let config_path = plugins.path().join("currency-catalog/config.toml");
     let mut config: toml::Table =
         toml::from_str(&std::fs::read_to_string(&config_path).expect("read catalog config"))
@@ -92,7 +93,7 @@ async fn shipped_currency_catalog_uses_external_config_over_wire() {
     let product_price = 2;
     let (boundary, host) = mc_script::start_lua_host(mc_script::LuaHostConfig::new(plugins.path()))
         .expect("start shipped currency catalog");
-    assert_eq!(host.loaded_plugins(), 1);
+    assert_eq!(host.loaded_plugins(), 2);
 
     let world_dir = tempfile::tempdir().expect("disk-backed world tempdir");
     std::fs::create_dir_all(world_dir.path().join("region")).expect("create world region");
@@ -103,6 +104,7 @@ async fn shipped_currency_catalog_uses_external_config_over_wire() {
     let items = Arc::new(mc_data::items::solaris_required_items());
     let currency_id = item_id(&items, currency_resource);
     let product_id = item_id(&items, product_resource);
+    let roster_item_id = item_id(&items, "minecraft:paper");
     let generator = Arc::new(mc_worldgen::TerrainGenerator::new(0, Arc::clone(&blocks)));
     let world =
         mc_world::WorldStorage::open_with_capacity(world_dir.path(), Arc::clone(&blocks), 49)
@@ -249,6 +251,9 @@ async fn shipped_currency_catalog_uses_external_config_over_wire() {
     )
     .await;
     assert_eq!(final_menu.product_count, product_count);
+
+    send_command(&mut client, "who").await;
+    wait_for_roster_menu(&mut client, roster_item_id, "CatalogPlayer").await;
 
     drop(client);
     shutdown.request();
@@ -571,6 +576,47 @@ async fn wait_for_catalog_menu(
         product_id,
         product_count: content.items[0].count,
     }
+}
+
+async fn wait_for_roster_menu(client: &mut Client, item_id: u32, username: &str) {
+    let open = client
+        .wait_for_frame_id_with_timeout_and_limits(
+            ClientboundOpenScreen::ID,
+            Duration::from_secs(5),
+            FRAME_LIMITS,
+        )
+        .await
+        .expect("online roster open frame");
+    let screen = ClientboundOpenScreen::decode(&mut open.frame.body.clone())
+        .expect("decode online roster OpenScreen");
+    assert_eq!(screen.menu_type, 0);
+    assert_eq!(
+        literal_text_component_text(&screen.title_nbt),
+        "Online Players (1)"
+    );
+
+    let content = loop {
+        let outcome = client
+            .wait_for_frame_id_with_timeout_and_limits(
+                ClientboundContainerSetContent::ID,
+                Duration::from_secs(5),
+                FRAME_LIMITS,
+            )
+            .await
+            .expect("online roster content frame");
+        let content = ClientboundContainerSetContent::decode(&mut outcome.frame.body.clone())
+            .expect("decode online roster content");
+        if content.container_id == screen.container_id {
+            break content;
+        }
+    };
+    assert_eq!(content.items.len(), 45);
+    assert_eq!(content.items[0].item_id, item_id);
+    assert_eq!(content.items[0].count, 1);
+    assert_eq!(
+        content.items[0].custom_name.as_deref(),
+        Some(format!("{username} | minecraft:overworld").as_str())
+    );
 }
 
 async fn click_catalog_product(client: &mut Client, menu: &CatalogMenu, button_num: i8) {

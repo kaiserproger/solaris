@@ -599,13 +599,19 @@ the fields of `HostAttached` is not an adapter API. Lua exposes no filesystem,
 network, process, debug, paths, locks, NBT, sessions, or entity pointers.
 
 See [the contract examples](../examples/plugins/) for the configurable currency
-catalog and the intentionally limited colony/villager scaffold.
+catalog, the `/who` inventory roster, and the intentionally limited
+colony/villager scaffold.
 
 `crates/mc-test-harness/tests/plugin_examples.rs` copies those exact shipped
 files into an isolated plugin directory and runs them through the production
 Lua host, server router, storage actor, regional owner, and wire client. The
 catalog gate proves zone entry, menu contents, atomic purchase, insufficient
-funds rejection, unchanged ledger, and refund. The colony gate proves command
+funds rejection, unchanged ledger, and refund. The same wire client invokes the
+shipped `/who` command and proves that a fresh authoritative online-player
+result becomes a server-owned inventory menu with the connected player's name
+and dimension. A focused Lua test proves that command-batch rejection releases
+the requester's pending slot and that the longest valid dimension cannot exceed
+the menu-label bound. The colony gate proves command
 registration, durable recruitment, initial `home`, a later accepted `hold`, and
 the resulting durable status. It then removes the bound villager and proves
 that rejected cached-token application causes one fresh bind and an explicit
