@@ -68,8 +68,17 @@ impl SessionRegistry {
         entity_type_name: String,
         position: Vec3,
     ) -> Vec<VisibilityDispatch> {
+        let chunk = chunk_pos_from_coords(position.x, position.z);
+        let hostile = is_hostile_entity(&entity_type_name);
         let mut inner = self.lock_session_entities("spawn command entity");
-        spawn_command_entity_locked(&mut inner, entity_type_id, entity_type_name, position)
+        let active = hostile && inner.loaded_chunk_refcounts.contains_key(&chunk);
+        let (entity_id, dispatches) =
+            spawn_command_entity_locked(&mut inner, entity_type_id, entity_type_name, position);
+        drop(inner);
+        if active {
+            self.publish_active_hostile_entity(entity_id);
+        }
+        dispatches
     }
 
     pub(in crate::play) fn tick_dying_entities(
@@ -108,7 +117,7 @@ pub(super) fn spawn_command_entity_locked(
     entity_type_id: i32,
     entity_type_name: String,
     position: Vec3,
-) -> Vec<VisibilityDispatch> {
+) -> (EntityId, Vec<VisibilityDispatch>) {
     let hostile = is_hostile_entity(&entity_type_name);
     let mut entity = SpawnEntity::new(entity_type_id, entity_type_name, position);
     apply_entity_facts(&mut entity);
@@ -124,7 +133,7 @@ pub(super) fn spawn_command_entity_locked(
         .or_insert(aabb);
     track_entity_chunk_locked(inner, id, position);
     initialize_entity_wire_state_locked(inner, id);
-    spawn_entity_visibility_locked(inner, id)
+    (id, spawn_entity_visibility_locked(inner, id))
 }
 
 pub(super) fn finish_dying_entities_locked(

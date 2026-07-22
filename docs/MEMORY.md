@@ -78,15 +78,20 @@ and is not startup context.
   20-minute MCP survival session with subagent-made decisions, no deterministic
   scenario runner, and no operator setup; subjective combat feel remains open.
 - Hostile attack planning no longer holds `SessionRegistry.inner` across
-  regional entity-owner requests. It copies live target pose/visibility, runs
-  creeper fuse CAS, skeleton arrow spawn, and melee attacker validation through
-  regional owners. Final melee admission uses per-session immutable
+  regional entity-owner requests. It reads a dedicated active-hostile ID
+  publication, stable per-session target/visibility snapshots, and an atomic
+  skeleton arrow type, then runs creeper fuse CAS, arrow spawn, and melee
+  attacker validation through regional owners. Final melee admission uses
+  per-session immutable
   combat-target/visibility snapshots and accepts an ordered reservation only if
   their shared odd/even publication epoch stays unchanged. Disconnect publishes
   non-targetable before queue close. Final melee does not reacquire the global
   session registry. Focused races cover attacker/target death, movement,
   Spectator, unregister, and completion while that registry is held elsewhere;
-  manual feel remains pending.
+  an ordinary whole melee tick also completes under that held lock. Regional
+  selection replaces the hostile publication before attacks on each goal turn;
+  unload and zero-live-session paths clear it without later owner reads. Manual
+  feel remains pending.
 - The exact dense 5,132-cow O3 gate is closed. The final reproduced cause was
   an unanswered keepalive challenge while valid movement packets still proved
   the client alive. Solaris now preserves one pending challenge, requires both

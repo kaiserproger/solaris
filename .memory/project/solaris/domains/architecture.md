@@ -84,9 +84,16 @@ Current runtime facts:
   count and perform no session-registry or owner-lane read. A transition to zero
   live players pushes generation-fenced hostile-target reconciliation after
   releasing the session lock; do not restore per-tick empty-player ECS scans.
-- Hostile attack planning copies live target poses and immutable visibility
-  sets, then releases `SessionRegistry.inner`. Creeper fuse CAS, arrow spawn,
-  and batched melee-attacker validation execute on regional owners. Final melee
+- Regional entity selection publishes a dedicated immutable active-hostile ID
+  set before hostile attacks on each regional goal-selection turn; command
+  spawns in loaded chunks join immediately. While an entity physics job is in
+  flight both goal selection and publication are retained from the prior turn.
+  A live-session generation fence clears any publication racing the last player
+  disconnect. Hostile planning reads the set plus stable per-session target/
+  visibility snapshots and an atomic skeleton arrow type, so ordinary candidate
+  and target discovery never enters `SessionRegistry.inner`. Creeper fuse CAS,
+  arrow spawn, and batched melee-
+  attacker validation execute on regional owners. Final melee
   admission reads the per-session `ArcSwap` combat-target and visibility
   snapshots and reserves output through the ordered session queue under one
   shared odd/even publication epoch. Target/visibility mutation opens the epoch

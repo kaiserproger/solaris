@@ -217,8 +217,16 @@ queues are not lock-free, but ordinary movement publication no longer enters
 the global session mutex and stale tracker, session, and visibility plans are
 still rejected.
 Goal input snapshots exclude dead sessions before hostile target selection.
-Hostile attacks copy live target positions and immutable visibility sets under
-the session lock, then release it before planning or touching regional owners.
+Each regional goal-selection turn publishes its current active hostile ID set
+separately from the full active entity set before hostile attacks run. Command-
+spawned hostiles in loaded chunks join immediately. If a prior entity physics
+job is still in flight, goal selection is skipped and both publications remain
+from the prior turn. A live-session generation fence prevents selection or a
+command spawn from republishing hostiles after the final player disconnects.
+Hostile attacks read that immutable set and stable per-session combat-target and
+visibility snapshots without taking the session lock before planning or
+touching regional owners. The skeleton arrow type is an atomically published
+startup resource, so ordinary target discovery has no registry read either.
 Creeper fuse CAS, arrow spawning, and the batched current-melee-attacker read
 therefore run without `SessionRegistry.inner`. Each session publishes one
 immutable combat-target snapshot containing its current pose and combined

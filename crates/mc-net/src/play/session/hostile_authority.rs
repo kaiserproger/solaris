@@ -188,16 +188,7 @@ impl SessionRegistry {
         tick: u64,
         air: BlockStateId,
     ) -> (usize, Vec<VisibilityDispatch>) {
-        let loaded_entity_ids = {
-            let inner = self.lock_inner("snapshot loaded hostile candidates");
-            inner
-                .loaded_chunk_refcounts
-                .keys()
-                .filter_map(|chunk| inner.entities_by_chunk.get(chunk))
-                .flat_map(|entities| entities.iter().copied())
-                .filter(|entity_id| inner.hostile_entities.contains(entity_id))
-                .collect::<HashSet<_>>()
-        };
+        let loaded_entity_ids = self.active_hostile_entities.load_full();
         if loaded_entity_ids.is_empty() {
             return (0, Vec::new());
         }
@@ -247,24 +238,21 @@ impl SessionRegistry {
             return (0, Vec::new());
         }
 
-        let (targets, arrow_entity_type_id) = {
-            let inner = self.lock_inner("snapshot hostile attack targets");
-            let targets = inner
-                .sessions
-                .iter()
-                .filter_map(|(&id, session)| {
-                    if inner.spectator_sessions.contains(&id) || inner.dead_sessions.contains(&id) {
-                        return None;
-                    }
-                    Some(HostileTargetTickSession {
-                        id,
-                        position: Vec3::new(session.pose.x, session.pose.y, session.pose.z),
-                        visible_entities: session.visible_entities.snapshot(),
-                    })
+        let targets = self
+            .movement_recipients
+            .load_full()
+            .values()
+            .filter_map(|publication| {
+                let (target, visible_entities) = publication.combat_target_snapshot()?;
+                target.is_targetable().then_some(HostileTargetTickSession {
+                    id: publication.id(),
+                    position: Vec3::new(target.pose().x, target.pose().y, target.pose().z),
+                    visible_entities,
                 })
-                .collect::<Vec<_>>();
-            (targets, inner.arrow_kill_rewards.arrow_entity_type_id)
-        };
+            })
+            .collect::<Vec<_>>();
+        let arrow_entity_type_id = self.hostile_arrow_entity_type_id.load(Ordering::Acquire);
+        let arrow_entity_type_id = (arrow_entity_type_id >= 0).then_some(arrow_entity_type_id);
 
         let mut creeper_fuses = Vec::new();
         let mut skeleton_attacks = Vec::new();

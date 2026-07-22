@@ -402,6 +402,95 @@ fn hostile_melee_publication_finishes_while_session_registry_is_held_elsewhere()
 }
 
 #[test]
+fn ordinary_hostile_melee_tick_never_waits_for_session_registry() {
+    let registry = Arc::new(SessionRegistry::new());
+    let player = register_test_session(&registry, "DetachedHostileTick");
+    assert!(registry.mark_loaded(player, (0, 0)).is_empty());
+    registry.spawn_command_entity(
+        &SimulationAuthority::for_test(),
+        54,
+        "minecraft:zombie".to_owned(),
+        Vec3::new(0.5, 64.0, 1.5),
+    );
+    assert_eq!(
+        registry.tick_entities_and_collect_physics_queries(1).len(),
+        1
+    );
+    let due_tick = due_melee_tick(&registry);
+    let session_guard = registry.inner.lock().expect("session registry poisoned");
+    let (finished_tx, finished_rx) = std::sync::mpsc::channel();
+    let attack_registry = Arc::clone(&registry);
+    let attack = std::thread::spawn(move || {
+        let result = attack_registry.tick_hostile_attacks(
+            &SimulationAuthority::for_test(),
+            due_tick,
+            BlockStateId(0),
+        );
+        finished_tx
+            .send(result)
+            .expect("hostile completion receiver remains");
+    });
+
+    let (attacks, dispatches) = finished_rx
+        .recv_timeout(Duration::from_secs(1))
+        .expect("ordinary melee tick must not wait for the session registry");
+    drop(session_guard);
+    attack.join().expect("hostile attack worker");
+
+    assert_eq!(attacks, 1);
+    assert!(dispatches.iter().any(|dispatch| {
+        dispatch.recipient.id == player
+            && matches!(dispatch.command, OutboundCommand::DamagePlayer { .. })
+    }));
+}
+
+#[test]
+fn hostile_tick_uses_current_loaded_selection_and_clears_without_players() {
+    let registry = SessionRegistry::new();
+    let player = register_test_session(&registry, "HostileSelectionTarget");
+    assert!(registry.mark_loaded(player, (0, 0)).is_empty());
+    registry.spawn_command_entity(
+        &SimulationAuthority::for_test(),
+        54,
+        "minecraft:zombie".to_owned(),
+        Vec3::new(0.5, 64.0, 1.5),
+    );
+    let zombie = registry.persisted_entity_records()[0].snapshot.id;
+
+    assert_eq!(
+        registry.tick_entities_and_collect_physics_queries(1).len(),
+        1
+    );
+    assert!(registry.active_hostile_entities.load().contains(&zombie));
+
+    registry.mark_unloaded(player, &[(0, 0)]);
+    assert!(
+        registry
+            .tick_entities_and_collect_physics_queries(2)
+            .is_empty()
+    );
+    assert!(registry.active_hostile_entities.load().is_empty());
+    registry.reset_entity_owner_requests_for_test();
+    let (attacks, dispatches) = registry.tick_hostile_attacks(
+        &SimulationAuthority::for_test(),
+        due_melee_tick(&registry),
+        BlockStateId(0),
+    );
+    assert_eq!(attacks, 0);
+    assert!(dispatches.is_empty());
+    assert_eq!(registry.entity_owner_requests_for_test(), 0);
+
+    registry.mark_loaded(player, (0, 0));
+    assert_eq!(
+        registry.tick_entities_and_collect_physics_queries(3).len(),
+        1
+    );
+    registry.unregister(player);
+    assert!(registry.active_simulation_entities.load().is_empty());
+    assert!(registry.active_hostile_entities.load().is_empty());
+}
+
+#[test]
 fn nearby_creeper_primes_once_and_explodes_after_thirty_ticks() {
     let registry = SessionRegistry::new();
     let player = register_test_session(&registry, "CreeperTarget");

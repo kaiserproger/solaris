@@ -86,16 +86,20 @@ hardening. An already-open lower-priority diff does not override this order.
 
 - Hostile melee now keeps a zero-speed target-facing goal while in reach, so a
   stationary zombie stops without freezing its body/head rotation and publishes
-  the corrected facing to observers. Hostile ticks now copy target pose and
-  visibility, release the session registry, and perform creeper, skeleton, and
-  melee owner work on regional lanes. Final melee publication reads per-session
+  the corrected facing to observers. Hostile ticks now read a dedicated active-
+  hostile publication plus stable per-session pose/visibility snapshots and
+  perform creeper, skeleton, and melee owner work on regional lanes without a
+  global registry read. Final melee publication reads per-session
   immutable combat-target and visibility snapshots, rechecks target life, pose,
   vertical reach, and range, then reserves ordered output only while a shared
   target/visibility epoch remains unchanged and even. It never reacquires the
   global session registry. Focused tests cover an unmoving player, facing,
   attacker/target death, movement out of range, Spectator transition,
   unregister-after-snapshot, and completion while another thread deliberately
-  holds the session registry. The existing TCP survival zombie damage/kill/drop
+  holds the session registry; a whole ordinary melee tick is covered by the same
+  lock exclusion. Regional selection publishes current loaded hostiles before
+  attacks on each goal turn; unload and last-player disconnect clear that input
+  without a later owner read. The existing TCP survival zombie damage/kill/drop
   test also remains green. A real-client feel check remains pending.
 
 - A fresh isolated O3 server and real 26.1.2 client completed the hostile-mob

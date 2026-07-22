@@ -211,6 +211,18 @@ impl MovementRecipientPublication {
         self.combat_target.load_full()
     }
 
+    pub(super) fn combat_target_snapshot(
+        &self,
+    ) -> Option<(PublishedCombatTargetState, Arc<HashSet<EntityId>>)> {
+        let before = self.publication_epoch.load();
+        if !before.is_multiple_of(2) {
+            return None;
+        }
+        let target = *self.combat_target();
+        let visible_entities = self.visible_entities();
+        (self.publication_epoch.load() == before).then_some((target, visible_entities))
+    }
+
     pub(super) fn reserve_combat_recipient_if(
         &self,
         validate: impl FnOnce(PublishedCombatTargetState, &HashSet<EntityId>) -> bool,

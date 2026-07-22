@@ -12,7 +12,7 @@ use mc_entity::{
 };
 use std::cell::RefCell;
 use std::ops::{Deref, DerefMut};
-use std::sync::atomic::{AtomicU32, AtomicU64, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicI32, AtomicU32, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Mutex, MutexGuard};
 
 mod campfire_authority;
@@ -399,7 +399,6 @@ struct PreparedChunkCache {
 struct ArrowKillRewards {
     item_entity_type_id: Option<i32>,
     xp_orb_entity_type_id: Option<i32>,
-    arrow_entity_type_id: Option<i32>,
     items: Option<Arc<ItemRegistry>>,
     item_facts: Option<Arc<ItemFactsTable>>,
     loot: Option<Arc<mc_data::loot::LootTables>>,
@@ -450,6 +449,8 @@ pub(crate) struct SessionRegistry {
     inner: Mutex<SessionRegistryInner>,
     movement_recipients: arc_swap::ArcSwap<MovementRecipientIndex>,
     active_simulation_entities: arc_swap::ArcSwap<HashSet<EntityId>>,
+    active_hostile_entities: arc_swap::ArcSwap<HashSet<EntityId>>,
+    hostile_arrow_entity_type_id: AtomicI32,
     prepared_cache: Mutex<PreparedChunkCache>,
     entities: SessionEntityOwners,
     world_chunk_journal: Mutex<Option<super::world_journal::WorldChunkJournal>>,
@@ -733,6 +734,8 @@ impl SessionRegistry {
             inner: Mutex::new(SessionRegistryInner::default()),
             movement_recipients: arc_swap::ArcSwap::from_pointee(MovementRecipientIndex::new()),
             active_simulation_entities: arc_swap::ArcSwap::from_pointee(HashSet::new()),
+            active_hostile_entities: arc_swap::ArcSwap::from_pointee(HashSet::new()),
+            hostile_arrow_entity_type_id: AtomicI32::new(-1),
             prepared_cache: Mutex::new(PreparedChunkCache::default()),
             entities: SessionEntityOwners::new(
                 Arc::clone(&pressure_observation),
@@ -988,14 +991,47 @@ impl SessionRegistry {
         self.live_session_count.load(Ordering::Acquire) != 0
     }
 
-    fn publish_active_simulation_entities(&self, entities: HashSet<EntityId>) {
+    fn publish_active_entity_selection(
+        &self,
+        expected_live_session_generation: u64,
+        entities: HashSet<EntityId>,
+        hostiles: HashSet<EntityId>,
+    ) {
         self.active_simulation_entities.store(Arc::new(entities));
+        self.active_hostile_entities.store(Arc::new(hostiles));
+        if self.live_session_generation.load(Ordering::Acquire) != expected_live_session_generation
+            || !self.has_live_sessions()
+        {
+            self.clear_active_simulation_entities();
+        }
+    }
+
+    fn publish_active_hostile_entity(&self, entity: EntityId) {
+        if !self.has_live_sessions() {
+            return;
+        }
+        let live_session_generation = self.live_session_generation.load(Ordering::Acquire);
+        let current = self.active_hostile_entities.load_full();
+        if current.contains(&entity) {
+            return;
+        }
+        let mut next = (*current).clone();
+        next.insert(entity);
+        self.active_hostile_entities.store(Arc::new(next));
+        if self.live_session_generation.load(Ordering::Acquire) != live_session_generation
+            || !self.has_live_sessions()
+        {
+            self.active_hostile_entities.store(Arc::new(HashSet::new()));
+        }
     }
 
     fn clear_active_simulation_entities(&self) {
         if !self.active_simulation_entities.load().is_empty() {
             self.active_simulation_entities
                 .store(Arc::new(HashSet::new()));
+        }
+        if !self.active_hostile_entities.load().is_empty() {
+            self.active_hostile_entities.store(Arc::new(HashSet::new()));
         }
     }
 
@@ -1004,7 +1040,11 @@ impl SessionRegistry {
         &self,
         entities: impl IntoIterator<Item = EntityId>,
     ) {
-        self.publish_active_simulation_entities(entities.into_iter().collect());
+        self.publish_active_entity_selection(
+            self.live_session_generation.load(Ordering::Acquire),
+            entities.into_iter().collect(),
+            HashSet::new(),
+        );
     }
 
     fn lock_entities(&self, operation: &'static str) -> EntityStoreGuard<'_> {
@@ -1474,11 +1514,12 @@ impl SessionRegistry {
         inner.arrow_kill_rewards = ArrowKillRewards {
             item_entity_type_id,
             xp_orb_entity_type_id,
-            arrow_entity_type_id,
             items: Some(items),
             item_facts: Some(item_facts),
             loot: Some(loot),
         };
+        self.hostile_arrow_entity_type_id
+            .store(arrow_entity_type_id.unwrap_or(-1), Ordering::Release);
     }
 
     pub(crate) fn configure_player_combat(

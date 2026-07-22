@@ -190,6 +190,7 @@ impl SessionRegistry {
             self.clear_active_simulation_entities();
             return Vec::new();
         }
+        let live_session_generation = self.live_session_generation.load(Ordering::Acquire);
         let (world_read, pathing_materials) = pathing.unzip();
         let (active_chunks, active_entity_candidates, player_positions, terrain_pathing_entities) = {
             let inner = self.lock_inner("snapshot entity tick inputs");
@@ -222,6 +223,7 @@ impl SessionRegistry {
             return Vec::new();
         }
         let mut active_entity_ids = HashSet::new();
+        let mut active_hostile_ids = HashSet::new();
         let mut sheep_grazing_entities = HashSet::new();
         let mut active_entity_aabbs = HashMap::new();
         let mut active_entity_kinds = HashMap::new();
@@ -235,6 +237,9 @@ impl SessionRegistry {
                     && entity_is_near_player_chunk(chunk, &player_positions, simulation_distance)
                 {
                     active_entity_ids.insert(entity.id);
+                    if is_hostile_entity(entity.type_name) {
+                        active_hostile_ids.insert(entity.id);
+                    }
                     if entity.retained.sheep_grazing_ticks.is_some() {
                         sheep_grazing_entities.insert(entity.id);
                     }
@@ -271,7 +276,11 @@ impl SessionRegistry {
                 }
             }
         });
-        self.publish_active_simulation_entities(active_entity_ids.clone());
+        self.publish_active_entity_selection(
+            live_session_generation,
+            active_entity_ids.clone(),
+            active_hostile_ids,
+        );
         if active_entity_ids.is_empty() {
             return Vec::new();
         }

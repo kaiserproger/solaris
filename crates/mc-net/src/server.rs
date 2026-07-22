@@ -1288,14 +1288,6 @@ impl BoundServer {
                     )
                     .await;
                 let mut animal_breeding_us = elapsed_us(started);
-                let started = Instant::now();
-                simulation_owner.tick_hostile_attacks(
-                    &entity_sessions,
-                    tick,
-                    play::air_state_id(&entity_config.blocks),
-                );
-                let hostile_attacks_us = elapsed_us(started);
-
                 let physics_was_in_flight = entity_physics_job.is_some();
                 let started = Instant::now();
                 let queries = if physics_was_in_flight {
@@ -1313,6 +1305,13 @@ impl BoundServer {
                     )
                 };
                 let entity_goals_us = elapsed_us(started);
+                let started = Instant::now();
+                simulation_owner.tick_hostile_attacks(
+                    &entity_sessions,
+                    tick,
+                    play::air_state_id(&entity_config.blocks),
+                );
+                let hostile_attacks_us = elapsed_us(started);
                 let started = Instant::now();
                 simulation_owner.tick_animal_breeding(&entity_sessions);
                 animal_breeding_us = animal_breeding_us.saturating_add(elapsed_us(started));
