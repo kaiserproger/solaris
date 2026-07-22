@@ -782,6 +782,7 @@ async fn survival_campfire_in_flight_state_resumes_after_reopen() {
     };
     let bound = mc_net::bind(cfg).await.expect("bind first server");
     let first_addr = bound.local_addr().expect("first local_addr");
+    let first_save = bound.save_handle();
     let first_task = tokio::spawn(async move { bound.serve().await });
 
     let (mut client, sync) = connect_to_play(first_addr, "M100CampResumeA").await;
@@ -846,12 +847,10 @@ async fn survival_campfire_in_flight_state_resumes_after_reopen() {
         .expect("start campfire cooking");
     wait_for_campfire_input_visual_and_slot(&mut client, campfire_pos, &porkchop_name).await;
 
-    {
-        let mut storage = first_world.lock().await;
-        storage
-            .flush_dirty()
-            .expect("flush in-flight campfire state");
-    }
+    assert!(
+        first_save.save_all().await.is_ok(),
+        "save in-flight campfire state through the simulation barrier"
+    );
 
     drop(client);
     first_shutdown.request();
