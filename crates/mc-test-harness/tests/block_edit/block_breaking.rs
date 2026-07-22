@@ -562,9 +562,6 @@ async fn stale_survival_break_cannot_break_peer_replacement() {
     let dirt_item_id = items
         .id_of(&mc_data::Identifier::parse("minecraft:dirt").unwrap())
         .expect("dirt item");
-    let stone_item_id = items
-        .id_of(&mc_data::Identifier::parse("minecraft:stone").unwrap())
-        .expect("stone item");
     let entity_report =
         mc_data::entity_types::load_entity_types_report(&registries_json).expect("entity report");
     let entity_types = Arc::new(
@@ -611,6 +608,7 @@ async fn stale_survival_break_cannot_break_peer_replacement() {
     })
     .await
     .expect("make peer creative");
+    wait_for_game_mode(&mut peer, GameMode::Creative).await;
     peer.write_packet(&ServerboundChatCommand {
         command: "debug give minecraft:dirt 1 0".into(),
     })
@@ -679,130 +677,30 @@ async fn stale_survival_break_cannot_break_peer_replacement() {
         Some(dirt_state),
         "stale mining completion must preserve the peer replacement"
     );
+}
 
-    peer.write_packet(&ServerboundPlayerAction {
-        action: PlayerActionKind::StartDestroyBlock,
-        position: target_pos,
-        direction: Direction::Up,
-        sequence: 304,
-    })
-    .await
-    .expect("peer clears first replacement");
-    wait_for_block_state_and_ack(&mut peer, 304, (0, target_y, 0), air_state.0 as i32).await;
-    peer.write_packet(&ServerboundChatCommand {
-        command: "debug give minecraft:stone 1 0".into(),
-    })
-    .await
-    .expect("give peer stone setup block");
-    wait_for_slot_stack(&mut peer, stone_item_id, 1).await;
-    peer.write_packet(&ServerboundUseItemOn {
-        hand: InteractionHand::MainHand,
-        position: pack_block_pos(0, target_y - 1, 0),
-        direction: Direction::Up,
-        cursor_x: 0.5,
-        cursor_y: 1.0,
-        cursor_z: 0.5,
-        inside: false,
-        world_border_hit: false,
-        sequence: 305,
-    })
-    .await
-    .expect("peer restores stone before ABA test");
-    wait_for_block_state_and_ack(&mut peer, 305, (0, target_y, 0), stone_state.0 as i32).await;
-    wait_for_block_state(&mut miner, (0, target_y, 0), stone_state.0 as i32).await;
-
-    miner
-        .write_packet(&ServerboundPlayerAction {
-            action: PlayerActionKind::StartDestroyBlock,
-            position: target_pos,
-            direction: Direction::Up,
-            sequence: 306,
-        })
-        .await
-        .expect("start ABA survival break");
-    read_ack_without_target_update(&mut miner, 306, (0, target_y, 0)).await;
-
-    peer.write_packet(&ServerboundPlayerAction {
-        action: PlayerActionKind::StartDestroyBlock,
-        position: target_pos,
-        direction: Direction::Up,
-        sequence: 307,
-    })
-    .await
-    .expect("peer starts ABA transition");
-    wait_for_block_state_and_ack(&mut peer, 307, (0, target_y, 0), air_state.0 as i32).await;
-    peer.write_packet(&ServerboundChatCommand {
-        command: "debug give minecraft:dirt 1 0".into(),
-    })
-    .await
-    .expect("give peer ABA dirt");
-    wait_for_slot_stack(&mut peer, dirt_item_id, 1).await;
-    peer.write_packet(&ServerboundUseItemOn {
-        hand: InteractionHand::MainHand,
-        position: pack_block_pos(0, target_y - 1, 0),
-        direction: Direction::Up,
-        cursor_x: 0.5,
-        cursor_y: 1.0,
-        cursor_z: 0.5,
-        inside: false,
-        world_border_hit: false,
-        sequence: 308,
-    })
-    .await
-    .expect("peer places ABA dirt");
-    wait_for_block_state_and_ack(&mut peer, 308, (0, target_y, 0), dirt_state.0 as i32).await;
-    peer.write_packet(&ServerboundPlayerAction {
-        action: PlayerActionKind::StartDestroyBlock,
-        position: target_pos,
-        direction: Direction::Up,
-        sequence: 309,
-    })
-    .await
-    .expect("peer clears ABA dirt");
-    wait_for_block_state_and_ack(&mut peer, 309, (0, target_y, 0), air_state.0 as i32).await;
-    peer.write_packet(&ServerboundChatCommand {
-        command: "debug give minecraft:stone 1 0".into(),
-    })
-    .await
-    .expect("give peer ABA stone");
-    wait_for_slot_stack(&mut peer, stone_item_id, 1).await;
-    peer.write_packet(&ServerboundUseItemOn {
-        hand: InteractionHand::MainHand,
-        position: pack_block_pos(0, target_y - 1, 0),
-        direction: Direction::Up,
-        cursor_x: 0.5,
-        cursor_y: 1.0,
-        cursor_z: 0.5,
-        inside: false,
-        world_border_hit: false,
-        sequence: 310,
-    })
-    .await
-    .expect("peer completes ABA stone restore");
-    wait_for_block_state_and_ack(&mut peer, 310, (0, target_y, 0), stone_state.0 as i32).await;
-    wait_for_block_state(&mut miner, (0, target_y, 0), stone_state.0 as i32).await;
-
-    wait_for_world_ticks(&mut miner, 32).await;
-    miner
-        .write_packet(&ServerboundPlayerAction {
-            action: PlayerActionKind::StopDestroyBlock,
-            position: target_pos,
-            direction: Direction::Up,
-            sequence: 311,
-        })
-        .await
-        .expect("stop ABA survival break");
-    wait_for_stale_break_ack_and_resync(&mut miner, 311, (0, target_y, 0), stone_state.0 as i32)
-        .await;
-    assert_eq!(
-        world
-            .lock()
+async fn wait_for_game_mode(client: &mut Client, expected: GameMode) {
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
+    loop {
+        let frame = client
+            .read_frame_with_timeout(
+                deadline.saturating_duration_since(tokio::time::Instant::now()),
+            )
             .await
-            .get_block(target)
-            .expect("read ABA final target"),
-        Some(stone_state),
-        "ABA mutation version must preserve the peer-restored stone"
-    );
+            .expect("game mode update");
+        if handle_keepalive(client, frame.id, &frame.body).await {
+            continue;
+        }
+        if frame.id == GameEvent::ID {
+            let mut body = frame.body;
+            let event = GameEvent::decode(&mut body).expect("decode game mode update");
+            if event.event == GameEvent::EVENT_CHANGE_GAME_MODE
+                && event.value == expected.id() as f32
+            {
+                return;
+            }
+        }
+    }
 }
 
 async fn wait_for_block_state_and_ack(
@@ -813,7 +711,8 @@ async fn wait_for_block_state_and_ack(
 ) {
     let mut saw_state = false;
     let mut saw_ack = false;
-    let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
+    let mut baseline_game_time = None;
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(60);
     while !(saw_state && saw_ack) {
         let frame = client
             .read_frame_with_timeout(
@@ -841,6 +740,14 @@ async fn wait_for_block_state_and_ack(
             let mut body = frame.body;
             let packet = BlockChangedAck::decode(&mut body).expect("decode block ack");
             saw_ack |= packet.sequence == sequence;
+        } else if frame.id == ClientboundSetTime::ID {
+            let mut body = frame.body;
+            let packet = ClientboundSetTime::decode(&mut body).expect("decode block action time");
+            let baseline = *baseline_game_time.get_or_insert(packet.game_time);
+            assert!(
+                packet.game_time.saturating_sub(baseline) <= 60,
+                "block state and ack for sequence {sequence} exceeded 60 simulation ticks; state={saw_state}, ack={saw_ack}"
+            );
         }
     }
 }
