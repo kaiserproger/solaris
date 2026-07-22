@@ -38,8 +38,13 @@ Current runtime facts:
   through the coordinator. Versioned referenced-goal reads carry the same
   per-lane version vector; their CAS locks selected lanes in stable lane-id
   order while unrelated direct lane operations remain independent. The
-  topology gate remains for actor fallbacks, global indexes, and
-  reconfiguration; ADR 0005 owns the distinction.
+  exclusive topology gate remains for actor fallbacks that change ownership or
+  global indexes and for reconfiguration; ADR 0005 owns the distinction.
+- Actor fallbacks for lane-local goal, animal, item, velocity, damage, and
+  effect mutations use shared topology plus successfully resolved touched-lane
+  admissions in stable lane-id order. Malformed ownership routes and actor
+  operations that can change region ownership or global indexes remain
+  exclusive.
 - Physics owner CAS returns its committed kinematics batch directly. The
   network adapter must not restore the removed immediate owner reread; it keeps
   one current-state read at the publication boundary.

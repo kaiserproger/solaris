@@ -480,6 +480,14 @@ decision. Referenced mutations additionally validate every selected entity,
 including non-mutated targets, while holding the corresponding lane admissions.
 This order prevents reconfiguration, migration, or a target mutation from
 making a validated route stale before prepare.
+Coordinator fallbacks for lane-local animal state, goals, item stacks,
+velocities, damage, and effects now follow the same lock order: shared topology
+gate, then successfully resolved touched owner admissions in ascending lane id.
+A malformed ownership-to-lane route retains the exclusive topology fence. A
+valid fallback stalled on one lane therefore no longer holds the exclusive
+topology gate or blocks direct work in unrelated lanes. Spawn, remove,
+position/region changes, full snapshot replacement, save/reconfigure, and other
+global-index operations remain on the exclusive side.
 Hostile goal planning now compares the computed goal with the goal already in
 the simulation view. Equal wander, follow-position, or idle goals are removed
 before the owner call, and an empty diff sends no command. This reduces the

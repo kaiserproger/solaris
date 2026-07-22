@@ -1070,6 +1070,8 @@ pub struct RegionalOwnerHandle {
     selected_read_probe: Arc<std::sync::Mutex<Option<SelectedReadProbe>>>,
     #[cfg(test)]
     referenced_goal_fallback_probe: Arc<std::sync::Mutex<Option<std::sync::mpsc::Sender<()>>>>,
+    #[cfg(test)]
+    direct_mutation_admission_probe: Arc<std::sync::Mutex<Option<std::sync::mpsc::Sender<bool>>>>,
 }
 
 #[cfg(test)]
@@ -1328,12 +1330,47 @@ enum RegionalOwnerCommand {
         entered: std::sync::mpsc::Sender<()>,
         release: Receiver<()>,
     },
+    #[cfg(test)]
+    HoldLaneForTest {
+        entity: EntityId,
+        entered: std::sync::mpsc::Sender<()>,
+        release: Receiver<()>,
+    },
     Shutdown {
         reply: std::sync::mpsc::Sender<Result<RegionalEntityStore, RegionalOwnerShutdownError>>,
     },
 }
 
 impl RegionalOwnerCommand {
+    fn lane_scoped_entities(&self) -> Option<Vec<EntityId>> {
+        match self {
+            Self::SetAnimalStatesIfCurrent { states, .. } => {
+                Some(states.iter().map(|(snapshot, _)| snapshot.id).collect())
+            }
+            Self::SetGoal { entity, goal, .. } => Some(
+                std::iter::once(*entity)
+                    .chain(goal_reference(goal))
+                    .collect(),
+            ),
+            Self::SetGoals { goals, .. } => Some(
+                goals
+                    .iter()
+                    .flat_map(|(entity, goal)| std::iter::once(*entity).chain(goal_reference(goal)))
+                    .collect(),
+            ),
+            Self::SetItemStack { entity, .. } | Self::Damage { entity, .. } => Some(vec![*entity]),
+            Self::SetItemStackIfCurrent { expected, .. }
+            | Self::DamageIfCurrent { expected, .. }
+            | Self::ApplyEffectIfCurrent { expected, .. } => Some(vec![expected.id]),
+            Self::SetVelocities { velocities, .. } => {
+                Some(velocities.iter().map(|(entity, _)| *entity).collect())
+            }
+            #[cfg(test)]
+            Self::HoldLaneForTest { entity, .. } => Some(vec![*entity]),
+            _ => None,
+        }
+    }
+
     fn mutates_entity_snapshots(&self) -> bool {
         matches!(
             self,
@@ -1377,6 +1414,28 @@ impl RegionalOwnerCommand {
                     | Self::Shutdown { .. }
             )
     }
+}
+
+fn owner_readers_for_entities(
+    coordinator: &RegionalOwnerCoordinator,
+    entities: impl IntoIterator<Item = EntityId>,
+) -> Result<Vec<RegionalOwnerLaneReader>, RegionOwnerLaneError> {
+    let mut readers = BTreeMap::new();
+    for entity in entities {
+        let Some(key) = coordinator.locations.get(&entity).copied() else {
+            continue;
+        };
+        let lease = coordinator
+            .ownership
+            .lease(key)
+            .ok_or(RegionOwnerLaneError::StaleLease)?;
+        let owner = coordinator
+            .lanes
+            .get(&lease.lane)
+            .ok_or(RegionOwnerLaneError::WrongLane)?;
+        readers.entry(lease.lane).or_insert_with(|| owner.reader());
+    }
+    Ok(readers.into_values().collect())
 }
 
 impl RegionalOwnerHandle {
@@ -1605,6 +1664,31 @@ impl RegionalOwnerHandle {
     }
 
     #[cfg(test)]
+    fn notify_direct_mutation_admission_for_test(&self, entered: std::sync::mpsc::Sender<bool>) {
+        *self
+            .direct_mutation_admission_probe
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(entered);
+    }
+
+    #[cfg(test)]
+    fn notify_direct_mutation_admission_probe(&self, owner: &RegionalOwnerLaneReader) {
+        let Some(probe) = self
+            .direct_mutation_admission_probe
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .take()
+        else {
+            return;
+        };
+        let blocked = matches!(
+            owner.admission().try_lock(),
+            Err(std::sync::TryLockError::WouldBlock)
+        );
+        let _ = probe.send(blocked);
+    }
+
+    #[cfg(test)]
     fn hold_coordinator_for_test(
         &self,
         entered: std::sync::mpsc::Sender<()>,
@@ -1612,6 +1696,22 @@ impl RegionalOwnerHandle {
     ) -> Result<(), RegionOwnerLaneError> {
         self.sender
             .send(RegionalOwnerCommand::HoldForTest { entered, release })
+            .map_err(|_| RegionOwnerLaneError::Closed)
+    }
+
+    #[cfg(test)]
+    fn hold_owner_lane_for_test(
+        &self,
+        entity: EntityId,
+        entered: std::sync::mpsc::Sender<()>,
+        release: Receiver<()>,
+    ) -> Result<(), RegionOwnerLaneError> {
+        self.sender
+            .send(RegionalOwnerCommand::HoldLaneForTest {
+                entity,
+                entered,
+                release,
+            })
             .map_err(|_| RegionOwnerLaneError::Closed)
     }
 
@@ -2166,6 +2266,8 @@ impl RegionalOwnerHandle {
         drop(cached);
         let owner = routes.values().next()?.owner.clone();
         Some((|| {
+            #[cfg(test)]
+            self.notify_direct_mutation_admission_probe(&owner);
             let _lane_admission = (!lane_admission_held).then(|| {
                 owner
                     .admission()
@@ -2581,6 +2683,8 @@ impl RegionalOwnerRuntime {
         let selected_read_probe = Arc::new(std::sync::Mutex::new(None));
         #[cfg(test)]
         let referenced_goal_fallback_probe = Arc::new(std::sync::Mutex::new(None));
+        #[cfg(test)]
+        let direct_mutation_admission_probe = Arc::new(std::sync::Mutex::new(None));
         let (sender, receiver) = sync_channel(64);
         let (start, started) = channel();
         let worker = match std::thread::Builder::new()
@@ -2620,6 +2724,8 @@ impl RegionalOwnerRuntime {
                 selected_read_probe,
                 #[cfg(test)]
                 referenced_goal_fallback_probe,
+                #[cfg(test)]
+                direct_mutation_admission_probe,
             },
             worker: Some(worker),
         })
@@ -2678,11 +2784,33 @@ fn run_regional_owner_runtime(
         return;
     };
     while let Ok(command) = receiver.recv() {
-        let exclusive_lane_access = command.requires_exclusive_lane_access();
-        let _mutation_guard = exclusive_lane_access.then(|| {
+        let lane_entities = command.lane_scoped_entities();
+        let lane_readers = lane_entities.as_ref().and_then(|entities| {
+            owner_readers_for_entities(&coordinator, entities.iter().copied()).ok()
+        });
+        let _shared_topology = lane_readers.as_ref().map(|_| {
+            mutation_gate
+                .read()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+        });
+        let lane_resolution_failed = lane_entities.is_some() && lane_readers.is_none();
+        let _exclusive_topology = (lane_resolution_failed
+            || (lane_entities.is_none() && command.requires_exclusive_lane_access()))
+        .then(|| {
             mutation_gate
                 .write()
                 .unwrap_or_else(|poisoned| poisoned.into_inner())
+        });
+        let _lane_admissions = lane_readers.as_ref().map(|readers| {
+            readers
+                .iter()
+                .map(|owner| {
+                    owner
+                        .admission()
+                        .lock()
+                        .unwrap_or_else(|poisoned| poisoned.into_inner())
+                })
+                .collect::<Vec<_>>()
         });
         match command {
             RegionalOwnerCommand::Snapshot { entity, reply } => {
@@ -3048,6 +3176,15 @@ fn run_regional_owner_runtime(
 
             #[cfg(test)]
             RegionalOwnerCommand::HoldForTest { entered, release } => {
+                let _ = entered.send(());
+                let _ = release.recv();
+            }
+            #[cfg(test)]
+            RegionalOwnerCommand::HoldLaneForTest {
+                entity: _,
+                entered,
+                release,
+            } => {
                 let _ = entered.send(());
                 let _ = release.recv();
             }
@@ -12749,6 +12886,93 @@ mod tests {
         assert!(super::DirectSelectedReadPermit::try_acquire(Arc::clone(&active)).is_none());
         permits.pop();
         assert!(super::DirectSelectedReadPermit::try_acquire(active).is_some());
+    }
+
+    #[test]
+    fn actor_lane_admission_keeps_unrelated_direct_lane_running() {
+        let runtime = super::RegionalOwnerRuntime::from_store(RegionalEntityStore::new(), 2)
+            .expect("owner runtime");
+        let handle = runtime.handle();
+        let west = handle
+            .spawn(cow(Vec3::new(0.5, 64.0, 0.5)))
+            .expect("west cow");
+        let east = handle
+            .spawn(cow(Vec3::new(128.5, 64.0, 0.5)))
+            .expect("east cow");
+        let selected = HashSet::from([west, east]);
+        let snapshots = handle
+            .snapshots_for_ids(&selected)
+            .expect("warm lane routes");
+        let west_snapshot = snapshots
+            .iter()
+            .find(|snapshot| snapshot.id == west)
+            .expect("west snapshot")
+            .clone();
+        let east_snapshot = snapshots
+            .iter()
+            .find(|snapshot| snapshot.id == east)
+            .expect("east snapshot")
+            .clone();
+        {
+            let routes = handle
+                .selected_read_routes
+                .read()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            assert_ne!(routes[&west].lease.lane, routes[&east].lease.lane);
+        }
+
+        let (lane_entered, lane_entered_rx) = mpsc::channel();
+        let (lane_release, lane_release_rx) = mpsc::channel();
+        handle
+            .hold_owner_lane_for_test(west, lane_entered, lane_release_rx)
+            .expect("queue west lane hold");
+        lane_entered_rx.recv().expect("west lane admission held");
+
+        let (east_complete, east_complete_rx) = mpsc::channel();
+        let east_handle = handle.clone();
+        let east_worker = std::thread::spawn(move || {
+            east_complete
+                .send(east_handle.apply_kinematics_if_current([(
+                    east_snapshot,
+                    movement(east, Vec3::new(129.0, 64.0, 0.5)),
+                )]))
+                .expect("publish east mutation");
+        });
+        let east_result = east_complete_rx.recv_timeout(Duration::from_secs(1));
+
+        let (west_complete, west_complete_rx) = mpsc::channel();
+        let (west_contended, west_contended_rx) = mpsc::channel();
+        handle.notify_direct_mutation_admission_for_test(west_contended);
+        let west_handle = handle.clone();
+        let west_worker = std::thread::spawn(move || {
+            west_complete
+                .send(west_handle.apply_kinematics_if_current([(
+                    west_snapshot,
+                    movement(west, Vec3::new(1.0, 64.0, 0.5)),
+                )]))
+                .expect("publish west mutation");
+        });
+        assert!(
+            west_contended_rx
+                .recv()
+                .expect("west direct mutation reached its lane admission")
+        );
+        assert_eq!(west_complete_rx.try_recv(), Err(mpsc::TryRecvError::Empty));
+
+        lane_release.send(()).expect("release west lane");
+        east_worker.join().expect("join east mutation");
+        west_worker.join().expect("join west mutation");
+        assert_eq!(
+            east_result.expect("east lane must progress while west actor lane is held"),
+            Ok(true)
+        );
+        assert_eq!(
+            west_complete_rx.recv().expect("west result after release"),
+            Ok(true)
+        );
+
+        drop(handle);
+        runtime.shutdown().expect("runtime shutdown");
     }
 
     #[test]
