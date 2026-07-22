@@ -610,31 +610,31 @@ impl EntityOwnerAccess {
                     .map(|snapshot| (snapshot, *state))
             })
             .collect::<Vec<_>>();
-        if conditional.is_empty()
-            || !owner_result(
-                self.handle
-                    .apply_kinematics_if_current_deferred_journal(conditional),
-            )
-        {
+        if conditional.is_empty() {
             return Vec::new();
         }
-        let applied = owner_result(self.handle.snapshots_for_ids(&ids));
-        {
-            let mut cache = self.snapshots.borrow_mut();
-            for snapshot in &applied {
-                cache.insert(snapshot.id, Some(snapshot.clone()));
-            }
+        #[cfg(test)]
+        self.record_owner_request();
+        let committed = owner_result(
+            self.handle
+                .apply_kinematics_if_current_deferred_journal_committed(conditional),
+        );
+        if committed.len() != expected.len() {
+            return Vec::new();
         }
-        applied
-            .into_iter()
-            .map(|snapshot| EntityKinematics {
-                id: snapshot.id,
-                position: snapshot.position,
-                rotation: snapshot.rotation,
-                velocity: snapshot.velocity,
-                on_ground: snapshot.on_ground,
-            })
-            .collect()
+        let mut cache = self.snapshots.borrow_mut();
+        for state in &committed {
+            let snapshot = expected
+                .get(&state.id)
+                .expect("committed kinematics retains its expected snapshot");
+            let mut snapshot = snapshot.clone();
+            snapshot.position = state.position;
+            snapshot.rotation = state.rotation;
+            snapshot.velocity = state.velocity;
+            snapshot.on_ground = state.on_ground;
+            cache.insert(state.id, Some(snapshot));
+        }
+        committed
     }
 
     #[cfg(test)]

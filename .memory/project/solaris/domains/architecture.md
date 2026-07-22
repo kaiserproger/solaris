@@ -27,6 +27,12 @@ Current runtime facts:
   visibility recheck at publication. Visibility indexes and outbound session
   queues remain centralized, so do not describe publication as lock-free or
   fully regional; ADR 0005 records the remaining boundary.
+- Physics owner CAS returns its committed kinematics batch directly. The
+  network adapter must not restore the removed immediate owner reread; it keeps
+  one current-state read at the publication boundary.
+- Movement and pickup planning use copied tracker and player-position inputs;
+  neither ECS access nor the global session registry may be held across that
+  pure computation.
 - Uncontrolled heavy host load invalidates performance attribution. Record the
   build, workload, host contention, p95/p99, and maximum; repeat the same gate
   on a clean host. A contaminated run may retain functional evidence only.

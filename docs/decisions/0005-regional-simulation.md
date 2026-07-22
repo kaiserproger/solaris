@@ -190,10 +190,19 @@ lifecycle state. Physics apply likewise returns accepted authoritative
 kinematics after local mutation or boundary migration; session publication,
 chunk indexes, visibility, and movement packets consume those states instead
 of speculative worker steps.
+The owner CAS now returns the exact committed kinematics batch. The network
+adapter projects that acknowledged batch into its short-lived access cache and
+performs one current-state read before publication, instead of acknowledging a
+boolean, rereading the owner immediately, invalidating that result, and reading
+the same entities again. A stale all-or-nothing CAS returns an empty batch.
 Movement publication now copies accepted kinematics, prior tracker state, and
 the recipient snapshot while holding the session registry, then builds the wire
 plan after releasing that lock. Commit reacquires the registry, compares the
 tracker state with the copied value, and rechecks visibility before publishing.
+The same snapshot boundary now copies player positions and tracker inputs, then
+releases both ECS access and the session registry before pickup-candidate and
+movement-plan computation. Only chunk/visibility mutation and the final
+tracker/visibility commit retain the registry.
 This removes packet planning from the global critical section without allowing
 a stale plan to overwrite newer state. Chunk visibility indexes and outbound
 session publication are still centralized; this is not a fully lock-free or

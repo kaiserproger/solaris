@@ -908,13 +908,33 @@ impl SessionRegistry {
             })
             .map(|step| step.id)
             .collect::<HashSet<_>>();
+        let tracker_inputs = tracker_states
+            .into_iter()
+            .filter_map(|(motion, smooth_natural_mob)| {
+                inner
+                    .last_sent_entity_states
+                    .get(&motion.id)
+                    .copied()
+                    .map(|last_sent| (motion, last_sent, smooth_natural_mob))
+            })
+            .collect::<Vec<_>>();
+        let session_positions = inner
+            .sessions
+            .iter()
+            .map(|(&session_id, session)| {
+                (
+                    session_id,
+                    Vec3::new(session.pose.x, session.pose.y, session.pose.z),
+                )
+            })
+            .collect::<Vec<_>>();
         let SessionEntityGuards {
             inner: session_inner,
             entities,
             ..
         } = inner;
         drop(entities);
-        let inner = session_inner;
+        drop(session_inner);
         #[cfg(test)]
         self.pause_before_session_movement_plan_for_test();
         let pickup_positions = steps
@@ -931,11 +951,9 @@ impl SessionRegistry {
             Vec::new()
         } else {
             let radius_sq = ENTITY_PICKUP_RADIUS * ENTITY_PICKUP_RADIUS;
-            inner
-                .sessions
+            session_positions
                 .iter()
-                .filter_map(|(&session_id, session)| {
-                    let player = Vec3::new(session.pose.x, session.pose.y, session.pose.z);
+                .filter_map(|&(session_id, player)| {
                     pickup_positions
                         .iter()
                         .any(|position| distance_sq(*position, player) <= radius_sq)
@@ -944,30 +962,17 @@ impl SessionRegistry {
                 .collect::<Vec<_>>()
         };
         pickup_sessions.extend(spawned_xp_observer_ids(&dispatches));
-        if tracker_states.is_empty() {
-            drop(inner);
+        if tracker_inputs.is_empty() {
             dispatches.extend(self.pickup_candidate_dispatches(pickup_sessions));
             dispatch_visibility_commands(dispatches);
             return steps.to_vec();
         }
-
-        let tracker_inputs = tracker_states
-            .into_iter()
-            .filter_map(|(motion, smooth_natural_mob)| {
-                inner
-                    .last_sent_entity_states
-                    .get(&motion.id)
-                    .copied()
-                    .map(|last_sent| (motion, last_sent, smooth_natural_mob))
-            })
-            .collect::<Vec<_>>();
         let ordinary_tracker_count = tracker_inputs
             .iter()
             .filter(|(motion, _, smooth_natural_mob)| {
                 !(motion.is_arrow || motion.is_item || motion.is_experience || *smooth_natural_mob)
             })
             .count();
-        drop(inner);
 
         dispatches.extend(self.pickup_candidate_dispatches(pickup_sessions));
 

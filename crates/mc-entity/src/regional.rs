@@ -1299,7 +1299,7 @@ enum RegionalOwnerCommand {
     ApplyKinematicsIfCurrent {
         states: Vec<(EntitySnapshot, EntityKinematics)>,
         defer_journal: bool,
-        reply: std::sync::mpsc::Sender<Result<bool, RegionOwnerLaneError>>,
+        reply: std::sync::mpsc::Sender<Result<Vec<EntityKinematics>, RegionOwnerLaneError>>,
     },
     DamageIfCurrent {
         expected: Box<EntitySnapshot>,
@@ -2256,17 +2256,20 @@ impl RegionalOwnerHandle {
         &self,
         states: impl IntoIterator<Item = (EntitySnapshot, EntityKinematics)>,
     ) -> Result<bool, RegionOwnerLaneError> {
+        let states = states.into_iter().collect::<Vec<_>>();
+        let expected_count = states.len();
         self.apply_kinematics_if_current_inner(states, true)
+            .map(|committed| committed.len() == expected_count)
     }
 
     fn apply_kinematics_if_current_inner(
         &self,
         states: impl IntoIterator<Item = (EntitySnapshot, EntityKinematics)>,
         journal_commit: bool,
-    ) -> Result<bool, RegionOwnerLaneError> {
+    ) -> Result<Vec<EntityKinematics>, RegionOwnerLaneError> {
         let states = states.into_iter().collect::<Vec<_>>();
         if states.is_empty() {
-            return Ok(true);
+            return Ok(Vec::new());
         }
         let expected_count = states.len();
         let mut ids = HashSet::with_capacity(expected_count);
@@ -2313,7 +2316,11 @@ impl RegionalOwnerHandle {
                 direct,
                 journal_commit,
             ) {
-                return result.map(|snapshots| snapshots.len() == expected_count);
+                return result.map(|snapshots| {
+                    (snapshots.len() == expected_count)
+                        .then(|| snapshots.into_iter().map(snapshot_kinematics).collect())
+                        .unwrap_or_default()
+                });
             }
         }
 
@@ -2328,10 +2335,10 @@ impl RegionalOwnerHandle {
         result.recv().map_err(|_| RegionOwnerLaneError::Closed)?
     }
 
-    pub fn apply_kinematics_if_current_deferred_journal(
+    pub fn apply_kinematics_if_current_deferred_journal_committed(
         &self,
         states: impl IntoIterator<Item = (EntitySnapshot, EntityKinematics)>,
-    ) -> Result<bool, RegionOwnerLaneError> {
+    ) -> Result<Vec<EntityKinematics>, RegionOwnerLaneError> {
         self.apply_kinematics_if_current_inner(states, false)
     }
 
@@ -2900,12 +2907,30 @@ fn run_regional_owner_runtime(
                 defer_journal,
                 reply,
             } => {
+                let ids = states
+                    .iter()
+                    .map(|(expected, _)| expected.id)
+                    .collect::<HashSet<_>>();
                 let crosses_region = states.iter().any(|(expected, state)| {
                     RegionKey::from_position(expected.position)
                         != RegionKey::from_position(state.position)
                 });
-                let result = coordinator.apply_kinematics_if_current_inner(states, !defer_journal);
-                if matches!(&result, Ok(true)) && crosses_region {
+                let expected_count = ids.len();
+                let result = coordinator
+                    .apply_kinematics_if_current_inner(states, !defer_journal)
+                    .and_then(|applied| {
+                        if !applied {
+                            return Ok(Vec::new());
+                        }
+                        coordinator.snapshots_for_ids(&ids).map(|snapshots| {
+                            snapshots.into_iter().map(snapshot_kinematics).collect()
+                        })
+                    });
+                if result
+                    .as_ref()
+                    .is_ok_and(|committed| committed.len() == expected_count)
+                    && crosses_region
+                {
                     selected_read_routes
                         .write()
                         .unwrap_or_else(|poisoned| poisoned.into_inner())
@@ -2995,6 +3020,16 @@ fn run_regional_owner_runtime(
         }
     }
     let _ = coordinator.shutdown();
+}
+
+fn snapshot_kinematics(snapshot: EntitySnapshot) -> EntityKinematics {
+    EntityKinematics {
+        id: snapshot.id,
+        position: snapshot.position,
+        rotation: snapshot.rotation,
+        velocity: snapshot.velocity,
+        on_ground: snapshot.on_ground,
+    }
 }
 
 fn publish_selected_read_routes(
@@ -11569,10 +11604,34 @@ mod tests {
         let commit_count = journal.lock().expect("journal state").commits.len();
         let next = movement(entity, Vec3::new(1.0, 64.0, 0.5));
 
+        assert_eq!(
+            handle
+                .apply_kinematics_if_current_deferred_journal_committed([(expected.clone(), next)])
+                .expect("checkpoint-only kinematics CAS"),
+            vec![next]
+        );
+        let current = handle
+            .snapshot(entity)
+            .expect("current read")
+            .expect("current cow");
+        assert_eq!(
+            handle
+                .apply_kinematics_if_current_deferred_journal_committed([(
+                    current,
+                    movement(entity, Vec3::new(1.5, 64.0, 0.5)),
+                )])
+                .expect("current kinematics CAS")
+                .len(),
+            1
+        );
         assert!(
             handle
-                .apply_kinematics_if_current_deferred_journal([(expected, next)])
-                .expect("checkpoint-only kinematics CAS")
+                .apply_kinematics_if_current_deferred_journal_committed([(
+                    expected,
+                    movement(entity, Vec3::new(2.0, 64.0, 0.5)),
+                )])
+                .expect("stale kinematics CAS")
+                .is_empty()
         );
         assert_eq!(
             journal.lock().expect("journal state").commits.len(),
@@ -11584,7 +11643,7 @@ mod tests {
                 .expect("updated read")
                 .expect("updated cow")
                 .position,
-            next.position
+            Vec3::new(1.5, 64.0, 0.5)
         );
 
         drop(handle);

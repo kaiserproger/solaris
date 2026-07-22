@@ -4927,7 +4927,7 @@ fn entity_physics_owner_apply_does_not_hold_session_registry() {
 }
 
 #[test]
-fn entity_physics_uses_prepare_and_one_current_read_after_commit() {
+fn entity_physics_uses_one_commit_and_one_current_read_after_commit() {
     let registry = SessionRegistry::new();
     let session = register_test_session(&registry, "PhysicsPostStateAlice");
     registry.mark_loaded(session, (0, 0));
@@ -4959,8 +4959,8 @@ fn entity_physics_uses_prepare_and_one_current_read_after_commit() {
 
     assert_eq!(
         registry.entity_owner_requests_for_test(),
-        3,
-        "physics reads ECS for preparation, item expiry, and current-state publication"
+        4,
+        "physics uses preparation, expiry, one regional commit, and one current publication read"
     );
 }
 
@@ -5045,7 +5045,7 @@ fn delayed_entity_physics_apply_cannot_overwrite_newer_commit() {
 }
 
 #[test]
-fn entity_store_is_released_before_session_movement_plan() {
+fn entity_and_session_state_are_released_before_movement_plan() {
     let registry = Arc::new(SessionRegistry::new());
     let session = register_test_session(&registry, "EntityReleaseAlice");
     assert!(registry.mark_loaded(session, (0, 0)).is_empty());
@@ -5087,10 +5087,7 @@ fn entity_store_is_released_before_session_movement_plan() {
         .expect("physics must reach the session movement-plan probe");
 
     let entity_store_available = registry.entities.owner_responsive_for_test();
-    let session_registry_busy = matches!(
-        registry.inner.try_lock(),
-        Err(std::sync::TryLockError::WouldBlock)
-    );
+    let session_registry_available = matches!(registry.inner.try_lock(), Ok(_));
     resume_tx.send(()).expect("release entity apply probe");
     physics.join().expect("physics worker");
 
@@ -5099,8 +5096,8 @@ fn entity_store_is_released_before_session_movement_plan() {
         "movement planning must not retain EntityStore after entity apply"
     );
     assert!(
-        session_registry_busy,
-        "probe must run while the session-only movement plan still owns SessionRegistry"
+        session_registry_available,
+        "movement planning must not retain SessionRegistry"
     );
 }
 
