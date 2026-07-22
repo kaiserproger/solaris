@@ -1074,6 +1074,8 @@ pub struct RegionalOwnerHandle {
     direct_mutation_admission_probe: Arc<std::sync::Mutex<Option<std::sync::mpsc::Sender<bool>>>>,
     #[cfg(test)]
     actor_snapshot_probe: Arc<std::sync::Mutex<Option<SelectedReadProbe>>>,
+    #[cfg(test)]
+    goal_prepare_probe: Arc<std::sync::Mutex<Option<std::sync::mpsc::Sender<()>>>>,
 }
 
 #[cfg(test)]
@@ -1346,6 +1348,7 @@ enum RegionalOwnerCommand {
 enum RegionalOwnerLaneScope {
     Entities(Vec<EntityId>),
     All,
+    TopologyOnly,
 }
 
 enum RegionalOwnerTopologyAccess {
@@ -1391,7 +1394,7 @@ impl RegionalOwnerCommand {
             Self::SetVelocities { velocities, .. } => Some(RegionalOwnerLaneScope::Entities(
                 velocities.iter().map(|(entity, _)| *entity).collect(),
             )),
-            Self::PrepareGoalTick { .. } => Some(RegionalOwnerLaneScope::All),
+            Self::PrepareGoalTick { .. } => Some(RegionalOwnerLaneScope::TopologyOnly),
             #[cfg(test)]
             Self::HoldLaneForTest { entity, .. } => {
                 Some(RegionalOwnerLaneScope::Entities(vec![*entity]))
@@ -1444,15 +1447,16 @@ fn owner_readers_for_scope(
     coordinator: &RegionalOwnerCoordinator,
     scope: &RegionalOwnerLaneScope,
 ) -> Result<Vec<RegionalOwnerLaneReader>, RegionOwnerLaneError> {
-    if matches!(scope, RegionalOwnerLaneScope::All) {
-        return Ok(coordinator
-            .lanes
-            .values()
-            .map(RegionalOwnerLane::reader)
-            .collect());
-    }
-    let RegionalOwnerLaneScope::Entities(entities) = scope else {
-        unreachable!("all lanes returned above");
+    let entities = match scope {
+        RegionalOwnerLaneScope::All => {
+            return Ok(coordinator
+                .lanes
+                .values()
+                .map(RegionalOwnerLane::reader)
+                .collect());
+        }
+        RegionalOwnerLaneScope::TopologyOnly => return Ok(Vec::new()),
+        RegionalOwnerLaneScope::Entities(entities) => entities,
     };
     let mut readers = BTreeMap::new();
     for entity in entities {
@@ -1747,6 +1751,14 @@ impl RegionalOwnerHandle {
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner()) =
             Some(SelectedReadProbe { entered, release });
+    }
+
+    #[cfg(test)]
+    fn notify_goal_prepare_entered_for_test(&self, entered: std::sync::mpsc::Sender<()>) {
+        *self
+            .goal_prepare_probe
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(entered);
     }
 
     #[cfg(test)]
@@ -2750,6 +2762,10 @@ impl RegionalOwnerRuntime {
         let actor_snapshot_probe = Arc::new(std::sync::Mutex::new(None));
         #[cfg(test)]
         let runtime_actor_snapshot_probe = Arc::clone(&actor_snapshot_probe);
+        #[cfg(test)]
+        let goal_prepare_probe = Arc::new(std::sync::Mutex::new(None));
+        #[cfg(test)]
+        let runtime_goal_prepare_probe = Arc::clone(&goal_prepare_probe);
         let (sender, receiver) = sync_channel(64);
         let (start, started) = channel();
         let worker = match std::thread::Builder::new()
@@ -2762,6 +2778,8 @@ impl RegionalOwnerRuntime {
                     runtime_mutation_gate,
                     #[cfg(test)]
                     runtime_actor_snapshot_probe,
+                    #[cfg(test)]
+                    runtime_goal_prepare_probe,
                 );
             }) {
             Ok(worker) => worker,
@@ -2795,6 +2813,8 @@ impl RegionalOwnerRuntime {
                 direct_mutation_admission_probe,
                 #[cfg(test)]
                 actor_snapshot_probe,
+                #[cfg(test)]
+                goal_prepare_probe,
             },
             worker: Some(worker),
         })
@@ -2849,6 +2869,7 @@ fn run_regional_owner_runtime(
     selected_read_routes: Arc<RwLock<HashMap<EntityId, CachedEntityReadRoute>>>,
     mutation_gate: Arc<RwLock<()>>,
     #[cfg(test)] actor_snapshot_probe: Arc<std::sync::Mutex<Option<SelectedReadProbe>>>,
+    #[cfg(test)] goal_prepare_probe: Arc<std::sync::Mutex<Option<std::sync::mpsc::Sender<()>>>>,
 ) {
     let Ok(mut coordinator) = started.recv() else {
         return;
@@ -3216,6 +3237,14 @@ fn run_regional_owner_runtime(
                 selected,
                 reply,
             } => {
+                #[cfg(test)]
+                if let Some(probe) = goal_prepare_probe
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner())
+                    .take()
+                {
+                    let _ = probe.send(());
+                }
                 let selected = selected
                     .filter(|selected| versioned_snapshots_are_current(&coordinator, selected))
                     .map(VersionedEntitySnapshots::into_snapshots);
@@ -4010,6 +4039,21 @@ impl RegionalOwnerCoordinator {
         &self,
         entities: &HashSet<EntityId>,
     ) -> Result<Vec<EntitySnapshot>, RegionOwnerLaneError> {
+        self.snapshots_for_ids_inner(entities, false)
+    }
+
+    fn snapshots_for_ids_admitted(
+        &self,
+        entities: &HashSet<EntityId>,
+    ) -> Result<Vec<EntitySnapshot>, RegionOwnerLaneError> {
+        self.snapshots_for_ids_inner(entities, true)
+    }
+
+    fn snapshots_for_ids_inner(
+        &self,
+        entities: &HashSet<EntityId>,
+        admitted_dispatch: bool,
+    ) -> Result<Vec<EntitySnapshot>, RegionOwnerLaneError> {
         self.commit_state.ensure_committed_state()?;
         let mut ordered = entities.iter().copied().collect::<Vec<_>>();
         ordered.sort_unstable();
@@ -4033,7 +4077,11 @@ impl RegionalOwnerCoordinator {
                 .lanes
                 .get(&lane)
                 .ok_or(RegionOwnerLaneError::WrongLane)?;
-            pending.push(owner.request_snapshots_for_ids(entities)?);
+            pending.push(if admitted_dispatch {
+                owner.request_snapshots_for_ids_admitted(entities)?
+            } else {
+                owner.request_snapshots_for_ids(entities)?
+            });
         }
         let mut snapshots = Vec::with_capacity(entities.len());
         for completion in pending {
@@ -5433,7 +5481,7 @@ impl RegionalOwnerCoordinator {
         }
         if !selected_is_complete {
             snapshots = self
-                .snapshots_for_ids(active_ids)?
+                .snapshots_for_ids_admitted(active_ids)?
                 .into_iter()
                 .map(|snapshot| (snapshot.id, snapshot))
                 .collect();
@@ -5449,7 +5497,7 @@ impl RegionalOwnerCoordinator {
             .filter(|target| self.locations.contains_key(target))
             .collect::<HashSet<_>>();
         snapshots.extend(
-            self.snapshots_for_ids(&target_ids)?
+            self.snapshots_for_ids_admitted(&target_ids)?
                 .into_iter()
                 .map(|snapshot| (snapshot.id, snapshot)),
         );
@@ -5508,7 +5556,7 @@ impl RegionalOwnerCoordinator {
                 .lanes
                 .get(&lease.lane)
                 .ok_or(RegionOwnerLaneError::WrongLane)?
-                .request_goal_tick(lease, tick, ids)?;
+                .request_goal_tick_admitted(lease, tick, ids)?;
             pending.push((key, completion));
         }
         let mut batches = BTreeMap::new();
@@ -8131,6 +8179,31 @@ mod tests {
         state: Arc<Mutex<TestDecisionJournalState>>,
         clear_started: mpsc::SyncSender<()>,
         clear_release: mpsc::Receiver<()>,
+    }
+
+    struct BlockingRecordDecisionJournal {
+        record_started: mpsc::SyncSender<()>,
+        record_release: mpsc::Receiver<()>,
+    }
+
+    impl super::RegionalDecisionJournal for BlockingRecordDecisionJournal {
+        fn record_commit(
+            &mut self,
+            _decision: &super::RegionalCommitDecision,
+        ) -> Result<(), super::RegionalDecisionJournalError> {
+            self.record_started
+                .send(())
+                .expect("publish journal record start");
+            self.record_release.recv().expect("release journal record");
+            Ok(())
+        }
+
+        fn clear_commit(
+            &mut self,
+            _phase: super::RegionPhase,
+        ) -> Result<(), super::RegionalDecisionJournalError> {
+            Ok(())
+        }
     }
 
     impl super::RegionalDecisionJournal for BlockingClearDecisionJournal {
@@ -13008,7 +13081,7 @@ mod tests {
                 reply,
             }
             .lane_scope(),
-            Some(super::RegionalOwnerLaneScope::All)
+            Some(super::RegionalOwnerLaneScope::TopologyOnly)
         ));
     }
 
@@ -13216,6 +13289,152 @@ mod tests {
             west_complete_rx.recv().expect("west result after release"),
             Ok(true)
         );
+
+        drop(handle);
+        runtime.shutdown().expect("runtime shutdown");
+    }
+
+    #[test]
+    fn goal_preparation_does_not_hold_unrelated_lane_admission() {
+        let runtime = super::RegionalOwnerRuntime::from_store(RegionalEntityStore::new(), 2)
+            .expect("owner runtime");
+        let handle = runtime.handle();
+        let west = handle
+            .spawn(cow(Vec3::new(0.5, 64.0, 0.5)))
+            .expect("west cow");
+        let east = handle
+            .spawn(cow(Vec3::new(128.5, 64.0, 0.5)))
+            .expect("east cow");
+        let snapshots = handle
+            .snapshots_for_ids(&HashSet::from([west, east]))
+            .expect("warm lane routes");
+        let east_snapshot = snapshots
+            .iter()
+            .find(|snapshot| snapshot.id == east)
+            .expect("east snapshot")
+            .clone();
+        let (west_owner, east_owner) = {
+            let routes = handle
+                .selected_read_routes
+                .read()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            assert_ne!(routes[&west].lease.lane, routes[&east].lease.lane);
+            (routes[&west].owner.clone(), routes[&east].owner.clone())
+        };
+
+        let (lane_entered, lane_entered_rx) = mpsc::channel();
+        let (lane_release, lane_release_rx) = mpsc::channel();
+        west_owner
+            .hold_for_test(lane_entered, lane_release_rx)
+            .expect("hold west owner worker");
+        lane_entered_rx.recv().expect("west owner worker held");
+
+        let (prepare_entered, prepare_entered_rx) = mpsc::channel();
+        handle.notify_goal_prepare_entered_for_test(prepare_entered);
+        let (prepare_complete, prepare_complete_rx) = mpsc::channel();
+        let prepare_handle = handle.clone();
+        let prepare_worker = std::thread::spawn(move || {
+            prepare_complete
+                .send(
+                    prepare_handle
+                        .prepare_goal_tick_with_pathing_for_ids(17, &HashSet::from([west])),
+                )
+                .expect("publish goal preparation result");
+        });
+        prepare_entered_rx
+            .recv()
+            .expect("actor entered goal preparation");
+
+        {
+            let east_admission = east_owner.admission().try_lock();
+            assert!(east_admission.is_ok());
+        }
+        assert!(
+            handle
+                .apply_kinematics_if_current([(
+                    east_snapshot,
+                    movement(east, Vec3::new(129.0, 64.0, 0.5)),
+                )])
+                .expect("east mutation during west goal preparation")
+        );
+        assert!(matches!(
+            prepare_complete_rx.try_recv(),
+            Err(mpsc::TryRecvError::Empty)
+        ));
+
+        lane_release.send(()).expect("release west owner worker");
+        prepare_complete_rx
+            .recv()
+            .expect("goal preparation result")
+            .expect("west goal preparation");
+        prepare_worker.join().expect("join goal preparation");
+
+        drop(handle);
+        runtime.shutdown().expect("runtime shutdown");
+    }
+
+    #[test]
+    fn goal_preparation_waits_for_same_lane_finalize_without_busy() {
+        let (record_started, record_started_rx) = mpsc::sync_channel(0);
+        let (record_release, record_release_rx) = mpsc::sync_channel(0);
+        let runtime = super::RegionalOwnerRuntime::from_store_with_journal(
+            RegionalEntityStore::new(),
+            1,
+            Box::new(BlockingRecordDecisionJournal {
+                record_started,
+                record_release: record_release_rx,
+            }),
+        )
+        .expect("owner runtime");
+        let handle = runtime.handle();
+        let entity = handle
+            .spawn_deferred_journal(cow(Vec3::new(0.5, 64.0, 0.5)))
+            .expect("cow");
+        let expected = handle
+            .snapshot(entity)
+            .expect("warm cow route")
+            .expect("cow snapshot");
+
+        let mutation_handle = handle.clone();
+        let mutation = std::thread::spawn(move || {
+            mutation_handle.apply_kinematics_if_current([(
+                expected,
+                movement(entity, Vec3::new(1.0, 64.0, 0.5)),
+            )])
+        });
+        record_started_rx
+            .recv()
+            .expect("direct mutation committed before finalize");
+
+        let (prepare_entered, prepare_entered_rx) = mpsc::channel();
+        handle.notify_goal_prepare_entered_for_test(prepare_entered);
+        let (prepare_complete, prepare_complete_rx) = mpsc::channel();
+        let prepare_handle = handle.clone();
+        let prepare = std::thread::spawn(move || {
+            prepare_complete
+                .send(
+                    prepare_handle
+                        .prepare_goal_tick_with_pathing_for_ids(18, &HashSet::from([entity])),
+                )
+                .expect("publish goal preparation");
+        });
+        prepare_entered_rx
+            .recv()
+            .expect("actor entered goal preparation");
+        assert!(matches!(
+            prepare_complete_rx.try_recv(),
+            Err(mpsc::TryRecvError::Empty)
+        ));
+
+        record_release
+            .send(())
+            .expect("release direct journal record");
+        assert_eq!(mutation.join().expect("join direct mutation"), Ok(true));
+        prepare_complete_rx
+            .recv()
+            .expect("goal preparation result")
+            .expect("goal preparation after finalize");
+        prepare.join().expect("join goal preparation");
 
         drop(handle);
         runtime.shutdown().expect("runtime shutdown");

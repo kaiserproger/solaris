@@ -489,11 +489,14 @@ topology gate or blocks direct work in unrelated lanes. Spawn, remove,
 position/region changes, full snapshot replacement, save/reconfigure, and other
 global-index operations remain on the exclusive side.
 Cold point and ID-filtered actor reads use the same shared topology and ordered
-touched-lane admissions. Full snapshots, breeding scans, and fallback goal
-preparation use shared topology plus every owner admission until their query is
-partitioned further. A cold read stalled on one lane therefore does not stop a
-direct writer in another lane, while the selected lanes remain stable through
-route publication and version-fence capture.
+touched-lane admissions. Full snapshots and breeding scans use shared topology
+plus every owner admission until their query is partitioned further. Goal
+preparation holds only shared topology: each owner-lane queue orders its local
+AI read against local mutations. Snapshot and goal-read messages use their
+lane admission only while they are enqueued, then release it before owner
+computation. Exact goal-input snapshots and leases reject stale plans at apply.
+A slow lane therefore does not hold admissions or stop direct work in another
+lane.
 Hostile goal planning now compares the computed goal with the goal already in
 the simulation view. Equal wander, follow-position, or idle goals are removed
 before the owner call, and an empty diff sends no command. This reduces the

@@ -46,9 +46,11 @@ Current runtime facts:
   operations that can change region ownership or global indexes remain
   exclusive.
 - Cold point and ID-filtered actor reads use shared topology plus touched-lane
-  admissions. Full snapshots, breeding scans, and fallback goal preparation
-  currently take every lane admission under shared topology; they no longer
-  take the exclusive topology fence but still serialize entity work globally.
+  admissions. Full snapshots and breeding scans currently take every lane
+  admission under shared topology. Long-running goal preparation holds shared
+  topology only; each lane admission is held briefly while its read message is
+  enqueued. Owner queues order local reads and exact-snapshot apply rejects
+  stale plans.
 - Physics owner CAS returns its committed kinematics batch directly. The
   network adapter must not restore the removed immediate owner reread; it keeps
   one current-state read at the publication boundary.

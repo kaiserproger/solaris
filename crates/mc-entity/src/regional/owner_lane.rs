@@ -201,6 +201,11 @@ enum RegionOwnerLaneMessage {
         active_ids: HashSet<EntityId>,
         reply: std::sync::mpsc::Sender<Result<PreparedGoalTick, RegionOwnerLaneError>>,
     },
+    #[cfg(test)]
+    HoldForTest {
+        entered: std::sync::mpsc::Sender<()>,
+        release: Receiver<()>,
+    },
 
     Shutdown {
         reply:
@@ -305,6 +310,17 @@ impl RegionalOwnerLaneReader {
 
     pub(super) fn state_version(&self) -> u64 {
         self.state_version.load(Ordering::Acquire)
+    }
+
+    #[cfg(test)]
+    pub(super) fn hold_for_test(
+        &self,
+        entered: std::sync::mpsc::Sender<()>,
+        release: Receiver<()>,
+    ) -> Result<(), RegionOwnerLaneError> {
+        self.sender
+            .send(RegionOwnerLaneMessage::HoldForTest { entered, release })
+            .map_err(|_| RegionOwnerLaneError::Closed)
     }
 
     pub(super) fn prepare_and_commit(
@@ -693,6 +709,18 @@ impl RegionalOwnerLane {
         Ok(snapshots)
     }
 
+    pub(super) fn request_snapshots_for_ids_admitted(
+        &self,
+        entities: Vec<(RegionLease, EntityId)>,
+    ) -> Result<Receiver<Result<Vec<EntitySnapshot>, RegionOwnerLaneError>>, RegionOwnerLaneError>
+    {
+        let _admission = self
+            .admission
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        self.request_snapshots_for_ids(entities)
+    }
+
     pub(super) fn request_existing_snapshots_for_ids(
         &self,
         entities: Vec<(RegionLease, EntityId)>,
@@ -770,6 +798,20 @@ impl RegionalOwnerLane {
             })
             .map_err(|_| RegionOwnerLaneError::Closed)?;
         Ok(prepared)
+    }
+
+    pub(super) fn request_goal_tick_admitted(
+        &self,
+        lease: RegionLease,
+        tick: u64,
+        active_ids: HashSet<EntityId>,
+    ) -> Result<Receiver<Result<PreparedGoalTick, RegionOwnerLaneError>>, RegionOwnerLaneError>
+    {
+        let _admission = self
+            .admission
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        self.request_goal_tick(lease, tick, active_ids)
     }
 
     pub fn shutdown(mut self) -> Result<BTreeMap<RegionKey, EntityStore>, RegionOwnerLaneError> {
@@ -1218,6 +1260,11 @@ fn run_region_owner_lane(
                     Err(RegionOwnerLaneError::UnknownRegion)
                 };
                 let _ = reply.send(result);
+            }
+            #[cfg(test)]
+            RegionOwnerLaneMessage::HoldForTest { entered, release } => {
+                let _ = entered.send(());
+                let _ = release.recv();
             }
 
             RegionOwnerLaneMessage::Shutdown { reply } => {
