@@ -12,9 +12,7 @@ use mc_entity::{
 };
 use std::cell::RefCell;
 use std::ops::{Deref, DerefMut};
-#[cfg(test)]
-use std::sync::atomic::AtomicUsize;
-use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU32, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Mutex, MutexGuard};
 
 mod campfire_authority;
@@ -448,6 +446,8 @@ pub(crate) struct SessionRegistry {
     player_attack_sender: tokio::sync::broadcast::Sender<PlayerAttackObservation>,
     player_attack_sequence: AtomicU64,
     active_session_sender: tokio::sync::watch::Sender<usize>,
+    live_session_count: AtomicUsize,
+    live_session_generation: AtomicU64,
     session_empty_generation: AtomicU64,
     session_became_empty: tokio::sync::Notify,
     player_save_generation: AtomicU64,
@@ -486,6 +486,8 @@ pub(crate) struct SessionRegistry {
     script_transaction_capture_probe: Mutex<Option<EntityApplyReleaseProbe>>,
     #[cfg(test)]
     hostile_scan_probe: Mutex<Option<HostileScanProbe>>,
+    #[cfg(test)]
+    hostile_reconcile_probe: Mutex<Option<HostileScanProbe>>,
     #[cfg(test)]
     hostile_commit_probe: Mutex<Option<HostileCommitProbe>>,
     #[cfg(test)]
@@ -724,6 +726,8 @@ impl SessionRegistry {
             player_attack_sender,
             player_attack_sequence: AtomicU64::new(0),
             active_session_sender,
+            live_session_count: AtomicUsize::new(0),
+            live_session_generation: AtomicU64::new(0),
             session_empty_generation: AtomicU64::new(0),
             session_became_empty: tokio::sync::Notify::new(),
             player_save_generation: AtomicU64::new(0),
@@ -762,6 +766,8 @@ impl SessionRegistry {
             script_transaction_capture_probe: Mutex::new(None),
             #[cfg(test)]
             hostile_scan_probe: Mutex::new(None),
+            #[cfg(test)]
+            hostile_reconcile_probe: Mutex::new(None),
             #[cfg(test)]
             hostile_commit_probe: Mutex::new(None),
             #[cfg(test)]
@@ -927,6 +933,24 @@ impl SessionRegistry {
     fn publish_movement_recipient_index(&self, inner: &SessionRegistryInner) {
         self.movement_recipients
             .store(Arc::new(build_movement_recipient_index(&inner.sessions)));
+    }
+
+    fn publish_live_session_count(&self, inner: &SessionRegistryInner) -> bool {
+        let live = inner
+            .sessions
+            .keys()
+            .filter(|session_id| !inner.dead_sessions.contains(session_id))
+            .count();
+        let previous = self.live_session_count.swap(live, Ordering::AcqRel);
+        if previous == live {
+            return false;
+        }
+        self.live_session_generation.fetch_add(1, Ordering::Release);
+        previous != 0 && live == 0
+    }
+
+    fn has_live_sessions(&self) -> bool {
+        self.live_session_count.load(Ordering::Acquire) != 0
     }
 
     fn lock_entities(&self, operation: &'static str) -> EntityStoreGuard<'_> {

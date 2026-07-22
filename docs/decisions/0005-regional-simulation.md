@@ -746,6 +746,19 @@ selects the fanout path only when `S * M > 2E`, and `M = 0` sends no fanout
 work. Three focused tests pass. This is a bounded work-selection change, not
 runtime throughput evidence; a performance rerun remains pending.
 
+Entity simulation admission now reads a published atomic live-session count.
+Registration, persisted death state, survival death/respawn, and unregister
+publish a generation while changing the authoritative session state. A
+transition to zero live players pushes hostile-goal reconciliation through the
+regional owner after releasing `SessionRegistry.inner`. If another player
+transition happens during that work, the stale generation replans from the
+newly published player set. Positive transitions do not block login on entity
+journal work; the next simulation event performs ordinary target selection.
+Empty/all-dead steady-state ticks therefore take neither the session mutex nor
+an entity-owner snapshot, without leaving disconnected or dead targets behind.
+Active-player selection and movement publication still retain their documented
+centralized metadata boundaries, so this is not full world regionalization.
+
 The `wide` SIMD experiment remains non-promoted. Its kernel median gain was
 `7.86%` and its full-path median gain was `0.72%`, both below the 10% promotion
 threshold. The scalar production path and its existing correctness fences stay

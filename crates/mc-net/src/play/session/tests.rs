@@ -24,6 +24,23 @@ fn lethal_survival_commit_pushes_immutable_player_death_before_session_cleanup()
     let expected_carried_item = persisted.carried_item.clone();
     let expected_xp = persisted.xp.clone();
     registry.register_player_persistence(session, Arc::new(Mutex::new(persisted)));
+    registry.spawn_command_entity(
+        &SimulationAuthority::for_test(),
+        54,
+        "minecraft:zombie".to_owned(),
+        Vec3::new(4.5, 70.0, -4.5),
+    );
+    {
+        let mut entities = registry.lock_entities("seed committed-death hostile target");
+        let zombie = entities.snapshots().next().expect("spawned zombie");
+        assert!(entities.set_goal(
+            zombie.id,
+            GoalState::FollowPosition {
+                target: Vec3::new(pose.x, pose.y, pose.z),
+                speed: 0.23,
+            },
+        ));
+    }
 
     let mut dead = expected_survival;
     dead.apply_damage(SurvivalState::MAX_HEALTH);
@@ -55,6 +72,18 @@ fn lethal_survival_commit_pushes_immutable_player_death_before_session_cleanup()
             .dead_sessions
             .contains(&session)
     );
+    {
+        let entities = registry.lock_entities("verify death-driven hostile target clear");
+        let zombie = entities.snapshots().next().expect("spawned zombie");
+        assert!(matches!(zombie.goal, GoalState::Wander { .. }));
+    }
+    registry.reset_entity_owner_requests_for_test();
+    assert!(
+        registry
+            .tick_entities_and_collect_physics_queries(1)
+            .is_empty()
+    );
+    assert_eq!(registry.entity_owner_requests_for_test(), 0);
 
     registry.unregister(session);
     let event = deaths
@@ -82,13 +111,37 @@ fn lethal_survival_commit_pushes_immutable_player_death_before_session_cleanup()
 fn respawn_commit_clears_player_hurt_resistance() {
     let registry = SessionRegistry::new();
     let session = register_test_session(&registry, "RespawnResistance");
+    assert!(registry.mark_loaded(session, (0, 0)).is_empty());
     let mut persisted = PlayerPersistedState::new_default(PlayerPose::new(0.5, 64.0, 0.5));
     persisted.survival.apply_damage(SurvivalState::MAX_HEALTH);
     let expected_survival = persisted.survival;
     let expected_inventory = persisted.inventory.clone();
     let expected_carried_item = persisted.carried_item.clone();
     let expected_xp = persisted.xp.clone();
+    registry.spawn_command_entity(
+        &SimulationAuthority::for_test(),
+        54,
+        "minecraft:zombie".to_owned(),
+        Vec3::new(4.5, 64.0, 0.5),
+    );
+    {
+        let mut entities = registry.lock_entities("seed dead-persistence hostile target");
+        let zombie = entities.snapshots().next().expect("spawned zombie");
+        assert!(entities.set_goal(
+            zombie.id,
+            GoalState::FollowPosition {
+                target: Vec3::new(0.5, 64.0, 0.5),
+                speed: 0.23,
+            },
+        ));
+    }
     registry.register_player_persistence(session, Arc::new(Mutex::new(persisted)));
+    assert!(!registry.has_live_sessions());
+    {
+        let entities = registry.lock_entities("verify dead persistence target clear");
+        let zombie = entities.snapshots().next().expect("spawned zombie");
+        assert!(matches!(zombie.goal, GoalState::Wander { .. }));
+    }
     let (_, resistance) = PlayerHurtResistance::default().preview(10, 4.0);
     registry
         .lock_inner("install respawn resistance test state")
@@ -118,6 +171,16 @@ fn respawn_commit_clears_player_hurt_resistance() {
         committed,
         Some(PlayerSurvivalCommitOutcome::Committed(_))
     ));
+    assert!(registry.has_live_sessions());
+    assert_eq!(
+        registry.tick_entities_and_collect_physics_queries(1).len(),
+        1
+    );
+    {
+        let entities = registry.lock_entities("verify respawn target reconciliation");
+        let zombie = entities.snapshots().next().expect("spawned zombie");
+        assert!(matches!(zombie.goal, GoalState::FollowPosition { .. }));
+    }
     let inner = registry.lock_inner("verify respawn projections reset");
     assert!(!inner.player_hurt_resistance.contains_key(&session));
     assert!(!inner.dead_sessions.contains(&session));
@@ -2772,7 +2835,9 @@ fn server_furnace_slot_dispatches_do_not_allocate_state_without_viewers() {
 fn hostile_forgets_target_when_last_player_unregisters() {
     let registry = SessionRegistry::new();
     let alice = register_test_session(&registry, "TargetAlice");
-    assert!(registry.mark_loaded(alice, (0, 0)).is_empty());
+    let bob = register_test_session(&registry, "TargetBob");
+    let _ = registry.mark_loaded(alice, (0, 0));
+    let _ = registry.mark_loaded(bob, (0, 0));
     registry.spawn_command_entity(
         &SimulationAuthority::for_test(),
         1,
@@ -2788,16 +2853,102 @@ fn hostile_forgets_target_when_last_player_unregisters() {
         assert!(matches!(entity.goal, GoalState::FollowPosition { .. }));
     }
 
-    registry.unregister(alice);
+    registry.mark_player_dead_for_test(alice);
+    {
+        let entities = registry.lock_entities("inspect remaining live-player hostile target");
+        let entity = entities.snapshots().next().expect("spawned hostile");
+        assert!(matches!(entity.goal, GoalState::FollowPosition { .. }));
+    }
+    registry.unregister(bob);
+    {
+        let entities = registry.lock_entities("inspect disconnect-driven hostile target clear");
+        let entity = entities.snapshots().next().expect("spawned hostile");
+        assert!(matches!(entity.goal, GoalState::Wander { .. }));
+    }
     assert!(
         registry
             .tick_entities_and_collect_physics_queries(2)
             .is_empty()
     );
+    registry.unregister(alice);
+}
 
-    let entities = registry.lock_entities("test entity access");
-    let entity = entities.snapshots().next().expect("spawned hostile");
-    assert!(matches!(entity.goal, GoalState::Wander { .. }));
+#[test]
+fn concurrent_live_session_change_cannot_leave_stale_hostile_cleanup() {
+    let registry = Arc::new(SessionRegistry::new());
+    let alice = register_test_session(&registry, "ReconcileAlice");
+    let _ = registry.mark_loaded(alice, (0, 0));
+    registry.spawn_command_entity(
+        &SimulationAuthority::for_test(),
+        54,
+        "minecraft:zombie".to_owned(),
+        Vec3::new(4.5, 64.0, 0.5),
+    );
+    assert_eq!(
+        registry.tick_entities_and_collect_physics_queries(1).len(),
+        1
+    );
+    let (reached_tx, reached_rx) = std::sync::mpsc::channel();
+    let (resume_tx, resume_rx) = std::sync::mpsc::channel();
+    *registry
+        .hostile_reconcile_probe
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(HostileScanProbe {
+        reached: reached_tx,
+        resume: resume_rx,
+    });
+
+    let unregister_registry = Arc::clone(&registry);
+    let unregister = std::thread::spawn(move || unregister_registry.unregister(alice));
+    reached_rx
+        .recv_timeout(Duration::from_secs(1))
+        .expect("zero-live reconciliation reaches its event boundary");
+    let bob = register_test_session(&registry, "ReconcileBob");
+    resume_tx
+        .send(())
+        .expect("zero-live reconciliation remains active");
+    unregister.join().expect("unregister reconciliation");
+
+    let entities = registry.lock_entities("verify generation-fenced hostile reconciliation");
+    let zombie = entities.snapshots().next().expect("spawned zombie");
+    assert!(matches!(zombie.goal, GoalState::FollowPosition { .. }));
+    drop(entities);
+    registry.unregister(bob);
+}
+
+#[test]
+fn empty_server_entity_tick_uses_published_session_state_without_locks_or_owner_work() {
+    let registry = Arc::new(SessionRegistry::new());
+    registry.spawn_command_entity(
+        &SimulationAuthority::for_test(),
+        1,
+        "minecraft:zombie".to_string(),
+        Vec3::new(4.5, 64.0, 0.5),
+    );
+    registry.reset_entity_owner_requests_for_test();
+
+    let held = registry.lock_inner("hold session registry during empty-server tick test");
+    let tick_registry = Arc::clone(&registry);
+    let (completed_tx, completed_rx) = std::sync::mpsc::channel();
+    let tick = std::thread::spawn(move || {
+        let queries = tick_registry.tick_entities_and_collect_physics_queries(1);
+        completed_tx
+            .send(queries)
+            .expect("empty-server tick result receiver remains");
+    });
+    let queries = completed_rx
+        .recv_timeout(Duration::from_secs(1))
+        .expect("empty-server tick must use the published session index");
+    assert!(queries.is_empty());
+    assert_eq!(registry.entity_owner_requests_for_test(), 0);
+    assert_eq!(
+        registry
+            .active_entity_selection_visits
+            .load(Ordering::Relaxed),
+        0
+    );
+    drop(held);
+    tick.join().expect("empty-server tick thread");
 }
 
 #[test]
@@ -2816,10 +2967,7 @@ fn hostile_forgets_dead_player_target_during_goal_tick() {
         registry.tick_entities_and_collect_physics_queries(1).len(),
         1
     );
-    registry
-        .lock_inner("mark goal target dead")
-        .dead_sessions
-        .insert(player);
+    registry.mark_player_dead_for_test(player);
     assert!(
         registry
             .tick_entities_and_collect_physics_queries(2)

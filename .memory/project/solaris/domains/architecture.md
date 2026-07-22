@@ -44,6 +44,10 @@ Current runtime facts:
 - The final tracker CAS and current-visibility recheck still use the global
   session registry. The movement read path is lock-free with respect to that
   mutex, but the complete publication path is not yet lock-free or regional.
+- Empty/all-dead server entity ticks use the published atomic live-session
+  count and perform no session-registry or owner-lane read. A transition to zero
+  live players pushes generation-fenced hostile-target reconciliation after
+  releasing the session lock; do not restore per-tick empty-player ECS scans.
 - Uncontrolled heavy host load invalidates performance attribution. Record the
   build, workload, host contention, p95/p99, and maximum; repeat the same gate
   on a clean host. A contaminated run may retain functional evidence only.

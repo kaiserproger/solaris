@@ -46,6 +46,11 @@ impl SessionRegistry {
         } else {
             inner.dead_sessions.remove(&id);
         }
+        let became_no_live_sessions = self.publish_live_session_count(&inner);
+        drop(inner);
+        if became_no_live_sessions {
+            self.reconcile_hostile_targets_after_live_session_change();
+        }
     }
 
     pub(in crate::play) fn set_active_shield(&self, id: SessionId, shield: Option<ActiveShield>) {
@@ -281,6 +286,7 @@ impl SessionRegistry {
             .flatten();
         let mut committed =
             apply_player_survival_plan_locked(&mut inner, actor_session, &mut player_state, plan);
+        let became_no_live_sessions = self.publish_live_session_count(&inner);
         if let Some(transition) = &plan.active_shield {
             if let Some(shield) = &transition.updated {
                 inner.active_shields.insert(actor_session, shield.clone());
@@ -293,6 +299,9 @@ impl SessionRegistry {
         }
         drop(player_state);
         drop(inner);
+        if became_no_live_sessions {
+            self.reconcile_hostile_targets_after_live_session_change();
+        }
         self.append_spawned_xp_pickup_candidates(&mut committed.dispatches);
         if let Some(sleeper) = staged_damage_wake {
             self.defer_staged_sleep_dispatches(actor_session, &mut committed.dispatches);
@@ -301,6 +310,18 @@ impl SessionRegistry {
             committed.dispatches = dispatches;
         }
         Some(PlayerSurvivalCommitOutcome::Committed(committed))
+    }
+
+    #[cfg(test)]
+    pub(in crate::play) fn mark_player_dead_for_test(&self, id: SessionId) {
+        let became_no_live_sessions = {
+            let mut inner = self.lock_inner("mark test player dead");
+            inner.dead_sessions.insert(id);
+            self.publish_live_session_count(&inner)
+        };
+        if became_no_live_sessions {
+            self.reconcile_hostile_targets_after_live_session_change();
+        }
     }
 }
 

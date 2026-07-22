@@ -186,14 +186,11 @@ impl SessionRegistry {
         simulation_distance: i32,
         pathing: Option<(&mc_world::WorldReadView, &mc_physics::BlockMaterialIds)>,
     ) -> Vec<EntityPhysicsQuery> {
+        if !self.has_live_sessions() {
+            return Vec::new();
+        }
         let (world_read, pathing_materials) = pathing.unzip();
-        let (
-            active_chunks,
-            active_entity_candidates,
-            player_positions,
-            terrain_pathing_entities,
-            has_tracked_entities,
-        ) = {
+        let (active_chunks, active_entity_candidates, player_positions, terrain_pathing_entities) = {
             let inner = self.lock_inner("snapshot entity tick inputs");
             let active_chunks = inner
                 .loaded_chunk_refcounts
@@ -216,17 +213,9 @@ impl SessionRegistry {
                 active_entity_candidates,
                 player_positions,
                 inner.terrain_pathing_entities.clone(),
-                !inner.entity_chunks.is_empty(),
             )
         };
-        if player_positions.is_empty() && !has_tracked_entities {
-            return Vec::new();
-        }
         let mut entities = self.lock_entities("prepare entity goals");
-        if player_positions.is_empty() {
-            update_hostile_targets(&mut entities, &player_positions, None);
-            return Vec::new();
-        }
         if active_chunks.is_empty() {
             return Vec::new();
         }

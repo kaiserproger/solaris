@@ -121,6 +121,7 @@ impl SessionRegistry {
         }
         let dispatches = refresh_visibility_locked(&mut inner);
         self.publish_movement_recipient_index(&inner);
+        let became_no_live_sessions = self.publish_live_session_count(&inner);
         debug!(
             session_id = id,
             entity_id,
@@ -134,6 +135,10 @@ impl SessionRegistry {
         );
         self.active_session_sender
             .send_replace(inner.sessions.len());
+        drop(inner);
+        if became_no_live_sessions {
+            self.reconcile_hostile_targets_after_live_session_change();
+        }
         Ok((id, dispatches))
     }
 
@@ -235,7 +240,14 @@ impl SessionRegistry {
                 );
                 poisoned.into_inner()
             });
-        let (snapshot, recipients, completed_sleep, player_save_requested) = {
+        let (
+            snapshot,
+            recipients,
+            completed_sleep,
+            player_save_requested,
+            became_empty,
+            became_no_live_sessions,
+        ) = {
             let mut inner = self.lock_inner("unregister play session");
             let Some(session) = inner.sessions.remove(&id) else {
                 return Vec::new();
@@ -339,11 +351,22 @@ impl SessionRegistry {
             let completed_sleep = self.resolve_sleep_transition_locked(&mut inner);
             self.active_session_sender.send_replace(active_sessions);
             self.publish_movement_recipient_index(&inner);
-            if active_sessions == 0 {
-                self.mark_session_empty();
-            }
-            (snapshot, recipients, completed_sleep, player_save_requested)
+            let became_no_live_sessions = self.publish_live_session_count(&inner);
+            (
+                snapshot,
+                recipients,
+                completed_sleep,
+                player_save_requested,
+                active_sessions == 0,
+                became_no_live_sessions,
+            )
         };
+        if became_no_live_sessions {
+            self.reconcile_hostile_targets_after_live_session_change();
+        }
+        if became_empty {
+            self.mark_session_empty();
+        }
         if player_save_requested {
             self.mark_player_save_requested();
         }

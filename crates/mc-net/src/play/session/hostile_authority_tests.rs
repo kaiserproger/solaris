@@ -36,10 +36,7 @@ fn hostiles_ignore_dead_players() {
         "minecraft:zombie".to_owned(),
         Vec3::new(0.5, 64.0, 1.5),
     );
-    registry
-        .lock_inner("mark test player dead")
-        .dead_sessions
-        .insert(player);
+    registry.mark_player_dead_for_test(player);
 
     for tick in 0..HOSTILE_MELEE_PERIOD_TICKS {
         let (attacks, dispatches) =

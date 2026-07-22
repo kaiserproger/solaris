@@ -1,6 +1,5 @@
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
-#[cfg(test)]
 use std::sync::atomic::Ordering;
 
 use mc_entity::{
@@ -81,6 +80,43 @@ pub(super) struct HostileCommitProbe {
 }
 
 impl SessionRegistry {
+    pub(in crate::play::session) fn reconcile_hostile_targets_after_live_session_change(&self) {
+        loop {
+            let (generation, player_positions) = {
+                let inner = self.lock_inner("snapshot live players for hostile reconciliation");
+                let generation = self.live_session_generation.load(Ordering::Acquire);
+                let player_positions = inner
+                    .sessions
+                    .iter()
+                    .filter(|(session_id, _)| !inner.dead_sessions.contains(session_id))
+                    .map(|(_, session)| Vec3::new(session.pose.x, session.pose.y, session.pose.z))
+                    .collect::<Vec<_>>();
+                (generation, player_positions)
+            };
+            #[cfg(test)]
+            self.pause_before_hostile_reconciliation_for_test();
+            let mut entities = self.lock_entities("reconcile hostiles after live session change");
+            update_hostile_targets(&mut entities, &player_positions, None);
+            drop(entities);
+            if self.live_session_generation.load(Ordering::Acquire) == generation {
+                return;
+            }
+        }
+    }
+
+    #[cfg(test)]
+    fn pause_before_hostile_reconciliation_for_test(&self) {
+        let probe = self
+            .hostile_reconcile_probe
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .take();
+        if let Some(probe) = probe {
+            probe.reached.send(()).expect("hostile reconcile receiver");
+            probe.resume.recv().expect("hostile reconcile release");
+        }
+    }
+
     #[cfg(test)]
     fn pause_during_hostile_scan_for_test(&self) {
         let probe = self
