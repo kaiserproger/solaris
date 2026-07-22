@@ -20,8 +20,13 @@ verification and keep ordinary survival play ahead of rare edge cases.
   a validated zero-copy binary table; focused shape/physics tests and the full
   `mc-net` library suite are green. Entity-dependent overrides, notably leather
   boots walking on powder snow, still need their owning movement context.
-- [ ] Breaking a block must spawn a world item drop before normal pickup rather
-  than crediting the inventory directly.
+- [x] Breaking a block must spawn a world item drop before normal pickup rather
+  than crediting the inventory directly. The authoritative break transaction
+  creates a persisted item entity without crediting the mined stack to player
+  inventory. The focused TCP gate requires block update/ack and tool damage,
+  then `AddEntity` plus item metadata, at least a 100 ms visible window, and
+  only then the separate pickup claim, take/remove packets, and inventory slot
+  update.
 - [ ] Shift-click crafting must craft the maximum complete batch that fits;
   shift-click container transfers must move the complete stack without a later
   slot teleport. Focused crafting and furnace quick-move regressions are green,

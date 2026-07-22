@@ -74,6 +74,14 @@ hardening. An already-open lower-priority diff does not override this order.
 
 ## Recent Evidence
 
+- Survival block loot remains a server-owned world item before pickup rather
+  than a direct inventory credit. The focused TCP gate observed the committed
+  block update/ack and tool durability update before `AddEntity` plus item
+  metadata, kept the drop visible for at least 100 ms, and only then accepted
+  one pickup command and emitted take/remove plus inventory slot updates. The
+  current run processed one block edit and one item pickup with queue depth
+  returning to zero.
+
 - The optional `examples/plugins/geological-mines` plugin declares the
   `geological_deposits` startup ore profile. Prepared plugin discovery runs once
   before world validation and is reused to start Lua later. The profile removes
