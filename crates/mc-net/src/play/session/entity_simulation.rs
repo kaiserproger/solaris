@@ -622,16 +622,9 @@ impl SessionRegistry {
             .iter()
             .copied()
             .collect::<HashSet<_>>();
-        let entities = self.lock_entities("prepare entity physics");
+        let mut entities = self.lock_entities("prepare entity physics");
         entities.prefetch(&step_ids);
-        let session_inner = self.lock_inner("apply entity physics");
-        let mut inner = SessionEntityGuards {
-            inner: session_inner,
-            entities,
-            entity_lifecycle_tick: self.simulation_tick(),
-        };
         self.entity_lifecycle_tick.fetch_max(tick, Ordering::AcqRel);
-        inner.entity_lifecycle_tick = self.simulation_tick();
         let expected_by_id = expected.map(|queries| {
             queries
                 .iter()
@@ -648,8 +641,7 @@ impl SessionRegistry {
             let Some(expected) = expected_by_id.get(&step.id) else {
                 return true;
             };
-            !inner
-                .entities
+            !entities
                 .motion_state(step.id)
                 .is_some_and(|current| entity_physics_query_matches(current, expected))
         });
@@ -667,32 +659,24 @@ impl SessionRegistry {
                     let Some(expected) = expected_by_id.get(&step.id) else {
                         return false;
                     };
-                    inner
-                        .entities
+                    entities
                         .motion_state(step.id)
                         .is_some_and(|current| entity_physics_query_matches(current, expected))
                 })
                 .collect::<Vec<_>>()
         });
         let steps = filtered_steps.as_deref().unwrap_or(steps);
-        let mut dispatches = despawn_expired_items_locked(&mut inner);
         let old_chunks: HashMap<_, _> = steps
             .iter()
             .filter_map(|step| {
-                inner
-                    .simulation_inputs
+                self.simulation_inputs
                     .entity_chunk(step.id)
                     .map(|chunk| (step.id, chunk))
             })
             .collect();
         let old_motion: HashMap<_, _> = steps
             .iter()
-            .filter_map(|step| {
-                inner
-                    .entities
-                    .motion_state(step.id)
-                    .map(|state| (step.id, state))
-            })
+            .filter_map(|step| entities.motion_state(step.id).map(|state| (step.id, state)))
             .collect();
         let kinematics = steps
             .iter()
@@ -726,17 +710,10 @@ impl SessionRegistry {
                     })
             })
             .collect::<Vec<_>>();
-        let regional_batch_count = inner.entities.parallel_kinematics_batch_count(&kinematics);
+        let regional_batch_count = entities.parallel_kinematics_batch_count(&kinematics);
         let regional_worker_permits = cpu_resources
             .map(|resources| acquire_regional_worker_permits(resources, regional_batch_count))
             .unwrap_or_default();
-        let entity_lifecycle_tick = inner.entity_lifecycle_tick;
-        let SessionEntityGuards {
-            inner: session_inner,
-            mut entities,
-            ..
-        } = inner;
-        drop(session_inner);
         #[cfg(test)]
         self.pause_before_physics_owner_apply_for_test();
         let applied_kinematics = if regional_worker_permits.is_empty() {
@@ -748,16 +725,20 @@ impl SessionRegistry {
             )
         };
         drop(regional_worker_permits);
+        let session_inner = self.lock_inner("publish entity physics");
+        // Re-read under the publication lock. Regional owner mutation does not
+        // require this lock, so a snapshot taken while waiting for it is not a
+        // valid publication fence.
         for id in &step_ids {
             entities.invalidate(*id);
         }
         entities.prefetch(&step_ids);
-        let session_inner = self.lock_inner("publish entity physics");
         let mut inner = SessionEntityGuards {
             inner: session_inner,
             entities,
-            entity_lifecycle_tick,
+            entity_lifecycle_tick: self.simulation_tick(),
         };
+        let mut dispatches = despawn_expired_items_locked(&mut inner);
         let input_steps = steps
             .iter()
             .map(|step| (step.id, *step))

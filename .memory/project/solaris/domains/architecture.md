@@ -82,6 +82,10 @@ Current runtime facts:
 - Physics owner CAS returns its committed kinematics batch directly. The
   network adapter must not restore the removed immediate owner reread; it keeps
   one current-state read at the publication boundary.
+- Physics prepare filters stale steps, reads prior owner motion, resolves old
+  chunk routes, and builds regional kinematics without `SessionRegistry.inner`.
+  The current owner re-read and later despawn/arrow/visibility/wire publication
+  still use the session lock and remain a migration boundary.
 - Movement and pickup planning use copied tracker and player-position inputs;
   neither ECS access nor the global session registry may be held across that
   pure computation.

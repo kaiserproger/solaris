@@ -270,6 +270,12 @@ smaller than 257 states stay inline, matching the existing physics-compute
 threshold, and autoscaler scale-down to one CPU disables extra workers. The
 global authority mutex still excludes unrelated point mutations during this
 phase, so this is concurrent regional mutation but not final region ownership.
+Physics prepare now reads owner snapshots and versioned chunk-routing snapshots
+without acquiring `SessionRegistry.inner`. It filters stale inputs,
+captures prior motion, and builds the regional kinematics batch before the
+remaining session lock is acquired for the current owner re-read, despawn,
+arrow, visibility, and wire publication. This shortens the global mutable
+boundary but does not remove it.
 The actor-side cached kinematics path groups multi-entity updates into one
 `SetKinematicsBatchIfCurrent` mutation per affected region. If every cached
 standalone route belongs to the same owner lane, that lane commits the batch

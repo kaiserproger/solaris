@@ -5201,6 +5201,57 @@ fn entity_physics_owner_apply_does_not_hold_session_registry() {
 }
 
 #[test]
+fn entity_physics_prepare_does_not_wait_for_session_registry() {
+    let registry = Arc::new(SessionRegistry::new());
+    let session = register_test_session(&registry, "PhysicsPrepareAlice");
+    assert!(registry.mark_loaded(session, (0, 0)).is_empty());
+    let entity_id = registry
+        .spawn_command_entity(
+            &SimulationAuthority::for_test(),
+            1,
+            "minecraft:zombie".to_owned(),
+            Vec3::new(0.5, 64.0, 0.5),
+        )
+        .into_iter()
+        .find_map(|dispatch| match dispatch.command {
+            OutboundCommand::SpawnEntity(snapshot) => Some(snapshot.id),
+            _ => None,
+        })
+        .expect("spawned zombie");
+    let (reached_tx, reached_rx) = std::sync::mpsc::channel();
+    let (resume_tx, resume_rx) = std::sync::mpsc::channel();
+    *registry
+        .physics_owner_apply_probe
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(EntityApplyReleaseProbe {
+        reached: reached_tx,
+        resume: resume_rx,
+    });
+
+    let session_guard = registry.lock_inner("hold session registry during physics prepare");
+    let physics_registry = Arc::clone(&registry);
+    let physics = std::thread::spawn(move || {
+        physics_registry.apply_entity_physics_and_dispatch(
+            ENTITY_MOVE_SEND_INTERVAL_TICKS,
+            &[EntityPhysicsStep {
+                id: entity_id,
+                position: Vec3::new(0.75, 64.0, 0.5),
+                velocity: Vec3::ZERO,
+                on_ground: true,
+                horizontal_collision: false,
+            }],
+        );
+    });
+
+    reached_rx
+        .recv_timeout(Duration::from_secs(1))
+        .expect("physics prepare reaches regional owner while session registry is held");
+    drop(session_guard);
+    resume_tx.send(()).expect("release physics owner apply");
+    physics.join().expect("physics worker");
+}
+
+#[test]
 fn delayed_physics_routing_cannot_overwrite_a_newer_physics_commit() {
     let registry = Arc::new(SessionRegistry::new());
     let session = register_test_session(&registry, "PhysicsRoutingRaceAlice");
