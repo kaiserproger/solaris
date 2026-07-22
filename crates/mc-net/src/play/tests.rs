@@ -3395,6 +3395,207 @@ async fn player_collision_uses_exact_full_cube_shape_for_stone() {
 }
 
 #[tokio::test]
+async fn player_collision_uses_exact_shapes_for_torch_and_campfire() {
+    let state = vanilla_collision_test_state();
+    let torch = vanilla_collision_state_id(&state, "minecraft:torch", &[]);
+    set_collision_test_block(&state, torch).await;
+    assert!(
+        !player_pose_collides_with_solid(Some(&state), PlayerPose::new(0.5, 64.0, 0.5)).await,
+        "the empty torch collision shape must come from the embedded table"
+    );
+
+    let campfire = vanilla_collision_state_id(
+        &state,
+        "minecraft:campfire",
+        &[
+            ("facing", "north"),
+            ("lit", "true"),
+            ("signal_fire", "false"),
+            ("waterlogged", "false"),
+        ],
+    );
+    set_collision_test_block(&state, campfire).await;
+    assert!(
+        !player_pose_collides_with_solid(Some(&state), PlayerPose::new(0.5, 64.4375, 0.5)).await,
+        "the player may stand on the campfire's exact 7/16-block top"
+    );
+    assert!(
+        player_pose_collides_with_solid(Some(&state), PlayerPose::new(0.5, 64.42, 0.5)).await,
+        "the campfire body must collide below its exact top"
+    );
+}
+
+#[tokio::test]
+async fn powder_snow_collision_uses_player_equipment_and_movement_context() {
+    let mut state = vanilla_collision_test_state();
+    let powder_snow = vanilla_collision_state_id(&state, "minecraft:powder_snow", &[]);
+    set_collision_test_block(&state, powder_snow).await;
+
+    let above = PlayerPose::new(0.5, 65.0, 0.5);
+    let entering = PlayerPose::new(0.5, 64.99, 0.5);
+    assert!(
+        !player_pose_collides_with_solid_using_context(Some(&state), entering, above).await,
+        "a player without leather boots sinks into powder snow"
+    );
+
+    const LEATHER_BOOTS_ID: u32 = 1;
+    state.items = Arc::new(ItemRegistry::from_report(&[ItemReport {
+        id: Identifier::parse("minecraft:leather_boots").unwrap(),
+        protocol_id: LEATHER_BOOTS_ID,
+    }]));
+    state.inventory.slots[PlayerInventory::FEET_ARMOR_SLOT] = ItemStack::new(LEATHER_BOOTS_ID, 1);
+    assert!(
+        player_pose_collides_with_solid_using_context(Some(&state), entering, above).await,
+        "leather boots support a player entering powder snow from above"
+    );
+
+    let mut descending = above;
+    descending.shifting = true;
+    assert!(
+        !player_pose_collides_with_solid_using_context(Some(&state), entering, descending).await,
+        "holding Shift lets a leather-booted player descend through powder snow"
+    );
+    assert!(
+        !player_pose_collides_with_solid_using_context(
+            Some(&state),
+            PlayerPose::new(0.5, 64.4, 0.5),
+            PlayerPose::new(0.5, 64.5, 0.5),
+        )
+        .await,
+        "boots do not turn powder snow solid after the player is already inside it"
+    );
+}
+
+#[tokio::test]
+async fn powder_snow_uses_falling_collision_shape_after_long_fall() {
+    let state = vanilla_collision_test_state();
+    let powder_snow = vanilla_collision_state_id(&state, "minecraft:powder_snow", &[]);
+    set_collision_test_block(&state, powder_snow).await;
+
+    let mut above_shape = PlayerPose::new(0.5, 64.9, 0.5);
+    above_shape.fall_start_y = 68.0;
+    assert!(
+        !player_pose_collides_with_solid(Some(&state), above_shape).await,
+        "the falling collision shape ends at the exact 0.9F boundary"
+    );
+
+    let mut inside_shape = PlayerPose::new(0.5, 64.89, 0.5);
+    inside_shape.fall_start_y = 68.0;
+    assert!(
+        player_pose_collides_with_solid(Some(&state), inside_shape).await,
+        "a fall longer than 2.5 blocks collides with powder snow's 0.9F shape"
+    );
+}
+
+#[tokio::test]
+async fn powder_snow_dynamic_shape_requires_exact_vanilla_state_identity() {
+    let mut reports = solaris_required_blocks_report();
+    let powder_snow = reports
+        .iter_mut()
+        .find(|block| block.id.as_str() == "minecraft:powder_snow")
+        .expect("embedded registry contains powder snow");
+    let state_id = powder_snow.states[0].id;
+    powder_snow
+        .properties
+        .insert("solaris_test".to_string(), vec!["mismatch".to_string()]);
+    powder_snow.states[0]
+        .properties
+        .insert("solaris_test".to_string(), "mismatch".to_string());
+    let blocks = mc_world::BlockRegistry::from_report(&reports)
+        .expect("altered powder snow registry retains dense vanilla state ids");
+    let mut state = interaction_state_for_blocks(Arc::new(blocks));
+    set_collision_test_block(&state, BlockStateId(state_id)).await;
+
+    const LEATHER_BOOTS_ID: u32 = 1;
+    state.items = Arc::new(ItemRegistry::from_report(&[ItemReport {
+        id: Identifier::parse("minecraft:leather_boots").unwrap(),
+        protocol_id: LEATHER_BOOTS_ID,
+    }]));
+    state.inventory.slots[PlayerInventory::FEET_ARMOR_SLOT] = ItemStack::new(LEATHER_BOOTS_ID, 1);
+    assert!(
+        player_pose_collides_with_solid_using_context(
+            Some(&state),
+            PlayerPose::new(0.5, 64.5, 0.5),
+            PlayerPose::new(0.5, 64.5, 0.5),
+        )
+        .await,
+        "a fingerprint mismatch must use conservative custom-block fallback"
+    );
+}
+
+#[tokio::test]
+async fn collision_correction_applies_powder_snow_movement_context() {
+    let mut state = vanilla_collision_test_state();
+    let powder_snow = vanilla_collision_state_id(&state, "minecraft:powder_snow", &[]);
+    set_collision_test_block(&state, powder_snow).await;
+    const LEATHER_BOOTS_ID: u32 = 1;
+    state.items = Arc::new(ItemRegistry::from_report(&[ItemReport {
+        id: Identifier::parse("minecraft:leather_boots").unwrap(),
+        protocol_id: LEATHER_BOOTS_ID,
+    }]));
+    state.inventory.slots[PlayerInventory::FEET_ARMOR_SLOT] = ItemStack::new(LEATHER_BOOTS_ID, 1);
+
+    let mut writer = Vec::new();
+    let mut next_teleport_id = 1;
+    let mut pending_teleport = None;
+    assert!(
+        correct_player_collision(
+            Some(&state),
+            &mut writer,
+            Compression::Disabled,
+            PlayerPose::new(0.5, 65.0, 0.5),
+            PlayerPose::new(0.5, 64.99, 0.5),
+            10,
+            &mut next_teleport_id,
+            &mut pending_teleport,
+        )
+        .await
+        .unwrap(),
+        "leather boots must correct entry through powder snow from above"
+    );
+
+    writer.clear();
+    pending_teleport = None;
+    let mut descending = PlayerPose::new(0.5, 65.0, 0.5);
+    descending.shifting = true;
+    assert!(
+        !correct_player_collision(
+            Some(&state),
+            &mut writer,
+            Compression::Disabled,
+            descending,
+            PlayerPose::new(0.5, 64.99, 0.5),
+            11,
+            &mut next_teleport_id,
+            &mut pending_teleport,
+        )
+        .await
+        .unwrap(),
+        "Shift descent must pass through the correction path"
+    );
+
+    let mut falling = PlayerPose::new(0.5, 64.91, 0.5);
+    falling.fall_start_y = 68.0;
+    let mut landing = PlayerPose::new(0.5, 64.89, 0.5);
+    landing.fall_start_y = 68.0;
+    assert!(
+        correct_player_collision(
+            Some(&state),
+            &mut writer,
+            Compression::Disabled,
+            falling,
+            landing,
+            12,
+            &mut next_teleport_id,
+            &mut pending_teleport,
+        )
+        .await
+        .unwrap(),
+        "a long fall must collide with the 0.9F landing shape"
+    );
+}
+
+#[tokio::test]
 async fn movement_block_reads_do_not_wait_for_world_writer() {
     let mut state = interaction_state_for_blocks(Arc::new(fluid_test_registry()));
     state.block_facts = Arc::new(fluid_test_facts());

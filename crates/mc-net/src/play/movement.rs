@@ -14,6 +14,27 @@ use super::survival::SurvivalState;
 const PLAYER_HORIZONTAL_COORDINATE_LIMIT: f64 = 30_000_000.0;
 const PLAYER_VERTICAL_COORDINATE_LIMIT: f64 = 20_000_000.0;
 const COLLISION_DEFLATION: f64 = 1.0e-5_f32 as f64;
+const POWDER_SNOW_FALLING_TOP: f64 = 0.9_f32 as f64;
+const POWDER_SNOW_FALL_DISTANCE: f64 = 2.5;
+
+#[derive(Debug, Clone, Copy)]
+pub(super) struct PlayerCollisionContext {
+    entity_bottom: f64,
+    fall_distance: f64,
+    descending: bool,
+    walks_on_powder_snow: bool,
+}
+
+impl PlayerCollisionContext {
+    pub(super) fn from_pose(pose: PlayerPose, walks_on_powder_snow: bool) -> Self {
+        Self {
+            entity_bottom: pose.y,
+            fall_distance: (pose.fall_start_y - pose.y).max(0.0),
+            descending: pose.shifting,
+            walks_on_powder_snow,
+        }
+    }
+}
 
 #[derive(Debug, Clone, Copy)]
 pub(super) struct AcceptedAbsoluteMovement {
@@ -118,6 +139,22 @@ pub(super) fn player_pose_collides_with_solid_in_snapshot(
     snapshot: &WorldReadSnapshot,
     pose: PlayerPose,
 ) -> bool {
+    player_pose_collides_with_solid_in_snapshot_with_context(
+        facts,
+        blocks,
+        snapshot,
+        pose,
+        PlayerCollisionContext::from_pose(pose, false),
+    )
+}
+
+pub(super) fn player_pose_collides_with_solid_in_snapshot_with_context(
+    facts: &BlockFactsTable,
+    blocks: &BlockRegistry,
+    snapshot: &WorldReadSnapshot,
+    pose: PlayerPose,
+    context: PlayerCollisionContext,
+) -> bool {
     let collision_shapes = vanilla_collision_shapes();
     let half_width = 0.3;
     let min_x = (pose.x - half_width).floor() as i32;
@@ -141,7 +178,7 @@ pub(super) fn player_pose_collides_with_solid_in_snapshot(
                             state_id,
                             block_pos,
                             pose,
-                            half_width,
+                            context,
                         )
                     });
                 if collides {
@@ -160,25 +197,20 @@ fn player_collision_state_intersects(
     state_id: BlockStateId,
     block_pos: BlockPos,
     pose: PlayerPose,
-    player_half_width: f64,
+    context: PlayerCollisionContext,
 ) -> bool {
     if facts.fluid(state_id.0).is_some() {
-        return false;
-    }
-    if is_campfire_block(blocks, state_id) {
         return false;
     }
     let Some(block_state) = blocks.by_id(state_id) else {
         return false;
     };
     let block_name = block_state.block.id.as_str();
-    if passable_block_name(block_name) {
-        return false;
-    }
 
     let block_min_x = f64::from(block_pos.x);
     let block_min_y = f64::from(block_pos.y);
     let block_min_z = f64::from(block_pos.z);
+    let player_half_width = 0.3;
     let intersects = |[min_x, min_y, min_z, max_x, max_y, max_z]: [f64; 6]| {
         pose.x - player_half_width < block_min_x + max_x - COLLISION_DEFLATION
             && pose.x + player_half_width > block_min_x + min_x + COLLISION_DEFLATION
@@ -188,14 +220,34 @@ fn player_collision_state_intersects(
             && pose.z + player_half_width > block_min_z + min_z + COLLISION_DEFLATION
     };
 
-    if let Some(boxes) = collision_shapes.get_for_state(
+    let exact_shape = collision_shapes.get_for_state(
         state_id.0,
         &block_state.block.id,
         block_state.properties.as_slice(),
-    ) {
+    );
+    if block_name == "minecraft:powder_snow" && exact_shape.is_some() {
+        if context.fall_distance > POWDER_SNOW_FALL_DISTANCE {
+            return intersects([0.0, 0.0, 0.0, 1.0, POWDER_SNOW_FALLING_TOP, 1.0]);
+        }
+        let is_above = context.entity_bottom > block_min_y + 1.0 - COLLISION_DEFLATION;
+        return context.walks_on_powder_snow
+            && is_above
+            && !context.descending
+            && intersects([0.0, 0.0, 0.0, 1.0, 1.0, 1.0]);
+    }
+
+    if let Some(boxes) = exact_shape {
         return boxes
             .iter()
             .any(|collision_box| intersects(collision_box.as_blocks()));
+    }
+
+    // Custom or reduced registries have no vanilla table identity. Preserve the
+    // known semantics for those fixtures instead of turning plants into cubes.
+    if is_campfire_block(blocks, state_id)
+        || (block_name != "minecraft:powder_snow" && passable_block_name(block_name))
+    {
+        return false;
     }
 
     let fallback_box = if collision_shapes

@@ -374,11 +374,11 @@ use lighting::{
 #[cfg(test)]
 use movement::fall_damage_amount;
 use movement::{
-    AcceptedAbsoluteMovement, PendingTeleport, TeleportConfirmResult, clamp_player_pose,
-    confirm_pending_teleport, farmland_trample_pos, guard_pending_teleport_movement,
-    movement_exhaustion, next_player_teleport_id, normalize_absolute_player_movement,
-    player_pose_collides_with_solid_in_snapshot, player_water_overlap_in_snapshot,
-    refresh_player_fall_state, validate_player_rotation,
+    AcceptedAbsoluteMovement, PendingTeleport, PlayerCollisionContext, TeleportConfirmResult,
+    clamp_player_pose, confirm_pending_teleport, farmland_trample_pos,
+    guard_pending_teleport_movement, movement_exhaustion, next_player_teleport_id,
+    normalize_absolute_player_movement, player_pose_collides_with_solid_in_snapshot_with_context,
+    player_water_overlap_in_snapshot, refresh_player_fall_state, validate_player_rotation,
 };
 #[cfg(test)]
 use persistence::PersistedEntityRecord;
@@ -10282,12 +10282,32 @@ async fn player_pose_collides_with_solid(
     state: Option<&InteractionState>,
     pose: PlayerPose,
 ) -> bool {
+    player_pose_collides_with_solid_using_context(state, pose, pose).await
+}
+
+async fn player_pose_collides_with_solid_using_context(
+    state: Option<&InteractionState>,
+    pose: PlayerPose,
+    context_pose: PlayerPose,
+) -> bool {
     let Some(state) = state else {
         return false;
     };
     let half_width = 0.3;
     let snapshot = player_body_block_snapshot(state, pose, half_width);
-    player_pose_collides_with_solid_in_snapshot(&state.block_facts, &state.blocks, &snapshot, pose)
+    let feet = &state.inventory.slots[PlayerInventory::FEET_ARMOR_SLOT];
+    let leather_boots = !feet.is_empty()
+        && state
+            .items
+            .name_of(feet.item_id)
+            .is_some_and(|name| name.as_str() == "minecraft:leather_boots");
+    player_pose_collides_with_solid_in_snapshot_with_context(
+        &state.block_facts,
+        &state.blocks,
+        &snapshot,
+        pose,
+        PlayerCollisionContext::from_pose(context_pose, leather_boots),
+    )
 }
 
 fn player_body_block_snapshot(
@@ -10322,7 +10342,7 @@ async fn correct_player_collision<W>(
 where
     W: AsyncWriteExt + Unpin,
 {
-    if !player_pose_collides_with_solid(state, new_pose).await
+    if !player_pose_collides_with_solid_using_context(state, new_pose, old_pose).await
         || player_pose_collides_with_solid(state, old_pose).await
     {
         return Ok(false);

@@ -26,12 +26,16 @@ verification and keep ordinary survival play ahead of rare edge cases.
   ordinary vanilla use input (`63 -> 62`), and to the east side (`x+1`) from
   the main hand (`62 -> 61`); all three authoritative block updates reached
   the client without a disconnect.
-- [ ] Embed exact vanilla collision shapes so torches, doors, crops, slabs,
+- [x] Embed exact vanilla collision shapes so torches, doors, crops, slabs,
   stairs, fences, and other non-cubes never fall back to full-cube collision.
   All 29,873 vanilla 26.1.2 states now have their context-free shape embedded in
-  a validated zero-copy binary table; focused shape/physics tests and the full
-  `mc-net` library suite are green. Entity-dependent overrides, notably leather
-  boots walking on powder snow, still need their owning movement context.
+  a validated zero-copy binary table. Player movement consults that table before
+  any reduced/custom-registry fallback, so torches remain empty while campfires
+  use their exact 7/16-block body. Powder snow now uses the player's current
+  leather boots, Shift descent, position-above-block check, and `> 2.5`-block
+  fall distance through the authoritative movement-correction path. Exact state
+  fingerprints prevent custom blocks from inheriting these dynamic semantics.
+  Focused shape/physics tests and the full `mc-net` library suite are green.
 - [x] Breaking a block must spawn a world item drop before normal pickup rather
   than crediting the inventory directly. The authoritative break transaction
   creates a persisted item entity without crediting the mined stack to player
@@ -206,6 +210,9 @@ verification and keep ordinary survival play ahead of rare edge cases.
   varied goals, sensible pauses, obstacle stepping, and no unprompted hopping,
   synchronized herds, circular running, diagonal grid motion, or stationary
   jitter.
+- [ ] Extend entity collision context beyond players: powder-snow-walkable mob
+  tags and falling blocks must use their vanilla dynamic powder-snow shape
+  without weakening the exact-state fingerprint fence.
 - [ ] Keep menus, inventory actions, block events, and attacks responsive under
   natural mob/chunk load.
 - [ ] Add concise comments to shipped TOML options explaining their effect.

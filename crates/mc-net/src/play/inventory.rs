@@ -32,6 +32,7 @@ impl PlayerInventory {
     /// Slot index where the hotbar begins on the wire.
     pub(crate) const HOTBAR_BASE: usize = 36;
     const HOTBAR_LEN: usize = 9;
+    pub(crate) const FEET_ARMOR_SLOT: usize = 8;
     pub(crate) const OFFHAND_SLOT: usize = 45;
 
     pub(crate) fn empty() -> Self {

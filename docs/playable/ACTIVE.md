@@ -26,7 +26,9 @@ packet has been applied. The original persisted dead-player save reproduced
 closed the death/loading screen, restored its inventory, and observed positive
 health. `wait_for_health_below` also now uses strict numeric ordering: the real
 client accepts exact zero below a `0.001` threshold without changing its
-push-driven wait.
+push-driven wait. Player collision now consumes the complete embedded vanilla
+shape table before custom-registry fallbacks and supplies vanilla movement
+context for leather boots, Shift descent, and long falls through powder snow.
 
 ## Current Queue
 
@@ -81,6 +83,14 @@ hardening. An already-open lower-priority diff does not override this order.
    blocks the playable or plugin path.
 
 ## Recent Evidence
+
+- Every exact vanilla state now reaches its embedded collision shape in player
+  movement instead of being bypassed by the old campfire/passable-name lists.
+  Focused tests prove empty torch collision, the campfire's 7/16-block body,
+  leather-boots support on powder snow, Shift descent, the long-fall 0.9F shape,
+  authoritative teleport correction, and conservative fallback after a state
+  fingerprint mismatch. Independent review found the fingerprint and direct
+  correction-path gaps; both were fixed before the full gates.
 
 - Shift-click batching is client-verified. One real 26.1.2 inventory-menu
   quick-move consumed four logs and produced 16 planks, and one crafting-table
