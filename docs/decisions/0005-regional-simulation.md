@@ -463,12 +463,12 @@ uses the shared atomic phase/sequence allocator, records the exact post-state
 through the production journal, rolls back safe journal failures, and
 fail-stops on unknown outcomes before finalize. Save, reconfiguration, journal
 clear, and shutdown take the exclusive side of the mutation gate. Global index
-changes, cross-region commands, and cache misses remain coordinator-owned.
-Coordinator snapshot, selected-snapshot, breeding, and goal-prepare reads also
-take that exclusive side, so they cannot publish direct lane state
-before journal durability or after a safe rollback. Cached ordinary reads are
-lock-free with respect to distinct lane commits and validate only their touched
-lane versions. Referenced goal CAS takes the shared side of the topology gate,
+changes and cross-region commands remain coordinator-owned. Cold coordinator
+reads take shared topology plus their resolved owner admissions, so they cannot
+publish lane state before journal durability or after a safe rollback. Cached
+ordinary reads are lock-free with respect to distinct lane commits and validate
+only their touched lane versions. Referenced goal CAS takes the shared side of
+the topology gate,
 locks only its selected owner lanes in lane-id order, and validates that exact
 version vector before commit. Direct writers in unrelated lanes can continue;
 coordinator-owned index changes, actor fallbacks, and reconfiguration still
@@ -488,6 +488,12 @@ valid fallback stalled on one lane therefore no longer holds the exclusive
 topology gate or blocks direct work in unrelated lanes. Spawn, remove,
 position/region changes, full snapshot replacement, save/reconfigure, and other
 global-index operations remain on the exclusive side.
+Cold point and ID-filtered actor reads use the same shared topology and ordered
+touched-lane admissions. Full snapshots, breeding scans, and fallback goal
+preparation use shared topology plus every owner admission until their query is
+partitioned further. A cold read stalled on one lane therefore does not stop a
+direct writer in another lane, while the selected lanes remain stable through
+route publication and version-fence capture.
 Hostile goal planning now compares the computed goal with the goal already in
 the simulation view. Equal wander, follow-position, or idle goals are removed
 before the owner call, and an empty diff sends no command. This reduces the

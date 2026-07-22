@@ -45,6 +45,10 @@ Current runtime facts:
   admissions in stable lane-id order. Malformed ownership routes and actor
   operations that can change region ownership or global indexes remain
   exclusive.
+- Cold point and ID-filtered actor reads use shared topology plus touched-lane
+  admissions. Full snapshots, breeding scans, and fallback goal preparation
+  currently take every lane admission under shared topology; they no longer
+  take the exclusive topology fence but still serialize entity work globally.
 - Physics owner CAS returns its committed kinematics batch directly. The
   network adapter must not restore the removed immediate owner reread; it keeps
   one current-state read at the publication boundary.
