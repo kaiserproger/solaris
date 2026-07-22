@@ -187,7 +187,7 @@ impl DecorationBlocks {
             short_grass: optional_block(registry, "minecraft:short_grass"),
             dandelion: optional_block(registry, "minecraft:dandelion"),
             poppy: optional_block(registry, "minecraft:poppy"),
-            grass_patch_spacing: 11,
+            grass_patch_spacing: 17,
             pumpkin: optional_block(registry, "minecraft:pumpkin"),
             sugar_cane: optional_block(registry, "minecraft:sugar_cane"),
             cactus: optional_block(registry, "minecraft:cactus"),
@@ -195,6 +195,38 @@ impl DecorationBlocks {
             kelp_plant: optional_block(registry, "minecraft:kelp_plant"),
             kelp: optional_block(registry, "minecraft:kelp"),
         }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TreeKind {
+    Oak,
+    Birch,
+    Spruce,
+    Jungle,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct TreeBlocks {
+    kind: TreeKind,
+    log: BlockStateId,
+    leaves: BlockStateId,
+}
+
+fn tree_canopy_radius(kind: TreeKind, relative_y: i32) -> Option<i8> {
+    match (kind, relative_y) {
+        (TreeKind::Oak, -2 | -1) => Some(2),
+        (TreeKind::Oak, 0 | 1) => Some(1),
+        (TreeKind::Birch, -2 | -1) => Some(2),
+        (TreeKind::Birch, 0) => Some(1),
+        (TreeKind::Birch, 1) => Some(0),
+        (TreeKind::Spruce, -4) => Some(1),
+        (TreeKind::Spruce, -3 | -2) => Some(2),
+        (TreeKind::Spruce, -1 | 0) => Some(1),
+        (TreeKind::Spruce, 1) => Some(0),
+        (TreeKind::Jungle, -2..=0) => Some(2),
+        (TreeKind::Jungle, 1) => Some(1),
+        _ => None,
     }
 }
 
@@ -1064,11 +1096,9 @@ impl TerrainGenerator {
                 if self.is_spawn_stone_outcrop(plan.wx, height, plan.wz) {
                     continue;
                 }
-                let tree_biome = self.biomes.temperate_forest.contains(biome)
-                    || self.biomes.cold.contains(biome)
-                    || self.biomes.jungle.contains(biome)
-                    || self.biomes.grassland.contains(biome);
-                if ((tree_biome && h.is_multiple_of(47)) || self.is_spawn_tree_anchor(plan))
+                let tree_spacing = self.tree_spacing_for_biome(biome);
+                if ((tree_spacing.is_some_and(|spacing| h.is_multiple_of(spacing)))
+                    || self.is_spawn_tree_anchor(plan))
                     && self.tree_site_is_stable(plan)
                     && self.place_tree(chunk, plan, self.tree_blocks_for_biome(biome), &mut touched)
                 {
@@ -1092,11 +1122,11 @@ impl TerrainGenerator {
                     || self.biomes.jungle.contains(biome))
                     && (surface == self.grass_block || surface == self.podzol)
                 {
-                    let plant = if h.is_multiple_of(97) {
+                    let plant = if h.is_multiple_of(1021) {
                         self.decorations.pumpkin
-                    } else if h.is_multiple_of(37) {
+                    } else if h.is_multiple_of(61) {
                         self.decorations.dandelion
-                    } else if h.is_multiple_of(41) {
+                    } else if h.is_multiple_of(67) {
                         self.decorations.poppy
                     } else if h.is_multiple_of(self.decorations.grass_patch_spacing) {
                         self.decorations.short_grass
@@ -1159,11 +1189,25 @@ impl TerrainGenerator {
             && (plan.surface == self.grass_block || plan.surface == self.podzol)
     }
 
+    fn tree_spacing_for_biome(&self, biome: &Identifier) -> Option<u64> {
+        if self.biomes.jungle.contains(biome) {
+            Some(23)
+        } else if self.biomes.temperate_forest.contains(biome) {
+            Some(31)
+        } else if self.biomes.cold.contains(biome) {
+            Some(37)
+        } else if self.biomes.grassland.contains(biome) {
+            Some(127)
+        } else {
+            None
+        }
+    }
+
     fn place_tree(
         &self,
         chunk: &mut Chunk,
         plan: &ColumnPlan,
-        blocks: (Option<BlockStateId>, Option<BlockStateId>),
+        blocks: Option<TreeBlocks>,
         touched: &mut [Option<i32>; 256],
     ) -> bool {
         let lx = plan.lx;
@@ -1171,13 +1215,19 @@ impl TerrainGenerator {
         let Some(base_y) = checked_y_offset(plan.height, 1) else {
             return false;
         };
-        let (Some(log), Some(leaves)) = blocks else {
+        let Some(blocks) = blocks else {
             return false;
         };
-        let Some(top_y) = checked_y_offset(base_y, 5) else {
+        let trunk_height = match blocks.kind {
+            TreeKind::Oak => 4 + (plan.hash % 2) as i32,
+            TreeKind::Birch => 5 + (plan.hash % 2) as i32,
+            TreeKind::Spruce => 5 + (plan.hash % 3) as i32,
+            TreeKind::Jungle => 6 + (plan.hash % 2) as i32,
+        };
+        let Some(trunk_top_y) = checked_y_offset(base_y, trunk_height - 1) else {
             return false;
         };
-        let Some(trunk_top_y) = checked_y_offset(base_y, 3) else {
+        let Some(top_y) = checked_y_offset(trunk_top_y, 1) else {
             return false;
         };
         if !(2..=13).contains(&lx) || !(2..=13).contains(&lz) || top_y >= self.geometry.max_y() {
@@ -1195,19 +1245,24 @@ impl TerrainGenerator {
             }
         }
         for y in base_y..=trunk_top_y {
-            self.place_single(chunk, lx, y, lz, log, touched);
+            self.place_single(chunk, lx, y, lz, blocks.log, touched);
         }
-        for dz in -2i8..=2 {
-            for dx in -2i8..=2 {
-                let distance = dx.unsigned_abs() + dz.unsigned_abs();
-                if distance > 3 {
-                    continue;
-                }
-                let x = lx.wrapping_add_signed(dx);
-                let z = lz.wrapping_add_signed(dz);
-                for y in trunk_top_y..=top_y {
+        for relative_y in -4..=1 {
+            let Some(radius) = tree_canopy_radius(blocks.kind, relative_y) else {
+                continue;
+            };
+            let Some(y) = checked_y_offset(trunk_top_y, relative_y) else {
+                continue;
+            };
+            for dz in -radius..=radius {
+                for dx in -radius..=radius {
+                    if !self.tree_leaf_is_present(plan, blocks.kind, y, dx, dz, radius) {
+                        continue;
+                    }
+                    let x = lx.wrapping_add_signed(dx);
+                    let z = lz.wrapping_add_signed(dz);
                     if chunk.get_block(x, y, z) == Some(self.air) {
-                        self.place_single(chunk, x, y, z, leaves, touched);
+                        self.place_single(chunk, x, y, z, blocks.leaves, touched);
                     }
                 }
             }
@@ -1215,19 +1270,70 @@ impl TerrainGenerator {
         true
     }
 
-    fn tree_blocks_for_biome(
-        &self,
-        biome: &Identifier,
-    ) -> (Option<BlockStateId>, Option<BlockStateId>) {
-        if self.biomes.jungle.contains(biome) {
-            (self.decorations.jungle_log, self.decorations.jungle_leaves)
+    fn tree_blocks_for_biome(&self, biome: &Identifier) -> Option<TreeBlocks> {
+        let (kind, log, leaves) = if self.biomes.jungle.contains(biome) {
+            (
+                TreeKind::Jungle,
+                self.decorations.jungle_log,
+                self.decorations.jungle_leaves,
+            )
         } else if self.biomes.cold.contains(biome) || biome.path().contains("taiga") {
-            (self.decorations.cold_log, self.decorations.cold_leaves)
+            (
+                TreeKind::Spruce,
+                self.decorations.cold_log,
+                self.decorations.cold_leaves,
+            )
         } else if self.biomes.temperate_forest.contains(biome) {
-            (self.decorations.forest_log, self.decorations.forest_leaves)
+            (
+                TreeKind::Birch,
+                self.decorations.forest_log,
+                self.decorations.forest_leaves,
+            )
         } else {
-            (self.decorations.oak_log, self.decorations.oak_leaves)
+            (
+                TreeKind::Oak,
+                self.decorations.oak_log,
+                self.decorations.oak_leaves,
+            )
+        };
+        log.zip(leaves)
+            .map(|(log, leaves)| TreeBlocks { kind, log, leaves })
+    }
+
+    fn tree_leaf_is_present(
+        &self,
+        plan: &ColumnPlan,
+        kind: TreeKind,
+        y: i32,
+        dx: i8,
+        dz: i8,
+        radius: i8,
+    ) -> bool {
+        if radius == 0 {
+            return dx == 0 && dz == 0;
         }
+        let edge_x = dx.unsigned_abs() == radius as u8;
+        let edge_z = dz.unsigned_abs() == radius as u8;
+        if edge_x && edge_z {
+            return false;
+        }
+        if radius < 2 || !(edge_x || edge_z) {
+            return true;
+        }
+        let salt = match kind {
+            TreeKind::Oak => 0x0A4,
+            TreeKind::Birch => 0xB17C,
+            TreeKind::Spruce => 0x5A9C,
+            TreeKind::Jungle => 0xA6E1,
+        };
+        !feature_hash(
+            self.seed,
+            plan.wx + i32::from(dx),
+            y,
+            plan.wz + i32::from(dz),
+            salt,
+        )
+        .is_multiple_of(5)
     }
 
     fn place_cactus(

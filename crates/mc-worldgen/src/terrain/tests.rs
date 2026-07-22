@@ -802,10 +802,11 @@ fn generated_column_has_bedrock_and_biome_surface() {
         assert_eq!(chunk.get_block(8, SEA_LEVEL + 1, 8), Some(air));
     }
 
-    // Heightmap value matches the height field.
+    // Decorations may extend the final opaque top above the terrain field.
     let hm = chunk.heightmaps.get("MOTION_BLOCKING").unwrap();
-    assert_eq!(hm.get(8, 8), (height + 1 - MIN_Y) as u32);
-    assert_eq!(chunk.highest_opaque_y(8, 8), Some(height));
+    let highest = chunk.highest_opaque_y(8, 8).unwrap();
+    assert!(highest >= height);
+    assert_eq!(hm.get(8, 8), (highest + 1 - MIN_Y) as u32);
 
     // Dirty flag set so M6 flush picks it up.
     assert!(chunk.dirty);
@@ -822,9 +823,11 @@ fn generated_chunk_uses_explicit_geometry() {
     assert_eq!(chunk.sections.len(), 16);
     assert_eq!(chunk.get_block(8, 0, 8), Some(generator.bedrock));
     let surface = generator.surface_height(8, 8);
+    let highest = chunk.highest_opaque_y(8, 8).unwrap();
+    assert!(highest >= surface);
     assert_eq!(
         chunk.heightmaps["MOTION_BLOCKING"].get(8, 8),
-        (surface + 1) as u32
+        (highest + 1) as u32
     );
 }
 
@@ -1665,6 +1668,48 @@ fn surface_decorations_are_visible_and_refresh_heightmaps() {
 }
 
 #[test]
+fn pumpkins_remain_a_rare_surface_decoration() {
+    let registry = tiny_registry();
+    let mut eligible_columns = 0usize;
+    let mut pumpkins = 0usize;
+    for seed in -2..2 {
+        let generator = TerrainGenerator::new(seed, Arc::clone(&registry));
+        let pumpkin = generator.decorations.pumpkin.expect("pumpkin state");
+        for chunk_x in -2..=2 {
+            for chunk_z in -2..=2 {
+                let pos = ChunkPos {
+                    x: chunk_x,
+                    z: chunk_z,
+                };
+                let chunk = generator.generate(pos);
+                for lx in 0..16u8 {
+                    for lz in 0..16u8 {
+                        let plan = generator.plan_column(pos, lx, lz);
+                        if (generator.biomes.grassland.contains(&plan.biome)
+                            || generator.biomes.temperate_forest.contains(&plan.biome)
+                            || generator.biomes.jungle.contains(&plan.biome))
+                            && (plan.surface == generator.grass_block
+                                || plan.surface == generator.podzol)
+                        {
+                            eligible_columns += 1;
+                            pumpkins += usize::from(
+                                chunk.get_block(lx, plan.height + 1, lz) == Some(pumpkin),
+                            );
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    assert!(pumpkins > 0, "sample should contain a pumpkin");
+    assert!(
+        pumpkins * 256 <= eligible_columns,
+        "pumpkins are too dense: {pumpkins}/{eligible_columns} eligible columns"
+    );
+}
+
+#[test]
 fn generated_tree_trunks_start_on_the_planned_surface() {
     let registry = tiny_registry();
     let mut trees = 0usize;
@@ -1718,6 +1763,119 @@ fn generated_tree_trunks_start_on_the_planned_surface() {
 }
 
 #[test]
+fn tree_species_have_distinct_tapered_canopy_profiles() {
+    let profile = |kind| {
+        (-4..=1)
+            .filter_map(|relative_y| tree_canopy_radius(kind, relative_y))
+            .collect::<Vec<_>>()
+    };
+
+    let oak = profile(TreeKind::Oak);
+    let birch = profile(TreeKind::Birch);
+    let spruce = profile(TreeKind::Spruce);
+    let jungle = profile(TreeKind::Jungle);
+    assert_eq!(oak.last(), Some(&1));
+    assert_eq!(birch.last(), Some(&0));
+    assert_eq!(spruce.last(), Some(&0));
+    assert_eq!(jungle.last(), Some(&1));
+    assert!(oak.iter().any(|radius| *radius > *oak.last().unwrap()));
+    assert!(birch.iter().any(|radius| *radius > *birch.last().unwrap()));
+    assert!(
+        spruce
+            .iter()
+            .any(|radius| *radius > *spruce.last().unwrap())
+    );
+    assert!(
+        jungle
+            .iter()
+            .any(|radius| *radius > *jungle.last().unwrap())
+    );
+    assert_ne!(oak, birch);
+    assert_ne!(oak, spruce);
+    assert_ne!(oak, jungle);
+    assert_ne!(birch, spruce);
+    assert_ne!(birch, jungle);
+    assert_ne!(spruce, jungle);
+}
+
+#[test]
+fn generated_tree_canopies_narrow_above_the_main_crown() {
+    let registry = tiny_registry();
+    let mut inspected = 0usize;
+    for seed in -4..4 {
+        let generator = TerrainGenerator::new(seed, Arc::clone(&registry));
+        let logs = [
+            generator.decorations.oak_log,
+            generator.decorations.forest_log,
+            generator.decorations.cold_log,
+            generator.decorations.jungle_log,
+        ];
+        let leaves = [
+            generator.decorations.oak_leaves,
+            generator.decorations.forest_leaves,
+            generator.decorations.cold_leaves,
+            generator.decorations.jungle_leaves,
+        ];
+        for chunk_x in -3..=3 {
+            for chunk_z in -3..=3 {
+                let pos = ChunkPos {
+                    x: chunk_x,
+                    z: chunk_z,
+                };
+                let chunk = generator.generate(pos);
+                for lx in 2..=13u8 {
+                    for lz in 2..=13u8 {
+                        let plan = generator.plan_column(pos, lx, lz);
+                        let base_y = plan.height + 1;
+                        if !chunk
+                            .get_block(lx, base_y, lz)
+                            .is_some_and(|state| logs.contains(&Some(state)))
+                        {
+                            continue;
+                        }
+                        let trunk_top = (base_y..=base_y + 7)
+                            .take_while(|y| {
+                                chunk
+                                    .get_block(lx, *y, lz)
+                                    .is_some_and(|state| logs.contains(&Some(state)))
+                            })
+                            .last()
+                            .expect("tree has a trunk base");
+                        let mut layers = Vec::new();
+                        for y in base_y..=base_y + 8 {
+                            let count = (-2..=2)
+                                .flat_map(|dx| (-2..=2).map(move |dz| (dx, dz)))
+                                .filter(|(dx, dz)| {
+                                    let x = i32::from(lx) + dx;
+                                    let z = i32::from(lz) + dz;
+                                    (0..16).contains(&x)
+                                        && (0..16).contains(&z)
+                                        && chunk
+                                            .get_block(x as u8, y, z as u8)
+                                            .is_some_and(|state| leaves.contains(&Some(state)))
+                                })
+                                .count();
+                            if count > 0 {
+                                layers.push((y, count));
+                            }
+                        }
+                        let (top_y, top_count) = layers.last().copied().expect("leaf canopy");
+                        let widest = layers.iter().map(|(_, count)| *count).max().unwrap();
+                        assert!(top_y > trunk_top, "tree crown must cap the trunk");
+                        assert!(
+                            top_count < widest,
+                            "tree crown must taper above its main canopy"
+                        );
+                        inspected += 1;
+                    }
+                }
+            }
+        }
+    }
+    assert!(inspected >= 8, "sample should contain generated trees");
+}
+
+#[test]
 fn structures_precede_tree_and_single_plant_decoration() {
     let registry = tiny_registry();
     let seed = 42;
@@ -1739,11 +1897,16 @@ fn structures_precede_tree_and_single_plant_decoration() {
                 || plain.biomes.cold.contains(&plan.biome)
                 || plain.biomes.jungle.contains(&plan.biome)
                 || plain.biomes.grassland.contains(&plan.biome);
-            let (Some(log), Some(leaves)) = plain.tree_blocks_for_biome(&plan.biome) else {
+            let Some(tree) = plain.tree_blocks_for_biome(&plan.biome) else {
                 continue;
             };
-            if tree_biome && plan.hash.is_multiple_of(47) && plan.hash.is_multiple_of(37) {
-                target = Some((wx, wz, plan.height, log, leaves));
+            if tree_biome
+                && plain
+                    .tree_spacing_for_biome(&plan.biome)
+                    .is_some_and(|spacing| plan.hash.is_multiple_of(spacing))
+                && plan.hash.is_multiple_of(61)
+            {
+                target = Some((wx, wz, plan.height, tree.log, tree.leaves));
                 break 'search;
             }
         }

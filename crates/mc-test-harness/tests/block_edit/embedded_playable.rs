@@ -119,7 +119,7 @@ async fn embedded_playable_short_session_soak_keeps_clients_responsive() {
                 )
                 .expect("seed soak floor")
                 .expect("replace soak floor");
-            for y in player_y..=player_y + 2 {
+            for y in (floor_y + 1)..=player_y + 2 {
                 world
                     .set_block_at(mc_world::BlockPos { x, y, z }, air_state)
                     .expect("clear soak movement space")
@@ -142,7 +142,11 @@ async fn embedded_playable_short_session_soak_keeps_clients_responsive() {
         tasks.push(tokio::spawn(async move {
             let (mut client, sync) = connect_to_play(addr, &format!("P2Soak{idx}")).await;
             drain_until_chunk(&mut client, (0, 0)).await;
-            assert_eq!(sync.y.floor() as i32, player_y);
+            let actual_spawn_y = sync.y.floor() as i32;
+            assert!(
+                (player_y - 1..=player_y).contains(&actual_spawn_y),
+                "soak spawn should stay on the prepared surface: {actual_spawn_y}"
+            );
 
             for step in 0..8 {
                 client

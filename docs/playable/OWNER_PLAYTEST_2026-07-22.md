@@ -42,12 +42,18 @@ verification and keep ordinary survival play ahead of rare edge cases.
 ## World Generation
 
 - [ ] Replace the current broken terrain pass: no floating trees, giant terrain
-  holes, excessive pumpkins, or random-seed water spawns.
-- [ ] Trees need species-specific vanilla-like silhouettes instead of rectangular
+  holes, excessive pumpkins, or random-seed water spawns. Stable tree placement
+  and rare-pumpkin density are now covered; cave/terrain and spawn checks remain.
+- [x] Trees need species-specific vanilla-like silhouettes instead of rectangular
   leaf prisms. Oak-like trees need an irregular crown above the main canopy and
-  must never leave unsupported floating foliage/trunks after generation.
+  must never leave unsupported floating foliage/trunks after generation. Oak,
+  birch, spruce, and jungle profiles now have distinct tapered layers, hashed
+  edge variation, stable support, and generated-shape regressions.
 - [ ] Biomes need coherent, longer terrain forms instead of noisy short-scale
   height changes. Vegetation density must stay moderate and biome-appropriate.
+  The existing router already uses 340-3,600 block landform scales; decoration
+  density is now biome-specific, grass/flowers are sparser, and pumpkins are
+  bounded below one per 256 eligible columns in the sampled regression.
 - [ ] Generated plants use their exact embedded vanilla collision shape; grass,
   flowers, crops, and saplings must never become full cubes.
 - [ ] Keep vanilla-compatible world load/save while producing coherent terrain
@@ -110,3 +116,8 @@ verification and keep ordinary survival play ahead of rare edge cases.
 
 The 2026-07-22 survival-fix checkpoint passed the full workspace test suite,
 workspace clippy with warnings denied, formatting, and `xtask code-health`.
+
+The 2026-07-22 tree/decorations checkpoint passed the full workspace test suite,
+workspace clippy with warnings denied, the external worldgen harness,
+formatting, and `xtask code-health`; independent review reported no findings. A
+fresh-world client visual pass remains part of the broader terrain checkpoint.
