@@ -3,9 +3,9 @@ use mc_data::biomes::BiomeWorldgenData;
 
 use crate::noise::fbm_2d;
 
-const BIOME_PICK_WARP_SCALE: f64 = 520.0;
-const BIOME_PICK_WARP_AMPLITUDE: f64 = 54.0;
-const BIOME_PICK_NOISE_SCALE: f64 = 460.0;
+const BIOME_PICK_WARP_SCALE: f64 = 760.0;
+const BIOME_PICK_WARP_AMPLITUDE: f64 = 72.0;
+const BIOME_PICK_NOISE_SCALE: f64 = 680.0;
 
 const OVERWORLD_BIOME_IDS: &[&str] = &[
     "minecraft:mushroom_fields",

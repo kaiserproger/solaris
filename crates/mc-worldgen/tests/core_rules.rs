@@ -211,6 +211,58 @@ fn sampled_land_contains_tree_shapes() {
 }
 
 #[test]
+fn generated_tree_trunks_are_supported_by_stable_terrain() {
+    let registry = Arc::new(
+        BlockRegistry::from_report(&mc_data::blocks::solaris_required_blocks_report()).unwrap(),
+    );
+    let air = default_state(&registry, "minecraft:air");
+    let water = default_state(&registry, "minecraft:water");
+    let mut trees = 0usize;
+
+    for seed in [-19, 0, 37] {
+        let generator = TerrainGenerator::new(seed, Arc::clone(&registry));
+        for cx in -1..=1 {
+            for cz in -1..=1 {
+                let chunk = generator.generate(ChunkPos { x: cx, z: cz });
+                for lx in 2..=13u8 {
+                    for lz in 2..=13u8 {
+                        let wx = cx * 16 + i32::from(lx);
+                        let wz = cz * 16 + i32::from(lz);
+                        let surface = generator.surface_height(wx, wz);
+                        let base = surface + 1;
+                        if !chunk
+                            .get_block(lx, base, lz)
+                            .is_some_and(|state| is_log(&registry, state))
+                        {
+                            continue;
+                        }
+                        let support = chunk.get_block(lx, surface, lz);
+                        assert!(
+                            support.is_some_and(|state| state != air && state != water),
+                            "tree trunk has no solid support at {wx},{base},{wz}"
+                        );
+                        for dx in -1..=1 {
+                            for dz in -1..=1 {
+                                let neighbour = generator.surface_height(wx + dx, wz + dz);
+                                assert!(
+                                    (surface - neighbour).abs() <= 1,
+                                    "tree at {wx},{base},{wz} overhangs terrain at {},{}",
+                                    wx + dx,
+                                    wz + dz
+                                );
+                            }
+                        }
+                        trees += 1;
+                    }
+                }
+            }
+        }
+    }
+
+    assert!(trees > 0, "sampled chunks should contain generated trees");
+}
+
+#[test]
 fn default_seed_spawn_window_contains_basic_playable_resources() {
     let registry = Arc::new(
         BlockRegistry::from_report(&mc_data::blocks::solaris_required_blocks_report()).unwrap(),

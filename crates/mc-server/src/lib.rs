@@ -592,7 +592,7 @@ mod tests {
         assert_eq!(cfg.network.port, 25565);
         assert_eq!(
             cfg.data.world_dir,
-            Some(std::path::PathBuf::from(".analysis/test-world"))
+            Some(std::path::PathBuf::from(".analysis/test-world-v2"))
         );
         assert_eq!(
             cfg.data.vanilla_data_dir,

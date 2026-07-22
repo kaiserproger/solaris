@@ -5,4 +5,4 @@
 
 mod density;
 
-pub(in crate::terrain) use density::DensityRouter;
+pub(in crate::terrain) use density::{DensityRouter, TerrainSample};

@@ -38,7 +38,7 @@ pub use ore_rules::{
 use ore_rules::{
     MAX_ORE_ANCHORS_PER_CELL, MAX_ORE_VEIN_SIZE, ORE_ANCHOR_CELL_EDGE, ORE_ANCHOR_CELL_VOLUME,
 };
-use overworld::DensityRouter;
+use overworld::{DensityRouter, TerrainSample};
 
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 pub enum TerrainGeneratorError {
@@ -69,7 +69,7 @@ const ORE_DIRECTIONS: [[i8; 3]; 6] = [
     [0, 0, -1],
     [0, 0, 1],
 ];
-const CAVE_SURFACE_CLEARANCE: i32 = 24;
+const CAVE_SURFACE_CLEARANCE: i32 = 32;
 const DEEPSLATE_TOP_Y: i32 = 0;
 const DEEPSLATE_SOLID_Y: i32 = -8;
 
@@ -469,27 +469,30 @@ impl TerrainGenerator {
         }
     }
 
-    fn continentalness(&self, world_x: i32, world_z: i32) -> f64 {
-        self.density_router()
-            .sample(world_x, world_z)
-            .continentalness
-    }
-
     fn biome_for(&self, world_x: i32, world_z: i32, height: i32) -> Identifier {
         match self.worldgen_mode {
-            WorldgenMode::VanillaLike => self.vanilla_biome_for(world_x, world_z, height),
+            WorldgenMode::VanillaLike => {
+                let sample = self.density_router().sample(world_x, world_z);
+                self.vanilla_biome_for(world_x, world_z, height, sample)
+            }
             WorldgenMode::TellusLike(settings) => {
                 self.tellus_biome_for(world_x, world_z, height, settings)
             }
         }
     }
 
-    fn vanilla_biome_for(&self, world_x: i32, world_z: i32, height: i32) -> Identifier {
-        let continental = self.continentalness(world_x, world_z);
-        let temperature = self.temperature(world_x, world_z);
-        let moisture = self.moisture(world_x, world_z);
-        let ridges = self.ridges(world_x, world_z);
-        let river = self.river_signal(world_x, world_z);
+    fn vanilla_biome_for(
+        &self,
+        world_x: i32,
+        world_z: i32,
+        height: i32,
+        sample: TerrainSample,
+    ) -> Identifier {
+        let continental = sample.continentalness;
+        let temperature = sample.temperature;
+        let moisture = sample.moisture;
+        let ridges = sample.ridges;
+        let river = sample.river;
 
         if height < SEA_LEVEL - 8 {
             return self
@@ -563,7 +566,7 @@ impl TerrainGenerator {
         let land_mask = self.tellus_land_mask(world_x, world_z, settings);
         let climate = self.tellus_climate(world_x, height, world_z);
         let mountain = self.tellus_mountain_factor(world_x, world_z);
-        let river = self.river_signal(world_x / 2, world_z / 2);
+        let river = self.river_signal(world_x, world_z);
 
         if settings.water_enabled {
             if height_y < sea_y - 18 {
@@ -626,6 +629,7 @@ impl TerrainGenerator {
         }
     }
 
+    #[cfg(test)]
     fn biome_for_cell(
         &self,
         world_x: i32,
@@ -639,14 +643,6 @@ impl TerrainGenerator {
                 .pick(&self.biomes.cave, world_x, world_z, 0x554E_4447);
         }
         self.biome_for(world_x, world_z, surface_height)
-    }
-
-    fn moisture(&self, world_x: i32, world_z: i32) -> f64 {
-        self.density_router().sample(world_x, world_z).moisture
-    }
-
-    fn temperature(&self, world_x: i32, world_z: i32) -> f64 {
-        self.density_router().sample(world_x, world_z).temperature
     }
 
     fn ridges(&self, world_x: i32, world_z: i32) -> f64 {
@@ -682,8 +678,12 @@ impl TerrainGenerator {
     fn plan_column(&self, pos: ChunkPos, lx: u8, lz: u8) -> ColumnPlan {
         let wx = pos.x * 16 + lx as i32;
         let wz = pos.z * 16 + lz as i32;
-        let height = self.surface_height(wx, wz);
-        let biome = self.biome_for(wx, wz, height);
+        let sample = self.density_router().sample(wx, wz);
+        let height = sample.surface_y;
+        let biome = match self.worldgen_mode {
+            WorldgenMode::VanillaLike => self.vanilla_biome_for(wx, wz, height, sample),
+            WorldgenMode::TellusLike(settings) => self.tellus_biome_for(wx, wz, height, settings),
+        };
         let (mut surface, fill) = self.surface_materials(&biome);
         if self.is_spawn_iron_outcrop(wx, height, wz) {
             surface = self.iron_ore;
@@ -802,7 +802,12 @@ impl TerrainGenerator {
                         let Ok(y) = i32::try_from(y) else {
                             continue;
                         };
-                        let biome = self.biome_for_cell(column.wx, y, column.wz, column.height);
+                        let biome = if i64::from(y) < i64::from(column.height) - 24 && y < 32 {
+                            self.biomes
+                                .pick(&self.biomes.cave, column.wx, column.wz, 0x554E_4447)
+                        } else {
+                            column.biome.clone()
+                        };
                         let palette_idx = palette
                             .iter()
                             .position(|entry| entry == &biome)
@@ -837,18 +842,10 @@ impl TerrainGenerator {
         let Some((cave_min_y, cave_max_y)) = self.cave_y_bounds(plan) else {
             return;
         };
-        let mut y = cave_min_y;
-        while y <= cave_max_y {
+        for y in cave_min_y..=cave_max_y {
             if self.is_cave_cell(plan.wx, y, plan.wz) {
-                let end = checked_y_offset(y, 1).unwrap_or(cave_max_y).min(cave_max_y);
-                for carve_y in y..=end {
-                    let _ = chunk.set_block(plan.lx, carve_y, plan.lz, self.air);
-                }
+                let _ = chunk.set_block(plan.lx, y, plan.lz, self.air);
             }
-            let Some(next_y) = checked_y_offset(y, 2) else {
-                break;
-            };
-            y = next_y;
         }
     }
 
@@ -1187,6 +1184,7 @@ impl TerrainGenerator {
                     || self.biomes.jungle.contains(biome)
                     || self.biomes.grassland.contains(biome))
                     && h.is_multiple_of(47)
+                    && self.tree_site_is_stable(plan)
                     && self.place_tree(
                         chunk,
                         lx,
@@ -1257,6 +1255,18 @@ impl TerrainGenerator {
                 }
             }
         }
+    }
+
+    fn tree_site_is_stable(&self, plan: &ColumnPlan) -> bool {
+        for dz in -1..=1 {
+            for dx in -1..=1 {
+                let neighbour = self.surface_height(plan.wx + dx, plan.wz + dz);
+                if (neighbour - plan.height).abs() > 1 {
+                    return false;
+                }
+            }
+        }
+        true
     }
 
     fn place_tree(

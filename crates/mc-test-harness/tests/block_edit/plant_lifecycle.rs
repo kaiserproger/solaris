@@ -66,7 +66,8 @@ async fn survival_plant_lifecycle_covers_stems_cocoa_and_harvest() {
         "minecraft:cocoa",
         &[("age", "2"), ("facing", "east")],
     );
-    let air_state_id = crop_test_state(&blocks, "minecraft:air", &[]).0 as i32;
+    let air = crop_test_state(&blocks, "minecraft:air", &[]);
+    let air_state_id = air.0 as i32;
     let bone_meal_item_id = items
         .id_of(&mc_data::Identifier::parse("minecraft:bone_meal").unwrap())
         .expect("bone meal item");
@@ -121,9 +122,12 @@ async fn survival_plant_lifecycle_covers_stems_cocoa_and_harvest() {
         let mut storage = world.lock().await;
         crop_test_set(&mut storage, (0, support_y, 2), farmland);
         crop_test_set(&mut storage, melon_stem_pos, melon_stem_age7);
+        crop_test_set(&mut storage, melon_pos, air);
         crop_test_set(&mut storage, (2, support_y, 2), farmland);
         crop_test_set(&mut storage, pumpkin_stem_pos, pumpkin_stem_age7);
+        crop_test_set(&mut storage, pumpkin_pos, air);
         crop_test_set(&mut storage, cocoa_place_log_pos, jungle_log);
+        crop_test_set(&mut storage, cocoa_place_pos, air);
         crop_test_set(&mut storage, cocoa_harvest_log_pos, jungle_log);
         crop_test_set(&mut storage, cocoa_harvest_pos, cocoa_age2_east);
     }
