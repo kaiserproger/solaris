@@ -187,9 +187,6 @@ enum RegionOwnerLaneMessage {
         excluded: HashSet<EntityId>,
         reply: std::sync::mpsc::Sender<Result<Option<EntitySnapshot>, RegionOwnerLaneError>>,
     },
-    BreedingTickSnapshots {
-        reply: std::sync::mpsc::Sender<Vec<EntitySnapshot>>,
-    },
     SaveBarrier {
         sequence_watermark: u64,
         leases: Vec<RegionLease>,
@@ -754,16 +751,6 @@ impl RegionalOwnerLane {
         Ok(snapshot)
     }
 
-    pub(super) fn request_breeding_tick_snapshots(
-        &self,
-    ) -> Result<Receiver<Vec<EntitySnapshot>>, RegionOwnerLaneError> {
-        let (reply, snapshots) = channel();
-        self.sender
-            .send(RegionOwnerLaneMessage::BreedingTickSnapshots { reply })
-            .map_err(|_| RegionOwnerLaneError::Closed)?;
-        Ok(snapshots)
-    }
-
     pub(super) fn request_save_barrier(
         &self,
         sequence_watermark: u64,
@@ -1200,16 +1187,6 @@ fn run_region_owner_lane(
                     Some(error) => Err(error),
                     None => Ok(nearest.map(|(_, snapshot)| snapshot)),
                 });
-            }
-            RegionOwnerLaneMessage::BreedingTickSnapshots { reply } => {
-                let mut snapshots = Vec::new();
-                for (_, store) in regions.values() {
-                    let mut ids = Vec::new();
-                    store.visit_breeding_tick_entities(|entity| ids.push(entity.id));
-                    snapshots.extend(ids.into_iter().filter_map(|id| store.snapshot(id)));
-                }
-                snapshots.sort_unstable_by_key(|snapshot| snapshot.id);
-                let _ = reply.send(snapshots);
             }
             RegionOwnerLaneMessage::SaveBarrier {
                 sequence_watermark,

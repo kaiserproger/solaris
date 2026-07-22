@@ -717,24 +717,6 @@ impl EntityOwnerAccess {
         }
     }
 
-    pub(super) fn visit_breeding_tick_entities(
-        &self,
-        mut visitor: impl FnMut(mc_entity::EntityView<'_>),
-    ) {
-        #[cfg(test)]
-        self.record_owner_request();
-        let snapshots = owner_result(self.handle.breeding_tick_snapshots());
-        {
-            let mut cache = self.snapshots.borrow_mut();
-            for snapshot in &snapshots {
-                cache.insert(snapshot.id, Some(snapshot.clone()));
-            }
-        }
-        for snapshot in snapshots {
-            visitor(entity_snapshot_view(&snapshot));
-        }
-    }
-
     pub(super) fn visit_sheep_entities_for_ids(
         &self,
         ids: &HashSet<EntityId>,

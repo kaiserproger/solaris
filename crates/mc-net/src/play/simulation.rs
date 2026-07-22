@@ -11474,6 +11474,7 @@ mod tests {
             &mut outbound,
         );
         assert_eq!(parent_ids.len(), 2);
+        registry.publish_active_simulation_entities_for_test(parent_ids.iter().copied());
 
         let (handle, mut owner) = simulation_channel_with_capacity(1);
         for (index, entity_id) in parent_ids.iter().copied().enumerate() {
@@ -11577,6 +11578,7 @@ mod tests {
             &mut outbound,
         );
         assert_eq!(parent_ids.len(), 2);
+        registry.publish_active_simulation_entities_for_test(parent_ids.iter().copied());
 
         let (handle, mut owner) = simulation_channel_with_capacity(1);
         for (index, entity_id) in parent_ids.iter().copied().enumerate() {

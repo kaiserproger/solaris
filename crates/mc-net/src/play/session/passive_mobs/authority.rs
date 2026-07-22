@@ -241,16 +241,24 @@ impl SessionRegistry {
         &self,
         _authority: &SimulationAuthority,
     ) -> (usize, Vec<VisibilityDispatch>) {
+        if !self.has_live_sessions() {
+            return (0, Vec::new());
+        }
         let breeding_tick = self.simulation_tick();
+        let active_entity_ids = self.active_simulation_entities.load_full();
+        if active_entity_ids.is_empty() {
+            return (0, Vec::new());
+        }
         let entities = self.lock_entities("snapshot animal breeding");
         let mut animals = Vec::new();
-        entities.visit_breeding_tick_entities(|entity| {
+        entities.visit_simulation_entities_for_ids(&active_entity_ids, |entity| {
+            let Some(animal) = entity.animal.filter(|animal| animal.needs_breeding_tick()) else {
+                return;
+            };
             #[cfg(test)]
             self.breeding_entity_scan_visits
                 .fetch_add(1, Ordering::Relaxed);
-            if entity.lifecycle == EntityLifecycle::Alive
-                && let Some(animal) = entity.animal
-            {
+            if entity.lifecycle == EntityLifecycle::Alive {
                 animals.push(BreedingAnimal {
                     id: entity.id,
                     type_id: entity.type_id,

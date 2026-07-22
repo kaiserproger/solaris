@@ -187,6 +187,7 @@ impl SessionRegistry {
         pathing: Option<(&mc_world::WorldReadView, &mc_physics::BlockMaterialIds)>,
     ) -> Vec<EntityPhysicsQuery> {
         if !self.has_live_sessions() {
+            self.clear_active_simulation_entities();
             return Vec::new();
         }
         let (world_read, pathing_materials) = pathing.unzip();
@@ -217,6 +218,7 @@ impl SessionRegistry {
         };
         let mut entities = self.lock_entities("prepare entity goals");
         if active_chunks.is_empty() {
+            self.clear_active_simulation_entities();
             return Vec::new();
         }
         let mut active_entity_ids = HashSet::new();
@@ -269,6 +271,7 @@ impl SessionRegistry {
                 }
             }
         });
+        self.publish_active_simulation_entities(active_entity_ids.clone());
         if active_entity_ids.is_empty() {
             return Vec::new();
         }

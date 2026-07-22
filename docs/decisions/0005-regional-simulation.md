@@ -489,14 +489,20 @@ topology gate or blocks direct work in unrelated lanes. Spawn, remove,
 position/region changes, full snapshot replacement, save/reconfigure, and other
 global-index operations remain on the exclusive side.
 Cold point and ID-filtered actor reads use the same shared topology and ordered
-touched-lane admissions. Full snapshots and breeding scans use shared topology
-plus every owner admission until their query is partitioned further. Goal
-preparation holds only shared topology: each owner-lane queue orders its local
-AI read against local mutations. Snapshot and goal-read messages use their
-lane admission only while they are enqueued, then release it before owner
-computation. Exact goal-input snapshots and leases reject stale plans at apply.
-A slow lane therefore does not hold admissions or stop direct work in another
-lane.
+touched-lane admissions. Full snapshots still use shared topology plus every
+owner admission. Goal preparation holds only shared topology: each owner-lane
+queue orders its local AI read against local mutations. Snapshot and goal-read
+messages use their lane admission only while they are enqueued, then release it
+before owner computation. Exact goal-input snapshots and leases reject stale
+plans at apply. A slow lane therefore does not hold admissions or stop direct
+work in another lane.
+Goal selection publishes the exact current simulation-active entity IDs through
+`ArcSwap`. Breeding runs after that publication, performs one selected-ID
+regional read, and filters the ECS animal state that actually needs a tick.
+Unobserved regions neither join the owner request nor age their animals. The
+former coordinator and owner-lane all-world breeding snapshot commands were
+deleted; breeding planning still runs without retaining session state or owner
+admission.
 Item lifetime expiry no longer performs a full entity snapshot during every
 physics publication turn. Item creation and restore add the entity id to a
 simulation-tick deadline index; an expiry turn reads and removes only due ids,

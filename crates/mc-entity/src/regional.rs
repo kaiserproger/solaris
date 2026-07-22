@@ -1193,9 +1193,6 @@ enum RegionalOwnerCommand {
         uuid: Uuid,
         reply: std::sync::mpsc::Sender<Result<bool, RegionOwnerLaneError>>,
     },
-    BreedingTickSnapshots {
-        reply: std::sync::mpsc::Sender<Result<Vec<EntitySnapshot>, RegionOwnerLaneError>>,
-    },
     ClaimNearestVillager {
         center: Vec3,
         radius: f64,
@@ -1367,9 +1364,7 @@ impl RegionalOwnerCommand {
     fn lane_scope(&self) -> Option<RegionalOwnerLaneScope> {
         match self {
             Self::Snapshot { entity, .. } => Some(RegionalOwnerLaneScope::Entities(vec![*entity])),
-            Self::Snapshots { .. } | Self::BreedingTickSnapshots { .. } => {
-                Some(RegionalOwnerLaneScope::All)
-            }
+            Self::Snapshots { .. } => Some(RegionalOwnerLaneScope::All),
             Self::SnapshotsForIds { entities, .. } => Some(RegionalOwnerLaneScope::Entities(
                 entities.iter().copied().collect(),
             )),
@@ -1851,14 +1846,6 @@ impl RegionalOwnerHandle {
         let (reply, result) = channel();
         self.sender
             .send(RegionalOwnerCommand::ContainsUuid { uuid, reply })
-            .map_err(|_| RegionOwnerLaneError::Closed)?;
-        result.recv().map_err(|_| RegionOwnerLaneError::Closed)?
-    }
-
-    pub fn breeding_tick_snapshots(&self) -> Result<Vec<EntitySnapshot>, RegionOwnerLaneError> {
-        let (reply, result) = channel();
-        self.sender
-            .send(RegionalOwnerCommand::BreedingTickSnapshots { reply })
             .map_err(|_| RegionOwnerLaneError::Closed)?;
         result.recv().map_err(|_| RegionOwnerLaneError::Closed)?
     }
@@ -3055,9 +3042,6 @@ fn run_regional_owner_runtime(
                         .map(|()| coordinator.contains_uuid(uuid)),
                 );
             }
-            RegionalOwnerCommand::BreedingTickSnapshots { reply } => {
-                let _ = reply.send(coordinator.breeding_tick_snapshots());
-            }
             RegionalOwnerCommand::ClaimNearestVillager {
                 center,
                 radius,
@@ -4091,30 +4075,6 @@ impl RegionalOwnerCoordinator {
     #[must_use]
     pub fn contains_uuid(&self, uuid: Uuid) -> bool {
         self.uuids.contains_key(&uuid)
-    }
-
-    pub fn breeding_tick_snapshots(&self) -> Result<Vec<EntitySnapshot>, RegionOwnerLaneError> {
-        self.commit_state.ensure_committed_state()?;
-        let mut pending = Vec::with_capacity(self.lanes.len());
-        for owner in self.lanes.values() {
-            pending.push(owner.request_breeding_tick_snapshots()?);
-        }
-        let mut snapshots = Vec::new();
-        for completion in pending {
-            snapshots.extend(
-                completion
-                    .recv()
-                    .map_err(|_| RegionOwnerLaneError::Closed)?,
-            );
-        }
-        snapshots.sort_unstable_by_key(|snapshot| snapshot.id);
-        if snapshots.iter().any(|snapshot| {
-            self.locations.get(&snapshot.id).copied() != RegionKey::from_position(snapshot.position)
-                || self.uuids.get(&snapshot.uuid).copied() != Some(snapshot.id)
-        }) {
-            return Err(RegionOwnerLaneError::InvalidMutation);
-        }
-        Ok(snapshots)
     }
 
     pub fn snapshots_for_ids(
@@ -6873,17 +6833,6 @@ impl RegionalEntityStore {
         }
     }
 
-    pub fn visit_breeding_tick_entities(&self, mut visitor: impl FnMut(EntityView<'_>)) {
-        let mut ids = Vec::new();
-        for store in self.stores.values() {
-            store.visit_breeding_tick_entities(|entity| ids.push(entity.id));
-        }
-        ids.sort_unstable();
-        for id in ids {
-            self.visit_entity(id, &mut visitor);
-        }
-    }
-
     pub fn visit_sheep_entities_for_ids(
         &self,
         ids: &HashSet<EntityId>,
@@ -7910,10 +7859,6 @@ impl RegionalEntityAuthority {
         visitor: impl FnMut(EntityView<'_>),
     ) {
         self.regions.visit_simulation_entities_for_ids(ids, visitor);
-    }
-
-    pub fn visit_breeding_tick_entities(&self, visitor: impl FnMut(EntityView<'_>)) {
-        self.regions.visit_breeding_tick_entities(visitor);
     }
 
     pub fn visit_sheep_entities_for_ids(
@@ -9135,9 +9080,6 @@ mod tests {
             selected.push(entity.id)
         });
         assert_eq!(selected, vec![east_id, west_id]);
-        let mut breeding = Vec::new();
-        regions.visit_breeding_tick_entities(|entity| breeding.push(entity.id));
-        assert_eq!(breeding, vec![east_id]);
         let mut sheep = Vec::new();
         regions.visit_sheep_entities_for_ids(&HashSet::from([east_id, west_id]), |entity| {
             sheep.push(entity.id)
@@ -13151,11 +13093,6 @@ mod tests {
         ));
         let (reply, _) = mpsc::channel();
         assert!(matches!(
-            super::RegionalOwnerCommand::BreedingTickSnapshots { reply }.lane_scope(),
-            Some(super::RegionalOwnerLaneScope::All)
-        ));
-        let (reply, _) = mpsc::channel();
-        assert!(matches!(
             super::RegionalOwnerCommand::PrepareGoalTick {
                 tick: 1,
                 active_ids: HashSet::from([entity]),
@@ -14232,23 +14169,6 @@ mod tests {
                 .expect("contains UUID")
         );
 
-        let mut breeding_cow = cow(Vec3::new(4.5, 64.0, 0.5));
-        breeding_cow.animal = Some(AnimalBreedingState {
-            age_ticks: -20,
-            love_ticks: 0,
-            sheep_wool: None,
-        });
-        let breeding_cow = handle.spawn(breeding_cow).expect("breeding cow");
-        assert_eq!(
-            handle
-                .breeding_tick_snapshots()
-                .expect("breeding owner query")
-                .into_iter()
-                .map(|snapshot| snapshot.id)
-                .collect::<Vec<_>>(),
-            vec![breeding_cow]
-        );
-
         let stale = handle
             .snapshot(west)
             .expect("west read")
@@ -14274,7 +14194,7 @@ mod tests {
                 .expect("fresh conditional remove"),
             Some(current)
         );
-        assert_eq!(handle.status().expect("final owner status").entity_count, 2);
+        assert_eq!(handle.status().expect("final owner status").entity_count, 1);
 
         let item = handle
             .spawn({
@@ -14313,7 +14233,7 @@ mod tests {
             "minecraft:oak_boat",
             Vec3::new(3.5, 64.0, 0.5),
         );
-        vehicle.vehicle.as_mut().expect("vehicle state").passenger = Some(EntityId(6_006));
+        vehicle.vehicle.as_mut().expect("vehicle state").passenger = Some(EntityId(6_005));
         let mounted = handle
             .spawn_batch([vehicle, cow(Vec3::new(3.75, 64.0, 0.5))])
             .expect("mounted pair");

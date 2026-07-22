@@ -46,11 +46,14 @@ Current runtime facts:
   operations that can change region ownership or global indexes remain
   exclusive.
 - Cold point and ID-filtered actor reads use shared topology plus touched-lane
-  admissions. Full snapshots and breeding scans currently take every lane
-  admission under shared topology. Long-running goal preparation holds shared
-  topology only; each lane admission is held briefly while its read message is
-  enqueued. Owner queues order local reads and exact-snapshot apply rejects
-  stale plans.
+  admissions. Full snapshots still take every lane admission under shared
+  topology. Long-running goal preparation holds shared topology only; each lane
+  admission is held briefly while its read message is enqueued. Owner queues
+  order local reads and exact-snapshot apply rejects stale plans.
+- Goal selection publishes the exact current simulation-active entity IDs
+  through `ArcSwap`; breeding reads that immutable set and requests only those
+  IDs from regional owners. Unobserved regions no longer join the tick or age
+  animals, and the removed all-lane breeding command must not be restored.
 - Item despawn uses a simulation-tick deadline index. Ordinary physics turns do
   not scan the full entity store; only due item ids reach their owner lanes.
   Restored items retain the deadline derived from their persisted `spawn_tick`;

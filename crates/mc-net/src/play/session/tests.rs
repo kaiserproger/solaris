@@ -676,6 +676,8 @@ fn world_clock_does_not_wait_for_session_registry() {
 #[test]
 fn idle_adult_animal_tick_does_not_rewrite_unchanged_state() {
     let registry = SessionRegistry::new();
+    let player = register_test_session(&registry, "IdleBreedingAlice");
+    assert!(registry.mark_loaded(player, (0, 0)).is_empty());
     registry.ensure_chunk_herd_legacy_for_test(
         (0, 0),
         &[HerdSpawn {
@@ -688,7 +690,8 @@ fn idle_adult_animal_tick_does_not_rewrite_unchanged_state() {
             sheep_color: None,
         }],
     );
-    assert_eq!(registry.persisted_entity_records().len(), 1);
+    let entity_id = registry.persisted_entity_records()[0].snapshot.id;
+    registry.publish_active_simulation_entities_for_test([entity_id]);
 
     let (births, dispatches) = registry.tick_animal_breeding(&SimulationAuthority::for_test());
 
@@ -710,6 +713,8 @@ fn animal_age_countdown_waits_for_entity_save_barrier() {
         1,
         Box::new(CountingEntityJournal(Arc::clone(&commits))),
     );
+    let player = register_test_session(&registry, "BreedingAgeAlice");
+    assert!(registry.mark_loaded(player, (0, 0)).is_empty());
     registry.ensure_chunk_herd_legacy_for_test(
         (0, 0),
         &[HerdSpawn {
@@ -727,6 +732,7 @@ fn animal_age_countdown_waits_for_entity_save_barrier() {
         let mut entities = registry.lock_entities("test entity access");
         assert!(entities.set_animal_state(entity_id, mc_entity::AnimalBreedingState::baby(),));
     }
+    registry.publish_active_simulation_entities_for_test([entity_id]);
     commits.store(0, Ordering::Relaxed);
 
     let (births, dispatches) = registry.tick_animal_breeding(&SimulationAuthority::for_test());
@@ -738,6 +744,91 @@ fn animal_age_countdown_waits_for_entity_save_barrier() {
     assert_eq!(
         saved[0].snapshot.animal.unwrap().age_ticks,
         mc_entity::BABY_START_AGE_TICKS + 1
+    );
+}
+
+#[test]
+fn breeding_tick_reads_only_current_simulation_active_animals() {
+    let registry = SessionRegistry::new_with_entity_owner_lanes(2);
+    let player = register_test_session(&registry, "ActiveBreedingAlice");
+    assert!(registry.mark_loaded(player, (0, 0)).is_empty());
+    for x in [0.5, 128.5] {
+        registry.spawn_command_entity(
+            &SimulationAuthority::for_test(),
+            4,
+            "minecraft:cow".to_owned(),
+            Vec3::new(x, 64.0, 0.5),
+        );
+    }
+    let records = registry.persisted_entity_records();
+    let west = records
+        .iter()
+        .find(|record| record.snapshot.position.x < 64.0)
+        .expect("west cow")
+        .snapshot
+        .id;
+    let east = records
+        .iter()
+        .find(|record| record.snapshot.position.x > 64.0)
+        .expect("east cow")
+        .snapshot
+        .id;
+    {
+        let mut entities = registry.lock_entities("seed active breeding animals");
+        assert!(entities.set_animal_state(west, mc_entity::AnimalBreedingState::baby()));
+        assert!(entities.set_animal_state(east, mc_entity::AnimalBreedingState::baby()));
+    }
+    let _ = registry.tick_entities_and_collect_physics_queries(1);
+
+    let (births, dispatches) = registry.tick_animal_breeding(&SimulationAuthority::for_test());
+
+    assert_eq!(births, 0);
+    assert!(dispatches.is_empty());
+    assert_eq!(
+        registry.breeding_entity_scan_visits.load(Ordering::Relaxed),
+        1
+    );
+    let entities = registry.lock_entities("inspect active breeding animals");
+    assert_eq!(
+        entities.snapshot(west).unwrap().animal.unwrap().age_ticks,
+        mc_entity::BABY_START_AGE_TICKS + 1
+    );
+    assert_eq!(
+        entities.snapshot(east).unwrap().animal.unwrap().age_ticks,
+        mc_entity::BABY_START_AGE_TICKS
+    );
+}
+
+#[test]
+fn breeding_tick_with_no_active_simulation_entities_skips_owner() {
+    let registry = SessionRegistry::new();
+    registry.spawn_command_entity(
+        &SimulationAuthority::for_test(),
+        4,
+        "minecraft:cow".to_owned(),
+        Vec3::new(0.5, 64.0, 0.5),
+    );
+    let entity_id = registry.persisted_entity_records()[0].snapshot.id;
+    {
+        let mut entities = registry.lock_entities("seed inactive breeding animal");
+        assert!(entities.set_animal_state(entity_id, mc_entity::AnimalBreedingState::baby()));
+    }
+    registry.reset_entity_owner_requests_for_test();
+
+    let (births, dispatches) = registry.tick_animal_breeding(&SimulationAuthority::for_test());
+
+    assert_eq!(births, 0);
+    assert!(dispatches.is_empty());
+    assert_eq!(registry.entity_owner_requests_for_test(), 0);
+    assert_eq!(
+        registry
+            .lock_entities("inspect inactive breeding animal")
+            .snapshot(entity_id)
+            .unwrap()
+            .animal
+            .unwrap()
+            .age_ticks,
+        mc_entity::BABY_START_AGE_TICKS
     );
 }
 
@@ -779,7 +870,8 @@ fn entity_save_owner_barrier_does_not_hold_session_registry() {
 #[test]
 fn breeding_plan_does_not_hold_session_or_entity_locks() {
     let registry = Arc::new(SessionRegistry::new());
-    register_test_session(&registry, "BreedingPlanAlice");
+    let player = register_test_session(&registry, "BreedingPlanAlice");
+    assert!(registry.mark_loaded(player, (0, 0)).is_empty());
     registry.ensure_chunk_herd_legacy_for_test(
         (0, 0),
         &[HerdSpawn {
@@ -797,6 +889,7 @@ fn breeding_plan_does_not_hold_session_or_entity_locks() {
         let mut entities = registry.lock_entities("test entity access");
         assert!(entities.set_animal_state(entity_id, mc_entity::AnimalBreedingState::baby()));
     }
+    registry.publish_active_simulation_entities_for_test([entity_id]);
     let (reached_tx, reached_rx) = std::sync::mpsc::channel();
     let (resume_tx, resume_rx) = std::sync::mpsc::channel();
     *registry
@@ -853,6 +946,8 @@ fn breeding_plan_does_not_hold_session_or_entity_locks() {
 #[test]
 fn breeding_rejects_the_whole_plan_when_a_parent_changes_after_snapshot() {
     let registry = Arc::new(SessionRegistry::new());
+    let player = register_test_session(&registry, "BreedingRejectAlice");
+    assert!(registry.mark_loaded(player, (0, 0)).is_empty());
     for x in [0.5, 1.5] {
         registry.spawn_command_entity(
             &SimulationAuthority::for_test(),
@@ -879,6 +974,7 @@ fn breeding_rejects_the_whole_plan_when_a_parent_changes_after_snapshot() {
         assert!(entities.set_animal_state(parent_ids[0], ready));
         assert!(entities.set_animal_state(parent_ids[1], ready));
     }
+    registry.publish_active_simulation_entities_for_test(parent_ids.iter().copied());
 
     let (reached_tx, reached_rx) = std::sync::mpsc::channel();
     let (resume_tx, resume_rx) = std::sync::mpsc::channel();
@@ -959,6 +1055,7 @@ fn breeding_commits_and_publishes_once_across_a_region_boundary() {
         assert!(entities.set_animal_state(parent_ids[0], ready));
         assert!(entities.set_animal_state(parent_ids[1], ready));
     }
+    registry.publish_active_simulation_entities_for_test(parent_ids.iter().copied());
     registry.entities.reset_owner_requests_for_test();
 
     let (births, dispatches) = registry.tick_animal_breeding(&SimulationAuthority::for_test());
@@ -1009,6 +1106,8 @@ fn breeding_commits_and_publishes_once_across_a_region_boundary() {
 #[test]
 fn breeding_commit_releases_both_locks_before_session_publication() {
     let registry = Arc::new(SessionRegistry::new());
+    let player = register_test_session(&registry, "BreedingCommitAlice");
+    assert!(registry.mark_loaded(player, (0, 0)).is_empty());
     registry.spawn_command_entity(
         &SimulationAuthority::for_test(),
         4,
@@ -1020,6 +1119,7 @@ fn breeding_commit_releases_both_locks_before_session_publication() {
         let mut entities = registry.lock_entities("test entity access");
         assert!(entities.set_animal_state(entity_id, mc_entity::AnimalBreedingState::baby()));
     }
+    registry.publish_active_simulation_entities_for_test([entity_id]);
     let (reached_tx, reached_rx) = std::sync::mpsc::channel();
     let (resume_tx, resume_rx) = std::sync::mpsc::channel();
     *registry

@@ -1278,7 +1278,6 @@ impl BoundServer {
                     .tick_dying_entities(&entity_sessions, entity_sessions.simulation_tick());
                 let world_time_us = elapsed_us(started);
                 let started = Instant::now();
-                simulation_owner.tick_animal_breeding(&entity_sessions);
                 simulation_owner
                     .run_sheep_grazing(
                         &entity_config,
@@ -1288,7 +1287,7 @@ impl BoundServer {
                         tick,
                     )
                     .await;
-                let animal_breeding_us = elapsed_us(started);
+                let mut animal_breeding_us = elapsed_us(started);
                 let started = Instant::now();
                 simulation_owner.tick_hostile_attacks(
                     &entity_sessions,
@@ -1314,6 +1313,9 @@ impl BoundServer {
                     )
                 };
                 let entity_goals_us = elapsed_us(started);
+                let started = Instant::now();
+                simulation_owner.tick_animal_breeding(&entity_sessions);
+                animal_breeding_us = animal_breeding_us.saturating_add(elapsed_us(started));
                 let entity_query_count = queries.len();
                 let (steps, entity_physics_us, entity_dispatch_us) = if physics_was_in_flight {
                     (Vec::new(), 0, 0)

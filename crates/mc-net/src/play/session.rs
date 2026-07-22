@@ -433,6 +433,7 @@ pub(super) enum SessionPreparedChunkClaimResult {
 pub(crate) struct SessionRegistry {
     inner: Mutex<SessionRegistryInner>,
     movement_recipients: arc_swap::ArcSwap<MovementRecipientIndex>,
+    active_simulation_entities: arc_swap::ArcSwap<HashSet<EntityId>>,
     prepared_cache: Mutex<PreparedChunkCache>,
     entities: SessionEntityOwners,
     world_chunk_journal: Mutex<Option<super::world_journal::WorldChunkJournal>>,
@@ -709,6 +710,7 @@ impl SessionRegistry {
         Self {
             inner: Mutex::new(SessionRegistryInner::default()),
             movement_recipients: arc_swap::ArcSwap::from_pointee(MovementRecipientIndex::new()),
+            active_simulation_entities: arc_swap::ArcSwap::from_pointee(HashSet::new()),
             prepared_cache: Mutex::new(PreparedChunkCache::default()),
             entities: SessionEntityOwners::new(
                 Arc::clone(&pressure_observation),
@@ -947,12 +949,34 @@ impl SessionRegistry {
         if previous == live {
             return false;
         }
+        if live == 0 {
+            self.clear_active_simulation_entities();
+        }
         self.live_session_generation.fetch_add(1, Ordering::Release);
         previous != 0 && live == 0
     }
 
     fn has_live_sessions(&self) -> bool {
         self.live_session_count.load(Ordering::Acquire) != 0
+    }
+
+    fn publish_active_simulation_entities(&self, entities: HashSet<EntityId>) {
+        self.active_simulation_entities.store(Arc::new(entities));
+    }
+
+    fn clear_active_simulation_entities(&self) {
+        if !self.active_simulation_entities.load().is_empty() {
+            self.active_simulation_entities
+                .store(Arc::new(HashSet::new()));
+        }
+    }
+
+    #[cfg(test)]
+    pub(in crate::play) fn publish_active_simulation_entities_for_test(
+        &self,
+        entities: impl IntoIterator<Item = EntityId>,
+    ) {
+        self.publish_active_simulation_entities(entities.into_iter().collect());
     }
 
     fn lock_entities(&self, operation: &'static str) -> EntityStoreGuard<'_> {
