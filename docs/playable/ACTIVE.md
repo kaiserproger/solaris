@@ -763,6 +763,16 @@ hardening. An already-open lower-priority diff does not override this order.
   spawned 1.5 blocks away at yaw `0`; the post-damage observation had yaw
   `-180`, player health `17` instead of `20`, and an unchanged player position.
   This is the requested zombie behavior gate, not broad hostile parity.
+- Natural passive and hostile spawning now has a fresh-world client gate. An
+  embedded 26.1.2 client saw seven naturally spawned pigs/sheep and consumed
+  five pushed motion events from one sheep: horizontal deltas stayed smooth,
+  yaw changed across events, vertical rise stayed zero, and the sheep travelled
+  about `0.85` blocks. Changing only server-console time to night then exposed a
+  naturally spawned moving zombie `20.3` blocks away; no summon command was
+  used. Focused physics already proves full-block climbing for cows, sheep, and
+  chickens, and session tests prove every-tick publication for bounded natural
+  passive and hostile movement. This closes basic natural spawn, publication,
+  and one-block stepping; longer visual movement quality remains open.
 
 ## Manual And Agent Gates
 

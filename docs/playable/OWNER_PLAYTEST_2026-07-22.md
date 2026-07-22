@@ -77,8 +77,17 @@ verification and keep ordinary survival play ahead of rare edge cases.
   damage, then observed the creeper damage the player and disappear. Operator
   commands only created the deterministic fixtures; they did not perform the
   attacks.
-- [ ] Passive and hostile mobs spawn naturally; animal movement and one-block
-  stepping are smooth and vanilla-like, without hopping, circles, or stutter.
+- [x] Passive and hostile mobs spawn naturally; baseline animal motion publishes
+  continuously and livestock has one-block stepping physics.
+  In a fresh generated world, an embedded 26.1.2 client saw seven naturally
+  spawned pigs/sheep, then received five pushed sheep-motion events with stable
+  speed, varied yaw, no vertical hopping, and `0.85` blocks of net travel. After
+  the server console changed only the time to night, the fresh world exposed a
+  naturally spawned moving zombie `20.3` blocks away; no entity summon command
+  was used. Focused physics covers full-block climbs for cows, sheep, and
+  chickens, while session tests cover every-tick publication for bounded
+  natural passive and hostile movement. Visible movement quality over longer
+  play remains the separate unchecked movement item below.
 - [ ] Water has player swimming, drag, buoyancy and breathing; aquatic mobs stay
   and move naturally below the surface.
 - [ ] `minecraft_break_block` must confirm pickup in any inventory slot and
@@ -170,8 +179,9 @@ verification and keep ordinary survival play ahead of rare edge cases.
   preparation off the tick owner. No single animal or block batch may stall
   packet processing.
 - [ ] Make animal and hostile movement visually alive: smooth velocity/rotation,
-  varied goals, sensible pauses, obstacle stepping, and no synchronized herds,
-  circular running, diagonal grid motion, or stationary jitter.
+  varied goals, sensible pauses, obstacle stepping, and no unprompted hopping,
+  synchronized herds, circular running, diagonal grid motion, or stationary
+  jitter.
 - [ ] Keep menus, inventory actions, block events, and attacks responsive under
   natural mob/chunk load.
 - [ ] Add concise comments to shipped TOML options explaining their effect.
