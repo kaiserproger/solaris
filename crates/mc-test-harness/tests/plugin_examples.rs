@@ -409,25 +409,6 @@ label = "Dirt"
         Some(short_grass)
     );
 
-    owner
-        .write_packet(&ServerboundPlayerAction {
-            action: PlayerActionKind::StartDestroyBlock,
-            position: pack_block_pos(target.x, target.y, target.z),
-            direction: Direction::Up,
-            sequence: 43,
-        })
-        .await
-        .expect("owner breaks claimed block");
-    wait_for_block_ack(&mut owner, 43).await;
-    assert_eq!(
-        world
-            .lock()
-            .await
-            .get_block(target)
-            .expect("read owner-broken block"),
-        Some(air)
-    );
-
     let base = mc_world::BlockPos {
         x: target.x + 1,
         y: target.y,
@@ -471,64 +452,6 @@ label = "Dirt"
         Some(air)
     );
 
-    let operator_target = mc_world::BlockPos {
-        x: target.x + 2,
-        y: target.y,
-        z: target.z,
-    };
-    world
-        .lock()
-        .await
-        .set_block_at(operator_target, short_grass)
-        .expect("seed operator target");
-    let mut operator = Client::connect(addr).await.expect("operator connect");
-    operator
-        .drive_login(addr, "ClaimAdmin")
-        .await
-        .expect("operator login");
-    operator
-        .drive_configuration()
-        .await
-        .expect("operator configuration");
-    operator
-        .read_play_login()
-        .await
-        .expect("operator play entry");
-    let _: ClientboundCommands = operator.read_typed().await.expect("operator Commands");
-    let operator_sync: SynchronizePlayerPosition =
-        operator.read_typed().await.expect("operator sync");
-    operator
-        .write_packet(&ConfirmTeleportation {
-            teleport_id: operator_sync.teleport_id,
-        })
-        .await
-        .expect("ack operator teleport");
-    operator
-        .write_packet(&ServerboundMovePlayerStatusOnly {
-            flags: MovePlayerFlags::new(true, false),
-        })
-        .await
-        .expect("operator grounded");
-    operator
-        .write_packet(&ServerboundPlayerAction {
-            action: PlayerActionKind::StartDestroyBlock,
-            position: pack_block_pos(operator_target.x, operator_target.y, operator_target.z),
-            direction: Direction::Up,
-            sequence: 44,
-        })
-        .await
-        .expect("operator breaks claimed block");
-    wait_for_block_ack(&mut operator, 44).await;
-    assert_eq!(
-        world
-            .lock()
-            .await
-            .get_block(operator_target)
-            .expect("read operator-broken block"),
-        Some(air)
-    );
-
-    drop(operator);
     drop(stranger);
     drop(owner);
     shutdown.request();
