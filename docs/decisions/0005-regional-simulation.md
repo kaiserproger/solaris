@@ -27,6 +27,11 @@ techniques are limited to immutable snapshots, versioned publications, and
 read indexes. Mutable state stays on region owners and crosses boundaries by
 bounded messages and explicit phase fences.
 
+Regional ownership is an internal scheduler and authority boundary, not a Lua
+API concept. Plugins never receive region keys, owner handles, mutable ECS
+references, or locks. ADR 0009 defines the serial plugin actor, immutable event,
+and transactional command boundary that hides routing and migration.
+
 This ADR accepts the regional target and its staged migration rules. It does
 not claim that the migration is complete: current production uses persistent
 regional entity-owner lanes, while coordinator metadata, cross-domain

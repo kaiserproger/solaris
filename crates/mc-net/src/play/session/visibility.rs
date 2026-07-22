@@ -2,7 +2,7 @@ use std::collections::{HashMap, HashSet};
 use std::hash::Hash;
 use std::sync::Arc;
 
-use mc_entity::{EntityId, EntityLifecycle, EntitySnapshot, Rotation, Vec3};
+use mc_entity::{EntityId, EntityLifecycle, EntityMotionState, EntitySnapshot, Rotation, Vec3};
 use mc_protocol::packets::play::MoveEntityPosRot;
 
 use crate::play::PlayerPose;
@@ -633,6 +633,28 @@ pub(super) fn publish_server_entity_snapshot_locked(
         .published_entity_snapshots
         .insert(entity_id, snapshot.clone());
     Some(snapshot)
+}
+
+pub(super) fn publish_server_entity_motion_locked(
+    inner: &mut SessionEntityGuards<'_>,
+    motion: EntityMotionState,
+) {
+    if let Some(snapshot) = inner.published_entity_snapshots.get_mut(&motion.id) {
+        update_server_entity_motion(snapshot, motion);
+        return;
+    }
+    let _ = publish_server_entity_snapshot_locked(inner, motion.id);
+}
+
+pub(super) fn update_server_entity_motion(
+    snapshot: &mut ServerEntitySnapshot,
+    motion: EntityMotionState,
+) {
+    debug_assert_eq!(snapshot.id, motion.id);
+    snapshot.position = motion.position;
+    snapshot.rotation = motion.rotation;
+    snapshot.velocity = motion.velocity;
+    snapshot.on_ground = motion.on_ground;
 }
 
 pub(super) fn initialize_entity_wire_state_locked(

@@ -86,6 +86,10 @@ Current runtime facts:
   chunk routes, and builds regional kinematics without `SessionRegistry.inner`.
   The current owner re-read and later despawn/arrow/visibility/wire publication
   still use the session lock and remain a migration boundary.
+- Common wire publication mutates only the four kinematic fields of an existing
+  entity snapshot and admits tracker state with one shard lock. Full snapshot
+  projection is a missing-publication fallback. Do not move this publication
+  outside the session transaction without a real stale-write generation fence.
 - Movement and pickup planning use copied tracker and player-position inputs;
   neither ECS access nor the global session registry may be held across that
   pure computation.
@@ -100,6 +104,11 @@ Current runtime facts:
   a movement already past recipient validation cannot dispatch after removal.
   Visibility mutation and each session's ordered outbound queue still use locks,
   so this is not fully lock-free or fully regional publication.
+- ADR 0009 keeps regional ownership behind the plugin boundary. The current
+  shared Lua host thread gives isolated plugin states serial handler semantics
+  over immutable events, bounded commands, targeted completions, and typed host
+  transactions. Region keys, epochs, owner handles, ECS references, and locks
+  are not stable plugin API.
 - Empty/all-dead server entity ticks use the published atomic live-session
   count and perform no session-registry or owner-lane read. A transition to zero
   live players pushes generation-fenced hostile-target reconciliation after

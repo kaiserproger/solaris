@@ -43,3 +43,13 @@ fn removing_tracker_rejects_delayed_commit() {
     assert!(!trackers.compare_exchange(EntityId(7), current, state(0.75)));
     assert!(trackers.is_empty());
 }
+
+#[test]
+fn get_or_insert_keeps_current_tracker_state() {
+    let trackers = EntityMovementTrackers::default();
+    let current = state(0.5);
+    trackers.insert(EntityId(9), current);
+
+    assert_eq!(trackers.get_or_insert(EntityId(9), state(8.0)), current);
+    assert_eq!(trackers.get_or_insert(EntityId(10), state(1.5)), state(1.5));
+}

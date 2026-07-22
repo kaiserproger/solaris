@@ -6,7 +6,10 @@ use super::interaction_geometry::{
     distance_sq, entity_aabb, entity_geometry, entity_is_near_player_chunk,
 };
 use super::simulation_input_publication::ExpectedEntityRoutingMove;
-use super::visibility::{entity_wire_move_for_kind, packed_head_yaw_changed};
+use super::visibility::{
+    LastSentEntityState, entity_wire_move_for_kind, packed_head_yaw_changed,
+    publish_server_entity_motion_locked,
+};
 use super::*;
 
 mod persistence_projection;
@@ -743,20 +746,20 @@ impl SessionRegistry {
             .iter()
             .map(|step| (step.id, *step))
             .collect::<HashMap<_, _>>();
-        let mut applied_steps = applied_kinematics
+        let applied_motion = applied_kinematics
             .into_iter()
-            .filter(|state| {
-                inner
-                    .entities
-                    .motion_state(state.id)
-                    .is_some_and(|current| {
-                        current.position == state.position
-                            && current.rotation == state.rotation
-                            && current.velocity == state.velocity
-                            && current.on_ground == state.on_ground
-                    })
-            })
             .filter_map(|state| {
+                let current = inner.entities.motion_state(state.id)?;
+                (current.position == state.position
+                    && current.rotation == state.rotation
+                    && current.velocity == state.velocity
+                    && current.on_ground == state.on_ground)
+                    .then_some((state, current))
+            })
+            .collect::<Vec<_>>();
+        let mut applied_steps = applied_motion
+            .iter()
+            .filter_map(|(state, _)| {
                 let input = input_steps.get(&state.id)?;
                 Some(EntityPhysicsStep {
                     id: state.id,
@@ -767,11 +770,8 @@ impl SessionRegistry {
                 })
             })
             .collect::<Vec<_>>();
-        for step in &applied_steps {
-            if !inner.entities.contains(step.id) {
-                continue;
-            }
-            let _ = publish_server_entity_snapshot_locked(&mut inner, step.id);
+        for (_, motion) in applied_motion {
+            publish_server_entity_motion_locked(&mut inner, motion);
         }
         inner = resolve_arrow_entity_hits_locked(
             self,
@@ -893,7 +893,7 @@ impl SessionRegistry {
             ));
         }
         let ordinary_tracking_turn = tick.is_multiple_of(ENTITY_MOVE_SEND_INTERVAL_TICKS);
-        let mut tracker_states = Vec::with_capacity(steps.len());
+        let mut tracker_inputs = Vec::with_capacity(steps.len());
         for step in steps {
             let Some(motion) = inner.entities.motion_state(step.id) else {
                 continue;
@@ -905,10 +905,18 @@ impl SessionRegistry {
             if !ordinary_tracking_turn && !latency_sensitive && !smooth_natural_mob {
                 continue;
             }
-            if !inner.entity_movement_trackers.contains(step.id) {
-                initialize_entity_wire_state_locked(&mut inner, step.id);
-            }
-            tracker_states.push((motion, smooth_natural_mob));
+            let last_sent = inner.entity_movement_trackers.get_or_insert(
+                step.id,
+                LastSentEntityState {
+                    position: motion.position,
+                    velocity: motion.velocity,
+                    rotation: motion.rotation,
+                    on_ground: motion.on_ground,
+                    tracking_update_count: 0,
+                    teleport_delay: 0,
+                },
+            );
+            tracker_inputs.push((motion, last_sent, smooth_natural_mob));
         }
         let lifecycle_tick = inner.entity_lifecycle_tick;
         let pickup_ready_items = steps
@@ -926,15 +934,6 @@ impl SessionRegistry {
             })
             .map(|step| step.id)
             .collect::<HashSet<_>>();
-        let tracker_inputs = tracker_states
-            .into_iter()
-            .filter_map(|(motion, smooth_natural_mob)| {
-                inner
-                    .entity_movement_trackers
-                    .get(motion.id)
-                    .map(|last_sent| (motion, last_sent, smooth_natural_mob))
-            })
-            .collect::<Vec<_>>();
         let session_positions = inner
             .sessions
             .iter()

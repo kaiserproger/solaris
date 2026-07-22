@@ -1,0 +1,95 @@
+# ADR 0009 - Regional simulation behind the plugin boundary
+
+**Date:** 2026-07-22
+**Status:** Accepted, staged implementation
+
+## Problem
+
+Solaris is moving mutable world and entity simulation to regional single-writer
+owners. Exposing that ownership model to Lua would force every plugin author to
+handle migration, concurrency, stale references, and cross-region commit. A
+globally mutable lock-free world would avoid visible regions only by moving the
+same consistency problem into atomics and retries.
+
+## Decision
+
+Use a hybrid ownership model:
+
+- regions own spatial simulation: entities, blocks, fluids, local physics, and
+  other state whose authority follows world position;
+- global actor services own non-spatial state such as plugin storage, economy,
+  permissions, claim definitions, and plugin lifecycle;
+- each Lua plugin has isolated state and serial handler semantics; the current
+  runtime multiplexes those states on one shared host thread;
+- the stable plugin boundary contains owned immutable events, bounded command
+  batches, targeted completion events, and typed transactions;
+- region keys, epochs, owner handles, ECS references, locks, sockets, and Rust
+  pointers are never part of the stable plugin API.
+
+The server routes an admitted command to the current owner and validates the
+observed session/entity generation at commit. Region migration is invisible to
+the plugin. Results return as exact targeted events. A future coroutine/await
+helper may wrap those events but cannot introduce polling or elapsed-time
+success.
+
+## Event and mutation classes
+
+Ordinary observations such as chat, death, zone entry, and completed world
+changes are asynchronous immutable events. Their handlers may enqueue later
+commands but cannot retain live world references.
+
+Actions that must conserve state, including purchases, inventory exchanges,
+teleports, and entity mutations, use typed host transactions. The host owns
+routing, prepare/commit, rejection, and compensation. A plugin receives one
+committed or rejected result and does not implement regional two-phase commit.
+
+Hot admission rules such as land-claim build permission must not call Lua while
+holding a region tick. Their owner service publishes an immutable versioned
+policy index for local reads. Updating a rule changes that publication; normal
+block admission remains local to the region.
+
+If an uncommon custom decision later needs synchronous-looking admission, its
+adapter may suspend only the initiating action while the host processes it.
+The region must continue ticking and may resume the action only from an exact
+response with its original generation fence. This general suspension adapter
+does not exist yet.
+
+## Ordering and consistency
+
+The current host consumes its bounded event FIFO on one thread and invokes one
+handler at a time. Each plugin therefore observes serial handler execution
+without pretending the server is single-threaded. If the host is later split
+into per-plugin workers, each plugin must retain its admitted FIFO order.
+
+Queries return immutable snapshots with an explicit observed revision. A
+transaction rechecks that revision or the narrower generation named by its DTO.
+Cross-region or cross-service atomicity is provided only by a typed transaction
+whose host adapter defines the participants and rollback rules. The API does
+not offer an unbounded general world transaction.
+
+Parallel plugin handlers or region-local pure handlers may be added later only
+as an opt-in API with isolated state and measured need. They are not the
+default and cannot weaken per-plugin FIFO ordering.
+
+## Consequences
+
+- Plugin authors write serial handlers and typed commands without locks or
+  region awareness.
+- Slow Lua cannot stall a region tick; queue and instruction limits isolate the
+  plugin.
+- Economy and claims do not become spatial simulation state merely to fit the
+  regional scheduler.
+- The host must provide explicit transaction adapters for compound gameplay
+  operations instead of exposing generic mutable world access.
+- Regional ownership can change internally without breaking plugin code.
+
+## Current implementation status
+
+`mc-script` already provides isolated Lua states multiplexed by one serial host
+thread, bounded immutable DTOs, capability-gated command batches, targeted
+result events, and instruction and memory limits. `mc-net` already has
+production adapters for storage, zones, menus, player inventory transactions,
+teleports, colonies, and villager bindings. There is no general coroutine wait
+API or custom-action suspension adapter. This ADR fixes the architectural
+direction; it does not claim that every gameplay transaction or published
+policy index is complete.

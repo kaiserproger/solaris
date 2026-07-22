@@ -1,7 +1,9 @@
-use mc_entity::{Rotation, Vec3};
+use mc_entity::{EntityId, EntityMotionState, Rotation, Vec3};
 
+use super::outbound::ServerEntitySnapshot;
 use super::visibility::{
-    EntityTrackerUpdate, LastSentEntityState, advance_entity_tracker_update, quantized_entity_delta,
+    EntityTrackerUpdate, LastSentEntityState, advance_entity_tracker_update,
+    quantized_entity_delta, update_server_entity_motion,
 };
 use crate::play::wire_entities::ServerEntityWireMove;
 
@@ -242,4 +244,51 @@ fn velocity_and_absolute_can_be_selected_together() {
     );
     assert!(update.send_velocity);
     assert_eq!(last.velocity, velocity);
+}
+
+#[test]
+fn physics_motion_publication_preserves_non_kinematic_state() {
+    let mut snapshot = ServerEntitySnapshot {
+        id: EntityId(41),
+        uuid: uuid::Uuid::nil(),
+        type_id: 123,
+        type_name: "minecraft:zombie".to_owned(),
+        position: Vec3::new(0.5, 64.0, 0.5),
+        rotation: Rotation::ZERO,
+        velocity: Vec3::ZERO,
+        on_ground: true,
+        health: Some(7.0),
+        item_stack: None,
+        experience_value: Some(3),
+        block_state: Some(9),
+        animal: None,
+    };
+    let motion = EntityMotionState {
+        id: snapshot.id,
+        position: Vec3::new(1.5, 65.0, 2.5),
+        rotation: Rotation {
+            yaw: 90.0,
+            pitch: 10.0,
+            head_yaw: 75.0,
+        },
+        velocity: Vec3::new(0.1, 0.2, 0.3),
+        on_ground: false,
+        is_item: false,
+        is_experience: false,
+        is_arrow: false,
+        arrow_revision: None,
+        arrow_embedded_block: None,
+        sends_velocity: true,
+    };
+
+    update_server_entity_motion(&mut snapshot, motion);
+
+    assert_eq!(snapshot.position, motion.position);
+    assert_eq!(snapshot.rotation, motion.rotation);
+    assert_eq!(snapshot.velocity, motion.velocity);
+    assert_eq!(snapshot.on_ground, motion.on_ground);
+    assert_eq!(snapshot.health, Some(7.0));
+    assert_eq!(snapshot.experience_value, Some(3));
+    assert_eq!(snapshot.block_state, Some(9));
+    assert_eq!(snapshot.type_name, "minecraft:zombie");
 }
