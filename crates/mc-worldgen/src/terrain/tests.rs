@@ -1399,6 +1399,28 @@ fn solaris_owned_river_masks_are_broad_when_reachable() {
 }
 
 #[test]
+fn river_biomes_only_label_carved_water_floors() {
+    let g = TerrainGenerator::new(42, tiny_registry());
+    let mut rivers = 0usize;
+
+    for wx in (-4_096..=4_096).step_by(32) {
+        for wz in (-4_096..=4_096).step_by(32) {
+            let height = g.surface_height(wx, wz);
+            let biome = g.biome_for(wx, wz, height);
+            if g.biomes.is_river(&biome) {
+                rivers += 1;
+                assert!(
+                    height <= SEA_LEVEL,
+                    "river biome at ({wx},{wz}) was not carved: {height}"
+                );
+            }
+        }
+    }
+
+    assert!(rivers > 0, "sample should contain routed river floors");
+}
+
+#[test]
 fn solaris_owned_river_valleys_keep_continuous_water_floors() {
     let g = TerrainGenerator::new(42, tiny_registry());
     let mut checked = 0usize;

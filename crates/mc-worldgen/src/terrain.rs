@@ -407,7 +407,7 @@ impl TerrainGenerator {
                 .biomes
                 .pick_region_band(&self.biomes.deep_ocean, world_x, world_z);
         }
-        if river.abs() < RIVER_BIOME_WIDTH && continental > -0.05 {
+        if river.abs() < RIVER_BIOME_WIDTH && continental > -0.05 && height <= SEA_LEVEL {
             return self
                 .biomes
                 .pick(&self.biomes.river, world_x, world_z, 0x5249_5645);
@@ -422,7 +422,7 @@ impl TerrainGenerator {
                 .biomes
                 .pick(&self.biomes.beach, world_x, world_z, 0x4245_4143);
         }
-        if height > 118 || ridges > 0.55 {
+        if height > 118 || ridges > 0.22 {
             return self
                 .biomes
                 .pick(&self.biomes.mountain, world_x, world_z, 0x4D4F_554E);
@@ -493,7 +493,11 @@ impl TerrainGenerator {
                 .biomes
                 .pick(&self.biomes.beach, world_x, world_z, 0x5442_4541);
         }
-        if settings.water_enabled && river.abs() < RIVER_BIOME_WIDTH * 0.65 && land_mask > -0.02 {
+        if settings.water_enabled
+            && river.abs() < RIVER_BIOME_WIDTH * 0.65
+            && land_mask > -0.02
+            && height_y <= sea_y
+        {
             return self
                 .biomes
                 .pick(&self.biomes.river, world_x, world_z, 0x5452_4956);
@@ -728,7 +732,7 @@ impl TerrainGenerator {
             return;
         };
         for y in cave_min_y..=cave_max_y {
-            if self.is_cave_cell(plan.wx, y, plan.wz) {
+            if self.is_cave_cell(plan.wx, y, plan.wz, plan.height) {
                 let _ = chunk.set_block(plan.lx, y, plan.lz, self.air);
             }
         }
@@ -996,7 +1000,7 @@ impl TerrainGenerator {
             let Ok(sample_y) = i32::try_from(sample_y) else {
                 return None;
             };
-            if self.is_cave_cell(world_x, sample_y, world_z) {
+            if self.is_cave_cell(world_x, sample_y, world_z, plan.height) {
                 return Some(self.air);
             }
         }
@@ -1468,8 +1472,8 @@ impl TerrainGenerator {
         }
     }
 
-    fn is_cave_cell(&self, x: i32, y: i32, z: i32) -> bool {
-        self.density_router().is_cave(x, y, z)
+    fn is_cave_cell(&self, x: i32, y: i32, z: i32, surface_y: i32) -> bool {
+        self.density_router().is_cave(x, y, z, surface_y)
     }
 
     #[cfg(test)]

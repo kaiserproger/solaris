@@ -51,6 +51,47 @@ fn chunk_borders_have_the_same_slope_budget_as_interior_columns() {
 }
 
 #[test]
+fn spawn_window_is_dry_walkable_land_across_seed_grid() {
+    for seed in -8..8 {
+        let router = OverworldRouter::new(seed, OVERWORLD_GEOMETRY, WorldgenMode::VanillaLike);
+        for z in -96..=96 {
+            for x in -96..=96 {
+                let height = router.sample(x, z).surface_y;
+                assert!(
+                    height >= SEA_LEVEL + 3,
+                    "seed {seed} has wet spawn terrain at ({x},{z}): {height}"
+                );
+                for (nx, nz) in [(x + 1, z), (x, z + 1)] {
+                    let neighbour = router.sample(nx, nz).surface_y;
+                    assert!(
+                        (height - neighbour).abs() <= 3,
+                        "seed {seed} has an impassable spawn step at ({x},{z}): {height} -> {neighbour}"
+                    );
+                }
+            }
+        }
+    }
+}
+
+#[test]
+fn caves_never_open_the_surface_shell_across_seed_grid() {
+    for seed in -16..16 {
+        let router = OverworldRouter::new(seed, OVERWORLD_GEOMETRY, WorldgenMode::VanillaLike);
+        for z in (-256..=256).step_by(31) {
+            for x in (-256..=256).step_by(29) {
+                let surface = router.sample(x, z).surface_y;
+                for y in surface - CAVE_SURFACE_CLEARANCE..=surface {
+                    assert!(
+                        !router.is_cave(x, y, z, surface),
+                        "seed {seed} cave opened the surface shell at ({x},{y},{z})"
+                    );
+                }
+            }
+        }
+    }
+}
+
+#[test]
 fn caves_are_sparse_connected_tunnels_without_shafts_or_chambers() {
     const SIDE: usize = 64;
     const MIN_Y: i32 = -48;
@@ -66,8 +107,14 @@ fn caves_are_sparse_connected_tunnels_without_shafts_or_chambers() {
         for y in 0..HEIGHT {
             for z in 0..SIDE {
                 for x in 0..SIDE {
-                    let cave =
-                        router.is_cave(origin + x as i32, MIN_Y + y as i32, -origin + z as i32);
+                    let world_x = origin + x as i32;
+                    let world_z = -origin + z as i32;
+                    let cave = router.is_cave(
+                        world_x,
+                        MIN_Y + y as i32,
+                        world_z,
+                        router.sample(world_x, world_z).surface_y,
+                    );
                     volume[index(x, y, z)] = cave;
                     cave_count += usize::from(cave);
                 }

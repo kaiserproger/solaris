@@ -74,15 +74,15 @@ hardening. An already-open lower-priority diff does not override this order.
 
 ## Recent Evidence
 
-- Worldgen revision 4 replaces the previous density router with one continuous
-  overworld authority for warped continents, erosion, ridges, rivers, climate,
-  and narrow neighbour-connected caves. Tests cover every column across full
+- Worldgen revision 5 replaces the mixed terrain-height formula with bounded
+  layers: continents, erosion/uplands, land-only ridges and low-relief rivers.
+  Tests cover a dry walkable 193x193 spawn window across a seed grid, full
   sampled cave volumes, chunk-border slopes, surface shells, exact tree support,
-  spawn resources, extreme coordinates, and wire-level generated world use.
+  spawn resources, extreme vertical geometry, and wire-level generated world use.
   Fresh Solaris worlds persist revision/seed/mode/geometry in
   `solaris/world.json`; unversioned vanilla Anvil worlds open without Solaris
   fallback generation, so terrain authorities cannot mix. `playable.toml` now
-  uses `.analysis/test-world-v4`. Real-client visual inspection is pending.
+  uses `.analysis/test-world-v5`. Real-client visual inspection is pending.
 
 - Hostile melee now keeps a zero-speed target-facing goal while in reach, so a
   stationary zombie stops without freezing its body/head rotation and publishes

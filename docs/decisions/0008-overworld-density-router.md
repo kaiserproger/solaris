@@ -1,7 +1,7 @@
 # ADR 0008 - Overworld generation pipeline
 
 **Date:** 2026-07-22
-**Status:** Accepted, worldgen revision 4
+**Status:** Accepted, worldgen revision 5
 
 ## Context
 
@@ -13,12 +13,13 @@ block as support instead of the surface planned for that column.
 
 ## Decision
 
-Worldgen revision 4 starts from `terrain::overworld::OverworldRouter`. One
-world-coordinate sample derives warped continents, erosion, narrow mountain
-ridges, hills, rivers, temperature, and moisture. Broad coordinate scales and a
-tested three-block adjacent-column slope budget keep both interior columns and
-chunk borders continuous. Rivers use the same mask for terrain and biome
-routing and always cut a river-labelled centre below sea level.
+Worldgen revision 5 replaces the previous mixed height formula with a layered
+`terrain::overworld::OverworldRouter`. Continents first choose ocean or land;
+erosion then chooses plains or uplands; ridges add mountains only on established
+land; rivers carve only low relief. Every layer has a bounded vertical effect,
+so no late mask can turn an ordinary surface column into a deep pit. Broad
+coordinate scales and a tested three-block adjacent-column slope budget keep
+interior columns and chunk borders continuous.
 
 Spawn land and river suppression are smooth field constraints, not later block
 rewrites. River availability is part of the returned field, so biome routing
@@ -42,11 +43,11 @@ seed, mode, and geometry. A mismatched contract is rejected before Anvil open.
 An existing unversioned Anvil world is treated as a vanilla import and opens
 without Solaris fallback generation, so missing chunks cannot mix both terrain
 authorities. Existing worlds are never rewritten. The local playable profile
-uses `.analysis/test-world-v4`.
+uses `.analysis/test-world-v5`.
 
 The hot path samples each surface column once and reuses its biome result for
 vertical biome cells. Cave noise exits after its region mask or first tunnel
-field rejects the cell. No revision-4 performance claim exists until a release
+field rejects the cell. No revision-5 performance claim exists until a release
 benchmark runs on a clean host.
 
 ## Staged boundary
@@ -60,7 +61,7 @@ vanilla NoiseRouter parity or complete Tectonic/Tellus feature coverage.
 
 - deterministic generation for repeated calls and explicit geometry;
 - bounded adjacent-column and chunk-border steps plus non-grid biome transitions;
-- dry land at the origin across sampled seeds;
+- dry walkable land throughout a 193x193 spawn window across sampled seeds;
 - broad water-filled river sections;
 - sparse locally coherent tunnel caves with no chamber field, surface mouth, or
   long vertical shaft;

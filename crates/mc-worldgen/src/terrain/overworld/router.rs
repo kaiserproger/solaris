@@ -4,16 +4,18 @@ use crate::noise::{fbm_2d, fbm_3d};
 
 use super::super::{SEA_LEVEL, TellusWorldgenSettings, WorldgenMode};
 
-const CONTINENT_SCALE: f64 = 3_600.0;
-const CONTINENT_WARP_SCALE: f64 = 1_300.0;
-const CONTINENT_WARP_STRENGTH: f64 = 180.0;
-const EROSION_SCALE: f64 = 1_800.0;
-const RIDGE_SCALE: f64 = 2_000.0;
-const HILL_SCALE: f64 = 460.0;
-const DETAIL_SCALE: f64 = 150.0;
-const RIVER_SCALE: f64 = 1_850.0;
-const RIVER_DETAIL_SCALE: f64 = 610.0;
-const SPAWN_LAND_RADIUS: f64 = 320.0;
+const CONTINENT_SCALE: f64 = 2_800.0;
+const CONTINENT_WARP_SCALE: f64 = 1_100.0;
+const CONTINENT_WARP_STRENGTH: f64 = 120.0;
+const EROSION_SCALE: f64 = 1_400.0;
+const UPLAND_SCALE: f64 = 760.0;
+const HILL_SCALE: f64 = 310.0;
+const DETAIL_SCALE: f64 = 120.0;
+const RIDGE_SCALE: f64 = 1_450.0;
+const RIVER_SCALE: f64 = 1_650.0;
+const RIVER_DETAIL_SCALE: f64 = 520.0;
+const SPAWN_LAND_RADIUS: f64 = 384.0;
+const CAVE_SURFACE_CLEARANCE: i32 = 32;
 
 #[derive(Clone, Copy, Debug)]
 pub(in crate::terrain) struct TerrainSample {
@@ -27,6 +29,11 @@ pub(in crate::terrain) struct TerrainSample {
 }
 
 /// Stateless world-coordinate authority for newly generated overworld chunks.
+///
+/// The router is deliberately layered: continents choose ocean or land,
+/// erosion chooses plains or uplands, ridges add mountains only on established
+/// land, and rivers carve only low relief. No later layer can turn one column
+/// into an unbounded pit.
 #[derive(Clone, Copy, Debug)]
 pub(in crate::terrain) struct OverworldRouter {
     seed: i64,
@@ -79,12 +86,12 @@ impl OverworldRouter {
             warped_x / (CONTINENT_SCALE * world_scale),
             warped_z / (CONTINENT_SCALE * world_scale),
             self.seed ^ 0x434F_4E54,
-            5,
+            4,
             0.52,
         );
         let spawn_weight = 1.0 - smootherstep((x.hypot(z) / SPAWN_LAND_RADIUS).clamp(0.0, 1.0));
-        let continentalness = raw_continent.max(lerp(raw_continent, 0.24, spawn_weight));
-        let land = smootherstep(remap(continentalness, -0.30, 0.02));
+        let continentalness = raw_continent.max(lerp(raw_continent, 0.30, spawn_weight));
+        let land_weight = smootherstep(remap(continentalness, -0.22, 0.08));
 
         let erosion = normalized(fbm_2d(
             warped_x / (EROSION_SCALE * world_scale),
@@ -93,18 +100,13 @@ impl OverworldRouter {
             4,
             0.52,
         ));
-        let weirdness = fbm_2d(
-            warped_x / (RIDGE_SCALE * world_scale),
-            warped_z / (RIDGE_SCALE * world_scale),
-            self.seed ^ 0x5249_4447,
-            4,
+        let upland = fbm_2d(
+            warped_x / (UPLAND_SCALE * world_scale),
+            warped_z / (UPLAND_SCALE * world_scale),
+            self.seed ^ 0x5550_4C44,
+            3,
             0.5,
         );
-        let ridge = (1.0 - weirdness.abs()).clamp(0.0, 1.0).powi(4);
-        let mountain_mask = smootherstep(remap(continentalness, 0.08, 0.42))
-            * (1.0 - smootherstep(remap(erosion, 0.38, 0.78)));
-        let ridges = ridge * mountain_mask * (1.0 - spawn_weight);
-
         let hills = fbm_2d(
             warped_x / (HILL_SCALE * world_scale),
             warped_z / (HILL_SCALE * world_scale),
@@ -119,21 +121,39 @@ impl OverworldRouter {
             2,
             0.45,
         );
+        let ridge_noise = fbm_2d(
+            warped_x / (RIDGE_SCALE * world_scale),
+            warped_z / (RIDGE_SCALE * world_scale),
+            self.seed ^ 0x5249_4447,
+            4,
+            0.5,
+        );
+        let ridge_shape = (1.0 - ridge_noise.abs()).clamp(0.0, 1.0).powi(3);
+        let mountain_mask = smootherstep(remap(continentalness, 0.12, 0.48))
+            * smootherstep(remap(1.0 - erosion, 0.34, 0.82))
+            * (1.0 - spawn_weight);
+        let ridges = ridge_shape * mountain_mask;
 
         let ocean_scale = settings.map_or(1.0, |value| value.oceanic_height_scale.max(0.0));
         let land_scale = settings.map_or(1.0, |value| value.terrestrial_height_scale.max(0.0));
-        let ocean_floor = f64::from(sea_level)
-            - (14.0 + (-continentalness).max(0.0) * 46.0) * ocean_scale
-            + hills * 2.0;
-        let lowland = f64::from(sea_level)
+        let relief_scale = settings.map_or(1.0, |_| 1.15);
+        let deep_ocean = smootherstep(remap(-continentalness, 0.08, 0.58));
+        let ocean_floor = f64::from(sea_level) - (12.0 + deep_ocean * 34.0) * ocean_scale
+            + hills * 2.0 * ocean_scale;
+        let rolling_land = f64::from(sea_level)
             + 7.0
-            + continentalness.max(0.0) * 24.0 * land_scale
-            + hills * (3.0 + (1.0 - erosion) * 5.0) * land_scale
-            + detail * 1.4 * land_scale;
-        let mountain_height = settings.map_or(72.0, |_| 100.0) * land_scale;
-        let mut height = lerp(ocean_floor, lowland + ridges * mountain_height, land);
+            + continentalness.max(0.0) * 18.0 * land_scale
+            + upland * (4.0 + (1.0 - erosion) * 7.0) * land_scale * relief_scale
+            + hills * 3.0 * land_scale * relief_scale
+            + detail * 1.25 * land_scale * relief_scale;
+        let mountain_height = settings.map_or(92.0, |_| 132.0) * land_scale;
+        let mut height = lerp(
+            ocean_floor,
+            rolling_land + ridges * mountain_height,
+            land_weight,
+        );
 
-        let raw_river = (fbm_2d(
+        let river = (fbm_2d(
             warped_x / (RIVER_SCALE * world_scale),
             warped_z / (RIVER_SCALE * world_scale),
             self.seed ^ 0x5249_5641,
@@ -145,13 +165,20 @@ impl OverworldRouter {
             self.seed ^ 0x5249_5642,
             2,
             0.45,
-        ) * 0.12)
-            .abs();
-        let river = raw_river.max(spawn_weight * 0.14);
-        let river_strength = 1.0 - smootherstep(remap(river, 0.025, 0.085));
-        let river_land = smootherstep(remap(continentalness, -0.08, -0.05));
-        let river_floor = f64::from(sea_level) - 4.0 + detail.abs().min(1.0) * 0.5;
-        height = lerp(height, river_floor, river_strength * river_land);
+        ) * 0.10)
+            .abs()
+            .max(spawn_weight * 0.14);
+        let river_channel = 1.0 - smootherstep(remap(river, 0.018, 0.070));
+        let low_relief = 1.0
+            - smootherstep(remap(
+                height,
+                f64::from(sea_level) + 22.0,
+                f64::from(sea_level) + 49.0,
+            ));
+        let river_weight = river_channel * land_weight * low_relief * (1.0 - spawn_weight);
+        let river_floor = f64::from(sea_level) - 3.0 + detail.abs() * 0.5;
+        height = lerp(height, river_floor, river_weight);
+        let routed_river = river.max((1.0 - river_weight) * 0.10);
 
         let temperature = self.temperature(x, height, z, settings);
         let moisture = fbm_2d(
@@ -166,13 +193,17 @@ impl OverworldRouter {
             surface_y: self.clamp_height(height),
             continentalness,
             ridges,
-            river,
+            river: routed_river,
             temperature,
             moisture,
         }
     }
 
-    pub(in crate::terrain) fn is_cave(self, x: i32, y: i32, z: i32) -> bool {
+    pub(in crate::terrain) fn is_cave(self, x: i32, y: i32, z: i32, surface_y: i32) -> bool {
+        let cave_ceiling = surface_y.saturating_sub(CAVE_SURFACE_CLEARANCE).min(32);
+        if y >= cave_ceiling {
+            return false;
+        }
         self.is_cave_raw(x, y, z)
             && [(-1, 0), (1, 0), (0, -1), (0, 1)]
                 .into_iter()
@@ -184,7 +215,7 @@ impl OverworldRouter {
     }
 
     fn is_cave_raw(self, x: i32, y: i32, z: i32) -> bool {
-        if y <= self.geometry.min_y().saturating_add(8) || y >= 40 {
+        if y <= self.geometry.min_y().saturating_add(10) {
             return false;
         }
         let x = f64::from(x);
