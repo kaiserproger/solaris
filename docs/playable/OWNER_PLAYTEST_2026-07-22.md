@@ -39,11 +39,15 @@ verification and keep ordinary survival play ahead of rare edge cases.
   then `AddEntity` plus item metadata, at least a 100 ms visible window, and
   only then the separate pickup claim, take/remove packets, and inventory slot
   update.
-- [ ] Shift-click crafting must craft the maximum complete batch that fits;
+- [x] Shift-click crafting must craft the maximum complete batch that fits;
   shift-click container transfers must move the complete stack without a later
   slot teleport. Focused crafting and furnace quick-move regressions are green,
-  and Lua craft events now report the complete batch; owner/client confirmation
-  is still pending.
+  and Lua craft events report the complete batch. A real 26.1.2 client used one
+  shift-click to turn four logs into 16 planks in both the inventory 2x2 grid
+  and a crafting table, consuming each grid completely. It also moved one
+  61-item stone stack into and back out of a chest. Reopening the crafting table
+  and chest kept the final authoritative slots with no delayed correction or
+  disconnect.
 - [ ] Furnace state must visibly become lit while cooking, open promptly, and
   deliver slot/cook events without delayed bursts.
 - [ ] Player melee reach and damage must match ordinary vanilla survival closely:

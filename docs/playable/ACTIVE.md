@@ -74,6 +74,15 @@ hardening. An already-open lower-priority diff does not override this order.
 
 ## Recent Evidence
 
+- Shift-click batching is client-verified. One real 26.1.2 inventory-menu
+  quick-move consumed four logs and produced 16 planks, and one crafting-table
+  quick-move did the same, raising the existing plank stack from 16 to 32. Both
+  crafting grids were empty after their transactions, and the crafting table
+  remained empty after reopening. A chest quick-move transferred one 61-stone
+  stack from player slot 54 to storage slot 0 and back to player slot 27;
+  reopening the chest preserved that complete stack and empty storage slot.
+  Every quick-move was confirmed and the client remained connected.
+
 - Placement is client-verified through both hands and a side face. A real
   26.1.2 client placed stone upward from the main hand (`64 -> 63`), used the
   ordinary vanilla input path to place upward from the offhand (`63 -> 62`),
