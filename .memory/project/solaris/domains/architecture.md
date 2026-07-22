@@ -22,12 +22,13 @@ Current runtime facts:
 - Overworld terrain shape is owned by `terrain::overworld::DensityRouter`;
   route worldgen topology, climate, river, cave, or stage extraction work
   through ADR 0008.
-- The second-generation Overworld router owns continents, mountain provinces,
-  rivers, climate, and per-block 3D caves. Caves keep a 32-block solid surface
-  shell; generated trees require a stable 3x3 terrain footprint. Generation
+- The third-generation Overworld router owns continents, tectonic plates,
+  erosion, ridges, rivers, climate, and per-block tunnel caves. Caves keep a
+  32-block solid surface shell and have no chamber field; generated trees
+  require a stable 5x5 terrain footprint under the full canopy. Generation
   order is terrain/caves/ores, then structures, then decorations. Persisted
   chunks are never silently regenerated, so evaluate the new router only in a
-  fresh world (`playable.toml` uses `.analysis/test-world-v2`).
+  fresh world (`playable.toml` uses `.analysis/test-world-v3`).
 - Regional entity owners commit authoritative kinematics. Movement wire plans
   are prepared outside the global session lock and use tracker CAS plus a
   visibility recheck at publication. Visibility indexes and outbound session

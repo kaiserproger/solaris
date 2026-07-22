@@ -23,7 +23,6 @@ use mc_world::{
     PackedBitArray,
 };
 
-use crate::noise::fbm_2d;
 use crate::structures::{StructureRules, StructureTemplate};
 
 mod biome_rules;
@@ -47,16 +46,8 @@ pub enum TerrainGeneratorError {
 }
 
 pub const SEA_LEVEL: i32 = 63;
-const METERS_PER_DEGREE: f64 = 111_319.491_666_666_67;
-const MAX_MERCATOR_LATITUDE: f64 = 85.051_128_78;
 const RIVER_BIOME_WIDTH: f64 = 0.025;
 const BEACH_HEIGHT_ABOVE_SEA: i32 = 2;
-const TELLUS_CONTINENT_SCALE: f64 = 22_000.0;
-const TELLUS_COAST_SCALE: f64 = 6_500.0;
-const TELLUS_CLIMATE_SCALE: f64 = 18_000.0;
-const TELLUS_MOISTURE_SCALE: f64 = 16_000.0;
-const TELLUS_MOUNTAIN_MASK_SCALE: f64 = 24_000.0;
-const TELLUS_MOUNTAIN_DETAIL_SCALE: f64 = 3_200.0;
 /// Number of dirt cells between grass cap and stone.
 const DIRT_DEPTH: i32 = 3;
 const ORE_VEIN_RADIUS: i32 = 4;
@@ -101,43 +92,6 @@ pub enum WorldgenMode {
     #[default]
     VanillaLike,
     TellusLike(TellusWorldgenSettings),
-}
-
-#[derive(Clone, Copy, Debug, PartialEq)]
-struct MercatorProjection {
-    world_scale_meters_per_block: f64,
-}
-
-impl MercatorProjection {
-    #[must_use]
-    fn new(world_scale_meters_per_block: f64) -> Self {
-        Self {
-            world_scale_meters_per_block: world_scale_meters_per_block.max(0.001),
-        }
-    }
-
-    #[must_use]
-    fn from_settings(settings: TellusWorldgenSettings) -> Self {
-        Self::new(settings.world_scale_meters_per_block)
-    }
-
-    #[must_use]
-    fn blocks_per_degree(&self) -> f64 {
-        METERS_PER_DEGREE / self.world_scale_meters_per_block
-    }
-
-    #[must_use]
-    fn latitude_from_block_z(&self, z: f64) -> f64 {
-        let mercator_radians = (-z / self.blocks_per_degree()).to_radians();
-        mercator_radians.sinh().atan().to_degrees()
-    }
-}
-
-#[derive(Clone, Copy, Debug, PartialEq)]
-struct TellusClimate {
-    latitude_degrees: f64,
-    temperature: f64,
-    moisture: f64,
 }
 
 /// Hill-noise terrain. Holds the resolved state ids of the four
@@ -410,73 +364,12 @@ impl TerrainGenerator {
         DensityRouter::new(self.seed, self.geometry, self.worldgen_mode)
     }
 
-    fn tellus_land_mask(
-        &self,
-        world_x: i32,
-        world_z: i32,
-        settings: TellusWorldgenSettings,
-    ) -> f64 {
-        let projection = MercatorProjection::from_settings(settings);
-        let latitude = projection.latitude_from_block_z(world_z as f64);
-        let equator_weight = (1.0 - latitude.abs() / MAX_MERCATOR_LATITUDE).clamp(0.0, 1.0);
-        let continent = fbm_2d(
-            world_x as f64 / TELLUS_CONTINENT_SCALE,
-            world_z as f64 / TELLUS_CONTINENT_SCALE,
-            self.seed ^ 0x5445_4C4C_5553,
-            5,
-            0.55,
-        );
-        let coast = fbm_2d(
-            world_x as f64 / TELLUS_COAST_SCALE,
-            world_z as f64 / TELLUS_COAST_SCALE,
-            self.seed ^ 0x434F_4153_5453,
-            3,
-            0.5,
-        );
-        continent + coast * 0.22 + (equator_weight - 0.5) * 0.08
-    }
-
-    #[must_use]
-    fn tellus_climate(&self, world_x: i32, height: i32, world_z: i32) -> TellusClimate {
-        let settings = match self.worldgen_mode {
-            WorldgenMode::VanillaLike => TellusWorldgenSettings::default(),
-            WorldgenMode::TellusLike(settings) => settings,
-        };
-        let projection = MercatorProjection::from_settings(settings);
-        let latitude_degrees = projection.latitude_from_block_z(world_z as f64);
-        let latitude_cooling = latitude_degrees.abs() / MAX_MERCATOR_LATITUDE;
-        let altitude = (i64::from(height) - i64::from(settings.sea_level)).max(0);
-        let altitude_cooling = (altitude as f64 / 128.0).min(1.0);
-        let weather = fbm_2d(
-            world_x as f64 / TELLUS_CLIMATE_SCALE,
-            world_z as f64 / TELLUS_CLIMATE_SCALE,
-            self.seed ^ 0x434C_494D_4154,
-            3,
-            0.55,
-        );
-        TellusClimate {
-            latitude_degrees,
-            temperature: ((1.0 - latitude_cooling * 1.8 - altitude_cooling * 0.85)
-                * settings.climate_strength)
-                + weather * 0.12,
-            moisture: fbm_2d(
-                world_x as f64 / TELLUS_MOISTURE_SCALE,
-                world_z as f64 / TELLUS_MOISTURE_SCALE,
-                self.seed ^ 0x4D4F_4953_5455,
-                3,
-                0.55,
-            ),
-        }
-    }
-
     fn biome_for(&self, world_x: i32, world_z: i32, height: i32) -> Identifier {
+        let sample = self.density_router().sample(world_x, world_z);
         match self.worldgen_mode {
-            WorldgenMode::VanillaLike => {
-                let sample = self.density_router().sample(world_x, world_z);
-                self.vanilla_biome_for(world_x, world_z, height, sample)
-            }
+            WorldgenMode::VanillaLike => self.vanilla_biome_for(world_x, world_z, height, sample),
             WorldgenMode::TellusLike(settings) => {
-                self.tellus_biome_for(world_x, world_z, height, settings)
+                self.tellus_biome_for(world_x, world_z, height, settings, sample)
             }
         }
     }
@@ -559,14 +452,14 @@ impl TerrainGenerator {
         world_z: i32,
         height: i32,
         settings: TellusWorldgenSettings,
+        sample: TerrainSample,
     ) -> Identifier {
         let sea_level = settings.sea_level;
         let height_y = i64::from(height);
         let sea_y = i64::from(sea_level);
-        let land_mask = self.tellus_land_mask(world_x, world_z, settings);
-        let climate = self.tellus_climate(world_x, height, world_z);
-        let mountain = self.tellus_mountain_factor(world_x, world_z);
-        let river = self.river_signal(world_x, world_z);
+        let land_mask = sample.continentalness;
+        let mountain = sample.ridges;
+        let river = sample.river;
 
         if settings.water_enabled {
             if height_y < sea_y - 18 {
@@ -600,27 +493,27 @@ impl TerrainGenerator {
                 .biomes
                 .pick(&self.biomes.cave, world_x, world_z, 0x5443_4156);
         }
-        if climate.moisture > 0.62 && height_y <= sea_y + 8 {
+        if sample.moisture > 0.62 && height_y <= sea_y + 8 {
             return self
                 .biomes
                 .pick(&self.biomes.swamp, world_x, world_z, 0x5453_5741);
         }
-        if climate.temperature < -0.25 {
+        if sample.temperature < -0.25 {
             return self
                 .biomes
                 .pick(&self.biomes.cold, world_x, world_z, 0x5443_4F4C);
         }
-        if climate.temperature > 0.38 && climate.moisture < -0.08 {
+        if sample.temperature > 0.38 && sample.moisture < -0.08 {
             return self
                 .biomes
                 .pick(&self.biomes.hot_dry, world_x, world_z, 0x5448_4F54);
         }
-        if climate.temperature > 0.22 && climate.moisture > 0.2 {
+        if sample.temperature > 0.22 && sample.moisture > 0.2 {
             return self
                 .biomes
                 .pick(&self.biomes.jungle, world_x, world_z, 0x544A_554E);
         }
-        if climate.moisture > 0.04 {
+        if sample.moisture > 0.04 {
             self.biomes
                 .pick(&self.biomes.temperate_forest, world_x, world_z, 0x5446_4F52)
         } else {
@@ -645,34 +538,9 @@ impl TerrainGenerator {
         self.biome_for(world_x, world_z, surface_height)
     }
 
+    #[cfg(test)]
     fn ridges(&self, world_x: i32, world_z: i32) -> f64 {
         self.density_router().sample(world_x, world_z).ridges
-    }
-
-    fn tellus_mountain_factor(&self, world_x: i32, world_z: i32) -> f64 {
-        let mask = fbm_2d(
-            world_x as f64 / TELLUS_MOUNTAIN_MASK_SCALE,
-            world_z as f64 / TELLUS_MOUNTAIN_MASK_SCALE,
-            self.seed ^ 0x544D_4F55_4E54,
-            4,
-            0.56,
-        );
-        let mask = ((mask - 0.32) / 0.30).clamp(0.0, 1.0);
-        let mask = mask * mask * (3.0 - 2.0 * mask);
-        let ridge = self.ridges(world_x / 10, world_z / 10).powf(1.35);
-        let detail = fbm_2d(
-            world_x as f64 / TELLUS_MOUNTAIN_DETAIL_SCALE,
-            world_z as f64 / TELLUS_MOUNTAIN_DETAIL_SCALE,
-            self.seed ^ 0x544D_4153_5349,
-            3,
-            0.5,
-        )
-        .max(0.0);
-        (mask * (ridge * 0.78 + detail * 0.22)).clamp(0.0, 1.0)
-    }
-
-    fn river_signal(&self, world_x: i32, world_z: i32) -> f64 {
-        self.density_router().sample(world_x, world_z).river
     }
 
     fn plan_column(&self, pos: ChunkPos, lx: u8, lz: u8) -> ColumnPlan {
@@ -682,7 +550,9 @@ impl TerrainGenerator {
         let height = sample.surface_y;
         let biome = match self.worldgen_mode {
             WorldgenMode::VanillaLike => self.vanilla_biome_for(wx, wz, height, sample),
-            WorldgenMode::TellusLike(settings) => self.tellus_biome_for(wx, wz, height, settings),
+            WorldgenMode::TellusLike(settings) => {
+                self.tellus_biome_for(wx, wz, height, settings, sample)
+            }
         };
         let (mut surface, fill) = self.surface_materials(&biome);
         if self.is_spawn_iron_outcrop(wx, height, wz) {
@@ -727,7 +597,7 @@ impl TerrainGenerator {
 
     fn is_spawn_iron_outcrop(&self, wx: i32, height: i32, wz: i32) -> bool {
         height > SEA_LEVEL + BEACH_HEIGHT_ABOVE_SEA
-            && (12..=13).contains(&wx)
+            && (11..=13).contains(&wx)
             && (4..=8).contains(&wz)
     }
 
@@ -1258,9 +1128,15 @@ impl TerrainGenerator {
     }
 
     fn tree_site_is_stable(&self, plan: &ColumnPlan) -> bool {
-        for dz in -1..=1 {
-            for dx in -1..=1 {
-                let neighbour = self.surface_height(plan.wx + dx, plan.wz + dz);
+        for dz in -2..=2 {
+            for dx in -2..=2 {
+                let Some(wx) = plan.wx.checked_add(dx) else {
+                    return false;
+                };
+                let Some(wz) = plan.wz.checked_add(dz) else {
+                    return false;
+                };
+                let neighbour = self.surface_height(wx, wz);
                 if (neighbour - plan.height).abs() > 1 {
                     return false;
                 }

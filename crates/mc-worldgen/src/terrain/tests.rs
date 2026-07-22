@@ -593,21 +593,6 @@ fn tellus_like_mode_preserves_default_but_changes_explicit_generator() {
 }
 
 #[test]
-fn tellus_like_latitude_and_altitude_drive_climate() {
-    let g = TerrainGenerator::with_worldgen_mode(
-        77,
-        tiny_registry(),
-        WorldgenMode::TellusLike(TellusWorldgenSettings::default()),
-    );
-    let equator = g.tellus_climate(0, 72, 0);
-    let arctic = g.tellus_climate(0, 72, -10_000_000);
-    let summit = g.tellus_climate(0, 180, 0);
-    assert!(equator.temperature > arctic.temperature);
-    assert!(equator.temperature > summit.temperature);
-    assert!(equator.latitude_degrees.abs() < arctic.latitude_degrees.abs());
-}
-
-#[test]
 fn tellus_like_biomes_use_projected_climate_bands() {
     let settings = TellusWorldgenSettings::default();
     let g = TerrainGenerator::with_worldgen_mode(
@@ -717,7 +702,7 @@ fn tellus_like_keeps_local_terrain_smooth() {
 
     for wx in (-256..=256).step_by(8) {
         for wz in (-256..=256).step_by(8) {
-            if g.tellus_mountain_factor(wx, wz) > 0.05 {
+            if g.ridges(wx, wz) > 0.05 {
                 continue;
             }
             let h = g.surface_height(wx, wz);
@@ -755,7 +740,7 @@ fn tellus_like_mountains_are_rare_but_giant() {
             samples += 1;
             let height = g.surface_height(wx, wz);
             max_height = max_height.max(height);
-            if g.tellus_mountain_factor(wx, wz) > 0.22 {
+            if g.ridges(wx, wz) > 0.22 {
                 mountain_samples += 1;
             }
         }
@@ -1278,7 +1263,7 @@ fn solaris_owned_biome_choices_do_not_track_192_block_grid_lines() {
 
     assert!(
         aligned_pairs > 150,
-        "sample should include enough grid-line land pairs"
+        "sample should include enough grid-line land pairs, saw {aligned_pairs} (control {control_pairs})"
     );
     assert!(
         control_pairs > 150,

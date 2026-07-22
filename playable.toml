@@ -25,8 +25,8 @@ allow_local_dev_operators = false
 directory = "plugins"
 
 [data]
-# Worldgen v2 needs a fresh directory because persisted chunks are never rewritten.
-world_dir = ".analysis/test-world-v2"
+# Worldgen v3 needs a fresh directory because persisted chunks are never rewritten.
+world_dir = ".analysis/test-world-v3"
 vanilla_data_dir = "data/vanilla"
 seed = 0
 # worldgen_mode = "tellus_like"

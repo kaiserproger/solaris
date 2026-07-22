@@ -241,8 +241,8 @@ fn generated_tree_trunks_are_supported_by_stable_terrain() {
                             support.is_some_and(|state| state != air && state != water),
                             "tree trunk has no solid support at {wx},{base},{wz}"
                         );
-                        for dx in -1..=1 {
-                            for dz in -1..=1 {
+                        for dx in -2..=2 {
+                            for dz in -2..=2 {
                                 let neighbour = generator.surface_height(wx + dx, wz + dz);
                                 assert!(
                                     (surface - neighbour).abs() <= 1,

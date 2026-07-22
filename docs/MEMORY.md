@@ -251,11 +251,11 @@ two priorities unless it becomes a common-play blocker or corruption risk.
 - Serverbound protocol collections/strings/blobs have a complete bounded
   allocation audit, symmetric encode limits, and no-partial-output tests.
 - Production worldgen consumes explicit `ChunkGeometry` for terrain, ores,
-  structures, and biome assignment. Its second-generation Solaris-owned router
+  structures, and biome assignment. Its third-generation Solaris-owned router
   uses one coordinate-derived field family for terrain, climate, rivers, and
-  per-block 3D caves, with a 32-block surface shell and stable tree footprints.
+  per-block tunnel caves, with a 32-block surface shell and 5x5 tree footprints.
   Persisted chunks are not regenerated; the playable profile points at the
-  fresh `.analysis/test-world-v2` world.
+  fresh `.analysis/test-world-v3` world.
 - Lua API 0.6 has bounded DTO/files/batches, optional bounded startup-only TOML
   configuration with fresh Lua copies, push-driven bounded simulation timers,
   one-shot host admission, an attested `mc-net` router, and durable plugin

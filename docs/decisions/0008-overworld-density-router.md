@@ -1,52 +1,54 @@
 # ADR 0008 - Overworld density router
 
 **Date:** 2026-07-22
-**Status:** Accepted, second-generation router
+**Status:** Accepted, third-generation router
 
 ## Context
 
 The old generator calculated terrain shape through separate formulas for
 height, continents, rivers, mountains, climate, and caves. Those formulas could
-disagree. The first unified router removed those duplicate authorities but
-still produced over-wide mountain ridges, vertically stretched caves, and tree
-anchors that looked unsupported on sharp terrain.
+disagree. Two later routers retained too much domain warping, broad ridge masks,
+and a second Tellus-only mountain authority. The result was hard to reason about
+and could produce visually abrupt terrain and decorations over unsupported
+ground.
 
 ## Decision
 
 `terrain::overworld::DensityRouter` is the single authority for terrain shape.
-The first router was replaced instead of extended. One coordinate sample derives
-warped continents, coast detail, erosion, mountain provinces, ridges, hills,
-rivers, temperature, and moisture from one field family. Mountains only rise
-inside a broad province mask. Rivers flatten land toward a water floor; they do
-not subtract vertical shafts from terrain density.
+The third router replaces the prior formulas instead of layering more fixes over
+them. One coordinate sample derives continents, coasts, tectonic plates, erosion,
+mountain ridges, hills, rivers, temperature, and moisture. The same sample drives
+both vanilla-like and Tellus-like terrain and biome routing. Mountains only rise
+where a plate mask and narrow ridge field overlap. Rivers flatten land toward a
+water floor; they never subtract vertical shafts from terrain density.
 
 Spawn land and river suppression are smooth field constraints, not later block
 rewrites. River availability is part of the returned field, so biome routing
 cannot label an uncarved coast as a river.
 
 Underground shape is sampled per block from two intersecting, vertically bounded
-3D tunnel fields plus rare deep chambers. Carvers never operate in the top 32
-solid blocks of a column and no longer rewrite two-block vertical pairs. This
-keeps caves locally coherent without surface mouths or long vertical voids.
+3D tunnel fields. The chamber field was removed. Carvers never operate in the
+top 32 solid blocks of a column. This keeps caves locally coherent without
+surface mouths, giant chambers, or long vertical voids.
 
 Chunk assembly, ore rules, structures, and decorations remain deterministic
 consumers. They may not calculate an alternative terrain surface. Structures
 are emitted before vegetation. Generated trees require solid support and every
-neighboring terrain column in a 3x3 footprint to be within one block of their
-base, preventing visually floating trees on narrow ridges.
+terrain column under their full 5x5 canopy footprint to be within one block of
+the trunk base, preventing visually floating trees on narrow ridges.
 
 Generation remains stateless and coordinate-derived. Parallel generation of the
 same chunk or neighboring chunks in any order must produce identical output.
 Changing this algorithm intentionally changes newly generated terrain; persisted
 vanilla-format chunks remain authoritative and are not regenerated. The local
-playable profile therefore uses `.analysis/test-world-v2`; the previous local
-world is retained but cannot be evidence for this router.
+playable profile therefore uses `.analysis/test-world-v3`; previous local worlds
+are retained but cannot be evidence for this router.
 
 The hot path samples each surface column once and reuses its biome result for
-vertical biome cells. Cave noise exits after the first rejected tunnel field
-and evaluates rare chamber fields only underground. On the same development
-build probe this changed a 25-chunk spawn window from 7.3 to 20.6 chunks/s. It
-is a narrow diagnostic result, not a release or full-server throughput claim.
+vertical biome cells. Cave noise exits after its region mask or first tunnel
+field rejects the cell. The ignored 25-chunk debug probe generated 24.1 chunks/s
+on the development host. This is a narrow diagnostic, not a release or full
+server throughput claim.
 
 ## Staged boundary
 
@@ -61,8 +63,9 @@ vanilla NoiseRouter parity or complete Tectonic/Tellus feature coverage.
 - bounded adjacent-column steps and non-grid biome transitions;
 - dry land at the origin across sampled seeds;
 - broad water-filled river sections;
-- sparse locally coherent caves with no surface mouth or long vertical shaft;
+- sparse locally coherent tunnel caves with no chamber field, surface mouth, or
+  long vertical shaft;
 - a 32-block solid protected surface shell across sampled seeds;
-- supported generated trees on stable terrain;
+- supported generated trees over their full 5x5 canopy footprint;
 - order-independent ore placement;
 - `cargo test -p mc-worldgen`.
