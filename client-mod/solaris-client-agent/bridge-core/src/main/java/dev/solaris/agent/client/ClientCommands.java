@@ -322,9 +322,14 @@ public final class ClientCommands {
             if (hasKeys != hasTicks) {
                 throw new IllegalArgumentException("respawn keys and ticks must be provided together");
             }
-            client.respawn(respawnTimeout(payload));
             if (hasKeys) {
-                client.pressInputs(inputKeys(payload), inputTicks(payload));
+                client.respawnWithInputs(
+                    inputKeys(payload),
+                    inputTicks(payload),
+                    respawnTimeout(payload)
+                );
+            } else {
+                client.respawn(respawnTimeout(payload));
             }
             JsonObject response = new JsonObject();
             response.addProperty("status", "respawned");

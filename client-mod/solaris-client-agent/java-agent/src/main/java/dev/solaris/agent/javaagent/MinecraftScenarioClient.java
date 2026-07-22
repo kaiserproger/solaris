@@ -1923,33 +1923,103 @@ public final class MinecraftScenarioClient implements ScenarioClient {
 
     @Override
     public boolean performRespawn(Duration duration) throws Exception {
-        executor.callOnClientThread(() -> {
+        long observedHealthVersion = executor.callOnClientThread(() -> {
             Minecraft minecraft = requireInPlay();
+            if (minecraft.player.getHealth() > 0.0F && !(minecraft.screen instanceof DeathScreen)) {
+                throw new IllegalStateException("client player is not dead");
+            }
+            long healthVersion = ClientStateEvents.healthVersion();
             minecraft.getConnection().send(new ServerboundClientCommandPacket(
                 ServerboundClientCommandPacket.Action.PERFORM_RESPAWN
             ));
-            return null;
+            return healthVersion;
         });
 
         long deadlineNanos = System.nanoTime() + duration.toNanos();
-        boolean finalSample = false;
-        do {
-            long observedVersion = ClientStateEvents.version();
-            finalSample = executor.callOnClientThread(() -> {
-                Minecraft minecraft = Minecraft.getInstance();
-                return minecraft.player != null
-                    && minecraft.level != null
-                    && minecraft.screen == null
-                    && minecraft.player.getHealth() > 0.0F;
-            });
-            if (finalSample) {
+        return waitForRespawnConfirmation(new RespawnWaitSource() {
+            @Override
+            public long healthVersion() {
+                return ClientStateEvents.healthVersion();
+            }
+
+            @Override
+            public long tickVersion() {
+                return ClientStateEvents.tickVersion();
+            }
+
+            @Override
+            public long stateVersion() {
+                return ClientStateEvents.version();
+            }
+
+            @Override
+            public boolean activePlayer() throws Exception {
+                return executor.callOnClientThread(() -> {
+                    Minecraft minecraft = Minecraft.getInstance();
+                    return minecraft.player != null
+                        && minecraft.level != null
+                        && minecraft.screen == null
+                        && minecraft.player.getHealth() > 0.0F;
+                });
+            }
+
+            @Override
+            public boolean awaitHealthChange(long version, long deadline)
+                throws InterruptedException {
+                long remainingNanos = deadline - System.nanoTime();
+                return remainingNanos > 0L && ClientStateEvents.awaitHealthChange(
+                    version,
+                    Duration.ofNanos(remainingNanos)
+                );
+            }
+
+            @Override
+            public boolean awaitTickOrStateChange(
+                long tickVersion,
+                long stateVersion,
+                long deadline
+            ) throws InterruptedException {
+                long remainingNanos = deadline - System.nanoTime();
+                return remainingNanos > 0L && ClientStateEvents.awaitTickOrStateChange(
+                    tickVersion,
+                    stateVersion,
+                    Duration.ofNanos(remainingNanos)
+                );
+            }
+        }, observedHealthVersion, deadlineNanos);
+    }
+
+    static boolean waitForRespawnConfirmation(
+        RespawnWaitSource source,
+        long observedHealthVersion,
+        long deadlineNanos
+    ) throws Exception {
+        boolean authoritativeHealthApplied = false;
+        while (true) {
+            long observedTickVersion = source.tickVersion();
+            long observedStateVersion = source.stateVersion();
+            long currentHealthVersion = source.healthVersion();
+            if (currentHealthVersion != observedHealthVersion) {
+                authoritativeHealthApplied = true;
+                observedHealthVersion = currentHealthVersion;
+            }
+            if (authoritativeHealthApplied && source.activePlayer()) {
                 return true;
             }
-            if (!awaitClientStateChange(observedVersion, deadlineNanos)) {
-                break;
+            if (System.nanoTime() >= deadlineNanos) {
+                return false;
             }
-        } while (true);
-        return false;
+            boolean changed = authoritativeHealthApplied
+                ? source.awaitTickOrStateChange(
+                    observedTickVersion,
+                    observedStateVersion,
+                    deadlineNanos
+                )
+                : source.awaitHealthChange(observedHealthVersion, deadlineNanos);
+            if (!changed) {
+                return false;
+            }
+        }
     }
 
     private BlockBreakAutomation startBlockBreakAfterReset(
@@ -4349,6 +4419,25 @@ public final class MinecraftScenarioClient implements ScenarioClient {
 
         boolean awaitStateChange(long observedVersion, long deadlineNanos)
             throws InterruptedException;
+    }
+
+    interface RespawnWaitSource {
+        long healthVersion();
+
+        long tickVersion();
+
+        long stateVersion();
+
+        boolean activePlayer() throws Exception;
+
+        boolean awaitHealthChange(long observedVersion, long deadlineNanos)
+            throws InterruptedException;
+
+        boolean awaitTickOrStateChange(
+            long observedTickVersion,
+            long observedStateVersion,
+            long deadlineNanos
+        ) throws InterruptedException;
     }
 
     record EntityStateSnapshot(Object level, EntityMotionSample motion, boolean present) {

@@ -858,14 +858,22 @@ public final class MinecraftClientFacade implements ClientFacade {
         long deadlineNanos = System.nanoTime() + MAX_TICK_WAIT_NANOS;
         while (true) {
             long observedVersion = ClientStateEvents.tickVersion();
-            int currentTick = executor.callOnClientThread(() -> requireInPlay().player.tickCount);
+            long observedStateVersion = ClientStateEvents.version();
+            int currentTick = executor.callOnClientThread(() -> {
+                Minecraft minecraft = requireInPlay();
+                if (minecraft.player.getHealth() <= 0.0F) {
+                    throw new IllegalStateException("input interrupted because the player died");
+                }
+                return minecraft.player.tickCount;
+            });
             if (Integer.toUnsignedLong(currentTick - startTick) >= ticks) {
                 return;
             }
             long remainingNanos = deadlineNanos - System.nanoTime();
             if (remainingNanos <= 0L
-                || !ClientStateEvents.awaitTickChange(
+                || !ClientStateEvents.awaitTickOrStateChange(
                     observedVersion,
+                    observedStateVersion,
                     java.time.Duration.ofNanos(remainingNanos)
                 )) {
                 throw new IllegalStateException(
@@ -923,6 +931,30 @@ public final class MinecraftClientFacade implements ClientFacade {
     @Override
     public void respawn(Duration timeout) throws Exception {
         respawn(new MinecraftScenarioClient(new MinecraftClientExecutor()), timeout);
+    }
+
+    @Override
+    public void respawnWithInputs(List<String> inputs, int ticks, Duration timeout) throws Exception {
+        MinecraftClientExecutor executor = new MinecraftClientExecutor();
+        executor.callOnClientThread(() -> {
+            Minecraft minecraft = requireInPlay();
+            for (String input : inputs) {
+                setInput(minecraft, input, true);
+            }
+            return null;
+        });
+        try {
+            respawn(new MinecraftScenarioClient(executor), timeout);
+            waitTicks(ticks);
+        } finally {
+            executor.callOnClientThread(() -> {
+                Minecraft minecraft = Minecraft.getInstance();
+                for (String input : inputs) {
+                    setInput(minecraft, input, false);
+                }
+                return null;
+            });
+        }
     }
 
     static void respawn(ScenarioClient client, Duration timeout) throws Exception {

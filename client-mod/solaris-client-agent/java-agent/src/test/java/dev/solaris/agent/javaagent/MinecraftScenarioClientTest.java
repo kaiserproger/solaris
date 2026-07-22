@@ -107,6 +107,36 @@ final class MinecraftScenarioClientTest {
     }
 
     @Test
+    void respawnRequiresHealthAppliedAfterDispatch() throws Exception {
+        RespawnWaitProbe probe = new RespawnWaitProbe();
+        probe.healthVersion = 4;
+        probe.activePlayer = true;
+
+        assertFalse(MinecraftScenarioClient.waitForRespawnConfirmation(
+            probe,
+            4,
+            Long.MAX_VALUE
+        ));
+        assertEquals(1, probe.healthWaits);
+        assertEquals(0, probe.stateWaits);
+    }
+
+    @Test
+    void respawnWaitsForLiveStateAfterAuthoritativeHealth() throws Exception {
+        RespawnWaitProbe probe = new RespawnWaitProbe();
+        probe.healthChangeOnWait = true;
+        probe.activateOnStateWait = true;
+
+        assertTrue(MinecraftScenarioClient.waitForRespawnConfirmation(
+            probe,
+            0,
+            Long.MAX_VALUE
+        ));
+        assertEquals(1, probe.healthWaits);
+        assertEquals(1, probe.stateWaits);
+    }
+
+    @Test
     void blockPickupAcceptsAnInventoryEventAppliedBeforeItsFirstSample() throws Exception {
         InventoryPickupProbe probe = new InventoryPickupProbe(
             new MinecraftScenarioClient.InventoryPickupSample(8, false)
@@ -502,6 +532,63 @@ final class MinecraftScenarioClientTest {
         private void publishChange() {
             version += 1;
             changed.countDown();
+        }
+    }
+
+    private static final class RespawnWaitProbe implements MinecraftScenarioClient.RespawnWaitSource {
+        private long healthVersion;
+        private long tickVersion;
+        private long stateVersion;
+        private boolean activePlayer;
+        private boolean healthChangeOnWait;
+        private boolean activateOnStateWait;
+        private int healthWaits;
+        private int stateWaits;
+
+        @Override
+        public long healthVersion() {
+            return healthVersion;
+        }
+
+        @Override
+        public long tickVersion() {
+            return tickVersion;
+        }
+
+        @Override
+        public long stateVersion() {
+            return stateVersion;
+        }
+
+        @Override
+        public boolean activePlayer() {
+            return activePlayer;
+        }
+
+        @Override
+        public boolean awaitHealthChange(long observedVersion, long deadlineNanos) {
+            healthWaits += 1;
+            if (!healthChangeOnWait) {
+                return false;
+            }
+            healthVersion = observedVersion + 1;
+            return true;
+        }
+
+        @Override
+        public boolean awaitTickOrStateChange(
+            long observedTickVersion,
+            long observedStateVersion,
+            long deadlineNanos
+        ) {
+            stateWaits += 1;
+            if (!activateOnStateWait) {
+                return false;
+            }
+            tickVersion = observedTickVersion + 1;
+            stateVersion = observedStateVersion + 1;
+            activePlayer = true;
+            return true;
         }
     }
 }

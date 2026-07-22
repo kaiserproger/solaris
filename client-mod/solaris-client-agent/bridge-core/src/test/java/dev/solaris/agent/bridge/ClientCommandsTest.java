@@ -100,6 +100,7 @@ final class ClientCommandsTest {
             "respawn",
             "{\"keys\":[\"forward\",\"sprint\"],\"ticks\":20}"
         ));
+        assertTrue(client.respawnWithInputsCalled);
         assertEquals(List.of("forward", "sprint"), client.pressedInputs);
         assertEquals(20, client.pressTicks);
 
@@ -1164,6 +1165,7 @@ final class ClientCommandsTest {
         String useItemFace;
         String useItemHand;
         Duration respawnTimeout;
+        boolean respawnWithInputsCalled;
         List<Integer> breakTarget;
         String breakFace;
         String breakDropItemId;
@@ -1365,6 +1367,14 @@ final class ClientCommandsTest {
         }
 
         public void respawn(Duration timeout) {
+            respawnTimeout = timeout;
+        }
+
+        @Override
+        public void respawnWithInputs(List<String> inputs, int ticks, Duration timeout) {
+            respawnWithInputsCalled = true;
+            pressedInputs = List.copyOf(inputs);
+            pressTicks = ticks;
             respawnTimeout = timeout;
         }
 

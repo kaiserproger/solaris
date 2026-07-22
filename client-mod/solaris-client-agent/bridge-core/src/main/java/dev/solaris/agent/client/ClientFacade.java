@@ -122,6 +122,15 @@ public interface ClientFacade {
 
     void respawn(Duration timeout) throws Exception;
 
+    default void respawnWithInputs(
+        List<String> inputs,
+        int ticks,
+        Duration timeout
+    ) throws Exception {
+        respawn(timeout);
+        pressInputs(inputs, ticks);
+    }
+
     JsonObject quickMoveContainerSlot(int slot, Duration timeout) throws Exception;
 
     JsonObject clickContainerSlot(int slot, String button, Duration timeout) throws Exception;

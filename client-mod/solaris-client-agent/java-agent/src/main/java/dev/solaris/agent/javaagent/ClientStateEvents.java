@@ -11,12 +11,15 @@ public final class ClientStateEvents {
     private static final ReentrantLock LOCK = new ReentrantLock();
     private static final Condition STATE_CHANGED = LOCK.newCondition();
     private static final Condition TICK_CHANGED = LOCK.newCondition();
+    private static final Condition TICK_OR_STATE_CHANGED = LOCK.newCondition();
+    private static final Condition HEALTH_CHANGED = LOCK.newCondition();
     private static final Condition SERVER_TIME_CHANGED = LOCK.newCondition();
     private static final Condition BLOCK_CHANGE_ACKED = LOCK.newCondition();
     private static final Condition CONTAINER_PACKET_APPLIED = LOCK.newCondition();
     private static final Map<ScenarioItemDropIdentity, Integer> ITEM_TAKEN_BY = new LinkedHashMap<>();
     private static long stateVersion;
     private static long tickVersion;
+    private static long healthVersion;
     private static long serverTimeVersion;
     private static long blockChangeAckVersion;
     private static long containerPacketVersion;
@@ -38,6 +41,15 @@ public final class ClientStateEvents {
         LOCK.lock();
         try {
             return tickVersion;
+        } finally {
+            LOCK.unlock();
+        }
+    }
+
+    public static long healthVersion() {
+        LOCK.lock();
+        try {
+            return healthVersion;
         } finally {
             LOCK.unlock();
         }
@@ -84,6 +96,7 @@ public final class ClientStateEvents {
         try {
             stateVersion += 1;
             STATE_CHANGED.signalAll();
+            TICK_OR_STATE_CHANGED.signalAll();
         } finally {
             LOCK.unlock();
         }
@@ -94,6 +107,17 @@ public final class ClientStateEvents {
         try {
             tickVersion += 1;
             TICK_CHANGED.signalAll();
+            TICK_OR_STATE_CHANGED.signalAll();
+        } finally {
+            LOCK.unlock();
+        }
+    }
+
+    public static void publishHealth() {
+        LOCK.lock();
+        try {
+            healthVersion += 1;
+            HEALTH_CHANGED.signalAll();
         } finally {
             LOCK.unlock();
         }
@@ -139,6 +163,7 @@ public final class ClientStateEvents {
             }
             stateVersion += 1;
             STATE_CHANGED.signalAll();
+            TICK_OR_STATE_CHANGED.signalAll();
         } finally {
             LOCK.unlock();
         }
@@ -190,6 +215,39 @@ public final class ClientStateEvents {
                 remainingNanos = TICK_CHANGED.awaitNanos(remainingNanos);
             }
             return tickVersion != observedVersion;
+        } finally {
+            LOCK.unlock();
+        }
+    }
+
+    public static boolean awaitTickOrStateChange(
+        long observedTickVersion,
+        long observedStateVersion,
+        Duration timeout
+    ) throws InterruptedException {
+        long remainingNanos = timeout.toNanos();
+        LOCK.lockInterruptibly();
+        try {
+            while (tickVersion == observedTickVersion
+                && stateVersion == observedStateVersion
+                && remainingNanos > 0L) {
+                remainingNanos = TICK_OR_STATE_CHANGED.awaitNanos(remainingNanos);
+            }
+            return tickVersion != observedTickVersion || stateVersion != observedStateVersion;
+        } finally {
+            LOCK.unlock();
+        }
+    }
+
+    public static boolean awaitHealthChange(long observedVersion, Duration timeout)
+        throws InterruptedException {
+        long remainingNanos = timeout.toNanos();
+        LOCK.lockInterruptibly();
+        try {
+            while (healthVersion == observedVersion && remainingNanos > 0L) {
+                remainingNanos = HEALTH_CHANGED.awaitNanos(remainingNanos);
+            }
+            return healthVersion != observedVersion;
         } finally {
             LOCK.unlock();
         }

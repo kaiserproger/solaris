@@ -95,6 +95,70 @@ final class ClientStateEventsTest {
     }
 
     @Test
+    void tickOrStateWaiterWakesForEitherEvent() throws Exception {
+        long observedTickVersion = ClientStateEvents.tickVersion();
+        long observedStateVersion = ClientStateEvents.version();
+        long stateWaitTickVersion = observedTickVersion;
+        long stateWaitStateVersion = observedStateVersion;
+        CompletableFuture<Boolean> stateWaiter = CompletableFuture.supplyAsync(() -> {
+            try {
+                return ClientStateEvents.awaitTickOrStateChange(
+                    stateWaitTickVersion,
+                    stateWaitStateVersion,
+                    Duration.ofSeconds(1)
+                );
+            } catch (InterruptedException error) {
+                Thread.currentThread().interrupt();
+                throw new IllegalStateException(error);
+            }
+        });
+        ClientStateEvents.publishState();
+        assertTrue(stateWaiter.get(1, TimeUnit.SECONDS));
+
+        observedTickVersion = ClientStateEvents.tickVersion();
+        observedStateVersion = ClientStateEvents.version();
+        long finalObservedTickVersion = observedTickVersion;
+        long finalObservedStateVersion = observedStateVersion;
+        CompletableFuture<Boolean> tickWaiter = CompletableFuture.supplyAsync(() -> {
+            try {
+                return ClientStateEvents.awaitTickOrStateChange(
+                    finalObservedTickVersion,
+                    finalObservedStateVersion,
+                    Duration.ofSeconds(1)
+                );
+            } catch (InterruptedException error) {
+                Thread.currentThread().interrupt();
+                throw new IllegalStateException(error);
+            }
+        });
+        ClientStateEvents.publishTick();
+        assertTrue(tickWaiter.get(1, TimeUnit.SECONDS));
+    }
+
+    @Test
+    void healthWaiterWakesOnlyForAppliedHealthPacket() throws Exception {
+        long observedHealthVersion = ClientStateEvents.healthVersion();
+
+        ClientStateEvents.publishTick();
+        ClientStateEvents.publishState();
+        assertFalse(ClientStateEvents.awaitHealthChange(observedHealthVersion, Duration.ZERO));
+
+        CompletableFuture<Boolean> healthWaiter = CompletableFuture.supplyAsync(() -> {
+            try {
+                return ClientStateEvents.awaitHealthChange(
+                    observedHealthVersion,
+                    Duration.ofSeconds(1)
+                );
+            } catch (InterruptedException error) {
+                Thread.currentThread().interrupt();
+                throw new IllegalStateException(error);
+            }
+        });
+        ClientStateEvents.publishHealth();
+        assertTrue(healthWaiter.get(1, TimeUnit.SECONDS));
+    }
+
+    @Test
     void serverTimePacketWakesOnlyTheServerTimeWaiter() throws Exception {
         long observedVersion = ClientStateEvents.serverTimeVersion();
         CompletableFuture<Boolean> waiter = CompletableFuture.supplyAsync(() -> {

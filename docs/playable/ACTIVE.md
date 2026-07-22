@@ -20,6 +20,13 @@ join -> move -> gather -> craft -> build -> fight/farm -> save/rejoin
 This is Playable Spike Mode. Do not turn focused playable evidence into M100
 replacement-readiness claims.
 
+The embedded client now confirms respawn only after an authoritative health
+packet has been applied. The original persisted dead-player save reproduced
+`health=0`; the corrected 26.1.2 client respawned with immediate movement held,
+closed the death/loading screen, restored its inventory, and observed positive
+health. A separate MCP boundary bug remains queued: `wait_for_health_below`
+currently rejects exact zero when the requested threshold is `0.001`.
+
 ## Current Queue
 
 This queue is binding across context compaction: common vanilla gameplay first,

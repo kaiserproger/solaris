@@ -110,11 +110,17 @@ verification and keep ordinary survival play ahead of rare edge cases.
   26.1.2 client gate, one stone occupied offhand inventory slot `40` while the
   selected main hand was empty; `hand=off_hand` returned vanilla `Success`,
   placed the stone, consumed it from `1` to `0`, and kept the client in play.
-- [ ] `minecraft_respawn` must not report success while the real client remains
-  dead. A pickup-gate rerun against a persisted dead player returned from
-  respawn with `health=0`; subsequent server `/give` feedback reached chat but
-  the item never appeared in inventory. Reproduce this exact saved-player path
-  after integrating the existing respawn/input worktree changes.
+- [x] `minecraft_respawn` waits for an applied authoritative health packet and
+  a live client state instead of accepting the transient healthy player created
+  by `ClientboundRespawn`. Against the original persisted dead player, the real
+  26.1.2 client started at `health=0`, respawned while holding immediate forward
+  input, closed the death/loading screen, restored its inventory, and reported
+  positive health only after the server health update.
+- [ ] `minecraft_wait_for_health_below` must accept exact zero for a positive
+  threshold. The real-client respawn gate observed `health=0`, but a request for
+  `health < 0.001` timed out because the comparison subtracts its epsilon from
+  the requested threshold. Keep the event-driven wait and fix only the boundary
+  predicate.
 
 ## World Generation
 
