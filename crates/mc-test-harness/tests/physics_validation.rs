@@ -21,7 +21,7 @@ use mc_protocol::packets::play::{
     pack_block_pos, pack_section_relative_pos, unpack_block_pos,
 };
 use mc_test_harness::client::Client;
-use mc_world::{BlockPos, BlockRegistry, BlockStateId, WorldStorage};
+use mc_world::{BlockPos, BlockRegistry, BlockStateId, MAX_Y, WorldStorage};
 
 const VIEW_DISTANCE: i32 = 2;
 
@@ -348,6 +348,25 @@ async fn landing_fall_damage_uses_accumulated_descent() {
     drain_until_chunk(&mut client, (0, 0)).await;
     client
         .write_packet(&ServerboundChangeGameMode {
+            mode: GameMode::Creative,
+        })
+        .await
+        .expect("switch to creative for fixture positioning");
+    clientbound_frames_until_fence(&mut client, "creative fixture positioning").await;
+    client
+        .write_packet(&ServerboundMovePlayerPosRot {
+            x: 6.5,
+            y: 64.0,
+            z: 0.5,
+            yaw: 90.0,
+            pitch: 0.0,
+            flags: MovePlayerFlags::new(true, false),
+        })
+        .await
+        .expect("establish fixture landing origin");
+    clientbound_frames_until_fence(&mut client, "fall origin").await;
+    client
+        .write_packet(&ServerboundChangeGameMode {
             mode: GameMode::Survival,
         })
         .await
@@ -495,10 +514,11 @@ async fn survival_sugar_cane_support_break_drops_cascaded_cane() {
     drain_until_chunk(&mut client, (0, 0)).await;
     client
         .write_packet(&ServerboundChangeGameMode {
-            mode: GameMode::Survival,
+            mode: GameMode::Creative,
         })
         .await
-        .expect("switch to survival");
+        .expect("switch to creative for cane fixture positioning");
+    clientbound_frames_until_fence(&mut client, "creative cane fixture positioning").await;
     client
         .write_packet(&ServerboundMovePlayerPosRot {
             x: 8.5,
@@ -510,6 +530,14 @@ async fn survival_sugar_cane_support_break_drops_cascaded_cane() {
         })
         .await
         .expect("move within support break reach");
+    clientbound_frames_until_fence(&mut client, "cane fixture position").await;
+    client
+        .write_packet(&ServerboundChangeGameMode {
+            mode: GameMode::Survival,
+        })
+        .await
+        .expect("switch to survival");
+    clientbound_frames_until_fence(&mut client, "survival cane mode").await;
 
     client
         .write_packet(&ServerboundPlayerAction {
@@ -1042,7 +1070,7 @@ fn physics_fixture_world(blocks: Arc<BlockRegistry>) -> (WorldStorage, FixtureSt
     for x in -8..=12 {
         for z in -4..=12 {
             set(&mut world, x, 63, z, states.stone);
-            for y in 64..=70 {
+            for y in 64..MAX_Y {
                 set(&mut world, x, y, z, states.air);
             }
         }
@@ -1326,7 +1354,10 @@ fn assert_position_near(
 }
 
 async fn wait_for_health_near(client: &mut Client, health: f32, tolerance: f32) {
-    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
+    let mut baseline_game_time = None;
+    let mut observed_health = Vec::new();
+    let mut corrections = Vec::new();
     loop {
         let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
         assert!(
@@ -1343,9 +1374,23 @@ async fn wait_for_health_near(client: &mut Client, health: f32, tolerance: f32) 
         if frame.id == ClientboundSetHealth::ID {
             let mut body = frame.body;
             let pkt = ClientboundSetHealth::decode(&mut body).expect("decode set health");
+            observed_health.push(pkt.health);
             if (pkt.health - health).abs() <= tolerance {
                 return;
             }
+        } else if frame.id == SynchronizePlayerPosition::ID {
+            let mut body = frame.body;
+            let pkt = SynchronizePlayerPosition::decode(&mut body)
+                .expect("decode health wait position correction");
+            corrections.push((pkt.x, pkt.y, pkt.z));
+        } else if frame.id == ClientboundSetTime::ID {
+            let mut body = frame.body;
+            let pkt = ClientboundSetTime::decode(&mut body).expect("decode health wait time");
+            let baseline = *baseline_game_time.get_or_insert(pkt.game_time);
+            assert!(
+                pkt.game_time.saturating_sub(baseline) <= 40,
+                "health did not reach {health} within 40 simulation ticks; observed={observed_health:?}, corrections={corrections:?}"
+            );
         }
     }
 }
@@ -1496,12 +1541,13 @@ async fn wait_for_block_action_observation(
     targets: &[(i32, i32, i32)],
     completion: BlockActionCompletion,
 ) -> BlockActionObservation {
-    let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(60);
     let primary_target = targets[0];
     let mut updates = Vec::new();
     let mut add_entities = Vec::new();
     let mut slot_updates = Vec::new();
     let mut saw_ack = false;
+    let mut baseline_game_time = None;
     loop {
         let now = tokio::time::Instant::now();
         if now >= deadline {
@@ -1547,6 +1593,14 @@ async fn wait_for_block_action_observation(
             let mut body = frame.body;
             let pkt = ClientboundContainerSetSlot::decode(&mut body).expect("decode SetSlot");
             slot_updates.push((pkt.item_stack.item_id, pkt.item_stack.count));
+        } else if frame.id == ClientboundSetTime::ID {
+            let mut body = frame.body;
+            let pkt = ClientboundSetTime::decode(&mut body).expect("decode block action time");
+            let baseline = *baseline_game_time.get_or_insert(pkt.game_time);
+            assert!(
+                pkt.game_time.saturating_sub(baseline) <= 200,
+                "block action did not complete within 200 simulation ticks"
+            );
         }
 
         let saw_all_targets = targets
