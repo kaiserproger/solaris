@@ -92,6 +92,140 @@ fn seed_zero_playable_ruin_is_deterministic_and_contains_fixed_loot() {
 }
 
 #[tokio::test]
+async fn fresh_seed_server_spawn_is_dry_with_clear_body_space() {
+    let report = mc_data::blocks::solaris_required_blocks_report();
+    let blocks = Arc::new(mc_world::BlockRegistry::from_report(&report).expect("block registry"));
+    let items = Arc::new(mc_data::items::solaris_required_items());
+    let block_facts = Arc::new(mc_data::block_facts::BlockFactsTable::from_blocks_report(
+        &report,
+    ));
+    let collision_shapes = mc_data::collision_shapes::vanilla_collision_shapes();
+
+    for (index, seed) in [i64::MIN, -1_000_003, 31, 999_983, i64::MAX]
+        .into_iter()
+        .enumerate()
+    {
+        let generator = Arc::new(mc_worldgen::TerrainGenerator::new(
+            seed,
+            Arc::clone(&blocks),
+        ));
+        let storage = mc_world::WorldStorage::in_memory_with_capacity(Arc::clone(&blocks), 25)
+            .with_item_registry(Arc::clone(&items))
+            .with_generator(generator as Arc<dyn ChunkGenerator>);
+        let world = Arc::new(tokio::sync::Mutex::new(storage));
+        let shutdown = mc_net::ShutdownHandle::default();
+        let config = mc_net::ServerConfig {
+            bind_address: "127.0.0.1:0".parse().expect("loopback address"),
+            motd: format!("fresh seed spawn {seed}"),
+            max_players: 1,
+            view_distance: 0,
+            data: Arc::new(mc_data::solaris_required_data()),
+            blocks: Arc::clone(&blocks),
+            world: Some(Arc::clone(&world)),
+            tags: Arc::new(mc_data::tags::solaris_required_item_tags(&items)),
+            recipes: Arc::new(mc_data::recipes::solaris_required_recipes()),
+            loot: Arc::new(mc_data::loot::builtin().clone()),
+            block_light: None,
+            items: Arc::clone(&items),
+            item_facts: Arc::new(mc_data::item_components::solaris_required_item_facts()),
+            block_facts: Arc::clone(&block_facts),
+            entity_types: Arc::new(mc_data::entity_types::solaris_required_entity_types()),
+            biome_spawns: Arc::new(mc_data::biomes::solaris_required_biome_spawn_rules()),
+            chunk_pipeline: mc_net::ChunkPipelinePolicy::default(),
+            random_tick: mc_net::RandomTickPolicy::default(),
+            command_permissions: mc_net::CommandPermissionConfig::new(Vec::<String>::new(), true),
+            shutdown: shutdown.clone(),
+        };
+        let bound = mc_net::bind(config).await.expect("bind fresh seed server");
+        let addr = bound.local_addr().expect("fresh seed server address");
+        let serve = tokio::spawn(async move { bound.serve().await });
+        let (client, sync) = connect_worldgen_client(addr, &format!("SeedSpawn{index}")).await;
+
+        let x = sync.x.floor() as i32;
+        let y = sync.y.floor() as i32;
+        let z = sync.z.floor() as i32;
+        let storage = world.lock().await;
+        let support = storage
+            .get_cached_block(mc_world::BlockPos { x, y: y - 2, z })
+            .unwrap_or_else(|| panic!("seed {seed} spawn support is missing"));
+        let support_state = blocks
+            .by_id(support)
+            .unwrap_or_else(|| panic!("seed {seed} spawn support state is unknown"));
+        let support_shape = collision_shapes
+            .get_for_state(
+                support.0,
+                &support_state.block.id,
+                &support_state.properties,
+            )
+            .unwrap_or_else(|| panic!("seed {seed} spawn support shape is missing"));
+        assert!(
+            block_facts.fluid(support.0).is_none(),
+            "seed {seed} selected fluid support at ({x},{},{z})",
+            y - 2
+        );
+        assert!(
+            !support_shape.is_empty(),
+            "seed {seed} selected passable support {} at ({x},{},{z})",
+            support_state.block.id,
+            y - 2
+        );
+        assert!(
+            !is_spawn_hazard(support_state.block.id.path()),
+            "seed {seed} selected hazardous support {} at ({x},{},{z})",
+            support_state.block.id,
+            y - 2
+        );
+        for body_y in (y - 1)..=y + 1 {
+            let state = storage
+                .get_cached_block(mc_world::BlockPos { x, y: body_y, z })
+                .unwrap_or_else(|| panic!("seed {seed} spawn body cell is missing"));
+            let block_state = blocks
+                .by_id(state)
+                .unwrap_or_else(|| panic!("seed {seed} spawn body state is unknown"));
+            let shape = collision_shapes
+                .get_for_state(state.0, &block_state.block.id, &block_state.properties)
+                .unwrap_or_else(|| panic!("seed {seed} spawn body shape is missing"));
+            assert!(
+                block_facts.fluid(state.0).is_none(),
+                "seed {seed} spawned in fluid at ({x},{body_y},{z})"
+            );
+            assert!(
+                shape.is_empty(),
+                "seed {seed} spawned inside collidable {} at ({x},{body_y},{z})",
+                block_state.block.id
+            );
+            assert!(
+                !is_spawn_hazard(block_state.block.id.path()),
+                "seed {seed} spawned inside hazardous {} at ({x},{body_y},{z})",
+                block_state.block.id
+            );
+        }
+        drop(storage);
+        drop(client);
+        shutdown.request();
+        tokio::time::timeout(Duration::from_secs(5), serve)
+            .await
+            .expect("fresh seed server shutdown")
+            .expect("fresh seed server joins")
+            .expect("fresh seed server exits cleanly");
+    }
+}
+
+fn is_spawn_hazard(path: &str) -> bool {
+    matches!(
+        path,
+        "cactus"
+            | "campfire"
+            | "fire"
+            | "magma_block"
+            | "powder_snow"
+            | "soul_campfire"
+            | "soul_fire"
+            | "sweet_berry_bush"
+    )
+}
+
+#[tokio::test]
 async fn generated_playable_ruin_chest_loot_moves_to_inventory_and_survives_restart() {
     let report = mc_data::blocks::solaris_required_blocks_report();
     let blocks = Arc::new(mc_world::BlockRegistry::from_report(&report).expect("block registry"));
@@ -261,6 +395,13 @@ fn ruin_server_config(
 }
 
 async fn connect_ruin_client(addr: std::net::SocketAddr, name: &str) -> Client {
+    connect_worldgen_client(addr, name).await.0
+}
+
+async fn connect_worldgen_client(
+    addr: std::net::SocketAddr,
+    name: &str,
+) -> (Client, SynchronizePlayerPosition) {
     let mut client = Client::connect(addr).await.expect("connect ruin client");
     let _ = client
         .drive_login(addr, name)
@@ -292,7 +433,7 @@ async fn connect_ruin_client(addr: std::net::SocketAddr, name: &str) -> Client {
         })
         .await
         .expect("report grounded spawn");
-    client
+    (client, sync)
 }
 
 async fn move_to_ruin_and_wait_for_resident_chunk(

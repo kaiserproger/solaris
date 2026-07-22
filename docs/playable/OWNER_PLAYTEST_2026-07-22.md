@@ -41,9 +41,12 @@ verification and keep ordinary survival play ahead of rare edge cases.
 
 ## World Generation
 
-- [ ] Replace the current broken terrain pass: no floating trees, giant terrain
-  holes, excessive pumpkins, or random-seed water spawns. Stable tree placement
-  and rare-pumpkin density are now covered; cave/terrain and spawn checks remain.
+- [x] Replace the current broken terrain pass: no floating trees, giant terrain
+  holes, excessive pumpkins, or random-seed water spawns. Stable tree placement,
+  rare-pumpkin density, a 32-block solid surface shell, and sparse caves without
+  shafts or chambers are covered across a widened seed/coordinate grid. A real
+  TCP login against five fresh extreme/dispersed seeds also verifies dry support
+  and clear dry body cells at the server-selected spawn.
 - [x] Trees need species-specific vanilla-like silhouettes instead of rectangular
   leaf prisms. Oak-like trees need an irregular crown above the main canopy and
   must never leave unsupported floating foliage/trunks after generation. Oak,
@@ -121,3 +124,10 @@ The 2026-07-22 tree/decorations checkpoint passed the full workspace test suite,
 workspace clippy with warnings denied, the external worldgen harness,
 formatting, and `xtask code-health`; independent review reported no findings. A
 fresh-world client visual pass remains part of the broader terrain checkpoint.
+
+The 2026-07-22 surface/spawn checkpoint passed all `mc-worldgen` tests and the
+external worldgen server harness. The harness starts a fresh generated server,
+logs in over TCP, and verifies the actual selected spawn across extreme and
+dispersed seeds. Independent review requested explicit collision/hazard checks
+for spawn cells and an exact cave-cutoff definition; both are covered in the
+final regressions, followed by full repository gates.

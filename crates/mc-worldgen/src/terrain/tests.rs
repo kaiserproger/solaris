@@ -1944,7 +1944,7 @@ fn structures_precede_tree_and_single_plant_decoration() {
 #[test]
 fn generated_columns_keep_a_solid_surface_shell_across_seeds() {
     let registry = tiny_registry();
-    for seed in -4..4 {
+    for seed in [i64::MIN, -1_000_003, -4, -1, 0, 1, 3, 999_983, i64::MAX] {
         let generator = TerrainGenerator::new(seed, Arc::clone(&registry));
         for pos in [
             ChunkPos { x: -2, z: -2 },
@@ -1958,8 +1958,11 @@ fn generated_columns_keep_a_solid_surface_shell_across_seeds() {
                     let wx = pos.x * 16 + i32::from(lx);
                     let wz = pos.z * 16 + i32::from(lz);
                     let surface = generator.surface_height(wx, wz);
-                    let shell_bottom =
-                        (surface - CAVE_SURFACE_CLEARANCE + 1).max(generator.geometry.min_y() + 1);
+                    // The cave cutoff itself may be carved. The 32 cells above it
+                    // are the protected shell, including the surface block.
+                    let cave_cutoff = surface - CAVE_SURFACE_CLEARANCE;
+                    let shell_bottom = (cave_cutoff + 1).max(generator.geometry.min_y() + 1);
+                    assert_eq!(surface - shell_bottom + 1, CAVE_SURFACE_CLEARANCE);
                     for y in shell_bottom..=surface {
                         assert_ne!(
                             chunk.get_block(lx, y, lz),
