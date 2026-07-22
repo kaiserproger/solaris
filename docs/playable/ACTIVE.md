@@ -74,6 +74,15 @@ hardening. An already-open lower-priority diff does not override this order.
 
 ## Recent Evidence
 
+- Embedded MCP launches now prefer the current run's environment token and
+  port over stale JVM properties and check for an existing listener before
+  starting another client. The earlier 401 was not reproduced under a fixed
+  token, so this removes two launch ambiguities rather than claiming a proven
+  server-side auth race. A patched real 26.1.2 client completed 200 fresh MCP
+  sessions, 180 observations, and 20 one-tick forward inputs with zero failures
+  or 401s, moved from z=0.598 to z=9.956, and remained in play at full health.
+  The current-build 20-minute autonomous survival session remains pending.
+
 - Worldgen revision 5 replaces the mixed terrain-height formula with bounded
   layers: continents, erosion/uplands, land-only ridges and low-relief rivers.
   Tests cover a dry walkable 193x193 spawn window across a seed grid, full

@@ -37,6 +37,16 @@ SOLARIS_CLIENT_MCP_PORT="${SOLARIS_CLIENT_MCP_PORT:-39095}"
 SOLARIS_CLIENT_MCP_GAME_DIR="${SOLARIS_CLIENT_MCP_GAME_DIR:-$AGENT_ROOT/fabric-agent/run-mcp}"
 SOLARIS_CLIENT_MCP_USERNAME="${SOLARIS_CLIENT_MCP_USERNAME:-SolarisMcp}"
 
+if [[ ! "$SOLARIS_CLIENT_MCP_PORT" =~ ^[0-9]{1,5}$ ]]; then
+    printf 'Invalid SOLARIS_CLIENT_MCP_PORT: use an integer from 1 to 65535.\n' >&2
+    exit 2
+fi
+SOLARIS_CLIENT_MCP_PORT=$((10#$SOLARIS_CLIENT_MCP_PORT))
+if (( SOLARIS_CLIENT_MCP_PORT < 1 || SOLARIS_CLIENT_MCP_PORT > 65535 )); then
+    printf 'Invalid SOLARIS_CLIENT_MCP_PORT: use an integer from 1 to 65535.\n' >&2
+    exit 2
+fi
+
 if [[ ! "$SOLARIS_CLIENT_MCP_USERNAME" =~ ^[A-Za-z0-9_]{1,16}$ ]]; then
     printf 'Invalid SOLARIS_CLIENT_MCP_USERNAME: use 1..16 ASCII letters, digits, or underscores.\n' >&2
     exit 2
@@ -80,6 +90,12 @@ if [[ "$MODE" == "check" ]]; then
         --tests dev.solaris.agent.mcp.McpHttpServerTest
     printf 'Minecraft MCP check passed; client was not launched.\n'
     exit 0
+fi
+
+if (exec 3<>"/dev/tcp/127.0.0.1/$SOLARIS_CLIENT_MCP_PORT") 2>/dev/null; then
+    printf 'MCP port %s is already in use; stop the existing client or choose another port.\n' \
+        "$SOLARIS_CLIENT_MCP_PORT" >&2
+    exit 1
 fi
 
 exec "$AGENT_ROOT/gradlew" \

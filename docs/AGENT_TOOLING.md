@@ -34,6 +34,13 @@ export SOLARIS_CLIENT_MCP_USERNAME=SolarisMcpA
 bash tools/run-minecraft-client-mcp.sh
 ```
 
+Normal launch requires a free MCP port and checks for an existing listener
+before Gradle starts; the in-client bind remains the final authority. Explicit
+`SOLARIS_CLIENT_MCP_TOKEN` and `SOLARIS_CLIENT_MCP_PORT` values override stale
+JVM properties from an earlier run. An HTTP 401 means the caller reached an
+endpoint with a different bearer token; verify the port and process instead of
+retrying it as a transient transport failure.
+
 Use a second port, token, game directory, and username for multiplayer gates.
 The endpoint is `http://127.0.0.1:<port>/mcp`. Inventory, entity, login, and
 client lifecycle waits block on packet/lifecycle state notifications. A

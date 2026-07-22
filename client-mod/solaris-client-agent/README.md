@@ -20,7 +20,13 @@ The launcher calls the fixed Gradle task
 
 - `SOLARIS_CLIENT_MCP_GAME_DIR`: isolated Minecraft game directory.
 - `SOLARIS_CLIENT_MCP_USERNAME`: 1..16 ASCII letters, digits, or underscores.
-- `SOLARIS_CLIENT_MCP_PORT`: IPv4 loopback port, default `39095`.
+- `SOLARIS_CLIENT_MCP_PORT`: free IPv4 loopback port, default `39095`.
+
+Normal launch checks for an occupied MCP port before starting Gradle; the
+in-client bind remains authoritative if another process races for the port.
+Environment token and port values describe the current run and take precedence
+over stale JVM properties. Treat HTTP 401 as a wrong endpoint/token pair, not
+as a retryable MCP failure.
 
 Validate Java, configuration, MCP transport tests, and the Gradle adapter
 without launching Minecraft:

@@ -19,16 +19,16 @@ record ClientMcpConfig(boolean enabled, String token, int port) {
         Map<String, String> args = parseAgentArgs(agentArgs);
         String token = firstNonBlank(
             args.get("mcpToken"),
-            properties.getProperty("solaris.clientMcp.token"),
-            environment.get("SOLARIS_CLIENT_MCP_TOKEN")
+            environment.get("SOLARIS_CLIENT_MCP_TOKEN"),
+            properties.getProperty("solaris.clientMcp.token")
         );
         if (token == null) {
             return new ClientMcpConfig(false, "", DEFAULT_PORT);
         }
         String configuredPort = firstNonBlank(
             args.get("mcpPort"),
-            properties.getProperty("solaris.clientMcp.port"),
             environment.get("SOLARIS_CLIENT_MCP_PORT"),
+            properties.getProperty("solaris.clientMcp.port"),
             Integer.toString(DEFAULT_PORT)
         );
         final int port;

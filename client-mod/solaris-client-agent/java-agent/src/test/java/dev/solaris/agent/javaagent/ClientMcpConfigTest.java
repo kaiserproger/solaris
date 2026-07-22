@@ -53,6 +53,25 @@ final class ClientMcpConfigTest {
     }
 
     @Test
+    void explicitRunEnvironmentOverridesStaleJvmProperties() {
+        Properties properties = new Properties();
+        properties.setProperty("solaris.clientMcp.token", "stale-token");
+        properties.setProperty("solaris.clientMcp.port", "39094");
+
+        ClientMcpConfig config = ClientMcpConfig.from(
+            properties,
+            "",
+            Map.of(
+                "SOLARIS_CLIENT_MCP_TOKEN", "current-token",
+                "SOLARIS_CLIENT_MCP_PORT", "39097"
+            )
+        );
+
+        assertEquals("current-token", config.token());
+        assertEquals(39097, config.port());
+    }
+
+    @Test
     void rejectsInvalidPortBeforeBinding() {
         Properties properties = new Properties();
         properties.setProperty("solaris.clientMcp.token", "token");
