@@ -61,8 +61,15 @@ verification and keep ordinary survival play ahead of rare edge cases.
   rejection boundary. An embedded real 26.1.2 client attacked with an empty
   selected slot at full strength, received an authoritative motion update, and
   observed the sheep remain alive at `7/8` health after exactly `1.0` damage.
-- [ ] Hostiles must react without waiting for player movement, cannot hit from
-  behind/out of reach, and stop attacking dead players.
+- [x] Hostiles must react without waiting for player movement, cannot hit while
+  facing away or from out of reach, and stop attacking dead players. Melee now
+  checks the attacker's current head direction during both planning and final
+  commit, alongside the existing current distance, visibility, life, and target
+  state fences. Focused tests cover a stationary target, facing-away rejection,
+  movement out of range, death before planning, and death during commit. An
+  embedded 26.1.2 client issued no movement input: the initial summoned-zombie
+  observation had yaw `0`; the post-damage observation had yaw `-180` and the
+  unchanged-position player had gone `20 -> 17` without player motion.
 - [ ] Skeletons fire arrows and creepers fuse/explode through authoritative paths.
 - [ ] Passive and hostile mobs spawn naturally; animal movement and one-block
   stepping are smooth and vanilla-like, without hopping, circles, or stutter.

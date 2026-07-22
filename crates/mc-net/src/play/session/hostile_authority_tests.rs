@@ -37,6 +37,21 @@ fn due_melee_tick(registry: &SessionRegistry) -> u64 {
     }
 }
 
+fn face_first_hostile_towards_player(registry: &SessionRegistry) {
+    let mut entities = registry.lock_entities("face test hostile toward player");
+    let expected = entities.snapshots().next().expect("test hostile");
+    let mut next = expected.clone();
+    let dx = 0.5 - next.position.x;
+    let dz = 0.5 - next.position.z;
+    let yaw = dz.atan2(dx).to_degrees() as f32 - 90.0;
+    next.rotation = Rotation {
+        yaw,
+        pitch: 0.0,
+        head_yaw: yaw,
+    };
+    assert!(entities.replace_snapshot_if_current(expected, next));
+}
+
 fn install_hostile_target_snapshot_probe(
     registry: &SessionRegistry,
 ) -> (std::sync::mpsc::Receiver<()>, std::sync::mpsc::Sender<()>) {
@@ -63,6 +78,7 @@ fn hostiles_ignore_dead_players() {
         "minecraft:zombie".to_owned(),
         Vec3::new(0.5, 64.0, 1.5),
     );
+    face_first_hostile_towards_player(&registry);
     registry.mark_player_dead_for_test(player);
 
     for tick in 0..HOSTILE_MELEE_PERIOD_TICKS {
@@ -86,7 +102,17 @@ fn stationary_live_player_is_attacked_on_each_due_turn() {
     );
     let due_tick = due_melee_tick(&registry);
 
-    for tick in [due_tick, due_tick + HOSTILE_MELEE_PERIOD_TICKS] {
+    let (attacks, dispatches) =
+        registry.tick_hostile_attacks(&SimulationAuthority::for_test(), due_tick, BlockStateId(0));
+    assert_eq!(attacks, 0, "a hostile facing away cannot deal melee damage");
+    assert!(dispatches.is_empty());
+
+    face_first_hostile_towards_player(&registry);
+
+    for tick in [
+        due_tick + HOSTILE_MELEE_PERIOD_TICKS,
+        due_tick + 2 * HOSTILE_MELEE_PERIOD_TICKS,
+    ] {
         let (attacks, dispatches) =
             registry.tick_hostile_attacks(&SimulationAuthority::for_test(), tick, BlockStateId(0));
         assert_eq!(attacks, 1);
@@ -174,6 +200,7 @@ fn death_between_melee_plan_and_commit_cancels_damage_and_swing() {
         "minecraft:zombie".to_owned(),
         Vec3::new(0.5, 64.0, 1.5),
     );
+    face_first_hostile_towards_player(&registry);
     let due_tick = due_melee_tick(&registry);
     let (reached_rx, resume_tx) = install_hostile_target_snapshot_probe(&registry);
     let attack_registry = Arc::clone(&registry);
@@ -207,6 +234,7 @@ fn movement_out_of_range_between_melee_plan_and_commit_cancels_attack() {
         "minecraft:zombie".to_owned(),
         Vec3::new(0.5, 64.0, 1.5),
     );
+    face_first_hostile_towards_player(&registry);
     let due_tick = due_melee_tick(&registry);
     let (reached_rx, resume_tx) = install_hostile_target_snapshot_probe(&registry);
     let attack_registry = Arc::clone(&registry);
@@ -240,6 +268,7 @@ fn spectator_transition_after_target_snapshot_cancels_melee_attack() {
         "minecraft:zombie".to_owned(),
         Vec3::new(0.5, 64.0, 1.5),
     );
+    face_first_hostile_towards_player(&registry);
     let due_tick = due_melee_tick(&registry);
     let (reached_rx, resume_tx) = install_hostile_target_snapshot_probe(&registry);
     let attack_registry = Arc::clone(&registry);
@@ -277,6 +306,7 @@ fn unregister_after_target_snapshot_cancels_damage_and_swing() {
         "minecraft:zombie".to_owned(),
         Vec3::new(0.5, 64.0, 1.5),
     );
+    face_first_hostile_towards_player(&registry);
     let due_tick = due_melee_tick(&registry);
     let (reached_rx, resume_tx) = install_hostile_target_snapshot_probe(&registry);
     let attack_registry = Arc::clone(&registry);
@@ -300,6 +330,46 @@ fn unregister_after_target_snapshot_cancels_damage_and_swing() {
 }
 
 #[test]
+fn attacker_turn_between_melee_plan_and_commit_cancels_damage_and_swing() {
+    let registry = Arc::new(SessionRegistry::new());
+    let player = register_test_session(&registry, "TurningAttackerTarget");
+    assert!(registry.mark_loaded(player, (0, 0)).is_empty());
+    registry.spawn_command_entity(
+        &SimulationAuthority::for_test(),
+        54,
+        "minecraft:zombie".to_owned(),
+        Vec3::new(0.5, 64.0, 1.5),
+    );
+    face_first_hostile_towards_player(&registry);
+    let due_tick = due_melee_tick(&registry);
+    let (reached_rx, resume_tx) = install_hostile_target_snapshot_probe(&registry);
+    let attack_registry = Arc::clone(&registry);
+    let attack = std::thread::spawn(move || {
+        attack_registry.tick_hostile_attacks(
+            &SimulationAuthority::for_test(),
+            due_tick,
+            BlockStateId(0),
+        )
+    });
+    reached_rx
+        .recv_timeout(Duration::from_secs(5))
+        .expect("melee attack reserves its target before the attacker fence");
+
+    let mut entities = registry.lock_entities("turn hostile away before melee commit");
+    let expected = entities.snapshots().next().expect("test hostile");
+    let mut turned = expected.clone();
+    turned.rotation.yaw = 0.0;
+    turned.rotation.head_yaw = 0.0;
+    assert!(entities.replace_snapshot_if_current(expected, turned));
+    drop(entities);
+    resume_tx.send(()).expect("release hostile commit");
+    let (attacks, dispatches) = attack.join().expect("hostile attack worker");
+
+    assert_eq!(attacks, 0);
+    assert!(dispatches.is_empty());
+}
+
+#[test]
 fn attacker_death_between_melee_plan_and_commit_cancels_damage_and_swing() {
     let registry = Arc::new(SessionRegistry::new());
     let player = register_test_session(&registry, "LiveTarget");
@@ -310,6 +380,7 @@ fn attacker_death_between_melee_plan_and_commit_cancels_damage_and_swing() {
         "minecraft:zombie".to_owned(),
         Vec3::new(0.5, 64.0, 1.5),
     );
+    face_first_hostile_towards_player(&registry);
     let zombie = registry.persisted_entity_records()[0].snapshot.clone();
     let due_tick = due_melee_tick(&registry);
     let (reached_tx, reached_rx) = std::sync::mpsc::channel();
@@ -364,6 +435,7 @@ fn hostile_melee_publication_finishes_while_session_registry_is_held_elsewhere()
         "minecraft:zombie".to_owned(),
         Vec3::new(0.5, 64.0, 1.5),
     );
+    face_first_hostile_towards_player(&registry);
     let due_tick = due_melee_tick(&registry);
     let (reached_tx, reached_rx) = std::sync::mpsc::channel();
     let (resume_tx, resume_rx) = std::sync::mpsc::channel();
@@ -412,6 +484,7 @@ fn ordinary_hostile_melee_tick_never_waits_for_session_registry() {
         "minecraft:zombie".to_owned(),
         Vec3::new(0.5, 64.0, 1.5),
     );
+    face_first_hostile_towards_player(&registry);
     assert_eq!(
         registry.tick_entities_and_collect_physics_queries(1).len(),
         1

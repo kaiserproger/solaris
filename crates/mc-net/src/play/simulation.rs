@@ -11652,7 +11652,7 @@ mod tests {
                 &SimulationAuthority::for_test(),
                 1,
                 "minecraft:zombie".to_owned(),
-                Vec3::new(0.5, 64.0, 1.5),
+                Vec3::new(0.5, 64.0, 0.0),
             ),
             &mut outbound,
         )[0];
@@ -11685,7 +11685,7 @@ mod tests {
                 },
                 ..
             } if (*amount - 3.0).abs() < f32::EPSILON
-                && *origin == Vec3::new(0.5, 64.0, 1.5)
+                && *origin == Vec3::new(0.5, 64.0, 0.0)
         )));
     }
 

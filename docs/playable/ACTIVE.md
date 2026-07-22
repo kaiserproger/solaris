@@ -753,6 +753,16 @@ hardening. An already-open lower-priority diff does not override this order.
   observed health change from `8` to `7`; the sheep remained alive. The client
   stayed connected. This proves the requested common melee path, not broad
   combat balance across every item, enchantment, effect, or mob.
+- Hostile melee now has a facing fence in both planning and final publication.
+  A zombie cannot deal damage while its current head direction points away from
+  the target, and a stale plan is rejected if either facing, range, visibility,
+  attacker life, or player targetability changes before commit. Existing
+  push-published target state handles stationary players and immediately fences
+  dead players. Focused tests cover those ordinary and race paths. In an
+  embedded 26.1.2 client run, the controller issued no movement input: a zombie
+  spawned 1.5 blocks away at yaw `0`; the post-damage observation had yaw
+  `-180`, player health `17` instead of `20`, and an unchanged player position.
+  This is the requested zombie behavior gate, not broad hostile parity.
 
 ## Manual And Agent Gates
 

@@ -36,6 +36,7 @@ struct HostileAttackTickEntity {
     id: EntityId,
     kind: HostileAttackKind,
     position: Vec3,
+    rotation: Rotation,
 }
 
 struct HostileTargetTickSession {
@@ -232,6 +233,7 @@ impl SessionRegistry {
                     id: entity.id,
                     kind,
                     position: entity.position,
+                    rotation: entity.rotation,
                 });
             });
         }
@@ -357,7 +359,13 @@ impl SessionRegistry {
                             let dx = target.position.x - hostile.position.x;
                             let dz = target.position.z - hostile.position.z;
                             let distance = dx * dx + dz * dz;
-                            (distance <= max_distance_sq).then_some((distance, target.id))
+                            (distance <= max_distance_sq
+                                && hostile_faces_target(
+                                    hostile.position,
+                                    hostile.rotation,
+                                    target.position,
+                                ))
+                            .then_some((distance, target.id))
                         })
                         .min_by(|left, right| left.0.total_cmp(&right.0));
                     let Some((_, recipient)) = target else {
@@ -538,6 +546,7 @@ impl SessionRegistry {
             #[cfg(test)]
             self.pause_before_hostile_session_publication_for_test();
             let recipients = self.movement_recipients.load_full();
+            let mut reserved_attacks = Vec::with_capacity(melee_attacks.len());
             for attack in melee_attacks {
                 let Some(hostile) = current_hostiles.get(&attack.hostile_id) else {
                     continue;
@@ -563,10 +572,30 @@ impl SessionRegistry {
                         let dx = target_pose.x - hostile.position.x;
                         let dz = target_pose.z - hostile.position.z;
                         dx * dx + dz * dz <= HOSTILE_MELEE_RANGE * HOSTILE_MELEE_RANGE
+                            && hostile_faces_target(
+                                hostile.position,
+                                hostile.rotation,
+                                Vec3::new(target_pose.x, target_pose.y, target_pose.z),
+                            )
                     })
                 else {
                     continue;
                 };
+                reserved_attacks.push((attack, hostile.clone(), target_recipient));
+            }
+            let current_attacker_ids = self
+                .current_expected_entity_snapshots(
+                    reserved_attacks
+                        .iter()
+                        .map(|(_, hostile, _)| hostile.clone()),
+                )
+                .into_iter()
+                .map(|hostile| hostile.id)
+                .collect::<HashSet<_>>();
+            for (attack, hostile, target_recipient) in reserved_attacks {
+                if !current_attacker_ids.contains(&attack.hostile_id) {
+                    continue;
+                }
                 dispatches.push(VisibilityDispatch {
                     recipient: target_recipient,
                     command: OutboundCommand::DamagePlayer {
@@ -641,6 +670,22 @@ impl SessionRegistry {
             entity.item_stack.is_none() && is_hostile_entity(&entity.type_name)
         })
     }
+}
+
+fn hostile_faces_target(position: Vec3, rotation: Rotation, target: Vec3) -> bool {
+    let dx = target.x - position.x;
+    let dz = target.z - position.z;
+    let distance = dx.hypot(dz);
+    if distance <= f64::EPSILON {
+        return true;
+    }
+    if !rotation.head_yaw.is_finite() {
+        return false;
+    }
+    let yaw = f64::from(rotation.head_yaw).to_radians();
+    let facing_x = -yaw.sin();
+    let facing_z = yaw.cos();
+    (facing_x * dx + facing_z * dz) / distance > 0.0
 }
 
 pub(super) fn update_hostile_targets(
