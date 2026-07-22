@@ -82,6 +82,9 @@ mod script_teleport_endpoint;
 #[cfg(test)]
 mod script_teleport_endpoint_tests;
 mod session_lifecycle;
+mod simulation_input_publication;
+#[cfg(test)]
+mod simulation_input_publication_tests;
 mod sleep;
 mod survival_action_authority;
 mod transactions;
@@ -184,6 +187,7 @@ pub(in crate::play) use script_menu_endpoint::{
 pub(in crate::play) use script_teleport_endpoint::{
     ScriptPlayerTeleportCommand, ScriptPlayerTeleportCompletion,
 };
+use simulation_input_publication::SimulationInputPublication;
 pub(super) use sleep::SleepOutcome;
 #[cfg(test)]
 use sleep::{DEEP_SLEEP_TICKS, sleepers_needed};
@@ -349,7 +353,7 @@ struct SessionRegistryInner {
     natural_aquatic_mobs: HashSet<EntityId>,
     published_entity_snapshots: HashMap<EntityId, ServerEntitySnapshot>,
     entity_type_aabbs: HashMap<i32, mc_physics::Aabb>,
-    terrain_pathing_entities: HashSet<EntityId>,
+    simulation_inputs: Arc<SimulationInputPublication>,
     entity_movement_trackers: Arc<EntityMovementTrackers>,
     arrow_tick_scratch: projectiles::ArrowTickScratch,
     spawned_entity_chunks: HashSet<(i32, i32)>,
@@ -375,10 +379,12 @@ struct SessionRegistryInner {
 
 impl SessionRegistryInner {
     fn publish_combat_target(&mut self, id: SessionId) {
-        let targetable =
-            !self.dead_sessions.contains(&id) && !self.spectator_sessions.contains(&id);
+        let alive = !self.dead_sessions.contains(&id);
+        let targetable = alive && !self.spectator_sessions.contains(&id);
         if let Some(session) = self.sessions.get(&id) {
-            session.combat_target.publish(session.pose, targetable);
+            session
+                .combat_target
+                .publish(session.pose, alive, targetable);
         }
     }
 }
@@ -447,6 +453,7 @@ pub(super) enum SessionPreparedChunkClaimResult {
 #[derive(Debug)]
 pub(crate) struct SessionRegistry {
     inner: Mutex<SessionRegistryInner>,
+    simulation_inputs: Arc<SimulationInputPublication>,
     movement_recipients: arc_swap::ArcSwap<MovementRecipientIndex>,
     active_simulation_entities: arc_swap::ArcSwap<HashSet<EntityId>>,
     active_hostile_entities: arc_swap::ArcSwap<HashSet<EntityId>>,
@@ -730,8 +737,13 @@ impl SessionRegistry {
         let (player_attack_sender, _) = tokio::sync::broadcast::channel(64);
         let (active_session_sender, _) = tokio::sync::watch::channel(0);
         let pressure_observation = Arc::new(SessionPressureObservation::default());
+        let simulation_inputs = Arc::new(SimulationInputPublication::default());
         Self {
-            inner: Mutex::new(SessionRegistryInner::default()),
+            inner: Mutex::new(SessionRegistryInner {
+                simulation_inputs: Arc::clone(&simulation_inputs),
+                ..SessionRegistryInner::default()
+            }),
+            simulation_inputs,
             movement_recipients: arc_swap::ArcSwap::from_pointee(MovementRecipientIndex::new()),
             active_simulation_entities: arc_swap::ArcSwap::from_pointee(HashSet::new()),
             active_hostile_entities: arc_swap::ArcSwap::from_pointee(HashSet::new()),
@@ -1642,9 +1654,7 @@ impl SessionRegistry {
 
     #[cfg(test)]
     fn terrain_pathing_entity_count(&self) -> usize {
-        self.lock_inner("terrain pathing entity count")
-            .terrain_pathing_entities
-            .len()
+        self.simulation_inputs.terrain_pathing_entities().len()
     }
 }
 
@@ -1902,7 +1912,12 @@ fn remove_ticket(
 }
 
 fn add_loaded_chunk_reference_locked(inner: &mut SessionRegistryInner, chunk: (i32, i32)) {
-    *inner.loaded_chunk_refcounts.entry(chunk).or_default() += 1;
+    let refcount = inner.loaded_chunk_refcounts.entry(chunk).or_default();
+    let became_active = *refcount == 0;
+    *refcount += 1;
+    if became_active {
+        inner.simulation_inputs.insert_active_chunk(chunk);
+    }
 }
 
 fn remove_loaded_chunk_reference_locked(inner: &mut SessionRegistryInner, chunk: (i32, i32)) {
@@ -1914,6 +1929,7 @@ fn remove_loaded_chunk_reference_locked(inner: &mut SessionRegistryInner, chunk:
     *refcount = refcount.saturating_sub(1);
     if *refcount == 0 {
         inner.loaded_chunk_refcounts.remove(&chunk);
+        inner.simulation_inputs.remove_active_chunk(chunk);
     }
 }
 

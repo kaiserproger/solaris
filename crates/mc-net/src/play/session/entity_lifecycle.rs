@@ -296,7 +296,7 @@ pub(super) fn clear_removed_entity_tracking_locked(
     inner.natural_hostile_mobs.remove(&entity_id);
     inner.natural_ground_mobs.remove(&entity_id);
     inner.natural_aquatic_mobs.remove(&entity_id);
-    inner.terrain_pathing_entities.remove(&entity_id);
+    inner.simulation_inputs.remove_terrain_pathing([entity_id]);
     untrack_entity_chunk_locked(inner, entity_id);
 }
 
@@ -334,6 +334,7 @@ pub(super) fn track_entity_chunk_locked(
         .entry(chunk)
         .or_default()
         .insert(entity_id);
+    inner.simulation_inputs.track_entity(chunk, entity_id);
 }
 
 pub(super) fn move_entity_chunk_locked(
@@ -354,15 +355,19 @@ pub(super) fn move_entity_chunk_locked(
         .entry(new_chunk)
         .or_default()
         .insert(entity_id);
+    inner
+        .simulation_inputs
+        .move_entity(entity_id, old_chunk, new_chunk);
 }
 
 fn untrack_entity_chunk_locked(inner: &mut SessionRegistryInner, entity_id: EntityId) {
-    if let Some(chunk) = inner.entity_chunks.remove(&entity_id)
-        && let Some(entities) = inner.entities_by_chunk.get_mut(&chunk)
-    {
-        entities.remove(&entity_id);
-        if entities.is_empty() {
-            inner.entities_by_chunk.remove(&chunk);
+    if let Some(chunk) = inner.entity_chunks.remove(&entity_id) {
+        if let Some(entities) = inner.entities_by_chunk.get_mut(&chunk) {
+            entities.remove(&entity_id);
+            if entities.is_empty() {
+                inner.entities_by_chunk.remove(&chunk);
+            }
         }
+        inner.simulation_inputs.untrack_entity(chunk, entity_id);
     }
 }

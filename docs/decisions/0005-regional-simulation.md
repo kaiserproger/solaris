@@ -531,6 +531,14 @@ Unobserved regions neither join the owner request nor age their animals. The
 former coordinator and owner-lane all-world breeding snapshot commands were
 deleted; breeding planning still runs without retaining session state or owner
 admission.
+Ordinary goal-input collection also reads immutable publications for active
+chunks, a 64-shard chunk-to-entity index, terrain-pathing IDs, and per-session
+combat-target poses. It therefore does not enter `SessionRegistry.inner`.
+One revision fence covers active-chunk and entity-index publication so a
+cross-shard move cannot disappear from a concurrent snapshot.
+Chunk, entity, and pathing mutations still refresh these publications from the
+existing centralized mutation paths, so this removes a global read lock rather
+than completing regional mutation ownership.
 Item lifetime expiry no longer performs a full entity snapshot during every
 physics publication turn. Item creation and restore add the entity id to a
 simulation-tick deadline index; an expiry turn reads and removes only due ids,

@@ -92,6 +92,12 @@ and is not startup context.
   selection replaces the hostile publication before attacks on each goal turn;
   unload and zero-live-session paths clear it without later owner reads. Manual
   feel remains pending.
+- Ordinary entity goal-input collection no longer enters
+  `SessionRegistry.inner`. Active chunks, a 64-shard chunk-to-entity index,
+  terrain-pathing IDs, and per-session combat-target poses are immutable
+  publications. A revision fence prevents cross-shard moves from disappearing
+  from concurrent snapshots. Mutation paths remain centralized, so this is a
+  removed global read lock, not completed regional mutation ownership.
 - The exact dense 5,132-cow O3 gate is closed. The final reproduced cause was
   an unanswered keepalive challenge while valid movement packets still proved
   the client alive. Solaris now preserves one pending challenge, requires both

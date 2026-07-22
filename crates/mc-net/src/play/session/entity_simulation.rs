@@ -192,31 +192,20 @@ impl SessionRegistry {
         }
         let live_session_generation = self.live_session_generation.load(Ordering::Acquire);
         let (world_read, pathing_materials) = pathing.unzip();
-        let (active_chunks, active_entity_candidates, player_positions, terrain_pathing_entities) = {
-            let inner = self.lock_inner("snapshot entity tick inputs");
-            let active_chunks = inner
-                .loaded_chunk_refcounts
-                .keys()
-                .copied()
-                .collect::<HashSet<_>>();
-            let active_entity_candidates = active_chunks
-                .iter()
-                .filter_map(|chunk| inner.entities_by_chunk.get(chunk))
-                .flat_map(|entities| entities.iter().copied())
-                .collect::<HashSet<_>>();
-            let player_positions = inner
-                .sessions
-                .iter()
-                .filter(|(session_id, _)| !inner.dead_sessions.contains(session_id))
-                .map(|(_, session)| Vec3::new(session.pose.x, session.pose.y, session.pose.z))
-                .collect::<Vec<_>>();
-            (
-                active_chunks,
-                active_entity_candidates,
-                player_positions,
-                inner.terrain_pathing_entities.clone(),
-            )
-        };
+        let (active_chunks, active_entity_candidates) =
+            self.simulation_inputs.active_entity_candidates();
+        let player_positions = self
+            .movement_recipients
+            .load_full()
+            .values()
+            .filter_map(|publication| {
+                let target = *publication.combat_target();
+                target
+                    .is_alive()
+                    .then(|| Vec3::new(target.pose().x, target.pose().y, target.pose().z))
+            })
+            .collect::<Vec<_>>();
+        let terrain_pathing_entities = self.simulation_inputs.terrain_pathing_entities();
         let mut entities = self.lock_entities("prepare entity goals");
         if active_chunks.is_empty() {
             self.clear_active_simulation_entities();
@@ -431,10 +420,8 @@ impl SessionRegistry {
             .collect();
         drop(entities);
         if !resolved_direct_paths.is_empty() {
-            let mut inner = self.lock_inner("resolve direct entity pathing");
-            for entity_id in resolved_direct_paths {
-                inner.terrain_pathing_entities.remove(&entity_id);
-            }
+            self.simulation_inputs
+                .remove_terrain_pathing(resolved_direct_paths);
         }
         queries
     }
@@ -841,11 +828,14 @@ impl SessionRegistry {
         processed_arrows.clear();
         inner.arrow_tick_scratch.processed = processed_arrows;
         let steps = effective_steps.as_slice();
-        for step in steps {
-            if step.horizontal_collision && step.velocity.y <= 0.0 {
-                inner.terrain_pathing_entities.insert(step.id);
-            }
-        }
+        let terrain_pathing_additions = steps
+            .iter()
+            .filter(|step| step.horizontal_collision && step.velocity.y <= 0.0)
+            .map(|step| step.id)
+            .collect::<Vec<_>>();
+        inner
+            .simulation_inputs
+            .insert_terrain_pathing(terrain_pathing_additions);
         let chunk_crossings = steps
             .iter()
             .filter_map(|step| {

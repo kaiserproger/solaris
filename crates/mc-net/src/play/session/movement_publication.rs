@@ -14,6 +14,7 @@ use super::{PlaySession, PlayerPose, SessionId};
 #[derive(Debug, Clone, Copy)]
 pub(super) struct PublishedCombatTargetState {
     pose: PlayerPose,
+    alive: bool,
     targetable: bool,
 }
 
@@ -46,6 +47,10 @@ impl PublishedCombatTargetState {
     pub(super) fn is_targetable(self) -> bool {
         self.targetable
     }
+
+    pub(super) fn is_alive(self) -> bool {
+        self.alive
+    }
 }
 
 #[derive(Debug)]
@@ -59,21 +64,25 @@ impl PublishedCombatTarget {
         Self {
             published: Arc::new(ArcSwap::from_pointee(PublishedCombatTargetState {
                 pose,
+                alive: true,
                 targetable: true,
             })),
             epoch,
         }
     }
 
-    pub(super) fn publish(&self, pose: PlayerPose, targetable: bool) {
+    pub(super) fn publish(&self, pose: PlayerPose, alive: bool, targetable: bool) {
         self.epoch.begin_update();
-        self.published
-            .store(Arc::new(PublishedCombatTargetState { pose, targetable }));
+        self.published.store(Arc::new(PublishedCombatTargetState {
+            pose,
+            alive,
+            targetable,
+        }));
         self.epoch.finish_update();
     }
 
     pub(super) fn close(&self, pose: PlayerPose) {
-        self.publish(pose, false);
+        self.publish(pose, false, false);
     }
 
     fn publication(&self) -> Arc<ArcSwap<PublishedCombatTargetState>> {
