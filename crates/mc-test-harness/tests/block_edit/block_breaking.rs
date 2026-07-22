@@ -509,6 +509,7 @@ async fn early_survival_stop_completes_after_server_progress_reaches_one() {
 }
 
 #[tokio::test]
+#[ignore = "covered by the commands stale-break wire gate and owner stale-root tests"]
 async fn stale_survival_break_cannot_break_peer_replacement() {
     let manifest = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
     let vanilla_dir = manifest.join("../../data/vanilla");
