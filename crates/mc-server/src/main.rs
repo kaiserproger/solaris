@@ -465,11 +465,26 @@ async fn serve(path: &Path) -> Result<()> {
     let configured_geometry = cfg.data.chunk_geometry().map_err(anyhow::Error::msg)?;
     let world_dir = required_world_dir(&cfg)?;
     let worldgen_mode = cfg.data.worldgen_mode.to_worldgen();
+    let mut prepared_plugins = if let Some(directory) = cfg.plugins.directory.as_deref() {
+        Some(
+            mc_script::prepare_lua_plugins(mc_script::LuaHostConfig::new(directory))
+                .with_context(|| format!("preparing Lua plugins from {}", directory.display()))?,
+        )
+    } else {
+        None
+    };
+    let plugin_ore_profile = prepared_plugins
+        .as_ref()
+        .and_then(mc_script::PreparedLuaPlugins::worldgen_ore_profile);
+    let ore_profile_name = plugin_ore_profile
+        .map(mc_script::LuaWorldgenOreProfile::contract_name)
+        .unwrap_or("vanilla");
     let world_source = ensure_world_contract(
         world_dir,
         configured_geometry,
         cfg.data.seed,
         worldgen_mode.contract_name(),
+        ore_profile_name,
     )?;
 
     let protocol_data = load_effective_protocol_data(cfg.data.vanilla_data_dir.as_deref())?;
@@ -532,6 +547,7 @@ async fn serve(path: &Path) -> Result<()> {
         configured_geometry,
         Arc::clone(&blocks),
         structure_rules,
+        plugin_ore_profile,
     )?;
     let item_facts_source = load_effective_item_facts(cfg.data.vanilla_data_dir.as_deref())?;
     let item_facts = Arc::new(item_facts_source.table);
@@ -702,8 +718,13 @@ async fn serve(path: &Path) -> Result<()> {
     );
 
     let shutdown_handle = net.shutdown.clone();
-    let (bound, lua_host) = if let Some(directory) = cfg.plugins.directory.as_deref() {
-        let (boundary, host) = mc_script::start_lua_host(mc_script::LuaHostConfig::new(directory))
+    let (bound, lua_host) = if let Some(prepared) = prepared_plugins.take() {
+        let directory = cfg
+            .plugins
+            .directory
+            .as_deref()
+            .expect("prepared plugins have a configured directory");
+        let (boundary, host) = mc_script::start_prepared_lua_host(prepared)
             .with_context(|| format!("starting Lua plugins from {}", directory.display()))?;
         tracing::info!(
             directory = %directory.display(),
@@ -772,16 +793,22 @@ fn build_terrain_generator(
     geometry: mc_world::ChunkGeometry,
     blocks: Arc<mc_world::BlockRegistry>,
     structure_rules: mc_worldgen::StructureRules,
+    ore_profile: Option<mc_script::LuaWorldgenOreProfile>,
 ) -> Result<Arc<mc_worldgen::TerrainGenerator>> {
     let biomes = mc_worldgen::BiomeRules::vanilla_overworld();
-
-    Ok(Arc::new(
-        mc_worldgen::TerrainGenerator::try_with_biome_rules(seed, blocks, biomes)
+    let mut generator =
+        mc_worldgen::TerrainGenerator::try_with_biome_rules(seed, Arc::clone(&blocks), biomes)
             .context("building terrain generator")?
             .with_geometry(geometry)
             .with_mode(worldgen_mode)
-            .with_structures(structure_rules),
-    ))
+            .with_structures(structure_rules);
+    if matches!(
+        ore_profile,
+        Some(mc_script::LuaWorldgenOreProfile::GeologicalDeposits)
+    ) {
+        generator = generator.with_geological_deposits(blocks.as_ref());
+    }
+    Ok(Arc::new(generator))
 }
 
 fn structure_rules_for_startup(
@@ -1671,7 +1698,7 @@ mod tests {
         let changed = mc_world::ChunkGeometry::new(-64, 384).unwrap();
 
         assert_eq!(
-            ensure_world_contract(world.path(), original, 7, "vanilla_like").unwrap(),
+            ensure_world_contract(world.path(), original, 7, "vanilla_like", "vanilla").unwrap(),
             WorldSource::SolarisGenerated,
         );
         let bytes = std::fs::read(world_contract_path(world.path())).unwrap();
@@ -1680,10 +1707,12 @@ mod tests {
         assert_eq!(persisted.worldgen_revision, mc_worldgen::WORLDGEN_REVISION);
         assert_eq!(persisted.seed, 7);
         assert_eq!(persisted.mode, "vanilla_like");
+        assert_eq!(persisted.ore_profile, "vanilla");
         assert_eq!(persisted.min_y, 0);
         assert_eq!(persisted.height, 256);
 
-        let error = ensure_world_contract(world.path(), changed, 7, "vanilla_like").unwrap_err();
+        let error =
+            ensure_world_contract(world.path(), changed, 7, "vanilla_like", "vanilla").unwrap_err();
 
         let message = error.to_string();
         assert!(message.contains("world contract geometry"), "{message}");
@@ -1695,7 +1724,7 @@ mod tests {
     fn world_contract_rejects_mismatched_worldgen_revision_before_world_open() {
         let world = tempfile::tempdir().unwrap();
         let geometry = mc_world::ChunkGeometry::new(-64, 384).unwrap();
-        ensure_world_contract(world.path(), geometry, 7, "vanilla_like").unwrap();
+        ensure_world_contract(world.path(), geometry, 7, "vanilla_like", "vanilla").unwrap();
 
         let path = world_contract_path(world.path());
         let bytes = std::fs::read(&path).unwrap();
@@ -1703,7 +1732,8 @@ mod tests {
         persisted.worldgen_revision = persisted.worldgen_revision.saturating_sub(1);
         std::fs::write(&path, serde_json::to_vec_pretty(&persisted).unwrap()).unwrap();
 
-        let error = ensure_world_contract(world.path(), geometry, 7, "vanilla_like").unwrap_err();
+        let error = ensure_world_contract(world.path(), geometry, 7, "vanilla_like", "vanilla")
+            .unwrap_err();
         assert!(error.to_string().contains("persisted worldgen revision="));
     }
 
@@ -1720,9 +1750,29 @@ mod tests {
 
         let geometry = mc_world::ChunkGeometry::new(0, 256).unwrap();
         assert_eq!(
-            ensure_world_contract(world.path(), geometry, 0, "vanilla_like").unwrap(),
+            ensure_world_contract(world.path(), geometry, 0, "vanilla_like", "vanilla").unwrap(),
             WorldSource::ExistingVanilla,
         );
+        assert!(!world_contract_path(world.path()).exists());
+    }
+
+    #[test]
+    fn unversioned_anvil_world_rejects_a_plugin_worldgen_profile() {
+        let world = tempfile::tempdir().unwrap();
+        let region = world.path().join("region");
+        std::fs::create_dir_all(&region).unwrap();
+        std::fs::write(region.join("r.0.0.mca"), b"not opened during preflight").unwrap();
+
+        let error = ensure_world_contract(
+            world.path(),
+            mc_world::OVERWORLD_GEOMETRY,
+            0,
+            "vanilla_like",
+            "geological_deposits",
+        )
+        .unwrap_err();
+
+        assert!(error.to_string().contains("unversioned Anvil import"));
         assert!(!world_contract_path(world.path()).exists());
     }
 
@@ -1732,23 +1782,40 @@ mod tests {
         let geometry = mc_world::OVERWORLD_GEOMETRY;
 
         assert_eq!(
-            ensure_world_contract(world.path(), geometry, 11, "vanilla_like").unwrap(),
+            ensure_world_contract(world.path(), geometry, 11, "vanilla_like", "vanilla").unwrap(),
             WorldSource::SolarisGenerated,
         );
         assert_eq!(
-            ensure_world_contract(world.path(), geometry, 11, "vanilla_like").unwrap(),
+            ensure_world_contract(world.path(), geometry, 11, "vanilla_like", "vanilla").unwrap(),
             WorldSource::SolarisGenerated,
         );
 
         let seed_error =
-            ensure_world_contract(world.path(), geometry, 12, "vanilla_like").unwrap_err();
+            ensure_world_contract(world.path(), geometry, 12, "vanilla_like", "vanilla")
+                .unwrap_err();
         assert!(seed_error.to_string().contains("seed=11"));
         assert!(seed_error.to_string().contains("seed=12"));
 
         let mode_error =
-            ensure_world_contract(world.path(), geometry, 11, "tellus_like").unwrap_err();
+            ensure_world_contract(world.path(), geometry, 11, "tellus_like", "vanilla")
+                .unwrap_err();
         assert!(mode_error.to_string().contains("mode=vanilla_like"));
         assert!(mode_error.to_string().contains("mode=tellus_like"));
+
+        let profile_error = ensure_world_contract(
+            world.path(),
+            geometry,
+            11,
+            "vanilla_like",
+            "geological_deposits",
+        )
+        .unwrap_err();
+        assert!(profile_error.to_string().contains("ore_profile=vanilla"));
+        assert!(
+            profile_error
+                .to_string()
+                .contains("ore_profile=geological_deposits")
+        );
 
         assert!(world_contract_path(world.path()).is_file());
     }
@@ -1782,6 +1849,7 @@ mod tests {
             mc_world::OVERWORLD_GEOMETRY,
             blocks,
             mc_worldgen::StructureRules::none(),
+            None,
         ) {
             Ok(_) => panic!("missing required terrain block must fail"),
             Err(err) => err,
@@ -1814,6 +1882,7 @@ mod tests {
             geometry,
             blocks,
             mc_worldgen::StructureRules::none(),
+            None,
         )
         .unwrap();
 
@@ -1824,6 +1893,28 @@ mod tests {
 
         assert_eq!(chunk.geometry(), geometry);
         assert_eq!(chunk.sections.len(), 16);
+    }
+
+    #[test]
+    fn build_terrain_generator_applies_the_prepared_plugin_ore_profile() {
+        let blocks =
+            Arc::new(
+                mc_world::BlockRegistry::from_report(
+                    &mc_data::blocks::solaris_required_blocks_report(),
+                )
+                .unwrap(),
+            );
+        let generator = build_terrain_generator(
+            42,
+            mc_worldgen::WorldgenMode::VanillaLike,
+            mc_world::OVERWORLD_GEOMETRY,
+            blocks,
+            mc_worldgen::StructureRules::none(),
+            Some(mc_script::LuaWorldgenOreProfile::GeologicalDeposits),
+        )
+        .unwrap();
+
+        assert_eq!(generator.ore_generation_profile(), "geological_deposits");
     }
 
     #[test]

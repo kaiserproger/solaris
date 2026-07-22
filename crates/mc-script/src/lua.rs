@@ -12,6 +12,9 @@ use mlua::{Function, HookTriggers, Lua, LuaOptions, LuaString, StdLib, Table, Va
 use serde::Deserialize;
 use tracing::{info, warn};
 
+#[cfg(test)]
+mod worldgen_tests;
+
 use crate::{
     CommandBatch, CommandBatchError, CommandCapabilities, HostCommandAdmission,
     MAX_ONLINE_PLAYER_QUERY_LIMIT, MAX_SCRIPT_CHAT_MESSAGE_BYTES, MAX_SCRIPT_CONSOLE_COMMAND_BYTES,
@@ -72,6 +75,8 @@ pub enum LuaHostError {
     Io { path: PathBuf, message: String },
     ThreadSpawn { message: String },
     StartupChannelClosed,
+    WorldgenConflict { first: String, second: String },
+    InvalidWorldgenPlugin { path: PathBuf, message: String },
 }
 
 impl fmt::Display for LuaHostError {
@@ -82,6 +87,15 @@ impl fmt::Display for LuaHostError {
                 write!(formatter, "starting Lua host thread: {message}")
             }
             Self::StartupChannelClosed => formatter.write_str("Lua host startup channel closed"),
+            Self::WorldgenConflict { first, second } => write!(
+                formatter,
+                "plugins {first} and {second} both declare a worldgen ore profile"
+            ),
+            Self::InvalidWorldgenPlugin { path, message } => write!(
+                formatter,
+                "worldgen plugin {} is invalid: {message}",
+                path.display()
+            ),
         }
     }
 }
@@ -93,6 +107,34 @@ impl std::error::Error for LuaHostError {}
 pub struct LuaHost {
     loaded_plugins: usize,
     thread: thread::JoinHandle<()>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum LuaWorldgenOreProfile {
+    GeologicalDeposits,
+}
+
+impl LuaWorldgenOreProfile {
+    #[must_use]
+    pub const fn contract_name(self) -> &'static str {
+        match self {
+            Self::GeologicalDeposits => "geological_deposits",
+        }
+    }
+}
+
+#[derive(Debug)]
+pub struct PreparedLuaPlugins {
+    sources: Vec<PluginSource>,
+    worldgen_ore_profile: Option<LuaWorldgenOreProfile>,
+}
+
+impl PreparedLuaPlugins {
+    #[must_use]
+    pub const fn worldgen_ore_profile(&self) -> Option<LuaWorldgenOreProfile> {
+        self.worldgen_ore_profile
+    }
 }
 
 impl LuaHost {
@@ -107,11 +149,39 @@ impl LuaHost {
 
 /// Start one dedicated host thread for all Lua plugins in the configured directory.
 pub fn start_lua_host(config: LuaHostConfig) -> Result<(ScriptBoundary, LuaHost), LuaHostError> {
+    start_prepared_lua_host(prepare_lua_plugins(config)?)
+}
+
+pub fn prepare_lua_plugins(config: LuaHostConfig) -> Result<PreparedLuaPlugins, LuaHostError> {
     fs::create_dir_all(config.plugins_dir()).map_err(|error| LuaHostError::Io {
         path: config.plugins_dir().to_path_buf(),
         message: error.to_string(),
     })?;
     let sources = discover_plugins(config.plugins_dir())?;
+    let mut selected = None;
+    let mut owner = None;
+    for source in &sources {
+        let Some(profile) = source.worldgen_ore_profile else {
+            continue;
+        };
+        if let Some(first) = owner {
+            return Err(LuaHostError::WorldgenConflict {
+                first,
+                second: source.manifest.plugin_id().to_owned(),
+            });
+        }
+        selected = Some(profile);
+        owner = Some(source.manifest.plugin_id().to_owned());
+    }
+    Ok(PreparedLuaPlugins {
+        sources,
+        worldgen_ore_profile: selected,
+    })
+}
+
+pub fn start_prepared_lua_host(
+    prepared: PreparedLuaPlugins,
+) -> Result<(ScriptBoundary, LuaHost), LuaHostError> {
     let (boundary, endpoint) = script_boundary_pair(
         NonZeroUsize::new(EVENT_QUEUE_CAPACITY).expect("event queue capacity is non-zero"),
         NonZeroUsize::new(COMMAND_QUEUE_CAPACITY).expect("command queue capacity is non-zero"),
@@ -119,7 +189,7 @@ pub fn start_lua_host(config: LuaHostConfig) -> Result<(ScriptBoundary, LuaHost)
     let (startup_tx, startup_rx) = std::sync::mpsc::sync_channel(1);
     let thread = thread::Builder::new()
         .name("solaris-lua-host".to_owned())
-        .spawn(move || run_lua_host(endpoint, sources, startup_tx))
+        .spawn(move || run_lua_host(endpoint, prepared.sources, startup_tx))
         .map_err(|error| LuaHostError::ThreadSpawn {
             message: error.to_string(),
         })?;
@@ -145,6 +215,33 @@ struct PluginSource {
     config: toml::Table,
     source: String,
     source_path: PathBuf,
+    worldgen_ore_profile: Option<LuaWorldgenOreProfile>,
+}
+
+#[derive(Debug)]
+struct PluginSourceError {
+    message: String,
+    worldgen_declared: bool,
+}
+
+impl PluginSourceError {
+    fn new(message: impl Into<String>, worldgen_declared: bool) -> Self {
+        Self {
+            message: message.into(),
+            worldgen_declared,
+        }
+    }
+
+    #[cfg(test)]
+    fn contains(&self, needle: &str) -> bool {
+        self.message.contains(needle)
+    }
+}
+
+impl std::fmt::Display for PluginSourceError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(&self.message)
+    }
 }
 
 #[derive(Debug, Deserialize)]
@@ -170,6 +267,19 @@ struct DiskManifest {
     dependencies: Vec<DiskDependency>,
     #[serde(default)]
     permissions: Vec<String>,
+    worldgen: Option<DiskWorldgen>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct DiskWorldgen {
+    ore_profile: DiskWorldgenOreProfile,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "snake_case")]
+enum DiskWorldgenOreProfile {
+    GeologicalDeposits,
 }
 
 #[derive(Debug, Deserialize)]
@@ -216,6 +326,12 @@ fn discover_plugins(plugins_dir: &Path) -> Result<Vec<PluginSource>, LuaHostErro
     for directory in directories {
         match read_plugin_source(&directory) {
             Ok(source) => sources.push(source),
+            Err(error) if error.worldgen_declared => {
+                return Err(LuaHostError::InvalidWorldgenPlugin {
+                    path: directory,
+                    message: error.message,
+                });
+            }
             Err(error) => warn!(
                 directory = %directory.display(),
                 %error,
@@ -226,12 +342,21 @@ fn discover_plugins(plugins_dir: &Path) -> Result<Vec<PluginSource>, LuaHostErro
     Ok(sources)
 }
 
-fn read_plugin_source(directory: &Path) -> Result<PluginSource, String> {
+fn read_plugin_source(directory: &Path) -> Result<PluginSource, PluginSourceError> {
     let manifest_path = directory.join("plugin.toml");
-    let raw_manifest = read_utf8_file_limited(&manifest_path, MAX_PLUGIN_MANIFEST_BYTES)?;
-    let disk: DiskManifest =
-        toml::from_str(&raw_manifest).map_err(|error| format!("parsing manifest: {error}"))?;
-    let requested_api_version = parse_api_version(&disk.api)?;
+    let raw_manifest = read_utf8_file_limited(&manifest_path, MAX_PLUGIN_MANIFEST_BYTES)
+        .map_err(|error| PluginSourceError::new(error, false))?;
+    let raw_manifest: toml::Value = toml::from_str(&raw_manifest)
+        .map_err(|error| PluginSourceError::new(format!("parsing manifest: {error}"), false))?;
+    let worldgen_declared = raw_manifest.get("worldgen").is_some();
+    let disk: DiskManifest = raw_manifest.try_into().map_err(|error| {
+        PluginSourceError::new(format!("parsing manifest: {error}"), worldgen_declared)
+    })?;
+    let requested_api_version = parse_api_version(&disk.api)
+        .map_err(|error| PluginSourceError::new(error, worldgen_declared))?;
+    let worldgen_ore_profile = disk.worldgen.map(|worldgen| match worldgen.ore_profile {
+        DiskWorldgenOreProfile::GeologicalDeposits => LuaWorldgenOreProfile::GeologicalDeposits,
+    });
     let mut manifest =
         ScriptPluginManifest::new(disk.id, disk.name, disk.version, requested_api_version);
     for event in disk.events {
@@ -261,19 +386,23 @@ fn read_plugin_source(directory: &Path) -> Result<PluginSource, String> {
         manifest = manifest.declare_permission(permission);
     }
     for capability in disk.capabilities {
-        manifest = declare_disk_capability(manifest, &capability)?;
+        manifest = declare_disk_capability(manifest, &capability)
+            .map_err(|error| PluginSourceError::new(error, worldgen_declared))?;
     }
-    let manifest = manifest
-        .validate()
-        .map_err(|error| format!("invalid manifest: {error:?}"))?;
-    let config = read_plugin_config(directory)?;
+    let manifest = manifest.validate().map_err(|error| {
+        PluginSourceError::new(format!("invalid manifest: {error:?}"), worldgen_declared)
+    })?;
+    let config = read_plugin_config(directory)
+        .map_err(|error| PluginSourceError::new(error, worldgen_declared))?;
     let source_path = directory.join("main.lua");
-    let source = read_utf8_file_limited(&source_path, MAX_PLUGIN_SOURCE_BYTES)?;
+    let source = read_utf8_file_limited(&source_path, MAX_PLUGIN_SOURCE_BYTES)
+        .map_err(|error| PluginSourceError::new(error, worldgen_declared))?;
     Ok(PluginSource {
         manifest,
         config,
         source,
         source_path,
+        worldgen_ore_profile,
     })
 }
 
@@ -2776,6 +2905,7 @@ mod tests {
             "#
             .to_owned(),
             source_path: PathBuf::from("atomic/main.lua"),
+            worldgen_ore_profile: None,
         };
         let (boundary, endpoint) =
             script_boundary_pair(NonZeroUsize::new(2).unwrap(), NonZeroUsize::new(1).unwrap());
@@ -3193,6 +3323,7 @@ mod tests {
             "#
             .to_owned(),
             source_path: PathBuf::from("bad/main.lua"),
+            worldgen_ore_profile: None,
         };
         let good_manifest =
             ScriptPluginManifest::new("good-plugin", "Good Plugin", "0.1.0", SCRIPT_API_VERSION)
@@ -3209,6 +3340,7 @@ mod tests {
             "#
             .to_owned(),
             source_path: PathBuf::from("good/main.lua"),
+            worldgen_ore_profile: None,
         };
         let (boundary, endpoint) =
             script_boundary_pair(NonZeroUsize::new(4).unwrap(), NonZeroUsize::new(4).unwrap());
@@ -3258,6 +3390,7 @@ mod tests {
             config: toml::Table::new(),
             source: "function on_server_tick(_event) end".to_owned(),
             source_path: PathBuf::from(path),
+            worldgen_ore_profile: None,
         };
         let (boundary, endpoint) =
             script_boundary_pair(NonZeroUsize::new(4).unwrap(), NonZeroUsize::new(4).unwrap());
@@ -3306,6 +3439,7 @@ mod tests {
             config: toml::Table::new(),
             source: "function on_player_command(_event) end".to_owned(),
             source_path: PathBuf::from(path),
+            worldgen_ore_profile: None,
         };
         let (boundary, endpoint) =
             script_boundary_pair(NonZeroUsize::new(4).unwrap(), NonZeroUsize::new(4).unwrap());
@@ -3341,6 +3475,7 @@ mod tests {
                 "#
             ),
             source_path: PathBuf::from(format!("{id}/main.lua")),
+            worldgen_ore_profile: None,
         };
         let (boundary, endpoint) =
             script_boundary_pair(NonZeroUsize::new(4).unwrap(), NonZeroUsize::new(4).unwrap());
@@ -3392,6 +3527,7 @@ mod tests {
             "#
             .to_owned(),
             source_path: PathBuf::from("bad/main.lua"),
+            worldgen_ore_profile: None,
         };
         let good = PluginSource {
             manifest: ScriptPluginManifest::new("good", "good", "0.1.0", SCRIPT_API_VERSION)
@@ -3406,6 +3542,7 @@ mod tests {
             "#
             .to_owned(),
             source_path: PathBuf::from("good/main.lua"),
+            worldgen_ore_profile: None,
         };
         let (boundary, endpoint) =
             script_boundary_pair(NonZeroUsize::new(4).unwrap(), NonZeroUsize::new(4).unwrap());
@@ -3730,6 +3867,7 @@ mod tests {
                 "#
             ),
             source_path: PathBuf::from(format!("{id}/main.lua")),
+            worldgen_ore_profile: None,
         };
         let (boundary, endpoint) =
             script_boundary_pair(NonZeroUsize::new(2).unwrap(), NonZeroUsize::new(2).unwrap());
@@ -3778,6 +3916,7 @@ mod tests {
         for (name, expected_commands) in [
             ("currency-catalog", 1_usize),
             ("colony-villager-scaffold", 2_usize),
+            ("geological-mines", 0_usize),
             ("online-roster", 0_usize),
         ] {
             let source = read_plugin_source(&examples.join(name)).unwrap();

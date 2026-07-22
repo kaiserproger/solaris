@@ -25,8 +25,8 @@ allow_local_dev_operators = false
 directory = "plugins"
 
 [data]
-# Worldgen v6 has a persisted revision/seed/mode contract and requires a fresh directory.
-world_dir = ".analysis/test-world-v6"
+# Worldgen v7 persists revision, seed, mode, ore profile, and geometry.
+world_dir = ".analysis/test-world-v7"
 vanilla_data_dir = "data/vanilla"
 seed = 0
 # worldgen_mode = "tellus_like"

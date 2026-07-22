@@ -5,7 +5,7 @@ use std::path::{Path, PathBuf};
 use anyhow::{Context, Result, bail};
 use mc_server::ServerConfig;
 
-pub(crate) const WORLD_CONTRACT_SCHEMA: u32 = 1;
+pub(crate) const WORLD_CONTRACT_SCHEMA: u32 = 2;
 const WORLD_CONTRACT_FILE: &str = "world.json";
 
 #[derive(Debug, serde::Deserialize, serde::Serialize)]
@@ -14,6 +14,7 @@ pub(crate) struct PersistedWorldContract {
     pub(crate) worldgen_revision: u32,
     pub(crate) seed: i64,
     pub(crate) mode: String,
+    pub(crate) ore_profile: String,
     pub(crate) min_y: i32,
     pub(crate) height: i32,
 }
@@ -97,6 +98,7 @@ pub(crate) fn ensure_world_contract(
     configured: mc_world::ChunkGeometry,
     seed: i64,
     mode: &str,
+    ore_profile: &str,
 ) -> Result<WorldSource> {
     let path = world_contract_path(world_dir);
     match std::fs::read(&path) {
@@ -114,16 +116,19 @@ pub(crate) fn ensure_world_contract(
             if persisted.worldgen_revision != mc_worldgen::WORLDGEN_REVISION
                 || persisted.seed != seed
                 || persisted.mode != mode
+                || persisted.ore_profile != ore_profile
             {
                 bail!(
-                    "persisted worldgen revision={} seed={} mode={} in {} does not match configured revision={} seed={} mode={}; use a fresh world_dir",
+                    "persisted worldgen revision={} seed={} mode={} ore_profile={} in {} does not match configured revision={} seed={} mode={} ore_profile={}; use a fresh world_dir",
                     persisted.worldgen_revision,
                     persisted.seed,
                     persisted.mode,
+                    persisted.ore_profile,
                     path.display(),
                     mc_worldgen::WORLDGEN_REVISION,
                     seed,
                     mode,
+                    ore_profile,
                 );
             }
             let stored = mc_world::ChunkGeometry::new(persisted.min_y, persisted.height)
@@ -149,9 +154,14 @@ pub(crate) fn ensure_world_contract(
         }
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
             if world_contains_anvil_data(world_dir)? {
+                if ore_profile != "vanilla" {
+                    bail!(
+                        "worldgen ore profile {ore_profile} cannot be applied to an unversioned Anvil import; use a fresh world_dir"
+                    );
+                }
                 return Ok(WorldSource::ExistingVanilla);
             }
-            write_world_contract(&path, configured, seed, mode)?;
+            write_world_contract(&path, configured, seed, mode, ore_profile)?;
             Ok(WorldSource::SolarisGenerated)
         }
         Err(error) => Err(error)
@@ -198,6 +208,7 @@ fn write_world_contract(
     geometry: mc_world::ChunkGeometry,
     seed: i64,
     mode: &str,
+    ore_profile: &str,
 ) -> Result<()> {
     let parent = path
         .parent()
@@ -209,6 +220,7 @@ fn write_world_contract(
         worldgen_revision: mc_worldgen::WORLDGEN_REVISION,
         seed,
         mode: mode.to_owned(),
+        ore_profile: ore_profile.to_owned(),
         min_y: geometry.min_y(),
         height: geometry.height(),
     };

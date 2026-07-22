@@ -77,9 +77,12 @@ verification and keep ordinary survival play ahead of rare edge cases.
   availability at branch-mining heights. Solaris still uses deterministic
   connected vein geometry rather than claiming byte-identical vanilla chunk
   RNG.
-- [ ] Add an optional plugin that disables the vanilla ore pass and generates
-  large geological mines/deposits in the style of TerraFirmaCraft. It must be
-  switchable per world without changing the default.
+- [x] Add an optional plugin that disables the vanilla ore pass and generates
+  large geological mines/deposits in the style of TerraFirmaCraft. The shipped
+  `examples/plugins/geological-mines` manifest selects deterministic elongated
+  cross-chunk deposits before pre-generation. No plugin keeps the vanilla
+  profile; the selected profile is persisted per world and changing it on an
+  existing world is rejected instead of mixing chunk authorities.
 
 ## Plugins
 
@@ -160,3 +163,10 @@ anchor, placement kind, attempt/rarity ratio, size, discard chance and target;
 the same oracle checks exact emerald and extra-gold biome lists. Runtime
 generation checks the resulting bands and deep peaks without requiring
 `data/vanilla` at startup.
+
+The 2026-07-23 geological-mines checkpoint added a startup-only worldgen
+declaration to the plugin manifest. Plugin discovery is prepared once before
+the world contract and reused by the Lua host. The geological profile empties
+the vanilla ore rules and creates deterministic elongated deposits spanning
+chunk boundaries; the default profile remains unchanged. World contract schema
+2 persists the ore profile and worldgen revision 7 fences mixed-profile worlds.

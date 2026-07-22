@@ -26,10 +26,12 @@ use mc_world::{
 use crate::structures::{StructureRules, StructureTemplate};
 
 mod biome_rules;
+mod geological_ores;
 mod ore_rules;
 mod overworld;
 
 pub use biome_rules::BiomeRules;
+use geological_ores::GeologicalOreRules;
 pub use ore_rules::{
     BiomeScope, MAX_ORE_RULES, MAX_ORE_WORK_UNITS_PER_CHUNK, OreRule, OreRules, OreRulesError,
     OreSpacing, YRange,
@@ -125,6 +127,7 @@ pub struct TerrainGenerator {
     water: BlockStateId,
     biomes: BiomeRules,
     ores: OreRules,
+    geological_ores: Option<GeologicalOreRules>,
     structures: StructureRules,
     decorations: DecorationBlocks,
     worldgen_mode: WorldgenMode,
@@ -379,6 +382,7 @@ impl TerrainGenerator {
             water: resolve_block_or(registry.as_ref(), "minecraft:water", air),
             biomes,
             ores,
+            geological_ores: None,
             structures: StructureRules::none(),
             decorations: DecorationBlocks::new(registry.as_ref()),
             worldgen_mode: WorldgenMode::VanillaLike,
@@ -389,6 +393,22 @@ impl TerrainGenerator {
     pub fn with_structures(mut self, structures: StructureRules) -> Self {
         self.structures = structures;
         self
+    }
+
+    #[must_use]
+    pub fn with_geological_deposits(mut self, registry: &BlockRegistry) -> Self {
+        self.ores = OreRules::new(Vec::new()).expect("empty ore rules are valid");
+        self.geological_ores = Some(GeologicalOreRules::new(registry, self.stone));
+        self
+    }
+
+    #[must_use]
+    pub const fn ore_generation_profile(&self) -> &'static str {
+        if self.geological_ores.is_some() {
+            "geological_deposits"
+        } else {
+            "vanilla"
+        }
     }
 
     #[must_use]
@@ -778,6 +798,10 @@ impl TerrainGenerator {
     }
 
     fn apply_ores(&self, chunk: &mut Chunk) {
+        if let Some(geological_ores) = &self.geological_ores {
+            geological_ores.apply(self, chunk);
+            return;
+        }
         let chunk_min_x = i64::from(chunk.pos.x) * 16;
         let chunk_min_z = i64::from(chunk.pos.z) * 16;
         // Re-evaluate nearby anchors so a vein crossing a chunk edge is derived

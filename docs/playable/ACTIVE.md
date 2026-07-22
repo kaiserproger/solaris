@@ -74,6 +74,14 @@ hardening. An already-open lower-priority diff does not override this order.
 
 ## Recent Evidence
 
+- The optional `examples/plugins/geological-mines` plugin declares the
+  `geological_deposits` startup ore profile. Prepared plugin discovery runs once
+  before world validation and is reused to start Lua later. The profile removes
+  the vanilla ore rules and generates deterministic elongated deposits larger
+  than 512 connected blocks across chunk boundaries. World contract schema 2
+  persists the profile under worldgen revision 7 and rejects a later profile
+  change; no declaration remains the vanilla default.
+
 - Default ore generation now embeds 18 separate vanilla 26.1.2 placement passes
   instead of nine merged family approximations. It preserves raw height anchors
   before world clipping, so diamond and lower-redstone trapezoids peak at
@@ -119,17 +127,17 @@ hardening. An already-open lower-priority diff does not override this order.
   or 401s, moved from z=0.598 to z=9.956, and remained in play at full health.
   The current-build 20-minute autonomous survival session remains pending.
 
-- Worldgen revision 6 replaces revision 5 with separate landform and cave
+- Worldgen revision 7 keeps the revision-6 landform and cave
   stages: domain-warped continents, branching mountain ranges, and warped
   river-valley contours that become river biomes only after substantial carving.
   Tests cover a dry walkable 193x193 spawn window across a seed grid, full
   sampled cave volumes, chunk-border slopes, isolated-crater rejection, surface
   shells, exact tree support, spawn resources, extreme vertical geometry, and
   wire-level generated world use.
-  Fresh Solaris worlds persist revision/seed/mode/geometry in
+  Fresh Solaris worlds persist revision/seed/mode/ore-profile/geometry in
   `solaris/world.json`; unversioned vanilla Anvil worlds open without Solaris
   fallback generation, so terrain authorities cannot mix. `playable.toml` now
-  uses `.analysis/test-world-v6`. Real-client visual inspection is pending.
+  uses `.analysis/test-world-v7`. Real-client visual inspection is pending.
 
 - Hostile melee now keeps a zero-speed target-facing goal while in reach, so a
   stationary zombie stops without freezing its body/head rotation and publishes

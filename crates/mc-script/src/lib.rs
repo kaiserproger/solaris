@@ -38,7 +38,10 @@ mod player_teleport_tests;
 mod tick_delivery_tests;
 
 #[cfg(feature = "lua-runtime")]
-pub use lua::{LuaHost, LuaHostConfig, LuaHostError, start_lua_host};
+pub use lua::{
+    LuaHost, LuaHostConfig, LuaHostError, LuaWorldgenOreProfile, PreparedLuaPlugins,
+    prepare_lua_plugins, start_lua_host, start_prepared_lua_host,
+};
 
 /// Crate version, exposed so other crates and the binary can report it.
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");

@@ -38,6 +38,24 @@ dependencies = [{ id = "economy", relation = "required" }]
 permissions = ["solaris:catalog.read"]
 ```
 
+An optional startup-only worldgen declaration is also available:
+
+```toml
+[worldgen]
+ore_profile = "geological_deposits"
+```
+
+Installing `examples/plugins/geological-mines` selects large deterministic
+cross-chunk deposits and disables the vanilla ore pass for that world. Without
+a declaration the profile remains `vanilla`. The selected profile is persisted
+in `solaris/world.json`; changing it requires a fresh world directory so old
+and new chunks cannot mix authorities. Two plugins declaring a profile fail
+startup instead of relying on directory order. This declaration is resolved
+before pre-generation and gives Lua no chunk, generator, lock, or worker handle.
+An invalid worldgen declaration or missing Lua source fails startup instead of
+silently selecting vanilla. Unversioned vanilla Anvil imports reject a plugin
+worldgen profile because Solaris does not generate missing chunks in imports.
+
 Plugin ids use lowercase ASCII letters, digits, `_`, `-`, or `.`. Command roots
 remain lowercase ASCII literals of at most 64 bytes. Plugin command roots are
 globally exclusive, bounded to 128 roots, and cannot shadow a Solaris built-in.

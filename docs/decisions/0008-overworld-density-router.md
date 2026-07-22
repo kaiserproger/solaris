@@ -1,7 +1,7 @@
 # ADR 0008 - Overworld generation pipeline
 
 **Date:** 2026-07-22
-**Status:** Accepted, worldgen revision 6
+**Status:** Accepted, worldgen revision 7
 
 ## Context
 
@@ -13,7 +13,14 @@ block as support instead of the surface planned for that column.
 
 ## Decision
 
-Worldgen revision 6 replaces the revision-5 router instead of tuning it.
+Worldgen revision 7 retains the revision-6 density router and adds an explicit
+ore profile to the persisted world contract. The default `vanilla` profile uses
+the embedded 26.1.2 ore passes. A validated plugin manifest may instead declare
+`geological_deposits`; that disables the vanilla pass and uses large
+deterministic cross-chunk deposits. Conflicting declarations fail startup, and
+Lua receives no generator state or locks.
+
+The revision-6 router replaced the revision-5 router instead of tuning it.
 `terrain::overworld::landforms` owns a new coordinate field: domain-warped
 continents establish shelves and land, erosion and uplands shape broad relief,
 and two differently oriented ridge fields form long branching mountain ranges.
@@ -42,15 +49,16 @@ support.
 Generation remains stateless and coordinate-derived. Parallel generation of the
 same chunk or neighbouring chunks in any order produces identical output. Every
 new Solaris world persists `solaris/world.json` with schema, worldgen revision,
-seed, mode, and geometry. A mismatched contract is rejected before Anvil open.
+seed, mode, ore profile, and geometry. A mismatched contract is rejected before
+Anvil open.
 An existing unversioned Anvil world is treated as a vanilla import and opens
 without Solaris fallback generation, so missing chunks cannot mix both terrain
 authorities. Existing worlds are never rewritten. The local playable profile
-uses `.analysis/test-world-v6`.
+uses `.analysis/test-world-v7`.
 
 The hot path samples each surface column once and reuses its biome result for
 vertical biome cells. Cave noise exits after its region mask or first tunnel
-field rejects the cell. No revision-6 performance claim exists until a release
+field rejects the cell. No revision-7 performance claim exists until a release
 benchmark runs on a clean host.
 
 ## Staged boundary
@@ -73,5 +81,7 @@ coverage. Real-client visual inspection remains required.
 - a 32-block solid protected surface shell across sampled seeds;
 - exact-surface tree support over a stable 5x5 footprint;
 - vanilla-import isolation plus rejection of mismatched revision/seed/mode/geometry;
+- rejection of a changed persisted ore profile;
 - order-independent ore placement;
+- geological deposits crossing chunk boundaries while default generation stays vanilla;
 - `cargo test -p mc-worldgen`.

@@ -528,6 +528,40 @@ fn default_ore_pass_generates_vanilla_height_bands_and_deep_peaks() {
     );
 }
 
+#[test]
+fn geological_profile_replaces_vanilla_veins_with_cross_chunk_deposits() {
+    let (default, registry, biomes) = generator();
+    let geological = TerrainGenerator::try_with_biome_rules(42, Arc::clone(&registry), biomes)
+        .unwrap()
+        .with_geological_deposits(registry.as_ref());
+    assert_eq!(default.ore_generation_profile(), "vanilla");
+    assert_eq!(geological.ore_generation_profile(), "geological_deposits");
+
+    let iron = default_state(&registry, "minecraft:iron_ore");
+    let deep_iron = default_state(&registry, "minecraft:deepslate_iron_ore");
+    let chunks = (-4..=4)
+        .flat_map(|z| (-4..=4).map(move |x| ChunkPos { x, z }))
+        .collect::<Vec<_>>();
+    let mut deposits = ore_positions(&geological, &chunks, iron, -54, 102);
+    deposits.extend(ore_positions(&geological, &chunks, deep_iron, -54, 102));
+    let largest = largest_connected_component(deposits.clone());
+    assert!(
+        largest > 512,
+        "largest geological iron deposit had only {largest} blocks"
+    );
+    assert!(deposits.iter().any(|&(x, y, z)| {
+        (x.rem_euclid(16) == 15 && deposits.contains(&(x + 1, y, z)))
+            || (z.rem_euclid(16) == 15 && deposits.contains(&(x, y, z + 1)))
+    }));
+
+    let mut default_iron = ore_positions(&default, &chunks, iron, -54, 102);
+    default_iron.extend(ore_positions(&default, &chunks, deep_iron, -54, 102));
+    assert_ne!(
+        deposits, default_iron,
+        "plugin profile must not retain the vanilla ore pass"
+    );
+}
+
 fn ore_positions(
     generator: &TerrainGenerator,
     positions: &[ChunkPos],
