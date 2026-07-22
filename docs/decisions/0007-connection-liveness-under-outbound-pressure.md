@@ -28,9 +28,9 @@ not clear or replace the challenge. A dead or fully stalled client still
 closes after the bounded inactivity deadline.
 
 Ordinary entity movement uses vanilla's default three-tick tracking interval.
-The bounded naturally spawned ground and aquatic populations are eligible every
-tick so nearby animals remain visually smooth without turning injected crowds
-into an unbounded packet workload. When more than 512 ordinary entity states
+The bounded naturally spawned hostile, ground, and aquatic populations are
+eligible every tick so nearby mobs remain visually smooth without turning
+injected crowds into an unbounded packet workload. When more than 512 ordinary entity states
 compete for one tracking turn, deterministic rotating shards publish at most
 roughly 512 states per turn. The latest unsent server state remains authoritative
 and is compared on the next eligible turn. Arrows, item entities, and experience

@@ -498,6 +498,7 @@ pub(in crate::play::session) fn install_committed_herd_spawns_locked(
     for entity in committed {
         if is_hostile_entity(&entity.type_name) {
             inner.hostile_entities.insert(entity.id);
+            inner.natural_hostile_mobs.insert(entity.id);
         } else if entity_type_uses_aquatic_physics(&entity.type_name) {
             inner.natural_aquatic_mobs.insert(entity.id);
         } else {

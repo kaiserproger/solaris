@@ -198,6 +198,9 @@ This removes packet planning from the global critical section without allowing
 a stale plan to overwrite newer state. Chunk visibility indexes and outbound
 session publication are still centralized; this is not a fully lock-free or
 fully regional publication path.
+Goal input snapshots exclude dead sessions before hostile target selection.
+Attack-time filtering remains a second authority fence, so a dead player is
+neither followed by a new goal tick nor damaged by a stale attack candidate.
 Goal apply now also exposes a narrow typed projection for the active physics
 set. It reads sorted alive kinematics from the lane-owned ECS stores after the
 successful CAS and avoids a second full-snapshot materialization on the common

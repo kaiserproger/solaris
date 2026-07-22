@@ -209,8 +209,9 @@ impl SessionRegistry {
                 .collect::<HashSet<_>>();
             let player_positions = inner
                 .sessions
-                .values()
-                .map(|session| Vec3::new(session.pose.x, session.pose.y, session.pose.z))
+                .iter()
+                .filter(|(session_id, _)| !inner.dead_sessions.contains(session_id))
+                .map(|(_, session)| Vec3::new(session.pose.x, session.pose.y, session.pose.z))
                 .collect::<Vec<_>>();
             (
                 active_chunks,
@@ -493,6 +494,7 @@ impl SessionRegistry {
             let position = entity.position;
             if is_hostile_entity(&entity.type_name) {
                 inner.hostile_entities.insert(entity_id);
+                inner.natural_hostile_mobs.insert(entity_id);
             } else if entity_type_uses_aquatic_physics(&entity.type_name) {
                 inner.natural_aquatic_mobs.insert(entity_id);
             } else if entity.animal.is_some() {
@@ -879,7 +881,8 @@ impl SessionRegistry {
                 continue;
             };
             let latency_sensitive = motion.is_arrow || motion.is_item || motion.is_experience;
-            let smooth_natural_mob = inner.natural_ground_mobs.contains(&step.id)
+            let smooth_natural_mob = inner.natural_hostile_mobs.contains(&step.id)
+                || inner.natural_ground_mobs.contains(&step.id)
                 || inner.natural_aquatic_mobs.contains(&step.id);
             if !ordinary_tracking_turn && !latency_sensitive && !smooth_natural_mob {
                 continue;

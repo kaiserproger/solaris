@@ -336,6 +336,7 @@ struct SessionRegistryInner {
     entities_by_chunk: HashMap<(i32, i32), HashSet<EntityId>>,
     entity_chunks: HashMap<EntityId, (i32, i32)>,
     hostile_entities: HashSet<EntityId>,
+    natural_hostile_mobs: HashSet<EntityId>,
     natural_ground_mobs: HashSet<EntityId>,
     natural_aquatic_mobs: HashSet<EntityId>,
     published_entity_snapshots: HashMap<EntityId, ServerEntitySnapshot>,

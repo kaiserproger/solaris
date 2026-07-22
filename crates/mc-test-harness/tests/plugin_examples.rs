@@ -276,11 +276,36 @@ label = "Dirt"
     let items = Arc::new(mc_data::items::solaris_required_items());
     let dirt_item_id = item_id(&items, "minecraft:dirt");
     let generator = Arc::new(mc_worldgen::TerrainGenerator::new(0, Arc::clone(&blocks)));
-    let world =
+    let fixture_y = generator.surface_height(0, 0) + 1;
+    let target = mc_world::BlockPos {
+        x: 0,
+        y: fixture_y,
+        z: 0,
+    };
+    let base = mc_world::BlockPos {
+        x: 1,
+        y: fixture_y - 1,
+        z: 0,
+    };
+    let placement = mc_world::BlockPos {
+        x: base.x,
+        y: base.y + 1,
+        z: base.z,
+    };
+    let mut world =
         mc_world::WorldStorage::open_with_capacity(world_dir.path(), Arc::clone(&blocks), 49)
             .expect("open disk-backed world")
             .with_item_registry(Arc::clone(&items))
             .with_generator(generator);
+    world
+        .set_block_at(target, short_grass)
+        .expect("seed protected short grass before publication");
+    world
+        .set_block_at(base, stone)
+        .expect("seed placement base before publication");
+    world
+        .set_block_at(placement, air)
+        .expect("seed protected air before publication");
     let world = Arc::new(tokio::sync::Mutex::new(world));
     let shutdown = mc_net::ShutdownHandle::default();
     let cfg = mc_net::ServerConfig {
@@ -380,16 +405,6 @@ label = "Dirt"
     let dirt_purchase = wait_for_message_and_inventory(&mut stranger, "Purchased Dirt.").await;
     assert_eq!(total_count(&dirt_purchase, dirt_item_id), 1);
 
-    let target = mc_world::BlockPos {
-        x: owner_sync.x.floor() as i32,
-        y: owner_sync.y.floor() as i32 - 2,
-        z: owner_sync.z.floor() as i32,
-    };
-    world
-        .lock()
-        .await
-        .set_block_at(target, short_grass)
-        .expect("seed protected short grass");
     stranger
         .write_packet(&ServerboundPlayerAction {
             action: PlayerActionKind::StartDestroyBlock,
@@ -409,25 +424,6 @@ label = "Dirt"
         Some(short_grass)
     );
 
-    let base = mc_world::BlockPos {
-        x: target.x + 1,
-        y: target.y,
-        z: target.z,
-    };
-    let placement = mc_world::BlockPos {
-        x: base.x,
-        y: base.y + 1,
-        z: base.z,
-    };
-    {
-        let mut world = world.lock().await;
-        world
-            .set_block_at(base, stone)
-            .expect("seed placement base");
-        world
-            .set_block_at(placement, air)
-            .expect("seed protected air");
-    }
     stranger
         .write_packet(&ServerboundUseItemOn {
             hand: InteractionHand::MainHand,

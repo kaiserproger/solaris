@@ -3,8 +3,8 @@ use std::collections::{BTreeMap, BTreeSet};
 use mc_data::Identifier;
 use mc_data::biomes::BiomeWorldgenData;
 
-use crate::terrain::TerrainGenerator;
 use crate::terrain::tests::tiny_registry;
+use crate::terrain::{SEA_LEVEL, TerrainGenerator};
 
 use super::BiomeRules;
 
@@ -14,45 +14,26 @@ fn every_overworld_biome_is_reachable_by_selector() {
     let expected: BTreeSet<_> = g.biomes.all.iter().map(Identifier::as_str).collect();
     let mut seen = BTreeSet::new();
 
-    let buckets = [
-        &g.biomes.ocean,
-        &g.biomes.beach,
-        &g.biomes.river,
-        &g.biomes.swamp,
-        &g.biomes.cold,
-        &g.biomes.temperate_forest,
-        &g.biomes.grassland,
-        &g.biomes.hot_dry,
-        &g.biomes.mountain,
-        &g.biomes.jungle,
-        &g.biomes.cave,
-    ];
-    for (bucket_index, bucket) in buckets.into_iter().enumerate() {
-        for x in (-4096..=4096).step_by(64) {
-            for z in (-4096..=4096).step_by(64) {
-                seen.insert(
-                    g.biomes
-                        .pick(bucket, x, z, 0x1000 + bucket_index as u64)
-                        .as_str()
-                        .to_string(),
-                );
+    'search: for x in (-16_384..=16_384).step_by(64) {
+        for z in (-16_384..=16_384).step_by(64) {
+            let surface = g.surface_height(x, z);
+            seen.insert(g.biome_for_cell(x, surface, z, surface).to_string());
+            seen.insert(g.biome_for(x, z, SEA_LEVEL - 20).to_string());
+            seen.insert(
+                g.biome_for_cell(x, surface.saturating_sub(32), z, surface)
+                    .to_string(),
+            );
+            if expected.iter().all(|biome| seen.contains(*biome)) {
+                break 'search;
             }
         }
     }
-    for x in (-4096..=4096).step_by(32) {
-        for z in (-4096..=4096).step_by(32) {
-            seen.insert(
-                g.biomes
-                    .pick_region_band(&g.biomes.deep_ocean, x, z)
-                    .as_str()
-                    .to_string(),
-            );
-        }
-    }
 
-    for biome in expected {
-        assert!(seen.contains(biome), "selector never emitted {biome}");
-    }
+    let missing = expected
+        .into_iter()
+        .filter(|biome| !seen.contains(*biome))
+        .collect::<Vec<_>>();
+    assert!(missing.is_empty(), "selector never emitted {missing:?}");
 }
 
 #[test]

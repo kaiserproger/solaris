@@ -283,6 +283,7 @@ pub(super) fn clear_removed_entity_tracking_locked(
 ) {
     clear_entity_publication_state_locked(inner, entity_id);
     inner.hostile_entities.remove(&entity_id);
+    inner.natural_hostile_mobs.remove(&entity_id);
     inner.natural_ground_mobs.remove(&entity_id);
     inner.natural_aquatic_mobs.remove(&entity_id);
     inner.terrain_pathing_entities.remove(&entity_id);

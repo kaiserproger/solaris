@@ -2801,6 +2801,37 @@ fn hostile_forgets_target_when_last_player_unregisters() {
 }
 
 #[test]
+fn hostile_forgets_dead_player_target_during_goal_tick() {
+    let registry = SessionRegistry::new();
+    let player = register_test_session(&registry, "DeadGoalTarget");
+    assert!(registry.mark_loaded(player, (0, 0)).is_empty());
+    registry.spawn_command_entity(
+        &SimulationAuthority::for_test(),
+        1,
+        "minecraft:zombie".to_string(),
+        Vec3::new(4.5, 64.0, 0.5),
+    );
+
+    assert_eq!(
+        registry.tick_entities_and_collect_physics_queries(1).len(),
+        1
+    );
+    registry
+        .lock_inner("mark goal target dead")
+        .dead_sessions
+        .insert(player);
+    assert!(
+        registry
+            .tick_entities_and_collect_physics_queries(2)
+            .is_empty()
+    );
+
+    let entities = registry.lock_entities("test dead goal target");
+    let entity = entities.snapshots().next().expect("spawned hostile");
+    assert!(matches!(entity.goal, GoalState::Wander { .. }));
+}
+
+#[test]
 fn fish_physics_queries_use_aquatic_water_rules() {
     let registry = SessionRegistry::new();
     let alice = register_test_session(&registry, "FishPhysicsAlice");
@@ -10146,6 +10177,56 @@ fn bounded_natural_mobs_publish_changed_movement_every_tick() {
     registry
         .lock_inner("mark bounded natural movement entity")
         .natural_ground_mobs
+        .insert(entity_id);
+
+    registry.apply_entity_physics_and_dispatch(
+        1,
+        &[EntityPhysicsStep {
+            id: entity_id,
+            position: Vec3::new(0.75, 64.0, 0.5),
+            velocity: Vec3::ZERO,
+            on_ground: true,
+            horizontal_collision: false,
+        }],
+    );
+
+    assert!(matches!(
+        rx.try_recv(),
+        Ok(OutboundCommand::MoveEntityRelative(movement)) if movement.id == entity_id
+    ));
+}
+
+#[test]
+fn bounded_natural_hostiles_publish_changed_movement_every_tick() {
+    let registry = SessionRegistry::new();
+    let (tx, mut rx) = mpsc::channel(8);
+    let (observer, _) = registry.register(
+        &profile("NaturalHostileMovementObserver"),
+        (0, 0),
+        2,
+        HashSet::from([(0, 0)]),
+        tx,
+        PlayerPose::new(0.5, 64.0, 0.5),
+    );
+    assert!(registry.mark_loaded(observer, (0, 0)).is_empty());
+    let dispatches = registry.spawn_command_entity(
+        &SimulationAuthority::for_test(),
+        54,
+        "minecraft:zombie".to_owned(),
+        Vec3::new(0.5, 64.0, 0.5),
+    );
+    let entity_id = dispatches
+        .iter()
+        .find_map(|dispatch| match &dispatch.command {
+            OutboundCommand::SpawnEntity(entity) => Some(entity.id),
+            _ => None,
+        })
+        .expect("spawned zombie is visible");
+    dispatch_visibility_commands(dispatches);
+    assert!(matches!(rx.try_recv(), Ok(OutboundCommand::SpawnEntity(_))));
+    registry
+        .lock_inner("mark bounded natural hostile movement entity")
+        .natural_hostile_mobs
         .insert(entity_id);
 
     registry.apply_entity_physics_and_dispatch(
