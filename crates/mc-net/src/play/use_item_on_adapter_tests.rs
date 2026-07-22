@@ -173,6 +173,32 @@ async fn offhand_use_item_on_places_and_debits_the_packet_selected_hand() {
 }
 
 #[tokio::test]
+async fn ordinary_block_placement_routes_all_six_clicked_faces() {
+    let clicked = BlockPos { x: 4, y: 64, z: 4 };
+    for (direction, target) in [
+        (Direction::Down, BlockPos { y: 63, ..clicked }),
+        (Direction::Up, BlockPos { y: 65, ..clicked }),
+        (Direction::North, BlockPos { z: 3, ..clicked }),
+        (Direction::South, BlockPos { z: 5, ..clicked }),
+        (Direction::West, BlockPos { x: 3, ..clicked }),
+        (Direction::East, BlockPos { x: 5, ..clicked }),
+    ] {
+        let mut harness = placement_harness(STONE_ITEM_ID).await;
+        set_block(&harness.state, clicked, BlockStateId(1)).await;
+        let action = use_item_on(clicked, direction, 0.5);
+
+        run_accepted_placement(&mut harness, clicked, &action).await;
+
+        assert_eq!(
+            harness.state.world.lock().await.get_cached_block(target),
+            Some(BlockStateId(1)),
+            "placement did not route {direction:?} to {target:?}"
+        );
+        assert_held_count(&harness, 1);
+    }
+}
+
+#[tokio::test]
 async fn ordinary_stair_placement_passes_the_real_validator_and_debits_once() {
     let mut harness = placement_harness(STAIR_ITEM_ID).await;
     let clicked = BlockPos { x: 4, y: 64, z: 4 };

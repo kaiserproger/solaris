@@ -74,6 +74,16 @@ hardening. An already-open lower-priority diff does not override this order.
 
 ## Recent Evidence
 
+- Placement is client-verified through both hands and a side face. A real
+  26.1.2 client placed stone upward from the main hand (`64 -> 63`), used the
+  ordinary vanilla input path to place upward from the offhand (`63 -> 62`),
+  then placed to the east side (`x+1`) from the main hand (`62 -> 61`). Focused
+  adapter regressions route ordinary blocks through all six clicked faces and
+  independently cover an offhand packet against an east face. The run remained
+  connected. It also exposed a harness limitation: direct
+  `minecraft_use_item_on` returned `ok` for the offhand-only stack without
+  changing its count or the target; ordinary `use` input then placed it.
+
 - A real 26.1.2 MCP client closed the intermittent survival-break gate. It mined
   eight prepared stone blocks at `x=12..19`, crossing both sides of the chunk
   boundary at `15/16`. Every first

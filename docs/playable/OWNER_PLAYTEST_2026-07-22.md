@@ -18,9 +18,14 @@ verification and keep ordinary survival play ahead of rare edge cases.
   `x=12..19`, crossing the chunk boundary at `15/16`; every first attempt became
   air, exposed its item entity, and the final inventory contained exactly eight
   cobblestone without a disconnect.
-- [ ] Block placement must work on every valid face and from either hand. The
-  owner transaction now accepts and debits the offhand slot, with a focused
-  regression; owner/client confirmation is still pending.
+- [x] Block placement must work on every valid face and from either hand. The
+  owner transaction accepts and debits the packet-selected hand, and focused
+  coverage routes ordinary placement through all six clicked faces and places
+  from the offhand against an east face. A real 26.1.2 client then placed stone
+  upward from the main hand (`64 -> 63`), upward from the offhand through the
+  ordinary vanilla use input (`63 -> 62`), and to the east side (`x+1`) from
+  the main hand (`62 -> 61`); all three authoritative block updates reached
+  the client without a disconnect.
 - [ ] Embed exact vanilla collision shapes so torches, doors, crops, slabs,
   stairs, fences, and other non-cubes never fall back to full-cube collision.
   All 29,873 vanilla 26.1.2 states now have their context-free shape embedded in
@@ -54,6 +59,11 @@ verification and keep ordinary survival play ahead of rare edge cases.
   return on the inventory event. The chunk-edge client gate collected all eight
   cobblestone into a non-selected slot, but every call returned
   `pickup_confirmed=false` even though the final inventory was correct.
+- [ ] `minecraft_use_item_on` must expose the hand to exercise or perform the
+  same main-then-offhand dispatch as ordinary vanilla use input. It currently
+  returned `ok` for an offhand-only stack but left its count and target block
+  unchanged; `minecraft_press_inputs(use)` then performed the vanilla fallback
+  and placed the block.
 
 ## World Generation
 
