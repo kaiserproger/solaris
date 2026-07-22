@@ -9,6 +9,7 @@ public final class ClientMcpTools {
     private static final List<String> BLOCK_FACES = List.of(
         "down", "up", "north", "south", "west", "east"
     );
+    private static final List<String> INTERACTION_HANDS = List.of("main_hand", "off_hand");
     private static final List<String> INPUT_KEYS = List.of(
         "forward", "back", "left", "right", "jump", "sneak", "sprint", "attack", "use",
         "swap_offhand"
@@ -230,9 +231,9 @@ public final class ClientMcpTools {
         ),
         mutating(
             "minecraft_use_item_on",
-            "Use the selected item on a face of a loaded client-visible block.",
+            "Use the selected main- or off-hand item on a face of a loaded client-visible block.",
             "use_item_on",
-            blockFaceSchema()
+            blockUseSchema()
         ),
         mutating(
             "minecraft_break_block",
@@ -418,6 +419,21 @@ public final class ClientMcpTools {
         );
     }
 
+    private static JsonObject blockUseSchema() {
+        JsonObject hand = enumString(INTERACTION_HANDS);
+        hand.addProperty("default", "main_hand");
+        return objectSchema(
+            properties(
+                "x", integer(),
+                "y", integer(),
+                "z", integer(),
+                "face", enumString(BLOCK_FACES),
+                "hand", hand
+            ),
+            List.of("x", "y", "z", "face")
+        );
+    }
+
     private static JsonObject blockNavigationSchema() {
         return objectSchema(
             properties(
@@ -571,7 +587,7 @@ public final class ClientMcpTools {
     }
 
     private static JsonObject entityInteractionSchema() {
-        JsonObject hand = enumString(List.of("main_hand", "off_hand"));
+        JsonObject hand = enumString(INTERACTION_HANDS);
         hand.addProperty("default", "main_hand");
         return objectSchema(
             properties(

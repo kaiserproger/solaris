@@ -90,7 +90,7 @@ public interface ClientFacade {
 
     void lookAtBlock(int x, int y, int z, String face);
 
-    void useItemOn(int x, int y, int z, String face);
+    JsonObject useItemOn(int x, int y, int z, String face, String hand);
 
     default JsonObject breakBlock(
         int x,

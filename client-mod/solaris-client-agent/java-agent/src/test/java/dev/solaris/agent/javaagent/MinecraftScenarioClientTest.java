@@ -359,6 +359,22 @@ final class MinecraftScenarioClientTest {
     }
 
     @Test
+    void blockUseMapsBothVanillaInteractionHands() {
+        assertEquals(
+            net.minecraft.world.InteractionHand.MAIN_HAND,
+            MinecraftScenarioClient.interactionHand("main_hand")
+        );
+        assertEquals(
+            net.minecraft.world.InteractionHand.OFF_HAND,
+            MinecraftScenarioClient.interactionHand("off_hand")
+        );
+        org.junit.jupiter.api.Assertions.assertThrows(
+            IllegalArgumentException.class,
+            () -> MinecraftScenarioClient.interactionHand("left")
+        );
+    }
+
+    @Test
     void mapsAllVanillaDyeColorsToWoolItems() throws Exception {
         Map<String, String> expected = Map.ofEntries(
             Map.entry("WHITE", "minecraft:white_wool"),

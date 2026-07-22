@@ -2939,17 +2939,18 @@ public final class MinecraftScenarioClient implements ScenarioClient {
         minecraft.player.lookAt(EntityAnchorArgument.Anchor.EYES, hitResult(target).getLocation());
     }
 
-    static ScenarioUseResult useItemOnClientThread(ScenarioBlockTarget target) {
+    static ScenarioUseResult useItemOnClientThread(ScenarioBlockTarget target, String handName) {
         Minecraft minecraft = requireInPlay();
         BlockHitResult hit = hitResult(target);
+        InteractionHand hand = interactionHand(handName);
         minecraft.hitResult = hit;
         minecraft.player.lookAt(EntityAnchorArgument.Anchor.EYES, hit.getLocation());
         InteractionResult result = minecraft.gameMode.useItemOn(
             minecraft.player,
-            InteractionHand.MAIN_HAND,
+            hand,
             hit
         );
-        minecraft.player.swing(InteractionHand.MAIN_HAND);
+        minecraft.player.swing(hand);
         return new ScenarioUseResult(result.toString());
     }
 

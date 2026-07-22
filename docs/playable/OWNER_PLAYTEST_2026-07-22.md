@@ -104,11 +104,12 @@ verification and keep ordinary survival play ahead of rare edge cases.
   and returned `pickup_confirmed=true` when cobblestone increased from `0` to
   `1` in non-selected slot `1`; the diamond pickaxe remained selected in slot
   `0`, the block became air, and the client stayed in play.
-- [ ] `minecraft_use_item_on` must expose the hand to exercise or perform the
-  same main-then-offhand dispatch as ordinary vanilla use input. It currently
-  returned `ok` for an offhand-only stack but left its count and target block
-  unchanged; `minecraft_press_inputs(use)` then performed the vanilla fallback
-  and placed the block.
+- [x] `minecraft_use_item_on` exposes `main_hand` and `off_hand`, defaults to
+  main hand, dispatches that exact vanilla interaction hand, and returns the
+  local interaction result instead of unconditional `ok`. In the focused real
+  26.1.2 client gate, one stone occupied offhand inventory slot `40` while the
+  selected main hand was empty; `hand=off_hand` returned vanilla `Success`,
+  placed the stone, consumed it from `1` to `0`, and kept the client in play.
 - [ ] `minecraft_respawn` must not report success while the real client remains
   dead. A pickup-gate rerun against a persisted dead player returned from
   respawn with `health=0`; subsequent server `/give` feedback reached chat but

@@ -116,6 +116,7 @@ final class ClientMcpToolsTest {
         ));
         JsonObject drop = properties(find(ClientMcpTools.definitions(), "minecraft_drop_selected_item"));
         JsonObject breakBlock = properties(find(ClientMcpTools.definitions(), "minecraft_break_block"));
+        JsonObject useItemOn = properties(find(ClientMcpTools.definitions(), "minecraft_use_item_on"));
         JsonObject respawn = properties(find(ClientMcpTools.definitions(), "minecraft_respawn"));
         JsonObject quickMove = properties(find(
             ClientMcpTools.definitions(),
@@ -239,6 +240,15 @@ final class ClientMcpToolsTest {
         assertEquals(64, drop.get("count").getAsJsonObject().get("maximum").getAsInt());
         assertEquals(120.0, drop.get("timeout_seconds").getAsJsonObject().get("maximum").getAsDouble());
         assertEquals(64, breakBlock.get("expected_drop_count").getAsJsonObject().get("maximum").getAsInt());
+        assertEquals(
+            List.of("main_hand", "off_hand"),
+            useItemOn.get("hand").getAsJsonObject().getAsJsonArray("enum")
+                .asList()
+                .stream()
+                .map(value -> value.getAsString())
+                .toList()
+        );
+        assertEquals("main_hand", useItemOn.get("hand").getAsJsonObject().get("default").getAsString());
         assertEquals(120.0, breakBlock.get("timeout_seconds").getAsJsonObject().get("maximum").getAsDouble());
         assertEquals(3, respawn.size());
         assertEquals(0.1, respawn.get("timeout_seconds").getAsJsonObject().get("minimum").getAsDouble());

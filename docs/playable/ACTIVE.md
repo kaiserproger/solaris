@@ -89,9 +89,16 @@ hardening. An already-open lower-priority diff does not override this order.
   then placed to the east side (`x+1`) from the main hand (`62 -> 61`). Focused
   adapter regressions route ordinary blocks through all six clicked faces and
   independently cover an offhand packet against an east face. The run remained
-  connected. It also exposed a harness limitation: direct
+  connected. It also exposed the now-closed direct-use limitation below:
   `minecraft_use_item_on` returned `ok` for the offhand-only stack without
-  changing its count or the target; ordinary `use` input then placed it.
+  changing its count or the target, while ordinary `use` input placed it.
+
+- The direct client-MCP offhand gap is closed. `minecraft_use_item_on` accepts
+  `main_hand` or `off_hand`, defaults to main hand, forwards the exact vanilla
+  interaction hand, and returns the local interaction result. In the focused
+  26.1.2 gate, stone was present only in offhand slot `40`, the selected main
+  hand was empty, and `hand=off_hand` returned vanilla `Success`, placed stone,
+  consumed the stack from `1` to `0`, and left the client in play.
 
 - A real 26.1.2 MCP client closed the intermittent survival-break gate. It mined
   eight prepared stone blocks at `x=12..19`, crossing both sides of the chunk

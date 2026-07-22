@@ -743,10 +743,16 @@ public final class MinecraftClientFacade implements ClientFacade {
     }
 
     @Override
-    public void useItemOn(int x, int y, int z, String face) {
-        MinecraftScenarioClient.useItemOnClientThread(
-            new ScenarioBlockTarget(x, y, z, face, "manual-command", blockIdAt(x, y, z))
+    public JsonObject useItemOn(int x, int y, int z, String face, String hand) {
+        ScenarioUseResult result = MinecraftScenarioClient.useItemOnClientThread(
+            new ScenarioBlockTarget(x, y, z, face, "manual-command", blockIdAt(x, y, z)),
+            hand
         );
+        JsonObject response = new JsonObject();
+        response.addProperty("dispatched", true);
+        response.addProperty("hand", hand);
+        response.addProperty("result", result.result());
+        return response;
     }
 
     @Override

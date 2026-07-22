@@ -398,6 +398,40 @@ final class ClientCommandsTest {
     }
 
     @Test
+    void useItemOnForwardsExplicitHandAndReturnsTheVanillaResult() throws Exception {
+        ImmediateExecutor executor = new ImmediateExecutor();
+        FakeClient client = new FakeClient();
+        CommandRegistry registry = ClientCommands.create(executor, client);
+
+        JsonObject result = registry.find("use_item_on").orElseThrow().execute(request(
+            "use_item_on",
+            "{\"x\":4,\"y\":65,\"z\":-2,\"face\":\"east\",\"hand\":\"off_hand\"}"
+        ));
+
+        assertTrue(result.get("dispatched").getAsBoolean());
+        assertEquals("off_hand", result.get("hand").getAsString());
+        assertEquals("SUCCESS", result.get("result").getAsString());
+        assertEquals(List.of(4, 65, -2), client.useItemTarget);
+        assertEquals("east", client.useItemFace);
+        assertEquals("off_hand", client.useItemHand);
+        assertEquals(1, executor.calls);
+
+        registry.find("use_item_on").orElseThrow().execute(request(
+            "use_item_on",
+            "{\"x\":4,\"y\":65,\"z\":-2,\"face\":\"east\"}"
+        ));
+        assertEquals("main_hand", client.useItemHand);
+
+        assertThrows(IllegalArgumentException.class, () -> registry.find("use_item_on")
+            .orElseThrow()
+            .execute(request(
+                "use_item_on",
+                "{\"x\":4,\"y\":65,\"z\":-2,\"face\":\"east\",\"hand\":\"left\"}"
+            ))
+        );
+    }
+
+    @Test
     void entityIdentityWaitsDoNotHoldSerializedExecutionLock() throws Exception {
         String uuid = "01234567-89ab-cdef-0123-456789abcdef";
         String payload = "{\"entity_id\":42,\"entity_uuid\":\"" + uuid + "\","
@@ -1126,6 +1160,9 @@ final class ClientCommandsTest {
         UUID interactedEntityUuid;
         String interactedEntityType;
         String interactedHand;
+        List<Integer> useItemTarget;
+        String useItemFace;
+        String useItemHand;
         Duration respawnTimeout;
         List<Integer> breakTarget;
         String breakFace;
@@ -1467,7 +1504,15 @@ final class ClientCommandsTest {
         }
 
         @Override
-        public void useItemOn(int x, int y, int z, String face) {
+        public JsonObject useItemOn(int x, int y, int z, String face, String hand) {
+            useItemTarget = List.of(x, y, z);
+            useItemFace = face;
+            useItemHand = hand;
+            JsonObject result = new JsonObject();
+            result.addProperty("dispatched", true);
+            result.addProperty("hand", hand);
+            result.addProperty("result", "SUCCESS");
+            return result;
         }
 
         @Override

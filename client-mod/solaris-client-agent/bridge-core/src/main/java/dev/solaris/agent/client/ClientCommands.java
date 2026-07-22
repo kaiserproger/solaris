@@ -248,11 +248,15 @@ public final class ClientCommands {
             });
         });
         registry.register("use_item_on", request -> {
-            BlockTarget target = blockTarget(request.payload());
-            return executor.callOnClientThread(() -> {
-                client.useItemOn(target.x, target.y, target.z, target.face);
-                return ok();
-            });
+            JsonObject payload = request.payload();
+            BlockTarget target = blockTarget(payload);
+            return executor.callOnClientThread(() -> client.useItemOn(
+                target.x,
+                target.y,
+                target.z,
+                target.face,
+                entityInteractionHand(payload)
+            ));
         });
         registry.register("break_block", request -> {
             JsonObject payload = request.payload();
