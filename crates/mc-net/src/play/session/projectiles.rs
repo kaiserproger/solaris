@@ -1044,8 +1044,8 @@ fn collect_arrow_entity_candidate_snapshots_locked(
     let chunk_count = u64::from(min_cx.abs_diff(max_cx))
         .saturating_add(1)
         .saturating_mul(u64::from(min_cz.abs_diff(max_cz)).saturating_add(1));
-    if chunk_count >= inner.entities_by_chunk.len() as u64 {
-        for id in inner.entity_chunks.keys().copied() {
+    if chunk_count >= inner.simulation_inputs.tracked_chunk_count() as u64 {
+        for id in inner.simulation_inputs.all_entity_ids() {
             if !push_arrow_candidate_snapshot(inner, snapshots, id) {
                 return false;
             }
@@ -1056,7 +1056,7 @@ fn collect_arrow_entity_candidate_snapshots_locked(
 
     for cz in min_cz..=max_cz {
         for cx in min_cx..=max_cx {
-            if let Some(chunk_ids) = inner.entities_by_chunk.get(&(cx, cz)) {
+            if let Some(chunk_ids) = inner.simulation_inputs.entities_in_chunk((cx, cz)) {
                 for id in chunk_ids.iter().copied() {
                     if !push_arrow_candidate_snapshot(inner, snapshots, id) {
                         return false;

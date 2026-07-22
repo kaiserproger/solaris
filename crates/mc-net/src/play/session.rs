@@ -345,8 +345,6 @@ struct SessionRegistryInner {
     sessions: HashMap<SessionId, PlaySession>,
     loaded_chunk_refcounts: HashMap<(i32, i32), usize>,
     tickets: HashMap<(i32, i32), HashSet<SessionId>>,
-    entities_by_chunk: HashMap<(i32, i32), HashSet<EntityId>>,
-    entity_chunks: HashMap<EntityId, (i32, i32)>,
     hostile_entities: HashSet<EntityId>,
     natural_hostile_mobs: HashSet<EntityId>,
     natural_ground_mobs: HashSet<EntityId>,

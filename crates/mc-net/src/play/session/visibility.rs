@@ -459,10 +459,10 @@ pub(super) fn refresh_loaded_chunk_for_session_locked(
         .map(|(&target_id, target)| (target_id, session_snapshot(target_id, target)))
         .collect::<Vec<_>>();
     let entities = inner
-        .entities_by_chunk
-        .get(&chunk)
+        .simulation_inputs
+        .entities_in_chunk(chunk)
         .into_iter()
-        .flat_map(|entities| entities.iter().copied())
+        .flat_map(|entities| entities.iter().copied().collect::<Vec<_>>())
         .filter_map(|entity_id| inner.published_entity_snapshots.get(&entity_id).cloned())
         .collect::<Vec<_>>();
 
@@ -523,7 +523,7 @@ pub(super) fn refresh_unloaded_chunk_for_session_locked(
         .iter()
         .copied()
         .filter_map(|entity_id| {
-            (inner.entity_chunks.get(&entity_id).copied() == Some(chunk))
+            (inner.simulation_inputs.entity_chunk(entity_id) == Some(chunk))
                 .then(|| inner.published_entity_snapshots.get(&entity_id).cloned())?
         })
         .collect::<Vec<_>>();
@@ -679,10 +679,13 @@ pub(super) fn install_committed_entity_publications_locked(
     let mut publications = Vec::with_capacity(snapshots.len());
     let mut publications_by_chunk = HashMap::<(i32, i32), Vec<usize>>::new();
     for snapshot in snapshots {
+        let chunk = inner
+            .simulation_inputs
+            .entity_chunk(snapshot.id)
+            .expect("committed entity snapshot must have a routing entry");
         inner
             .published_entity_snapshots
             .insert(snapshot.id, snapshot.clone());
-        let chunk = inner.entity_chunks[&snapshot.id];
         let publication_index = publications.len();
         publications.push(EntityPublication {
             snapshot,
@@ -763,7 +766,7 @@ pub(super) fn spawn_entity_visibility_from_snapshot_locked(
     snapshot: ServerEntitySnapshot,
 ) -> Vec<VisibilityDispatch> {
     let entity_id = snapshot.id;
-    let Some(chunk) = inner.entity_chunks.get(&entity_id).copied() else {
+    let Some(chunk) = inner.simulation_inputs.entity_chunk(entity_id) else {
         return Vec::new();
     };
     inner
@@ -886,8 +889,13 @@ pub(super) fn refresh_visibility_locked(
             let desired = observer
                 .loaded
                 .iter()
-                .filter_map(|chunk| inner.entities_by_chunk.get(chunk))
-                .flat_map(|entities| entities.iter().copied())
+                .flat_map(|chunk| {
+                    inner
+                        .simulation_inputs
+                        .entities_in_chunk(*chunk)
+                        .map(|entities| entities.iter().copied().collect::<Vec<_>>())
+                        .unwrap_or_default()
+                })
                 .filter(|entity_id| inner.published_entity_snapshots.contains_key(entity_id))
                 .collect();
             Some((*observer_id, desired))

@@ -59,9 +59,12 @@ Current runtime facts:
 - Ordinary goal-input collection reads immutable active chunks, a 64-shard
   chunk-to-entity index, terrain-pathing IDs, and per-session combat-target
   poses without entering `SessionRegistry.inner`. A revision fence keeps
-  active chunks and cross-shard entity moves coherent for readers. Existing
-  centralized mutation paths still refresh these publications; this is not
-  full regional mutation ownership.
+  active chunks and cross-shard entity moves coherent for readers. The
+  publication is the sole chunk/entity routing index; visibility, projectiles,
+  grazing, lifecycle radius queries, and player-body relocation no longer read
+  duplicate maps from `SessionRegistry.inner`. Existing centralized mutation
+  paths still refresh the publication; this is not full regional mutation
+  ownership.
 - Item despawn uses a simulation-tick deadline index. Ordinary physics turns do
   not scan the full entity store; only due item ids reach their owner lanes.
   Restored items retain the deadline derived from their persisted `spawn_tick`;

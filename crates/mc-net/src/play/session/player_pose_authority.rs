@@ -395,7 +395,7 @@ pub(super) fn publish_player_body_pushes_locked(
             published.velocity = velocity;
         }
         let new_chunk = chunk_pos_from_coords(position.x, position.z);
-        match inner.entity_chunks.get(&entity_id).copied() {
+        match inner.simulation_inputs.entity_chunk(entity_id) {
             Some(old_chunk) if old_chunk != new_chunk => {
                 move_entity_chunk_locked(inner, entity_id, old_chunk, new_chunk);
                 dispatches.extend(refresh_entity_target_visibility_locked(

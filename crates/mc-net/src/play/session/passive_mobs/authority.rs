@@ -428,15 +428,7 @@ impl SessionRegistry {
         _authority: &SimulationAuthority,
         tick: u64,
     ) -> SheepGrazingPlan {
-        let loaded_entity_ids = {
-            let inner = self.lock_inner("snapshot loaded sheep grazing candidates");
-            inner
-                .loaded_chunk_refcounts
-                .keys()
-                .filter_map(|chunk| inner.entities_by_chunk.get(chunk))
-                .flat_map(|entities| entities.iter().copied())
-                .collect::<HashSet<_>>()
-        };
+        let (_, loaded_entity_ids) = self.simulation_inputs.active_entity_candidates();
         let mut entities = self.lock_entities("snapshot sheep grazing candidates");
         #[cfg(test)]
         self.pause_during_sheep_grazing_plan_for_test();

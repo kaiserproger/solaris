@@ -276,7 +276,7 @@ pub(super) fn nearby_entity_candidate_ids_locked(
     let mut ids = Vec::new();
     for cz in min_cz..=max_cz {
         for cx in min_cx..=max_cx {
-            if let Some(chunk_ids) = inner.entities_by_chunk.get(&(cx, cz)) {
+            if let Some(chunk_ids) = inner.simulation_inputs.entities_in_chunk((cx, cz)) {
                 ids.extend(chunk_ids.iter().copied());
             }
         }
@@ -328,12 +328,6 @@ pub(super) fn track_entity_chunk_locked(
     position: Vec3,
 ) {
     let chunk = chunk_pos_from_coords(position.x, position.z);
-    inner.entity_chunks.insert(entity_id, chunk);
-    inner
-        .entities_by_chunk
-        .entry(chunk)
-        .or_default()
-        .insert(entity_id);
     inner.simulation_inputs.track_entity(chunk, entity_id);
 }
 
@@ -343,31 +337,10 @@ pub(super) fn move_entity_chunk_locked(
     old_chunk: (i32, i32),
     new_chunk: (i32, i32),
 ) {
-    if let Some(entities) = inner.entities_by_chunk.get_mut(&old_chunk) {
-        entities.remove(&entity_id);
-        if entities.is_empty() {
-            inner.entities_by_chunk.remove(&old_chunk);
-        }
-    }
-    inner.entity_chunks.insert(entity_id, new_chunk);
-    inner
-        .entities_by_chunk
-        .entry(new_chunk)
-        .or_default()
-        .insert(entity_id);
-    inner
-        .simulation_inputs
-        .move_entity(entity_id, old_chunk, new_chunk);
+    let routed_old_chunk = inner.simulation_inputs.move_entity(entity_id, new_chunk);
+    debug_assert_eq!(routed_old_chunk, Some(old_chunk));
 }
 
 fn untrack_entity_chunk_locked(inner: &mut SessionRegistryInner, entity_id: EntityId) {
-    if let Some(chunk) = inner.entity_chunks.remove(&entity_id) {
-        if let Some(entities) = inner.entities_by_chunk.get_mut(&chunk) {
-            entities.remove(&entity_id);
-            if entities.is_empty() {
-                inner.entities_by_chunk.remove(&chunk);
-            }
-        }
-        inner.simulation_inputs.untrack_entity(chunk, entity_id);
-    }
+    inner.simulation_inputs.untrack_entity(entity_id);
 }

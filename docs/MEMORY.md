@@ -96,8 +96,11 @@ and is not startup context.
   `SessionRegistry.inner`. Active chunks, a 64-shard chunk-to-entity index,
   terrain-pathing IDs, and per-session combat-target poses are immutable
   publications. A revision fence prevents cross-shard moves from disappearing
-  from concurrent snapshots. Mutation paths remain centralized, so this is a
-  removed global read lock, not completed regional mutation ownership.
+  from concurrent snapshots. The duplicate chunk/entity maps were removed from
+  `SessionRegistry.inner`; visibility, projectiles, grazing, lifecycle radius
+  queries, and player-body relocation now use the same routing authority.
+  Mutation paths remain centralized, so regional mutation ownership is still
+  incomplete.
 - The exact dense 5,132-cow O3 gate is closed. The final reproduced cause was
   an unanswered keepalive challenge while valid movement packets still proved
   the client alive. Solaris now preserves one pending challenge, requires both

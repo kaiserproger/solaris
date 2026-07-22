@@ -680,9 +680,8 @@ impl SessionRegistry {
             .iter()
             .filter_map(|step| {
                 inner
-                    .entity_chunks
-                    .get(&step.id)
-                    .copied()
+                    .simulation_inputs
+                    .entity_chunk(step.id)
                     .map(|chunk| (step.id, chunk))
             })
             .collect();

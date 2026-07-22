@@ -1100,7 +1100,7 @@ fn breeding_commits_and_publishes_once_across_a_region_boundary() {
             .map(|entity| entity.id),
         Some(child.id)
     );
-    assert_eq!(inner.entity_chunks.get(&child.id), Some(&(8, 0)));
+    assert_eq!(inner.simulation_inputs.entity_chunk(child.id), Some((8, 0)));
 }
 
 #[test]
@@ -4198,8 +4198,8 @@ fn committed_herd_batch_publication_preserves_visibility_order_and_indexes() {
     assert_eq!(entities.snapshot(east_id).unwrap().retained.spawn_tick, 77);
     drop(entities);
     let inner = registry.lock_inner("inspect committed herd batch");
-    assert_eq!(inner.entity_chunks.get(&west_id), Some(&west));
-    assert_eq!(inner.entity_chunks.get(&east_id), Some(&east));
+    assert_eq!(inner.simulation_inputs.entity_chunk(west_id), Some(west));
+    assert_eq!(inner.simulation_inputs.entity_chunk(east_id), Some(east));
     assert!(inner.published_entity_snapshots.contains_key(&west_id));
     assert!(inner.published_entity_snapshots.contains_key(&east_id));
     assert!(inner.sessions[&alice].visible_entities.contains(&west_id));
@@ -4359,8 +4359,13 @@ fn ensure_chunk_herd_releases_session_lock_during_durable_unique_batch() {
     {
         let inner = registry.lock_inner("inspect durable herd publication");
         for entity_id in [restored_id, new.id] {
-            assert_eq!(inner.entity_chunks.get(&entity_id), Some(&chunk));
-            assert!(inner.entities_by_chunk[&chunk].contains(&entity_id));
+            assert_eq!(inner.simulation_inputs.entity_chunk(entity_id), Some(chunk));
+            assert!(
+                inner
+                    .simulation_inputs
+                    .entities_in_chunk(chunk)
+                    .is_some_and(|entities| entities.contains(&entity_id))
+            );
             let published = &inner.published_entity_snapshots[&entity_id];
             let wire = inner
                 .entity_movement_trackers
@@ -4496,13 +4501,7 @@ fn safe_chunk_herd_failure_releases_claim_for_one_exact_retry() {
     {
         let inner = registry.lock_inner("inspect failed herd publication");
         assert!(!inner.spawned_entity_chunks.contains(&chunk));
-        assert!(
-            !inner
-                .entity_chunks
-                .values()
-                .any(|indexed| *indexed == chunk)
-        );
-        assert!(!inner.entities_by_chunk.contains_key(&chunk));
+        assert!(inner.simulation_inputs.entities_in_chunk(chunk).is_none());
         assert!(inner.published_entity_snapshots.is_empty());
         assert!(inner.entity_movement_trackers.is_empty());
     }
@@ -4544,7 +4543,7 @@ fn unknown_chunk_herd_failure_keeps_claim_and_cannot_retry() {
     {
         let inner = registry.lock_inner("inspect uncertain herd claim");
         assert!(inner.spawned_entity_chunks.contains(&chunk));
-        assert!(!inner.entities_by_chunk.contains_key(&chunk));
+        assert!(inner.simulation_inputs.entities_in_chunk(chunk).is_none());
         assert!(inner.published_entity_snapshots.is_empty());
     }
     assert!(
@@ -4708,8 +4707,16 @@ fn pending_hostile_activation_releases_session_lock_during_journal_commit() {
     {
         let inner = registry.lock_inner("inspect pending hostile publication");
         assert!(!inner.pending_hostile_spawns.contains_key(&chunk));
-        assert_eq!(inner.entity_chunks.get(&hostile.id), Some(&chunk));
-        assert!(inner.entities_by_chunk[&chunk].contains(&hostile.id));
+        assert_eq!(
+            inner.simulation_inputs.entity_chunk(hostile.id),
+            Some(chunk)
+        );
+        assert!(
+            inner
+                .simulation_inputs
+                .entities_in_chunk(chunk)
+                .is_some_and(|entities| entities.contains(&hostile.id))
+        );
         let published = &inner.published_entity_snapshots[&hostile.id];
         let wire = inner
             .entity_movement_trackers
@@ -4860,7 +4867,7 @@ fn pending_hostile_chunks_commit_and_publish_as_one_batch() {
     {
         let inner = registry.lock_inner("inspect atomic pending hostile publication");
         assert!(inner.published_entity_snapshots.is_empty());
-        assert!(inner.entities_by_chunk.is_empty());
+        assert!(inner.simulation_inputs.all_entity_ids().is_empty());
     }
 
     release_tx
@@ -4883,7 +4890,7 @@ fn pending_hostile_chunks_commit_and_publish_as_one_batch() {
     assert!(
         chunks
             .iter()
-            .all(|chunk| inner.entities_by_chunk.contains_key(chunk))
+            .all(|chunk| inner.simulation_inputs.entities_in_chunk(*chunk).is_some())
     );
 }
 
@@ -4940,7 +4947,7 @@ fn unknown_pending_hostile_failure_does_not_publish_or_retry() {
     {
         let inner = registry.lock_inner("inspect uncertain pending hostile publication");
         assert!(!inner.pending_hostile_spawns.contains_key(&chunk));
-        assert!(!inner.entities_by_chunk.contains_key(&chunk));
+        assert!(inner.simulation_inputs.entities_in_chunk(chunk).is_none());
         assert!(inner.published_entity_snapshots.is_empty());
         assert!(inner.entity_movement_trackers.is_empty());
         assert!(inner.sessions[&observer].visible_entities.is_empty());
@@ -7461,11 +7468,8 @@ fn moving_arrow_deduplicates_complete_chunk_candidates_before_kernel_prepare() {
     };
     let target_health = server_entity_health(&registry, target_id);
     registry
-        .lock_inner("duplicate arrow candidate across chunks")
-        .entities_by_chunk
-        .entry((0, 0))
-        .or_default()
-        .insert(target_id);
+        .simulation_inputs
+        .insert_chunk_candidate_for_test((0, 0), target_id);
 
     registry.apply_entity_physics_and_dispatch(
         1,
@@ -10091,7 +10095,7 @@ fn non_finite_entity_physics_is_rejected_before_visibility_mutation() {
                 .get(&entity_id)
                 .cloned()
                 .expect("published zombie snapshot"),
-            inner.entity_chunks.get(&entity_id).copied(),
+            inner.simulation_inputs.entity_chunk(entity_id),
         )
     };
 
@@ -10118,7 +10122,7 @@ fn non_finite_entity_physics_is_rejected_before_visibility_mutation() {
                 .get(&entity_id)
                 .cloned()
                 .expect("published zombie snapshot"),
-            inner.entity_chunks.get(&entity_id).copied(),
+            inner.simulation_inputs.entity_chunk(entity_id),
             tracker.tracking_update_count,
             tracker.teleport_delay,
         )
@@ -10273,17 +10277,20 @@ fn player_body_push_keeps_entity_chunk_index_with_authoritative_position() {
         .position;
     let expected_chunk = chunk_pos_from_coords(position.x, position.z);
     assert_eq!(expected_chunk, (0, 0));
-    assert_eq!(inner.entity_chunks.get(&entity_id), Some(&expected_chunk));
+    assert_eq!(
+        inner.simulation_inputs.entity_chunk(entity_id),
+        Some(expected_chunk)
+    );
     assert!(
         inner
-            .entities_by_chunk
-            .get(&expected_chunk)
+            .simulation_inputs
+            .entities_in_chunk(expected_chunk)
             .is_some_and(|entities| entities.contains(&entity_id))
     );
     assert!(
         inner
-            .entities_by_chunk
-            .get(&(1, 0))
+            .simulation_inputs
+            .entities_in_chunk((1, 0))
             .is_none_or(|entities| !entities.contains(&entity_id))
     );
     assert!(!dispatches.iter().any(|dispatch| {

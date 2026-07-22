@@ -536,9 +536,13 @@ chunks, a 64-shard chunk-to-entity index, terrain-pathing IDs, and per-session
 combat-target poses. It therefore does not enter `SessionRegistry.inner`.
 One revision fence covers active-chunk and entity-index publication so a
 cross-shard move cannot disappear from a concurrent snapshot.
-Chunk, entity, and pathing mutations still refresh these publications from the
-existing centralized mutation paths, so this removes a global read lock rather
-than completing regional mutation ownership.
+The publication owns both chunk-to-entity and entity-to-chunk routing. The
+duplicate maps formerly stored in `SessionRegistry.inner` were deleted;
+visibility, projectile collision, sheep grazing, lifecycle radius queries, and
+player-body relocation read the same fenced authority. Chunk, entity, and
+pathing mutations still enter through existing centralized mutation paths, so
+this removes a global index authority rather than completing regional mutation
+ownership.
 Item lifetime expiry no longer performs a full entity snapshot during every
 physics publication turn. Item creation and restore add the entity id to a
 simulation-tick deadline index; an expiry turn reads and removes only due ids,

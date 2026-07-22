@@ -57,12 +57,16 @@ fn chunk_and_entity_publications_follow_exact_membership() {
 
     inputs.insert_active_chunk(old_chunk);
     inputs.track_entity(old_chunk, entity);
+    assert_eq!(inputs.entity_chunk(entity), Some(old_chunk));
+    assert_eq!(inputs.tracked_chunk_count(), 1);
     assert_eq!(
         inputs.entity_candidates(inputs.active_chunks().as_ref()),
         HashSet::from([entity])
     );
 
-    inputs.move_entity(entity, old_chunk, new_chunk);
+    assert_eq!(inputs.move_entity(entity, new_chunk), Some(old_chunk));
+    assert_eq!(inputs.entity_chunk(entity), Some(new_chunk));
+    assert!(inputs.entities_in_chunk(old_chunk).is_none());
     assert!(
         inputs
             .entity_candidates(inputs.active_chunks().as_ref())
@@ -75,7 +79,9 @@ fn chunk_and_entity_publications_follow_exact_membership() {
     );
 
     inputs.remove_active_chunk(old_chunk);
-    inputs.untrack_entity(new_chunk, entity);
+    inputs.untrack_entity(entity);
+    assert_eq!(inputs.entity_chunk(entity), None);
+    assert!(inputs.all_entity_ids().is_empty());
     assert!(
         inputs
             .entity_candidates(inputs.active_chunks().as_ref())
@@ -135,4 +141,47 @@ fn spectator_pose_remains_a_goal_input_without_becoming_a_combat_target() {
         .combat_target();
     assert!(target.is_alive());
     assert!(!target.is_targetable());
+}
+
+#[test]
+fn cross_shard_moves_never_disappear_from_a_concurrent_snapshot() {
+    use std::sync::Barrier;
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    let inputs = Arc::new(SimulationInputPublication::default());
+    let entity = EntityId(17);
+    let first_chunk = (0, 0);
+    let second_chunk = (8, -3);
+    inputs.insert_active_chunk(first_chunk);
+    inputs.insert_active_chunk(second_chunk);
+    inputs.track_entity(first_chunk, entity);
+
+    let start = Arc::new(Barrier::new(2));
+    let finished = Arc::new(AtomicBool::new(false));
+    let writer_inputs = Arc::clone(&inputs);
+    let writer_start = Arc::clone(&start);
+    let writer_finished = Arc::clone(&finished);
+    let writer = std::thread::spawn(move || {
+        writer_start.wait();
+        let mut destination = second_chunk;
+        for _ in 0..10_000 {
+            writer_inputs.move_entity(entity, destination);
+            destination = if destination == first_chunk {
+                second_chunk
+            } else {
+                first_chunk
+            };
+        }
+        writer_finished.store(true, Ordering::Release);
+    });
+
+    start.wait();
+    while !finished.load(Ordering::Acquire) {
+        let (_, candidates) = inputs.active_entity_candidates();
+        assert!(candidates.contains(&entity));
+    }
+    writer.join().expect("routing writer");
+    inputs.untrack_entity(entity);
+    assert!(inputs.entities_in_chunk(first_chunk).is_none());
+    assert!(inputs.entities_in_chunk(second_chunk).is_none());
 }
