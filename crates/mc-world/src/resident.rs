@@ -670,6 +670,30 @@ impl ResidentChunkStore {
 }
 
 impl WorldMutationView {
+    /// Apply accumulated active-player time to resident chunks.
+    ///
+    /// Callers batch ticks before entering this mutation boundary so ordinary
+    /// simulation does not republish every active chunk on every game tick.
+    pub fn increment_chunk_inhabited_times(
+        &self,
+        updates: &[(ChunkPos, u64)],
+    ) -> Vec<(ChunkPos, u64)> {
+        let mut missing = Vec::new();
+        for &(position, elapsed_ticks) in updates {
+            if elapsed_ticks != 0
+                && self
+                    .resident
+                    .mutate(position, |chunk| {
+                        chunk.increment_inhabited_time(elapsed_ticks);
+                    })
+                    .is_none()
+            {
+                missing.push((position, elapsed_ticks));
+            }
+        }
+        missing
+    }
+
     pub fn stamp_chunks_for_world_journal(
         &self,
         decision_id: u64,

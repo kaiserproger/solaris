@@ -37,6 +37,9 @@ mod hostile_authority;
 #[cfg(test)]
 #[path = "session/hostile_authority_tests.rs"]
 mod hostile_authority_tests;
+mod inhabited_time;
+#[cfg(test)]
+mod inhabited_time_tests;
 mod interaction_geometry;
 #[cfg(test)]
 #[path = "session/interaction_geometry_tests.rs"]

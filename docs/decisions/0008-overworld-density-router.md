@@ -60,9 +60,14 @@ Anvil root metadata belongs to the chunk serialization boundary, not a concrete
 terrain generator. The encoder emits one `DataVersion`, `LastUpdate`, and
 `InhabitedTime` field for every saved chunk. It preserves imported data and
 inhabited values, supplies the pinned 26.1.2 data version when absent, and uses
-the explicit simulation tick for `LastUpdate`. Runtime accumulation of
-`InhabitedTime` is a separate ownership task; generated chunks currently begin
-at zero.
+the explicit simulation tick for `LastUpdate`. The tick owner follows vanilla's
+strict 128-block chunk-center range around non-spectator players and counts
+every spawning chunk once per game tick. It accumulates those ticks in a small
+coordinate map, publishes resident metadata every 20 ticks or when a chunk
+leaves the range, and drains a partial interval before shutdown. A resident
+miss retains its delta for retry; shutdown loads that chunk without generation
+before the final save. This preserves vanilla elapsed-tick semantics without
+republishing hundreds of chunks on every tick.
 
 The hot path samples each surface column once and reuses its biome result for
 vertical biome cells. Cave noise exits after its region mask or first tunnel
@@ -91,6 +96,8 @@ coverage. Real-client visual inspection remains required.
 - vanilla-import isolation plus rejection of mismatched revision/seed/mode/geometry;
 - canonical vanilla root metadata through an actual Anvil write/read at a
   nonzero simulation tick;
+- exact active-tick `InhabitedTime` accumulation through an actual Anvil
+  flush/reopen, including a chunk active for only part of a batch;
 - rejection of a changed persisted ore profile;
 - order-independent ore placement;
 - geological deposits crossing chunk boundaries while default generation stays vanilla;

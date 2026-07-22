@@ -597,6 +597,35 @@ impl Chunk {
         self.dirty_generation = self.dirty_generation.wrapping_add(1).max(1);
     }
 
+    /// Number of game ticks players have kept this chunk active.
+    #[must_use]
+    pub fn inhabited_time(&self) -> i64 {
+        self.extras
+            .iter()
+            .find_map(|(key, value)| {
+                (key == "InhabitedTime")
+                    .then_some(value)
+                    .and_then(|value| match value {
+                        Tag::Long(value) => Some(*value),
+                        _ => None,
+                    })
+            })
+            .unwrap_or(0)
+    }
+
+    /// Add active game ticks to the vanilla `InhabitedTime` field.
+    pub fn increment_inhabited_time(&mut self, elapsed_ticks: u64) {
+        if elapsed_ticks == 0 {
+            return;
+        }
+        let elapsed_ticks = i64::try_from(elapsed_ticks).unwrap_or(i64::MAX);
+        let next = self.inhabited_time().max(0).saturating_add(elapsed_ticks);
+        self.extras.retain(|(key, _)| key != "InhabitedTime");
+        self.extras
+            .push(("InhabitedTime".to_string(), Tag::Long(next)));
+        self.mark_dirty();
+    }
+
     #[must_use]
     pub fn world_journal_lsn(&self) -> u64 {
         self.extras

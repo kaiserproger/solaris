@@ -37,3 +37,6 @@ pub use storage::{
 
 /// Crate version, exposed so other crates and the binary can report it.
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");
+
+#[cfg(test)]
+mod inhabited_time_tests;

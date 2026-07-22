@@ -1050,6 +1050,7 @@ impl BoundServer {
             let mut pushed_simulation_lane_attribution = Vec::new();
             let mut entity_physics_job = None;
             let mut scheduled_budget_exhausted_since_publish = false;
+            let mut inhabited_time = play::InhabitedTimeAccumulator::default();
             loop {
                 let command_arrived = tokio::select! {
                     biased;
@@ -1073,6 +1074,12 @@ impl BoundServer {
                             )
                             .await;
                         }
+                        persist_inhabited_time_tail(
+                            &entity_config,
+                            entity_world_mutation.as_ref(),
+                            &mut inhabited_time,
+                        )
+                        .await;
                         simulation_owner.shutdown();
                         tick_metrics_publisher.try_publish(
                             tick,
@@ -1188,6 +1195,12 @@ impl BoundServer {
                                 )
                                 .await;
                             }
+                            persist_inhabited_time_tail(
+                                &entity_config,
+                                entity_world_mutation.as_ref(),
+                                &mut inhabited_time,
+                            )
+                            .await;
                             simulation_owner.shutdown();
                             tick_metrics_publisher.try_publish(
                                 tick,
@@ -1427,7 +1440,17 @@ impl BoundServer {
                     .await;
                 let furnace_tick_us = elapsed_us(started);
 
-                let entity_save_us = 0;
+                let loaded_chunks = entity_sessions.loaded_chunks_sorted();
+                let spawning_chunks = entity_sessions.spawning_chunks_sorted();
+                let started = Instant::now();
+                let inhabited_updates = inhabited_time.observe_tick(tick, &spawning_chunks);
+                let missing = entity_world_mutation
+                    .as_ref()
+                    .map_or(inhabited_updates.clone(), |mutation| {
+                        mutation.increment_chunk_inhabited_times(&inhabited_updates)
+                    });
+                inhabited_time.restore(missing);
+                let entity_save_us = elapsed_us(started);
                 if tick.is_multiple_of(simulation_policy.save_interval_ticks)
                     && entity_sessions.active_session_count() > 0
                 {
@@ -1455,7 +1478,6 @@ impl BoundServer {
                     .await;
                 let random_tick_us = elapsed_us(started);
 
-                let loaded_chunks = entity_sessions.loaded_chunks_sorted();
                 let started = Instant::now();
                 let block_tick = if entity_scheduled_ticks
                     .as_ref()
@@ -2069,6 +2091,51 @@ fn request_full_checkpoint(
     };
     debug!(tick, trigger, "full checkpoint requested");
     requests.request_full_checkpoint();
+}
+
+async fn persist_inhabited_time_tail(
+    config: &ServerConfig,
+    mutation: Option<&mc_world::WorldMutationView>,
+    accumulator: &mut play::InhabitedTimeAccumulator,
+) {
+    let updates = accumulator.drain();
+    let missing = mutation.map_or_else(
+        || updates.clone(),
+        |mutation| mutation.increment_chunk_inhabited_times(&updates),
+    );
+    if missing.is_empty() {
+        return;
+    }
+    let Some(world) = config.world.as_ref() else {
+        warn!(
+            chunks = missing.len(),
+            "cannot persist inhabited time without world storage"
+        );
+        return;
+    };
+    let mut storage = crate::lock_metrics::timed_guard(
+        crate::lock_metrics::LockMetricKind::WorldStorage,
+        "persist inhabited time tail",
+        Instant::now(),
+        world.lock().await,
+    );
+    let mut loaded = Vec::with_capacity(missing.len());
+    for update @ (position, _) in missing {
+        match storage.get_chunk_without_generation(position) {
+            Ok(Some(_)) => loaded.push(update),
+            Ok(None) => warn!(?position, "inhabited-time chunk vanished before shutdown"),
+            Err(error) => warn!(?position, %error, "failed to load inhabited-time chunk"),
+        }
+    }
+    let still_missing = storage
+        .mutation_view()
+        .increment_chunk_inhabited_times(&loaded);
+    if !still_missing.is_empty() {
+        warn!(
+            chunks = still_missing.len(),
+            "inhabited-time chunks vanished during shutdown publication"
+        );
+    }
 }
 
 async fn wait_for_session_empty_save_request(

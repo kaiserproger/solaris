@@ -90,7 +90,12 @@ hardening. An already-open lower-priority diff does not override this order.
   `LastUpdate`, imported `InhabitedTime` is preserved, and each field is emitted
   exactly once through a real region write/read. This closes the concrete format
   gap but does not yet prove the broader terrain-quality item; visual client
-  inspection and inhabited-time accumulation remain queued.
+  inspection remains queued. Runtime now uses vanilla's strict 128-block
+  chunk-center range around non-spectator players, counts each spawning chunk
+  once per game tick, applies those counts in 20-tick mutation batches, and
+  flushes chunks as they leave that range. Missing residents retain their delta
+  for retry and shutdown loads them without generation. The value survives a
+  real Anvil flush/reopen without adding per-tick chunk publication pressure.
 
 - Every exact vanilla state now reaches its embedded collision shape in player
   movement instead of being bypassed by the old campfire/passable-name lists.

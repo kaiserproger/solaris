@@ -120,6 +120,9 @@ mod containers;
 mod explosions;
 mod falling_blocks;
 mod fluids;
+mod inhabited_time;
+#[cfg(test)]
+mod inhabited_time_tests;
 mod inventory;
 mod item_blocks;
 mod lighting;
@@ -210,6 +213,7 @@ use falling_blocks::{
     FallingBlockLandingPlan, falling_block_landing_chunks, falling_block_start_chunks,
     is_falling_block_state, plan_falling_block_landings, plan_falling_block_starts,
 };
+pub(crate) use inhabited_time::InhabitedTimeAccumulator;
 #[cfg(test)]
 use mc_protocol::packets::play::{LIVING_ENTITY_FLAG_OFF_HAND, LIVING_ENTITY_FLAG_USING_ITEM};
 pub(crate) use session::SessionRegistry;
