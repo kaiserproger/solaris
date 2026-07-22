@@ -507,6 +507,7 @@ async fn survival_bonemeal_emits_client_visible_atomic_batch_for_two_by_two_spru
         let sequence = 610 + i32::try_from(index).expect("two mega sapling cases");
         let expected = {
             let mut storage = fixture.world.lock().await;
+            clear_loaded_mega_sapling_volume(&mut storage, &fixture.blocks, northwest);
             set_mega_sapling_square(&mut storage, saplings, states.sapling, states.dirt);
             mega_sapling_expected_deltas(
                 &storage,
@@ -600,6 +601,7 @@ async fn survival_bonemeal_rejects_obstructed_two_by_two_spruce_and_jungle_witho
         let obstruction = (northwest.0, northwest.1 + 1, northwest.2);
         {
             let mut storage = fixture.world.lock().await;
+            clear_loaded_mega_sapling_volume(&mut storage, &fixture.blocks, northwest);
             set_mega_sapling_square(&mut storage, saplings, states.sapling, states.dirt);
             sapling_test_set(&mut storage, obstruction, states.stone);
         }
@@ -877,6 +879,26 @@ fn set_mega_sapling_square(
     for pos in saplings {
         sapling_test_set(storage, (pos.0, pos.1 - 1, pos.2), dirt);
         sapling_test_set(storage, pos, sapling);
+    }
+}
+
+fn clear_loaded_mega_sapling_volume(
+    storage: &mut mc_world::WorldStorage,
+    blocks: &mc_world::BlockRegistry,
+    northwest: (i32, i32, i32),
+) {
+    let air = sapling_test_state(blocks, "minecraft:air", &[]);
+    for x in (northwest.0 - 3)..=(northwest.0 + 4) {
+        for z in (northwest.2 - 3)..=(northwest.2 + 4) {
+            for y in northwest.1..=(northwest.1 + 32) {
+                let pos = mc_world::BlockPos { x, y, z };
+                if storage.get_cached_block(pos).is_some() {
+                    storage
+                        .set_block_at(pos, air)
+                        .expect("loaded mega-sapling fixture volume clears");
+                }
+            }
+        }
     }
 }
 
