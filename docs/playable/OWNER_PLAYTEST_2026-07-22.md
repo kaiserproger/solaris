@@ -116,11 +116,10 @@ verification and keep ordinary survival play ahead of rare edge cases.
   26.1.2 client started at `health=0`, respawned while holding immediate forward
   input, closed the death/loading screen, restored its inventory, and reported
   positive health only after the server health update.
-- [ ] `minecraft_wait_for_health_below` must accept exact zero for a positive
-  threshold. The real-client respawn gate observed `health=0`, but a request for
-  `health < 0.001` timed out because the comparison subtracts its epsilon from
-  the requested threshold. Keep the event-driven wait and fix only the boundary
-  predicate.
+- [x] `minecraft_wait_for_health_below` uses strict numeric ordering without an
+  epsilon-shifted boundary. The real 26.1.2 client returned `matched=true` for
+  observed `health=0` and requested `health < 0.001`; equality with the threshold
+  remains a non-match and the wait remains event-driven.
 
 ## World Generation
 

@@ -5484,7 +5484,7 @@ final class PlayableRealClientLoopScenarioTest {
         }
 
         @Override
-        public float waitForPlayerHealthBelow(float health, Duration duration) {
+        public float waitForPlayerHealthBelow(double health, Duration duration) {
             operations.add("waitHealthBelow:" + health);
             if (healthAfterHostileCombat >= health) {
                 float damage = equippedIronChestplate ? 2.46F : 3.0F;

@@ -285,8 +285,8 @@ public final class MinecraftClientFacade implements ClientFacade {
     @Override
     public JsonObject waitForHealthBelow(double health, java.time.Duration timeout) throws Exception {
         MinecraftScenarioClient client = new MinecraftScenarioClient(new MinecraftClientExecutor());
-        float observedHealth = client.waitForPlayerHealthBelow((float) health, timeout);
-        if (observedHealth >= health - 0.001) {
+        float observedHealth = client.waitForPlayerHealthBelow(health, timeout);
+        if (!MinecraftScenarioClient.healthBelow(observedHealth, health)) {
             throw new IllegalStateException(
                 "player health did not fall below " + health + " latest=" + observedHealth
             );

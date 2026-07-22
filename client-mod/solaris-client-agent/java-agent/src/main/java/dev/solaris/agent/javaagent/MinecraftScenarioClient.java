@@ -2931,13 +2931,13 @@ public final class MinecraftScenarioClient implements ScenarioClient {
     }
 
     @Override
-    public float waitForPlayerHealthBelow(float health, Duration duration) throws Exception {
+    public float waitForPlayerHealthBelow(double health, Duration duration) throws Exception {
         long deadlineNanos = System.nanoTime() + duration.toNanos();
         float latest;
         do {
             long observedVersion = ClientStateEvents.version();
             latest = playerHealth();
-            if (latest < health - 0.001F) {
+            if (healthBelow(latest, health)) {
                 return latest;
             }
             if (!awaitClientStateChange(observedVersion, deadlineNanos)) {
@@ -2945,6 +2945,10 @@ public final class MinecraftScenarioClient implements ScenarioClient {
             }
         } while (true);
         return latest;
+    }
+
+    static boolean healthBelow(float observed, double threshold) {
+        return observed < threshold;
     }
 
     static void selectHotbarSlotOnClientThread(int slot) {

@@ -24,8 +24,9 @@ The embedded client now confirms respawn only after an authoritative health
 packet has been applied. The original persisted dead-player save reproduced
 `health=0`; the corrected 26.1.2 client respawned with immediate movement held,
 closed the death/loading screen, restored its inventory, and observed positive
-health. A separate MCP boundary bug remains queued: `wait_for_health_below`
-currently rejects exact zero when the requested threshold is `0.001`.
+health. `wait_for_health_below` also now uses strict numeric ordering: the real
+client accepts exact zero below a `0.001` threshold without changing its
+push-driven wait.
 
 ## Current Queue
 

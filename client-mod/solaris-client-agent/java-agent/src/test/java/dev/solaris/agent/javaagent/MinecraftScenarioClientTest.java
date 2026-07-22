@@ -16,6 +16,18 @@ import static org.junit.jupiter.api.Assertions.assertTrue;
 
 final class MinecraftScenarioClientTest {
     @Test
+    void healthThresholdUsesStrictNumericOrdering() {
+        assertTrue(MinecraftScenarioClient.healthBelow(0.0F, 0.001F));
+        assertTrue(MinecraftScenarioClient.healthBelow(0.0F, Double.MIN_VALUE));
+        assertTrue(MinecraftScenarioClient.healthBelow(10.0F, 10.0000001D));
+        assertTrue(MinecraftScenarioClient.healthBelow(9.999F, 10.0F));
+        assertFalse(MinecraftScenarioClient.healthBelow(10.0F, 10.0F));
+        assertFalse(MinecraftScenarioClient.healthBelow(10.001F, 10.0F));
+        assertFalse(MinecraftScenarioClient.healthBelow(Float.NaN, 10.0F));
+        assertFalse(MinecraftScenarioClient.healthBelow(0.0F, Double.NaN));
+    }
+
+    @Test
     void directMovementDoesNotDetourWithoutCollision() {
         assertEquals(
             0,

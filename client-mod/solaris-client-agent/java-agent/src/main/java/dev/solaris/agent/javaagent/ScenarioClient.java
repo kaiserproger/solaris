@@ -338,7 +338,7 @@ interface ScenarioClient {
         throw new UnsupportedOperationException("scenario client does not support player health reads");
     }
 
-    default float waitForPlayerHealthBelow(float health, Duration duration) throws Exception {
+    default float waitForPlayerHealthBelow(double health, Duration duration) throws Exception {
         throw new UnsupportedOperationException("scenario client does not support player health waits");
     }
 
