@@ -496,6 +496,8 @@ pub(crate) struct SessionRegistry {
     #[cfg(test)]
     physics_owner_apply_probe: Mutex<Option<EntityApplyReleaseProbe>>,
     #[cfg(test)]
+    physics_routing_probe: Mutex<Option<EntityApplyReleaseProbe>>,
+    #[cfg(test)]
     arrow_transaction_probe: Mutex<Option<ArrowTransactionProbe>>,
     #[cfg(test)]
     breeding_plan_probe: Mutex<Option<BreedingPlanProbe>>,
@@ -789,6 +791,8 @@ impl SessionRegistry {
             entity_apply_release_probe: Mutex::new(None),
             #[cfg(test)]
             physics_owner_apply_probe: Mutex::new(None),
+            #[cfg(test)]
+            physics_routing_probe: Mutex::new(None),
             #[cfg(test)]
             arrow_transaction_probe: Mutex::new(None),
             #[cfg(test)]
@@ -1164,6 +1168,22 @@ impl SessionRegistry {
                 .resume
                 .recv()
                 .expect("physics owner apply probe release");
+        }
+    }
+
+    #[cfg(test)]
+    fn pause_before_physics_routing_for_test(&self) {
+        let probe = self
+            .physics_routing_probe
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .take();
+        if let Some(probe) = probe {
+            probe
+                .reached
+                .send(())
+                .expect("physics routing probe receiver");
+            probe.resume.recv().expect("physics routing probe release");
         }
     }
 

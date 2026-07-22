@@ -1,11 +1,11 @@
 use super::entity_lifecycle::{
-    move_entity_chunk_locked, remove_server_entity_locked, schedule_entity_death_locked,
-    track_entity_chunk_locked,
+    remove_server_entity_locked, schedule_entity_death_locked, track_entity_chunk_locked,
 };
 use super::entity_physics_class::entity_type_uses_aquatic_physics;
 use super::interaction_geometry::{
     distance_sq, entity_aabb, entity_geometry, entity_is_near_player_chunk,
 };
+use super::simulation_input_publication::ExpectedEntityRoutingMove;
 use super::visibility::{entity_wire_move_for_kind, packed_head_yaw_changed};
 use super::*;
 
@@ -835,7 +835,7 @@ impl SessionRegistry {
         inner
             .simulation_inputs
             .insert_terrain_pathing(terrain_pathing_additions);
-        let chunk_crossings = steps
+        let mut chunk_crossings = steps
             .iter()
             .filter_map(|step| {
                 let old_chunk = old_chunks.get(&step.id).copied()?;
@@ -843,6 +843,48 @@ impl SessionRegistry {
                 (old_chunk != new_chunk).then_some((step.id, old_chunk, new_chunk))
             })
             .collect::<Vec<_>>();
+        let routing_moves = chunk_crossings
+            .iter()
+            .map(
+                |&(entity, expected_chunk, new_chunk)| ExpectedEntityRoutingMove {
+                    entity,
+                    expected_chunk,
+                    new_chunk,
+                },
+            )
+            .collect::<Vec<_>>();
+        if !routing_moves.is_empty() {
+            let entity_lifecycle_tick = inner.entity_lifecycle_tick;
+            let SessionEntityGuards {
+                inner: session_inner,
+                entities,
+                ..
+            } = inner;
+            drop(session_inner);
+            #[cfg(test)]
+            self.pause_before_physics_routing_for_test();
+            let routing_outcomes = self
+                .simulation_inputs
+                .move_entities_if_current(&routing_moves);
+            debug_assert_eq!(routing_outcomes.len(), chunk_crossings.len());
+            chunk_crossings = chunk_crossings
+                .into_iter()
+                .zip(routing_outcomes)
+                .filter_map(|(crossing, outcome)| {
+                    debug_assert_eq!(outcome.entity, crossing.0);
+                    if !outcome.applied {
+                        debug_assert_ne!(outcome.current_chunk, Some(crossing.1));
+                    }
+                    outcome.applied.then_some(crossing)
+                })
+                .collect();
+            let session_inner = self.lock_inner("publish entity chunk crossings");
+            inner = SessionEntityGuards {
+                inner: session_inner,
+                entities,
+                entity_lifecycle_tick,
+            };
+        }
         let old_observers_by_entity = chunk_crossings
             .iter()
             .map(|&(entity_id, _, _)| {
@@ -858,7 +900,11 @@ impl SessionRegistry {
             })
             .collect::<HashMap<_, _>>();
         for &(entity_id, old_chunk, new_chunk) in &chunk_crossings {
-            move_entity_chunk_locked(&mut inner, entity_id, old_chunk, new_chunk);
+            debug_assert_eq!(
+                inner.simulation_inputs.entity_chunk(entity_id),
+                Some(new_chunk)
+            );
+            debug_assert_ne!(old_chunk, new_chunk);
         }
         for &(entity_id, old_chunk, new_chunk) in &chunk_crossings {
             dispatches.extend(refresh_entity_target_visibility_locked(

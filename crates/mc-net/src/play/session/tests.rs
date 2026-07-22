@@ -5201,6 +5201,82 @@ fn entity_physics_owner_apply_does_not_hold_session_registry() {
 }
 
 #[test]
+fn delayed_physics_routing_cannot_overwrite_a_newer_physics_commit() {
+    let registry = Arc::new(SessionRegistry::new());
+    let session = register_test_session(&registry, "PhysicsRoutingRaceAlice");
+    assert!(registry.mark_loaded(session, (0, 0)).is_empty());
+    let entity_id = registry
+        .spawn_command_entity(
+            &SimulationAuthority::for_test(),
+            1,
+            "minecraft:zombie".to_owned(),
+            Vec3::new(0.5, 64.0, 0.5),
+        )
+        .into_iter()
+        .find_map(|dispatch| match dispatch.command {
+            OutboundCommand::SpawnEntity(snapshot) => Some(snapshot.id),
+            _ => None,
+        })
+        .expect("spawned zombie");
+    let (reached_tx, reached_rx) = std::sync::mpsc::channel();
+    let (resume_tx, resume_rx) = std::sync::mpsc::channel();
+    *registry
+        .physics_routing_probe
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(EntityApplyReleaseProbe {
+        reached: reached_tx,
+        resume: resume_rx,
+    });
+
+    let delayed_registry = Arc::clone(&registry);
+    let delayed = std::thread::spawn(move || {
+        delayed_registry.apply_entity_physics_and_dispatch(
+            1,
+            &[EntityPhysicsStep {
+                id: entity_id,
+                position: Vec3::new(16.5, 64.0, 0.5),
+                velocity: Vec3::ZERO,
+                on_ground: true,
+                horizontal_collision: false,
+            }],
+        );
+    });
+    reached_rx
+        .recv_timeout(Duration::from_secs(1))
+        .expect("delayed physics reaches routing boundary");
+
+    let newer_position = Vec3::new(32.5, 64.0, 0.5);
+    registry.apply_entity_physics_and_dispatch(
+        2,
+        &[EntityPhysicsStep {
+            id: entity_id,
+            position: newer_position,
+            velocity: Vec3::ZERO,
+            on_ground: true,
+            horizontal_collision: false,
+        }],
+    );
+    assert_eq!(
+        registry.simulation_inputs.entity_chunk(entity_id),
+        Some((2, 0))
+    );
+    resume_tx.send(()).expect("release delayed physics routing");
+    delayed.join().expect("delayed physics worker");
+
+    assert_eq!(
+        registry.simulation_inputs.entity_chunk(entity_id),
+        Some((2, 0))
+    );
+    assert_eq!(
+        registry
+            .server_entity_snapshot(entity_id)
+            .expect("current zombie")
+            .position,
+        newer_position
+    );
+}
+
+#[test]
 fn entity_physics_uses_one_commit_and_one_current_read_after_commit() {
     let registry = SessionRegistry::new();
     let session = register_test_session(&registry, "PhysicsPostStateAlice");

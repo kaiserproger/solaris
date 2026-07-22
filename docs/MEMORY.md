@@ -101,6 +101,12 @@ and is not startup context.
   queries, and player-body relocation now use the same routing authority.
   Mutation paths remain centralized, so regional mutation ownership is still
   incomplete.
+- Physics chunk crossings now release `SessionRegistry.inner`, update all
+  routing moves under one generation fence with one clone per touched shard,
+  then reacquire the session lock for visibility/tracker publication. Each move
+  requires its expected old route, so a concurrent newer relocation/removal
+  wins and the stale crossing is not published. Session membership can progress
+  independently.
 - The exact dense 5,132-cow O3 gate is closed. The final reproduced cause was
   an unanswered keepalive challenge while valid movement packets still proved
   the client alive. Solaris now preserves one pending challenge, requires both

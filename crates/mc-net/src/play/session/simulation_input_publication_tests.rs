@@ -185,3 +185,53 @@ fn cross_shard_moves_never_disappear_from_a_concurrent_snapshot() {
     assert!(inputs.entities_in_chunk(first_chunk).is_none());
     assert!(inputs.entities_in_chunk(second_chunk).is_none());
 }
+
+#[test]
+fn routing_batch_never_waits_for_session_registry() {
+    let registry = Arc::new(SessionRegistry::new());
+    let first = EntityId(31);
+    let second = EntityId(47);
+    registry.simulation_inputs.track_entity((0, 0), first);
+    registry.simulation_inputs.track_entity((1, 0), second);
+
+    let session_guard = registry.inner.lock().expect("session registry poisoned");
+    let (finished_tx, finished_rx) = std::sync::mpsc::channel();
+    let worker_registry = Arc::clone(&registry);
+    let worker = std::thread::spawn(move || {
+        let moved = worker_registry
+            .simulation_inputs
+            .move_entities(&[(first, (8, 0)), (second, (-8, 0))]);
+        finished_tx
+            .send(moved)
+            .expect("routing result receiver remains");
+    });
+
+    assert_eq!(
+        finished_rx
+            .recv_timeout(Duration::from_secs(1))
+            .expect("routing batch must not wait for the session registry"),
+        vec![(first, Some((0, 0))), (second, Some((1, 0)))]
+    );
+    drop(session_guard);
+    worker.join().expect("routing worker");
+}
+
+#[test]
+fn repeated_entity_in_one_routing_batch_keeps_one_final_chunk() {
+    let inputs = SimulationInputPublication::default();
+    let entity = EntityId(63);
+    inputs.track_entity((0, 0), entity);
+
+    assert_eq!(
+        inputs.move_entities(&[(entity, (8, 0)), (entity, (16, 0))]),
+        vec![(entity, Some((0, 0))), (entity, Some((8, 0)))]
+    );
+    assert_eq!(inputs.entity_chunk(entity), Some((16, 0)));
+    assert!(inputs.entities_in_chunk((0, 0)).is_none());
+    assert!(inputs.entities_in_chunk((8, 0)).is_none());
+    assert!(
+        inputs
+            .entities_in_chunk((16, 0))
+            .is_some_and(|entities| entities.contains(&entity))
+    );
+}

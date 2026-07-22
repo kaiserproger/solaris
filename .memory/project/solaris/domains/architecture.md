@@ -65,6 +65,11 @@ Current runtime facts:
   duplicate maps from `SessionRegistry.inner`. Existing centralized mutation
   paths still refresh the publication; this is not full regional mutation
   ownership.
+- Physics chunk crossings update routing outside `SessionRegistry.inner` with
+  expected-old CAS semantics. A newer relocation/removal wins; only committed
+  crossings reach visibility publication. One generation-fenced batch clones
+  each touched forward/reverse shard once, then the session lock is reacquired.
+  Do not move routing clones back under the global session lock.
 - Item despawn uses a simulation-tick deadline index. Ordinary physics turns do
   not scan the full entity store; only due item ids reach their owner lanes.
   Restored items retain the deadline derived from their persisted `spawn_tick`;

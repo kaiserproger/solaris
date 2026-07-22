@@ -543,6 +543,13 @@ player-body relocation read the same fenced authority. Chunk, entity, and
 pathing mutations still enter through existing centralized mutation paths, so
 this removes a global index authority rather than completing regional mutation
 ownership.
+Committed physics chunk crossings release `SessionRegistry.inner`, then update
+the routing publication as one expected-old batch. Each move commits only when
+its route still matches the pre-apply snapshot; a newer relocation or removal
+wins instead of being overwritten. The batch clones each touched forward and
+reverse shard once and reacquires the session lock only for the successfully
+committed moves' visibility and tracker publication. Session membership and
+loaded-chunk updates may progress without observing a partial cross-shard move.
 Item lifetime expiry no longer performs a full entity snapshot during every
 physics publication turn. Item creation and restore add the entity id to a
 simulation-tick deadline index; an expiry turn reads and removes only due ids,

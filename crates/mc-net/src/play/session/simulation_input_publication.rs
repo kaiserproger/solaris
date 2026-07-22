@@ -4,6 +4,20 @@ const ENTITY_INDEX_SHARDS: usize = 64;
 type ChunkEntityIndex = HashMap<(i32, i32), Arc<HashSet<EntityId>>>;
 type EntityChunkIndex = HashMap<EntityId, (i32, i32)>;
 
+#[derive(Debug, Clone, Copy)]
+pub(super) struct ExpectedEntityRoutingMove {
+    pub(super) entity: EntityId,
+    pub(super) expected_chunk: (i32, i32),
+    pub(super) new_chunk: (i32, i32),
+}
+
+#[derive(Debug, Clone, Copy)]
+pub(super) struct EntityRoutingMoveOutcome {
+    pub(super) entity: EntityId,
+    pub(super) current_chunk: Option<(i32, i32)>,
+    pub(super) applied: bool,
+}
+
 #[derive(Debug)]
 pub(super) struct SimulationInputPublication {
     routing_revision: std::sync::atomic::AtomicU64,
@@ -78,23 +92,83 @@ impl SimulationInputPublication {
         entity: EntityId,
         new_chunk: (i32, i32),
     ) -> Option<(i32, i32)> {
-        let revision = self.begin_routing_update();
-        let old_chunk = self.entity_chunk_unfenced(entity);
-        if old_chunk == Some(new_chunk) {
-            self.finish_routing_update(revision);
-            return old_chunk;
+        self.move_entities(&[(entity, new_chunk)])
+            .pop()
+            .and_then(|(_, old_chunk)| old_chunk)
+    }
+
+    pub(super) fn move_entities(
+        &self,
+        moves: &[(EntityId, (i32, i32))],
+    ) -> Vec<(EntityId, Option<(i32, i32)>)> {
+        if moves.is_empty() {
+            return Vec::new();
         }
-        self.update_chunk(new_chunk, |entities| {
-            entities.insert(entity);
-        });
-        if let Some(old_chunk) = old_chunk {
-            self.update_chunk(old_chunk, |entities| {
-                entities.remove(&entity);
+        let revision = self.begin_routing_update();
+        let mut previous_chunks = Vec::with_capacity(moves.len());
+        let mut changed_chunks = HashMap::<(i32, i32), HashSet<EntityId>>::new();
+        let mut changed_entities = HashMap::<EntityId, (i32, i32)>::new();
+        for &(entity, new_chunk) in moves {
+            let old_chunk = changed_entities
+                .get(&entity)
+                .copied()
+                .or_else(|| self.entity_chunk_unfenced(entity));
+            if old_chunk != Some(new_chunk) {
+                self.staged_chunk_entities(&mut changed_chunks, new_chunk)
+                    .insert(entity);
+                if let Some(old_chunk) = old_chunk {
+                    self.staged_chunk_entities(&mut changed_chunks, old_chunk)
+                        .remove(&entity);
+                }
+                changed_entities.insert(entity, new_chunk);
+            }
+            previous_chunks.push((entity, old_chunk));
+        }
+        self.store_changed_chunks(changed_chunks);
+        self.store_changed_entities(changed_entities);
+        self.finish_routing_update(revision);
+        previous_chunks
+    }
+
+    pub(super) fn move_entities_if_current(
+        &self,
+        moves: &[ExpectedEntityRoutingMove],
+    ) -> Vec<EntityRoutingMoveOutcome> {
+        if moves.is_empty() {
+            return Vec::new();
+        }
+        let revision = self.begin_routing_update();
+        let mut outcomes = Vec::with_capacity(moves.len());
+        let mut changed_chunks = HashMap::<(i32, i32), HashSet<EntityId>>::new();
+        let mut changed_entities = HashMap::<EntityId, (i32, i32)>::new();
+        for &ExpectedEntityRoutingMove {
+            entity,
+            expected_chunk,
+            new_chunk,
+        } in moves
+        {
+            let current_chunk = changed_entities
+                .get(&entity)
+                .copied()
+                .or_else(|| self.entity_chunk_unfenced(entity));
+            let applied = current_chunk == Some(expected_chunk);
+            if applied && current_chunk != Some(new_chunk) {
+                self.staged_chunk_entities(&mut changed_chunks, new_chunk)
+                    .insert(entity);
+                self.staged_chunk_entities(&mut changed_chunks, expected_chunk)
+                    .remove(&entity);
+                changed_entities.insert(entity, new_chunk);
+            }
+            outcomes.push(EntityRoutingMoveOutcome {
+                entity,
+                current_chunk,
+                applied,
             });
         }
-        self.update_entity_chunk(entity, Some(new_chunk));
+        self.store_changed_chunks(changed_chunks);
+        self.store_changed_entities(changed_entities);
         self.finish_routing_update(revision);
-        old_chunk
+        outcomes
     }
 
     pub(super) fn untrack_entity(&self, entity: EntityId) {
@@ -224,6 +298,52 @@ impl SimulationInputPublication {
             next.remove(&entity);
         }
         shard.store(Arc::new(next));
+    }
+
+    fn staged_chunk_entities<'a>(
+        &self,
+        changed: &'a mut HashMap<(i32, i32), HashSet<EntityId>>,
+        chunk: (i32, i32),
+    ) -> &'a mut HashSet<EntityId> {
+        changed.entry(chunk).or_insert_with(|| {
+            self.entity_chunks[entity_index_shard(chunk)]
+                .load()
+                .get(&chunk)
+                .map(|entities| (**entities).clone())
+                .unwrap_or_default()
+        })
+    }
+
+    fn store_changed_chunks(&self, changed: HashMap<(i32, i32), HashSet<EntityId>>) {
+        let mut changed_shards = HashMap::<usize, ChunkEntityIndex>::new();
+        for (chunk, entities) in changed {
+            let shard_index = entity_index_shard(chunk);
+            let shard = changed_shards
+                .entry(shard_index)
+                .or_insert_with(|| (*self.entity_chunks[shard_index].load_full()).clone());
+            if entities.is_empty() {
+                shard.remove(&chunk);
+            } else {
+                shard.insert(chunk, Arc::new(entities));
+            }
+        }
+        for (shard_index, changed) in changed_shards {
+            self.entity_chunks[shard_index].store(Arc::new(changed));
+        }
+    }
+
+    fn store_changed_entities(&self, changed: HashMap<EntityId, (i32, i32)>) {
+        let mut changed_shards = HashMap::<usize, EntityChunkIndex>::new();
+        for (entity, chunk) in changed {
+            let shard_index = entity_id_shard(entity);
+            changed_shards
+                .entry(shard_index)
+                .or_insert_with(|| (*self.chunks_by_entity[shard_index].load_full()).clone())
+                .insert(entity, chunk);
+        }
+        for (shard_index, changed) in changed_shards {
+            self.chunks_by_entity[shard_index].store(Arc::new(changed));
+        }
     }
 
     fn entity_chunk_unfenced(&self, entity: EntityId) -> Option<(i32, i32)> {
