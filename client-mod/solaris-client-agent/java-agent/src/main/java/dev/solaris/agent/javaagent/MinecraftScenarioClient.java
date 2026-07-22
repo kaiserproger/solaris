@@ -2014,11 +2014,14 @@ public final class MinecraftScenarioClient implements ScenarioClient {
     public ScenarioBreakResult breakBlock(
         ScenarioBlockTarget target,
         String expectedDropItemId,
-        int expectedSelectedCount,
+        int expectedPickupCount,
         Duration timeout
     ) throws Exception {
         long deadlineNanos = System.nanoTime() + timeout.toNanos();
         Direction face = direction(target.face());
+        int initialInventoryCount = executor.callOnClientThread(
+            () -> inventoryCountOnClientThread(expectedDropItemId)
+        );
         BlockBreakAutomation action = startBlockBreakAfterReset(target, face, deadlineNanos);
         if (action == null) {
             return new ScenarioBreakResult(false, false, false, false, selectedItem());
@@ -2047,25 +2050,113 @@ public final class MinecraftScenarioClient implements ScenarioClient {
                     breakStopped = true;
                     stopBlockBreak(action);
                 }
-                if (becameAir && selected.matches(expectedDropItemId, expectedSelectedCount)) {
-                    return new ScenarioBreakResult(true, true, sawDrop, true, selected);
+                if (becameAir) {
+                    break;
                 }
                 if (!awaitClientTick(observedVersion, deadlineNanos)) {
                     break;
                 }
             } while (true);
+
+            if (!becameAir) {
+                return new ScenarioBreakResult(true, false, sawDrop, false, selected);
+            }
+
+            InventoryPickupResult pickup = waitForInventoryPickup(
+                expectedDropItemId,
+                initialInventoryCount,
+                expectedPickupCount,
+                pos(target),
+                deadlineNanos
+            );
+            sawDrop |= pickup.sawDrop();
+            selected = selectedItem();
             return new ScenarioBreakResult(
                 true,
-                becameAir,
+                true,
                 sawDrop,
-                selected.matches(expectedDropItemId, expectedSelectedCount),
-                selected
+                pickup.confirmed(),
+                selected,
+                pickup.detail()
             );
         } finally {
             if (!breakStopped) {
                 stopBlockBreak(action);
             }
         }
+    }
+
+    private InventoryPickupResult waitForInventoryPickup(
+        String itemId,
+        int initialCount,
+        int expectedPickupCount,
+        BlockPos dropPosition,
+        long deadlineNanos
+    ) throws Exception {
+        return waitForInventoryPickup(
+            new InventoryPickupWaitSource() {
+                @Override
+                public long stateVersion() {
+                    return ClientStateEvents.version();
+                }
+
+                @Override
+                public InventoryPickupSample sample() throws Exception {
+                    return executor.callOnClientThread(() -> new InventoryPickupSample(
+                        inventoryCountOnClientThread(itemId),
+                        itemDropVisibleOnClientThread(itemId, dropPosition)
+                    ));
+                }
+
+                @Override
+                public boolean awaitStateChange(long observedVersion, long deadlineNanos)
+                    throws InterruptedException {
+                    return awaitClientStateChange(observedVersion, deadlineNanos);
+                }
+            },
+            initialCount,
+            expectedPickupCount,
+            deadlineNanos
+        );
+    }
+
+    static InventoryPickupResult waitForInventoryPickup(
+        InventoryPickupWaitSource source,
+        int initialCount,
+        int expectedPickupCount,
+        long deadlineNanos
+    ) throws Exception {
+        int observedCount = initialCount;
+        boolean sawDrop = false;
+        do {
+            long observedVersion = source.stateVersion();
+            InventoryPickupSample sample = source.sample();
+            observedCount = sample.inventoryCount();
+            sawDrop |= sample.sawDrop();
+            if (pickupCountReached(initialCount, observedCount, expectedPickupCount)) {
+                return InventoryPickupResult.of(
+                    true,
+                    sawDrop,
+                    initialCount,
+                    observedCount,
+                    expectedPickupCount
+                );
+            }
+
+            if (!source.awaitStateChange(observedVersion, deadlineNanos)) {
+                return InventoryPickupResult.of(
+                    false,
+                    sawDrop,
+                    initialCount,
+                    observedCount,
+                    expectedPickupCount
+                );
+            }
+        } while (true);
+    }
+
+    static boolean pickupCountReached(int initialCount, int observedCount, int expectedPickupCount) {
+        return (long) observedCount >= (long) initialCount + expectedPickupCount;
     }
 
     @Override
@@ -4216,6 +4307,36 @@ public final class MinecraftScenarioClient implements ScenarioClient {
     }
 
     private record EntityApproachSample(boolean visible, boolean inReach, int detourDirection) {
+    }
+
+    record InventoryPickupResult(boolean confirmed, boolean sawDrop, String detail) {
+        private static InventoryPickupResult of(
+            boolean confirmed,
+            boolean sawDrop,
+            int initialCount,
+            int observedCount,
+            int expectedPickupCount
+        ) {
+            return new InventoryPickupResult(
+                confirmed,
+                sawDrop,
+                "inventory_count=" + observedCount
+                    + " initial_count=" + initialCount
+                    + " expected_delta=" + expectedPickupCount
+            );
+        }
+    }
+
+    record InventoryPickupSample(int inventoryCount, boolean sawDrop) {
+    }
+
+    interface InventoryPickupWaitSource {
+        long stateVersion();
+
+        InventoryPickupSample sample() throws Exception;
+
+        boolean awaitStateChange(long observedVersion, long deadlineNanos)
+            throws InterruptedException;
     }
 
     interface EntityWaitSource {

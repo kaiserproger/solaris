@@ -99,9 +99,18 @@ hardening. An already-open lower-priority diff does not override this order.
   ordinary break became air and exposed a visible item entity; the final
   inventory contained exactly eight cobblestone, health stayed at 20, and the
   client remained connected. The run also exposed a client-MCP defect:
-  `minecraft_break_block` misses pickup into a non-selected slot despite the
-  authoritative inventory update; that tooling issue is now recorded
-  separately in the owner queue.
+  `minecraft_break_block` missed pickup into a non-selected slot despite the
+  authoritative inventory update; that tooling issue is closed below.
+
+- The client-MCP pickup defect from that run is closed. `minecraft_break_block`
+  snapshots the total expected-item count before mining and, after the block
+  becomes air, reacts to applied client state events instead of polling ticks
+  or the selected stack; only an observed inventory-count increase completes
+  pickup. In the focused 26.1.2 client gate, a stone world drop was
+  observed and one cobblestone entered non-selected slot `1` while the diamond
+  pickaxe remained selected in slot `0`; the command returned
+  `pickup_confirmed=true` with `initial_count=0`, `inventory_count=1`, and the
+  client remained in play.
 
 - Rapid sequential mining no longer strands the second valid early `STOP`
   behind an existing delayed break. The stop is retained as queued work, and

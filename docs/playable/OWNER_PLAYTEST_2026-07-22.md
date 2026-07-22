@@ -98,15 +98,22 @@ verification and keep ordinary survival play ahead of rare edge cases.
   amphibious classes. In the corrected representative debug client gate, a
   tropical fish produced eight pushed motion events, moved `0.36` blocks, and
   remained underwater at `y=62.50..62.57`.
-- [ ] `minecraft_break_block` must confirm pickup in any inventory slot and
-  return on the inventory event. The chunk-edge client gate collected all eight
-  cobblestone into a non-selected slot, but every call returned
-  `pickup_confirmed=false` even though the final inventory was correct.
+- [x] `minecraft_break_block` confirms pickup from the applied inventory packet
+  and counts the expected item across every player inventory slot. A focused
+  real 26.1.2 client gate broke a placed stone block, observed its world drop,
+  and returned `pickup_confirmed=true` when cobblestone increased from `0` to
+  `1` in non-selected slot `1`; the diamond pickaxe remained selected in slot
+  `0`, the block became air, and the client stayed in play.
 - [ ] `minecraft_use_item_on` must expose the hand to exercise or perform the
   same main-then-offhand dispatch as ordinary vanilla use input. It currently
   returned `ok` for an offhand-only stack but left its count and target block
   unchanged; `minecraft_press_inputs(use)` then performed the vanilla fallback
   and placed the block.
+- [ ] `minecraft_respawn` must not report success while the real client remains
+  dead. A pickup-gate rerun against a persisted dead player returned from
+  respawn with `health=0`; subsequent server `/give` feedback reached chat but
+  the item never appeared in inventory. Reproduce this exact saved-player path
+  after integrating the existing respawn/input worktree changes.
 
 ## World Generation
 

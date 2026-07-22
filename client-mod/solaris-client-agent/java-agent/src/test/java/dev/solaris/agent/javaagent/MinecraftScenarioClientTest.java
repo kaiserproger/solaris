@@ -98,6 +98,61 @@ final class MinecraftScenarioClientTest {
     }
 
     @Test
+    void blockPickupUsesTotalInventoryDeltaInsteadOfTheSelectedStack() {
+        assertTrue(MinecraftScenarioClient.pickupCountReached(0, 1, 1));
+        assertTrue(MinecraftScenarioClient.pickupCountReached(7, 8, 1));
+        assertTrue(MinecraftScenarioClient.pickupCountReached(7, 9, 1));
+        assertFalse(MinecraftScenarioClient.pickupCountReached(7, 7, 1));
+        assertFalse(MinecraftScenarioClient.pickupCountReached(7, 8, 2));
+    }
+
+    @Test
+    void blockPickupAcceptsAnInventoryEventAppliedBeforeItsFirstSample() throws Exception {
+        InventoryPickupProbe probe = new InventoryPickupProbe(
+            new MinecraftScenarioClient.InventoryPickupSample(8, false)
+        );
+
+        MinecraftScenarioClient.InventoryPickupResult result =
+            MinecraftScenarioClient.waitForInventoryPickup(probe, 7, 1, Long.MAX_VALUE);
+
+        assertTrue(result.confirmed());
+        assertFalse(result.sawDrop());
+        assertEquals(0, probe.awaitCalls);
+    }
+
+    @Test
+    void blockPickupKeepsDropEvidenceAcrossUnrelatedAppliedEvents() throws Exception {
+        InventoryPickupProbe probe = new InventoryPickupProbe(
+            new MinecraftScenarioClient.InventoryPickupSample(7, false),
+            new MinecraftScenarioClient.InventoryPickupSample(7, true),
+            new MinecraftScenarioClient.InventoryPickupSample(8, false)
+        );
+
+        MinecraftScenarioClient.InventoryPickupResult result =
+            MinecraftScenarioClient.waitForInventoryPickup(probe, 7, 1, Long.MAX_VALUE);
+
+        assertTrue(result.confirmed());
+        assertTrue(result.sawDrop());
+        assertEquals(2, probe.awaitCalls);
+        assertEquals(3, probe.sampleCalls);
+    }
+
+    @Test
+    void blockPickupTimeoutIsFailure() throws Exception {
+        InventoryPickupProbe probe = new InventoryPickupProbe(
+            new MinecraftScenarioClient.InventoryPickupSample(7, true)
+        );
+
+        MinecraftScenarioClient.InventoryPickupResult result =
+            MinecraftScenarioClient.waitForInventoryPickup(probe, 7, 1, 0L);
+
+        assertFalse(result.confirmed());
+        assertTrue(result.sawDrop());
+        assertEquals(1, probe.awaitCalls);
+        assertEquals(1, probe.sampleCalls);
+    }
+
+    @Test
     void experienceWaitUsesAppliedPacketEvents() throws Exception {
         String source = java.nio.file.Files.readString(java.nio.file.Path.of(
             "src/main/java/dev/solaris/agent/javaagent/MinecraftScenarioClient.java"
@@ -346,6 +401,39 @@ final class MinecraftScenarioClientTest {
             current = current.getCause();
         }
         return current;
+    }
+
+    private static final class InventoryPickupProbe
+        implements MinecraftScenarioClient.InventoryPickupWaitSource {
+        private final MinecraftScenarioClient.InventoryPickupSample[] samples;
+        private int index;
+        private int sampleCalls;
+        private int awaitCalls;
+
+        private InventoryPickupProbe(MinecraftScenarioClient.InventoryPickupSample... samples) {
+            this.samples = samples;
+        }
+
+        @Override
+        public long stateVersion() {
+            return index;
+        }
+
+        @Override
+        public MinecraftScenarioClient.InventoryPickupSample sample() {
+            sampleCalls += 1;
+            return samples[index];
+        }
+
+        @Override
+        public boolean awaitStateChange(long observedVersion, long deadlineNanos) {
+            awaitCalls += 1;
+            if (index + 1 >= samples.length) {
+                return false;
+            }
+            index += 1;
+            return true;
+        }
     }
 
     private static final class EntityWaitProbe implements MinecraftScenarioClient.EntityWaitSource {
