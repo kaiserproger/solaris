@@ -1227,7 +1227,9 @@ impl TerrainGenerator {
                     } else {
                         None
                     };
-                    if let Some(plant) = plant {
+                    if let Some(plant) = plant
+                        && chunk.get_block(lx, base_y, lz) == Some(self.air)
+                    {
                         self.place_single(chunk, lx, base_y, lz, plant, &mut touched);
                     }
                 }
@@ -1797,8 +1799,8 @@ impl ChunkGenerator for TerrainGenerator {
         }
         self.apply_ores(&mut chunk);
         self.assign_biomes(&mut chunk, &columns);
-        self.apply_decorations(&mut chunk, &columns);
         self.apply_structures(&mut chunk);
+        self.apply_decorations(&mut chunk, &columns);
         chunk.status = "minecraft:full".into();
         chunk.mark_dirty();
         chunk

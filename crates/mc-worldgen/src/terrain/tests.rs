@@ -1629,6 +1629,99 @@ fn surface_decorations_are_visible_and_refresh_heightmaps() {
 }
 
 #[test]
+fn structures_precede_tree_and_single_plant_decoration() {
+    let registry = tiny_registry();
+    let seed = 42;
+    let plain = TerrainGenerator::new(seed, Arc::clone(&registry));
+    let mut target = None;
+    'search: for wx in -384_i32..=384 {
+        for wz in -384_i32..=384 {
+            let lx = wx.rem_euclid(16) as u8;
+            let lz = wz.rem_euclid(16) as u8;
+            if !(2..=13).contains(&lx) || !(2..=13).contains(&lz) {
+                continue;
+            }
+            let pos = ChunkPos {
+                x: wx.div_euclid(16),
+                z: wz.div_euclid(16),
+            };
+            let plan = plain.plan_column(pos, lx, lz);
+            let tree_biome = plain.biomes.temperate_forest.contains(&plan.biome)
+                || plain.biomes.cold.contains(&plan.biome)
+                || plain.biomes.jungle.contains(&plan.biome)
+                || plain.biomes.grassland.contains(&plan.biome);
+            let (Some(log), Some(leaves)) = plain.tree_blocks_for_biome(&plan.biome) else {
+                continue;
+            };
+            if tree_biome && plan.hash.is_multiple_of(47) && plan.hash.is_multiple_of(37) {
+                target = Some((wx, wz, plan.height, log, leaves));
+                break 'search;
+            }
+        }
+    }
+    let (wx, wz, height, log, leaves) = target.expect("sample should contain a tree anchor");
+    let marker = BlockStateId(25);
+    assert_ne!(marker, log);
+    assert_ne!(marker, leaves);
+    let structure = StructureTemplate::new(
+        [1, 1, 1],
+        vec![crate::structures::TemplateBlock {
+            pos: [0, 0, 0],
+            state: marker,
+        }],
+    );
+    let generator = TerrainGenerator::new(seed, registry)
+        .with_structures(StructureRules::fixed_for_test(structure, (wx, wz)));
+    let chunk = generator.generate(ChunkPos {
+        x: wx.div_euclid(16),
+        z: wz.div_euclid(16),
+    });
+    let lx = wx.rem_euclid(16) as u8;
+    let lz = wz.rem_euclid(16) as u8;
+
+    assert_eq!(chunk.get_block(lx, height + 1, lz), Some(marker));
+    for y in (height + 2)..=(height + 6) {
+        assert_ne!(
+            chunk.get_block(lx, y, lz),
+            Some(log),
+            "structure-overwritten tree left a floating trunk at {wx},{y},{wz}"
+        );
+    }
+}
+
+#[test]
+fn generated_columns_keep_a_solid_surface_shell_across_seeds() {
+    let registry = tiny_registry();
+    for seed in -4..4 {
+        let generator = TerrainGenerator::new(seed, Arc::clone(&registry));
+        for pos in [
+            ChunkPos { x: -2, z: -2 },
+            ChunkPos { x: 0, z: 0 },
+            ChunkPos { x: 2, z: -1 },
+            ChunkPos { x: 1, z: 2 },
+        ] {
+            let chunk = generator.generate(pos);
+            for lx in 0..16u8 {
+                for lz in 0..16u8 {
+                    let wx = pos.x * 16 + i32::from(lx);
+                    let wz = pos.z * 16 + i32::from(lz);
+                    let surface = generator.surface_height(wx, wz);
+                    let shell_bottom =
+                        (surface - CAVE_SURFACE_CLEARANCE + 1).max(generator.geometry.min_y() + 1);
+                    for y in shell_bottom..=surface {
+                        assert_ne!(
+                            chunk.get_block(lx, y, lz),
+                            Some(generator.air),
+                            "seed {seed} opened the protected surface shell at {wx},{y},{wz}"
+                        );
+                    }
+                }
+            }
+        }
+    }
+}
+
+#[test]
 fn generated_overlays_survive_flush_and_reopen() {
     let registry = tiny_registry();
     let marker = BlockStateId(25);

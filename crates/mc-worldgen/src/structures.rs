@@ -263,6 +263,17 @@ impl StructureRules {
     pub(crate) fn fixed_center(&self) -> Option<(i32, i32)> {
         self.fixed_center
     }
+
+    #[cfg(test)]
+    pub(crate) fn fixed_for_test(template: StructureTemplate, center: (i32, i32)) -> Self {
+        Self {
+            templates: vec![template],
+            grid_chunks: 34,
+            separation_chunks: 8,
+            salt: 0,
+            fixed_center: Some(center),
+        }
+    }
 }
 
 fn playable_ruin_block(blocks: &BlockRegistry, name: &str) -> Result<BlockStateId, StructureError> {

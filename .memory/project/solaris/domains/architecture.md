@@ -22,6 +22,10 @@ Current runtime facts:
 - Overworld terrain shape is owned by `terrain::overworld::DensityRouter`;
   route worldgen topology, climate, river, cave, or stage extraction work
   through ADR 0008.
+- Overworld caves use true 3D density fields and keep a 24-block solid surface
+  shell. Generation order is terrain/caves/ores, then structures, then
+  decorations; do not move structures after trees. Persisted chunks are never
+  silently regenerated, so changed terrain algorithms affect new chunks/worlds.
 - Regional entity owners commit authoritative kinematics. Movement wire plans
   are prepared outside the global session lock and use tracker CAS plus a
   visibility recheck at publication. Visibility indexes and outbound session

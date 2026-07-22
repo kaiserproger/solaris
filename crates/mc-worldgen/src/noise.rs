@@ -1,4 +1,4 @@
-//! Tiny hash-based 2D value noise for the M7 baseline terrain.
+//! Small hash-based value noise used by deterministic world generation.
 //!
 //! Not a translation of vanilla's algorithm — Solaris uses its own
 //! deterministic noise per ADR 0001 / PROJECT_SPEC §8.1. The shape is
@@ -29,11 +29,34 @@ fn hash3(x: i32, z: i32, seed: i64) -> u32 {
     (h & 0xFFFF_FFFF) as u32
 }
 
+#[inline]
+fn hash4(x: i32, y: i32, z: i32, seed: i64) -> u32 {
+    let mut h = (seed as u64 ^ HASH_PRIME_2).wrapping_mul(HASH_PRIME_3);
+    h ^= h >> 31;
+    h ^= (x as i64 as u64).wrapping_mul(HASH_PRIME_1);
+    h = h.wrapping_mul(HASH_PRIME_2);
+    h ^= h >> 27;
+    h ^= (y as i64 as u64).wrapping_mul(HASH_PRIME_2);
+    h = h.wrapping_mul(HASH_PRIME_3);
+    h ^= h >> 23;
+    h ^= (z as i64 as u64).wrapping_mul(HASH_PRIME_3);
+    h ^= h >> 29;
+    h = h.wrapping_mul(HASH_PRIME_1 ^ HASH_PRIME_3);
+    h ^= h >> 32;
+    (h & 0xFFFF_FFFF) as u32
+}
+
 /// Lattice value at integer `(x, z)`. `[-1.0, 1.0]`.
 #[inline]
 fn lattice(x: i32, z: i32, seed: i64) -> f64 {
     let h = hash3(x, z, seed);
     // Map `0..=u32::MAX` to `-1..=1` linearly.
+    (h as f64 / u32::MAX as f64) * 2.0 - 1.0
+}
+
+#[inline]
+fn lattice_3d(x: i32, y: i32, z: i32, seed: i64) -> f64 {
+    let h = hash4(x, y, z, seed);
     (h as f64 / u32::MAX as f64) * 2.0 - 1.0
 }
 
@@ -51,9 +74,9 @@ fn lerp(a: f64, b: f64, t: f64) -> f64 {
 
 /// Smooth 2D value noise. Returns a value in `[-1.0, 1.0]`.
 ///
-/// `seed` mixes into every lattice sample so two different seeds
-/// produce uncorrelated fields. The noise period is `2^31` cells
-/// (the input ints), which is far beyond any reasonable world size.
+/// `seed` contributes to every lattice sample so different seeds produce
+/// deterministic field variants. The input period is `2^31` cells, far beyond
+/// any reasonable world size.
 #[must_use]
 pub fn value_noise_2d(x: f64, z: f64, seed: i64) -> f64 {
     let xi = x.floor();
@@ -94,66 +117,71 @@ pub fn fbm_2d(x: f64, z: f64, seed: i64, octaves: u32, persistence: f64) -> f64 
     if max > 0.0 { total / max } else { 0.0 }
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
+/// Smooth 3D value noise. Returns a value in `[-1.0, 1.0]`.
+#[must_use]
+pub fn value_noise_3d(x: f64, y: f64, z: f64, seed: i64) -> f64 {
+    let xi = x.floor();
+    let yi = y.floor();
+    let zi = z.floor();
+    let xf = x - xi;
+    let yf = y - yi;
+    let zf = z - zi;
+    let xi = xi as i32;
+    let yi = yi as i32;
+    let zi = zi as i32;
 
-    #[test]
-    fn deterministic_across_calls() {
-        let a = value_noise_2d(3.7, -12.4, 42);
-        let b = value_noise_2d(3.7, -12.4, 42);
-        assert_eq!(a, b);
-    }
-
-    #[test]
-    fn output_is_bounded() {
-        for x in -50..=50 {
-            for z in -50..=50 {
-                let v = value_noise_2d(x as f64 * 0.37, z as f64 * 0.41, 7);
-                assert!((-1.0..=1.0).contains(&v), "value out of [-1,1]: {v}");
-            }
-        }
-    }
-
-    #[test]
-    fn different_seeds_differ() {
-        // Pick a handful of points and assert at least one differs
-        // between seeds 0 and 1. We can't assert *every* point
-        // differs (two seeds may collide on any single lattice cell)
-        // but pairs ought to disagree somewhere.
-        let mut any_diff = false;
-        for x in 0..10 {
-            for z in 0..10 {
-                let a = value_noise_2d(x as f64, z as f64, 0);
-                let b = value_noise_2d(x as f64, z as f64, 1);
-                if (a - b).abs() > 1e-9 {
-                    any_diff = true;
-                }
-            }
-        }
-        assert!(
-            any_diff,
-            "two seeds produced identical noise across 100 samples — implausible"
-        );
-    }
-
-    #[test]
-    fn fbm_is_bounded() {
-        for x in -20..=20 {
-            for z in -20..=20 {
-                let v = fbm_2d(x as f64 * 0.1, z as f64 * 0.1, 13, 4, 0.5);
-                assert!((-1.0..=1.0).contains(&v), "fbm out of [-1,1]: {v}");
-            }
-        }
-    }
-
-    #[test]
-    fn neighbour_samples_are_continuous() {
-        // Smooth noise should produce small deltas between very
-        // close inputs. Pick a step size much smaller than 1
-        // (the lattice spacing) and confirm.
-        let a = value_noise_2d(5.0, 5.0, 99);
-        let b = value_noise_2d(5.001, 5.0, 99);
-        assert!((a - b).abs() < 0.05, "expected smooth noise: {a} vs {b}");
-    }
+    let u = fade(xf);
+    let v = fade(yf);
+    let w = fade(zf);
+    let x00 = lerp(
+        lattice_3d(xi, yi, zi, seed),
+        lattice_3d(xi.wrapping_add(1), yi, zi, seed),
+        u,
+    );
+    let x10 = lerp(
+        lattice_3d(xi, yi.wrapping_add(1), zi, seed),
+        lattice_3d(xi.wrapping_add(1), yi.wrapping_add(1), zi, seed),
+        u,
+    );
+    let x01 = lerp(
+        lattice_3d(xi, yi, zi.wrapping_add(1), seed),
+        lattice_3d(xi.wrapping_add(1), yi, zi.wrapping_add(1), seed),
+        u,
+    );
+    let x11 = lerp(
+        lattice_3d(xi, yi.wrapping_add(1), zi.wrapping_add(1), seed),
+        lattice_3d(
+            xi.wrapping_add(1),
+            yi.wrapping_add(1),
+            zi.wrapping_add(1),
+            seed,
+        ),
+        u,
+    );
+    lerp(lerp(x00, x10, v), lerp(x01, x11, v), w)
 }
+
+/// Multi-octave 3D value noise with normalized amplitude.
+#[must_use]
+pub fn fbm_3d(x: f64, y: f64, z: f64, seed: i64, octaves: u32, persistence: f64) -> f64 {
+    let mut total = 0.0;
+    let mut amplitude = 1.0;
+    let mut frequency = 1.0;
+    let mut max = 0.0;
+    for octave in 0..octaves {
+        total += value_noise_3d(
+            x * frequency,
+            y * frequency,
+            z * frequency,
+            seed ^ (octave as i64 + 1),
+        ) * amplitude;
+        max += amplitude;
+        amplitude *= persistence;
+        frequency *= 2.0;
+    }
+    if max > 0.0 { total / max } else { 0.0 }
+}
+
+#[cfg(test)]
+#[path = "noise_tests.rs"]
+mod tests;

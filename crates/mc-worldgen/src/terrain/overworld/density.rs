@@ -1,6 +1,6 @@
 use mc_world::chunk::ChunkGeometry;
 
-use crate::noise::fbm_2d;
+use crate::noise::{fbm_2d, fbm_3d};
 
 use super::super::{SEA_LEVEL, TellusWorldgenSettings, WorldgenMode};
 
@@ -168,34 +168,43 @@ impl DensityRouter {
         let x = f64::from(x);
         let y = f64::from(y);
         let z = f64::from(z);
-        let tubes = (fbm_2d(
-            x / 72.0 + y / 131.0,
-            z / 72.0 - y / 149.0,
-            self.seed ^ 0x4341_5645,
-            3,
-            0.53,
-        )
-        .abs()
-            - 0.18)
-            .abs();
-        let branches = (fbm_2d(
-            x / 118.0 - y / 83.0,
-            z / 118.0 + y / 97.0,
-            self.seed ^ 0x4252_414E,
-            2,
+        let warp = fbm_3d(
+            x / 180.0,
+            y / 130.0,
+            z / 180.0,
+            self.seed ^ 0x4341_5657,
+            1,
             0.5,
-        )
-        .abs()
-            - 0.22)
-            .abs();
-        let chambers = fbm_2d(
-            x / 46.0 + y / 109.0,
-            z / 46.0 - y / 101.0,
-            self.seed ^ 0x524F_4F4D,
-            3,
+        ) * 20.0;
+        let warped_x = x + warp;
+        let warped_z = z - warp;
+        let vertical_perturbation =
+            fbm_3d(x / 48.0, y / 8.0, z / 48.0, self.seed ^ 0x4341_5647, 1, 0.5);
+        let tunnel_a = fbm_3d(
+            warped_x / 58.0,
+            y / 24.0,
+            warped_z / 58.0,
+            self.seed ^ 0x4341_5641,
+            2,
+            0.52,
+        ) + vertical_perturbation * 0.2;
+        let tunnel_b = fbm_3d(
+            warped_x / 67.0,
+            y / 29.0,
+            warped_z / 67.0,
+            self.seed ^ 0x4341_5642,
+            2,
+            0.52,
+        ) - vertical_perturbation * 0.14;
+        let chamber = fbm_3d(
+            x / 96.0,
+            y / 48.0,
+            z / 96.0,
+            self.seed ^ 0x4341_5643,
+            2,
             0.56,
-        );
-        (tubes < 0.038 && branches < 0.21) || (branches < 0.026 && tubes < 0.2) || chambers > 0.72
+        ) + vertical_perturbation * 0.22;
+        (tunnel_a.abs() < 0.08 && tunnel_b.abs() < 0.19) || chamber > 0.72
     }
 
     fn temperature(self, x: f64, z: f64, settings: Option<TellusWorldgenSettings>) -> f64 {
@@ -261,5 +270,69 @@ mod tests {
         let router = DensityRouter::new(7, OVERWORLD_GEOMETRY, WorldgenMode::VanillaLike);
         let carved = (-48..40).filter(|&y| router.is_cave(91, y, -37)).count();
         assert!(carved < 32, "cave router opened {carved} of 88 cells");
+    }
+
+    #[test]
+    fn cave_density_does_not_open_entire_vertical_columns() {
+        for seed in -8..8 {
+            let router = DensityRouter::new(seed, OVERWORLD_GEOMETRY, WorldgenMode::VanillaLike);
+            let offset = (seed * 17_i64).rem_euclid(48) as i32;
+            for x in ((-192 + offset)..=(192 + offset)).step_by(48) {
+                for z in ((-192 - offset)..=(192 - offset)).step_by(48) {
+                    let mut longest = 0;
+                    let mut current = 0;
+                    for y in (-48..=40).step_by(2) {
+                        if router.is_cave(x, y, z) {
+                            current += 1;
+                            longest = longest.max(current);
+                        } else {
+                            current = 0;
+                        }
+                    }
+                    assert!(
+                        longest <= 32,
+                        "seed {seed} opened {} continuous vertical cave blocks at {x},{z}",
+                        longest * 2
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn sampled_cave_cells_are_not_isolated() {
+        let mut caves = 0;
+        let mut isolated = 0;
+        for seed in -4..4 {
+            let router = DensityRouter::new(seed, OVERWORLD_GEOMETRY, WorldgenMode::VanillaLike);
+            for x in (-96..=96).step_by(8) {
+                for z in (-96..=96).step_by(8) {
+                    for y in (-48..=40).step_by(4) {
+                        if !router.is_cave(x, y, z) {
+                            continue;
+                        }
+                        caves += 1;
+                        if ![
+                            (1, 0, 0),
+                            (-1, 0, 0),
+                            (0, 1, 0),
+                            (0, -1, 0),
+                            (0, 0, 1),
+                            (0, 0, -1),
+                        ]
+                        .into_iter()
+                        .any(|(dx, dy, dz)| router.is_cave(x + dx, y + dy, z + dz))
+                        {
+                            isolated += 1;
+                        }
+                    }
+                }
+            }
+        }
+        assert!(caves > 32, "sample should include enough cave cells");
+        assert!(
+            isolated * 100 <= caves,
+            "{isolated} of {caves} sampled cave cells were isolated"
+        );
     }
 }
