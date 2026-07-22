@@ -2317,9 +2317,11 @@ impl RegionalOwnerHandle {
                 journal_commit,
             ) {
                 return result.map(|snapshots| {
-                    (snapshots.len() == expected_count)
-                        .then(|| snapshots.into_iter().map(snapshot_kinematics).collect())
-                        .unwrap_or_default()
+                    if snapshots.len() == expected_count {
+                        snapshots.into_iter().map(snapshot_kinematics).collect()
+                    } else {
+                        Vec::new()
+                    }
                 });
             }
         }
