@@ -70,7 +70,13 @@ verification and keep ordinary survival play ahead of rare edge cases.
   embedded 26.1.2 client issued no movement input: the initial summoned-zombie
   observation had yaw `0`; the post-damage observation had yaw `-180` and the
   unchanged-position player had gone `20 -> 17` without player motion.
-- [ ] Skeletons fire arrows and creepers fuse/explode through authoritative paths.
+- [x] Skeletons fire arrows and creepers fuse/explode through authoritative
+  paths. Current focused gates prove a skeleton-owned moving arrow, a 30-tick
+  creeper fuse with authoritative explosion/removal, and explosion damage over
+  TCP. The retained embedded-client combat run observed the arrow and player
+  damage, then observed the creeper damage the player and disappear. Operator
+  commands only created the deterministic fixtures; they did not perform the
+  attacks.
 - [ ] Passive and hostile mobs spawn naturally; animal movement and one-block
   stepping are smooth and vanilla-like, without hopping, circles, or stutter.
 - [ ] Water has player swimming, drag, buoyancy and breathing; aquatic mobs stay
