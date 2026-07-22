@@ -200,9 +200,10 @@ the recipient snapshot while holding the session registry, then builds the wire
 plan after releasing that lock. Commit reacquires the registry, compares the
 tracker state with the copied value, and rechecks visibility before publishing.
 The same snapshot boundary now copies player positions and tracker inputs, then
-releases both ECS access and the session registry before pickup-candidate and
-movement-plan computation. Only chunk/visibility mutation and the final
-tracker/visibility commit retain the registry.
+releases both ECS access and the session registry for pickup-distance filtering
+and movement-plan computation. Recipient snapshotting, pickup admission,
+chunk/visibility mutation, and the final tracker/visibility commit still
+reacquire the registry.
 This removes packet planning from the global critical section without allowing
 a stale plan to overwrite newer state. Chunk visibility indexes and outbound
 session publication are still centralized; this is not a fully lock-free or
