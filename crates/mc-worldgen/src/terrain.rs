@@ -37,7 +37,7 @@ pub use ore_rules::{
 use ore_rules::{
     MAX_ORE_ANCHORS_PER_CELL, MAX_ORE_VEIN_SIZE, ORE_ANCHOR_CELL_EDGE, ORE_ANCHOR_CELL_VOLUME,
 };
-use overworld::{DensityRouter, TerrainSample};
+use overworld::{OverworldRouter, TerrainSample};
 
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 pub enum TerrainGeneratorError {
@@ -92,6 +92,16 @@ pub enum WorldgenMode {
     #[default]
     VanillaLike,
     TellusLike(TellusWorldgenSettings),
+}
+
+impl WorldgenMode {
+    #[must_use]
+    pub const fn contract_name(self) -> &'static str {
+        match self {
+            Self::VanillaLike => "vanilla_like",
+            Self::TellusLike(_) => "tellus_like",
+        }
+    }
 }
 
 /// Hill-noise terrain. Holds the resolved state ids of the four
@@ -237,6 +247,11 @@ fn heightmap_value_for_top(geometry: ChunkGeometry, top: i32) -> Option<u32> {
     (value <= geometry.height() as u32).then_some(value)
 }
 
+fn world_block_coordinate(chunk: i32, local: u8) -> i32 {
+    let coordinate = i64::from(chunk) * 16 + i64::from(local);
+    i32::try_from(coordinate).expect("chunk lies outside the supported i32 block-coordinate range")
+}
+
 impl TerrainGenerator {
     /// Build a generator from a seed plus a block registry.
     ///
@@ -360,8 +375,8 @@ impl TerrainGenerator {
         self.density_router().sample(world_x, world_z).surface_y
     }
 
-    fn density_router(&self) -> DensityRouter {
-        DensityRouter::new(self.seed, self.geometry, self.worldgen_mode)
+    fn density_router(&self) -> OverworldRouter {
+        OverworldRouter::new(self.seed, self.geometry, self.worldgen_mode)
     }
 
     fn biome_for(&self, world_x: i32, world_z: i32, height: i32) -> Identifier {
@@ -544,8 +559,8 @@ impl TerrainGenerator {
     }
 
     fn plan_column(&self, pos: ChunkPos, lx: u8, lz: u8) -> ColumnPlan {
-        let wx = pos.x * 16 + lx as i32;
-        let wz = pos.z * 16 + lz as i32;
+        let wx = world_block_coordinate(pos.x, lx);
+        let wz = world_block_coordinate(pos.z, lz);
         let sample = self.density_router().sample(wx, wz);
         let height = sample.surface_y;
         let biome = match self.worldgen_mode {
@@ -1049,20 +1064,13 @@ impl TerrainGenerator {
                 if self.is_spawn_stone_outcrop(plan.wx, height, plan.wz) {
                     continue;
                 }
-                if (self.biomes.temperate_forest.contains(biome)
+                let tree_biome = self.biomes.temperate_forest.contains(biome)
                     || self.biomes.cold.contains(biome)
                     || self.biomes.jungle.contains(biome)
-                    || self.biomes.grassland.contains(biome))
-                    && h.is_multiple_of(47)
+                    || self.biomes.grassland.contains(biome);
+                if ((tree_biome && h.is_multiple_of(47)) || self.is_spawn_tree_anchor(plan))
                     && self.tree_site_is_stable(plan)
-                    && self.place_tree(
-                        chunk,
-                        lx,
-                        base_y,
-                        lz,
-                        self.tree_blocks_for_biome(biome),
-                        &mut touched,
-                    )
+                    && self.place_tree(chunk, plan, self.tree_blocks_for_biome(biome), &mut touched)
                 {
                     continue;
                 }
@@ -1145,15 +1153,24 @@ impl TerrainGenerator {
         true
     }
 
+    fn is_spawn_tree_anchor(&self, plan: &ColumnPlan) -> bool {
+        plan.wx == -8
+            && plan.wz == -8
+            && (plan.surface == self.grass_block || plan.surface == self.podzol)
+    }
+
     fn place_tree(
         &self,
         chunk: &mut Chunk,
-        lx: u8,
-        base_y: i32,
-        lz: u8,
+        plan: &ColumnPlan,
         blocks: (Option<BlockStateId>, Option<BlockStateId>),
         touched: &mut [Option<i32>; 256],
     ) -> bool {
+        let lx = plan.lx;
+        let lz = plan.lz;
+        let Some(base_y) = checked_y_offset(plan.height, 1) else {
+            return false;
+        };
         let (Some(log), Some(leaves)) = blocks else {
             return false;
         };
@@ -1169,8 +1186,7 @@ impl TerrainGenerator {
         let Some(support_y) = checked_y_offset(base_y, -1) else {
             return false;
         };
-        if matches!(chunk.get_block(lx, support_y, lz), Some(state) if state == self.air || state == self.water)
-        {
+        if chunk.get_block(lx, support_y, lz) != Some(plan.surface) {
             return false;
         }
         for y in base_y..=top_y {
@@ -1407,9 +1423,11 @@ impl TerrainGenerator {
         let x_offset = separation + (h % usable as u64) as i32;
         let z_offset = separation + ((h >> 16) % usable as u64) as i32;
         let template = &templates[((h >> 32) as usize) % templates.len()];
-        let center_chunk_x = grid_x * spacing + x_offset;
-        let center_chunk_z = grid_z * spacing + z_offset;
-        Some((template, center_chunk_x * 16 + 8, center_chunk_z * 16 + 8))
+        let center_chunk_x = i64::from(grid_x) * i64::from(spacing) + i64::from(x_offset);
+        let center_chunk_z = i64::from(grid_z) * i64::from(spacing) + i64::from(z_offset);
+        let center_x = i32::try_from(center_chunk_x * 16 + 8).ok()?;
+        let center_z = i32::try_from(center_chunk_z * 16 + 8).ok()?;
+        Some((template, center_x, center_z))
     }
 
     fn refresh_structure_column(&self, chunk: &mut Chunk, lx: u8, lz: u8) {
@@ -1440,8 +1458,8 @@ impl TerrainGenerator {
         if y > DEEPSLATE_TOP_Y {
             return self.stone;
         }
-        let wx = pos.x * 16 + lx as i32;
-        let wz = pos.z * 16 + lz as i32;
+        let wx = world_block_coordinate(pos.x, lx);
+        let wz = world_block_coordinate(pos.z, lz);
         let deepslate_chance = (DEEPSLATE_TOP_Y - y + 1) as u64;
         if feature_hash(self.seed, wx, y, wz, 0xD33F).is_multiple_of(9 - deepslate_chance) {
             self.deepslate
@@ -1591,8 +1609,8 @@ fn paste_template(
     origin_z: i32,
     touched: &mut [bool; 256],
 ) {
-    let min_x = chunk.pos.x * 16;
-    let min_z = chunk.pos.z * 16;
+    let min_x = world_block_coordinate(chunk.pos.x, 0);
+    let min_z = world_block_coordinate(chunk.pos.z, 0);
     let geometry = chunk.geometry();
     for block in template.blocks() {
         let wx = origin_x + block.pos[0];

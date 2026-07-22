@@ -19,16 +19,16 @@ Current runtime facts:
   and bounded admissions; operator worker-percentage knobs are forbidden.
 - SIMD and fast paths require a measured bottleneck, a scalar/correctness
   fence, and evidence for only the measured workload.
-- Overworld terrain shape is owned by `terrain::overworld::DensityRouter`;
+- Overworld terrain shape is owned by `terrain::overworld::OverworldRouter`;
   route worldgen topology, climate, river, cave, or stage extraction work
   through ADR 0008.
-- The third-generation Overworld router owns continents, tectonic plates,
-  erosion, ridges, rivers, climate, and per-block tunnel caves. Caves keep a
-  32-block solid surface shell and have no chamber field; generated trees
-  require a stable 5x5 terrain footprint under the full canopy. Generation
-  order is terrain/caves/ores, then structures, then decorations. Persisted
-  chunks are never silently regenerated, so evaluate the new router only in a
-  fresh world (`playable.toml` uses `.analysis/test-world-v3`).
+- Worldgen revision 4 owns warped continents, erosion, ridges, rivers, climate,
+  and narrow neighbour-connected tunnel caves. Caves keep a 32-block solid
+  surface shell; trees require their exact planned support and a stable 5x5
+  footprint. Generation order is terrain/caves/ores, structures, decorations.
+  `solaris/world.json` fences revision, seed, mode, and geometry before Anvil
+  open. Unversioned Anvil worlds open as vanilla imports without Solaris
+  fallback generation. Evaluate revision 4 in `.analysis/test-world-v4`.
 - Regional entity owners commit authoritative kinematics. Movement wire plans
   are prepared outside the global session lock and use tracker CAS plus a
   visibility recheck at publication. Visibility indexes and outbound session

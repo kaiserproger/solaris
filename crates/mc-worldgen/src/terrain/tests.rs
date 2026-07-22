@@ -821,6 +821,12 @@ fn generated_chunk_handles_geometry_above_vanilla_surface_band() {
 }
 
 #[test]
+#[should_panic(expected = "chunk lies outside the supported i32 block-coordinate range")]
+fn generation_rejects_chunk_coordinates_outside_the_block_domain() {
+    TerrainGenerator::new(0, tiny_registry()).generate(ChunkPos { x: i32::MAX, z: 0 });
+}
+
+#[test]
 fn chunk_geometry_typed_boundary_rejects_invalid_vertical_ranges() {
     assert_eq!(mc_world::ChunkGeometry::new(0, 0), None);
     assert_eq!(mc_world::ChunkGeometry::new(1, 16), None);
@@ -1611,6 +1617,59 @@ fn surface_decorations_are_visible_and_refresh_heightmaps() {
         saw_decoration,
         "sampled chunks should contain surface decorations"
     );
+}
+
+#[test]
+fn generated_tree_trunks_start_on_the_planned_surface() {
+    let registry = tiny_registry();
+    let mut trees = 0usize;
+    for seed in -4..4 {
+        let generator = TerrainGenerator::new(seed, Arc::clone(&registry));
+        let log_states = [
+            generator.decorations.oak_log,
+            generator.decorations.forest_log,
+            generator.decorations.cold_log,
+            generator.decorations.jungle_log,
+        ];
+        for chunk_x in -3..=3 {
+            for chunk_z in -3..=3 {
+                let pos = ChunkPos {
+                    x: chunk_x,
+                    z: chunk_z,
+                };
+                let chunk = generator.generate(pos);
+                for lx in 0..16u8 {
+                    for lz in 0..16u8 {
+                        let plan = generator.plan_column(pos, lx, lz);
+                        let first_above = chunk.get_block(lx, plan.height + 1, lz);
+                        let has_trunk = (plan.height + 1..=plan.height + 6).any(|y| {
+                            chunk
+                                .get_block(lx, y, lz)
+                                .is_some_and(|state| log_states.contains(&Some(state)))
+                        });
+                        if !has_trunk {
+                            continue;
+                        }
+                        trees += 1;
+                        assert_eq!(
+                            chunk.get_block(lx, plan.height, lz),
+                            Some(plan.surface),
+                            "tree support changed at {},{}",
+                            plan.wx,
+                            plan.wz,
+                        );
+                        assert!(
+                            first_above.is_some_and(|state| log_states.contains(&Some(state))),
+                            "tree trunk floats above {},{}",
+                            plan.wx,
+                            plan.wz,
+                        );
+                    }
+                }
+            }
+        }
+    }
+    assert!(trees >= 8, "sample should contain generated trees");
 }
 
 #[test]

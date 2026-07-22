@@ -5,14 +5,23 @@ use std::path::{Path, PathBuf};
 use anyhow::{Context, Result, bail};
 use mc_server::ServerConfig;
 
-pub(crate) const WORLD_GEOMETRY_CONTRACT_VERSION: u32 = 1;
-const WORLD_GEOMETRY_CONTRACT_FILE: &str = "world-geometry.json";
+pub(crate) const WORLD_CONTRACT_SCHEMA: u32 = 1;
+const WORLD_CONTRACT_FILE: &str = "world.json";
 
 #[derive(Debug, serde::Deserialize, serde::Serialize)]
-pub(crate) struct PersistedWorldGeometry {
-    pub(crate) version: u32,
+pub(crate) struct PersistedWorldContract {
+    pub(crate) schema: u32,
+    pub(crate) worldgen_revision: u32,
+    pub(crate) seed: i64,
+    pub(crate) mode: String,
     pub(crate) min_y: i32,
     pub(crate) height: i32,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum WorldSource {
+    SolarisGenerated,
+    ExistingVanilla,
 }
 
 pub(crate) fn required_world_dir(config: &ServerConfig) -> Result<&Path> {
@@ -79,31 +88,48 @@ pub(crate) fn validate_runtime_config(config: &ServerConfig) -> Result<()> {
     Ok(())
 }
 
-pub(crate) fn world_geometry_contract_path(world_dir: &Path) -> PathBuf {
-    world_dir.join("solaris").join(WORLD_GEOMETRY_CONTRACT_FILE)
+pub(crate) fn world_contract_path(world_dir: &Path) -> PathBuf {
+    world_dir.join("solaris").join(WORLD_CONTRACT_FILE)
 }
 
-pub(crate) fn ensure_world_geometry_contract(
+pub(crate) fn ensure_world_contract(
     world_dir: &Path,
     configured: mc_world::ChunkGeometry,
-) -> Result<()> {
-    let path = world_geometry_contract_path(world_dir);
+    seed: i64,
+    mode: &str,
+) -> Result<WorldSource> {
+    let path = world_contract_path(world_dir);
     match std::fs::read(&path) {
         Ok(bytes) => {
-            let persisted: PersistedWorldGeometry = serde_json::from_slice(&bytes)
-                .with_context(|| format!("reading persisted world geometry {}", path.display()))?;
-            if persisted.version != WORLD_GEOMETRY_CONTRACT_VERSION {
+            let persisted: PersistedWorldContract = serde_json::from_slice(&bytes)
+                .with_context(|| format!("reading persisted world contract {}", path.display()))?;
+            if persisted.schema != WORLD_CONTRACT_SCHEMA {
                 bail!(
-                    "unsupported persisted world geometry version {} in {}; expected {}",
-                    persisted.version,
+                    "unsupported persisted world contract schema {} in {}; expected {}",
+                    persisted.schema,
                     path.display(),
-                    WORLD_GEOMETRY_CONTRACT_VERSION,
+                    WORLD_CONTRACT_SCHEMA,
+                );
+            }
+            if persisted.worldgen_revision != mc_worldgen::WORLDGEN_REVISION
+                || persisted.seed != seed
+                || persisted.mode != mode
+            {
+                bail!(
+                    "persisted worldgen revision={} seed={} mode={} in {} does not match configured revision={} seed={} mode={}; use a fresh world_dir",
+                    persisted.worldgen_revision,
+                    persisted.seed,
+                    persisted.mode,
+                    path.display(),
+                    mc_worldgen::WORLDGEN_REVISION,
+                    seed,
+                    mode,
                 );
             }
             let stored = mc_world::ChunkGeometry::new(persisted.min_y, persisted.height)
                 .ok_or_else(|| {
                     anyhow::anyhow!(
-                        "invalid persisted world geometry min_y={} height={} in {}",
+                        "invalid persisted world contract geometry min_y={} height={} in {}",
                         persisted.min_y,
                         persisted.height,
                         path.display(),
@@ -111,7 +137,7 @@ pub(crate) fn ensure_world_geometry_contract(
                 })?;
             if stored != configured {
                 bail!(
-                    "persisted world geometry {}..{} in {} does not match configured geometry {}..{}",
+                    "persisted world contract geometry {}..{} in {} does not match configured geometry {}..{}",
                     stored.min_y(),
                     stored.max_y(),
                     path.display(),
@@ -119,21 +145,17 @@ pub(crate) fn ensure_world_geometry_contract(
                     configured.max_y(),
                 );
             }
-            Ok(())
+            Ok(WorldSource::SolarisGenerated)
         }
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-            if configured != mc_world::OVERWORLD_GEOMETRY && world_contains_anvil_data(world_dir)? {
-                bail!(
-                    "missing persisted world geometry {} for custom geometry {}..{} with existing Anvil data; restore the original geometry contract or migrate the world explicitly",
-                    path.display(),
-                    configured.min_y(),
-                    configured.max_y(),
-                );
+            if world_contains_anvil_data(world_dir)? {
+                return Ok(WorldSource::ExistingVanilla);
             }
-            write_world_geometry_contract(&path, configured)
+            write_world_contract(&path, configured, seed, mode)?;
+            Ok(WorldSource::SolarisGenerated)
         }
         Err(error) => Err(error)
-            .with_context(|| format!("reading persisted world geometry {}", path.display())),
+            .with_context(|| format!("reading persisted world contract {}", path.display())),
     }
 }
 
@@ -171,19 +193,27 @@ fn world_contains_anvil_data(world_dir: &Path) -> Result<bool> {
     Ok(false)
 }
 
-fn write_world_geometry_contract(path: &Path, geometry: mc_world::ChunkGeometry) -> Result<()> {
+fn write_world_contract(
+    path: &Path,
+    geometry: mc_world::ChunkGeometry,
+    seed: i64,
+    mode: &str,
+) -> Result<()> {
     let parent = path
         .parent()
         .expect("world geometry contract path has a parent");
     std::fs::create_dir_all(parent)
         .with_context(|| format!("creating Solaris metadata directory {}", parent.display()))?;
-    let metadata = PersistedWorldGeometry {
-        version: WORLD_GEOMETRY_CONTRACT_VERSION,
+    let metadata = PersistedWorldContract {
+        schema: WORLD_CONTRACT_SCHEMA,
+        worldgen_revision: mc_worldgen::WORLDGEN_REVISION,
+        seed,
+        mode: mode.to_owned(),
         min_y: geometry.min_y(),
         height: geometry.height(),
     };
     let bytes =
-        serde_json::to_vec_pretty(&metadata).context("encoding persisted world geometry")?;
+        serde_json::to_vec_pretty(&metadata).context("encoding persisted world contract")?;
     let temporary = path.with_extension(format!("json.{}.tmp", std::process::id()));
     let mut file = std::fs::OpenOptions::new()
         .write(true)
@@ -206,7 +236,7 @@ fn write_world_geometry_contract(path: &Path, geometry: mc_world::ChunkGeometry)
         })?;
     std::fs::rename(&temporary, path).with_context(|| {
         format!(
-            "installing persisted world geometry {} from {}",
+            "installing persisted world contract {} from {}",
             path.display(),
             temporary.display()
         )

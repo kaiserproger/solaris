@@ -15,11 +15,9 @@ use mc_server::ServerConfig;
 mod startup_validation;
 
 #[cfg(test)]
+use startup_validation::{PersistedWorldContract, WORLD_CONTRACT_SCHEMA, world_contract_path};
 use startup_validation::{
-    PersistedWorldGeometry, WORLD_GEOMETRY_CONTRACT_VERSION, world_geometry_contract_path,
-};
-use startup_validation::{
-    ensure_world_geometry_contract, has_non_directory_ancestor, is_public_bind_ip,
+    WorldSource, ensure_world_contract, has_non_directory_ancestor, is_public_bind_ip,
     required_world_dir, validate_runtime_config, validate_vanilla_sidecar_version,
     world_region_root_is_blocked,
 };
@@ -466,7 +464,13 @@ async fn serve(path: &Path) -> Result<()> {
     validate_runtime_config(&cfg)?;
     let configured_geometry = cfg.data.chunk_geometry().map_err(anyhow::Error::msg)?;
     let world_dir = required_world_dir(&cfg)?;
-    ensure_world_geometry_contract(world_dir, configured_geometry)?;
+    let worldgen_mode = cfg.data.worldgen_mode.to_worldgen();
+    let world_source = ensure_world_contract(
+        world_dir,
+        configured_geometry,
+        cfg.data.seed,
+        worldgen_mode.contract_name(),
+    )?;
 
     let protocol_data = load_effective_protocol_data(cfg.data.vanilla_data_dir.as_deref())?;
     let data = protocol_data.data;
@@ -524,7 +528,7 @@ async fn serve(path: &Path) -> Result<()> {
     let chunk_pipeline = cfg.chunk_pipeline.to_network();
     let terrain_generator = build_terrain_generator(
         cfg.data.seed,
-        cfg.data.worldgen_mode.to_worldgen(),
+        worldgen_mode,
         configured_geometry,
         Arc::clone(&blocks),
         structure_rules,
@@ -549,20 +553,22 @@ async fn serve(path: &Path) -> Result<()> {
         })();
         match open_result {
             Ok(storage) => {
-                // M7: attach the terrain generator. Chunks missing
-                // from disk get materialised on demand; the M6 flush
-                // path then persists them so this only runs once per
-                // chunk per fresh world.
-                let generator: Arc<dyn mc_world::ChunkGenerator> =
-                    Arc::clone(&terrain_generator) as Arc<dyn mc_world::ChunkGenerator>;
+                // Solaris worlds generate missing chunks. Imported vanilla
+                // worlds stay read-only with respect to terrain authority.
                 let startup_workers =
                     startup_chunk_worker_threads(chunk_pipeline.chunk_worker_threads);
                 let startup_light_workers = startup_light_bake_worker_threads(startup_workers);
-                let mut storage = storage
-                    .with_generator(generator)
-                    .with_item_registry(Arc::clone(&items));
+                let mut storage = storage.with_item_registry(Arc::clone(&items));
+                if world_source == WorldSource::SolarisGenerated {
+                    let generator: Arc<dyn mc_world::ChunkGenerator> =
+                        Arc::clone(&terrain_generator) as Arc<dyn mc_world::ChunkGenerator>;
+                    storage = storage.with_generator(generator);
+                }
                 let mut region_count = count_region_files(world_dir);
                 if region_count == 0 {
+                    if world_source == WorldSource::ExistingVanilla {
+                        bail!("existing vanilla world has no readable overworld region files");
+                    }
                     let generated = generate_spawn_window(
                         &mut storage,
                         Arc::clone(&terrain_generator) as Arc<dyn mc_world::ChunkGenerator>,
@@ -603,6 +609,7 @@ async fn serve(path: &Path) -> Result<()> {
                     block_count = storage.registry().len(),
                     region_files = region_count,
                     seed = cfg.data.seed,
+                    source = ?world_source,
                     "world storage opened with worldgen baseline",
                 );
                 Some(Arc::new(tokio::sync::Mutex::new(storage)))
@@ -1658,28 +1665,34 @@ mod tests {
     }
 
     #[test]
-    fn world_geometry_contract_rejects_mismatched_restart_before_world_open() {
+    fn world_contract_rejects_mismatched_geometry_before_world_open() {
         let world = tempfile::tempdir().unwrap();
         let original = mc_world::ChunkGeometry::new(0, 256).unwrap();
         let changed = mc_world::ChunkGeometry::new(-64, 384).unwrap();
 
-        ensure_world_geometry_contract(world.path(), original).unwrap();
-        let bytes = std::fs::read(world_geometry_contract_path(world.path())).unwrap();
-        let persisted: PersistedWorldGeometry = serde_json::from_slice(&bytes).unwrap();
-        assert_eq!(persisted.version, WORLD_GEOMETRY_CONTRACT_VERSION);
+        assert_eq!(
+            ensure_world_contract(world.path(), original, 7, "vanilla_like").unwrap(),
+            WorldSource::SolarisGenerated,
+        );
+        let bytes = std::fs::read(world_contract_path(world.path())).unwrap();
+        let persisted: PersistedWorldContract = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(persisted.schema, WORLD_CONTRACT_SCHEMA);
+        assert_eq!(persisted.worldgen_revision, mc_worldgen::WORLDGEN_REVISION);
+        assert_eq!(persisted.seed, 7);
+        assert_eq!(persisted.mode, "vanilla_like");
         assert_eq!(persisted.min_y, 0);
         assert_eq!(persisted.height, 256);
 
-        let error = ensure_world_geometry_contract(world.path(), changed).unwrap_err();
+        let error = ensure_world_contract(world.path(), changed, 7, "vanilla_like").unwrap_err();
 
         let message = error.to_string();
-        assert!(message.contains("persisted world geometry"), "{message}");
+        assert!(message.contains("world contract geometry"), "{message}");
         assert!(message.contains("0..256"), "{message}");
         assert!(message.contains("-64..320"), "{message}");
     }
 
     #[test]
-    fn world_geometry_contract_rejects_legacy_custom_world_with_anvil_data() {
+    fn unversioned_anvil_world_opens_without_solaris_generation() {
         let world = tempfile::tempdir().unwrap();
         let region = world.path().join("region");
         std::fs::create_dir_all(&region).unwrap();
@@ -1690,28 +1703,38 @@ mod tests {
         .unwrap();
 
         let geometry = mc_world::ChunkGeometry::new(0, 256).unwrap();
-        let error = ensure_world_geometry_contract(world.path(), geometry).unwrap_err();
-
-        let message = error.to_string();
-        assert!(
-            message.contains("missing persisted world geometry"),
-            "{message}"
+        assert_eq!(
+            ensure_world_contract(world.path(), geometry, 0, "vanilla_like").unwrap(),
+            WorldSource::ExistingVanilla,
         );
-        assert!(message.contains("existing Anvil data"), "{message}");
-        assert!(!world_geometry_contract_path(world.path()).exists());
+        assert!(!world_contract_path(world.path()).exists());
     }
 
     #[test]
-    fn world_geometry_contract_migrates_legacy_overworld_without_reading_chunks() {
+    fn world_contract_rejects_seed_and_mode_changes() {
         let world = tempfile::tempdir().unwrap();
-        let region = world.path().join("region");
-        std::fs::create_dir_all(&region).unwrap();
-        std::fs::write(region.join("r.0.0.mca"), b"migration must not decode this").unwrap();
+        let geometry = mc_world::OVERWORLD_GEOMETRY;
 
-        ensure_world_geometry_contract(world.path(), mc_world::OVERWORLD_GEOMETRY).unwrap();
-        ensure_world_geometry_contract(world.path(), mc_world::OVERWORLD_GEOMETRY).unwrap();
+        assert_eq!(
+            ensure_world_contract(world.path(), geometry, 11, "vanilla_like").unwrap(),
+            WorldSource::SolarisGenerated,
+        );
+        assert_eq!(
+            ensure_world_contract(world.path(), geometry, 11, "vanilla_like").unwrap(),
+            WorldSource::SolarisGenerated,
+        );
 
-        assert!(world_geometry_contract_path(world.path()).is_file());
+        let seed_error =
+            ensure_world_contract(world.path(), geometry, 12, "vanilla_like").unwrap_err();
+        assert!(seed_error.to_string().contains("seed=11"));
+        assert!(seed_error.to_string().contains("seed=12"));
+
+        let mode_error =
+            ensure_world_contract(world.path(), geometry, 11, "tellus_like").unwrap_err();
+        assert!(mode_error.to_string().contains("mode=vanilla_like"));
+        assert!(mode_error.to_string().contains("mode=tellus_like"));
+
+        assert!(world_contract_path(world.path()).is_file());
     }
 
     #[test]

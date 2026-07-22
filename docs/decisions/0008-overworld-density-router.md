@@ -1,58 +1,57 @@
-# ADR 0008 - Overworld density router
+# ADR 0008 - Overworld generation pipeline
 
 **Date:** 2026-07-22
-**Status:** Accepted, third-generation router
+**Status:** Accepted, worldgen revision 4
 
 ## Context
 
-The old generator calculated terrain shape through separate formulas for
-height, continents, rivers, mountains, climate, and caves. Those formulas could
-disagree. Two later routers retained too much domain warping, broad ridge masks,
-and a second Tellus-only mountain authority. The result was hard to reason about
-and could produce visually abrupt terrain and decorations over unsupported
-ground.
+Three previous routers changed terrain formulas without fencing persisted
+chunks by generator revision, seed, and mode. A server could therefore join old
+and new terrain inside one Anvil world. That creates hard borders which no local
+height or decoration fix can remove. Tree placement also accepted any non-fluid
+block as support instead of the surface planned for that column.
 
 ## Decision
 
-`terrain::overworld::DensityRouter` is the single authority for terrain shape.
-The third router replaces the prior formulas instead of layering more fixes over
-them. One coordinate sample derives continents, coasts, tectonic plates, erosion,
-mountain ridges, hills, rivers, temperature, and moisture. The same sample drives
-both vanilla-like and Tellus-like terrain and biome routing. Mountains only rise
-where a plate mask and narrow ridge field overlap. Rivers flatten land toward a
-water floor; they never subtract vertical shafts from terrain density.
+Worldgen revision 4 starts from `terrain::overworld::OverworldRouter`. One
+world-coordinate sample derives warped continents, erosion, narrow mountain
+ridges, hills, rivers, temperature, and moisture. Broad coordinate scales and a
+tested three-block adjacent-column slope budget keep both interior columns and
+chunk borders continuous. Rivers use the same mask for terrain and biome
+routing and always cut a river-labelled centre below sea level.
 
 Spawn land and river suppression are smooth field constraints, not later block
 rewrites. River availability is part of the returned field, so biome routing
 cannot label an uncarved coast as a river.
 
-Underground shape is sampled per block from two intersecting, vertically bounded
-3D tunnel fields. The chamber field was removed. Carvers never operate in the
-top 32 solid blocks of a column. This keeps caves locally coherent without
-surface mouths, giant chambers, or long vertical voids.
+Underground shape is a vertically bounded intersection of two narrow 3D tunnel
+fields. A cell is carved only when a horizontal neighbour belongs to the same
+tunnel. Carvers retain a 32-block solid surface shell and tests bound shafts,
+isolated cells, total cave density, and open cells in 9x9 slices.
 
-Chunk assembly, ore rules, structures, and decorations remain deterministic
-consumers. They may not calculate an alternative terrain surface. Structures
-are emitted before vegetation. Generated trees require solid support and every
-terrain column under their full 5x5 canopy footprint to be within one block of
-the trunk base, preventing visually floating trees on narrow ridges.
+Chunk assembly, ore rules, structures, and decorations are deterministic
+consumers. Structures are emitted before vegetation. A generated tree now
+requires the exact planned surface block under its trunk plus a stable 5x5
+terrain footprint; structures or earlier stages cannot become accidental tree
+support.
 
 Generation remains stateless and coordinate-derived. Parallel generation of the
-same chunk or neighboring chunks in any order must produce identical output.
-Changing this algorithm intentionally changes newly generated terrain; persisted
-vanilla-format chunks remain authoritative and are not regenerated. The local
-playable profile therefore uses `.analysis/test-world-v3`; previous local worlds
-are retained but cannot be evidence for this router.
+same chunk or neighbouring chunks in any order produces identical output. Every
+new Solaris world persists `solaris/world.json` with schema, worldgen revision,
+seed, mode, and geometry. A mismatched contract is rejected before Anvil open.
+An existing unversioned Anvil world is treated as a vanilla import and opens
+without Solaris fallback generation, so missing chunks cannot mix both terrain
+authorities. Existing worlds are never rewritten. The local playable profile
+uses `.analysis/test-world-v4`.
 
 The hot path samples each surface column once and reuses its biome result for
 vertical biome cells. Cave noise exits after its region mask or first tunnel
-field rejects the cell. The ignored 25-chunk debug probe generated 24.1 chunks/s
-on the development host. This is a narrow diagnostic, not a release or full
-server throughput claim.
+field rejects the cell. No revision-4 performance claim exists until a release
+benchmark runs on a clean host.
 
 ## Staged boundary
 
-Density routing is isolated. Surface composition, carvers, ores, features, and
+Overworld routing is isolated. Surface composition, carvers, ores, features, and
 structures still reside in the larger `terrain.rs` assembly and should move into
 focused sibling modules when each stage is changed. This ADR does not claim
 vanilla NoiseRouter parity or complete Tectonic/Tellus feature coverage.
@@ -60,12 +59,13 @@ vanilla NoiseRouter parity or complete Tectonic/Tellus feature coverage.
 ## Verification
 
 - deterministic generation for repeated calls and explicit geometry;
-- bounded adjacent-column steps and non-grid biome transitions;
+- bounded adjacent-column and chunk-border steps plus non-grid biome transitions;
 - dry land at the origin across sampled seeds;
 - broad water-filled river sections;
 - sparse locally coherent tunnel caves with no chamber field, surface mouth, or
   long vertical shaft;
 - a 32-block solid protected surface shell across sampled seeds;
-- supported generated trees over their full 5x5 canopy footprint;
+- exact-surface tree support over a stable 5x5 footprint;
+- vanilla-import isolation plus rejection of mismatched revision/seed/mode/geometry;
 - order-independent ore placement;
 - `cargo test -p mc-worldgen`.

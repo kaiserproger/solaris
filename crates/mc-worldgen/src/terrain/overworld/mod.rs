@@ -1,8 +1,8 @@
-//! Deterministic overworld density routing.
+//! Deterministic overworld routing.
 //!
-//! This module owns terrain shape. Features consume its output but may not
-//! invent a second height, climate, river, or cave authority.
+//! The router is the only source of terrain height, climate, rivers, and cave
+//! membership. Later stages may choose blocks, but may not reshape terrain.
 
-mod density;
+mod router;
 
-pub(in crate::terrain) use density::{DensityRouter, TerrainSample};
+pub(in crate::terrain) use router::{OverworldRouter, TerrainSample};
