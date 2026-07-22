@@ -497,6 +497,16 @@ lane admission only while they are enqueued, then release it before owner
 computation. Exact goal-input snapshots and leases reject stale plans at apply.
 A slow lane therefore does not hold admissions or stop direct work in another
 lane.
+Item lifetime expiry no longer performs a full entity snapshot during every
+physics publication turn. Item creation and restore add the entity id to a
+simulation-tick deadline index; an expiry turn reads and removes only due ids,
+bounded by the existing sweep budget. This removes the steady all-lane
+admission and keeps restored items on their original `spawn_tick` deadline.
+Removal cancels the live deadline, duplicate scheduling is idempotent, and
+stale queue entries do not consume the live-item sweep budget.
+Due removal and visibility publication still use the centralized session
+registry, so this is a removed global read fence rather than a claim that item
+lifecycle is fully regional.
 Prepared-goal apply uses shared topology plus the admissions resolved from its
 active goal inputs, follow-target sources, lease/batch regions, and any requested
 post-apply kinematics IDs. Its multi-lane prepare/commit/finalize remains atomic

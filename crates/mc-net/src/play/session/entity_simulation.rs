@@ -488,6 +488,9 @@ impl SessionRegistry {
                 inner.natural_ground_mobs.insert(entity_id);
             }
             schedule_entity_death_locked(&mut inner, &entity);
+            if entity.item_stack.is_some() {
+                schedule_item_despawn_locked(&mut inner, entity_id, entity.retained.spawn_tick);
+            }
             if entity.item_stack.is_some()
                 && let Some(ready_tick) = entity.retained.item_pickup_ready_tick
                 && ready_tick > lifecycle_clock

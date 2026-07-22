@@ -5107,8 +5107,8 @@ fn entity_physics_uses_one_commit_and_one_current_read_after_commit() {
 
     assert_eq!(
         registry.entity_owner_requests_for_test(),
-        4,
-        "physics uses preparation, expiry, one regional commit, and one current publication read"
+        3,
+        "physics uses preparation, one regional commit, and one current publication read"
     );
 }
 
@@ -9024,6 +9024,38 @@ fn item_drop_despawns_after_lifetime() {
 }
 
 #[test]
+fn restored_item_keeps_its_original_despawn_deadline() {
+    let source = SessionRegistry::new();
+    source.spawn_item_drop(1, Vec3::new(0.5, 64.0, 0.5), EntityItemStack::new(42, 3));
+    source.advance_world_time(12);
+    let (checkpoint, _) = source.persisted_entity_save_snapshot();
+
+    let restored = SessionRegistry::new();
+    assert_eq!(restored.restore_persisted_entities(checkpoint), 1);
+    restored.advance_world_time(ITEM_DESPAWN_AGE_TICKS - 12);
+    restored.apply_entity_physics_and_dispatch(ITEM_DESPAWN_AGE_TICKS, &[]);
+
+    assert!(restored.persisted_entity_records().is_empty());
+}
+
+#[test]
+fn item_despawn_idle_tick_does_not_scan_entity_owner() {
+    let registry = SessionRegistry::new();
+    registry.spawn_command_entity(
+        &SimulationAuthority::for_test(),
+        1,
+        "minecraft:cow".to_owned(),
+        Vec3::new(0.5, 64.0, 0.5),
+    );
+    registry.spawn_item_drop(2, Vec3::new(1.5, 64.0, 0.5), EntityItemStack::new(42, 1));
+    registry.reset_entity_owner_requests_for_test();
+
+    registry.apply_entity_physics_and_dispatch(1, &[]);
+
+    assert_eq!(registry.entity_owner_requests_for_test(), 0);
+}
+
+#[test]
 fn item_lifecycle_index_tracks_only_item_entities_and_clears_on_remove() {
     let registry = SessionRegistry::new();
     let collector = register_test_session(&registry, "ItemIndexCollector");
@@ -9082,6 +9114,34 @@ fn item_despawn_sweep_is_budgeted() {
 
     let remaining = registry.persisted_entity_records().len();
     assert_eq!(remaining, 10);
+}
+
+#[test]
+fn stale_item_deadlines_do_not_consume_live_despawn_budget() {
+    let registry = SessionRegistry::new();
+    let collector = register_test_session(&registry, "StaleDeadlineCollector");
+    for _ in 0..=ITEM_DESPAWN_SWEEP_BUDGET {
+        registry.spawn_item_drop(1, Vec3::new(0.5, 64.0, 0.5), EntityItemStack::new(42, 1));
+    }
+    let mut item_ids = registry
+        .persisted_entity_records()
+        .into_iter()
+        .map(|record| record.snapshot.id)
+        .collect::<Vec<_>>();
+    item_ids.sort_unstable();
+    registry.advance_world_time(ITEM_PICKUP_DELAY_TICKS);
+    for entity_id in item_ids.into_iter().take(ITEM_DESPAWN_SWEEP_BUDGET) {
+        assert!(
+            registry
+                .claim_item_pickup_for_test(entity_id, collector, 1)
+                .is_some()
+        );
+    }
+    registry.advance_world_time(ITEM_DESPAWN_AGE_TICKS - ITEM_PICKUP_DELAY_TICKS);
+
+    registry.apply_entity_physics_and_dispatch(ITEM_DESPAWN_AGE_TICKS, &[]);
+
+    assert!(registry.persisted_entity_records().is_empty());
 }
 
 #[test]

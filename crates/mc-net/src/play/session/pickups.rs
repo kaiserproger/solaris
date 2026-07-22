@@ -7,9 +7,9 @@ use super::outbound::{OutboundCommand, SessionRecipient, VisibilityDispatch};
 use super::visibility::ordered_session_recipient;
 use super::{
     ServerEntitySnapshot, SessionEntityGuards, SessionId, SessionRegistry, SessionRegistryInner,
-    initialize_entity_wire_state_locked, server_entity_snapshot_from, session_recipients,
-    spawn_entity_visibility_from_snapshot_locked, spawn_entity_visibility_locked,
-    spawned_xp_observer_ids, visible_entity_observers_locked,
+    initialize_entity_wire_state_locked, schedule_item_despawn_locked, server_entity_snapshot_from,
+    session_recipients, spawn_entity_visibility_from_snapshot_locked,
+    spawn_entity_visibility_locked, spawned_xp_observer_ids, visible_entity_observers_locked,
 };
 use crate::play::GameMode;
 use crate::play::campfire::PendingCampfireOutput;
@@ -298,6 +298,7 @@ impl SessionRegistry {
 
         let mut dispatches = Vec::new();
         for (id, (entity_type_id, position, _)) in ids.into_iter().zip(drops) {
+            schedule_item_despawn_locked(&mut inner, id, lifecycle_tick);
             inner
                 .item_pickup_ready
                 .entry(ready_tick)
@@ -355,6 +356,7 @@ impl SessionRegistry {
             .collect::<Vec<_>>();
         snapshots.sort_unstable_by_key(|snapshot| snapshot.uuid.as_u128());
         for snapshot in &snapshots {
+            schedule_item_despawn_locked(&mut inner, snapshot.id, snapshot.retained.spawn_tick);
             inner
                 .entity_type_aabbs
                 .entry(snapshot.type_id)
@@ -843,19 +845,19 @@ fn spawn_item_drop_entity_locked_inner(
     if stack.is_empty() {
         return None;
     }
+    let spawn_tick = inner.entity_lifecycle_tick;
     let mut entity = SpawnEntity::new(entity_type_id, "minecraft:item", position);
-    entity.velocity = item_drop_velocity(position, &stack, inner.entity_lifecycle_tick);
+    entity.velocity = item_drop_velocity(position, &stack, spawn_tick);
     entity.item_stack = Some(stack);
-    entity.retained.spawn_tick = inner.entity_lifecycle_tick;
-    let ready_tick = inner
-        .entity_lifecycle_tick
-        .saturating_add(ITEM_PICKUP_DELAY_TICKS);
+    entity.retained.spawn_tick = spawn_tick;
+    let ready_tick = spawn_tick.saturating_add(ITEM_PICKUP_DELAY_TICKS);
     entity.retained.item_pickup_ready_tick = Some(ready_tick);
     let id = if journal_commit {
         inner.entities.spawn(entity)
     } else {
         inner.entities.spawn_deferred_journal(entity)
     };
+    schedule_item_despawn_locked(inner, id, spawn_tick);
     inner
         .item_pickup_ready
         .entry(ready_tick)

@@ -349,6 +349,8 @@ struct SessionRegistryInner {
     spawned_entity_chunks: HashSet<(i32, i32)>,
     pending_hostile_spawns: BTreeMap<(i32, i32), Vec<HerdSpawn>>,
     item_pickup_ready: BTreeMap<u64, Vec<EntityId>>,
+    item_despawn_deadlines: BTreeMap<u64, VecDeque<EntityId>>,
+    item_despawn_deadline_by_id: HashMap<EntityId, u64>,
     dying_entity_deadlines: BTreeMap<u64, VecDeque<EntityId>>,
     dying_entity_deadline_by_id: HashMap<EntityId, u64>,
     player_persistence: HashMap<SessionId, Arc<Mutex<PlayerPersistedState>>>,
@@ -1575,25 +1577,74 @@ fn apply_entity_facts(entity: &mut SpawnEntity) {
     }
 }
 
+fn schedule_item_despawn_locked(
+    inner: &mut SessionRegistryInner,
+    entity_id: EntityId,
+    spawn_tick: u64,
+) {
+    let deadline = spawn_tick.saturating_add(ITEM_DESPAWN_AGE_TICKS);
+    if inner
+        .item_despawn_deadline_by_id
+        .insert(entity_id, deadline)
+        == Some(deadline)
+    {
+        return;
+    }
+    inner
+        .item_despawn_deadlines
+        .entry(deadline)
+        .or_default()
+        .push_back(entity_id);
+}
+
 fn despawn_expired_items_locked(inner: &mut SessionEntityGuards<'_>) -> Vec<VisibilityDispatch> {
-    let expired = inner
-        .entities
-        .snapshots_vec()
-        .into_iter()
-        .filter_map(|entity| {
-            (entity.item_stack.is_some()
-                && inner
-                    .entity_lifecycle_tick
-                    .saturating_sub(entity.retained.spawn_tick)
-                    >= ITEM_DESPAWN_AGE_TICKS)
-                .then_some(entity.id)
-        })
-        .take(ITEM_DESPAWN_SWEEP_BUDGET)
-        .collect::<Vec<_>>();
+    let current_tick = inner.entity_lifecycle_tick;
+    let mut expired = Vec::with_capacity(ITEM_DESPAWN_SWEEP_BUDGET);
+    while expired.len() < ITEM_DESPAWN_SWEEP_BUDGET {
+        let Some(mut entry) = inner.item_despawn_deadlines.first_entry() else {
+            break;
+        };
+        if *entry.key() > current_tick {
+            break;
+        }
+        let deadline = *entry.key();
+        let entity_id = entry
+            .get_mut()
+            .pop_front()
+            .expect("item despawn deadline bucket is non-empty");
+        if entry.get().is_empty() {
+            entry.remove_entry();
+        }
+        if inner.item_despawn_deadline_by_id.get(&entity_id) != Some(&deadline) {
+            continue;
+        }
+        inner.item_despawn_deadline_by_id.remove(&entity_id);
+        expired.push(entity_id);
+    }
     expired
         .into_iter()
         .filter_map(|entity_id| {
-            remove_server_entity_locked(inner, entity_id).map(|(_, dispatches)| dispatches)
+            let entity = inner.entities.snapshot(entity_id)?;
+            entity.item_stack.as_ref()?;
+            let deadline = entity
+                .retained
+                .spawn_tick
+                .saturating_add(ITEM_DESPAWN_AGE_TICKS);
+            if deadline > current_tick {
+                schedule_item_despawn_locked(inner, entity_id, entity.retained.spawn_tick);
+                return None;
+            }
+            match remove_server_entity_locked(inner, entity_id) {
+                Some((_, dispatches)) => Some(dispatches),
+                None => {
+                    if let Some(current) = inner.entities.snapshot(entity_id)
+                        && current.item_stack.is_some()
+                    {
+                        schedule_item_despawn_locked(inner, entity_id, current.retained.spawn_tick);
+                    }
+                    None
+                }
+            }
         })
         .flatten()
         .collect()

@@ -51,6 +51,10 @@ Current runtime facts:
   topology only; each lane admission is held briefly while its read message is
   enqueued. Owner queues order local reads and exact-snapshot apply rejects
   stale plans.
+- Item despawn uses a simulation-tick deadline index. Ordinary physics turns do
+  not scan the full entity store; only due item ids reach their owner lanes.
+  Restored items retain the deadline derived from their persisted `spawn_tick`;
+  cancellation and deduplication keep stale ids outside the live sweep budget.
 - Prepared-goal apply holds shared topology and only the admissions named by
   its active inputs, follow targets, lease/batch regions, and requested
   post-apply kinematics IDs. Multi-lane apply remains atomic across those

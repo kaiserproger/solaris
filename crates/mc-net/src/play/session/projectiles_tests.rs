@@ -136,7 +136,7 @@ fn grounded_arrows_share_one_owner_commit() {
 
     assert_eq!(
         registry.entity_owner_requests_for_test(),
-        5,
+        4,
         "owner traffic must stay constant for the whole grounded-arrow batch"
     );
     for arrow_id in arrow_ids {
