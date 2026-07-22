@@ -10116,6 +10116,56 @@ fn moving_mobs_share_one_relative_move_batch_per_observer() {
 }
 
 #[test]
+fn bounded_natural_mobs_publish_changed_movement_every_tick() {
+    let registry = SessionRegistry::new();
+    let (tx, mut rx) = mpsc::channel(8);
+    let (observer, _) = registry.register(
+        &profile("NaturalMovementObserver"),
+        (0, 0),
+        2,
+        HashSet::from([(0, 0)]),
+        tx,
+        PlayerPose::new(0.5, 64.0, 0.5),
+    );
+    assert!(registry.mark_loaded(observer, (0, 0)).is_empty());
+    let dispatches = registry.spawn_command_entity(
+        &SimulationAuthority::for_test(),
+        93,
+        "minecraft:chicken".to_owned(),
+        Vec3::new(0.5, 64.0, 0.5),
+    );
+    let entity_id = dispatches
+        .iter()
+        .find_map(|dispatch| match &dispatch.command {
+            OutboundCommand::SpawnEntity(entity) => Some(entity.id),
+            _ => None,
+        })
+        .expect("spawned chicken is visible");
+    dispatch_visibility_commands(dispatches);
+    assert!(matches!(rx.try_recv(), Ok(OutboundCommand::SpawnEntity(_))));
+    registry
+        .lock_inner("mark bounded natural movement entity")
+        .natural_ground_mobs
+        .insert(entity_id);
+
+    registry.apply_entity_physics_and_dispatch(
+        1,
+        &[EntityPhysicsStep {
+            id: entity_id,
+            position: Vec3::new(0.75, 64.0, 0.5),
+            velocity: Vec3::ZERO,
+            on_ground: true,
+            horizontal_collision: false,
+        }],
+    );
+
+    assert!(matches!(
+        rx.try_recv(),
+        Ok(OutboundCommand::MoveEntityRelative(movement)) if movement.id == entity_id
+    ));
+}
+
+#[test]
 fn dense_movement_shard_publishes_latest_state_when_entity_becomes_due() {
     let registry = SessionRegistry::new();
     let (tx, mut rx) = mpsc::channel(2048);

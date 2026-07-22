@@ -104,7 +104,7 @@ async fn embedded_playable_short_session_soak_keeps_clients_responsive() {
     let mut world = embedded_world(&data);
     let surface_y = top_non_air_y(&mut world, 0, 0, air_state).expect("spawn column terrain");
     let floor_y = surface_y + 1;
-    let player_y = floor_y + 2;
+    let player_y = floor_y + 1;
     for x in -2..=5 {
         for z in -2..=5 {
             world

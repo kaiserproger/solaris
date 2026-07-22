@@ -27,13 +27,14 @@ Any decoded inbound packet proves that the connection is alive, but it does
 not clear or replace the challenge. A dead or fully stalled client still
 closes after the bounded inactivity deadline.
 
-Ordinary entity movement is eligible every simulation tick so nearby animals
-do not visibly advance in three-tick steps. Natural spawn caps bound the common
-population. When more than 512 entity states compete for one tracking turn,
-deterministic rotating shards publish at most roughly 512 ordinary states per
-turn. The latest unsent server state remains authoritative and is compared on
-the next eligible turn. Arrows, item entities, and experience orbs bypass the
-shard so combat and pickup feedback stays responsive.
+Ordinary entity movement uses vanilla's default three-tick tracking interval.
+The bounded naturally spawned ground and aquatic populations are eligible every
+tick so nearby animals remain visually smooth without turning injected crowds
+into an unbounded packet workload. When more than 512 ordinary entity states
+compete for one tracking turn, deterministic rotating shards publish at most
+roughly 512 states per turn. The latest unsent server state remains authoritative
+and is compared on the next eligible turn. Arrows, item entities, and experience
+orbs bypass the shard so combat and pickup feedback stays responsive.
 
 Movement wire plans are built outside the global session-registry lock. A
 tracker-state compare-and-commit fence and a visibility recheck discard stale
@@ -43,7 +44,8 @@ plans. Unchanged entities skip recipient reverse-index work entirely.
 
 - Dense outbound work cannot disconnect a client that is still sending valid
   traffic merely because its keepalive echo is delayed.
-- Normal-size worlds may publish changed movement every tick.
+- Natural mobs may publish changed movement every tick; ordinary entities retain
+  the default three-tick cadence.
 - Extreme crowds trade visual update frequency for bounded packet work; no
   authoritative simulation state is dropped.
 - Per-entity vanilla update intervals remain future parity work. The current

@@ -879,13 +879,15 @@ impl SessionRegistry {
                 continue;
             };
             let latency_sensitive = motion.is_arrow || motion.is_item || motion.is_experience;
-            if !ordinary_tracking_turn && !latency_sensitive {
+            let smooth_natural_mob = inner.natural_ground_mobs.contains(&step.id)
+                || inner.natural_aquatic_mobs.contains(&step.id);
+            if !ordinary_tracking_turn && !latency_sensitive && !smooth_natural_mob {
                 continue;
             }
             if !inner.last_sent_entity_states.contains_key(&step.id) {
                 initialize_entity_wire_state_locked(&mut inner, step.id);
             }
-            tracker_states.push(motion);
+            tracker_states.push((motion, smooth_natural_mob));
         }
         let lifecycle_tick = inner.entity_lifecycle_tick;
         let pickup_ready_items = steps
@@ -948,17 +950,19 @@ impl SessionRegistry {
 
         let tracker_inputs = tracker_states
             .into_iter()
-            .filter_map(|motion| {
+            .filter_map(|(motion, smooth_natural_mob)| {
                 inner
                     .last_sent_entity_states
                     .get(&motion.id)
                     .copied()
-                    .map(|last_sent| (motion, last_sent))
+                    .map(|last_sent| (motion, last_sent, smooth_natural_mob))
             })
             .collect::<Vec<_>>();
         let ordinary_tracker_count = tracker_inputs
             .iter()
-            .filter(|(motion, _)| !(motion.is_arrow || motion.is_item || motion.is_experience))
+            .filter(|(motion, _, smooth_natural_mob)| {
+                !(motion.is_arrow || motion.is_item || motion.is_experience || *smooth_natural_mob)
+            })
             .count();
         drop(inner);
 
@@ -971,8 +975,9 @@ impl SessionRegistry {
         );
         let mut tracker_commits = Vec::with_capacity(tracker_inputs.len());
         let mut ordinary_ordinal = 0;
-        for (motion, last_sent) in tracker_inputs {
-            let latency_sensitive = motion.is_arrow || motion.is_item || motion.is_experience;
+        for (motion, last_sent, smooth_natural_mob) in tracker_inputs {
+            let latency_sensitive =
+                motion.is_arrow || motion.is_item || motion.is_experience || smooth_natural_mob;
             if !latency_sensitive
                 && !ordinary_entity_is_due_for_movement_tracking(
                     ordinary_ordinal,

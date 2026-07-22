@@ -317,16 +317,26 @@ async fn survival_can_place_naturally_picked_up_block() {
     let report = mc_data::blocks::load_blocks_report(&blocks_json).expect("blocks report loads");
     let blocks =
         Arc::new(mc_world::BlockRegistry::from_report(&report).expect("block registry builds"));
-    let dirt_state_id = blocks
+    let air_state = blocks
+        .block(&mc_data::Identifier::parse("minecraft:air").unwrap())
+        .map(|block| block.default)
+        .expect("air in registry");
+    let dirt_state = blocks
         .block(&mc_data::Identifier::parse("minecraft:dirt").unwrap())
-        .map(|b| b.default.0 as i32)
+        .map(|block| block.default)
         .expect("dirt in registry");
+    let dirt_state_id = dirt_state.0 as i32;
     let generator = Arc::new(mc_worldgen::TerrainGenerator::new(0, Arc::clone(&blocks)));
-    let storage = mc_world::WorldStorage::in_memory_with_capacity(
+    let mut storage = mc_world::WorldStorage::in_memory_with_capacity(
         Arc::clone(&blocks),
         ((2 * VIEW_DISTANCE + 3) as usize).pow(2),
     )
     .with_generator(generator);
+    let target_y = top_non_air_y(&mut storage, 0, 0, air_state).expect("spawn column terrain");
+    storage
+        .set_block_at(mc_world::BlockPos { x: 0, y: target_y, z: 0 }, dirt_state)
+        .expect("seed dirt target")
+        .expect("replace generated surface block");
     let world = Some(Arc::new(tokio::sync::Mutex::new(storage)));
     let tags = Arc::new(mc_data::tags::load(&vanilla_dir, &data).expect("tags load"));
     let items_report = mc_data::items::load_items_report(&registries_json).expect("items report");
@@ -369,10 +379,9 @@ async fn survival_can_place_naturally_picked_up_block() {
         let _ = bound.serve().await;
     });
 
-    let (mut client, sync) = connect_to_play(addr, "M23SurvivalPlace").await;
+    let (mut client, _sync) = connect_to_play(addr, "M23SurvivalPlace").await;
     drain_until_chunk(&mut client, (0, 0)).await;
 
-    let target_y = sync.y.floor() as i32 - 2;
     let target_pos = pack_block_pos(0, target_y, 0);
     client
         .write_packet(&ServerboundPlayerAction {
@@ -468,20 +477,30 @@ async fn invalid_carried_item_slot_does_not_change_survival_placement_slot() {
     let report = mc_data::blocks::load_blocks_report(&blocks_json).expect("blocks report loads");
     let blocks =
         Arc::new(mc_world::BlockRegistry::from_report(&report).expect("block registry builds"));
-    let dirt_state_id = blocks
+    let air_state = blocks
+        .block(&mc_data::Identifier::parse("minecraft:air").unwrap())
+        .map(|block| block.default)
+        .expect("air in registry");
+    let dirt_state = blocks
         .block(&mc_data::Identifier::parse("minecraft:dirt").unwrap())
-        .map(|b| b.default.0 as i32)
+        .map(|block| block.default)
         .expect("dirt in registry");
+    let dirt_state_id = dirt_state.0 as i32;
     let stone_state_id = blocks
         .block(&mc_data::Identifier::parse("minecraft:stone").unwrap())
         .map(|b| b.default.0 as i32)
         .expect("stone in registry");
     let generator = Arc::new(mc_worldgen::TerrainGenerator::new(0, Arc::clone(&blocks)));
-    let storage = mc_world::WorldStorage::in_memory_with_capacity(
+    let mut storage = mc_world::WorldStorage::in_memory_with_capacity(
         Arc::clone(&blocks),
         ((2 * VIEW_DISTANCE + 3) as usize).pow(2),
     )
     .with_generator(generator);
+    let target_y = top_non_air_y(&mut storage, 0, 0, air_state).expect("spawn column terrain");
+    storage
+        .set_block_at(mc_world::BlockPos { x: 0, y: target_y, z: 0 }, dirt_state)
+        .expect("seed dirt target")
+        .expect("replace generated surface block");
     let world = Some(Arc::new(tokio::sync::Mutex::new(storage)));
     let tags = Arc::new(mc_data::tags::load(&vanilla_dir, &data).expect("tags load"));
     let items_report = mc_data::items::load_items_report(&registries_json).expect("items report");
@@ -527,10 +546,9 @@ async fn invalid_carried_item_slot_does_not_change_survival_placement_slot() {
         let _ = bound.serve().await;
     });
 
-    let (mut client, sync) = connect_to_play(addr, "M100BadHotbar").await;
+    let (mut client, _sync) = connect_to_play(addr, "M100BadHotbar").await;
     drain_until_chunk(&mut client, (0, 0)).await;
 
-    let target_y = sync.y.floor() as i32 - 2;
     let target_pos = pack_block_pos(0, target_y, 0);
     client
         .write_packet(&ServerboundPlayerAction {

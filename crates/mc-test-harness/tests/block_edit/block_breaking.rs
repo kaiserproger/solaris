@@ -820,7 +820,9 @@ async fn wait_for_block_state_and_ack(
                 deadline.saturating_duration_since(tokio::time::Instant::now()),
             )
             .await
-            .expect("block state and ack");
+            .unwrap_or_else(|error| {
+                panic!("block state and ack for sequence {sequence}: {error}")
+            });
         if handle_keepalive(client, frame.id, &frame.body).await {
             continue;
         }

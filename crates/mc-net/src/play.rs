@@ -622,9 +622,9 @@ pub(crate) fn configure_session_player_combat(sessions: &SessionRegistry, config
         Arc::clone(&config.item_facts),
     );
 }
-// Publish changed movement every tick. Dense crowds are still bounded by the
-// rotating shard below, while ordinary nearby mobs remain visually smooth.
-const ENTITY_MOVE_SEND_INTERVAL_TICKS: u64 = 1;
+// Keep vanilla's default cadence for ordinary entities. The natural-mob path
+// opts its bounded population into every-tick publication separately.
+const ENTITY_MOVE_SEND_INTERVAL_TICKS: u64 = 3;
 
 fn ordinary_entity_is_due_for_movement_tracking(
     ordinal: usize,
