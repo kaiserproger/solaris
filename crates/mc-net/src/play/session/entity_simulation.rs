@@ -909,7 +909,7 @@ impl SessionRegistry {
             ..
         } = inner;
         drop(entities);
-        let mut inner = session_inner;
+        let inner = session_inner;
         #[cfg(test)]
         self.pause_before_session_movement_plan_for_test();
         let pickup_positions = steps
@@ -946,17 +946,32 @@ impl SessionRegistry {
             return steps.to_vec();
         }
 
-        let ordinary_tracker_count = tracker_states
+        let tracker_inputs = tracker_states
+            .into_iter()
+            .filter_map(|motion| {
+                inner
+                    .last_sent_entity_states
+                    .get(&motion.id)
+                    .copied()
+                    .map(|last_sent| (motion, last_sent))
+            })
+            .collect::<Vec<_>>();
+        let ordinary_tracker_count = tracker_inputs
             .iter()
-            .filter(|motion| !(motion.is_arrow || motion.is_item || motion.is_experience))
+            .filter(|(motion, _)| !(motion.is_arrow || motion.is_item || motion.is_experience))
             .count();
+        drop(inner);
+
+        dispatches.extend(self.pickup_candidate_dispatches(pickup_sessions));
+
         let mut movements = Vec::with_capacity(
-            tracker_states
+            tracker_inputs
                 .len()
                 .min(ENTITY_MOVEMENT_TARGET_UPDATES_PER_TRACKING_TURN),
         );
+        let mut tracker_commits = Vec::with_capacity(tracker_inputs.len());
         let mut ordinary_ordinal = 0;
-        for motion in tracker_states {
+        for (motion, last_sent) in tracker_inputs {
             let latency_sensitive = motion.is_arrow || motion.is_item || motion.is_experience;
             if !latency_sensitive
                 && !ordinary_entity_is_due_for_movement_tracking(
@@ -969,20 +984,14 @@ impl SessionRegistry {
                 continue;
             }
             ordinary_ordinal += usize::from(!latency_sensitive);
-            let Some(last_sent) = inner.last_sent_entity_states.get(&motion.id).copied() else {
-                continue;
-            };
             let rotation = motion.rotation;
             let body_rotation_changed = packed_rotation_changed(last_sent.rotation, rotation);
             let send_head_rotation = packed_head_yaw_changed(last_sent.rotation, rotation);
             let send_velocity = motion.sends_velocity
                 && entity_velocity_changed(last_sent.velocity, motion.velocity);
-            let sent = inner
-                .last_sent_entity_states
-                .get_mut(&motion.id)
-                .expect("entity wire state exists after lookup");
+            let mut next_sent = last_sent;
             let position_update =
-                plan_entity_position_update(sent, motion.position, motion.on_ground);
+                plan_entity_position_update(&mut next_sent, motion.position, motion.on_ground);
             let wire_move = entity_wire_move_for_kind(
                 position_update,
                 body_rotation_changed,
@@ -990,97 +999,109 @@ impl SessionRegistry {
                 motion.is_arrow,
             );
             if body_rotation_changed || position_update == EntityPositionUpdate::Absolute {
-                sent.rotation.yaw = rotation.yaw;
-                sent.rotation.pitch = rotation.pitch;
-                sent.on_ground = motion.on_ground;
+                next_sent.rotation.yaw = rotation.yaw;
+                next_sent.rotation.pitch = rotation.pitch;
+                next_sent.on_ground = motion.on_ground;
             }
             if send_head_rotation {
-                sent.rotation.head_yaw = rotation.head_yaw;
+                next_sent.rotation.head_yaw = rotation.head_yaw;
             }
             if send_velocity {
-                sent.velocity = motion.velocity;
+                next_sent.velocity = motion.velocity;
             }
+            tracker_commits.push((motion.id, last_sent, next_sent));
             if wire_move.is_none() && !send_velocity && !send_head_rotation {
                 continue;
             }
-            let movement = ServerEntityMove {
-                id: motion.id,
-                position: motion.position,
-                wire_move,
-                velocity: motion.velocity,
-                rotation,
-                on_ground: motion.on_ground,
-                send_velocity,
-                send_head_rotation,
-            };
-            movements.push((motion.id, movement));
+            movements.push((
+                motion.id,
+                ServerEntityMove {
+                    id: motion.id,
+                    position: motion.position,
+                    wire_move,
+                    velocity: motion.velocity,
+                    rotation,
+                    on_ground: motion.on_ground,
+                    send_velocity,
+                    send_head_rotation,
+                },
+            ));
         }
-        let mut movement_recipients = Vec::new();
-        let mut current_observers_by_entity = None;
-        if !movements.is_empty() {
-            let session_count = inner.sessions.len();
-            let visibility_edge_count = inner
-                .sessions
-                .values()
-                .try_fold(0usize, |edge_count, observer| {
-                    edge_count.checked_add(observer.visible_entities.len())
-                });
-            let estimated_exhaustive_cost = session_count.saturating_mul(movements.len());
-            // Charge one extra unit per edge for reverse-map allocation and insertion.
-            let use_reverse_index = visibility_edge_count
-                .is_some_and(|edge_count| estimated_exhaustive_cost > edge_count.saturating_mul(2));
 
-            movement_recipients.reserve(session_count);
-            if use_reverse_index {
-                #[cfg(test)]
-                record_movement_visibility_index_build();
-                let mut reverse_index = HashMap::<EntityId, Vec<usize>>::new();
-                for (&observer_id, observer) in &inner.sessions {
-                    let recipient_index = movement_recipients.len();
-                    movement_recipients.push((
-                        observer_id,
-                        ordered_session_recipient(observer_id, observer),
-                        None,
-                    ));
-                    for &entity_id in observer.visible_entities.iter() {
-                        #[cfg(test)]
-                        record_movement_visibility_index_edge_visit();
-                        reverse_index
-                            .entry(entity_id)
-                            .or_default()
-                            .push(recipient_index);
-                    }
+        if movements.is_empty() {
+            let mut inner = self.lock_inner("advance entity movement trackers");
+            for (entity_id, expected, next) in tracker_commits {
+                let Some(current) = inner.last_sent_entity_states.get_mut(&entity_id) else {
+                    continue;
+                };
+                if *current == expected {
+                    *current = next;
                 }
-                let indexed_visibility_edges = reverse_index
-                    .values()
-                    .try_fold(0usize, |edge_count, observer_indexes| {
-                        edge_count.checked_add(observer_indexes.len())
-                    });
-                if indexed_visibility_edges == visibility_edge_count {
-                    current_observers_by_entity = Some(reverse_index);
-                } else {
-                    for ((recipient_id, _, visible_entities), (&observer_id, observer)) in
-                        movement_recipients.iter_mut().zip(&inner.sessions)
-                    {
-                        debug_assert_eq!(*recipient_id, observer_id);
-                        *visible_entities = Some(Arc::clone(&observer.visible_entities));
-                    }
-                }
-            } else {
-                movement_recipients.extend(inner.sessions.iter().map(
-                    |(&observer_id, observer)| {
-                        (
-                            observer_id,
-                            ordered_session_recipient(observer_id, observer),
-                            Some(Arc::clone(&observer.visible_entities)),
-                        )
-                    },
-                ));
             }
+            drop(inner);
+            dispatch_visibility_commands(dispatches);
+            return steps.to_vec();
+        }
+
+        let inner = self.lock_inner("snapshot entity movement recipients");
+        let session_count = inner.sessions.len();
+        let visibility_edge_count = inner
+            .sessions
+            .values()
+            .try_fold(0usize, |edge_count, observer| {
+                edge_count.checked_add(observer.visible_entities.len())
+            });
+        let estimated_exhaustive_cost = session_count.saturating_mul(movements.len());
+        // Charge one extra unit per edge for reverse-map allocation and insertion.
+        let use_reverse_index = visibility_edge_count
+            .is_some_and(|edge_count| estimated_exhaustive_cost > edge_count.saturating_mul(2));
+        let mut movement_recipients = Vec::with_capacity(session_count);
+        let mut current_observers_by_entity = None;
+        if use_reverse_index {
+            #[cfg(test)]
+            record_movement_visibility_index_build();
+            let mut reverse_index = HashMap::<EntityId, Vec<usize>>::new();
+            for (&observer_id, observer) in &inner.sessions {
+                let recipient_index = movement_recipients.len();
+                movement_recipients.push((
+                    observer_id,
+                    ordered_session_recipient(observer_id, observer),
+                    None,
+                ));
+                for &entity_id in observer.visible_entities.iter() {
+                    #[cfg(test)]
+                    record_movement_visibility_index_edge_visit();
+                    reverse_index
+                        .entry(entity_id)
+                        .or_default()
+                        .push(recipient_index);
+                }
+            }
+            let indexed_visibility_edges = reverse_index
+                .values()
+                .try_fold(0usize, |edge_count, observer_indexes| {
+                    edge_count.checked_add(observer_indexes.len())
+                });
+            if indexed_visibility_edges == visibility_edge_count {
+                current_observers_by_entity = Some(reverse_index);
+            } else {
+                for ((recipient_id, _, visible_entities), (&observer_id, observer)) in
+                    movement_recipients.iter_mut().zip(&inner.sessions)
+                {
+                    debug_assert_eq!(*recipient_id, observer_id);
+                    *visible_entities = Some(Arc::clone(&observer.visible_entities));
+                }
+            }
+        } else {
+            movement_recipients.extend(inner.sessions.iter().map(|(&observer_id, observer)| {
+                (
+                    observer_id,
+                    ordered_session_recipient(observer_id, observer),
+                    Some(Arc::clone(&observer.visible_entities)),
+                )
+            }));
         }
         drop(inner);
-
-        dispatches.extend(self.pickup_candidate_dispatches(pickup_sessions));
 
         #[cfg(test)]
         self.pause_before_move_fanout_for_test();
@@ -1125,6 +1146,16 @@ impl SessionRegistry {
             }
         }
         let mut inner = self.lock_inner("order entity movement dispatches");
+        let mut accepted_tracker_entities = HashSet::with_capacity(tracker_commits.len());
+        for (entity_id, expected, next) in tracker_commits {
+            let Some(current) = inner.last_sent_entity_states.get_mut(&entity_id) else {
+                continue;
+            };
+            if *current == expected {
+                *current = next;
+                accepted_tracker_entities.insert(entity_id);
+            }
+        }
         let mut ordered_movements = Vec::with_capacity(movements_by_recipient.len());
         let mut canceled_recipients = Vec::new();
         let mut move_dispatch_count = 0usize;
@@ -1133,7 +1164,10 @@ impl SessionRegistry {
                 canceled_recipients.push(recipient);
                 continue;
             };
-            movements.retain(|movement| observer.visible_entities.contains(&movement.id));
+            movements.retain(|movement| {
+                accepted_tracker_entities.contains(&movement.id)
+                    && observer.visible_entities.contains(&movement.id)
+            });
             if movements.is_empty() {
                 canceled_recipients.push(recipient);
                 continue;

@@ -355,6 +355,7 @@ struct SessionRegistryInner {
     next_disconnected_player_generation: u64,
     sleeping_sessions: HashMap<SessionId, SleepingState>,
     spectator_sessions: HashSet<SessionId>,
+    dead_sessions: HashSet<SessionId>,
     entity_dispatches: EntityDispatchCounters,
     arrow_kill_rewards: ArrowKillRewards,
     player_combat: PlayerCombatResources,

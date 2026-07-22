@@ -190,6 +190,14 @@ lifecycle state. Physics apply likewise returns accepted authoritative
 kinematics after local mutation or boundary migration; session publication,
 chunk indexes, visibility, and movement packets consume those states instead
 of speculative worker steps.
+Movement publication now copies accepted kinematics, prior tracker state, and
+the recipient snapshot while holding the session registry, then builds the wire
+plan after releasing that lock. Commit reacquires the registry, compares the
+tracker state with the copied value, and rechecks visibility before publishing.
+This removes packet planning from the global critical section without allowing
+a stale plan to overwrite newer state. Chunk visibility indexes and outbound
+session publication are still centralized; this is not a fully lock-free or
+fully regional publication path.
 Goal apply now also exposes a narrow typed projection for the active physics
 set. It reads sorted alive kinematics from the lane-owned ECS stores after the
 successful CAS and avoids a second full-snapshot materialization on the common

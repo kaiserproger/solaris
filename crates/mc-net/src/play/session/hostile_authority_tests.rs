@@ -26,6 +26,30 @@ fn register_test_session(registry: &SessionRegistry, name: &str) -> SessionId {
 }
 
 #[test]
+fn hostiles_ignore_dead_players() {
+    let registry = SessionRegistry::new();
+    let player = register_test_session(&registry, "DeadTarget");
+    assert!(registry.mark_loaded(player, (0, 0)).is_empty());
+    registry.spawn_command_entity(
+        &SimulationAuthority::for_test(),
+        54,
+        "minecraft:zombie".to_owned(),
+        Vec3::new(0.5, 64.0, 1.5),
+    );
+    registry
+        .lock_inner("mark test player dead")
+        .dead_sessions
+        .insert(player);
+
+    for tick in 0..HOSTILE_MELEE_PERIOD_TICKS {
+        let (attacks, dispatches) =
+            registry.tick_hostile_attacks(&SimulationAuthority::for_test(), tick, BlockStateId(0));
+        assert_eq!(attacks, 0);
+        assert!(dispatches.is_empty());
+    }
+}
+
+#[test]
 fn nearby_creeper_primes_once_and_explodes_after_thirty_ticks() {
     let registry = SessionRegistry::new();
     let player = register_test_session(&registry, "CreeperTarget");

@@ -622,9 +622,9 @@ pub(crate) fn configure_session_player_combat(sessions: &SessionRegistry, config
         Arc::clone(&config.item_facts),
     );
 }
-// Vanilla's default EntityType tracking interval is three ticks; individual
-// fast projectiles can override it once Solaris carries that registry fact.
-const ENTITY_MOVE_SEND_INTERVAL_TICKS: u64 = 3;
+// Publish changed movement every tick. Dense crowds are still bounded by the
+// rotating shard below, while ordinary nearby mobs remain visually smooth.
+const ENTITY_MOVE_SEND_INTERVAL_TICKS: u64 = 1;
 
 fn ordinary_entity_is_due_for_movement_tracking(
     ordinal: usize,

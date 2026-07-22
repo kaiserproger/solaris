@@ -9,8 +9,9 @@ A real 26.1.2 client connected to a world with 5,132 injected cows kept sending
 valid movement packets but did not process Solaris's keepalive echo before the
 30-second deadline. Solaris replaced pending challenges every period on the
 first failing build, then still closed the active client after challenge
-replacement was fixed. Movement publication also used every simulation tick,
-while vanilla's default entity tracking interval is three ticks.
+replacement was fixed. Movement publication also used every simulation tick
+without a bounded natural mob population or a cheap way to skip unchanged
+tracker work.
 
 ## Decision
 
@@ -26,18 +27,23 @@ Any decoded inbound packet proves that the connection is alive, but it does
 not clear or replace the challenge. A dead or fully stalled client still
 closes after the bounded inactivity deadline.
 
-Ordinary entity movement uses vanilla's default three-tick tracking interval.
-When more than 512 entity states compete for one tracking turn, deterministic
-rotating shards publish at most roughly 512 ordinary states per turn. The
-latest unsent server state remains authoritative and is compared on the next
-eligible turn. Arrows, item entities, and experience orbs bypass the shard so
-combat and pickup feedback stays responsive.
+Ordinary entity movement is eligible every simulation tick so nearby animals
+do not visibly advance in three-tick steps. Natural spawn caps bound the common
+population. When more than 512 entity states compete for one tracking turn,
+deterministic rotating shards publish at most roughly 512 ordinary states per
+turn. The latest unsent server state remains authoritative and is compared on
+the next eligible turn. Arrows, item entities, and experience orbs bypass the
+shard so combat and pickup feedback stays responsive.
+
+Movement wire plans are built outside the global session-registry lock. A
+tracker-state compare-and-commit fence and a visibility recheck discard stale
+plans. Unchanged entities skip recipient reverse-index work entirely.
 
 ## Consequences
 
 - Dense outbound work cannot disconnect a client that is still sending valid
   traffic merely because its keepalive echo is delayed.
-- Normal-size worlds retain vanilla's three-tick movement cadence.
+- Normal-size worlds may publish changed movement every tick.
 - Extreme crowds trade visual update frequency for bounded packet work; no
   authoritative simulation state is dropped.
 - Per-entity vanilla update intervals remain future parity work. The current

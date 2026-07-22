@@ -22,6 +22,11 @@ Current runtime facts:
 - Overworld terrain shape is owned by `terrain::overworld::DensityRouter`;
   route worldgen topology, climate, river, cave, or stage extraction work
   through ADR 0008.
+- Regional entity owners commit authoritative kinematics. Movement wire plans
+  are prepared outside the global session lock and use tracker CAS plus a
+  visibility recheck at publication. Visibility indexes and outbound session
+  queues remain centralized, so do not describe publication as lock-free or
+  fully regional; ADR 0005 records the remaining boundary.
 - Uncontrolled heavy host load invalidates performance attribution. Record the
   build, workload, host contention, p95/p99, and maximum; repeat the same gate
   on a clean host. A contaminated run may retain functional evidence only.

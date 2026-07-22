@@ -187,6 +187,7 @@ impl SessionRegistry {
                             .iter()
                             .filter_map(|(&session_id, session)| {
                                 if inner.spectator_sessions.contains(&session_id)
+                                    || inner.dead_sessions.contains(&session_id)
                                     || !session.visible_entities.contains(&hostile.id)
                                 {
                                     return None;
@@ -237,9 +238,12 @@ impl SessionRegistry {
                         let max_distance_sq = SKELETON_SHOT_RANGE * SKELETON_SHOT_RANGE;
                         let target = inner
                             .sessions
-                            .values()
-                            .filter_map(|session| {
-                                if !session.visible_entities.contains(&hostile.id) {
+                            .iter()
+                            .filter_map(|(&session_id, session)| {
+                                if inner.spectator_sessions.contains(&session_id)
+                                    || inner.dead_sessions.contains(&session_id)
+                                    || !session.visible_entities.contains(&hostile.id)
+                                {
                                     return None;
                                 }
                                 let position =
@@ -310,7 +314,9 @@ impl SessionRegistry {
                             .sessions
                             .iter()
                             .filter_map(|(&session_id, session)| {
-                                if !session.visible_entities.contains(&hostile.id)
+                                if inner.spectator_sessions.contains(&session_id)
+                                    || inner.dead_sessions.contains(&session_id)
+                                    || !session.visible_entities.contains(&hostile.id)
                                     || (session.pose.y - hostile.position.y).abs()
                                         > HOSTILE_MELEE_VERTICAL_REACH
                                 {

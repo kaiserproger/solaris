@@ -26,10 +26,12 @@ impl SessionRegistry {
         state: Arc<Mutex<PlayerPersistedState>>,
     ) {
         let mut inner = self.lock_inner("register player persistence");
-        let game_mode = state
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .game_mode;
+        let (game_mode, dead) = {
+            let state = state
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            (state.game_mode, state.survival.is_dead())
+        };
         inner.player_persistence.insert(id, state);
         if let Some(uuid) = inner.sessions.get(&id).map(|session| session.uuid) {
             inner.disconnected_player_persistence.remove(&uuid);
@@ -38,6 +40,11 @@ impl SessionRegistry {
             inner.spectator_sessions.insert(id);
         } else {
             inner.spectator_sessions.remove(&id);
+        }
+        if dead {
+            inner.dead_sessions.insert(id);
+        } else {
+            inner.dead_sessions.remove(&id);
         }
     }
 
@@ -382,6 +389,11 @@ pub(super) fn apply_player_survival_plan_locked(
     player_state.survival = plan.updated_survival;
     player_state.replace_container(inventory.clone(), carried_item.clone());
     player_state.replace_xp(xp.clone());
+    if plan.updated_survival.is_dead() {
+        inner.dead_sessions.insert(actor_session);
+    } else {
+        inner.dead_sessions.remove(&actor_session);
+    }
     if let Some(input) = &plan.enchanting_table_input {
         player_state.enchanting_table_input = input.updated.clone();
     }

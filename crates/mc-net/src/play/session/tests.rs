@@ -49,6 +49,12 @@ fn lethal_survival_commit_pushes_immutable_player_death_before_session_cleanup()
         committed,
         Some(PlayerSurvivalCommitOutcome::Committed(committed)) if committed.died
     ));
+    assert!(
+        registry
+            .lock_inner("verify dead target projection")
+            .dead_sessions
+            .contains(&session)
+    );
 
     registry.unregister(session);
     let event = deaths
@@ -112,12 +118,9 @@ fn respawn_commit_clears_player_hurt_resistance() {
         committed,
         Some(PlayerSurvivalCommitOutcome::Committed(_))
     ));
-    assert!(
-        !registry
-            .lock_inner("verify respawn resistance reset")
-            .player_hurt_resistance
-            .contains_key(&session)
-    );
+    let inner = registry.lock_inner("verify respawn projections reset");
+    assert!(!inner.player_hurt_resistance.contains_key(&session));
+    assert!(!inner.dead_sessions.contains(&session));
 }
 
 struct CountingEntityJournal(Arc<AtomicUsize>);

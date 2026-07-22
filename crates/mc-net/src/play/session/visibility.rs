@@ -35,7 +35,7 @@ fn ordered_spawn_session_recipient(id: SessionId, session: &PlaySession) -> Sess
     )
 }
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, PartialEq)]
 pub(super) struct LastSentEntityState {
     pub(super) position: Vec3,
     pub(super) velocity: Vec3,
