@@ -5087,7 +5087,7 @@ fn entity_and_session_state_are_released_before_movement_plan() {
         .expect("physics must reach the session movement-plan probe");
 
     let entity_store_available = registry.entities.owner_responsive_for_test();
-    let session_registry_available = matches!(registry.inner.try_lock(), Ok(_));
+    let session_registry_available = registry.inner.try_lock().is_ok();
     resume_tx.send(()).expect("release entity apply probe");
     physics.join().expect("physics worker");
 
