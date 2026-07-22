@@ -3194,7 +3194,15 @@ mod tests {
 
         let mut reopened = WorldStorage::open_with_capacity(tmp_world.path(), registry, 4).unwrap();
         let chunk = reopened.get_chunk(cpos).unwrap().unwrap();
-        assert_eq!(chunk.extras, extras);
+        assert_eq!(
+            chunk.extras,
+            vec![
+                ("DataVersion".into(), Tag::Int(4444)),
+                ("LastUpdate".into(), Tag::Long(0)),
+                ("InhabitedTime".into(), Tag::Long(123_456)),
+                ("structures".into(), Tag::Compound(Vec::new())),
+            ]
+        );
         assert_eq!(chunk.get_block(1, 0, 1).unwrap(), BlockStateId(1));
     }
 

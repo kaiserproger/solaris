@@ -56,6 +56,14 @@ without Solaris fallback generation, so missing chunks cannot mix both terrain
 authorities. Existing worlds are never rewritten. The local playable profile
 uses `.analysis/test-world-v7`.
 
+Anvil root metadata belongs to the chunk serialization boundary, not a concrete
+terrain generator. The encoder emits one `DataVersion`, `LastUpdate`, and
+`InhabitedTime` field for every saved chunk. It preserves imported data and
+inhabited values, supplies the pinned 26.1.2 data version when absent, and uses
+the explicit simulation tick for `LastUpdate`. Runtime accumulation of
+`InhabitedTime` is a separate ownership task; generated chunks currently begin
+at zero.
+
 The hot path samples each surface column once and reuses its biome result for
 vertical biome cells. Cave noise exits after its region mask or first tunnel
 field rejects the cell. No revision-7 performance claim exists until a release
@@ -81,6 +89,8 @@ coverage. Real-client visual inspection remains required.
 - a 32-block solid protected surface shell across sampled seeds;
 - exact-surface tree support over a stable 5x5 footprint;
 - vanilla-import isolation plus rejection of mismatched revision/seed/mode/geometry;
+- canonical vanilla root metadata through an actual Anvil write/read at a
+  nonzero simulation tick;
 - rejection of a changed persisted ore profile;
 - order-independent ore placement;
 - geological deposits crossing chunk boundaries while default generation stays vanilla;

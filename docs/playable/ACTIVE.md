@@ -84,6 +84,14 @@ hardening. An already-open lower-priority diff does not override this order.
 
 ## Recent Evidence
 
+- Fresh and legacy Solaris chunks now serialize the mandatory vanilla Anvil
+  metadata at the codec boundary rather than in one generator. `DataVersion`
+  defaults to the pinned 26.1.2 value, nonzero production ticks become
+  `LastUpdate`, imported `InhabitedTime` is preserved, and each field is emitted
+  exactly once through a real region write/read. This closes the concrete format
+  gap but does not yet prove the broader terrain-quality item; visual client
+  inspection and inhabited-time accumulation remain queued.
+
 - Every exact vanilla state now reaches its embedded collision shape in player
   movement instead of being bypassed by the old campfire/passable-name lists.
   Focused tests prove empty torch collision, the campfire's 7/16-block body,

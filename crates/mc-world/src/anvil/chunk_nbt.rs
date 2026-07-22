@@ -41,6 +41,8 @@ use crate::section::{ChunkSection, PackedBitArray, SECTION_VOLUME};
 const REGION_AXIS_CHUNKS: i32 = 32;
 const DAMAGE_COMPONENT: &str = "minecraft:damage";
 const ENCHANTMENTS_COMPONENT: &str = "minecraft:enchantments";
+const TARGET_DATA_VERSION: i32 = 4_790;
+const VANILLA_METADATA_KEYS: &[&str] = &["DataVersion", "LastUpdate", "InhabitedTime"];
 
 /// Serialise a chunk to a [`ChunkPayload`] ready for
 /// [`write_region`](crate::anvil::write_region). Used by the M6.b
@@ -572,11 +574,38 @@ pub fn chunk_to_nbt_with_items_at_tick(
     items: Option<&ItemRegistry>,
     current_tick: u64,
 ) -> Result<Tag, ChunkNbtError> {
-    let mut root: Vec<(String, Tag)> = Vec::with_capacity(8);
+    let extra = |key: &str| {
+        chunk
+            .extras
+            .iter()
+            .find(|(name, _)| name == key)
+            .map(|(_, value)| value)
+    };
+    let data_version = match extra("DataVersion") {
+        Some(Tag::Int(value)) => *value,
+        _ => TARGET_DATA_VERSION,
+    };
+    let last_update = if current_tick == 0 {
+        match extra("LastUpdate") {
+            Some(Tag::Long(value)) => *value,
+            _ => 0,
+        }
+    } else {
+        i64::try_from(current_tick).unwrap_or(i64::MAX)
+    };
+    let inhabited_time = match extra("InhabitedTime") {
+        Some(Tag::Long(value)) => *value,
+        _ => 0,
+    };
+
+    let mut root: Vec<(String, Tag)> = Vec::with_capacity(11);
+    root.push(("DataVersion".into(), Tag::Int(data_version)));
     root.push(("xPos".into(), Tag::Int(chunk.pos.x)));
     root.push(("zPos".into(), Tag::Int(chunk.pos.z)));
     let min_section_y = chunk.geometry().min_y() / SECTION_DIM as i32;
     root.push(("yPos".into(), Tag::Int(min_section_y)));
+    root.push(("LastUpdate".into(), Tag::Long(last_update)));
+    root.push(("InhabitedTime".into(), Tag::Long(inhabited_time)));
     root.push(("Status".into(), Tag::String(chunk.status.clone())));
 
     // sections
@@ -687,7 +716,9 @@ pub fn chunk_to_nbt_with_items_at_tick(
     // Order is the decode-time insertion order so the round-trip
     // stays stable.
     for (key, value) in &chunk.extras {
-        if !MODELLED_ROOT_KEYS.contains(&key.as_str()) {
+        if !MODELLED_ROOT_KEYS.contains(&key.as_str())
+            && !VANILLA_METADATA_KEYS.contains(&key.as_str())
+        {
             root.push((key.clone(), value.clone()));
         }
     }
@@ -1431,6 +1462,49 @@ mod tests {
             .find(|&y| chunk.get_block(x, y, z) != Some(air))
     }
 
+    fn extra<'a>(chunk: &'a Chunk, key: &str) -> Option<&'a Tag> {
+        chunk
+            .extras
+            .iter()
+            .find(|(name, _)| name == key)
+            .map(|(_, value)| value)
+    }
+
+    fn non_metadata_extras(chunk: &Chunk) -> Vec<&(String, Tag)> {
+        chunk
+            .extras
+            .iter()
+            .filter(|(name, _)| !VANILLA_METADATA_KEYS.contains(&name.as_str()))
+            .collect()
+    }
+
+    fn assert_normalized_metadata(original: &Chunk, decoded: &Chunk) {
+        let expected_data_version = match extra(original, "DataVersion") {
+            Some(Tag::Int(value)) => *value,
+            _ => TARGET_DATA_VERSION,
+        };
+        let expected_last_update = match extra(original, "LastUpdate") {
+            Some(Tag::Long(value)) => *value,
+            _ => 0,
+        };
+        let expected_inhabited_time = match extra(original, "InhabitedTime") {
+            Some(Tag::Long(value)) => *value,
+            _ => 0,
+        };
+        assert_eq!(
+            extra(decoded, "DataVersion"),
+            Some(&Tag::Int(expected_data_version))
+        );
+        assert_eq!(
+            extra(decoded, "LastUpdate"),
+            Some(&Tag::Long(expected_last_update))
+        );
+        assert_eq!(
+            extra(decoded, "InhabitedTime"),
+            Some(&Tag::Long(expected_inhabited_time))
+        );
+    }
+
     #[test]
     fn furnace_family_block_entity_ids_follow_block_state() {
         fn block_report(id: u32, name: &str) -> mc_data::blocks::BlockReport {
@@ -1768,17 +1842,15 @@ mod tests {
                 chunk1.pos
             );
 
-            // M5.c.2: extras must round-trip key-and-value.
+            // Unknown extras stay byte-stable; vanilla's mandatory metadata is
+            // normalized when absent from older Solaris chunks.
             assert_eq!(
-                chunk1.extras.len(),
-                chunk2.extras.len(),
+                non_metadata_extras(&chunk1),
+                non_metadata_extras(&chunk2),
                 "extras count in {:?}",
                 chunk1.pos,
             );
-            for (e1, e2) in chunk1.extras.iter().zip(&chunk2.extras) {
-                assert_eq!(e1.0, e2.0, "extras key order in {:?}", chunk1.pos);
-                assert_eq!(e1.1, e2.1, "extras value for {} in {:?}", e1.0, chunk1.pos);
-            }
+            assert_normalized_metadata(&chunk1, &chunk2);
 
             probed += 1;
         }
@@ -1905,12 +1977,8 @@ mod tests {
         let hms_before: std::collections::BTreeSet<&String> = chunk.heightmaps.keys().collect();
         let hms_after: std::collections::BTreeSet<&String> = chunk2.heightmaps.keys().collect();
         assert_eq!(hms_before, hms_after, "heightmap key set must survive");
-        // Extras (DataVersion / InhabitedTime / …) survived byte-stably.
-        assert_eq!(chunk.extras.len(), chunk2.extras.len(), "extras count");
-        for (e1, e2) in chunk.extras.iter().zip(&chunk2.extras) {
-            assert_eq!(e1.0, e2.0, "extras key order");
-            assert_eq!(e1.1, e2.1, "extras value for {}", e1.0);
-        }
+        assert_eq!(non_metadata_extras(&chunk), non_metadata_extras(&chunk2));
+        assert_normalized_metadata(&chunk, &chunk2);
         // Timestamp survived through the write/read pair.
         assert_eq!(reread_payload.timestamp, 1_700_000_000);
     }
@@ -2071,6 +2139,60 @@ mod tests {
             Tag::Compound(entries) => entries,
             other => panic!("expected root compound, got {other:?}"),
         }
+    }
+
+    fn root_field<'a>(root: &'a Tag, name: &str) -> Option<&'a Tag> {
+        root_fields(root)
+            .iter()
+            .find(|(key, _)| key == name)
+            .map(|(_, value)| value)
+    }
+
+    #[test]
+    fn fresh_chunk_disk_payload_has_current_vanilla_metadata() {
+        let registry = tiny_registry();
+        let mut chunk = Chunk::empty(
+            ChunkPos { x: 3, z: -2 },
+            BlockStateId(0),
+            Identifier::parse("minecraft:plains").unwrap(),
+        );
+        chunk.extras.push(("InhabitedTime".into(), Tag::Long(77)));
+
+        let payload =
+            chunk_to_payload_with_items_at_tick(&chunk, &registry, None, 1_700_000_000, 123)
+                .expect("fresh chunk serializes");
+        let file = tempfile::NamedTempFile::new().unwrap();
+        region::write_region(file.path(), &[payload]).unwrap();
+        let payload = region::read_region(file.path()).unwrap().remove(0);
+        let mut cursor = Cursor::new(payload.uncompressed_nbt);
+        let (_, root) = mc_nbt::read_named(&mut cursor).unwrap();
+
+        assert_eq!(
+            root_field(&root, "DataVersion"),
+            Some(&Tag::Int(TARGET_DATA_VERSION))
+        );
+        assert_eq!(root_field(&root, "LastUpdate"), Some(&Tag::Long(123)));
+        assert_eq!(root_field(&root, "InhabitedTime"), Some(&Tag::Long(77)));
+        for key in VANILLA_METADATA_KEYS {
+            assert_eq!(
+                root_fields(&root)
+                    .iter()
+                    .filter(|(name, _)| name == key)
+                    .count(),
+                1,
+                "{key} must be emitted exactly once"
+            );
+        }
+
+        let decoded = chunk_from_nbt(&root, &registry).unwrap();
+        assert_eq!(
+            decoded
+                .extras
+                .iter()
+                .find(|(name, _)| name == "InhabitedTime")
+                .map(|(_, value)| value),
+            Some(&Tag::Long(77))
+        );
     }
 
     fn scheduled_tick_list(elements: Vec<Tag>) -> Tag {

@@ -153,7 +153,13 @@ verification and keep ordinary survival play ahead of rare edge cases.
   physics sampler also reproduces an exact partial pitcher-crop shape instead
   of its full-block fallback.
 - [ ] Keep vanilla-compatible world load/save while producing coherent terrain
-  quality comparable in intent to Tectonic/Tellus.
+  quality comparable in intent to Tectonic/Tellus. The Anvil encoder now emits
+  exactly one `DataVersion`, `LastUpdate`, and `InhabitedTime` root field for
+  every chunk, including old Solaris chunks that lacked them. Production
+  flushes use the actual simulation tick for `LastUpdate`; imported
+  `DataVersion` and `InhabitedTime` survive save/reopen. Focused disk round-trip
+  coverage and all `mc-world` tests are green. A real-client terrain visual pass
+  and runtime accumulation of inhabited time remain before this item closes.
 - [x] Verify vanilla ore height/distribution when the vanilla ore pass is active.
   The default embedded pass now preserves all 18 relevant vanilla 26.1.2
   placed/configured ore facts: separate passes, height anchors, uniform versus
@@ -215,6 +221,9 @@ verification and keep ordinary survival play ahead of rare edge cases.
   without weakening the exact-state fingerprint fence.
 - [ ] Keep menus, inventory actions, block events, and attacks responsive under
   natural mob/chunk load.
+- [ ] Accumulate vanilla-style per-chunk `InhabitedTime` while players keep a
+  chunk active. The Anvil codec now preserves and emits the field, but generated
+  chunks remain at zero until runtime ownership supplies this counter.
 - [ ] Add concise comments to shipped TOML options explaining their effect.
 - [ ] A runnable build must not require copying `data/vanilla`; required runtime
   tables belong in compact embedded binary data, decoded with minimal memory.
