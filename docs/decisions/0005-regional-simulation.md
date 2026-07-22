@@ -217,8 +217,13 @@ queues are not lock-free, but ordinary movement publication no longer enters
 the global session mutex and stale tracker, session, and visibility plans are
 still rejected.
 Goal input snapshots exclude dead sessions before hostile target selection.
-Attack-time filtering remains a second authority fence, so a dead player is
-neither followed by a new goal tick nor damaged by a stale attack candidate.
+Melee publication performs one batched current-attacker read while holding the
+session lock, then rechecks target presence, death/spectator state, visibility,
+current pose, vertical reach, and horizontal range before accepting the attack.
+An attacker that died or moved before this fence and a target that died or
+moved before it are both rejected without damage or swing. A melee hostile already in range uses a
+zero-speed `FollowPosition`: it skips pathfinding and translation but still
+turns body and head toward the live target for movement publication.
 Goal apply now also exposes a narrow typed projection for the active physics
 set. It reads sorted alive kinematics from the lane-owned ECS stores after the
 successful CAS and avoids a second full-snapshot materialization on the common

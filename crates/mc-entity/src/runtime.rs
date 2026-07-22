@@ -1070,7 +1070,7 @@ fn goal_pathing_request(
     tick: u64,
 ) -> Option<GoalPathingRequest> {
     let (target, target_epoch, speed) = match &goal.0 {
-        GoalState::FollowPosition { target, speed } => (*target, None, *speed),
+        GoalState::FollowPosition { target, speed } if *speed != 0.0 => (*target, None, *speed),
         GoalState::Wander {
             speed,
             period_ticks,
@@ -1913,11 +1913,12 @@ fn apply_goal_to_entity(
         stats.skipped_non_alive += 1;
         return;
     }
-    let pathing_result = if request.pathing_enabled
-        && matches!(
-            &goal.0,
-            GoalState::Wander { .. } | GoalState::FollowPosition { .. }
-        ) {
+    let goal_uses_pathing = match &goal.0 {
+        GoalState::Wander { .. } => true,
+        GoalState::FollowPosition { speed, .. } => *speed != 0.0,
+        _ => false,
+    };
+    let pathing_result = if request.pathing_enabled && goal_uses_pathing {
         let Some(result) = request.pathing.get(&identity.id) else {
             return;
         };
@@ -2012,18 +2013,13 @@ fn apply_goal_to_entity(
         }
         GoalState::FollowPosition { target, speed } => {
             let vertical_velocity = motion.velocity.y;
-            let direction = if request.pathing_enabled {
-                if let Some(result) = pathing_result {
-                    match result.decision.kind {
-                        PathingDecisionKind::Move => stats.pathing_moves += 1,
-                        PathingDecisionKind::Blocked => stats.pathing_blocked += 1,
-                        PathingDecisionKind::Unloaded => stats.pathing_unloaded += 1,
-                    }
-                    result.decision.velocity
-                } else {
-                    stats.pathing_blocked += 1;
-                    Vec3::ZERO
+            let direction = if let Some(result) = pathing_result {
+                match result.decision.kind {
+                    PathingDecisionKind::Move => stats.pathing_moves += 1,
+                    PathingDecisionKind::Blocked => stats.pathing_blocked += 1,
+                    PathingDecisionKind::Unloaded => stats.pathing_unloaded += 1,
                 }
+                result.decision.velocity
             } else {
                 Vec3 {
                     x: target.x - transform.position.x,
@@ -2039,8 +2035,13 @@ fn apply_goal_to_entity(
                 vertical_velocity
             };
             motion.velocity.z = direction.z * speed;
-            if motion.velocity.horizontal_len() > 0.0 {
-                transform.rotation.yaw = crate::yaw_from_velocity(motion.velocity);
+            let facing = if *speed == 0.0 {
+                direction
+            } else {
+                motion.velocity
+            };
+            if facing.horizontal_len() > 0.0 {
+                transform.rotation.yaw = crate::yaw_from_velocity(facing);
                 transform.rotation.head_yaw = transform.rotation.yaw;
             }
         }

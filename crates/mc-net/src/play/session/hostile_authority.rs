@@ -55,8 +55,7 @@ struct PlannedSkeletonAttack {
 
 struct PlannedMeleeAttack {
     hostile_id: EntityId,
-    source_origin: Vec3,
-    recipient: SessionRecipient,
+    target_session: super::SessionId,
     amount: f32,
 }
 
@@ -361,16 +360,7 @@ impl SessionRegistry {
                                 let dx = session.pose.x - hostile.position.x;
                                 let dz = session.pose.z - hostile.position.z;
                                 let distance = dx * dx + dz * dz;
-                                (distance <= max_distance_sq).then(|| {
-                                    (
-                                        distance,
-                                        SessionRecipient::unordered(
-                                            session_id,
-                                            session.tx.clone(),
-                                            Arc::clone(&session.pressure),
-                                        ),
-                                    )
-                                })
+                                (distance <= max_distance_sq).then_some((distance, session_id))
                             })
                             .min_by(|left, right| left.0.total_cmp(&right.0));
                         let Some((_, recipient)) = target else {
@@ -378,8 +368,7 @@ impl SessionRegistry {
                         };
                         melee_attacks.push(PlannedMeleeAttack {
                             hostile_id: hostile.id,
-                            source_origin: hostile.position,
-                            recipient,
+                            target_session: recipient,
                             amount,
                         });
                     }
@@ -445,7 +434,6 @@ impl SessionRegistry {
         #[cfg(test)]
         self.pause_between_hostile_entity_and_session_commit_for_test();
 
-        let mut inner = self.lock_inner("publish hostile attacks");
         let mut attacks = 0;
         let mut dispatches = Vec::new();
         let hostile_by_arrow = spawned_arrows
@@ -460,53 +448,101 @@ impl SessionRegistry {
             .map(|snapshot| SpawnedHostileArrow {
                 hostile_id: hostile_by_arrow[&snapshot.id],
                 snapshot,
-            });
-        for arrow in spawned_arrows {
-            let snapshot = server_entity_snapshot_from(arrow.snapshot);
-            let arrow_id = snapshot.id;
-            let arrow_position = snapshot.position;
-            let arrow_type_id = snapshot.type_id;
-            inner
-                .entity_type_aabbs
-                .entry(arrow_type_id)
-                .or_insert_with(|| entity_aabb(&snapshot.type_name));
-            track_entity_chunk_locked(&mut inner, arrow_id, arrow_position);
-            initialize_entity_wire_state_from_snapshot_locked(&mut inner, &snapshot);
-            dispatches.extend(spawn_entity_visibility_from_snapshot_locked(
-                &mut inner, snapshot,
-            ));
-            let animation_recipients = session_recipients(
-                &inner,
-                visible_entity_observers_locked(&inner, arrow.hostile_id),
-            );
-            dispatches.extend(visibility_dispatches(animation_recipients, || {
-                OutboundCommand::AnimatePlayer {
-                    entity_id: arrow.hostile_id.0,
-                }
-            }));
-            attacks += 1;
+            })
+            .collect::<Vec<_>>();
+        if !spawned_arrows.is_empty() {
+            let mut inner = self.lock_inner("publish hostile arrows");
+            for arrow in spawned_arrows {
+                let snapshot = server_entity_snapshot_from(arrow.snapshot);
+                let arrow_id = snapshot.id;
+                let arrow_position = snapshot.position;
+                let arrow_type_id = snapshot.type_id;
+                inner
+                    .entity_type_aabbs
+                    .entry(arrow_type_id)
+                    .or_insert_with(|| entity_aabb(&snapshot.type_name));
+                track_entity_chunk_locked(&mut inner, arrow_id, arrow_position);
+                initialize_entity_wire_state_from_snapshot_locked(&mut inner, &snapshot);
+                dispatches.extend(spawn_entity_visibility_from_snapshot_locked(
+                    &mut inner, snapshot,
+                ));
+                let animation_recipients = session_recipients(
+                    &inner,
+                    visible_entity_observers_locked(&inner, arrow.hostile_id),
+                );
+                dispatches.extend(visibility_dispatches(animation_recipients, || {
+                    OutboundCommand::AnimatePlayer {
+                        entity_id: arrow.hostile_id.0,
+                    }
+                }));
+                attacks += 1;
+            }
         }
-        for attack in melee_attacks {
-            dispatches.push(VisibilityDispatch {
-                recipient: attack.recipient,
-                command: OutboundCommand::DamagePlayer {
-                    damage: PlayerDamageRequest {
-                        kind: PlayerDamageKind::MobAttack,
-                        amount: attack.amount,
-                        source_origin: Some(attack.source_origin),
-                    },
-                },
-            });
-            let animation_recipients = session_recipients(
-                &inner,
-                visible_entity_observers_locked(&inner, attack.hostile_id),
-            );
-            dispatches.extend(visibility_dispatches(animation_recipients, || {
-                OutboundCommand::AnimatePlayer {
-                    entity_id: attack.hostile_id.0,
+
+        if !melee_attacks.is_empty() {
+            let melee_ids = melee_attacks
+                .iter()
+                .map(|attack| attack.hostile_id)
+                .collect::<HashSet<_>>();
+            let inner = self.lock_session_entities("commit hostile melee attacks");
+            inner.entities.prefetch(&melee_ids);
+            let current_hostiles = melee_ids
+                .iter()
+                .filter_map(|&entity_id| {
+                    inner
+                        .entities
+                        .snapshot(entity_id)
+                        .map(|entity| (entity_id, entity))
+                })
+                .collect::<HashMap<_, _>>();
+            for attack in melee_attacks {
+                let Some(hostile) = current_hostiles.get(&attack.hostile_id) else {
+                    continue;
+                };
+                if hostile.lifecycle != EntityLifecycle::Alive {
+                    continue;
                 }
-            }));
-            attacks += 1;
+                let Some(session) = inner.sessions.get(&attack.target_session) else {
+                    continue;
+                };
+                if inner.spectator_sessions.contains(&attack.target_session)
+                    || inner.dead_sessions.contains(&attack.target_session)
+                    || !session.visible_entities.contains(&attack.hostile_id)
+                    || (session.pose.y - hostile.position.y).abs() > HOSTILE_MELEE_VERTICAL_REACH
+                {
+                    continue;
+                }
+                let dx = session.pose.x - hostile.position.x;
+                let dz = session.pose.z - hostile.position.z;
+                if dx * dx + dz * dz > HOSTILE_MELEE_RANGE * HOSTILE_MELEE_RANGE {
+                    continue;
+                }
+                let recipient = SessionRecipient::unordered(
+                    attack.target_session,
+                    session.tx.clone(),
+                    Arc::clone(&session.pressure),
+                );
+                dispatches.push(VisibilityDispatch {
+                    recipient,
+                    command: OutboundCommand::DamagePlayer {
+                        damage: PlayerDamageRequest {
+                            kind: PlayerDamageKind::MobAttack,
+                            amount: attack.amount,
+                            source_origin: Some(hostile.position),
+                        },
+                    },
+                });
+                let animation_recipients = session_recipients(
+                    &inner,
+                    visible_entity_observers_locked(&inner, attack.hostile_id),
+                );
+                dispatches.extend(visibility_dispatches(animation_recipients, || {
+                    OutboundCommand::AnimatePlayer {
+                        entity_id: attack.hostile_id.0,
+                    }
+                }));
+                attacks += 1;
+            }
         }
 
         (attacks + creeper_ignitions, dispatches)
@@ -645,7 +681,7 @@ pub(super) fn update_hostile_targets(
                                 + (target.z - hostile_position.z).powi(2)
                                 <= HOSTILE_MELEE_RANGE * HOSTILE_MELEE_RANGE =>
                     {
-                        GoalState::Idle
+                        GoalState::FollowPosition { target, speed: 0.0 }
                     }
                     Some(target) => GoalState::FollowPosition {
                         target,

@@ -3163,7 +3163,7 @@ async fn last_session_unregister_pushes_empty_event() {
 }
 
 #[test]
-fn melee_hostile_stops_without_rewriting_unchanged_idle_goal() {
+fn melee_hostile_faces_close_target_without_rewriting_unchanged_hold_goal() {
     let registry = SessionRegistry::new();
     let alice = register_test_session(&registry, "CloseTargetAlice");
     assert!(registry.mark_loaded(alice, (0, 0)).is_empty());
@@ -3178,12 +3178,25 @@ fn melee_hostile_stops_without_rewriting_unchanged_idle_goal() {
     let queries = registry.tick_entities_and_collect_physics_queries(1);
 
     assert_eq!(queries.len(), 1);
+    assert_eq!(registry.entities.owner_requests_for_test(), 4);
+    assert_eq!(queries[0].velocity.x, 0.0);
+    assert_eq!(queries[0].velocity.z, 0.0);
+    {
+        let entities = registry.lock_entities("test entity access");
+        let entity = entities.snapshots().next().expect("spawned hostile");
+        assert!(matches!(
+            entity.goal,
+            GoalState::FollowPosition { speed: 0.0, .. }
+        ));
+    }
+
+    registry.entities.reset_owner_requests_for_test();
+    let queries = registry.tick_entities_and_collect_physics_queries(2);
+
+    assert_eq!(queries.len(), 1);
     assert_eq!(registry.entities.owner_requests_for_test(), 3);
     assert_eq!(queries[0].velocity.x, 0.0);
     assert_eq!(queries[0].velocity.z, 0.0);
-    let entities = registry.lock_entities("test entity access");
-    let entity = entities.snapshots().next().expect("spawned hostile");
-    assert_eq!(entity.goal, GoalState::Idle);
 }
 
 #[test]
