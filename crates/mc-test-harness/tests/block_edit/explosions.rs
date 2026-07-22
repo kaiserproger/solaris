@@ -628,7 +628,8 @@ async fn survival_tnt_explosion_damages_mob_over_wire() {
     let mut saw_explosion = false;
     let mut saw_raw_chicken_drop = false;
     let mut saw_experience_orb = false;
-    let deadline = tokio::time::Instant::now() + Duration::from_secs(6);
+    let mut explosion_game_time = None;
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
 
     while !(saw_tnt_remove
         && saw_chicken_remove
@@ -718,6 +719,14 @@ async fn survival_tnt_explosion_damages_mob_over_wire() {
             assert!((packet.center.z - explosion_center.2).abs() < 0.001);
             assert_eq!(packet.radius, 4.0);
             saw_explosion = true;
+        } else if frame.id == ClientboundSetTime::ID && saw_explosion {
+            let mut body = frame.body;
+            let packet = ClientboundSetTime::decode(&mut body).expect("decode TNT lifecycle time");
+            let baseline = *explosion_game_time.get_or_insert(packet.game_time);
+            assert!(
+                packet.game_time.saturating_sub(baseline) <= 60 || saw_chicken_remove,
+                "exploded chicken remained visible for more than 60 simulation ticks"
+            );
         }
     }
 
