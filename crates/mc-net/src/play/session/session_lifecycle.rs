@@ -9,8 +9,9 @@ use super::visibility::{
     visibility_dispatches,
 };
 use super::{
-    DisconnectedPlayerPersistence, PlaySession, SessionAdmissionError, SessionId,
-    SessionRegistration, SessionRegistry, remove_loaded_chunk_reference_locked, remove_ticket,
+    DisconnectedPlayerPersistence, PlaySession, PublishedEntityVisibility, SessionAdmissionError,
+    SessionId, SessionRegistration, SessionRegistry, remove_loaded_chunk_reference_locked,
+    remove_ticket,
 };
 #[cfg(test)]
 use crate::login::LoggedInProfile;
@@ -92,7 +93,7 @@ impl SessionRegistry {
                 desired: registration.desired,
                 loaded: HashSet::new(),
                 visible_players: HashSet::new(),
-                visible_entities: Arc::new(HashSet::new()),
+                visible_entities: PublishedEntityVisibility::new(),
                 tx: registration.tx,
                 pressure,
                 ordered_dispatch: Arc::new(OrderedDispatchState::default()),
@@ -119,6 +120,7 @@ impl SessionRegistry {
             self.publish_prepared_cache(&cache);
         }
         let dispatches = refresh_visibility_locked(&mut inner);
+        self.publish_movement_recipient_index(&inner);
         debug!(
             session_id = id,
             entity_id,
@@ -336,6 +338,7 @@ impl SessionRegistry {
             let active_sessions = inner.sessions.len();
             let completed_sleep = self.resolve_sleep_transition_locked(&mut inner);
             self.active_session_sender.send_replace(active_sessions);
+            self.publish_movement_recipient_index(&inner);
             if active_sessions == 0 {
                 self.mark_session_empty();
             }

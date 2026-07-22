@@ -5102,6 +5102,146 @@ fn entity_and_session_state_are_released_before_movement_plan() {
 }
 
 #[test]
+fn movement_recipient_snapshot_does_not_wait_for_session_registry() {
+    let registry = Arc::new(SessionRegistry::new());
+    let session = register_test_session(&registry, "PublishedRecipientAlice");
+    assert!(registry.mark_loaded(session, (0, 0)).is_empty());
+    let spawn = registry.spawn_command_entity(
+        &SimulationAuthority::for_test(),
+        1,
+        "minecraft:zombie".to_owned(),
+        Vec3::new(0.5, 64.0, 0.5),
+    );
+    let entity_id = match &spawn[0].command {
+        OutboundCommand::SpawnEntity(snapshot) => snapshot.id,
+        command => panic!("expected entity spawn, got {command:?}"),
+    };
+
+    let (plan_reached_tx, plan_reached_rx) = std::sync::mpsc::channel();
+    let (plan_resume_tx, plan_resume_rx) = std::sync::mpsc::channel();
+    *registry
+        .entity_apply_release_probe
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(EntityApplyReleaseProbe {
+        reached: plan_reached_tx,
+        resume: plan_resume_rx,
+    });
+    let (fanout_reached_tx, fanout_reached_rx) = std::sync::mpsc::channel();
+    let (fanout_resume_tx, fanout_resume_rx) = std::sync::mpsc::channel();
+    *registry
+        .move_fanout_probe
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(MoveFanoutProbe {
+        reached: fanout_reached_tx,
+        resume: fanout_resume_rx,
+    });
+
+    let physics_registry = Arc::clone(&registry);
+    let physics = std::thread::spawn(move || {
+        physics_registry.apply_entity_physics_and_dispatch(
+            ENTITY_MOVE_SEND_INTERVAL_TICKS,
+            &[EntityPhysicsStep {
+                id: entity_id,
+                position: Vec3::new(0.75, 64.0, 0.5),
+                velocity: Vec3::ZERO,
+                on_ground: true,
+                horizontal_collision: false,
+            }],
+        );
+    });
+    plan_reached_rx
+        .recv_timeout(Duration::from_secs(5))
+        .expect("movement reaches the unlocked plan boundary");
+
+    let session_guard = registry.lock_inner("hold registry across recipient snapshot");
+    plan_resume_tx
+        .send(())
+        .expect("release movement planning boundary");
+    let reached_fanout = fanout_reached_rx.recv_timeout(Duration::from_secs(5));
+    drop(session_guard);
+    fanout_resume_tx
+        .send(())
+        .expect("release movement fanout boundary");
+    physics.join().expect("physics worker");
+
+    assert!(
+        reached_fanout.is_ok(),
+        "published recipient snapshot must not acquire SessionRegistry"
+    );
+}
+
+#[test]
+fn concurrent_spawn_cannot_follow_an_earlier_movement_reservation() {
+    let registry = Arc::new(SessionRegistry::new());
+    let (tx, mut rx) = mpsc::channel(8);
+    let (session, _) = registry.register(
+        &profile("PublishedSpawnOrderAlice"),
+        (0, 0),
+        2,
+        HashSet::new(),
+        tx,
+        PlayerPose::new(0.5, 64.0, 0.5),
+    );
+    let spawn = registry.spawn_command_entity(
+        &SimulationAuthority::for_test(),
+        1,
+        "minecraft:zombie".to_owned(),
+        Vec3::new(0.5, 64.0, 0.5),
+    );
+    assert!(spawn.is_empty());
+    let entity_id = registry.persisted_entity_records()[0].id;
+
+    let (reached_tx, reached_rx) = std::sync::mpsc::channel();
+    let (resume_tx, resume_rx) = std::sync::mpsc::channel();
+    *registry
+        .movement_visibility_load_probe
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(MoveFanoutProbe {
+        reached: reached_tx,
+        resume: resume_rx,
+    });
+    let physics_registry = Arc::clone(&registry);
+    let physics = std::thread::spawn(move || {
+        physics_registry.apply_entity_physics_and_dispatch(
+            ENTITY_MOVE_SEND_INTERVAL_TICKS,
+            &[EntityPhysicsStep {
+                id: entity_id,
+                position: Vec3::new(0.75, 64.0, 0.5),
+                velocity: Vec3::ZERO,
+                on_ground: true,
+                horizontal_collision: false,
+            }],
+        );
+    });
+    reached_rx
+        .recv_timeout(Duration::from_secs(5))
+        .expect("movement loads the pre-spawn visibility publication");
+
+    let spawn = registry.mark_loaded(session, (0, 0));
+    assert!(matches!(
+        spawn.as_slice(),
+        [VisibilityDispatch {
+            command: OutboundCommand::SpawnEntity(snapshot),
+            ..
+        }] if snapshot.id == entity_id
+    ));
+    dispatch_visibility_commands(spawn);
+    resume_tx
+        .send(())
+        .expect("release movement visibility-load boundary");
+    physics.join().expect("physics worker");
+
+    assert!(matches!(
+        rx.try_recv(),
+        Ok(OutboundCommand::SpawnEntity(snapshot)) if snapshot.id == entity_id
+    ));
+    assert!(
+        rx.try_recv().is_err(),
+        "movement planned from the older visibility snapshot must not follow the spawn"
+    );
+}
+
+#[test]
 fn save_all_recovers_after_player_persistence_mutex_poison() {
     let registry = SessionRegistry::new();
     let session_id = register_test_session(&registry, "PoisonPersist");
@@ -10354,7 +10494,8 @@ fn movement_fanout_skips_visibility_work_when_no_movement_is_published() {
             .sessions
             .get_mut(&session_id)
             .expect("registered no-op movement observer")
-            .visible_entities = Arc::new(HashSet::from([entity_id]));
+            .visible_entities
+            .replace_and_publish(HashSet::from([entity_id]));
     }
     registry
         .lock_inner("place no-op movement outside tracker refresh cadence")
@@ -10418,7 +10559,8 @@ fn movement_fanout_uses_exhaustive_scan_for_one_dense_movement() {
                 .sessions
                 .get_mut(session_id)
                 .expect("registered movement observer")
-                .visible_entities = Arc::new(HashSet::from([entity_id]));
+                .visible_entities
+                .replace_and_publish(HashSet::from([entity_id]));
         }
     }
 
@@ -10496,7 +10638,8 @@ fn movement_fanout_indexes_sparse_disjoint_current_visibility() {
                 .sessions
                 .get_mut(session_id)
                 .expect("registered movement observer")
-                .visible_entities = Arc::new(HashSet::from([*entity_id]));
+                .visible_entities
+                .replace_and_publish(HashSet::from([*entity_id]));
         }
     }
 

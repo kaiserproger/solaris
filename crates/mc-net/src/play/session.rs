@@ -39,6 +39,7 @@ mod interaction_geometry;
 #[cfg(test)]
 #[path = "session/interaction_geometry_tests.rs"]
 mod interaction_geometry_tests;
+mod movement_publication;
 mod outbound;
 #[cfg(test)]
 mod outbound_backpressure_tests;
@@ -128,6 +129,9 @@ pub(super) use interaction_geometry::within_block_reach;
 #[cfg(test)]
 pub(super) use interaction_geometry::{
     entity_aabb, entity_is_near_player_chunk, within_entity_reach,
+};
+use movement_publication::{
+    MovementRecipientIndex, PublishedEntityVisibility, build_movement_recipient_index,
 };
 pub(crate) use outbound::{EntityDispatchCounters, SessionPressureSnapshot};
 #[cfg(test)]
@@ -312,7 +316,7 @@ struct PlaySession {
     desired: HashSet<(i32, i32)>,
     loaded: HashSet<(i32, i32)>,
     visible_players: HashSet<SessionId>,
-    visible_entities: Arc<HashSet<EntityId>>,
+    visible_entities: PublishedEntityVisibility,
     tx: mpsc::Sender<OutboundCommand>,
     pressure: Arc<OutboundPressureMetrics>,
     ordered_dispatch: Arc<OrderedDispatchState>,
@@ -428,6 +432,7 @@ pub(super) enum SessionPreparedChunkClaimResult {
 #[derive(Debug)]
 pub(crate) struct SessionRegistry {
     inner: Mutex<SessionRegistryInner>,
+    movement_recipients: arc_swap::ArcSwap<MovementRecipientIndex>,
     prepared_cache: Mutex<PreparedChunkCache>,
     entities: SessionEntityOwners,
     world_chunk_journal: Mutex<Option<super::world_journal::WorldChunkJournal>>,
@@ -457,6 +462,8 @@ pub(crate) struct SessionRegistry {
     prepared_claim_calls: AtomicU64,
     #[cfg(test)]
     move_fanout_probe: Mutex<Option<MoveFanoutProbe>>,
+    #[cfg(test)]
+    movement_visibility_load_probe: Mutex<Option<MoveFanoutProbe>>,
     #[cfg(test)]
     entity_apply_release_probe: Mutex<Option<EntityApplyReleaseProbe>>,
     #[cfg(test)]
@@ -697,6 +704,7 @@ impl SessionRegistry {
         let pressure_observation = Arc::new(SessionPressureObservation::default());
         Self {
             inner: Mutex::new(SessionRegistryInner::default()),
+            movement_recipients: arc_swap::ArcSwap::from_pointee(MovementRecipientIndex::new()),
             prepared_cache: Mutex::new(PreparedChunkCache::default()),
             entities: SessionEntityOwners::new(
                 Arc::clone(&pressure_observation),
@@ -730,6 +738,8 @@ impl SessionRegistry {
             prepared_claim_calls: AtomicU64::new(0),
             #[cfg(test)]
             move_fanout_probe: Mutex::new(None),
+            #[cfg(test)]
+            movement_visibility_load_probe: Mutex::new(None),
             #[cfg(test)]
             entity_apply_release_probe: Mutex::new(None),
             #[cfg(test)]
@@ -914,6 +924,11 @@ impl SessionRegistry {
         }
     }
 
+    fn publish_movement_recipient_index(&self, inner: &SessionRegistryInner) {
+        self.movement_recipients
+            .store(Arc::new(build_movement_recipient_index(&inner.sessions)));
+    }
+
     fn lock_entities(&self, operation: &'static str) -> EntityStoreGuard<'_> {
         let _ = operation;
         EntityStoreGuard {
@@ -957,6 +972,25 @@ impl SessionRegistry {
         if let Some(probe) = probe {
             probe.reached.send(()).expect("move fanout probe receiver");
             probe.resume.recv().expect("move fanout probe release");
+        }
+    }
+
+    #[cfg(test)]
+    fn pause_after_movement_visibility_load_for_test(&self) {
+        let probe = self
+            .movement_visibility_load_probe
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .take();
+        if let Some(probe) = probe {
+            probe
+                .reached
+                .send(())
+                .expect("movement visibility-load probe receiver");
+            probe
+                .resume
+                .recv()
+                .expect("movement visibility-load probe release");
         }
     }
 

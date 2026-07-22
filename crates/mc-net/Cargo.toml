@@ -12,6 +12,7 @@ repository.workspace = true
 workspace = true
 
 [dependencies]
+arc-swap = { workspace = true }
 mc-data = { path = "../mc-data" }
 mc-entity = { path = "../mc-entity" }
 mc-extension = { path = "../mc-extension" }

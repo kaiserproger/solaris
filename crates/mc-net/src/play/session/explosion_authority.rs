@@ -138,6 +138,11 @@ impl ExpiredPrimedTnt {
                 )),
             });
         }
+        for observer_id in observer_ids {
+            if let Some(observer) = inner.sessions.get(&observer_id) {
+                observer.visible_entities.publish();
+            }
+        }
         record_entity_dispatches_locked(inner, &dispatches);
         dispatches
     }

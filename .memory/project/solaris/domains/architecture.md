@@ -33,6 +33,13 @@ Current runtime facts:
 - Movement and pickup planning use copied tracker and player-position inputs;
   neither ECS access nor the global session registry may be held across that
   pure computation.
+- Movement recipient discovery reads an `ArcSwap` session index and per-session
+  immutable visibility publications. Connect/disconnect rebuild the index;
+  visibility writers publish only after reserving ordered spawn/despawn. Do not
+  restore per-tick session/visibility traversal under `SessionRegistry.inner`.
+- The final tracker CAS and current-visibility recheck still use the global
+  session registry. The movement read path is lock-free with respect to that
+  mutex, but the complete publication path is not yet lock-free or regional.
 - Uncontrolled heavy host load invalidates performance attribution. Record the
   build, workload, host contention, p95/p99, and maximum; repeat the same gate
   on a clean host. A contaminated run may retain functional evidence only.

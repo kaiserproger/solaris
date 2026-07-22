@@ -101,6 +101,9 @@ impl SessionRegistry {
         &self,
         mut session_ids: Vec<SessionId>,
     ) -> Vec<VisibilityDispatch> {
+        if session_ids.is_empty() {
+            return Vec::new();
+        }
         session_ids.sort_unstable();
         session_ids.dedup();
         let plans = {
@@ -1140,8 +1143,9 @@ fn picked_entity_recipients_locked(
         .unwrap_or_default();
     let mut recipients = Vec::new();
     for (&observer_id, observer) in &mut inner.sessions {
-        if Arc::make_mut(&mut observer.visible_entities).remove(&entity_id) {
+        if observer.visible_entities.remove(&entity_id) {
             recipients.push(ordered_session_recipient(observer_id, observer));
+            observer.visible_entities.publish();
         }
     }
     inner.entity_dispatches.take += recipients.len() as u64;

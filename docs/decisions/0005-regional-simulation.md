@@ -195,19 +195,24 @@ adapter projects that acknowledged batch into its short-lived access cache and
 performs one current-state read before publication, instead of acknowledging a
 boolean, rereading the owner immediately, invalidating that result, and reading
 the same entities again. A stale all-or-nothing CAS returns an empty batch.
-Movement publication now copies accepted kinematics, prior tracker state, and
-the recipient snapshot while holding the session registry, then builds the wire
-plan after releasing that lock. Commit reacquires the registry, compares the
-tracker state with the copied value, and rechecks visibility before publishing.
+Movement publication now copies accepted kinematics and prior tracker state,
+then builds the wire plan without holding the session registry. Recipient
+discovery reads an `ArcSwap` index rebuilt only when a session connects or
+disconnects. Each entry references that session's own immutable `ArcSwap`
+visibility set, so ordinary movement ticks do not traverse sessions or
+visibility edges under the global registry mutex. Visibility writers publish a
+replacement set only after reserving the corresponding ordered spawn/despawn
+command; movement therefore cannot reserve an earlier sequence for a newly
+visible entity. Commit still reacquires the registry, compares the tracker
+state with the copied value, and rechecks current visibility before publishing.
 The same snapshot boundary now copies player positions and tracker inputs, then
 releases both ECS access and the session registry for pickup-distance filtering
-and movement-plan computation. Recipient snapshotting, pickup admission,
-chunk/visibility mutation, and the final tracker/visibility commit still
-reacquire the registry.
-This removes packet planning from the global critical section without allowing
-a stale plan to overwrite newer state. Chunk visibility indexes and outbound
-session publication are still centralized; this is not a fully lock-free or
-fully regional publication path.
+and movement-plan computation. Pickup admission, chunk/visibility mutation,
+and the final tracker/visibility commit still reacquire the registry.
+This removes recipient discovery and packet planning from the global critical
+section without allowing a stale plan to overwrite newer state. Chunk
+visibility mutation, tracker CAS, and outbound session publication are still
+centralized; this is not a fully lock-free or fully regional publication path.
 Goal input snapshots exclude dead sessions before hostile target selection.
 Attack-time filtering remains a second authority fence, so a dead player is
 neither followed by a new goal tick nor damaged by a stale attack candidate.

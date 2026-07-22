@@ -484,7 +484,7 @@ pub(super) fn refresh_loaded_chunk_for_session_locked(
     }
     let mut new_entities = Vec::with_capacity(entities.len());
     for snapshot in entities {
-        if Arc::make_mut(&mut observer.visible_entities).insert(snapshot.id) {
+        if observer.visible_entities.insert(snapshot.id) {
             new_entities.push(snapshot);
         }
     }
@@ -499,6 +499,7 @@ pub(super) fn refresh_loaded_chunk_for_session_locked(
             command: OutboundCommand::SpawnEntities(new_entities),
         }),
     }
+    observer.visible_entities.publish();
     record_entity_dispatches_locked(inner, &dispatches);
     dispatches
 }
@@ -512,7 +513,7 @@ pub(super) fn refresh_unloaded_chunk_for_session_locked(
         return Vec::new();
     };
     let visible_players = observer.visible_players.clone();
-    let visible_entities = observer.visible_entities.clone();
+    let visible_entities = observer.visible_entities.snapshot();
 
     let players = visible_players
         .into_iter()
@@ -544,13 +545,14 @@ pub(super) fn refresh_unloaded_chunk_for_session_locked(
         }
     }
     for snapshot in entities {
-        if Arc::make_mut(&mut observer.visible_entities).remove(&snapshot.id) {
+        if observer.visible_entities.remove(&snapshot.id) {
             dispatches.push(VisibilityDispatch {
                 recipient: ordered_session_recipient(observer_id, observer),
                 command: OutboundCommand::DespawnEntity(snapshot),
             });
         }
     }
+    observer.visible_entities.publish();
     record_entity_dispatches_locked(inner, &dispatches);
     dispatches
 }
@@ -703,13 +705,14 @@ pub(super) fn install_committed_entity_publications_locked(
             }
             for &publication_index in publication_indexes {
                 let publication = &mut publications[publication_index];
-                if Arc::make_mut(&mut observer.visible_entities).insert(publication.snapshot.id) {
+                if observer.visible_entities.insert(publication.snapshot.id) {
                     publication
                         .recipients
                         .push(ordered_spawn_session_recipient(observer_id, observer));
                 }
             }
         }
+        observer.visible_entities.publish();
     }
 
     let mut dispatches = Vec::new();
@@ -772,14 +775,13 @@ pub(super) fn spawn_entity_visibility_from_snapshot_locked(
         .insert(entity_id, snapshot.clone());
     let mut dispatches = Vec::new();
     for (&observer_id, observer) in &mut inner.sessions {
-        if observer.loaded.contains(&chunk)
-            && Arc::make_mut(&mut observer.visible_entities).insert(entity_id)
-        {
+        if observer.loaded.contains(&chunk) && observer.visible_entities.insert(entity_id) {
             dispatches.push(VisibilityDispatch {
                 recipient: ordered_spawn_session_recipient(observer_id, observer),
                 command: OutboundCommand::SpawnEntity(snapshot.clone()),
             });
         }
+        observer.visible_entities.publish();
     }
     record_entity_dispatches_locked(inner, &dispatches);
     dispatches
@@ -807,11 +809,18 @@ pub(super) fn refresh_entity_target_visibility_locked(
             continue;
         };
         let desired = observer.loaded.contains(&new_chunk);
-        match update_visibility_set(
-            Arc::make_mut(&mut observer.visible_entities),
-            entity_id,
-            desired,
-        ) {
+        let transition = if desired {
+            observer
+                .visible_entities
+                .insert(entity_id)
+                .then_some(VisibilityTransition::Spawn)
+        } else {
+            observer
+                .visible_entities
+                .remove(&entity_id)
+                .then_some(VisibilityTransition::Despawn)
+        };
+        match transition {
             Some(VisibilityTransition::Spawn) => {
                 dispatches.push(VisibilityDispatch {
                     recipient: ordered_spawn_session_recipient(observer_id, observer),
@@ -826,6 +835,7 @@ pub(super) fn refresh_entity_target_visibility_locked(
             }
             None => {}
         }
+        observer.visible_entities.publish();
     }
     record_entity_dispatches_locked(inner, &dispatches);
     dispatches
@@ -935,7 +945,9 @@ pub(super) fn refresh_visibility_locked(
                 });
             }
         }
-        observer.visible_entities = Arc::new(desired_entities);
+        observer
+            .visible_entities
+            .replace_and_publish(desired_entities);
     }
     record_entity_dispatches_locked(inner, &dispatches);
     dispatches
@@ -975,8 +987,8 @@ pub(super) fn despawn_entity_visibility_locked(
 ) -> Vec<VisibilityDispatch> {
     let observer_ids = remove_entity_visibility_locked(inner, snapshot.id);
     let dispatches = observer_ids
-        .into_iter()
-        .filter_map(|observer_id| {
+        .iter()
+        .filter_map(|&observer_id| {
             let observer = inner.sessions.get(&observer_id)?;
             Some(VisibilityDispatch {
                 recipient: ordered_session_recipient(observer_id, observer),
@@ -984,6 +996,11 @@ pub(super) fn despawn_entity_visibility_locked(
             })
         })
         .collect::<Vec<_>>();
+    for observer_id in observer_ids {
+        if let Some(observer) = inner.sessions.get(&observer_id) {
+            observer.visible_entities.publish();
+        }
+    }
     record_entity_dispatches_locked(inner, &dispatches);
     dispatches
 }
@@ -996,7 +1013,8 @@ pub(super) fn remove_entity_visibility_locked(
         .sessions
         .iter_mut()
         .filter_map(|(&observer_id, observer)| {
-            Arc::make_mut(&mut observer.visible_entities)
+            observer
+                .visible_entities
                 .remove(&entity_id)
                 .then_some(observer_id)
         })

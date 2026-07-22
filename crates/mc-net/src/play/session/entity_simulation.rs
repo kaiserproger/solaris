@@ -6,9 +6,7 @@ use super::entity_physics_class::entity_type_uses_aquatic_physics;
 use super::interaction_geometry::{
     distance_sq, entity_aabb, entity_geometry, entity_is_near_player_chunk,
 };
-use super::visibility::{
-    entity_wire_move_for_kind, ordered_session_recipient, packed_head_yaw_changed,
-};
+use super::visibility::{entity_wire_move_for_kind, packed_head_yaw_changed};
 use super::*;
 
 mod persistence_projection;
@@ -1056,13 +1054,21 @@ impl SessionRegistry {
             return steps.to_vec();
         }
 
-        let inner = self.lock_inner("snapshot entity movement recipients");
-        let session_count = inner.sessions.len();
-        let visibility_edge_count = inner
-            .sessions
+        let recipient_index = self.movement_recipients.load_full();
+        let recipient_snapshots = recipient_index
             .values()
-            .try_fold(0usize, |edge_count, observer| {
-                edge_count.checked_add(observer.visible_entities.len())
+            .map(|publication| {
+                let visible_entities = publication.visible_entities();
+                #[cfg(test)]
+                self.pause_after_movement_visibility_load_for_test();
+                (publication.id(), publication.recipient(), visible_entities)
+            })
+            .collect::<Vec<_>>();
+        let session_count = recipient_snapshots.len();
+        let visibility_edge_count = recipient_snapshots
+            .iter()
+            .try_fold(0usize, |edge_count, (_, _, visible_entities)| {
+                edge_count.checked_add(visible_entities.len())
             });
         let estimated_exhaustive_cost = session_count.saturating_mul(movements.len());
         // Charge one extra unit per edge for reverse-map allocation and insertion.
@@ -1074,14 +1080,14 @@ impl SessionRegistry {
             #[cfg(test)]
             record_movement_visibility_index_build();
             let mut reverse_index = HashMap::<EntityId, Vec<usize>>::new();
-            for (&observer_id, observer) in &inner.sessions {
+            for (observer_id, recipient, visible_entities) in recipient_snapshots {
                 let recipient_index = movement_recipients.len();
                 movement_recipients.push((
                     observer_id,
-                    ordered_session_recipient(observer_id, observer),
-                    None,
+                    recipient,
+                    Some(Arc::clone(&visible_entities)),
                 ));
-                for &entity_id in observer.visible_entities.iter() {
+                for &entity_id in visible_entities.iter() {
                     #[cfg(test)]
                     record_movement_visibility_index_edge_visit();
                     reverse_index
@@ -1097,24 +1103,17 @@ impl SessionRegistry {
                 });
             if indexed_visibility_edges == visibility_edge_count {
                 current_observers_by_entity = Some(reverse_index);
-            } else {
-                for ((recipient_id, _, visible_entities), (&observer_id, observer)) in
-                    movement_recipients.iter_mut().zip(&inner.sessions)
-                {
-                    debug_assert_eq!(*recipient_id, observer_id);
-                    *visible_entities = Some(Arc::clone(&observer.visible_entities));
+                for (_, _, visible_entities) in &mut movement_recipients {
+                    *visible_entities = None;
                 }
             }
         } else {
-            movement_recipients.extend(inner.sessions.iter().map(|(&observer_id, observer)| {
-                (
-                    observer_id,
-                    ordered_session_recipient(observer_id, observer),
-                    Some(Arc::clone(&observer.visible_entities)),
-                )
-            }));
+            movement_recipients.extend(recipient_snapshots.into_iter().map(
+                |(observer_id, recipient, visible_entities)| {
+                    (observer_id, recipient, Some(visible_entities))
+                },
+            ));
         }
-        drop(inner);
 
         #[cfg(test)]
         self.pause_before_move_fanout_for_test();
