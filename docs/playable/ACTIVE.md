@@ -74,6 +74,19 @@ hardening. An already-open lower-priority diff does not override this order.
 
 ## Recent Evidence
 
+- A normal 26.1.2 client is now fenced from combat between respawn and its
+  `ServerboundPlayerLoaded` acknowledgement, matching vanilla's load gate.
+  While unloaded it remains simulated but cannot be selected or damaged; the
+  acknowledgement republishes it as a combat target and reconciles hostile
+  goals. Focused coverage proves both sides of that transition. The embedded
+  MCP can also combine respawn with immediate movement and perform an exact
+  ordinary block break with drop/pickup confirmation. On a fresh non-operator
+  world the real client navigated to a jungle tree, broke and collected four
+  logs, then used ordinary inventory clicks to craft planks and a crafting
+  table; it remained alive at full health. This closes the observed idle-agent
+  tooling blocker and the first gather/craft survival slice, not the pending
+  20-minute autonomous session.
+
 - Embedded MCP launches now prefer the current run's environment token and
   port over stale JVM properties and check for an existing listener before
   starting another client. The earlier 401 was not reproduced under a fixed

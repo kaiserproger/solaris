@@ -96,8 +96,23 @@ final class ClientCommandsTest {
         assertEquals(Duration.ofSeconds(8), client.respawnTimeout);
         assertEquals(0, executor.calls, "facade owns the push-driven respawn confirmation");
 
+        respawn.execute(request(
+            "respawn",
+            "{\"keys\":[\"forward\",\"sprint\"],\"ticks\":20}"
+        ));
+        assertEquals(List.of("forward", "sprint"), client.pressedInputs);
+        assertEquals(20, client.pressTicks);
+
         respawn.execute(request("respawn", "{}"));
         assertEquals(Duration.ofSeconds(10), client.respawnTimeout);
+        assertThrows(IllegalArgumentException.class, () -> respawn.execute(request(
+            "respawn",
+            "{\"keys\":[\"forward\"]}"
+        )));
+        assertThrows(IllegalArgumentException.class, () -> respawn.execute(request(
+            "respawn",
+            "{\"ticks\":20}"
+        )));
         assertThrows(IllegalArgumentException.class, () -> respawn.execute(request(
             "respawn",
             "{\"timeout_seconds\":0.01}"
@@ -106,6 +121,25 @@ final class ClientCommandsTest {
             "respawn",
             "{\"timeout_seconds\":120.1}"
         )));
+    }
+
+    @Test
+    void breakBlockForwardsExactTargetDropAndTimeout() throws Exception {
+        FakeClient client = new FakeClient();
+        CommandRegistry registry = ClientCommands.create(new ImmediateExecutor(), client);
+
+        registry.find("break_block").orElseThrow().execute(request(
+            "break_block",
+            "{\"x\":2,\"y\":76,\"z\":3,\"face\":\"north\","
+                + "\"expected_drop_item_id\":\"minecraft:jungle_log\","
+                + "\"expected_drop_count\":1,\"timeout_seconds\":12.0}"
+        ));
+
+        assertEquals(List.of(2, 76, 3), client.breakTarget);
+        assertEquals("north", client.breakFace);
+        assertEquals("minecraft:jungle_log", client.breakDropItemId);
+        assertEquals(1, client.breakDropCount);
+        assertEquals(Duration.ofSeconds(12), client.breakTimeout);
     }
 
     @Test
@@ -1074,6 +1108,11 @@ final class ClientCommandsTest {
         String interactedEntityType;
         String interactedHand;
         Duration respawnTimeout;
+        List<Integer> breakTarget;
+        String breakFace;
+        String breakDropItemId;
+        int breakDropCount;
+        Duration breakTimeout;
         long stateVersion;
         int awaitStateChangeCalls;
 
@@ -1276,6 +1315,24 @@ final class ClientCommandsTest {
         public void pressInputs(List<String> inputs, int ticks) {
             pressedInputs = List.copyOf(inputs);
             pressTicks = ticks;
+        }
+
+        @Override
+        public JsonObject breakBlock(
+            int x,
+            int y,
+            int z,
+            String face,
+            String expectedDropItemId,
+            int expectedDropCount,
+            Duration timeout
+        ) {
+            breakTarget = List.of(x, y, z);
+            breakFace = face;
+            breakDropItemId = expectedDropItemId;
+            breakDropCount = expectedDropCount;
+            breakTimeout = timeout;
+            return new JsonObject();
         }
 
         public void sendChat(String message, boolean command) {

@@ -110,6 +110,9 @@ mod bucket_interactions;
 mod campfire;
 mod campfire_adapter;
 mod chunk_stream;
+mod client_load;
+#[cfg(test)]
+mod client_load_tests;
 mod combat;
 mod command_execution;
 pub(crate) mod commands;
@@ -139,6 +142,7 @@ mod script_gameplay_events;
 #[cfg(test)]
 mod script_gameplay_events_tests;
 
+use client_load::ClientLoadGate;
 use player_breathing::{PlayerBreathingState, player_can_drown};
 // Router and storage-owner wiring land separately; keep the bounded adapter
 // contract available without creating a second ingress path here.
@@ -11763,6 +11767,7 @@ where
     }
     let mut food_tick_timer: u32 = 0;
     let mut breathing_state = PlayerBreathingState::default();
+    let mut client_load = ClientLoadGate::default();
     let mut next_teleport_id: i32 = 2;
     let mut pending_teleport = Some(PendingTeleport::new(1, sessions.simulation_tick()));
     let mut client_brand: Option<String> = None;
@@ -11900,19 +11905,21 @@ where
                         write_packet(writer, &event, compression).await?;
                     }
                     Some(OutboundCommand::DamagePlayer { damage }) => {
-                        apply_player_damage(
-                            interaction.as_deref_mut(),
-                            writer,
-                            compression,
-                            &mut survival_state,
-                            &mut xp_state,
-                            game_mode,
-                            PlayerDamageApplication {
-                                player_pose,
-                                request: damage,
-                            },
-                        )
-                        .await?;
+                        if sessions.player_accepts_damage(session_id) {
+                            apply_player_damage(
+                                interaction.as_deref_mut(),
+                                writer,
+                                compression,
+                                &mut survival_state,
+                                &mut xp_state,
+                                game_mode,
+                                PlayerDamageApplication {
+                                    player_pose,
+                                    request: damage,
+                                },
+                            )
+                            .await?;
+                        }
                     }
                     Some(OutboundCommand::PlayerDamageCommitted {
                         publication,
@@ -12225,6 +12232,10 @@ where
                     return Ok(());
                 }
                 let current_tick = *simulation_ticks.borrow_and_update();
+                if client_load.tick() {
+                    let completed_respawn_load = sessions.mark_client_loaded(session_id);
+                    debug!(completed_respawn_load, "client load timeout elapsed");
+                }
                 if resend_pending_teleport_if_due(
                     writer,
                     compression,
@@ -12244,7 +12255,9 @@ where
                     player_pose.eye_in_water,
                     player_can_drown(game_mode, survival_state.is_dead()),
                 );
-                let breathing_requires_damage_commit = breathing_tick.drowning_damage > 0.0;
+                let client_has_loaded = client_load.has_loaded();
+                let breathing_requires_damage_commit =
+                    client_has_loaded && breathing_tick.drowning_damage > 0.0;
                 if !breathing_requires_damage_commit {
                     breathing_state = next_breathing;
                     if breathing_tick.air_changed {
@@ -12261,22 +12274,28 @@ where
                         food_tick_timer = 0;
                         SurvivalHealthTick::Unchanged
                     };
-                    if let SurvivalHealthTick::StarvationDamage(amount) = health_tick {
+                    if client_has_loaded
+                        && let SurvivalHealthTick::StarvationDamage(amount) = health_tick
+                    {
                         updated_survival.apply_damage(survival_damage_after_equipment(
                             interaction.as_deref(),
                             amount,
                             PlayerDamageKind::Starvation,
                         ));
                     }
-                    if breathing_tick.drowning_damage > 0.0 {
+                    if client_has_loaded && breathing_tick.drowning_damage > 0.0 {
                         updated_survival.apply_damage(survival_damage_after_equipment(
                             interaction.as_deref(),
                             breathing_tick.drowning_damage,
                             PlayerDamageKind::Drowning,
                         ));
                     }
-                    if health_tick != SurvivalHealthTick::Unchanged
-                        || breathing_tick.drowning_damage > 0.0
+                    let health_changed = match health_tick {
+                        SurvivalHealthTick::Unchanged => false,
+                        SurvivalHealthTick::StarvationDamage(_) => client_has_loaded,
+                        _ => true,
+                    };
+                    if health_changed || breathing_requires_damage_commit
                     {
                         if let Some(state) = interaction.as_deref_mut() {
                             let expected_inventory = state.inventory.clone();
@@ -12300,7 +12319,10 @@ where
                             breathing_damage_committed = true;
                         }
                     }
-                    if game_mode == GameMode::Survival && current_tick.is_multiple_of(20) {
+                    if client_has_loaded
+                        && game_mode == GameMode::Survival
+                        && current_tick.is_multiple_of(20)
+                    {
                         apply_contact_block_damage(
                             interaction.as_deref_mut(),
                             writer,
@@ -12380,6 +12402,9 @@ where
                         }
                     }
                 } else if frame.id == ServerboundMovePlayerPos::ID {
+                    if !client_load.has_loaded() {
+                        continue;
+                    }
                     if guard_pending_teleport_movement(
                         &pending_teleport,
                         "ServerboundMovePlayerPos",
@@ -12412,6 +12437,9 @@ where
                     )
                     .await?;
                 } else if frame.id == ServerboundMovePlayerPosRot::ID {
+                    if !client_load.has_loaded() {
+                        continue;
+                    }
                     if guard_pending_teleport_movement(
                         &pending_teleport,
                         "ServerboundMovePlayerPosRot",
@@ -12444,6 +12472,9 @@ where
                     )
                     .await?;
                 } else if frame.id == ServerboundMovePlayerRot::ID {
+                    if !client_load.has_loaded() {
+                        continue;
+                    }
                     if guard_pending_teleport_movement(
                         &pending_teleport,
                         "ServerboundMovePlayerRot",
@@ -12469,6 +12500,9 @@ where
                     )
                     .await?;
                 } else if frame.id == ServerboundMovePlayerStatusOnly::ID {
+                    if !client_load.has_loaded() {
+                        continue;
+                    }
                     if guard_pending_teleport_movement(
                         &pending_teleport,
                         "ServerboundMovePlayerStatusOnly",
@@ -12599,7 +12633,9 @@ where
                 } else if frame.id == ServerboundAttack::ID {
                     let mut body = frame.body;
                     let attack = ServerboundAttack::decode(&mut body)?;
-                    if let Some(state) = interaction.as_deref_mut() {
+                    if !client_load.has_loaded() {
+                        debug!(entity_id = attack.entity_id, "Attack ignored while client is loading");
+                    } else if let Some(state) = interaction.as_deref_mut() {
                         handle_attack(
                             state,
                             writer,
@@ -12619,7 +12655,9 @@ where
                 } else if frame.id == ServerboundInteract::ID {
                     let mut body = frame.body;
                     let interact = ServerboundInteract::decode(&mut body)?;
-                    if let Some(state) = interaction.as_deref_mut() {
+                    if !client_load.has_loaded() {
+                        debug!(entity_id = interact.entity_id, "Interact ignored while client is loading");
+                    } else if let Some(state) = interaction.as_deref_mut() {
                         handle_interact(state, writer, script_gameplay_events.as_ref(), interact)
                             .await?;
                     } else {
@@ -12792,8 +12830,11 @@ where
                         command,
                     )
                     .await?;
-                    if was_dead && !survival_state.is_dead() && breathing_state.reset() {
-                        publish_player_air_supply(&sessions, session_id, breathing_state);
+                    if was_dead && !survival_state.is_dead() {
+                        client_load.restart_after_respawn();
+                        if breathing_state.reset() {
+                            publish_player_air_supply(&sessions, session_id, breathing_state);
+                        }
                     }
                     commit_authoritative_player_pose(&simulation, player_pose).await?;
                 } else if frame.id == ServerboundClientInformation::ID {
@@ -12898,7 +12939,9 @@ where
                 } else if frame.id == ServerboundPlayerLoaded::ID {
                     let mut body = frame.body;
                     let _ = ServerboundPlayerLoaded::decode(&mut body)?;
-                    debug!("client reported player loaded");
+                    client_load.acknowledge();
+                    let completed_respawn_load = sessions.mark_client_loaded(session_id);
+                    debug!(completed_respawn_load, "client reported player loaded");
                 } else if frame.id == ServerboundCommandSuggestion::ID {
                     let mut body = frame.body;
                     let request = ServerboundCommandSuggestion::decode(&mut body)?;

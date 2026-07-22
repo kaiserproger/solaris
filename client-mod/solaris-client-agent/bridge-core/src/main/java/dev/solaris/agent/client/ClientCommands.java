@@ -245,6 +245,19 @@ public final class ClientCommands {
                 return ok();
             });
         });
+        registry.register("break_block", request -> {
+            JsonObject payload = request.payload();
+            BlockTarget target = blockTarget(payload);
+            return client.breakBlock(
+                target.x,
+                target.y,
+                target.z,
+                target.face,
+                boundedString(payload, "expected_drop_item_id", 128),
+                boundedInt(payload, "expected_drop_count", 1, 64),
+                eventTimeout(payload)
+            );
+        });
         registry.register("move_forward", request -> {
             client.moveForward(inputTicks(request.payload()));
             return ok();
@@ -290,7 +303,16 @@ public final class ClientCommands {
             return ok();
         }));
         registry.register("respawn", request -> {
-            client.respawn(respawnTimeout(request.payload()));
+            JsonObject payload = request.payload();
+            boolean hasKeys = payload.has("keys");
+            boolean hasTicks = payload.has("ticks");
+            if (hasKeys != hasTicks) {
+                throw new IllegalArgumentException("respawn keys and ticks must be provided together");
+            }
+            client.respawn(respawnTimeout(payload));
+            if (hasKeys) {
+                client.pressInputs(inputKeys(payload), inputTicks(payload));
+            }
             JsonObject response = new JsonObject();
             response.addProperty("status", "respawned");
             return response;

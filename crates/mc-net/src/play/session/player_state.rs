@@ -285,6 +285,9 @@ impl SessionRegistry {
                 self.stage_sleep_wake_locked(&mut inner, actor_session, SleepWakeReason::Damage)
             })
             .flatten();
+        if respawned {
+            inner.client_unloaded_sessions.insert(actor_session);
+        }
         let mut committed =
             apply_player_survival_plan_locked(&mut inner, actor_session, &mut player_state, plan);
         let became_no_live_sessions = self.publish_live_session_count(&inner);
@@ -300,7 +303,7 @@ impl SessionRegistry {
         }
         drop(player_state);
         drop(inner);
-        if became_no_live_sessions {
+        if became_no_live_sessions || respawned {
             self.reconcile_hostile_targets_after_live_session_change();
         }
         self.append_spawned_xp_pickup_candidates(&mut committed.dispatches);
@@ -324,6 +327,28 @@ impl SessionRegistry {
         if became_no_live_sessions {
             self.reconcile_hostile_targets_after_live_session_change();
         }
+    }
+
+    pub(in crate::play) fn mark_client_loaded(&self, id: SessionId) -> bool {
+        let changed = {
+            let mut inner = self.lock_inner("mark client loaded");
+            if !inner.sessions.contains_key(&id) || !inner.client_unloaded_sessions.remove(&id) {
+                return false;
+            }
+            inner.publish_combat_target(id);
+            true
+        };
+        if changed {
+            self.reconcile_hostile_targets_after_live_session_change();
+        }
+        true
+    }
+
+    pub(in crate::play) fn player_accepts_damage(&self, id: SessionId) -> bool {
+        self.movement_recipients
+            .load_full()
+            .get(&id)
+            .is_some_and(|publication| publication.combat_target().is_targetable())
     }
 }
 

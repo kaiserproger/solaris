@@ -177,13 +177,38 @@ fn respawn_commit_clears_player_hurt_resistance() {
         1
     );
     {
-        let entities = registry.lock_entities("verify respawn target reconciliation");
+        let entities = registry.lock_entities("verify unloaded respawn target reconciliation");
         let zombie = entities.snapshots().next().expect("spawned zombie");
-        assert!(matches!(zombie.goal, GoalState::FollowPosition { .. }));
+        assert!(matches!(zombie.goal, GoalState::Wander { .. }));
     }
-    let inner = registry.lock_inner("verify respawn projections reset");
-    assert!(!inner.player_hurt_resistance.contains_key(&session));
-    assert!(!inner.dead_sessions.contains(&session));
+    {
+        let inner = registry.lock_inner("verify respawn projections reset");
+        assert!(!inner.player_hurt_resistance.contains_key(&session));
+        assert!(!inner.dead_sessions.contains(&session));
+        assert!(inner.client_unloaded_sessions.contains(&session));
+    }
+    assert!(
+        !registry.movement_recipients.load_full()[&session]
+            .combat_target()
+            .is_targetable()
+    );
+    assert!(!registry.player_accepts_damage(session));
+
+    assert!(registry.mark_client_loaded(session));
+    assert!(!registry.mark_client_loaded(session));
+    {
+        let inner = registry.lock_inner("verify loaded respawn projection");
+        assert!(!inner.client_unloaded_sessions.contains(&session));
+    }
+    assert!(
+        registry.movement_recipients.load_full()[&session]
+            .combat_target()
+            .is_targetable()
+    );
+    assert!(registry.player_accepts_damage(session));
+    let entities = registry.lock_entities("verify loaded respawn target reconciliation");
+    let zombie = entities.snapshots().next().expect("spawned zombie");
+    assert!(matches!(zombie.goal, GoalState::FollowPosition { .. }));
 }
 
 struct CountingEntityJournal(Arc<AtomicUsize>);

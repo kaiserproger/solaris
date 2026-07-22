@@ -263,6 +263,7 @@ impl SessionRegistry {
             inner.sleeping_sessions.remove(&id);
             inner.spectator_sessions.remove(&id);
             inner.dead_sessions.remove(&id);
+            inner.client_unloaded_sessions.remove(&id);
             inner.player_hurt_resistance.remove(&id);
             inner.active_shields.remove(&id);
             for &chunk in &session.loaded {

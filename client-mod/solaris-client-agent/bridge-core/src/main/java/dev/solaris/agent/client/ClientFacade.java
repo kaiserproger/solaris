@@ -85,6 +85,18 @@ public interface ClientFacade {
 
     void useItemOn(int x, int y, int z, String face);
 
+    default JsonObject breakBlock(
+        int x,
+        int y,
+        int z,
+        String face,
+        String expectedDropItemId,
+        int expectedDropCount,
+        Duration timeout
+    ) throws Exception {
+        throw new UnsupportedOperationException("block breaking is not available");
+    }
+
     void moveForward(int ticks) throws Exception;
 
     void moveBackward(int ticks) throws Exception;

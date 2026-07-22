@@ -221,6 +221,12 @@ public final class ClientMcpTools {
             blockFaceSchema()
         ),
         mutating(
+            "minecraft_break_block",
+            "Break one loaded block through ordinary client mining and wait for the expected drop pickup.",
+            "break_block",
+            blockBreakSchema()
+        ),
+        mutating(
             "minecraft_press_inputs",
             "Activate vanilla client inputs for exact client ticks; swap_offhand clicks once.",
             "press_inputs",
@@ -246,12 +252,9 @@ public final class ClientMcpTools {
         ),
         nonIdempotentControl(
             "minecraft_respawn",
-            "Send the vanilla respawn action and wait for confirmed active player state.",
+            "Send the vanilla respawn action, wait for confirmed active player state, and optionally apply immediate vanilla inputs.",
             "respawn",
-            objectSchema(
-                properties("timeout_seconds", number(0.1, 120.0, 10.0)),
-                List.of()
-            )
+            respawnSchema()
         ),
         mutating(
             "minecraft_quick_move_container_slot",
@@ -411,6 +414,43 @@ public final class ClientMcpTools {
             ),
             List.of("x", "y", "z")
         );
+    }
+
+    private static JsonObject blockBreakSchema() {
+        return objectSchema(
+            properties(
+                "x", integer(),
+                "y", integer(),
+                "z", integer(),
+                "face", enumString(BLOCK_FACES),
+                "expected_drop_item_id", string(128),
+                "expected_drop_count", integer(1, 64),
+                "timeout_seconds", number(0.1, 120.0, 8.0)
+            ),
+            List.of("x", "y", "z", "face", "expected_drop_item_id", "expected_drop_count")
+        );
+    }
+
+    private static JsonObject respawnSchema() {
+        JsonObject schema = objectSchema(
+            properties(
+                "timeout_seconds", number(0.1, 120.0, 10.0),
+                "keys", inputKeysSchema(),
+                "ticks", integer(1, 255)
+            ),
+            List.of()
+        );
+        JsonObject dependentRequired = new JsonObject();
+        dependentRequired.add("keys", stringArray("ticks"));
+        dependentRequired.add("ticks", stringArray("keys"));
+        schema.add("dependentRequired", dependentRequired);
+        return schema;
+    }
+
+    private static JsonArray stringArray(String value) {
+        JsonArray values = new JsonArray();
+        values.add(value);
+        return values;
     }
 
     private static JsonObject blockStateWaitSchema() {
@@ -588,19 +628,23 @@ public final class ClientMcpTools {
     }
 
     private static JsonObject pressInputsSchema() {
+        return objectSchema(
+            properties(
+                "keys", inputKeysSchema(),
+                "ticks", integer(1, 255)
+            ),
+            List.of("keys", "ticks")
+        );
+    }
+
+    private static JsonObject inputKeysSchema() {
         JsonObject keys = new JsonObject();
         keys.addProperty("type", "array");
         keys.add("items", enumString(INPUT_KEYS));
         keys.addProperty("minItems", 1);
         keys.addProperty("maxItems", 8);
         keys.addProperty("uniqueItems", true);
-        return objectSchema(
-            properties(
-                "keys", keys,
-                "ticks", integer(1, 255)
-            ),
-            List.of("keys", "ticks")
-        );
+        return keys;
     }
 
     private static JsonObject objectSchema(JsonObject properties, List<String> required) {

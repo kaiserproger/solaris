@@ -43,6 +43,7 @@ final class ClientMcpToolsTest {
             "minecraft_look",
             "minecraft_look_at_block",
             "minecraft_use_item_on",
+            "minecraft_break_block",
             "minecraft_press_inputs",
             "minecraft_wait_ticks",
             "minecraft_close_screen",
@@ -113,6 +114,7 @@ final class ClientMcpToolsTest {
             "minecraft_attack_entity_until_drop_collected"
         ));
         JsonObject drop = properties(find(ClientMcpTools.definitions(), "minecraft_drop_selected_item"));
+        JsonObject breakBlock = properties(find(ClientMcpTools.definitions(), "minecraft_break_block"));
         JsonObject respawn = properties(find(ClientMcpTools.definitions(), "minecraft_respawn"));
         JsonObject quickMove = properties(find(
             ClientMcpTools.definitions(),
@@ -235,10 +237,23 @@ final class ClientMcpToolsTest {
         assertEquals(120.0, attack.get("timeout_seconds").getAsJsonObject().get("maximum").getAsDouble());
         assertEquals(64, drop.get("count").getAsJsonObject().get("maximum").getAsInt());
         assertEquals(120.0, drop.get("timeout_seconds").getAsJsonObject().get("maximum").getAsDouble());
-        assertEquals(1, respawn.size());
+        assertEquals(64, breakBlock.get("expected_drop_count").getAsJsonObject().get("maximum").getAsInt());
+        assertEquals(120.0, breakBlock.get("timeout_seconds").getAsJsonObject().get("maximum").getAsDouble());
+        assertEquals(3, respawn.size());
         assertEquals(0.1, respawn.get("timeout_seconds").getAsJsonObject().get("minimum").getAsDouble());
         assertEquals(120.0, respawn.get("timeout_seconds").getAsJsonObject().get("maximum").getAsDouble());
         assertEquals(10.0, respawn.get("timeout_seconds").getAsJsonObject().get("default").getAsDouble());
+        assertEquals(8, respawn.get("keys").getAsJsonObject().get("maxItems").getAsInt());
+        assertEquals(255, respawn.get("ticks").getAsJsonObject().get("maximum").getAsInt());
+        JsonObject respawnSchema = find(ClientMcpTools.definitions(), "minecraft_respawn").inputSchema();
+        assertEquals(
+            "ticks",
+            respawnSchema.getAsJsonObject("dependentRequired").getAsJsonArray("keys").get(0).getAsString()
+        );
+        assertEquals(
+            "keys",
+            respawnSchema.getAsJsonObject("dependentRequired").getAsJsonArray("ticks").get(0).getAsString()
+        );
         assertEquals(32_767, quickMove.get("slot").getAsJsonObject().get("maximum").getAsInt());
         assertEquals(32_767, containerSlot.get("slot").getAsJsonObject().get("maximum").getAsInt());
         assertEquals(

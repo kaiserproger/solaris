@@ -369,6 +369,7 @@ struct SessionRegistryInner {
     sleeping_sessions: HashMap<SessionId, SleepingState>,
     spectator_sessions: HashSet<SessionId>,
     dead_sessions: HashSet<SessionId>,
+    client_unloaded_sessions: HashSet<SessionId>,
     entity_dispatches: EntityDispatchCounters,
     arrow_kill_rewards: ArrowKillRewards,
     player_combat: PlayerCombatResources,
@@ -378,7 +379,9 @@ struct SessionRegistryInner {
 impl SessionRegistryInner {
     fn publish_combat_target(&mut self, id: SessionId) {
         let alive = !self.dead_sessions.contains(&id);
-        let targetable = alive && !self.spectator_sessions.contains(&id);
+        let targetable = alive
+            && !self.spectator_sessions.contains(&id)
+            && !self.client_unloaded_sessions.contains(&id);
         if let Some(session) = self.sessions.get(&id) {
             session
                 .combat_target

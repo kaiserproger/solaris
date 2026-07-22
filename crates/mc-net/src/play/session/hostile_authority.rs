@@ -98,7 +98,11 @@ impl SessionRegistry {
                 let player_positions = inner
                     .sessions
                     .iter()
-                    .filter(|(session_id, _)| !inner.dead_sessions.contains(session_id))
+                    .filter(|(session_id, _)| {
+                        !inner.dead_sessions.contains(session_id)
+                            && !inner.spectator_sessions.contains(session_id)
+                            && !inner.client_unloaded_sessions.contains(session_id)
+                    })
                     .map(|(_, session)| Vec3::new(session.pose.x, session.pose.y, session.pose.z))
                     .collect::<Vec<_>>();
                 (generation, player_positions)

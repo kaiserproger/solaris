@@ -71,6 +71,9 @@ impl SessionRegistry {
         }
 
         let inner = self.lock_inner("player attack target");
+        if inner.client_unloaded_sessions.contains(&attacker_session) {
+            return PlayerAttackResult::ValidationRejected;
+        }
         let Some(attacker_pose) = inner
             .sessions
             .get(&attacker_session)
@@ -105,6 +108,9 @@ impl SessionRegistry {
             );
         };
         if target_session == attacker_session {
+            return PlayerAttackResult::ValidationRejected;
+        }
+        if inner.client_unloaded_sessions.contains(&target_session) {
             return PlayerAttackResult::ValidationRejected;
         }
 
@@ -608,6 +614,9 @@ pub(super) fn prepare_projectile_player_damage_locked(
     current_tick: u64,
     damage: PlayerDamageRequest,
 ) -> ProjectilePlayerDamagePreview {
+    if inner.client_unloaded_sessions.contains(&target_session) {
+        return ProjectilePlayerDamagePreview::Rejected(None);
+    }
     let Some(target) = inner.sessions.get(&target_session) else {
         return ProjectilePlayerDamagePreview::Rejected(None);
     };
@@ -1208,6 +1217,43 @@ mod tests {
             &dispatch.command,
             OutboundCommand::PlayerDamageCommitted { .. }
         )));
+    }
+
+    #[test]
+    fn client_unloaded_after_respawn_cannot_attack() {
+        let registry = SessionRegistry::new();
+        let attacker_pose = PlayerPose::new(0.5, 64.0, 0.5);
+        let target_pose = PlayerPose::new(1.0, 64.0, 0.5);
+        let attacker = register_player(
+            &registry,
+            "UnloadedAttacker",
+            attacker_pose,
+            PlayerPersistedState::new_default(attacker_pose),
+        );
+        let target = register_player(
+            &registry,
+            "LoadedTarget",
+            target_pose,
+            PlayerPersistedState::new_default(target_pose),
+        );
+        let target_entity = {
+            let mut inner = registry.lock_inner("mark attacker client unloaded");
+            inner.client_unloaded_sessions.insert(attacker);
+            EntityId(inner.sessions[&target].entity_id)
+        };
+
+        let result = registry.player_attack_entity(
+            &SimulationAuthority::for_test(),
+            PlayerEntityAttack {
+                attacker_session: attacker,
+                entity_id: target_entity,
+                amount: 2.0,
+                attacker_costs: None,
+                authority_tick: registry.simulation_tick(),
+            },
+        );
+
+        assert!(matches!(result, PlayerAttackResult::ValidationRejected));
     }
 
     #[test]

@@ -729,6 +729,35 @@ public final class MinecraftClientFacade implements ClientFacade {
     }
 
     @Override
+    public JsonObject breakBlock(
+        int x,
+        int y,
+        int z,
+        String face,
+        String expectedDropItemId,
+        int expectedDropCount,
+        Duration timeout
+    ) throws Exception {
+        MinecraftClientExecutor executor = new MinecraftClientExecutor();
+        String blockId = executor.callOnClientThread(() -> blockIdAt(x, y, z));
+        ScenarioBreakResult result = new MinecraftScenarioClient(executor).breakBlock(
+            new ScenarioBlockTarget(x, y, z, face, "mcp", blockId),
+            expectedDropItemId,
+            expectedDropCount,
+            timeout
+        );
+        JsonObject response = new JsonObject();
+        response.addProperty("started", result.started());
+        response.addProperty("became_air", result.becameAir());
+        response.addProperty("saw_drop", result.sawDrop());
+        response.addProperty("pickup_confirmed", result.pickupRestored());
+        response.addProperty("selected_item_id", result.selectedItem().itemId());
+        response.addProperty("selected_item_count", result.selectedItem().count());
+        response.addProperty("pickup_detail", result.pickupDetail());
+        return response;
+    }
+
+    @Override
     public void moveForward(int ticks) throws Exception {
         moveWithKey(ticks, true);
     }

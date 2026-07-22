@@ -197,17 +197,19 @@ impl SessionRegistry {
         let (world_read, pathing_materials) = pathing.unzip();
         let (active_chunks, active_entity_candidates) =
             self.simulation_inputs.active_entity_candidates();
-        let player_positions = self
-            .movement_recipients
-            .load_full()
-            .values()
-            .filter_map(|publication| {
-                let target = *publication.combat_target();
-                target
-                    .is_alive()
-                    .then(|| Vec3::new(target.pose().x, target.pose().y, target.pose().z))
-            })
-            .collect::<Vec<_>>();
+        let recipients = self.movement_recipients.load_full();
+        let mut player_positions = Vec::new();
+        let mut hostile_target_positions = Vec::new();
+        for publication in recipients.values() {
+            let target = *publication.combat_target();
+            let position = Vec3::new(target.pose().x, target.pose().y, target.pose().z);
+            if target.is_alive() {
+                player_positions.push(position);
+            }
+            if target.is_targetable() {
+                hostile_target_positions.push(position);
+            }
+        }
         let terrain_pathing_entities = self.simulation_inputs.terrain_pathing_entities();
         let mut entities = self.lock_entities("prepare entity goals");
         if active_chunks.is_empty() {
@@ -276,7 +278,11 @@ impl SessionRegistry {
         if active_entity_ids.is_empty() {
             return Vec::new();
         }
-        update_hostile_targets(&mut entities, &player_positions, Some(&active_entity_ids));
+        update_hostile_targets(
+            &mut entities,
+            &hostile_target_positions,
+            Some(&active_entity_ids),
+        );
         let goal_entity_ids = active_entity_ids
             .difference(&sheep_grazing_entities)
             .copied()
