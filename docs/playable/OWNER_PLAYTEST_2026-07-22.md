@@ -6,15 +6,18 @@ verification and keep ordinary survival play ahead of rare edge cases.
 
 ## Immediate Gameplay
 
-- [ ] Block breaking must not intermittently reject valid survival breaks.
+- [x] Block breaking must not intermittently reject valid survival breaks.
   Evidence: stone at `x = 31` repeatedly rejected while nearby blocks broke;
   chat and movement remained live. The first proven cause is unnecessary stair
   dependency reads for non-stair-to-non-stair edits at a chunk edge. A second
   proven cause was an early `STOP` becoming permanently orphaned when another
   delayed break already occupied the single delayed slot. The older break now
   promotes the queued stop on either completion or cancellation. Both focused
-  state-machine regressions and the full `mc-net` library suite are green;
-  owner/client confirmation is still pending.
+  state-machine regressions and the full `mc-net` library suite are green. A
+  real 26.1.2 MCP client then broke eight consecutive prepared stone blocks at
+  `x=12..19`, crossing the chunk boundary at `15/16`; every first attempt became
+  air, exposed its item entity, and the final inventory contained exactly eight
+  cobblestone without a disconnect.
 - [ ] Block placement must work on every valid face and from either hand. The
   owner transaction now accepts and debits the offhand slot, with a focused
   regression; owner/client confirmation is still pending.
@@ -47,6 +50,10 @@ verification and keep ordinary survival play ahead of rare edge cases.
   stepping are smooth and vanilla-like, without hopping, circles, or stutter.
 - [ ] Water has player swimming, drag, buoyancy and breathing; aquatic mobs stay
   and move naturally below the surface.
+- [ ] `minecraft_break_block` must confirm pickup in any inventory slot and
+  return on the inventory event. The chunk-edge client gate collected all eight
+  cobblestone into a non-selected slot, but every call returned
+  `pickup_confirmed=false` even though the final inventory was correct.
 
 ## World Generation
 

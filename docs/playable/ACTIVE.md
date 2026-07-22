@@ -74,6 +74,16 @@ hardening. An already-open lower-priority diff does not override this order.
 
 ## Recent Evidence
 
+- A real 26.1.2 MCP client closed the intermittent survival-break gate. It mined
+  eight prepared stone blocks at `x=12..19`, crossing both sides of the chunk
+  boundary at `15/16`. Every first
+  ordinary break became air and exposed a visible item entity; the final
+  inventory contained exactly eight cobblestone, health stayed at 20, and the
+  client remained connected. The run also exposed a client-MCP defect:
+  `minecraft_break_block` misses pickup into a non-selected slot despite the
+  authoritative inventory update; that tooling issue is now recorded
+  separately in the owner queue.
+
 - Rapid sequential mining no longer strands the second valid early `STOP`
   behind an existing delayed break. The stop is retained as queued work, and
   completion or cancellation of the older delayed break promotes it into the
