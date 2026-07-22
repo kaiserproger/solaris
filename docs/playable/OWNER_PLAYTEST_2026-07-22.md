@@ -88,8 +88,16 @@ verification and keep ordinary survival play ahead of rare edge cases.
   chickens, while session tests cover every-tick publication for bounded
   natural passive and hostile movement. Visible movement quality over longer
   play remains the separate unchecked movement item below.
-- [ ] Water has player swimming, drag, buoyancy and breathing; aquatic mobs stay
-  and move naturally below the surface.
+- [x] Water has player swimming, drag, buoyancy and breathing; aquatic mobs stay
+  and move naturally below the surface. The retained representative O3 26.1.2
+  client gate
+  proves ascent, diving, a `3.43`-block swimming pass, air depletion and
+  `20 -> 18` drowning damage while connected. A command-spawned aquatic mob no
+  longer starts with an idle goal: it receives the same three-dimensional
+  aquatic wander used by natural spawns across the supported aquatic and
+  amphibious classes. In the corrected representative debug client gate, a
+  tropical fish produced eight pushed motion events, moved `0.36` blocks, and
+  remained underwater at `y=62.50..62.57`.
 - [ ] `minecraft_break_block` must confirm pickup in any inventory slot and
   return on the inventory event. The chunk-edge client gate collected all eight
   cobblestone into a non-selected slot, but every call returned
@@ -175,6 +183,9 @@ verification and keep ordinary survival play ahead of rare edge cases.
   in 20-tick batches and inline single-region scheduled block ticks no longer
   wait for a WAL append. The batched breeding pass preserves every eligible
   love window; an O3 profile rerun is still required.
+  A debug deep-water fixture also exposed a scheduled-fluid backlog applying
+  roughly 94-105 updates in `68-76 ms` per tick and delaying client entry for
+  more than two minutes; profile and bound that common loaded-ocean path.
 - [ ] Bound breeding and scheduled-block work per tick and move expensive
   preparation off the tick owner. No single animal or block batch may stall
   packet processing.

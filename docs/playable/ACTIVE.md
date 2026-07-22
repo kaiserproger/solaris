@@ -773,6 +773,19 @@ hardening. An already-open lower-priority diff does not override this order.
   chickens, and session tests prove every-tick publication for bounded natural
   passive and hostile movement. This closes basic natural spawn, publication,
   and one-block stepping; longer visual movement quality remains open.
+- The representative player water path is client-verified. The retained O3
+  26.1.2 run proves ascent, diving, a `3.43`-block swimming pass, air depletion,
+  `20 -> 18` drowning damage, and connection continuity. The missing aquatic
+  client path was command spawning: `/summon` left water mobs in `Idle` even
+  though natural spawns already received `AquaticWander`. Command-spawned water
+  mobs now share one class-wide three-dimensional default goal with natural
+  aquatic spawns and start off-ground; exact policy tests cover every supported
+  aquatic and amphibious class, including hostile members. A corrected
+  representative debug client gate summoned one previously absent tropical
+  fish into an inspected deep source-water column, consumed eight pushed motion events,
+  measured `0.36` blocks of horizontal travel, and observed it remain underwater
+  at `y=62.50..62.57`; the client stayed connected. The fixture also exposed a
+  separate scheduled-fluid backlog, recorded in the owner performance queue.
 
 ## Manual And Agent Gates
 

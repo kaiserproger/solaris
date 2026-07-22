@@ -6,6 +6,7 @@ use crate::play::is_hostile_entity;
 use crate::play::simulation::SimulationAuthority;
 use crate::play::spawn::chunk_pos_from_coords;
 
+use super::entity_goal_defaults::apply_default_mob_goal;
 #[cfg(test)]
 use super::interaction_geometry::distance_sq;
 use super::interaction_geometry::entity_aabb;
@@ -121,6 +122,7 @@ pub(super) fn spawn_command_entity_locked(
     let hostile = is_hostile_entity(&entity_type_name);
     let mut entity = SpawnEntity::new(entity_type_id, entity_type_name, position);
     apply_entity_facts(&mut entity);
+    apply_default_mob_goal(&mut entity, hostile);
     entity.retained.spawn_tick = inner.entity_lifecycle_tick;
     let aabb = entity_aabb(&entity.type_name);
     let id = inner.entities.spawn(entity);

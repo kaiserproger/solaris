@@ -2,16 +2,16 @@ use std::ops::Deref;
 #[cfg(test)]
 use std::sync::mpsc::{Receiver, SyncSender};
 
-use mc_entity::{AttributeKind, EntitySnapshot, GoalState, SpawnEntity, Vec3};
+use mc_entity::{EntitySnapshot, SpawnEntity, Vec3};
 use tracing::debug;
 
 use crate::play::simulation::SimulationAuthority;
 use crate::play::{
-    HOSTILE_WANDER_SPEED, HerdSpawn, MAX_HOSTILE_SPAWNS_PER_CHUNK, MAX_PASSIVE_SPAWNS_PER_CHUNK,
-    MIN_ENTITY_SPAWN_DISTANCE_FROM_PLAYER, PASSIVE_WANDER_SPEED, herd_uuid, is_hostile_entity,
-    world_time_is_night,
+    HerdSpawn, MAX_HOSTILE_SPAWNS_PER_CHUNK, MAX_PASSIVE_SPAWNS_PER_CHUNK,
+    MIN_ENTITY_SPAWN_DISTANCE_FROM_PLAYER, herd_uuid, is_hostile_entity, world_time_is_night,
 };
 
+use super::entity_goal_defaults::apply_default_mob_goal;
 use super::entity_lifecycle::track_entity_chunk_locked;
 use super::entity_owner::owner_result;
 use super::entity_physics_class::entity_type_uses_aquatic_physics;
@@ -343,14 +343,6 @@ impl SessionRegistry {
     }
 }
 
-pub(in crate::play::session) fn passive_ground_wander_speed(entity: &SpawnEntity) -> f64 {
-    entity
-        .attributes
-        .base(&AttributeKind::MovementSpeed)
-        .unwrap_or(0.2)
-        * 10.0
-}
-
 fn session_player_positions(inner: &SessionRegistryInner) -> Vec<Vec3> {
     inner
         .sessions
@@ -468,25 +460,7 @@ fn build_herd_spawn_candidates(
             debug_assert_eq!(entity.type_name, "minecraft:sheep");
             entity.animal = Some(mc_entity::AnimalBreedingState::adult_sheep(color));
         }
-        let ground_wander_speed = passive_ground_wander_speed(&entity);
-        entity.goal = if spawn.hostile {
-            GoalState::Wander {
-                speed: HOSTILE_WANDER_SPEED,
-                period_ticks: 20,
-            }
-        } else if entity_type_uses_aquatic_physics(&entity.type_name) {
-            entity.on_ground = false;
-            GoalState::AquaticWander {
-                speed: PASSIVE_WANDER_SPEED * 0.9,
-                vertical_speed: 0.18,
-                period_ticks: 45,
-            }
-        } else {
-            GoalState::Wander {
-                speed: ground_wander_speed,
-                period_ticks: 80,
-            }
-        };
+        apply_default_mob_goal(&mut entity, spawn.hostile);
         entities.push(entity);
         if spawn.hostile {
             hostile_count += 1;

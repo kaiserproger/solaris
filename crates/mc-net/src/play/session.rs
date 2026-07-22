@@ -23,6 +23,7 @@ mod combat_load_tests;
 mod container_state;
 mod container_views;
 mod entity_combat;
+mod entity_goal_defaults;
 mod entity_lifecycle;
 mod entity_owner;
 mod entity_physics_class;
@@ -105,6 +106,7 @@ use container_state::{
     ContainerCommitProbe, ServerContainerDispatchProbe, ServerFurnaceCommitProbe,
 };
 pub(super) use entity_combat::ServerEntityPlayerAttack;
+use entity_goal_defaults::passive_ground_wander_speed;
 use entity_lifecycle::remove_server_entity_locked;
 #[cfg(test)]
 use entity_lifecycle::{
@@ -122,9 +124,7 @@ use herd_spawn_authority::{
     ChunkHerdClaimProbe, VANILLA_CREATURE_MOB_CAP, VANILLA_HOSTILE_MOB_CAP,
     install_committed_herd_spawns_locked,
 };
-use herd_spawn_authority::{
-    ClaimedPendingHostiles, claim_loaded_pending_hostiles_locked, passive_ground_wander_speed,
-};
+use herd_spawn_authority::{ClaimedPendingHostiles, claim_loaded_pending_hostiles_locked};
 use hostile_authority::update_hostile_targets;
 #[cfg(test)]
 use hostile_authority::{

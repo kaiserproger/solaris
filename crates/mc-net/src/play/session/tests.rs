@@ -3195,28 +3195,68 @@ fn fish_physics_queries_use_aquatic_water_rules() {
         Vec3::new(4.5, 62.0, 0.5),
     );
 
-    let queries = registry.tick_entities_and_collect_physics_queries(1);
+    {
+        let entities = registry.lock_entities("inspect command-spawned fish goal");
+        let fish = entities.snapshots().next().expect("spawned fish");
+        assert_eq!(
+            fish.goal,
+            GoalState::AquaticWander {
+                speed: PASSIVE_WANDER_SPEED * 0.9,
+                vertical_speed: 0.18,
+                period_ticks: 45,
+            }
+        );
+        assert!(!fish.on_ground);
+    }
+
+    let queries = registry.tick_entities_and_collect_physics_queries(45);
 
     assert_eq!(queries.len(), 1);
     assert_eq!(queries[0].kind, EntityPhysicsKind::AquaticLiving);
+    assert!(queries[0].velocity.horizontal_len() > 0.0);
+    assert!(queries[0].velocity.y.abs() > 0.0);
+    assert!(!queries[0].on_ground);
 }
 
 #[test]
 fn all_living_aquatic_and_amphibious_classes_use_aquatic_water_rules() {
     for type_name in [
-        "minecraft:guardian",
-        "minecraft:elder_guardian",
-        "minecraft:tadpole",
-        "minecraft:nautilus",
-        "minecraft:zombie_nautilus",
         "minecraft:axolotl",
+        "minecraft:cod",
+        "minecraft:dolphin",
+        "minecraft:drowned",
+        "minecraft:elder_guardian",
         "minecraft:frog",
+        "minecraft:glow_squid",
+        "minecraft:guardian",
+        "minecraft:nautilus",
+        "minecraft:pufferfish",
+        "minecraft:salmon",
+        "minecraft:squid",
+        "minecraft:tadpole",
+        "minecraft:tropical_fish",
         "minecraft:turtle",
+        "minecraft:zombie_nautilus",
     ] {
         assert!(
             super::entity_physics_class::entity_type_uses_aquatic_physics(type_name),
             "{type_name}"
         );
+        let mut entity = SpawnEntity::new(1, type_name, Vec3::ZERO);
+        super::entity_goal_defaults::apply_default_mob_goal(
+            &mut entity,
+            is_hostile_entity(type_name),
+        );
+        assert_eq!(
+            entity.goal,
+            GoalState::AquaticWander {
+                speed: PASSIVE_WANDER_SPEED * 0.9,
+                vertical_speed: 0.18,
+                period_ticks: 45,
+            },
+            "{type_name}"
+        );
+        assert!(!entity.on_ground, "{type_name}");
     }
     assert!(!super::entity_physics_class::entity_type_uses_aquatic_physics("minecraft:zombie"));
 }
