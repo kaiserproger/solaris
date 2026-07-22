@@ -442,11 +442,15 @@ cache. A warm read sends one non-blocking request to every selected lane
 without entering the actor. Every route carries the exact entity UUID and
 region lease; stale or missing routes fall back through the coordinator and
 refresh. A cold point read publishes the route for its next caller. Lanes reject
-selected reads while a phase is pending or committed but not finalized. The
-actor and direct lanes share an active-writer count and state version, and a
-direct multi-lane result is accepted only if no writer overlaps the whole
-fanout and the version remains unchanged. This prevents one result from
-combining pre-commit state from one lane with post-commit state from another. Direct fanout is limited to 16
+selected reads while a phase is pending or committed but not finalized. Each
+owner lane publishes its own monotonic state version. Ordinary point and
+ID-filtered reads capture the versions of only the lanes they touch and accept
+the fanout only when those versions remain unchanged. A writer in another lane
+therefore cannot force an unrelated read back through the coordinator. This
+still prevents one result from combining pre-commit state from one lane with
+post-commit state from another. Versioned reads used by referenced multi-entity
+goal validation retain the global active-writer and state-version fence because
+their contract spans every referenced entity. Direct fanout is limited to 16
 concurrent batches, leaving at least 48 slots in each 64-message owner queue for
 prepare/commit/finalize traffic. Reconfiguration clears cached lane senders,
 and a region crossing invalidates routes before the mutation reply. This
@@ -462,10 +466,10 @@ clear, and shutdown take the exclusive side of the mutation gate. Global index
 changes, cross-region commands, and cache misses remain coordinator-owned.
 Coordinator snapshot, selected-snapshot, breeding, and goal-prepare reads also
 take that exclusive side, so they cannot publish direct lane state
-before journal durability or after a safe rollback. Cached direct reads remain
-lock-free with respect to distinct lane commits, but accept a result only after
-an acquire load observes zero active writers followed by an unchanged state
-version.
+before journal durability or after a safe rollback. Cached ordinary reads are
+lock-free with respect to distinct lane commits and validate only their touched
+lane versions. Cross-lane/versioned transactions retain the global fence until
+their authority contract moves to a version vector.
 The direct helper validates every `(id, UUID, lease)` under the read side of the
 mutation gate before releasing the route cache, rejects duplicate IDs, reserves
 one sequence per mutation, and journals the complete post-state set as one

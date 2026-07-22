@@ -1450,7 +1450,19 @@ impl RegionalOwnerHandle {
         &self,
         entities: &HashSet<EntityId>,
     ) -> Result<Vec<EntitySnapshot>, RegionOwnerLaneError> {
-        self.snapshots_for_ids_versioned(entities)
+        if let Some(snapshots) = self.read_cached_selected_entities(entities) {
+            return Ok(snapshots);
+        }
+        let (reply, result) = channel();
+        self.sender
+            .send(RegionalOwnerCommand::SnapshotsForIds {
+                entities: entities.clone(),
+                reply,
+            })
+            .map_err(|_| RegionOwnerLaneError::Closed)?;
+        result
+            .recv()
+            .map_err(|_| RegionOwnerLaneError::Closed)?
             .map(VersionedEntitySnapshots::into_snapshots)
     }
 
@@ -1475,14 +1487,6 @@ impl RegionalOwnerHandle {
         result.recv().map_err(|_| RegionOwnerLaneError::Closed)?
     }
 
-    fn read_cached_selected_entities(
-        &self,
-        entities: &HashSet<EntityId>,
-    ) -> Option<Vec<EntitySnapshot>> {
-        self.read_cached_selected_entities_versioned(entities)
-            .map(|(_, snapshots)| snapshots)
-    }
-
     fn read_cached_selected_entities_versioned(
         &self,
         entities: &HashSet<EntityId>,
@@ -1492,6 +1496,24 @@ impl RegionalOwnerHandle {
         if self.active_entity_writers.load(Ordering::Acquire) != 0 {
             return None;
         }
+        let snapshots = self.read_cached_selected_entities(entities)?;
+        if self.active_entity_writers.load(Ordering::Acquire) != 0 {
+            return None;
+        }
+        let version_after = self.entity_state_version.load(Ordering::Acquire);
+        if version_after != version_before {
+            #[cfg(test)]
+            self.notify_referenced_goal_fallback_probe();
+            return None;
+        }
+        Some((version_after, snapshots))
+    }
+
+    fn read_cached_selected_entities(
+        &self,
+        entities: &HashSet<EntityId>,
+    ) -> Option<Vec<EntitySnapshot>> {
+        self.commit_state.ensure_committed_state().ok()?;
         let _admission =
             DirectSelectedReadPermit::try_acquire(Arc::clone(&self.direct_selected_reads))?;
         let routes = self
@@ -1515,8 +1537,11 @@ impl RegionalOwnerHandle {
         drop(routes);
 
         let mut pending = Vec::with_capacity(requests.len());
+        let mut lane_versions = Vec::with_capacity(requests.len());
         for (_, (owner, entities)) in requests {
+            let version = owner.state_version();
             pending.push(owner.request_snapshots_for_ids(entities).ok()?);
+            lane_versions.push((owner, version));
         }
         #[cfg(test)]
         if let Some(probe) = self
@@ -1546,17 +1571,16 @@ impl RegionalOwnerHandle {
                 return None;
             }
         }
-        if self.active_entity_writers.load(Ordering::Acquire) != 0 {
-            return None;
-        }
-        let version_after = self.entity_state_version.load(Ordering::Acquire);
-        if version_after != version_before {
+        if lane_versions
+            .iter()
+            .any(|(owner, version)| owner.state_version() != *version)
+        {
             #[cfg(test)]
             self.notify_referenced_goal_fallback_probe();
             return None;
         }
         self.commit_state.ensure_committed_state().ok()?;
-        Some((version_after, snapshots))
+        Some(snapshots)
     }
 
     #[cfg(test)]
@@ -12551,6 +12575,75 @@ mod tests {
         assert!(super::DirectSelectedReadPermit::try_acquire(Arc::clone(&active)).is_none());
         permits.pop();
         assert!(super::DirectSelectedReadPermit::try_acquire(active).is_some());
+    }
+
+    #[test]
+    fn cached_read_ignores_unrelated_regional_writer() {
+        let runtime = super::RegionalOwnerRuntime::from_store(RegionalEntityStore::new(), 2)
+            .expect("owner runtime");
+        let handle = runtime.handle();
+        let west = handle
+            .spawn(cow(Vec3::new(0.5, 64.0, 0.5)))
+            .expect("west cow");
+        let east = handle
+            .spawn(cow(Vec3::new(128.5, 64.0, 0.5)))
+            .expect("east cow");
+        let west_snapshot = handle
+            .snapshot(west)
+            .expect("warm west route")
+            .expect("west snapshot");
+        handle
+            .snapshot(east)
+            .expect("warm east route")
+            .expect("east snapshot");
+
+        let (coordinator_entered, coordinator_entered_rx) = mpsc::channel();
+        let (coordinator_release, coordinator_release_rx) = mpsc::channel();
+        handle
+            .hold_coordinator_for_test(coordinator_entered, coordinator_release_rx)
+            .expect("queue coordinator hold");
+        coordinator_entered_rx
+            .recv()
+            .expect("coordinator entered hold");
+
+        let (read_entered, read_entered_rx) = mpsc::channel();
+        let (read_release, read_release_rx) = mpsc::channel();
+        handle.pause_selected_read_after_dispatch_for_test(read_entered, read_release_rx);
+        let read_handle = handle.clone();
+        let (read_complete, read_complete_rx) = mpsc::channel();
+        let reader = std::thread::spawn(move || {
+            read_complete
+                .send(read_handle.snapshot(east))
+                .expect("publish cached read");
+        });
+        read_entered_rx
+            .recv()
+            .expect("east read dispatched to its owner lane");
+
+        assert!(
+            handle
+                .apply_kinematics_if_current([(
+                    west_snapshot,
+                    movement(west, Vec3::new(1.0, 64.0, 0.5)),
+                )])
+                .expect("west mutation")
+        );
+        read_release.send(()).expect("release east read");
+        let direct = read_complete_rx.recv_timeout(Duration::from_secs(1));
+        coordinator_release.send(()).expect("release coordinator");
+        reader.join().expect("join cached reader");
+
+        assert_eq!(
+            direct
+                .expect("unrelated writer must not force coordinator fallback")
+                .expect("cached point read")
+                .expect("east snapshot")
+                .id,
+            east
+        );
+
+        drop(handle);
+        runtime.shutdown().expect("runtime shutdown");
     }
 
     #[test]

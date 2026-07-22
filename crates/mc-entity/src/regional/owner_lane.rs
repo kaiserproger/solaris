@@ -1,5 +1,4 @@
 use std::collections::{BTreeMap, HashMap, HashSet};
-#[cfg(test)]
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::mpsc::{Receiver, SyncSender, TrySendError, channel, sync_channel};
 use std::sync::{Arc, Mutex};
@@ -282,6 +281,7 @@ struct CommittedRegionOwnerBatch {
 pub struct RegionalOwnerLane {
     sender: SyncSender<RegionOwnerLaneMessage>,
     admission: Arc<Mutex<()>>,
+    state_version: Arc<AtomicU64>,
     worker: Option<JoinHandle<()>>,
     #[cfg(test)]
     prepare_requests: std::sync::Arc<AtomicU64>,
@@ -295,11 +295,16 @@ pub struct RegionalOwnerLane {
 pub(super) struct RegionalOwnerLaneReader {
     sender: SyncSender<RegionOwnerLaneMessage>,
     admission: Arc<Mutex<()>>,
+    state_version: Arc<AtomicU64>,
 }
 
 impl RegionalOwnerLaneReader {
     pub(super) fn admission(&self) -> &Mutex<()> {
         &self.admission
+    }
+
+    pub(super) fn state_version(&self) -> u64 {
+        self.state_version.load(Ordering::Acquire)
     }
 
     pub(super) fn prepare_and_commit(
@@ -451,6 +456,8 @@ impl RegionalOwnerLane {
         }
         let (sender, receiver) = sync_channel(Self::QUEUE_CAPACITY);
         let admission = Arc::new(Mutex::new(()));
+        let state_version = Arc::new(AtomicU64::new(0));
+        let worker_state_version = Arc::clone(&state_version);
         #[cfg(test)]
         let prepare_requests = std::sync::Arc::new(AtomicU64::new(0));
         #[cfg(test)]
@@ -467,7 +474,14 @@ impl RegionalOwnerLane {
                     .unwrap_or_else(|poisoned| poisoned.into_inner())
                     .take()
                     .expect("owner lane startup handoff remains available");
-                run_region_owner_lane(lane, owned, last_phase.0, last_sequence, receiver);
+                run_region_owner_lane(
+                    lane,
+                    owned,
+                    last_phase.0,
+                    last_sequence,
+                    receiver,
+                    worker_state_version,
+                );
             }) {
             Ok(worker) => worker,
             Err(_) => {
@@ -485,6 +499,7 @@ impl RegionalOwnerLane {
         Ok(Self {
             sender,
             admission,
+            state_version,
             worker: Some(worker),
             #[cfg(test)]
             prepare_requests,
@@ -550,6 +565,7 @@ impl RegionalOwnerLane {
         RegionalOwnerLaneReader {
             sender: self.sender.clone(),
             admission: Arc::clone(&self.admission),
+            state_version: Arc::clone(&self.state_version),
         }
     }
 
@@ -796,6 +812,7 @@ fn run_region_owner_lane(
     mut last_phase: u64,
     mut last_sequence: u64,
     receiver: Receiver<RegionOwnerLaneMessage>,
+    state_version: Arc<AtomicU64>,
 ) {
     let mut pending = None;
     let mut committed = None;
@@ -821,6 +838,9 @@ fn run_region_owner_lane(
                         }
                     }
                 };
+                if result.is_ok() {
+                    state_version.fetch_add(1, Ordering::Release);
+                }
                 let _ = reply.send(result);
             }
             RegionOwnerLaneMessage::DetachRegion { lease, reply } => {
@@ -838,6 +858,9 @@ fn run_region_owner_lane(
                         .remove(&lease.key)
                         .ok_or(RegionOwnerLaneError::UnknownRegion)
                 };
+                if result.is_ok() {
+                    state_version.fetch_add(1, Ordering::Release);
+                }
                 let _ = reply.send(result);
             }
             RegionOwnerLaneMessage::Prepare { batch, reply } => {
@@ -852,6 +875,9 @@ fn run_region_owner_lane(
                             phase
                         })
                 };
+                if result.is_ok() {
+                    state_version.fetch_add(1, Ordering::Release);
+                }
                 let _ = reply.send(result);
             }
             RegionOwnerLaneMessage::PrepareAndCommit { batch, reply } => {
@@ -870,6 +896,9 @@ fn run_region_owner_lane(
                             )
                         })
                 };
+                if result.is_ok() {
+                    state_version.fetch_add(1, Ordering::Release);
+                }
                 let _ = reply.send(result);
             }
             RegionOwnerLaneMessage::Commit { phase, reply } => {
@@ -889,6 +918,9 @@ fn run_region_owner_lane(
                     }
                     None => Err(RegionOwnerLaneError::StalePhase),
                 };
+                if result.is_ok() {
+                    state_version.fetch_add(1, Ordering::Release);
+                }
                 let _ = reply.send(result);
             }
             RegionOwnerLaneMessage::Finalize { phase, reply } => {
@@ -903,6 +935,9 @@ fn run_region_owner_lane(
                     }
                     None => Err(RegionOwnerLaneError::StalePhase),
                 };
+                if result.is_ok() {
+                    state_version.fetch_add(1, Ordering::Release);
+                }
                 let _ = reply.send(result);
             }
             RegionOwnerLaneMessage::Rollback { phase, reply } => {
@@ -916,6 +951,9 @@ fn run_region_owner_lane(
                     }
                     None => Err(RegionOwnerLaneError::StalePhase),
                 };
+                if result.is_ok() {
+                    state_version.fetch_add(1, Ordering::Release);
+                }
                 let _ = reply.send(result);
             }
             RegionOwnerLaneMessage::Abort { phase, reply } => {

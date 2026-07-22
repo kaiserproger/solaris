@@ -33,6 +33,11 @@ Current runtime facts:
   visibility recheck at publication. Visibility indexes and outbound session
   queues remain centralized, so do not describe publication as lock-free or
   fully regional; ADR 0005 records the remaining boundary.
+- Warm ordinary entity reads validate monotonic versions on only the owner
+  lanes they touch, so an unrelated regional writer no longer forces them
+  through the coordinator. Versioned referenced-goal reads still use the
+  global fence until that API carries a per-lane version vector; ADR 0005 owns
+  the distinction.
 - Physics owner CAS returns its committed kinematics batch directly. The
   network adapter must not restore the removed immediate owner reread; it keeps
   one current-state read at the publication boundary.
