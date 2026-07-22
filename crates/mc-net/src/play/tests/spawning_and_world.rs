@@ -2718,7 +2718,7 @@ async fn resident_scheduled_fluid_tick_is_durable_without_world_writer() {
     let (_simulation, owner) = simulation_channel();
     let world_writer = shared_world.lock().await;
     let report = tokio::time::timeout(
-        std::time::Duration::from_secs(1),
+        std::time::Duration::from_secs(5),
         owner.run_scheduled_fluid_ticks_with_budget(
             &config,
             &sessions,

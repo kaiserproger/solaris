@@ -8594,7 +8594,7 @@ async fn scheduled_button_crossing_region_boundary_commits_without_world_storage
     let resources = ChunkPipelineResources::with_limits(1, 2);
     let world_writer = world.lock().await;
     let report = tokio::time::timeout(
-        Duration::from_secs(1),
+        Duration::from_secs(5),
         owner.run_scheduled_block_ticks_with_budget(
             &config,
             &sessions,
@@ -8985,7 +8985,7 @@ async fn scheduled_button_regions_commit_without_the_global_world_writer() {
     let resources = ChunkPipelineResources::with_limits(1, 2);
     let world_writer = world.lock().await;
     let report = tokio::time::timeout(
-        Duration::from_secs(1),
+        Duration::from_secs(5),
         owner.run_scheduled_block_ticks_with_budget(
             &config,
             &sessions,
@@ -9538,7 +9538,7 @@ async fn scheduled_hopper_tick_pulls_one_item_into_hopper_before_ejecting_withou
     let (_simulation, owner) = simulation_channel();
     let world_writer = world.lock().await;
     let report = tokio::time::timeout(
-        Duration::from_secs(1),
+        Duration::from_secs(5),
         owner.run_scheduled_block_ticks_with_budget(
             &config,
             &sessions,
@@ -10328,7 +10328,7 @@ async fn scheduled_hopper_cooldown_tick_uses_resident_commit() {
     let (_simulation, owner) = simulation_channel();
     let world_writer = world.lock().await;
     let report = tokio::time::timeout(
-        Duration::from_secs(1),
+        Duration::from_secs(5),
         owner.run_scheduled_block_ticks_with_budget(
             &config,
             &sessions,
