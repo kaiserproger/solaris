@@ -133,7 +133,8 @@ pub(super) use interaction_geometry::{
     entity_aabb, entity_is_near_player_chunk, within_entity_reach,
 };
 use movement_publication::{
-    MovementRecipientIndex, PublishedEntityVisibility, build_movement_recipient_index,
+    MovementRecipientIndex, PublishedCombatTarget, PublishedEntityVisibility,
+    SessionPublicationEpoch, build_movement_recipient_index,
 };
 pub(crate) use outbound::{EntityDispatchCounters, SessionPressureSnapshot};
 #[cfg(test)]
@@ -319,6 +320,7 @@ struct PlaySession {
     loaded: HashSet<(i32, i32)>,
     visible_players: HashSet<SessionId>,
     visible_entities: PublishedEntityVisibility,
+    combat_target: PublishedCombatTarget,
     tx: mpsc::Sender<OutboundCommand>,
     pressure: Arc<OutboundPressureMetrics>,
     ordered_dispatch: Arc<OrderedDispatchState>,
@@ -369,6 +371,16 @@ struct SessionRegistryInner {
     arrow_kill_rewards: ArrowKillRewards,
     player_combat: PlayerCombatResources,
     script_commit_events: Option<tokio::sync::mpsc::UnboundedSender<ScriptEvent>>,
+}
+
+impl SessionRegistryInner {
+    fn publish_combat_target(&mut self, id: SessionId) {
+        let targetable =
+            !self.dead_sessions.contains(&id) && !self.spectator_sessions.contains(&id);
+        if let Some(session) = self.sessions.get(&id) {
+            session.combat_target.publish(session.pose, targetable);
+        }
+    }
 }
 
 #[derive(Debug, Default)]
@@ -501,6 +513,8 @@ pub(crate) struct SessionRegistry {
     hostile_commit_probe: Mutex<Option<HostileCommitProbe>>,
     #[cfg(test)]
     hostile_publication_probe: Mutex<Option<HostileCommitProbe>>,
+    #[cfg(test)]
+    hostile_target_snapshot_probe: Mutex<Option<HostileCommitProbe>>,
     #[cfg(test)]
     player_push_commit_probe: Mutex<Option<PlayerPushCommitProbe>>,
     #[cfg(test)]
@@ -786,6 +800,8 @@ impl SessionRegistry {
             hostile_commit_probe: Mutex::new(None),
             #[cfg(test)]
             hostile_publication_probe: Mutex::new(None),
+            #[cfg(test)]
+            hostile_target_snapshot_probe: Mutex::new(None),
             #[cfg(test)]
             player_push_commit_probe: Mutex::new(None),
             #[cfg(test)]

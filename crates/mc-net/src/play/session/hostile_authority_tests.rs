@@ -37,6 +37,21 @@ fn due_melee_tick(registry: &SessionRegistry) -> u64 {
     }
 }
 
+fn install_hostile_target_snapshot_probe(
+    registry: &SessionRegistry,
+) -> (std::sync::mpsc::Receiver<()>, std::sync::mpsc::Sender<()>) {
+    let (reached_tx, reached_rx) = std::sync::mpsc::channel();
+    let (resume_tx, resume_rx) = std::sync::mpsc::channel();
+    *registry
+        .hostile_target_snapshot_probe
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(HostileCommitProbe {
+        reached: reached_tx,
+        resume: resume_rx,
+    });
+    (reached_rx, resume_tx)
+}
+
 #[test]
 fn hostiles_ignore_dead_players() {
     let registry = SessionRegistry::new();
@@ -160,15 +175,7 @@ fn death_between_melee_plan_and_commit_cancels_damage_and_swing() {
         Vec3::new(0.5, 64.0, 1.5),
     );
     let due_tick = due_melee_tick(&registry);
-    let (reached_tx, reached_rx) = std::sync::mpsc::channel();
-    let (resume_tx, resume_rx) = std::sync::mpsc::channel();
-    *registry
-        .hostile_commit_probe
-        .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(HostileCommitProbe {
-        reached: reached_tx,
-        resume: resume_rx,
-    });
+    let (reached_rx, resume_tx) = install_hostile_target_snapshot_probe(&registry);
     let attack_registry = Arc::clone(&registry);
     let attack = std::thread::spawn(move || {
         attack_registry.tick_hostile_attacks(
@@ -183,6 +190,109 @@ fn death_between_melee_plan_and_commit_cancels_damage_and_swing() {
 
     registry.mark_player_dead_for_test(player);
     resume_tx.send(()).expect("release hostile commit");
+    let (attacks, dispatches) = attack.join().expect("hostile attack worker");
+
+    assert_eq!(attacks, 0);
+    assert!(dispatches.is_empty());
+}
+
+#[test]
+fn movement_out_of_range_between_melee_plan_and_commit_cancels_attack() {
+    let registry = Arc::new(SessionRegistry::new());
+    let player = register_test_session(&registry, "EscapingTarget");
+    assert!(registry.mark_loaded(player, (0, 0)).is_empty());
+    registry.spawn_command_entity(
+        &SimulationAuthority::for_test(),
+        54,
+        "minecraft:zombie".to_owned(),
+        Vec3::new(0.5, 64.0, 1.5),
+    );
+    let due_tick = due_melee_tick(&registry);
+    let (reached_rx, resume_tx) = install_hostile_target_snapshot_probe(&registry);
+    let attack_registry = Arc::clone(&registry);
+    let attack = std::thread::spawn(move || {
+        attack_registry.tick_hostile_attacks(
+            &SimulationAuthority::for_test(),
+            due_tick,
+            BlockStateId(0),
+        )
+    });
+    reached_rx
+        .recv_timeout(Duration::from_secs(5))
+        .expect("melee attack reaches commit fence");
+
+    registry.update_pose(player, PlayerPose::new(100.0, 64.0, 100.0));
+    resume_tx.send(()).expect("release hostile commit");
+    let (attacks, dispatches) = attack.join().expect("hostile attack worker");
+
+    assert_eq!(attacks, 0);
+    assert!(dispatches.is_empty());
+}
+
+#[test]
+fn spectator_transition_after_target_snapshot_cancels_melee_attack() {
+    let registry = Arc::new(SessionRegistry::new());
+    let player = register_test_session(&registry, "SpectatorFenceTarget");
+    assert!(registry.mark_loaded(player, (0, 0)).is_empty());
+    registry.spawn_command_entity(
+        &SimulationAuthority::for_test(),
+        54,
+        "minecraft:zombie".to_owned(),
+        Vec3::new(0.5, 64.0, 1.5),
+    );
+    let due_tick = due_melee_tick(&registry);
+    let (reached_rx, resume_tx) = install_hostile_target_snapshot_probe(&registry);
+    let attack_registry = Arc::clone(&registry);
+    let attack = std::thread::spawn(move || {
+        attack_registry.tick_hostile_attacks(
+            &SimulationAuthority::for_test(),
+            due_tick,
+            BlockStateId(0),
+        )
+    });
+    reached_rx
+        .recv_timeout(Duration::from_secs(5))
+        .expect("melee admission snapshots target state");
+
+    {
+        let mut inner = registry.lock_inner("mark spectator during melee admission");
+        inner.spectator_sessions.insert(player);
+        inner.publish_combat_target(player);
+    }
+    resume_tx.send(()).expect("release hostile target fence");
+    let (attacks, dispatches) = attack.join().expect("hostile attack worker");
+
+    assert_eq!(attacks, 0);
+    assert!(dispatches.is_empty());
+}
+
+#[test]
+fn unregister_after_target_snapshot_cancels_damage_and_swing() {
+    let registry = Arc::new(SessionRegistry::new());
+    let player = register_test_session(&registry, "DisconnectingTarget");
+    assert!(registry.mark_loaded(player, (0, 0)).is_empty());
+    registry.spawn_command_entity(
+        &SimulationAuthority::for_test(),
+        54,
+        "minecraft:zombie".to_owned(),
+        Vec3::new(0.5, 64.0, 1.5),
+    );
+    let due_tick = due_melee_tick(&registry);
+    let (reached_rx, resume_tx) = install_hostile_target_snapshot_probe(&registry);
+    let attack_registry = Arc::clone(&registry);
+    let attack = std::thread::spawn(move || {
+        attack_registry.tick_hostile_attacks(
+            &SimulationAuthority::for_test(),
+            due_tick,
+            BlockStateId(0),
+        )
+    });
+    reached_rx
+        .recv_timeout(Duration::from_secs(5))
+        .expect("melee admission snapshots target state");
+
+    registry.unregister(player);
+    resume_tx.send(()).expect("release hostile target fence");
     let (attacks, dispatches) = attack.join().expect("hostile attack worker");
 
     assert_eq!(attacks, 0);
@@ -244,7 +354,7 @@ fn attacker_death_between_melee_plan_and_commit_cancels_damage_and_swing() {
 }
 
 #[test]
-fn hostile_owner_validation_releases_session_registry_before_publication() {
+fn hostile_melee_publication_finishes_while_session_registry_is_held_elsewhere() {
     let registry = Arc::new(SessionRegistry::new());
     let player = register_test_session(&registry, "DetachedHostilePublication");
     assert!(registry.mark_loaded(player, (0, 0)).is_empty());
@@ -265,25 +375,29 @@ fn hostile_owner_validation_releases_session_registry_before_publication() {
         resume: resume_rx,
     });
     let attack_registry = Arc::clone(&registry);
+    let (finished_tx, finished_rx) = std::sync::mpsc::channel();
     let attack = std::thread::spawn(move || {
-        attack_registry.tick_hostile_attacks(
+        let result = attack_registry.tick_hostile_attacks(
             &SimulationAuthority::for_test(),
             due_tick,
             BlockStateId(0),
-        )
+        );
+        finished_tx
+            .send(result)
+            .expect("hostile completion receiver remains");
     });
     reached_rx
         .recv_timeout(Duration::from_secs(5))
         .expect("hostile owner validation reaches publication boundary");
 
-    let session_available = registry.inner.try_lock().is_ok();
+    let session_guard = registry.inner.lock().expect("session registry poisoned");
     resume_tx.send(()).expect("release hostile publication");
-    let (attacks, _) = attack.join().expect("hostile attack worker");
+    let (attacks, _) = finished_rx
+        .recv_timeout(Duration::from_secs(1))
+        .expect("hostile publication must not wait for the session registry");
+    drop(session_guard);
+    attack.join().expect("hostile attack worker");
 
-    assert!(
-        session_available,
-        "regional owner validation must not retain the session registry"
-    );
     assert_eq!(attacks, 1);
 }
 

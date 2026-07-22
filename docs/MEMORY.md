@@ -80,9 +80,13 @@ and is not startup context.
 - Hostile attack planning no longer holds `SessionRegistry.inner` across
   regional entity-owner requests. It copies live target pose/visibility, runs
   creeper fuse CAS, skeleton arrow spawn, and melee attacker validation through
-  regional owners, then takes a short session-only melee publication lock with
-  a final target recheck. Focused races cover attacker/target death and the
-  owner-to-publication lock boundary; manual feel remains pending.
+  regional owners. Final melee admission uses per-session immutable
+  combat-target/visibility snapshots and accepts an ordered reservation only if
+  their shared odd/even publication epoch stays unchanged. Disconnect publishes
+  non-targetable before queue close. Final melee does not reacquire the global
+  session registry. Focused races cover attacker/target death, movement,
+  Spectator, unregister, and completion while that registry is held elsewhere;
+  manual feel remains pending.
 - The exact dense 5,132-cow O3 gate is closed. The final reproduced cause was
   an unanswered keepalive challenge while valid movement packets still proved
   the client alive. Solaris now preserves one pending challenge, requires both

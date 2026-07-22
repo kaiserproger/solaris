@@ -86,10 +86,15 @@ Current runtime facts:
   releasing the session lock; do not restore per-tick empty-player ECS scans.
 - Hostile attack planning copies live target poses and immutable visibility
   sets, then releases `SessionRegistry.inner`. Creeper fuse CAS, arrow spawn,
-  and batched melee-attacker validation execute on regional owners before a
-  short session-only publication recheck. Never put an owner request back under
-  the session lock. This is an ordered regional boundary, not global lock-free
-  state.
+  and batched melee-attacker validation execute on regional owners. Final melee
+  admission reads the per-session `ArcSwap` combat-target and visibility
+  snapshots and reserves output through the ordered session queue under one
+  shared odd/even publication epoch. Target/visibility mutation opens the epoch
+  before changing state; admission rejects an odd or changed epoch. Disconnect
+  publishes non-targetable before queue close. Final melee does not reacquire
+  the global registry. Never put an owner request or melee publication back
+  under the session lock. This is an ordered regional boundary with lock-free
+  reads, not global lock-free state.
 - Uncontrolled heavy host load invalidates performance attribution. Record the
   build, workload, host contention, p95/p99, and maximum; repeat the same gate
   on a clean host. A contaminated run may retain functional evidence only.

@@ -9,9 +9,9 @@ use super::visibility::{
     visibility_dispatches,
 };
 use super::{
-    DisconnectedPlayerPersistence, PlaySession, PublishedEntityVisibility, SessionAdmissionError,
-    SessionId, SessionRegistration, SessionRegistry, remove_loaded_chunk_reference_locked,
-    remove_ticket,
+    DisconnectedPlayerPersistence, PlaySession, PublishedCombatTarget, PublishedEntityVisibility,
+    SessionAdmissionError, SessionId, SessionPublicationEpoch, SessionRegistration,
+    SessionRegistry, remove_loaded_chunk_reference_locked, remove_ticket,
 };
 #[cfg(test)]
 use crate::login::LoggedInProfile;
@@ -80,6 +80,8 @@ impl SessionRegistry {
             inner.tickets.entry(chunk).or_default().insert(id);
         }
         let pressure = Arc::clone(&self.outbound_pressure);
+        let ordered_dispatch = Arc::new(OrderedDispatchState::default());
+        let publication_epoch = Arc::new(SessionPublicationEpoch::default());
         inner.sessions.insert(
             id,
             PlaySession {
@@ -93,10 +95,11 @@ impl SessionRegistry {
                 desired: registration.desired,
                 loaded: HashSet::new(),
                 visible_players: HashSet::new(),
-                visible_entities: PublishedEntityVisibility::new(),
+                visible_entities: PublishedEntityVisibility::new(Arc::clone(&publication_epoch)),
+                combat_target: PublishedCombatTarget::new(registration.pose, publication_epoch),
                 tx: registration.tx,
                 pressure,
-                ordered_dispatch: Arc::new(OrderedDispatchState::default()),
+                ordered_dispatch,
                 script_transaction_active: Arc::new(Mutex::new(true)),
                 script_operator: registration.script_operator,
                 dimension: registration.dimension.to_owned(),
@@ -252,6 +255,7 @@ impl SessionRegistry {
             let Some(session) = inner.sessions.remove(&id) else {
                 return Vec::new();
             };
+            session.combat_target.close(session.pose);
             let dropped = session.ordered_dispatch.close();
             session.pressure.record_reliable_command_drops(dropped);
             *script_transaction_active = false;

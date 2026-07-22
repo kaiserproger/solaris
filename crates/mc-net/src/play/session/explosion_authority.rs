@@ -139,7 +139,7 @@ impl ExpiredPrimedTnt {
             });
         }
         for observer_id in observer_ids {
-            if let Some(observer) = inner.sessions.get(&observer_id) {
+            if let Some(observer) = inner.sessions.get_mut(&observer_id) {
                 observer.visible_entities.publish();
             }
         }

@@ -1,6 +1,7 @@
 use std::collections::{HashMap, HashSet};
 use std::ops::Deref;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use arc_swap::ArcSwap;
 use mc_entity::EntityId;
@@ -8,32 +9,122 @@ use mc_entity::EntityId;
 use super::outbound::{
     OrderedDispatchState, OutboundCommand, OutboundPressureMetrics, SessionRecipient,
 };
-use super::{PlaySession, SessionId};
+use super::{PlaySession, PlayerPose, SessionId};
+
+#[derive(Debug, Clone, Copy)]
+pub(super) struct PublishedCombatTargetState {
+    pose: PlayerPose,
+    targetable: bool,
+}
+
+#[derive(Debug, Default)]
+pub(super) struct SessionPublicationEpoch {
+    revision: AtomicU64,
+}
+
+impl SessionPublicationEpoch {
+    fn begin_update(&self) {
+        let previous = self.revision.fetch_add(1, Ordering::AcqRel);
+        debug_assert!(previous.is_multiple_of(2));
+    }
+
+    fn finish_update(&self) {
+        let previous = self.revision.fetch_add(1, Ordering::Release);
+        debug_assert!(!previous.is_multiple_of(2));
+    }
+
+    fn load(&self) -> u64 {
+        self.revision.load(Ordering::Acquire)
+    }
+}
+
+impl PublishedCombatTargetState {
+    pub(super) fn pose(self) -> PlayerPose {
+        self.pose
+    }
+
+    pub(super) fn is_targetable(self) -> bool {
+        self.targetable
+    }
+}
+
+#[derive(Debug)]
+pub(super) struct PublishedCombatTarget {
+    published: Arc<ArcSwap<PublishedCombatTargetState>>,
+    epoch: Arc<SessionPublicationEpoch>,
+}
+
+impl PublishedCombatTarget {
+    pub(super) fn new(pose: PlayerPose, epoch: Arc<SessionPublicationEpoch>) -> Self {
+        Self {
+            published: Arc::new(ArcSwap::from_pointee(PublishedCombatTargetState {
+                pose,
+                targetable: true,
+            })),
+            epoch,
+        }
+    }
+
+    pub(super) fn publish(&self, pose: PlayerPose, targetable: bool) {
+        self.epoch.begin_update();
+        self.published
+            .store(Arc::new(PublishedCombatTargetState { pose, targetable }));
+        self.epoch.finish_update();
+    }
+
+    pub(super) fn close(&self, pose: PlayerPose) {
+        self.publish(pose, false);
+    }
+
+    fn publication(&self) -> Arc<ArcSwap<PublishedCombatTargetState>> {
+        Arc::clone(&self.published)
+    }
+
+    fn epoch(&self) -> Arc<SessionPublicationEpoch> {
+        Arc::clone(&self.epoch)
+    }
+}
 
 #[derive(Debug)]
 pub(super) struct PublishedEntityVisibility {
     current: Arc<HashSet<EntityId>>,
     published: Arc<ArcSwap<HashSet<EntityId>>>,
+    epoch: Arc<SessionPublicationEpoch>,
+    updating: bool,
 }
 
 impl PublishedEntityVisibility {
-    pub(super) fn new() -> Self {
+    pub(super) fn new(epoch: Arc<SessionPublicationEpoch>) -> Self {
         let current = Arc::new(HashSet::new());
         Self {
             published: Arc::new(ArcSwap::from(Arc::clone(&current))),
             current,
+            epoch,
+            updating: false,
         }
     }
 
     pub(super) fn insert(&mut self, entity_id: EntityId) -> bool {
+        if self.current.contains(&entity_id) {
+            return false;
+        }
+        self.begin_update();
         Arc::make_mut(&mut self.current).insert(entity_id)
     }
 
     pub(super) fn remove(&mut self, entity_id: &EntityId) -> bool {
+        if !self.current.contains(entity_id) {
+            return false;
+        }
+        self.begin_update();
         Arc::make_mut(&mut self.current).remove(entity_id)
     }
 
     pub(super) fn replace(&mut self, entities: HashSet<EntityId>) {
+        if *self.current == entities {
+            return;
+        }
+        self.begin_update();
         self.current = Arc::new(entities);
     }
 
@@ -41,8 +132,13 @@ impl PublishedEntityVisibility {
         Arc::clone(&self.current)
     }
 
-    pub(super) fn publish(&self) {
+    pub(super) fn publish(&mut self) {
+        if !self.updating {
+            return;
+        }
         self.published.store(Arc::clone(&self.current));
+        self.updating = false;
+        self.epoch.finish_update();
     }
 
     pub(super) fn replace_and_publish(&mut self, entities: HashSet<EntityId>) {
@@ -52,6 +148,13 @@ impl PublishedEntityVisibility {
 
     fn publication(&self) -> Arc<ArcSwap<HashSet<EntityId>>> {
         Arc::clone(&self.published)
+    }
+
+    fn begin_update(&mut self) {
+        if !self.updating {
+            self.epoch.begin_update();
+            self.updating = true;
+        }
     }
 }
 
@@ -70,6 +173,8 @@ pub(super) struct MovementRecipientPublication {
     pressure: Arc<OutboundPressureMetrics>,
     ordered_dispatch: Arc<OrderedDispatchState>,
     visible_entities: Arc<ArcSwap<HashSet<EntityId>>>,
+    combat_target: Arc<ArcSwap<PublishedCombatTargetState>>,
+    publication_epoch: Arc<SessionPublicationEpoch>,
 }
 
 impl MovementRecipientPublication {
@@ -80,6 +185,8 @@ impl MovementRecipientPublication {
             pressure: Arc::clone(&session.pressure),
             ordered_dispatch: Arc::clone(&session.ordered_dispatch),
             visible_entities: session.visible_entities.publication(),
+            combat_target: session.combat_target.publication(),
+            publication_epoch: session.combat_target.epoch(),
         }
     }
 
@@ -98,6 +205,45 @@ impl MovementRecipientPublication {
 
     pub(super) fn visible_entities(&self) -> Arc<HashSet<EntityId>> {
         self.visible_entities.load_full()
+    }
+
+    pub(super) fn combat_target(&self) -> Arc<PublishedCombatTargetState> {
+        self.combat_target.load_full()
+    }
+
+    pub(super) fn reserve_combat_recipient_if(
+        &self,
+        validate: impl FnOnce(PublishedCombatTargetState, &HashSet<EntityId>) -> bool,
+    ) -> Option<(PublishedCombatTargetState, SessionRecipient)> {
+        let before = self.publication_epoch.load();
+        if !before.is_multiple_of(2) {
+            return None;
+        }
+        let target = *self.combat_target();
+        let visible_entities = self.visible_entities();
+        if !validate(target, &visible_entities) {
+            return None;
+        }
+        let recipient = self.recipient();
+        if self.publication_epoch.load() != before {
+            return None;
+        }
+        Some((target, recipient))
+    }
+
+    pub(super) fn reserve_observer_if_visible(
+        &self,
+        entity_id: EntityId,
+    ) -> Option<SessionRecipient> {
+        let before = self.publication_epoch.load();
+        if !before.is_multiple_of(2) || !self.visible_entities().contains(&entity_id) {
+            return None;
+        }
+        let recipient = self.recipient();
+        if self.publication_epoch.load() != before {
+            return None;
+        }
+        Some(recipient)
     }
 
     pub(super) fn is_same_session(&self, other: &Self) -> bool {

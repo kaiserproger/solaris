@@ -75,6 +75,9 @@ impl SessionRegistry {
                 }
             }
         }
+        if matches!(event, PlayerStateEvent::GameMode(_)) {
+            inner.publish_combat_target(id);
+        }
         drop(player_state);
         let transition = (matches!(event, PlayerStateEvent::GameMode(_))
             && staged_spectator_wake.is_none())

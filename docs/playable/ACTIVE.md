@@ -88,13 +88,15 @@ hardening. An already-open lower-priority diff does not override this order.
   stationary zombie stops without freezing its body/head rotation and publishes
   the corrected facing to observers. Hostile ticks now copy target pose and
   visibility, release the session registry, and perform creeper, skeleton, and
-  melee owner work on regional lanes. Final melee publication takes only the
-  session registry and rechecks target life, visibility, pose, vertical reach,
-  and range. Attacker or target death before its respective fence cancels both
-  damage and swing. Focused tests cover an unmoving player, facing publication,
-  both death fences, and prove the session registry is free after owner
-  validation. The existing TCP survival zombie damage/kill/drop test also
-  remains green. A real-client feel check remains pending.
+  melee owner work on regional lanes. Final melee publication reads per-session
+  immutable combat-target and visibility snapshots, rechecks target life, pose,
+  vertical reach, and range, then reserves ordered output only while a shared
+  target/visibility epoch remains unchanged and even. It never reacquires the
+  global session registry. Focused tests cover an unmoving player, facing,
+  attacker/target death, movement out of range, Spectator transition,
+  unregister-after-snapshot, and completion while another thread deliberately
+  holds the session registry. The existing TCP survival zombie damage/kill/drop
+  test also remains green. A real-client feel check remains pending.
 
 - A fresh isolated O3 server and real 26.1.2 client completed the hostile-mob
   functional gate through embedded MCP. The client selected an iron sword,

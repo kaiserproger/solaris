@@ -141,6 +141,7 @@ pub(super) fn accept_player_pose_locked(
         old_session.pose.yaw,
     );
     inner.sessions.get_mut(&id)?.pose = pose;
+    inner.publish_combat_target(id);
     let max_entity_half_width = inner
         .entity_type_aabbs
         .values()

@@ -419,6 +419,7 @@ impl SessionRegistry {
                     });
             if spectator_commit_is_current {
                 inner.spectator_sessions.insert(token.session_id);
+                inner.publish_combat_target(token.session_id);
             }
             let transition = self.resolve_sleep_transition_locked(&mut inner);
             (transition, std::mem::take(&mut state.deferred_dispatches))

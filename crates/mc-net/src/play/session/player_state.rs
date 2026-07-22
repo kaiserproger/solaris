@@ -46,6 +46,7 @@ impl SessionRegistry {
         } else {
             inner.dead_sessions.remove(&id);
         }
+        inner.publish_combat_target(id);
         let became_no_live_sessions = self.publish_live_session_count(&inner);
         drop(inner);
         if became_no_live_sessions {
@@ -317,6 +318,7 @@ impl SessionRegistry {
         let became_no_live_sessions = {
             let mut inner = self.lock_inner("mark test player dead");
             inner.dead_sessions.insert(id);
+            inner.publish_combat_target(id);
             self.publish_live_session_count(&inner)
         };
         if became_no_live_sessions {
@@ -415,6 +417,7 @@ pub(super) fn apply_player_survival_plan_locked(
     } else {
         inner.dead_sessions.remove(&actor_session);
     }
+    inner.publish_combat_target(actor_session);
     if let Some(input) = &plan.enchanting_table_input {
         player_state.enchanting_table_input = input.updated.clone();
     }

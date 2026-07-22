@@ -23,7 +23,7 @@ use super::entity_owner::EntityOwnerAccess;
 use super::interaction_geometry::{distance_sq, entity_aabb};
 #[cfg(test)]
 use super::outbound::ServerEntitySnapshot;
-use super::outbound::{OutboundCommand, SessionRecipient, VisibilityDispatch};
+use super::outbound::{OutboundCommand, VisibilityDispatch};
 use super::projectiles::{initial_arrow_state, projectile_identity};
 use super::visibility::{
     initialize_entity_wire_state_from_snapshot_locked, server_entity_snapshot_from,
@@ -166,6 +166,19 @@ impl SessionRegistry {
                 .send(())
                 .expect("hostile publication receiver");
             probe.resume.recv().expect("hostile publication release");
+        }
+    }
+
+    #[cfg(test)]
+    fn pause_after_hostile_target_snapshot_for_test(&self) {
+        let probe = self
+            .hostile_target_snapshot_probe
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .take();
+        if let Some(probe) = probe {
+            probe.reached.send(()).expect("hostile target receiver");
+            probe.resume.recv().expect("hostile target release");
         }
     }
 
@@ -532,7 +545,7 @@ impl SessionRegistry {
             };
             #[cfg(test)]
             self.pause_before_hostile_session_publication_for_test();
-            let inner = self.lock_inner("publish hostile melee attacks");
+            let recipients = self.movement_recipients.load_full();
             for attack in melee_attacks {
                 let Some(hostile) = current_hostiles.get(&attack.hostile_id) else {
                     continue;
@@ -540,28 +553,30 @@ impl SessionRegistry {
                 if hostile.lifecycle != EntityLifecycle::Alive {
                     continue;
                 }
-                let Some(session) = inner.sessions.get(&attack.target_session) else {
+                let Some(target_publication) = recipients.get(&attack.target_session) else {
                     continue;
                 };
-                if inner.spectator_sessions.contains(&attack.target_session)
-                    || inner.dead_sessions.contains(&attack.target_session)
-                    || !session.visible_entities.contains(&attack.hostile_id)
-                    || (session.pose.y - hostile.position.y).abs() > HOSTILE_MELEE_VERTICAL_REACH
-                {
+                let Some((_, target_recipient)) =
+                    target_publication.reserve_combat_recipient_if(|target, visible_entities| {
+                        #[cfg(test)]
+                        self.pause_after_hostile_target_snapshot_for_test();
+                        let target_pose = target.pose();
+                        if !target.is_targetable()
+                            || !visible_entities.contains(&attack.hostile_id)
+                            || (target_pose.y - hostile.position.y).abs()
+                                > HOSTILE_MELEE_VERTICAL_REACH
+                        {
+                            return false;
+                        }
+                        let dx = target_pose.x - hostile.position.x;
+                        let dz = target_pose.z - hostile.position.z;
+                        dx * dx + dz * dz <= HOSTILE_MELEE_RANGE * HOSTILE_MELEE_RANGE
+                    })
+                else {
                     continue;
-                }
-                let dx = session.pose.x - hostile.position.x;
-                let dz = session.pose.z - hostile.position.z;
-                if dx * dx + dz * dz > HOSTILE_MELEE_RANGE * HOSTILE_MELEE_RANGE {
-                    continue;
-                }
-                let recipient = SessionRecipient::unordered(
-                    attack.target_session,
-                    session.tx.clone(),
-                    Arc::clone(&session.pressure),
-                );
+                };
                 dispatches.push(VisibilityDispatch {
-                    recipient,
+                    recipient: target_recipient,
                     command: OutboundCommand::DamagePlayer {
                         damage: PlayerDamageRequest {
                             kind: PlayerDamageKind::MobAttack,
@@ -570,10 +585,12 @@ impl SessionRegistry {
                         },
                     },
                 });
-                let animation_recipients = session_recipients(
-                    &inner,
-                    visible_entity_observers_locked(&inner, attack.hostile_id),
-                );
+                let animation_recipients = recipients
+                    .values()
+                    .filter_map(|publication| {
+                        publication.reserve_observer_if_visible(attack.hostile_id)
+                    })
+                    .collect::<Vec<_>>();
                 dispatches.extend(visibility_dispatches(animation_recipients, || {
                     OutboundCommand::AnimatePlayer {
                         entity_id: attack.hostile_id.0,

@@ -220,15 +220,22 @@ Goal input snapshots exclude dead sessions before hostile target selection.
 Hostile attacks copy live target positions and immutable visibility sets under
 the session lock, then release it before planning or touching regional owners.
 Creeper fuse CAS, arrow spawning, and the batched current-melee-attacker read
-therefore run without `SessionRegistry.inner`. Melee publication reacquires only
-the session registry and rechecks target presence, death/spectator state,
-visibility, current pose, vertical reach, and horizontal range. An attacker that
-died or moved before its owner-lane read and a target that died or moved before
-publication are rejected without damage or swing. This is ordered regional
-ownership with short publication locks, not a claim that the whole server is
-lock-free. A melee hostile already in range uses a zero-speed `FollowPosition`:
-it skips pathfinding and translation but still turns body and head toward the
-live target for movement publication.
+therefore run without `SessionRegistry.inner`. Each session publishes one
+immutable combat-target snapshot containing its current pose and combined
+alive/non-spectator admission beside its immutable entity-visibility set.
+The target and visibility publications share an odd/even epoch. Every mutation
+opens the epoch before changing current state or reserving visibility output and
+closes it after the immutable snapshot is stored. Melee publication reads both
+snapshots, validates range, reserves ordered damage/swing output, and accepts
+only if the epoch stayed at the same even value. Disconnect first publishes a
+non-targetable state, then closes the ordered queue and removes the index entry.
+An attacker that died or moved before its owner-lane read and a target that
+died, moved, became Spectator, lost visibility, or disconnected during admission
+are rejected without damage or swing. This is ordered regional ownership with
+lock-free reads and per-session queue locks, not a claim that the whole server
+is lock-free. A melee hostile already in range uses a zero-speed
+`FollowPosition`: it skips pathfinding and translation but still turns body and
+head toward the live target for movement publication.
 Goal apply now also exposes a narrow typed projection for the active physics
 set. It reads sorted alive kinematics from the lane-owned ECS stores after the
 successful CAS and avoids a second full-snapshot materialization on the common
