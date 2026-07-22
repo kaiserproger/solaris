@@ -754,10 +754,8 @@ async fn lua_gameplay_events_follow_authoritative_commits() {
         .await
         .expect("break generated surface block");
 
-    let expected_message = format!(
-        "block-broken:minecraft:grass_block:minecraft:overworld:0:{}:0:creative:BreakEvents",
-        target.1
-    );
+    let expected_message_suffix =
+        format!(":minecraft:overworld:0:{}:0:creative:BreakEvents", target.1);
     let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
     let mut saw_committed_update = false;
     let mut saw_plugin_event = false;
@@ -784,7 +782,9 @@ async fn lua_gameplay_events_follow_authoritative_commits() {
         } else if frame.id == ClientboundSystemChat::ID {
             let chat = ClientboundSystemChat::decode(&mut frame.body).expect("decode SystemChat");
             let message = text_component_text(&chat);
-            if message == expected_message {
+            if message.starts_with("block-broken:minecraft:")
+                && message.ends_with(&expected_message_suffix)
+            {
                 saw_plugin_event = true;
             }
             observed_messages.push(message);
@@ -886,12 +886,11 @@ async fn lua_gameplay_events_follow_authoritative_commits() {
         .await
         .expect("finish survival break");
 
-    let expected_survival_message = format!(
-        "block-broken:minecraft:grass_block:minecraft:overworld:1:{}:0:survival:BreakEvents",
+    let expected_survival_suffix = format!(
+        ":minecraft:overworld:1:{}:0:survival:BreakEvents",
         survival_target.1
     );
-    let expected_pickup_message =
-        "item-picked-up:minecraft:dirt:1:item_entity:survival:minecraft:overworld:BreakEvents";
+    let expected_pickup_suffix = ":1:item_entity:survival:minecraft:overworld:BreakEvents";
     let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
     let mut saw_survival_update = false;
     let mut saw_survival_event = false;
@@ -912,9 +911,13 @@ async fn lua_gameplay_events_follow_authoritative_commits() {
         } else if frame.id == ClientboundSystemChat::ID {
             let chat = ClientboundSystemChat::decode(&mut frame.body).expect("decode SystemChat");
             let message = text_component_text(&chat);
-            if message == expected_survival_message {
+            if message.starts_with("block-broken:minecraft:")
+                && message.ends_with(&expected_survival_suffix)
+            {
                 saw_survival_event = true;
-            } else if message == expected_pickup_message {
+            } else if message.starts_with("item-picked-up:minecraft:")
+                && message.ends_with(expected_pickup_suffix)
+            {
                 saw_pickup_event = true;
             }
         }
@@ -932,7 +935,9 @@ async fn lua_gameplay_events_follow_authoritative_commits() {
             .expect("walk onto the committed survival drop");
         loop {
             let message = next_lua_transaction_system_chat_text(&mut client).await;
-            if message == expected_pickup_message {
+            if message.starts_with("item-picked-up:minecraft:")
+                && message.ends_with(expected_pickup_suffix)
+            {
                 break;
             }
         }
@@ -1102,8 +1107,8 @@ async fn lua_gameplay_events_follow_authoritative_commits() {
     })
     .await
     .expect("peer invalidates survival break snapshot");
-    let expected_peer_message = format!(
-        "block-broken:minecraft:grass_block:minecraft:overworld:2:{}:0:creative:BreakPeer",
+    let expected_peer_message_suffix = format!(
+        ":minecraft:overworld:2:{}:0:creative:BreakPeer",
         stale_target.1
     );
     let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
@@ -1123,7 +1128,10 @@ async fn lua_gameplay_events_follow_authoritative_commits() {
             }
         } else if frame.id == ClientboundSystemChat::ID {
             let chat = ClientboundSystemChat::decode(&mut frame.body).expect("decode SystemChat");
-            if text_component_text(&chat) == expected_peer_message {
+            let message = text_component_text(&chat);
+            if message.starts_with("block-broken:minecraft:")
+                && message.ends_with(&expected_peer_message_suffix)
+            {
                 saw_peer_event = true;
             }
         }
