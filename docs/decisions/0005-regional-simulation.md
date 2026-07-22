@@ -203,16 +203,19 @@ visibility set, so ordinary movement ticks do not traverse sessions or
 visibility edges under the global registry mutex. Visibility writers publish a
 replacement set only after reserving the corresponding ordered spawn/despawn
 command; movement therefore cannot reserve an earlier sequence for a newly
-visible entity. Commit still reacquires the registry, compares the tracker
-state with the copied value, and rechecks current visibility before publishing.
+visible entity. Wire tracker state now lives in 64 independently locked shards.
+Commit compares the copied tracker state in those shards, reloads the published
+session index and current per-session visibility, and records its metric
+atomically without reacquiring `SessionRegistry.inner`. Session unregister
+closes the per-session ordered queue before publishing removal; the same queue
+lock fences a movement that already passed recipient validation.
 The same snapshot boundary now copies player positions and tracker inputs, then
 releases both ECS access and the session registry for pickup-distance filtering
-and movement-plan computation. Pickup admission, chunk/visibility mutation,
-and the final tracker/visibility commit still reacquire the registry.
-This removes recipient discovery and packet planning from the global critical
-section without allowing a stale plan to overwrite newer state. Chunk
-visibility mutation, tracker CAS, and outbound session publication are still
-centralized; this is not a fully lock-free or fully regional publication path.
+and movement-plan computation. Pickup admission and chunk/visibility mutation
+still reacquire the registry. Tracker shards and per-session ordered outbound
+queues are not lock-free, but ordinary movement publication no longer enters
+the global session mutex and stale tracker, session, and visibility plans are
+still rejected.
 Goal input snapshots exclude dead sessions before hostile target selection.
 Attack-time filtering remains a second authority fence, so a dead player is
 neither followed by a new goal tick nor damaged by a stale attack candidate.
@@ -803,7 +806,7 @@ newly published player set. Positive transitions do not block login on entity
 journal work; the next simulation event performs ordinary target selection.
 Empty/all-dead steady-state ticks therefore take neither the session mutex nor
 an entity-owner snapshot, without leaving disconnected or dead targets behind.
-Active-player selection and movement publication still retain their documented
+Active-player selection and visibility mutation still retain their documented
 centralized metadata boundaries, so this is not full world regionalization.
 
 The `wide` SIMD experiment remains non-promoted. Its kernel median gain was

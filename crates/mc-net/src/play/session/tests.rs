@@ -4349,7 +4349,10 @@ fn ensure_chunk_herd_releases_session_lock_during_durable_unique_batch() {
             assert_eq!(inner.entity_chunks.get(&entity_id), Some(&chunk));
             assert!(inner.entities_by_chunk[&chunk].contains(&entity_id));
             let published = &inner.published_entity_snapshots[&entity_id];
-            let wire = &inner.last_sent_entity_states[&entity_id];
+            let wire = inner
+                .entity_movement_trackers
+                .get(entity_id)
+                .expect("published herd entity has tracker state");
             assert_eq!(wire.position, published.position);
             assert_eq!(wire.velocity, published.velocity);
             assert_eq!(wire.rotation, published.rotation);
@@ -4488,7 +4491,7 @@ fn safe_chunk_herd_failure_releases_claim_for_one_exact_retry() {
         );
         assert!(!inner.entities_by_chunk.contains_key(&chunk));
         assert!(inner.published_entity_snapshots.is_empty());
-        assert!(inner.last_sent_entity_states.is_empty());
+        assert!(inner.entity_movement_trackers.is_empty());
     }
     registry.ensure_chunk_herd_legacy_for_test(chunk, &spawns);
     assert_eq!(registry.persisted_entity_records().len(), 1);
@@ -4695,7 +4698,10 @@ fn pending_hostile_activation_releases_session_lock_during_journal_commit() {
         assert_eq!(inner.entity_chunks.get(&hostile.id), Some(&chunk));
         assert!(inner.entities_by_chunk[&chunk].contains(&hostile.id));
         let published = &inner.published_entity_snapshots[&hostile.id];
-        let wire = &inner.last_sent_entity_states[&hostile.id];
+        let wire = inner
+            .entity_movement_trackers
+            .get(hostile.id)
+            .expect("published hostile has tracker state");
         assert_eq!(wire.position, published.position);
         assert_eq!(wire.velocity, published.velocity);
         assert_eq!(wire.rotation, published.rotation);
@@ -4923,7 +4929,7 @@ fn unknown_pending_hostile_failure_does_not_publish_or_retry() {
         assert!(!inner.pending_hostile_spawns.contains_key(&chunk));
         assert!(!inner.entities_by_chunk.contains_key(&chunk));
         assert!(inner.published_entity_snapshots.is_empty());
-        assert!(inner.last_sent_entity_states.is_empty());
+        assert!(inner.entity_movement_trackers.is_empty());
         assert!(inner.sessions[&observer].visible_entities.is_empty());
     }
     assert!(
@@ -5415,6 +5421,136 @@ fn movement_recipient_snapshot_does_not_wait_for_session_registry() {
     assert!(
         reached_fanout.is_ok(),
         "published recipient snapshot must not acquire SessionRegistry"
+    );
+}
+
+#[test]
+fn movement_publication_finishes_while_session_registry_is_held() {
+    let registry = Arc::new(SessionRegistry::new());
+    let (tx, mut rx) = mpsc::channel(8);
+    let (session, _) = registry.register(
+        &profile("UnlockedMovementPublishAlice"),
+        (0, 0),
+        2,
+        HashSet::new(),
+        tx,
+        PlayerPose::new(0.5, 64.0, 0.5),
+    );
+    assert!(registry.mark_loaded(session, (0, 0)).is_empty());
+    let spawn = registry.spawn_command_entity(
+        &SimulationAuthority::for_test(),
+        1,
+        "minecraft:zombie".to_owned(),
+        Vec3::new(0.5, 64.0, 0.5),
+    );
+    let entity_id = match &spawn[0].command {
+        OutboundCommand::SpawnEntity(snapshot) => snapshot.id,
+        command => panic!("expected entity spawn, got {command:?}"),
+    };
+    dispatch_visibility_commands(spawn);
+    assert!(matches!(rx.try_recv(), Ok(OutboundCommand::SpawnEntity(_))));
+
+    let (fanout_reached_tx, fanout_reached_rx) = std::sync::mpsc::channel();
+    let (fanout_resume_tx, fanout_resume_rx) = std::sync::mpsc::channel();
+    *registry
+        .move_fanout_probe
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(MoveFanoutProbe {
+        reached: fanout_reached_tx,
+        resume: fanout_resume_rx,
+    });
+    let (completed_tx, completed_rx) = std::sync::mpsc::channel();
+    let physics_registry = Arc::clone(&registry);
+    let physics = std::thread::spawn(move || {
+        physics_registry.apply_entity_physics_and_dispatch(
+            ENTITY_MOVE_SEND_INTERVAL_TICKS,
+            &[EntityPhysicsStep {
+                id: entity_id,
+                position: Vec3::new(0.75, 64.0, 0.5),
+                velocity: Vec3::ZERO,
+                on_ground: true,
+                horizontal_collision: false,
+            }],
+        );
+        completed_tx.send(()).expect("publish completion receiver");
+    });
+    fanout_reached_rx
+        .recv_timeout(Duration::from_secs(5))
+        .expect("movement reaches unlocked fanout");
+
+    let session_guard = registry.lock_inner("hold registry across final movement publication");
+    fanout_resume_tx.send(()).expect("release movement fanout");
+    completed_rx
+        .recv_timeout(Duration::from_secs(5))
+        .expect("movement publication must not reacquire SessionRegistry");
+    drop(session_guard);
+    physics.join().expect("physics worker");
+
+    assert!(matches!(
+        rx.try_recv(),
+        Ok(OutboundCommand::MoveEntityRelative(movement)) if movement.id == entity_id
+    ));
+}
+
+#[test]
+fn unregister_fences_movement_after_recipient_validation() {
+    let registry = Arc::new(SessionRegistry::new());
+    let (tx, mut rx) = mpsc::channel(8);
+    let (session, _) = registry.register(
+        &profile("FencedMovementAlice"),
+        (0, 0),
+        2,
+        HashSet::new(),
+        tx,
+        PlayerPose::new(0.5, 64.0, 0.5),
+    );
+    assert!(registry.mark_loaded(session, (0, 0)).is_empty());
+    let spawn = registry.spawn_command_entity(
+        &SimulationAuthority::for_test(),
+        1,
+        "minecraft:zombie".to_owned(),
+        Vec3::new(0.5, 64.0, 0.5),
+    );
+    let entity_id = match &spawn[0].command {
+        OutboundCommand::SpawnEntity(snapshot) => snapshot.id,
+        command => panic!("expected entity spawn, got {command:?}"),
+    };
+    dispatch_visibility_commands(spawn);
+    assert!(matches!(rx.try_recv(), Ok(OutboundCommand::SpawnEntity(_))));
+
+    let (validated_tx, validated_rx) = std::sync::mpsc::channel();
+    let (resume_tx, resume_rx) = std::sync::mpsc::channel();
+    *registry
+        .movement_dispatch_probe
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(MoveFanoutProbe {
+        reached: validated_tx,
+        resume: resume_rx,
+    });
+    let physics_registry = Arc::clone(&registry);
+    let physics = std::thread::spawn(move || {
+        physics_registry.apply_entity_physics_and_dispatch(
+            ENTITY_MOVE_SEND_INTERVAL_TICKS,
+            &[EntityPhysicsStep {
+                id: entity_id,
+                position: Vec3::new(0.75, 64.0, 0.5),
+                velocity: Vec3::ZERO,
+                on_ground: true,
+                horizontal_collision: false,
+            }],
+        );
+    });
+    validated_rx
+        .recv_timeout(Duration::from_secs(5))
+        .expect("movement validates its recipient");
+
+    assert!(registry.unregister(session).is_empty());
+    resume_tx.send(()).expect("release movement publication");
+    physics.join().expect("physics worker");
+
+    assert!(
+        rx.try_recv().is_err(),
+        "unregistered session received movement"
     );
 }
 
@@ -9932,12 +10068,10 @@ fn non_finite_entity_physics_is_rejected_before_visibility_mutation() {
     dispatch_visibility_commands(spawn_dispatches);
     assert!(matches!(rx.try_recv(), Ok(OutboundCommand::SpawnEntity(_))));
     let (published_before, chunk_before) = {
-        let mut inner = registry.inner.lock().expect("session registry poisoned");
-        inner
-            .last_sent_entity_states
-            .get_mut(&entity_id)
-            .expect("spawned entity has tracker state")
-            .tracking_update_count = 1;
+        let inner = registry.inner.lock().expect("session registry poisoned");
+        assert!(inner.entity_movement_trackers.update(entity_id, |tracker| {
+            tracker.tracking_update_count = 1;
+        }));
         (
             inner
                 .published_entity_snapshots
@@ -9962,8 +10096,8 @@ fn non_finite_entity_physics_is_rejected_before_visibility_mutation() {
     let (published_after, chunk_after, tracker_count, teleport_delay) = {
         let inner = registry.inner.lock().expect("session registry poisoned");
         let tracker = inner
-            .last_sent_entity_states
-            .get(&entity_id)
+            .entity_movement_trackers
+            .get(entity_id)
             .expect("spawned entity keeps tracker state");
         (
             inner
@@ -10031,13 +10165,15 @@ fn stale_entity_physics_result_does_not_overwrite_newer_kinematics() {
         }],
     );
     {
-        let mut inner = registry.lock_inner("prepare stale physics tracker cadence");
-        let tracker = inner
-            .last_sent_entity_states
-            .get_mut(&initial.id)
-            .expect("spawned entity has tracker state");
-        tracker.tracking_update_count = 59;
-        tracker.teleport_delay = 399;
+        let inner = registry.lock_inner("prepare stale physics tracker cadence");
+        assert!(
+            inner
+                .entity_movement_trackers
+                .update(initial.id, |tracker| {
+                    tracker.tracking_update_count = 59;
+                    tracker.teleport_delay = 399;
+                })
+        );
     }
 
     registry.apply_entity_physics_if_current_and_dispatch(
@@ -10059,8 +10195,8 @@ fn stale_entity_physics_result_does_not_overwrite_newer_kinematics() {
     assert_eq!(current.velocity, newer_velocity);
     let inner = registry.lock_inner("verify stale physics tracker cadence");
     let tracker = inner
-        .last_sent_entity_states
-        .get(&initial.id)
+        .entity_movement_trackers
+        .get(initial.id)
         .expect("spawned entity keeps tracker state");
     assert_eq!(tracker.tracking_update_count, 59);
     assert_eq!(tracker.teleport_delay, 399);
@@ -10170,8 +10306,8 @@ fn player_body_push_keeps_entity_chunk_index_with_authoritative_position() {
     }));
     assert_eq!(
         inner
-            .last_sent_entity_states
-            .get(&entity_id)
+            .entity_movement_trackers
+            .get(entity_id)
             .expect("zombie wire state")
             .position,
         position
@@ -10805,12 +10941,11 @@ fn movement_fanout_skips_visibility_work_when_no_movement_is_published() {
             .visible_entities
             .replace_and_publish(HashSet::from([entity_id]));
     }
-    registry
-        .lock_inner("place no-op movement outside tracker refresh cadence")
-        .last_sent_entity_states
-        .get_mut(&entity_id)
-        .expect("spawned entity has tracker state")
-        .tracking_update_count = 1;
+    let inner = registry.lock_inner("place no-op movement outside tracker refresh cadence");
+    assert!(inner.entity_movement_trackers.update(entity_id, |tracker| {
+        tracker.tracking_update_count = 1;
+    }));
+    drop(inner);
 
     entity_simulation::reset_movement_fanout_work();
     registry.apply_entity_physics_and_dispatch(

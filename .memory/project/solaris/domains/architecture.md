@@ -73,9 +73,13 @@ Current runtime facts:
   immutable visibility publications. Connect/disconnect rebuild the index;
   visibility writers publish only after reserving ordered spawn/despawn. Do not
   restore per-tick session/visibility traversal under `SessionRegistry.inner`.
-- The final tracker CAS and current-visibility recheck still use the global
-  session registry. The movement read path is lock-free with respect to that
-  mutex, but the complete publication path is not yet lock-free or regional.
+- Wire tracker state is split across 64 shards. Final movement publication CASes
+  those shards, reloads the `ArcSwap` recipient index and per-session visibility,
+  and records metrics atomically without entering `SessionRegistry.inner`.
+  Unregister closes that session's ordered queue before publishing removal, so
+  a movement already past recipient validation cannot dispatch after removal.
+  Visibility mutation and each session's ordered outbound queue still use locks,
+  so this is not fully lock-free or fully regional publication.
 - Empty/all-dead server entity ticks use the published atomic live-session
   count and perform no session-registry or owner-lane read. A transition to zero
   live players pushes generation-fenced hostile-target reconciliation after

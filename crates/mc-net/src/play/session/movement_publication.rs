@@ -99,6 +99,10 @@ impl MovementRecipientPublication {
     pub(super) fn visible_entities(&self) -> Arc<HashSet<EntityId>> {
         self.visible_entities.load_full()
     }
+
+    pub(super) fn is_same_session(&self, other: &Self) -> bool {
+        self.id == other.id && Arc::ptr_eq(&self.ordered_dispatch, &other.ordered_dispatch)
+    }
 }
 
 pub(super) type MovementRecipientIndex = HashMap<SessionId, MovementRecipientPublication>;

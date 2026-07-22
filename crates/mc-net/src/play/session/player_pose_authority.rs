@@ -413,8 +413,8 @@ pub(super) fn publish_player_body_pushes_locked(
 
         let new_observers = visible_entity_observers_locked(inner, entity_id);
         let send_velocity = inner
-            .last_sent_entity_states
-            .get(&entity_id)
+            .entity_movement_trackers
+            .get(entity_id)
             .is_some_and(|last_sent| entity_velocity_changed(last_sent.velocity, velocity));
         let mut movement_dispatches =
             publish_entity_movement_locked(inner, &snapshot, &old_observers, &new_observers);
@@ -449,9 +449,9 @@ pub(super) fn publish_player_body_pushes_locked(
                     })
                 })
                 .collect::<Vec<_>>();
-            if let Some(last_sent) = inner.last_sent_entity_states.get_mut(&entity_id) {
-                last_sent.velocity = velocity;
-            }
+            inner
+                .entity_movement_trackers
+                .update(entity_id, |last_sent| last_sent.velocity = velocity);
             record_entity_dispatches_locked(inner, &velocity_dispatches);
             movement_dispatches.extend(velocity_dispatches);
         }

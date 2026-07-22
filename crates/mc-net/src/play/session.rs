@@ -27,6 +27,9 @@ mod entity_lifecycle;
 mod entity_owner;
 mod entity_physics_class;
 mod entity_simulation;
+mod entity_tracking;
+#[cfg(test)]
+mod entity_tracking_tests;
 mod explosion_authority;
 mod herd_spawn_authority;
 mod hostile_authority;
@@ -105,6 +108,7 @@ use entity_lifecycle::{
     ENTITY_EVENT_DEATH_COMPLETE, nearby_entity_candidate_ids_locked, nearby_entity_snapshots_locked,
 };
 use entity_owner::*;
+use entity_tracking::EntityMovementTrackers;
 #[allow(unused_imports)]
 pub(super) use explosion_authority::{
     ExpiredPrimedTnt, ExplosionEntityTarget, ExplosionPlayerTarget, ServerEntityExplosionImpact,
@@ -184,8 +188,8 @@ pub(super) use sleep::SleepOutcome;
 use sleep::{DEEP_SLEEP_TICKS, sleepers_needed};
 use sleep::{DEFAULT_PLAYERS_SLEEPING_PERCENTAGE, SleepingState};
 pub(super) use transactions::*;
+use visibility::EntityPositionUpdate;
 pub(super) use visibility::server_entity_snapshot_from;
-use visibility::{EntityPositionUpdate, LastSentEntityState};
 use visibility::{
     entity_event_dispatches_locked, entity_velocity_changed,
     initialize_entity_wire_state_from_snapshot_locked, initialize_entity_wire_state_locked,
@@ -344,7 +348,7 @@ struct SessionRegistryInner {
     published_entity_snapshots: HashMap<EntityId, ServerEntitySnapshot>,
     entity_type_aabbs: HashMap<i32, mc_physics::Aabb>,
     terrain_pathing_entities: HashSet<EntityId>,
-    last_sent_entity_states: HashMap<EntityId, LastSentEntityState>,
+    entity_movement_trackers: Arc<EntityMovementTrackers>,
     arrow_tick_scratch: projectiles::ArrowTickScratch,
     spawned_entity_chunks: HashSet<(i32, i32)>,
     pending_hostile_spawns: BTreeMap<(i32, i32), Vec<HerdSpawn>>,
@@ -465,6 +469,8 @@ pub(crate) struct SessionRegistry {
     prepared_claim_calls: AtomicU64,
     #[cfg(test)]
     move_fanout_probe: Mutex<Option<MoveFanoutProbe>>,
+    #[cfg(test)]
+    movement_dispatch_probe: Mutex<Option<MoveFanoutProbe>>,
     #[cfg(test)]
     movement_visibility_load_probe: Mutex<Option<MoveFanoutProbe>>,
     #[cfg(test)]
@@ -747,6 +753,8 @@ impl SessionRegistry {
             #[cfg(test)]
             move_fanout_probe: Mutex::new(None),
             #[cfg(test)]
+            movement_dispatch_probe: Mutex::new(None),
+            #[cfg(test)]
             movement_visibility_load_probe: Mutex::new(None),
             #[cfg(test)]
             entity_apply_release_probe: Mutex::new(None),
@@ -1022,6 +1030,19 @@ impl SessionRegistry {
         if let Some(probe) = probe {
             probe.reached.send(()).expect("move fanout probe receiver");
             probe.resume.recv().expect("move fanout probe release");
+        }
+    }
+
+    #[cfg(test)]
+    fn pause_after_movement_recipient_validation_for_test(&self) {
+        let probe = self
+            .movement_dispatch_probe
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .take();
+        if let Some(probe) = probe {
+            let _ = probe.reached.send(());
+            let _ = probe.resume.recv();
         }
     }
 

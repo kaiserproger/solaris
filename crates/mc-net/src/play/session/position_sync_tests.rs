@@ -254,8 +254,8 @@ fn scheduled_updates_advance_global_counters_without_movement_reset() {
     {
         let inner = registry.lock_inner("verify initial tracker counters");
         let state = inner
-            .last_sent_entity_states
-            .get(&entity_id)
+            .entity_movement_trackers
+            .get(entity_id)
             .expect("item wire state");
         assert_eq!(state.tracking_update_count, 0);
         assert_eq!(state.teleport_delay, 0);
@@ -305,8 +305,8 @@ fn scheduled_updates_advance_global_counters_without_movement_reset() {
     );
     let inner = registry.lock_inner("verify scheduled tracker counters");
     let state = inner
-        .last_sent_entity_states
-        .get(&entity_id)
+        .entity_movement_trackers
+        .get(entity_id)
         .expect("item wire state");
     assert_eq!(state.tracking_update_count, 61);
     assert_eq!(state.teleport_delay, 61);
@@ -375,8 +375,8 @@ fn player_body_push_does_not_advance_tracker_counters() {
     let counters_before = {
         let inner = registry.lock_inner("capture tracker counters before body push");
         let state = inner
-            .last_sent_entity_states
-            .get(&entity_id)
+            .entity_movement_trackers
+            .get(entity_id)
             .expect("zombie wire state");
         (state.tracking_update_count, state.teleport_delay)
     };
@@ -394,8 +394,8 @@ fn player_body_push_does_not_advance_tracker_counters() {
     }));
     let inner = registry.lock_inner("verify body push tracker counters");
     let state = inner
-        .last_sent_entity_states
-        .get(&entity_id)
+        .entity_movement_trackers
+        .get(entity_id)
         .expect("zombie wire state");
     assert_eq!(
         (state.tracking_update_count, state.teleport_delay),

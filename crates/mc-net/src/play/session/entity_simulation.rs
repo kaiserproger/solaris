@@ -880,7 +880,7 @@ impl SessionRegistry {
             if !ordinary_tracking_turn && !latency_sensitive && !smooth_natural_mob {
                 continue;
             }
-            if !inner.last_sent_entity_states.contains_key(&step.id) {
+            if !inner.entity_movement_trackers.contains(step.id) {
                 initialize_entity_wire_state_locked(&mut inner, step.id);
             }
             tracker_states.push((motion, smooth_natural_mob));
@@ -905,9 +905,8 @@ impl SessionRegistry {
             .into_iter()
             .filter_map(|(motion, smooth_natural_mob)| {
                 inner
-                    .last_sent_entity_states
-                    .get(&motion.id)
-                    .copied()
+                    .entity_movement_trackers
+                    .get(motion.id)
                     .map(|last_sent| (motion, last_sent, smooth_natural_mob))
             })
             .collect::<Vec<_>>();
@@ -921,6 +920,7 @@ impl SessionRegistry {
                 )
             })
             .collect::<Vec<_>>();
+        let entity_movement_trackers = Arc::clone(&inner.entity_movement_trackers);
         let SessionEntityGuards {
             inner: session_inner,
             entities,
@@ -1035,16 +1035,7 @@ impl SessionRegistry {
         }
 
         if movements.is_empty() {
-            let mut inner = self.lock_inner("advance entity movement trackers");
-            for (entity_id, expected, next) in tracker_commits {
-                let Some(current) = inner.last_sent_entity_states.get_mut(&entity_id) else {
-                    continue;
-                };
-                if *current == expected {
-                    *current = next;
-                }
-            }
-            drop(inner);
+            entity_movement_trackers.compare_exchange_many(tracker_commits);
             dispatch_visibility_commands(dispatches);
             return steps.to_vec();
         }
@@ -1056,7 +1047,11 @@ impl SessionRegistry {
                 let visible_entities = publication.visible_entities();
                 #[cfg(test)]
                 self.pause_after_movement_visibility_load_for_test();
-                (publication.id(), publication.recipient(), visible_entities)
+                (
+                    publication.clone(),
+                    publication.recipient(),
+                    visible_entities,
+                )
             })
             .collect::<Vec<_>>();
         let session_count = recipient_snapshots.len();
@@ -1075,10 +1070,10 @@ impl SessionRegistry {
             #[cfg(test)]
             record_movement_visibility_index_build();
             let mut reverse_index = HashMap::<EntityId, Vec<usize>>::new();
-            for (observer_id, recipient, visible_entities) in recipient_snapshots {
+            for (publication, recipient, visible_entities) in recipient_snapshots {
                 let recipient_index = movement_recipients.len();
                 movement_recipients.push((
-                    observer_id,
+                    publication,
                     recipient,
                     Some(Arc::clone(&visible_entities)),
                 ));
@@ -1104,8 +1099,8 @@ impl SessionRegistry {
             }
         } else {
             movement_recipients.extend(recipient_snapshots.into_iter().map(
-                |(observer_id, recipient, visible_entities)| {
-                    (observer_id, recipient, Some(visible_entities))
+                |(publication, recipient, visible_entities)| {
+                    (publication, recipient, Some(visible_entities))
                 },
             ));
         }
@@ -1114,8 +1109,8 @@ impl SessionRegistry {
         self.pause_before_move_fanout_for_test();
         let mut movements_by_recipient = movement_recipients
             .into_iter()
-            .map(|(observer_id, recipient, visible_entities)| {
-                (observer_id, recipient, visible_entities, Vec::new())
+            .map(|(publication, recipient, visible_entities)| {
+                (publication, recipient, visible_entities, Vec::new())
             })
             .collect::<Vec<_>>();
         if let Some(current_observers_by_entity) = current_observers_by_entity.as_ref() {
@@ -1124,18 +1119,18 @@ impl SessionRegistry {
                     continue;
                 };
                 for &recipient_index in candidate_indexes {
-                    let (observer_id, _, _, recipient_movements) =
+                    let (publication, _, _, recipient_movements) =
                         &mut movements_by_recipient[recipient_index];
                     if old_observers_by_entity
                         .get(entity_id)
-                        .is_none_or(|observers| observers.contains(observer_id))
+                        .is_none_or(|observers| observers.contains(&publication.id()))
                     {
                         recipient_movements.push(*movement);
                     }
                 }
             }
         } else {
-            for (observer_id, _, visible_entities, recipient_movements) in
+            for (publication, _, visible_entities, recipient_movements) in
                 &mut movements_by_recipient
             {
                 let visible_entities = visible_entities
@@ -1147,33 +1142,30 @@ impl SessionRegistry {
                     (visible_entities.contains(entity_id)
                         && old_observers_by_entity
                             .get(entity_id)
-                            .is_none_or(|observers| observers.contains(observer_id)))
+                            .is_none_or(|observers| observers.contains(&publication.id())))
                     .then_some(*movement)
                 }));
             }
         }
-        let mut inner = self.lock_inner("order entity movement dispatches");
-        let mut accepted_tracker_entities = HashSet::with_capacity(tracker_commits.len());
-        for (entity_id, expected, next) in tracker_commits {
-            let Some(current) = inner.last_sent_entity_states.get_mut(&entity_id) else {
-                continue;
-            };
-            if *current == expected {
-                *current = next;
-                accepted_tracker_entities.insert(entity_id);
-            }
-        }
+        let accepted_tracker_entities =
+            entity_movement_trackers.compare_exchange_many(tracker_commits);
+        let current_recipients = self.movement_recipients.load_full();
         let mut ordered_movements = Vec::with_capacity(movements_by_recipient.len());
         let mut canceled_recipients = Vec::new();
         let mut move_dispatch_count = 0usize;
-        for (observer_id, recipient, _, mut movements) in movements_by_recipient {
-            let Some(observer) = inner.sessions.get(&observer_id) else {
+        for (publication, recipient, _, mut movements) in movements_by_recipient {
+            let Some(current_publication) = current_recipients.get(&publication.id()) else {
                 canceled_recipients.push(recipient);
                 continue;
             };
+            if !publication.is_same_session(current_publication) {
+                canceled_recipients.push(recipient);
+                continue;
+            }
+            let visible_entities = publication.visible_entities();
             movements.retain(|movement| {
                 accepted_tracker_entities.contains(&movement.id)
-                    && observer.visible_entities.contains(&movement.id)
+                    && visible_entities.contains(&movement.id)
             });
             if movements.is_empty() {
                 canceled_recipients.push(recipient);
@@ -1182,10 +1174,12 @@ impl SessionRegistry {
             move_dispatch_count += movements.len();
             ordered_movements.push((recipient, movements));
         }
-        inner.entity_dispatches.move_relative += move_dispatch_count as u64;
-        drop(inner);
+        self.pressure_observation
+            .record_unlocked_entity_move_dispatches(move_dispatch_count);
         drop(canceled_recipients);
 
+        #[cfg(test)]
+        self.pause_after_movement_recipient_validation_for_test();
         dispatch_visibility_commands(dispatches);
         for (recipient, mut movements) in ordered_movements {
             let command = if movements.len() == 1 {

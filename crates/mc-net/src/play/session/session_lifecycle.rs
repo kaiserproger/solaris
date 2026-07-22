@@ -252,6 +252,8 @@ impl SessionRegistry {
             let Some(session) = inner.sessions.remove(&id) else {
                 return Vec::new();
             };
+            let dropped = session.ordered_dispatch.close();
+            session.pressure.record_reliable_command_drops(dropped);
             *script_transaction_active = false;
             drop(script_transaction_active);
             inner.sleeping_sessions.remove(&id);

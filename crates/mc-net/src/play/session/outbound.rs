@@ -323,6 +323,17 @@ impl OrderedDispatchState {
             })
             .expect("session outbound sequence exhausted")
     }
+
+    pub(super) fn close(&self) -> usize {
+        let mut queue = lock_ordered_dispatch_state(self);
+        if queue.closing {
+            return 0;
+        }
+        queue.closing = true;
+        let dropped = queue.pending.values().map(ordered_queue_entry_weight).sum();
+        queue.pending.clear();
+        dropped
+    }
 }
 
 #[derive(Debug, Default)]
@@ -500,7 +511,7 @@ impl OutboundPressureMetrics {
         self.mark_changed();
     }
 
-    fn record_reliable_command_drops(&self, count: usize) {
+    pub(super) fn record_reliable_command_drops(&self, count: usize) {
         if count == 0 {
             return;
         }
@@ -724,6 +735,7 @@ pub(super) struct SessionPressureObservation {
     chest_viewer_sets: AtomicUsize,
     entity_spawn_dispatches: AtomicU64,
     entity_move_dispatches: AtomicU64,
+    unlocked_entity_move_dispatches: AtomicU64,
     entity_data_dispatches: AtomicU64,
     entity_take_dispatches: AtomicU64,
     entity_remove_dispatches: AtomicU64,
@@ -761,6 +773,11 @@ impl SessionPressureObservation {
         self.server_entities.fetch_add(count, Ordering::Relaxed);
     }
 
+    pub(super) fn record_unlocked_entity_move_dispatches(&self, count: usize) {
+        self.unlocked_entity_move_dispatches
+            .fetch_add(count as u64, Ordering::Relaxed);
+    }
+
     pub(super) fn record_entity_remove(&self) {
         let _ = self
             .server_entities
@@ -790,7 +807,8 @@ impl SessionPressureObservation {
             chest_viewer_sets: self.chest_viewer_sets.load(Ordering::Relaxed),
             entity_dispatches: EntityDispatchCounters {
                 spawn: self.entity_spawn_dispatches.load(Ordering::Relaxed),
-                move_relative: self.entity_move_dispatches.load(Ordering::Relaxed),
+                move_relative: self.entity_move_dispatches.load(Ordering::Relaxed)
+                    + self.unlocked_entity_move_dispatches.load(Ordering::Relaxed),
                 data: self.entity_data_dispatches.load(Ordering::Relaxed),
                 take: self.entity_take_dispatches.load(Ordering::Relaxed),
                 remove: self.entity_remove_dispatches.load(Ordering::Relaxed),

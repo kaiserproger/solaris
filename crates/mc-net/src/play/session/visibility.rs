@@ -8,6 +8,7 @@ use mc_protocol::packets::play::MoveEntityPosRot;
 use crate::play::PlayerPose;
 use crate::play::wire_entities::ServerEntityWireMove;
 
+pub(super) use super::entity_tracking::LastSentEntityState;
 use super::outbound::{
     OutboundCommand, PlayerEntitySnapshot, ServerEntityMove, ServerEntitySnapshot,
     SessionRecipient, VisibilityDispatch,
@@ -33,16 +34,6 @@ fn ordered_spawn_session_recipient(id: SessionId, session: &PlaySession) -> Sess
         Arc::clone(&session.pressure),
         &session.ordered_dispatch,
     )
-}
-
-#[derive(Debug, Clone, Copy, PartialEq)]
-pub(super) struct LastSentEntityState {
-    pub(super) position: Vec3,
-    pub(super) velocity: Vec3,
-    pub(super) rotation: Rotation,
-    pub(super) on_ground: bool,
-    pub(super) tracking_update_count: u64,
-    pub(super) teleport_delay: u16,
 }
 
 const ENTITY_POSITION_DIRTY_THRESHOLD_SQUARED: f64 = 7.629_394_531_25e-6;
@@ -341,7 +332,7 @@ pub(super) fn publish_entity_movement_locked(
 ) -> Vec<VisibilityDispatch> {
     let entity_id = snapshot.id;
     let position = snapshot.position;
-    let Some(last_sent) = inner.last_sent_entity_states.get(&entity_id).copied() else {
+    let Some(last_sent) = inner.entity_movement_trackers.get(entity_id) else {
         initialize_entity_wire_state_from_snapshot_locked(inner, snapshot);
         return Vec::new();
     };
@@ -354,14 +345,19 @@ pub(super) fn publish_entity_movement_locked(
     if position_update == EntityPositionUpdate::None {
         return Vec::new();
     }
-    if let Some(sent) = inner.last_sent_entity_states.get_mut(&entity_id) {
-        sent.position = position;
-        sent.on_ground = snapshot.on_ground;
-        if position_update == EntityPositionUpdate::Absolute {
-            sent.rotation.yaw = snapshot.rotation.yaw;
-            sent.rotation.pitch = snapshot.rotation.pitch;
-            sent.teleport_delay = 0;
-        }
+    let mut next_sent = last_sent;
+    next_sent.position = position;
+    next_sent.on_ground = snapshot.on_ground;
+    if position_update == EntityPositionUpdate::Absolute {
+        next_sent.rotation.yaw = snapshot.rotation.yaw;
+        next_sent.rotation.pitch = snapshot.rotation.pitch;
+        next_sent.teleport_delay = 0;
+    }
+    if !inner
+        .entity_movement_trackers
+        .compare_exchange(entity_id, last_sent, next_sent)
+    {
+        return Vec::new();
     }
     let wire_move = entity_wire_move(position_update, false, position);
     let dispatches = old_observers
@@ -646,7 +642,7 @@ pub(super) fn initialize_entity_wire_state_locked(
     let Some(entity) = inner.entities.snapshot(entity_id) else {
         return;
     };
-    inner.last_sent_entity_states.insert(
+    inner.entity_movement_trackers.insert(
         entity_id,
         LastSentEntityState {
             position: entity.position,
@@ -663,7 +659,7 @@ pub(super) fn initialize_entity_wire_state_from_snapshot_locked(
     inner: &mut SessionRegistryInner,
     entity: &ServerEntitySnapshot,
 ) {
-    inner.last_sent_entity_states.insert(
+    inner.entity_movement_trackers.insert(
         entity.id,
         LastSentEntityState {
             position: entity.position,
@@ -978,7 +974,7 @@ pub(super) fn clear_entity_publication_state_locked(
     entity_id: EntityId,
 ) {
     inner.published_entity_snapshots.remove(&entity_id);
-    inner.last_sent_entity_states.remove(&entity_id);
+    inner.entity_movement_trackers.remove(entity_id);
 }
 
 pub(super) fn despawn_entity_visibility_locked(
