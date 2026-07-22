@@ -38,6 +38,17 @@ struct HostileAttackTickEntity {
     position: Vec3,
 }
 
+struct HostileTargetTickSession {
+    id: super::SessionId,
+    position: Vec3,
+    visible_entities: Arc<HashSet<EntityId>>,
+}
+
+struct PlannedCreeperFuse {
+    hostile_id: EntityId,
+    nearest_distance_sq: Option<f64>,
+}
+
 #[derive(Debug, Clone, Copy)]
 enum HostileAttackKind {
     Creeper,
@@ -142,6 +153,22 @@ impl SessionRegistry {
         }
     }
 
+    #[cfg(test)]
+    fn pause_before_hostile_session_publication_for_test(&self) {
+        let probe = self
+            .hostile_publication_probe
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .take();
+        if let Some(probe) = probe {
+            probe
+                .reached
+                .send(())
+                .expect("hostile publication receiver");
+            probe.resume.recv().expect("hostile publication release");
+        }
+    }
+
     pub(in crate::play) fn tick_hostile_attacks(
         &self,
         _authority: &SimulationAuthority,
@@ -207,174 +234,181 @@ impl SessionRegistry {
             return (0, Vec::new());
         }
 
-        let (skeleton_attacks, melee_attacks, creeper_ignitions) = {
-            let mut inner = self.lock_session_entities("plan hostile attacks");
-            let mut skeleton_attacks = Vec::new();
-            let mut melee_attacks = Vec::new();
-            let mut creeper_ignitions = 0;
-            for hostile in hostiles {
-                match hostile.kind {
-                    HostileAttackKind::Creeper => {
-                        let cancel_distance_sq = CREEPER_CANCEL_RANGE * CREEPER_CANCEL_RANGE;
-                        let trigger_distance_sq = CREEPER_TRIGGER_RANGE * CREEPER_TRIGGER_RANGE;
-                        let nearest_distance_sq = inner
-                            .sessions
-                            .iter()
-                            .filter_map(|(&session_id, session)| {
-                                if inner.spectator_sessions.contains(&session_id)
-                                    || inner.dead_sessions.contains(&session_id)
-                                    || !session.visible_entities.contains(&hostile.id)
-                                {
-                                    return None;
-                                }
-                                let position =
-                                    Vec3::new(session.pose.x, session.pose.y, session.pose.z);
-                                Some(distance_sq(hostile.position, position))
-                            })
-                            .min_by(f64::total_cmp);
-                        let Some(expected) = inner.entities.snapshot(hostile.id) else {
-                            continue;
-                        };
-                        let previous_fuse = expected.retained.primed_tnt;
-                        let next_fuse = match (previous_fuse, nearest_distance_sq) {
-                            (None, Some(distance)) if distance < trigger_distance_sq => {
-                                Some(EntityPrimedTntState {
-                                    expires_tick: tick.saturating_add(CREEPER_FUSE_TICKS),
-                                    air_block_state: air.0,
-                                })
-                            }
-                            (Some(_), Some(distance)) if distance <= cancel_distance_sq => {
-                                continue;
-                            }
-                            (Some(fuse), _) => {
-                                let remaining = fuse.expires_tick.saturating_sub(tick);
-                                let progress = CREEPER_FUSE_TICKS.saturating_sub(remaining);
-                                (progress > 1).then_some(EntityPrimedTntState {
-                                    expires_tick: fuse.expires_tick.saturating_add(2),
-                                    air_block_state: fuse.air_block_state,
-                                })
-                            }
-                            (None, _) => continue,
-                        };
-                        let mut next = expected.clone();
-                        next.retained.primed_tnt = next_fuse;
-                        if inner.entities.replace_snapshot_if_current(expected, next)
-                            && previous_fuse.is_none()
-                        {
-                            creeper_ignitions += 1;
-                        }
+        let (targets, arrow_entity_type_id) = {
+            let inner = self.lock_inner("snapshot hostile attack targets");
+            let targets = inner
+                .sessions
+                .iter()
+                .filter_map(|(&id, session)| {
+                    if inner.spectator_sessions.contains(&id) || inner.dead_sessions.contains(&id) {
+                        return None;
                     }
-                    HostileAttackKind::Skeleton => {
-                        let Some(arrow_entity_type_id) =
-                            inner.arrow_kill_rewards.arrow_entity_type_id
-                        else {
-                            continue;
-                        };
-                        let max_distance_sq = SKELETON_SHOT_RANGE * SKELETON_SHOT_RANGE;
-                        let target = inner
-                            .sessions
-                            .iter()
-                            .filter_map(|(&session_id, session)| {
-                                if inner.spectator_sessions.contains(&session_id)
-                                    || inner.dead_sessions.contains(&session_id)
-                                    || !session.visible_entities.contains(&hostile.id)
-                                {
-                                    return None;
-                                }
-                                let position =
-                                    Vec3::new(session.pose.x, session.pose.y, session.pose.z);
-                                let distance = distance_sq(hostile.position, position);
-                                (distance <= max_distance_sq).then_some((distance, position))
-                            })
-                            .min_by(|left, right| left.0.total_cmp(&right.0));
-                        let Some((_, target_position)) = target else {
-                            continue;
-                        };
+                    Some(HostileTargetTickSession {
+                        id,
+                        position: Vec3::new(session.pose.x, session.pose.y, session.pose.z),
+                        visible_entities: session.visible_entities.snapshot(),
+                    })
+                })
+                .collect::<Vec<_>>();
+            (targets, inner.arrow_kill_rewards.arrow_entity_type_id)
+        };
 
-                        let shooter_eye = Vec3::new(
-                            hostile.position.x,
-                            hostile.position.y + 1.5,
-                            hostile.position.z,
-                        );
-                        let target_eye = Vec3::new(
-                            target_position.x,
-                            target_position.y + 1.0,
-                            target_position.z,
-                        );
-                        let delta = Vec3::new(
-                            target_eye.x - shooter_eye.x,
-                            target_eye.y - shooter_eye.y,
-                            target_eye.z - shooter_eye.z,
-                        );
-                        let length =
-                            (delta.x * delta.x + delta.y * delta.y + delta.z * delta.z).sqrt();
-                        if length <= f64::EPSILON {
-                            continue;
-                        }
-                        let direction =
-                            Vec3::new(delta.x / length, delta.y / length, delta.z / length);
-                        let velocity = Vec3::new(
-                            direction.x * SKELETON_ARROW_SPEED,
-                            direction.y * SKELETON_ARROW_SPEED,
-                            direction.z * SKELETON_ARROW_SPEED,
-                        );
-                        let position = Vec3::new(
-                            shooter_eye.x + direction.x * 0.7,
-                            shooter_eye.y + direction.y * 0.7,
-                            shooter_eye.z + direction.z * 0.7,
-                        );
-                        let horizontal = velocity.x.hypot(velocity.z);
-                        let yaw = velocity.z.atan2(velocity.x).to_degrees() as f32 - 90.0;
-                        let pitch = (-velocity.y).atan2(horizontal).to_degrees() as f32;
-                        skeleton_attacks.push(PlannedSkeletonAttack {
-                            hostile_id: hostile.id,
-                            arrow_entity_type_id,
-                            position,
-                            velocity,
-                            rotation: Rotation {
-                                yaw,
-                                pitch,
-                                head_yaw: yaw,
-                            },
-                        });
+        let mut creeper_fuses = Vec::new();
+        let mut skeleton_attacks = Vec::new();
+        let mut melee_attacks = Vec::new();
+        for hostile in hostiles {
+            match hostile.kind {
+                HostileAttackKind::Creeper => {
+                    let nearest_distance_sq = targets
+                        .iter()
+                        .filter(|target| target.visible_entities.contains(&hostile.id))
+                        .map(|target| distance_sq(hostile.position, target.position))
+                        .min_by(f64::total_cmp);
+                    creeper_fuses.push(PlannedCreeperFuse {
+                        hostile_id: hostile.id,
+                        nearest_distance_sq,
+                    });
+                }
+                HostileAttackKind::Skeleton => {
+                    let Some(arrow_entity_type_id) = arrow_entity_type_id else {
+                        continue;
+                    };
+                    let max_distance_sq = SKELETON_SHOT_RANGE * SKELETON_SHOT_RANGE;
+                    let target = targets
+                        .iter()
+                        .filter_map(|target| {
+                            if !target.visible_entities.contains(&hostile.id) {
+                                return None;
+                            }
+                            let distance = distance_sq(hostile.position, target.position);
+                            (distance <= max_distance_sq).then_some((distance, target.position))
+                        })
+                        .min_by(|left, right| left.0.total_cmp(&right.0));
+                    let Some((_, target_position)) = target else {
+                        continue;
+                    };
+
+                    let shooter_eye = Vec3::new(
+                        hostile.position.x,
+                        hostile.position.y + 1.5,
+                        hostile.position.z,
+                    );
+                    let target_eye = Vec3::new(
+                        target_position.x,
+                        target_position.y + 1.0,
+                        target_position.z,
+                    );
+                    let delta = Vec3::new(
+                        target_eye.x - shooter_eye.x,
+                        target_eye.y - shooter_eye.y,
+                        target_eye.z - shooter_eye.z,
+                    );
+                    let length = (delta.x * delta.x + delta.y * delta.y + delta.z * delta.z).sqrt();
+                    if length <= f64::EPSILON {
+                        continue;
                     }
-                    HostileAttackKind::Melee {
-                        attack_damage: amount,
-                    } => {
-                        if amount <= 0.0 {
-                            continue;
-                        }
-                        let max_distance_sq = HOSTILE_MELEE_RANGE * HOSTILE_MELEE_RANGE;
-                        let target = inner
-                            .sessions
-                            .iter()
-                            .filter_map(|(&session_id, session)| {
-                                if inner.spectator_sessions.contains(&session_id)
-                                    || inner.dead_sessions.contains(&session_id)
-                                    || !session.visible_entities.contains(&hostile.id)
-                                    || (session.pose.y - hostile.position.y).abs()
-                                        > HOSTILE_MELEE_VERTICAL_REACH
-                                {
-                                    return None;
-                                }
-                                let dx = session.pose.x - hostile.position.x;
-                                let dz = session.pose.z - hostile.position.z;
-                                let distance = dx * dx + dz * dz;
-                                (distance <= max_distance_sq).then_some((distance, session_id))
-                            })
-                            .min_by(|left, right| left.0.total_cmp(&right.0));
-                        let Some((_, recipient)) = target else {
-                            continue;
-                        };
-                        melee_attacks.push(PlannedMeleeAttack {
-                            hostile_id: hostile.id,
-                            target_session: recipient,
-                            amount,
-                        });
+                    let direction = Vec3::new(delta.x / length, delta.y / length, delta.z / length);
+                    let velocity = Vec3::new(
+                        direction.x * SKELETON_ARROW_SPEED,
+                        direction.y * SKELETON_ARROW_SPEED,
+                        direction.z * SKELETON_ARROW_SPEED,
+                    );
+                    let position = Vec3::new(
+                        shooter_eye.x + direction.x * 0.7,
+                        shooter_eye.y + direction.y * 0.7,
+                        shooter_eye.z + direction.z * 0.7,
+                    );
+                    let horizontal = velocity.x.hypot(velocity.z);
+                    let yaw = velocity.z.atan2(velocity.x).to_degrees() as f32 - 90.0;
+                    let pitch = (-velocity.y).atan2(horizontal).to_degrees() as f32;
+                    skeleton_attacks.push(PlannedSkeletonAttack {
+                        hostile_id: hostile.id,
+                        arrow_entity_type_id,
+                        position,
+                        velocity,
+                        rotation: Rotation {
+                            yaw,
+                            pitch,
+                            head_yaw: yaw,
+                        },
+                    });
+                }
+                HostileAttackKind::Melee {
+                    attack_damage: amount,
+                } => {
+                    if amount <= 0.0 {
+                        continue;
                     }
+                    let max_distance_sq = HOSTILE_MELEE_RANGE * HOSTILE_MELEE_RANGE;
+                    let target = targets
+                        .iter()
+                        .filter_map(|target| {
+                            if !target.visible_entities.contains(&hostile.id)
+                                || (target.position.y - hostile.position.y).abs()
+                                    > HOSTILE_MELEE_VERTICAL_REACH
+                            {
+                                return None;
+                            }
+                            let dx = target.position.x - hostile.position.x;
+                            let dz = target.position.z - hostile.position.z;
+                            let distance = dx * dx + dz * dz;
+                            (distance <= max_distance_sq).then_some((distance, target.id))
+                        })
+                        .min_by(|left, right| left.0.total_cmp(&right.0));
+                    let Some((_, recipient)) = target else {
+                        continue;
+                    };
+                    melee_attacks.push(PlannedMeleeAttack {
+                        hostile_id: hostile.id,
+                        target_session: recipient,
+                        amount,
+                    });
                 }
             }
-            (skeleton_attacks, melee_attacks, creeper_ignitions)
+        }
+
+        let creeper_ignitions = if creeper_fuses.is_empty() {
+            0
+        } else {
+            let creeper_ids = creeper_fuses
+                .iter()
+                .map(|plan| plan.hostile_id)
+                .collect::<HashSet<_>>();
+            let mut entities = self.lock_entities("commit hostile creeper fuses");
+            entities.prefetch(&creeper_ids);
+            let mut ignitions = 0;
+            for plan in creeper_fuses {
+                let Some(expected) = entities.snapshot(plan.hostile_id) else {
+                    continue;
+                };
+                let previous_fuse = expected.retained.primed_tnt;
+                let cancel_distance_sq = CREEPER_CANCEL_RANGE * CREEPER_CANCEL_RANGE;
+                let trigger_distance_sq = CREEPER_TRIGGER_RANGE * CREEPER_TRIGGER_RANGE;
+                let next_fuse = match (previous_fuse, plan.nearest_distance_sq) {
+                    (None, Some(distance)) if distance < trigger_distance_sq => {
+                        Some(EntityPrimedTntState {
+                            expires_tick: tick.saturating_add(CREEPER_FUSE_TICKS),
+                            air_block_state: air.0,
+                        })
+                    }
+                    (Some(_), Some(distance)) if distance <= cancel_distance_sq => continue,
+                    (Some(fuse), _) => {
+                        let remaining = fuse.expires_tick.saturating_sub(tick);
+                        let progress = CREEPER_FUSE_TICKS.saturating_sub(remaining);
+                        (progress > 1).then_some(EntityPrimedTntState {
+                            expires_tick: fuse.expires_tick.saturating_add(2),
+                            air_block_state: fuse.air_block_state,
+                        })
+                    }
+                    (None, _) => continue,
+                };
+                let mut next = expected.clone();
+                next.retained.primed_tnt = next_fuse;
+                if entities.replace_snapshot_if_current(expected, next) && previous_fuse.is_none() {
+                    ignitions += 1;
+                }
+            }
+            ignitions
         };
         if skeleton_attacks.is_empty() && melee_attacks.is_empty() {
             return (creeper_ignitions, Vec::new());
@@ -484,17 +518,21 @@ impl SessionRegistry {
                 .iter()
                 .map(|attack| attack.hostile_id)
                 .collect::<HashSet<_>>();
-            let inner = self.lock_session_entities("commit hostile melee attacks");
-            inner.entities.prefetch(&melee_ids);
-            let current_hostiles = melee_ids
-                .iter()
-                .filter_map(|&entity_id| {
-                    inner
-                        .entities
-                        .snapshot(entity_id)
-                        .map(|entity| (entity_id, entity))
-                })
-                .collect::<HashMap<_, _>>();
+            let current_hostiles = {
+                let entities = self.lock_entities("validate hostile melee attackers");
+                entities.prefetch(&melee_ids);
+                melee_ids
+                    .iter()
+                    .filter_map(|&entity_id| {
+                        entities
+                            .snapshot(entity_id)
+                            .map(|entity| (entity_id, entity))
+                    })
+                    .collect::<HashMap<_, _>>()
+            };
+            #[cfg(test)]
+            self.pause_before_hostile_session_publication_for_test();
+            let inner = self.lock_inner("publish hostile melee attacks");
             for attack in melee_attacks {
                 let Some(hostile) = current_hostiles.get(&attack.hostile_id) else {
                     continue;

@@ -77,6 +77,12 @@ and is not startup context.
   `.analysis/codex-logs/mcp-hostile-combat-server-v2.log`. Next: run a
   20-minute MCP survival session with subagent-made decisions, no deterministic
   scenario runner, and no operator setup; subjective combat feel remains open.
+- Hostile attack planning no longer holds `SessionRegistry.inner` across
+  regional entity-owner requests. It copies live target pose/visibility, runs
+  creeper fuse CAS, skeleton arrow spawn, and melee attacker validation through
+  regional owners, then takes a short session-only melee publication lock with
+  a final target recheck. Focused races cover attacker/target death and the
+  owner-to-publication lock boundary; manual feel remains pending.
 - The exact dense 5,132-cow O3 gate is closed. The final reproduced cause was
   an unanswered keepalive challenge while valid movement packets still proved
   the client alive. Solaris now preserves one pending challenge, requires both

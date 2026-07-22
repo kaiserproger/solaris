@@ -244,6 +244,50 @@ fn attacker_death_between_melee_plan_and_commit_cancels_damage_and_swing() {
 }
 
 #[test]
+fn hostile_owner_validation_releases_session_registry_before_publication() {
+    let registry = Arc::new(SessionRegistry::new());
+    let player = register_test_session(&registry, "DetachedHostilePublication");
+    assert!(registry.mark_loaded(player, (0, 0)).is_empty());
+    registry.spawn_command_entity(
+        &SimulationAuthority::for_test(),
+        54,
+        "minecraft:zombie".to_owned(),
+        Vec3::new(0.5, 64.0, 1.5),
+    );
+    let due_tick = due_melee_tick(&registry);
+    let (reached_tx, reached_rx) = std::sync::mpsc::channel();
+    let (resume_tx, resume_rx) = std::sync::mpsc::channel();
+    *registry
+        .hostile_publication_probe
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(HostileCommitProbe {
+        reached: reached_tx,
+        resume: resume_rx,
+    });
+    let attack_registry = Arc::clone(&registry);
+    let attack = std::thread::spawn(move || {
+        attack_registry.tick_hostile_attacks(
+            &SimulationAuthority::for_test(),
+            due_tick,
+            BlockStateId(0),
+        )
+    });
+    reached_rx
+        .recv_timeout(Duration::from_secs(5))
+        .expect("hostile owner validation reaches publication boundary");
+
+    let session_available = registry.inner.try_lock().is_ok();
+    resume_tx.send(()).expect("release hostile publication");
+    let (attacks, _) = attack.join().expect("hostile attack worker");
+
+    assert!(
+        session_available,
+        "regional owner validation must not retain the session registry"
+    );
+    assert_eq!(attacks, 1);
+}
+
+#[test]
 fn nearby_creeper_primes_once_and_explodes_after_thirty_ticks() {
     let registry = SessionRegistry::new();
     let player = register_test_session(&registry, "CreeperTarget");

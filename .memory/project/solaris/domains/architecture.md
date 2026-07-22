@@ -84,6 +84,12 @@ Current runtime facts:
   count and perform no session-registry or owner-lane read. A transition to zero
   live players pushes generation-fenced hostile-target reconciliation after
   releasing the session lock; do not restore per-tick empty-player ECS scans.
+- Hostile attack planning copies live target poses and immutable visibility
+  sets, then releases `SessionRegistry.inner`. Creeper fuse CAS, arrow spawn,
+  and batched melee-attacker validation execute on regional owners before a
+  short session-only publication recheck. Never put an owner request back under
+  the session lock. This is an ordered regional boundary, not global lock-free
+  state.
 - Uncontrolled heavy host load invalidates performance attribution. Record the
   build, workload, host contention, p95/p99, and maximum; repeat the same gate
   on a clean host. A contaminated run may retain functional evidence only.

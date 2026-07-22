@@ -500,6 +500,8 @@ pub(crate) struct SessionRegistry {
     #[cfg(test)]
     hostile_commit_probe: Mutex<Option<HostileCommitProbe>>,
     #[cfg(test)]
+    hostile_publication_probe: Mutex<Option<HostileCommitProbe>>,
+    #[cfg(test)]
     player_push_commit_probe: Mutex<Option<PlayerPushCommitProbe>>,
     #[cfg(test)]
     pickup_snapshot_probe: Mutex<Option<PickupSnapshotProbe>>,
@@ -782,6 +784,8 @@ impl SessionRegistry {
             hostile_reconcile_probe: Mutex::new(None),
             #[cfg(test)]
             hostile_commit_probe: Mutex::new(None),
+            #[cfg(test)]
+            hostile_publication_probe: Mutex::new(None),
             #[cfg(test)]
             player_push_commit_probe: Mutex::new(None),
             #[cfg(test)]

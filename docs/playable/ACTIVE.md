@@ -86,15 +86,15 @@ hardening. An already-open lower-priority diff does not override this order.
 
 - Hostile melee now keeps a zero-speed target-facing goal while in reach, so a
   stationary zombie stops without freezing its body/head rotation and publishes
-  the corrected facing to observers. Attack publication refreshes the attacker
-  batch while holding the session lock, then rechecks the target's live state,
-  visibility, current pose, vertical reach and range before acceptance. Attacker
-  or target death between plan and commit cancels both damage and swing. Focused
-  tests cover two due attacks and swings against an unmoving player, zero-velocity
-  facing publication, both sides of the death fence, dead-before-plan rejection,
-  and unchanged-goal request count. The existing TCP survival zombie
-  damage/kill/drop test also remains green. This is focused authority and TCP
-  evidence; a real-client feel check remains pending.
+  the corrected facing to observers. Hostile ticks now copy target pose and
+  visibility, release the session registry, and perform creeper, skeleton, and
+  melee owner work on regional lanes. Final melee publication takes only the
+  session registry and rechecks target life, visibility, pose, vertical reach,
+  and range. Attacker or target death before its respective fence cancels both
+  damage and swing. Focused tests cover an unmoving player, facing publication,
+  both death fences, and prove the session registry is free after owner
+  validation. The existing TCP survival zombie damage/kill/drop test also
+  remains green. A real-client feel check remains pending.
 
 - A fresh isolated O3 server and real 26.1.2 client completed the hostile-mob
   functional gate through embedded MCP. The client selected an iron sword,
