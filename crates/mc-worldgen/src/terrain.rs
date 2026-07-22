@@ -477,6 +477,11 @@ impl TerrainGenerator {
         let river = sample.river;
 
         if settings.water_enabled {
+            if river.abs() < RIVER_BIOME_WIDTH * 0.65 && land_mask > -0.02 && height_y <= sea_y {
+                return self
+                    .biomes
+                    .pick(&self.biomes.river, world_x, world_z, 0x5452_4956);
+            }
             if height_y < sea_y - 18 {
                 return self
                     .biomes
@@ -492,15 +497,6 @@ impl TerrainGenerator {
             return self
                 .biomes
                 .pick(&self.biomes.beach, world_x, world_z, 0x5442_4541);
-        }
-        if settings.water_enabled
-            && river.abs() < RIVER_BIOME_WIDTH * 0.65
-            && land_mask > -0.02
-            && height_y <= sea_y
-        {
-            return self
-                .biomes
-                .pick(&self.biomes.river, world_x, world_z, 0x5452_4956);
         }
         if height_y > sea_y + 86 || mountain > 0.22 {
             return self

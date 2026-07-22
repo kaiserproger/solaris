@@ -1692,6 +1692,22 @@ mod tests {
     }
 
     #[test]
+    fn world_contract_rejects_mismatched_worldgen_revision_before_world_open() {
+        let world = tempfile::tempdir().unwrap();
+        let geometry = mc_world::ChunkGeometry::new(-64, 384).unwrap();
+        ensure_world_contract(world.path(), geometry, 7, "vanilla_like").unwrap();
+
+        let path = world_contract_path(world.path());
+        let bytes = std::fs::read(&path).unwrap();
+        let mut persisted: PersistedWorldContract = serde_json::from_slice(&bytes).unwrap();
+        persisted.worldgen_revision = persisted.worldgen_revision.saturating_sub(1);
+        std::fs::write(&path, serde_json::to_vec_pretty(&persisted).unwrap()).unwrap();
+
+        let error = ensure_world_contract(world.path(), geometry, 7, "vanilla_like").unwrap_err();
+        assert!(error.to_string().contains("persisted worldgen revision="));
+    }
+
+    #[test]
     fn unversioned_anvil_world_opens_without_solaris_generation() {
         let world = tempfile::tempdir().unwrap();
         let region = world.path().join("region");

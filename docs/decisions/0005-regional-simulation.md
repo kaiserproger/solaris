@@ -20,6 +20,13 @@ production migration.
 
 ## Decision
 
+The final simulation model is regional single-writer ownership. Solaris does
+not pursue a globally lock-free mutable world: combat, transfers, persistence,
+and cross-region transactions require deterministic ordered commits. Lock-free
+techniques are limited to immutable snapshots, versioned publications, and
+read indexes. Mutable state stays on region owners and crosses boundaries by
+bounded messages and explicit phase fences.
+
 This ADR accepts the regional target and its staged migration rules. It does
 not claim that the migration is complete: current production uses persistent
 regional entity-owner lanes, while coordinator metadata, cross-domain

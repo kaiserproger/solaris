@@ -655,6 +655,29 @@ fn tellus_like_water_uses_configured_sea_level() {
 }
 
 #[test]
+fn tellus_like_river_biomes_are_reachable_on_carved_land() {
+    let settings = TellusWorldgenSettings::default();
+    let g = TerrainGenerator::with_worldgen_mode(
+        91,
+        tiny_registry(),
+        WorldgenMode::TellusLike(settings),
+    );
+
+    let river = (-8_192..=8_192)
+        .step_by(32)
+        .flat_map(|x| (-8_192..=8_192).step_by(32).map(move |z| (x, z)))
+        .find(|(x, z)| {
+            let height = g.surface_height(*x, *z);
+            g.biomes.is_river(&g.biome_for(*x, *z, height))
+        });
+
+    assert!(
+        river.is_some(),
+        "Tellus land should contain a routed river biome"
+    );
+}
+
+#[test]
 fn tellus_like_can_disable_water_fill_without_changing_vanilla_default() {
     let settings = TellusWorldgenSettings {
         water_enabled: false,

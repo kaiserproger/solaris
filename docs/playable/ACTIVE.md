@@ -83,15 +83,17 @@ hardening. An already-open lower-priority diff does not override this order.
   or 401s, moved from z=0.598 to z=9.956, and remained in play at full health.
   The current-build 20-minute autonomous survival session remains pending.
 
-- Worldgen revision 5 replaces the mixed terrain-height formula with bounded
-  layers: continents, erosion/uplands, land-only ridges and low-relief rivers.
+- Worldgen revision 6 replaces revision 5 with separate landform and cave
+  stages: domain-warped continents, branching mountain ranges, and warped
+  river-valley contours that become river biomes only after substantial carving.
   Tests cover a dry walkable 193x193 spawn window across a seed grid, full
-  sampled cave volumes, chunk-border slopes, surface shells, exact tree support,
-  spawn resources, extreme vertical geometry, and wire-level generated world use.
+  sampled cave volumes, chunk-border slopes, isolated-crater rejection, surface
+  shells, exact tree support, spawn resources, extreme vertical geometry, and
+  wire-level generated world use.
   Fresh Solaris worlds persist revision/seed/mode/geometry in
   `solaris/world.json`; unversioned vanilla Anvil worlds open without Solaris
   fallback generation, so terrain authorities cannot mix. `playable.toml` now
-  uses `.analysis/test-world-v5`. Real-client visual inspection is pending.
+  uses `.analysis/test-world-v6`. Real-client visual inspection is pending.
 
 - Hostile melee now keeps a zero-speed target-facing goal while in reach, so a
   stationary zombie stops without freezing its body/head rotation and publishes

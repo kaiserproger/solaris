@@ -22,14 +22,15 @@ Current runtime facts:
 - Overworld terrain shape is owned by `terrain::overworld::OverworldRouter`;
   route worldgen topology, climate, river, cave, or stage extraction work
   through ADR 0008.
-- Worldgen revision 5 layers continents, erosion/uplands, land-only ridges and
-  low-relief rivers so no late terrain mask can create a deep surface pit.
-  Caves keep a 32-block solid surface shell; trees require their exact planned
-  support and a stable 5x5 footprint. Generation order is terrain/caves/ores,
+- Worldgen revision 6 separates new domain-warped landforms from cave routing.
+  Branching ridge fields form mountain ranges; river biomes require a
+  substantially carved valley; a focused sampled invariant detects isolated
+  craters. Caves keep a 32-block solid surface shell; trees require their
+  exact planned support and a stable 5x5 footprint. Generation order is terrain/caves/ores,
   structures, decorations.
   `solaris/world.json` fences revision, seed, mode, and geometry before Anvil
   open. Unversioned Anvil worlds open as vanilla imports without Solaris
-  fallback generation. Evaluate revision 5 in `.analysis/test-world-v5`.
+  fallback generation. Evaluate revision 6 in `.analysis/test-world-v6`.
 - Regional entity owners commit authoritative kinematics. Movement wire plans
   are prepared outside the global session lock and use tracker CAS plus a
   visibility recheck at publication. Visibility indexes and outbound session

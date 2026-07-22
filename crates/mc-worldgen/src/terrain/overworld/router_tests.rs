@@ -51,6 +51,43 @@ fn chunk_borders_have_the_same_slope_budget_as_interior_columns() {
 }
 
 #[test]
+fn landforms_do_not_create_isolated_craters() {
+    for (seed, mode) in [
+        (-11, WorldgenMode::VanillaLike),
+        (23, WorldgenMode::VanillaLike),
+        (
+            91,
+            WorldgenMode::TellusLike(TellusWorldgenSettings::default()),
+        ),
+    ] {
+        let router = OverworldRouter::new(seed, OVERWORLD_GEOMETRY, mode);
+        for z in (-1_024..=1_024).step_by(31) {
+            for x in (-1_024..=1_024).step_by(29) {
+                let center = router.sample(x, z).surface_y;
+                let surrounding_min = [
+                    (x - 4, z),
+                    (x + 4, z),
+                    (x, z - 4),
+                    (x, z + 4),
+                    (x - 3, z - 3),
+                    (x + 3, z - 3),
+                    (x - 3, z + 3),
+                    (x + 3, z + 3),
+                ]
+                .into_iter()
+                .map(|(x, z)| router.sample(x, z).surface_y)
+                .min()
+                .unwrap();
+                assert!(
+                    surrounding_min - center <= 6,
+                    "seed {seed} has an isolated crater at ({x},{z}): {center} below {surrounding_min}"
+                );
+            }
+        }
+    }
+}
+
+#[test]
 fn spawn_window_is_dry_walkable_land_across_seed_grid() {
     for seed in -8..8 {
         let router = OverworldRouter::new(seed, OVERWORLD_GEOMETRY, WorldgenMode::VanillaLike);
