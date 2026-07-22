@@ -1,27 +1,34 @@
-//! Exact vanilla 26.1.2 collision boxes for movement-critical non-full blocks.
+//! Vanilla 26.1.2 context-free collision boxes for every embedded block state.
+//!
+//! Entity-dependent rules such as leather boots walking on powder snow belong
+//! in the entity collision layer on top of this static baseline.
 
-use std::collections::{BTreeMap, HashMap};
 use std::sync::OnceLock;
 
-use serde::Deserialize;
-use thiserror::Error;
-
 use crate::Identifier;
-use crate::blocks::solaris_required_blocks_report;
 
-const RAW_COLLISION_SHAPES: &str = include_str!("../data/block_collision_shapes_26_1_2.json");
+const RAW_COLLISION_SHAPES: &[u8] = include_bytes!("../data/block_collision_shapes_26_1_2.bin");
 const EXPECTED_VERSION: &str = "26.1.2";
-const UNITS_PER_BLOCK: u8 = 16;
+pub const COLLISION_UNITS_PER_BLOCK: i16 = 4096;
+const HEADER_LEN: usize = 32;
+const MISSING_SHAPE: u16 = u16::MAX;
 static VANILLA_COLLISION_SHAPES: OnceLock<CollisionShapeTable> = OnceLock::new();
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct CollisionBox {
-    coordinates: [u8; 6],
+    coordinates: [i16; 6],
 }
 
 impl CollisionBox {
     #[must_use]
-    pub const fn new(min_x: u8, min_y: u8, min_z: u8, max_x: u8, max_y: u8, max_z: u8) -> Self {
+    pub const fn new(
+        min_x: i16,
+        min_y: i16,
+        min_z: i16,
+        max_x: i16,
+        max_y: i16,
+        max_z: i16,
+    ) -> Self {
         assert!(min_x < max_x && min_y < max_y && min_z < max_z);
         Self {
             coordinates: [min_x, min_y, min_z, max_x, max_y, max_z],
@@ -29,66 +36,105 @@ impl CollisionBox {
     }
 
     #[must_use]
-    pub const fn coordinates(self) -> [u8; 6] {
+    pub const fn coordinates(self) -> [i16; 6] {
         self.coordinates
     }
 
     #[must_use]
     pub fn as_blocks(self) -> [f64; 6] {
         self.coordinates
-            .map(|value| f64::from(value) / f64::from(UNITS_PER_BLOCK))
+            .map(|value| f64::from(value) / f64::from(COLLISION_UNITS_PER_BLOCK))
     }
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug)]
 pub struct CollisionShapeTable {
-    version: String,
-    family_state_counts: BTreeMap<String, u32>,
-    shapes: Vec<Box<[CollisionBox]>>,
-    state_shapes: HashMap<u32, usize>,
-    state_identities: HashMap<u32, CanonicalStateIdentity>,
-    farmland_state_ids: Box<[u32]>,
-    max_box_y: u8,
+    bytes: &'static [u8],
+    state_count: usize,
+    shape_count: usize,
+    box_count: usize,
+    fingerprints_offset: usize,
+    shape_offsets_offset: usize,
+    boxes_offset: usize,
+    max_box_y: i16,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
-struct CanonicalStateIdentity {
-    block: Identifier,
-    properties: Box<[(String, String)]>,
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CollisionShape<'a> {
+    bytes: &'a [u8],
 }
 
-impl CanonicalStateIdentity {
-    fn matches(&self, block: &Identifier, properties: &[(String, String)]) -> bool {
-        self.block == *block && self.properties.as_ref() == properties
+impl<'a> CollisionShape<'a> {
+    #[must_use]
+    pub const fn len(self) -> usize {
+        self.bytes.len() / 12
+    }
+
+    #[must_use]
+    pub const fn is_empty(self) -> bool {
+        self.bytes.is_empty()
+    }
+
+    pub fn iter(self) -> impl ExactSizeIterator<Item = CollisionBox> + 'a {
+        self.bytes.chunks_exact(12).map(|bytes| CollisionBox {
+            coordinates: [
+                read_i16(bytes, 0),
+                read_i16(bytes, 2),
+                read_i16(bytes, 4),
+                read_i16(bytes, 6),
+                read_i16(bytes, 8),
+                read_i16(bytes, 10),
+            ],
+        })
+    }
+
+    #[must_use]
+    pub fn is_full_cube(self) -> bool {
+        self.len() == 1
+            && self.iter().next().is_some_and(|collision_box| {
+                collision_box.coordinates()
+                    == [
+                        0,
+                        0,
+                        0,
+                        COLLISION_UNITS_PER_BLOCK,
+                        COLLISION_UNITS_PER_BLOCK,
+                        COLLISION_UNITS_PER_BLOCK,
+                    ]
+            })
     }
 }
 
 impl CollisionShapeTable {
     #[must_use]
     pub fn version(&self) -> &str {
-        &self.version
+        EXPECTED_VERSION
     }
 
-    /// Returns the shape assigned to a canonical numeric state ID without checking identity.
-    /// Runtime collision must use [`Self::get_for_state`] instead.
     #[must_use]
-    pub fn get(&self, state_id: u32) -> Option<&[CollisionBox]> {
-        let shape = *self.state_shapes.get(&state_id)?;
-        self.shapes.get(shape).map(Box::as_ref)
+    pub fn get(&self, state_id: u32) -> Option<CollisionShape<'_>> {
+        let state_id = usize::try_from(state_id).ok()?;
+        if state_id >= self.state_count {
+            return None;
+        }
+        let shape = read_u16(self.bytes, HEADER_LEN + state_id * 2);
+        if shape == MISSING_SHAPE {
+            return None;
+        }
+        self.shape(shape as usize)
     }
 
-    /// Returns a table shape only when all canonical state semantics match exactly.
     #[must_use]
     pub fn get_for_state(
         &self,
         state_id: u32,
         block: &Identifier,
         properties: &[(String, String)],
-    ) -> Option<&[CollisionBox]> {
-        if !self
-            .state_identities
-            .get(&state_id)
-            .is_some_and(|identity| identity.matches(block, properties))
+    ) -> Option<CollisionShape<'_>> {
+        let index = usize::try_from(state_id).ok()?;
+        if index >= self.state_count
+            || read_u64(self.bytes, self.fingerprints_offset + index * 8)
+                != state_fingerprint(block, properties)
         {
             return None;
         }
@@ -102,162 +148,159 @@ impl CollisionShapeTable {
         block: &Identifier,
         properties: &[(String, String)],
     ) -> bool {
-        self.farmland_state_ids.iter().any(|state_id| {
-            self.state_identities
-                .get(state_id)
-                .is_some_and(|identity| identity.matches(block, properties))
-        })
+        block.as_str() == "minecraft:farmland"
+            && properties.len() == 1
+            && properties.iter().any(|(name, value)| {
+                name == "moisture" && value.parse::<u8>().is_ok_and(|value| value <= 7)
+            })
     }
 
     #[must_use]
     pub fn covered_state_count(&self) -> usize {
-        self.state_shapes.len()
+        self.state_count
     }
 
     #[must_use]
-    pub fn family_state_count(&self, family: &str) -> Option<u32> {
-        self.family_state_counts.get(family).copied()
-    }
-
-    #[must_use]
-    pub const fn max_box_y(&self) -> u8 {
+    pub const fn max_box_y(&self) -> i16 {
         self.max_box_y
     }
 
-    fn from_json(json: &str) -> Result<Self, CollisionShapeError> {
-        let raw: RawTable = serde_json::from_str(json)?;
-        if raw.version != EXPECTED_VERSION {
-            return Err(CollisionShapeError::Version(raw.version));
-        }
-        if raw.units_per_block != UNITS_PER_BLOCK {
-            return Err(CollisionShapeError::Units(raw.units_per_block));
-        }
+    #[must_use]
+    pub fn max_box_y_blocks(&self) -> f64 {
+        f64::from(self.max_box_y) / f64::from(COLLISION_UNITS_PER_BLOCK)
+    }
 
-        let mut shapes = Vec::with_capacity(raw.shapes.len());
-        let mut max_box_y = 0;
-        for (shape_index, raw_shape) in raw.shapes.into_iter().enumerate() {
-            if raw_shape.is_empty() {
-                return Err(CollisionShapeError::EmptyShape(shape_index));
-            }
-            let mut shape = Vec::with_capacity(raw_shape.len());
-            for coordinates in raw_shape {
-                if coordinates[0] >= coordinates[3]
-                    || coordinates[1] >= coordinates[4]
-                    || coordinates[2] >= coordinates[5]
-                {
-                    return Err(CollisionShapeError::InvalidBox {
-                        shape: shape_index,
-                        coordinates,
-                    });
-                }
-                max_box_y = max_box_y.max(coordinates[4]);
-                shape.push(CollisionBox { coordinates });
-            }
-            shapes.push(shape.into_boxed_slice());
+    fn from_binary(bytes: &'static [u8]) -> Self {
+        assert!(
+            bytes.len() >= HEADER_LEN,
+            "collision table header is truncated"
+        );
+        assert_eq!(&bytes[..8], b"SOLCOLL1", "collision table magic mismatch");
+        assert_eq!(read_i16(bytes, 8), COLLISION_UNITS_PER_BLOCK);
+        assert_eq!(read_u32(bytes, 24), 1, "unsupported collision table format");
+        assert_eq!(
+            read_u32(bytes, 28),
+            0,
+            "collision table reserved field is set"
+        );
+        let state_count = read_u32(bytes, 12) as usize;
+        let shape_count = read_u32(bytes, 16) as usize;
+        let box_count = read_u32(bytes, 20) as usize;
+        let fingerprints_offset = HEADER_LEN + state_count * 2;
+        let shape_offsets_offset = fingerprints_offset + state_count * 8;
+        let boxes_offset = shape_offsets_offset + (shape_count + 1) * 4;
+        let expected_len = boxes_offset + box_count * 12;
+        assert_eq!(bytes.len(), expected_len, "collision table length mismatch");
+        assert_eq!(
+            read_u32(bytes, shape_offsets_offset + shape_count * 4) as usize,
+            box_count,
+            "collision table terminal box offset mismatch"
+        );
+        for state in 0..state_count {
+            let shape = read_u16(bytes, HEADER_LEN + state * 2);
+            assert!(
+                shape == MISSING_SHAPE || usize::from(shape) < shape_count,
+                "collision table state shape index is out of range"
+            );
         }
+        let mut previous_offset = 0;
+        for shape in 0..=shape_count {
+            let offset = read_u32(bytes, shape_offsets_offset + shape * 4) as usize;
+            assert!(
+                offset >= previous_offset && offset <= box_count,
+                "collision table shape offsets are invalid"
+            );
+            previous_offset = offset;
+        }
+        let mut actual_max_y = 0;
+        for index in 0..box_count {
+            let offset = boxes_offset + index * 12;
+            let coordinates = [
+                read_i16(bytes, offset),
+                read_i16(bytes, offset + 2),
+                read_i16(bytes, offset + 4),
+                read_i16(bytes, offset + 6),
+                read_i16(bytes, offset + 8),
+                read_i16(bytes, offset + 10),
+            ];
+            assert!(
+                coordinates[0] < coordinates[3]
+                    && coordinates[1] < coordinates[4]
+                    && coordinates[2] < coordinates[5],
+                "collision table contains an invalid box"
+            );
+            actual_max_y = actual_max_y.max(coordinates[4]);
+        }
+        assert_eq!(
+            read_i16(bytes, 10),
+            actual_max_y,
+            "collision table maximum Y mismatch"
+        );
+        Self {
+            bytes,
+            state_count,
+            shape_count,
+            box_count,
+            fingerprints_offset,
+            shape_offsets_offset,
+            boxes_offset,
+            max_box_y: read_i16(bytes, 10),
+        }
+    }
 
-        let mut state_shapes = HashMap::with_capacity(raw.entries.len());
-        let mut previous = None;
-        for [state_id, shape_index] in raw.entries {
-            if previous.is_some_and(|previous| state_id <= previous) {
-                return Err(CollisionShapeError::StateOrder(state_id));
-            }
-            let shape_index = usize::try_from(shape_index)
-                .map_err(|_| CollisionShapeError::ShapeIndex(shape_index))?;
-            if shape_index >= shapes.len() {
-                return Err(CollisionShapeError::ShapeIndex(shape_index as u32));
-            }
-            state_shapes.insert(state_id, shape_index);
-            previous = Some(state_id);
+    fn shape(&self, shape: usize) -> Option<CollisionShape<'_>> {
+        if shape >= self.shape_count {
+            return None;
         }
-
-        let canonical_blocks = solaris_required_blocks_report();
-        let mut state_identities = HashMap::with_capacity(state_shapes.len());
-        let mut farmland_state_ids = Vec::new();
-        for block in &canonical_blocks {
-            for state in &block.states {
-                if !state_shapes.contains_key(&state.id) {
-                    continue;
-                }
-                let properties = block
-                    .properties
-                    .keys()
-                    .map(|name| {
-                        (
-                            name.clone(),
-                            state.properties.get(name).cloned().unwrap_or_default(),
-                        )
-                    })
-                    .collect::<Vec<_>>()
-                    .into_boxed_slice();
-                state_identities.insert(
-                    state.id,
-                    CanonicalStateIdentity {
-                        block: block.id.clone(),
-                        properties,
-                    },
-                );
-                if block.id.as_str() == "minecraft:farmland" {
-                    farmland_state_ids.push(state.id);
-                }
-            }
+        let start = read_u32(self.bytes, self.shape_offsets_offset + shape * 4) as usize;
+        let end = read_u32(self.bytes, self.shape_offsets_offset + (shape + 1) * 4) as usize;
+        if start > end || end > self.box_count {
+            return None;
         }
-        if state_identities.len() != state_shapes.len() {
-            let missing_state = state_shapes
-                .keys()
-                .find(|state_id| !state_identities.contains_key(state_id))
-                .copied()
-                .expect("state identity count mismatch has a missing state");
-            return Err(CollisionShapeError::MissingCanonicalState(missing_state));
-        }
-
-        Ok(Self {
-            version: raw.version,
-            family_state_counts: raw.family_state_counts,
-            shapes,
-            state_shapes,
-            state_identities,
-            farmland_state_ids: farmland_state_ids.into_boxed_slice(),
-            max_box_y,
+        Some(CollisionShape {
+            bytes: &self.bytes[self.boxes_offset + start * 12..self.boxes_offset + end * 12],
         })
     }
 }
 
 #[must_use]
 pub fn vanilla_collision_shapes() -> &'static CollisionShapeTable {
-    VANILLA_COLLISION_SHAPES.get_or_init(|| {
-        CollisionShapeTable::from_json(RAW_COLLISION_SHAPES)
-            .expect("embedded vanilla 26.1.2 collision shape data is valid")
-    })
+    VANILLA_COLLISION_SHAPES.get_or_init(|| CollisionShapeTable::from_binary(RAW_COLLISION_SHAPES))
 }
 
-#[derive(Debug, Error)]
-enum CollisionShapeError {
-    #[error("collision shape data is not valid JSON: {0}")]
-    Json(#[from] serde_json::Error),
-    #[error("collision shape data version is {0}, expected 26.1.2")]
-    Version(String),
-    #[error("collision shape units_per_block is {0}, expected 16")]
-    Units(u8),
-    #[error("collision shape {0} is empty")]
-    EmptyShape(usize),
-    #[error("collision shape {shape} has invalid box {coordinates:?}")]
-    InvalidBox { shape: usize, coordinates: [u8; 6] },
-    #[error("collision state entries are duplicate or unsorted at state {0}")]
-    StateOrder(u32),
-    #[error("collision shape index {0} is out of range")]
-    ShapeIndex(u32),
-    #[error("collision state {0} is missing from the embedded canonical block report")]
-    MissingCanonicalState(u32),
+fn state_fingerprint(block: &Identifier, properties: &[(String, String)]) -> u64 {
+    let mut hash = fnv1a(0xcbf2_9ce4_8422_2325, block.as_str().as_bytes());
+    for (name, value) in properties {
+        hash = fnv1a(hash, b"\0");
+        hash = fnv1a(hash, name.as_bytes());
+        hash = fnv1a(hash, b"=");
+        hash = fnv1a(hash, value.as_bytes());
+    }
+    hash
 }
 
-#[derive(Deserialize)]
-struct RawTable {
-    version: String,
-    units_per_block: u8,
-    family_state_counts: BTreeMap<String, u32>,
-    shapes: Vec<Vec<[u8; 6]>>,
-    entries: Vec<[u32; 2]>,
+fn fnv1a(mut hash: u64, bytes: &[u8]) -> u64 {
+    for &byte in bytes {
+        hash ^= u64::from(byte);
+        hash = hash.wrapping_mul(0x100_0000_01b3);
+    }
+    hash
+}
+
+fn read_u16(bytes: &[u8], offset: usize) -> u16 {
+    u16::from_be_bytes(bytes[offset..offset + 2].try_into().expect("u16 slice"))
+}
+
+fn read_i16(bytes: &[u8], offset: usize) -> i16 {
+    i16::from_be_bytes(bytes[offset..offset + 2].try_into().expect("i16 slice"))
+}
+
+fn read_u32(bytes: &[u8], offset: usize) -> u32 {
+    u32::from_be_bytes(bytes[offset..offset + 4].try_into().expect("u32 slice"))
+}
+
+fn read_u64(bytes: &[u8], offset: usize) -> u64 {
+    u64::from_be_bytes(bytes[offset..offset + 8].try_into().expect("u64 slice"))
 }
 
 #[cfg(test)]
@@ -266,6 +309,32 @@ mod tests {
     use crate::blocks::solaris_required_blocks_report;
 
     use super::{CollisionBox, vanilla_collision_shapes};
+
+    fn box_16(
+        min_x: i16,
+        min_y: i16,
+        min_z: i16,
+        max_x: i16,
+        max_y: i16,
+        max_z: i16,
+    ) -> CollisionBox {
+        CollisionBox::new(
+            min_x * 256,
+            min_y * 256,
+            min_z * 256,
+            max_x * 256,
+            max_y * 256,
+            max_z * 256,
+        )
+    }
+
+    fn shape(state_id: u32) -> Vec<CollisionBox> {
+        vanilla_collision_shapes()
+            .get(state_id)
+            .expect("state collision shape")
+            .iter()
+            .collect()
+    }
 
     fn state_id(block_name: &str, properties: &[(&str, &str)]) -> u32 {
         let blocks = solaris_required_blocks_report();
@@ -321,13 +390,13 @@ mod tests {
             .iter()
             .find(|block| block.id.as_str() == "minecraft:farmland")
             .unwrap();
-        let expected = [CollisionBox::new(0, 0, 0, 16, 15, 16)];
+        let expected = [box_16(0, 0, 0, 16, 15, 16)];
 
         assert_eq!(farmland.states.len(), 8);
         for state in &farmland.states {
             assert_eq!(
-                vanilla_collision_shapes().get(state.id),
-                Some(expected.as_slice()),
+                shape(state.id),
+                expected,
                 "farmland state {} must retain the vanilla 15/16 collision top",
                 state.id
             );
@@ -335,30 +404,15 @@ mod tests {
     }
 
     #[test]
-    fn oracle_table_is_pinned_to_the_named_pareto_families() {
+    fn oracle_table_covers_the_complete_vanilla_state_registry() {
         let table = vanilla_collision_shapes();
 
         assert_eq!(table.version(), "26.1.2");
-        assert_eq!(table.family_state_count("farmland"), Some(8));
-        for family in ["fence", "slab", "stairs"] {
-            assert!(
-                table
-                    .family_state_count(family)
-                    .is_some_and(|count| count > 0)
-            );
-        }
-        assert_eq!(
-            table.covered_state_count(),
-            ["farmland", "fence", "slab", "stairs"]
-                .into_iter()
-                .map(|family| table.family_state_count(family).unwrap() as usize)
-                .sum::<usize>()
-        );
+        assert_eq!(table.covered_state_count(), 29_873);
     }
 
     #[test]
     fn oracle_table_keeps_state_dependent_slab_stair_and_fence_boxes() {
-        let shapes = vanilla_collision_shapes();
         let bottom_slab = state_id(
             "minecraft:stone_slab",
             &[("type", "bottom"), ("waterlogged", "false")],
@@ -387,28 +441,42 @@ mod tests {
             ],
         );
 
+        assert_eq!(shape(bottom_slab), [box_16(0, 0, 0, 16, 8, 16)]);
+        assert_eq!(shape(top_slab), [box_16(0, 8, 0, 16, 16, 16)]);
         assert_eq!(
-            shapes.get(bottom_slab),
-            Some([CollisionBox::new(0, 0, 0, 16, 8, 16)].as_slice())
+            shape(straight_stair),
+            [box_16(0, 0, 0, 16, 8, 16), box_16(0, 8, 0, 16, 16, 8)]
         );
-        assert_eq!(
-            shapes.get(top_slab),
-            Some([CollisionBox::new(0, 8, 0, 16, 16, 16)].as_slice())
+        assert_eq!(shape(isolated_fence), [box_16(6, 0, 6, 10, 24, 10)]);
+    }
+
+    #[test]
+    fn oracle_table_keeps_closed_and_open_door_planes() {
+        let shapes = vanilla_collision_shapes();
+        let closed = state_id(
+            "minecraft:oak_door",
+            &[
+                ("facing", "north"),
+                ("half", "lower"),
+                ("hinge", "left"),
+                ("open", "false"),
+                ("powered", "false"),
+            ],
         );
-        assert_eq!(
-            shapes.get(straight_stair),
-            Some(
-                [
-                    CollisionBox::new(0, 0, 0, 16, 8, 16),
-                    CollisionBox::new(0, 8, 0, 16, 16, 8),
-                ]
-                .as_slice()
-            )
+        let open = state_id(
+            "minecraft:oak_door",
+            &[
+                ("facing", "north"),
+                ("half", "lower"),
+                ("hinge", "left"),
+                ("open", "true"),
+                ("powered", "false"),
+            ],
         );
-        assert_eq!(
-            shapes.get(isolated_fence),
-            Some([CollisionBox::new(6, 0, 6, 10, 24, 10)].as_slice())
-        );
+
+        assert_ne!(shapes.get(closed), shapes.get(open));
+        assert!(shapes.get(closed).is_some_and(|boxes| boxes.len() == 1));
+        assert!(shapes.get(open).is_some_and(|boxes| boxes.len() == 1));
     }
 
     #[test]
@@ -500,6 +568,6 @@ mod tests {
 
     #[test]
     fn oracle_table_reports_maximum_local_collision_y() {
-        assert_eq!(vanilla_collision_shapes().max_box_y(), 24);
+        assert_eq!(vanilla_collision_shapes().max_box_y(), 24 * 256);
     }
 }

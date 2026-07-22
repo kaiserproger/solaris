@@ -548,7 +548,9 @@ regional read, and filters the ECS animal state that actually needs a tick.
 Unobserved regions neither join the owner request nor age their animals. The
 former coordinator and owner-lane all-world breeding snapshot commands were
 deleted; breeding planning still runs without retaining session state or owner
-admission.
+admission. Age and love counters advance in 20-tick batches. This keeps their
+tick-count semantics while removing the per-tick synchronous owner round trip;
+pairing and adulthood publication may therefore lag by at most one second.
 Ordinary goal-input collection also reads immutable publications for active
 chunks, a 64-shard chunk-to-entity index, terrain-pathing IDs, and per-session
 combat-target poses. It therefore does not enter `SessionRegistry.inner`.
@@ -777,13 +779,12 @@ Restart repair and replay inspect the WAL bytes and choose exactly the recorded
 outcome; runtime code never guesses whether the attempted decision reached disk.
 
 Active furnace ticks retain their full `(block state, furnace snapshot)` CAS
-under the resident region lock and now stamp every changed chunk with one
-decision shared by the simulation pass. The coordinator appends the final
-unique chunk images once, then clears their flush fences and dispatches viewer
-updates. Stale furnaces are replanned from a fresh resident pair only after the
-current wave, including an empty decision when nothing applied, is durable.
-This preserves conflict semantics without one fsync per furnace or guessed
-retry timing.
+under the resident region lock. A successful local mutation marks the owning
+chunk dirty for the normal save cadence and dispatches viewer updates without
+waiting for a WAL append on the tick thread. Stale furnaces are replanned from a
+fresh resident pair on the next pass. This keeps the common cooking path
+responsive; an unclean process loss may discard unsaved furnace progress just
+like other ordinary dirty world state.
 
 Active campfire cooking now shares that resident journal-wave boundary. The
 campfire session lock protects the in-memory cooking transition while a
@@ -794,21 +795,20 @@ Cold chunks are not loaded for ticking. This makes the world-side cooking state
 recoverable and bounds WAL appends per pass; it does not yet make the later
 cooked item entity spawn exactly-once across process loss.
 
-Ordinary scheduled block passes now preserve their global due order as
-contiguous regional waves instead of submitting one batch that becomes
-`CrossRegion` as soon as two independent regions are active. Same-wave groups
-share one journal decision and final append. Distinct region groups fan out
-across autoscaler CPU permits; groups assigned to the same worker lane keep due
-order. Repeated region order such as `A, B, A` stays sequential, and each group
-is replanned from the state published by the preceding commit so it still
-finishes in the current server tick. A group's complete planned edit footprint
-still has to fit one region; otherwise the preceding resident wave is made
-durable, the group crosses the ordered coordinator barrier, and only then does
-the next resident wave begin. The coordinator path uses the same ordered
-pre-stamp, flush-fence, append, and recovery protocol as other block edits. This
-removes the global writer from the multi-region common case without weakening
-same-region order or boundary atomicity. Autoscaler scale-down to one CPU keeps
-the pass inline.
+Ordinary scheduled block passes preserve their global due order as contiguous
+regional groups instead of submitting one batch that becomes `CrossRegion` as
+soon as two independent regions are active. An inline single-region group uses
+resident conditional mutation and the normal dirty-chunk save cadence; it does
+not wait for a WAL append on the tick thread. This deliberately allows an
+unclean process loss to discard unsaved ordinary scheduled-tick progress, like
+other unsaved world state, and removes the measured 70-133 ms append stalls
+from the common path. Distinct region groups may fan out across autoscaler CPU
+permits and retain their ordered journal wave. Repeated region order such as
+`A, B, A` stays sequential, and each group is replanned from state published by
+the preceding commit. A plan whose edit footprint crosses a region boundary
+still uses the ordered durable coordinator transaction because partial
+installation would violate block invariants. Autoscaler scale-down to one CPU
+keeps ordinary groups inline.
 
 Random-tick planning now partitions the common mutation path before commit.
 Contiguous groups retain global sample order and original indexes for

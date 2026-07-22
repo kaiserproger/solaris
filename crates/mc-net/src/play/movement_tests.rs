@@ -21,6 +21,20 @@ fn water_plants_do_not_become_full_cube_collision_fallbacks() {
     }
 }
 
+#[test]
+fn torches_do_not_become_full_cube_collision_fallbacks() {
+    for name in [
+        "minecraft:torch",
+        "minecraft:wall_torch",
+        "minecraft:soul_torch",
+        "minecraft:soul_wall_torch",
+        "minecraft:redstone_torch",
+        "minecraft:redstone_wall_torch",
+    ] {
+        assert!(passable_block_name(name), "{name} must be passable");
+    }
+}
+
 #[tokio::test]
 async fn swimming_pose_submerges_eyes_in_one_block_of_water() {
     let mut state = interaction_state_for_blocks(Arc::new(fluid_test_registry()));

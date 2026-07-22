@@ -132,7 +132,10 @@ impl SessionRegistry {
         chunk: (i32, i32),
         spawns: &[HerdSpawn],
     ) -> HerdSpawnOutcome {
-        self.ensure_chunk_herds_owned(&[(chunk, spawns.to_vec())])
+        self.ensure_chunk_herds_owned(
+            &[(chunk, spawns.to_vec())],
+            MIN_ENTITY_SPAWN_DISTANCE_FROM_PLAYER,
+        )
     }
 
     pub(in crate::play) fn ensure_chunk_herds(
@@ -140,7 +143,7 @@ impl SessionRegistry {
         _authority: &SimulationAuthority,
         herds: &[((i32, i32), Vec<HerdSpawn>)],
     ) -> HerdSpawnOutcome {
-        self.ensure_chunk_herds_owned(herds)
+        self.ensure_chunk_herds_owned(herds, MIN_ENTITY_SPAWN_DISTANCE_FROM_PLAYER)
     }
 
     #[cfg(test)]
@@ -149,11 +152,15 @@ impl SessionRegistry {
         chunk: (i32, i32),
         spawns: &[HerdSpawn],
     ) -> Vec<VisibilityDispatch> {
-        self.ensure_chunk_herds_owned(&[(chunk, spawns.to_vec())])
+        self.ensure_chunk_herds_owned(&[(chunk, spawns.to_vec())], 0.5)
             .into_dispatches()
     }
 
-    fn ensure_chunk_herds_owned(&self, herds: &[((i32, i32), Vec<HerdSpawn>)]) -> HerdSpawnOutcome {
+    fn ensure_chunk_herds_owned(
+        &self,
+        herds: &[((i32, i32), Vec<HerdSpawn>)],
+        minimum_player_distance: f64,
+    ) -> HerdSpawnOutcome {
         #[cfg(test)]
         self.pause_before_chunk_herd_claim_for_test();
         let (selected, claims, player_positions, capacities) = {
@@ -208,7 +215,13 @@ impl SessionRegistry {
         let candidates = selected
             .iter()
             .flat_map(|(chunk, spawns)| {
-                build_herd_spawn_candidates(*chunk, spawns, &player_positions, lifecycle_tick)
+                build_herd_spawn_candidates(
+                    *chunk,
+                    spawns,
+                    &player_positions,
+                    lifecycle_tick,
+                    minimum_player_distance,
+                )
             })
             .collect::<Vec<_>>();
         let candidates = limit_natural_candidates(candidates, capacities);
@@ -267,6 +280,7 @@ impl SessionRegistry {
                     &claim.spawns,
                     &claimed.player_positions,
                     lifecycle_tick,
+                    MIN_ENTITY_SPAWN_DISTANCE_FROM_PLAYER,
                 )
             })
             .collect::<Vec<_>>();
@@ -424,6 +438,7 @@ fn build_herd_spawn_candidates(
     spawns: &[HerdSpawn],
     player_positions: &[Vec3],
     lifecycle_tick: u64,
+    minimum_player_distance: f64,
 ) -> Vec<SpawnEntity> {
     let mut passive_count = 0_usize;
     let mut hostile_count = 0_usize;
@@ -437,7 +452,8 @@ fn build_herd_spawn_candidates(
         } else if passive_count >= MAX_PASSIVE_SPAWNS_PER_CHUNK {
             continue;
         }
-        if !spawn_far_enough_from_players(player_positions, spawn.position) {
+        if !spawn_far_enough_from_players(player_positions, spawn.position, minimum_player_distance)
+        {
             continue;
         }
         let mut entity = SpawnEntity::new(
@@ -481,9 +497,12 @@ fn build_herd_spawn_candidates(
     entities
 }
 
-fn spawn_far_enough_from_players(player_positions: &[Vec3], position: Vec3) -> bool {
-    let min_distance_sq =
-        MIN_ENTITY_SPAWN_DISTANCE_FROM_PLAYER * MIN_ENTITY_SPAWN_DISTANCE_FROM_PLAYER;
+pub(super) fn spawn_far_enough_from_players(
+    player_positions: &[Vec3],
+    position: Vec3,
+    minimum_distance: f64,
+) -> bool {
+    let min_distance_sq = minimum_distance * minimum_distance;
     player_positions
         .iter()
         .all(|player| distance_sq(position, *player) > min_distance_sq)

@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
-# Extract state-specific collision boxes for the first movement-critical
-# non-full block families from the bundled vanilla 26.1.2 server.
+# Extract state-specific collision boxes for every block state from the bundled
+# vanilla 26.1.2 server. The generated table is embedded in mc-data.
 
 set -euo pipefail
 
@@ -12,7 +12,7 @@ if [[ "${1:-}" == "--check" ]]; then
 fi
 
 BUNDLE_JAR="${1:-$REPO_ROOT/.analysis/server.jar}"
-OUT_JSON="$REPO_ROOT/crates/mc-data/data/block_collision_shapes_26_1_2.json"
+OUT_BIN="$REPO_ROOT/crates/mc-data/data/block_collision_shapes_26_1_2.bin"
 JAVA="${JAVA:-$REPO_ROOT/.analysis/java/current/bin/java}"
 if [[ ! -x "$JAVA" ]]; then
   JAVA="$(command -v java || true)"
@@ -44,18 +44,17 @@ mkdir -p "$TMP/classes"
 "$JAVAC" -d "$TMP/classes" -cp "$CP" \
   "$REPO_ROOT/tools/extract-block-collision-shapes/CollisionShapeExtractor.java"
 
-GENERATED="$TMP/block_collision_shapes_26_1_2.json"
+GENERATED="$TMP/block_collision_shapes_26_1_2.bin"
 "$JAVA" -cp "$TMP/classes:$CP" CollisionShapeExtractor "$GENERATED"
 
 if [[ "$CHECK" -eq 1 ]]; then
-  if ! cmp -s "$GENERATED" "$OUT_JSON"; then
-    echo "error: $OUT_JSON is stale; rerun tools/extract-block-collision-shapes.sh" >&2
-    diff -u "$OUT_JSON" "$GENERATED" || true
+  if ! cmp -s "$GENERATED" "$OUT_BIN"; then
+    echo "error: $OUT_BIN is stale; rerun tools/extract-block-collision-shapes.sh" >&2
     exit 1
   fi
-  echo "verified $OUT_JSON against bundled vanilla 26.1.2"
+  echo "verified $OUT_BIN against bundled vanilla 26.1.2"
 else
-  mkdir -p "$(dirname "$OUT_JSON")"
-  cp "$GENERATED" "$OUT_JSON"
-  echo "wrote $OUT_JSON ($(stat -c %s "$OUT_JSON") bytes)"
+  mkdir -p "$(dirname "$OUT_BIN")"
+  cp "$GENERATED" "$OUT_BIN"
+  echo "wrote $OUT_BIN ($(stat -c %s "$OUT_BIN") bytes)"
 fi

@@ -1,7 +1,7 @@
 use mc_data::Identifier;
 use mc_data::item_components::ItemFactsTable;
 use mc_data::items::{ItemRegistry, ItemReport};
-use mc_world::FurnaceBlockEntity;
+use mc_world::{FurnaceBlockEntity, FurnaceSlot};
 
 use super::{FurnaceClickAction, FurnaceClickInput, FurnaceKind, plan_click};
 use crate::play::{ItemStack, PlayerInventory};
@@ -41,4 +41,34 @@ fn non_flammable_wood_is_rejected_by_every_fuel_slot_click_path() {
 
         assert!(plan.is_none());
     }
+}
+
+#[test]
+fn output_quick_move_uses_the_vanilla_reverse_player_range() {
+    let items = ItemRegistry::from_report(&[ItemReport {
+        id: Identifier::parse("minecraft:iron_ingot").unwrap(),
+        protocol_id: 11,
+    }]);
+    let mut furnace = FurnaceBlockEntity::default();
+    furnace.slots[2] = FurnaceSlot {
+        item_id: 11,
+        count: 3,
+        ..FurnaceSlot::default()
+    };
+    let plan = plan_click(FurnaceClickInput {
+        recipes: &[],
+        items: &items,
+        item_facts: &ItemFactsTable::default(),
+        tags: &mc_data::tags::TagsData::default(),
+        kind: FurnaceKind::Furnace,
+        furnace,
+        inventory: PlayerInventory::empty(),
+        carried_item: ItemStack::EMPTY,
+        action: FurnaceClickAction::QuickMove { slot: 2 },
+        experience_seed: 0,
+    })
+    .expect("furnace output moves");
+
+    assert!(plan.furnace.slots[2].is_empty());
+    assert_eq!(plan.inventory.slots[44], ItemStack::new(11, 3));
 }

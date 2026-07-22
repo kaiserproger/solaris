@@ -16,6 +16,7 @@ use uuid::Uuid;
 pub(crate) mod ai_core_26_1_2;
 pub mod attributes_26_1_2;
 pub mod effects_26_1_2;
+mod entity_scale_26_1_2;
 pub mod equipment_26_1_2;
 pub mod living_26_1_2;
 pub mod mob_control_26_1_2;
@@ -26,6 +27,11 @@ mod runtime;
 pub mod runtime_26_1_2;
 pub mod synced_data_26_1_2;
 
+#[cfg(test)]
+#[path = "entity_scale_26_1_2_tests.rs"]
+mod entity_scale_26_1_2_tests;
+
+pub use entity_scale_26_1_2::{EntityScale26_1_2, EntityScaleError};
 pub use regional::VillagerBindingClaim;
 pub use regional::{
     REGION_SIZE_CHUNKS, RegionEntityStoreError, RegionEpoch, RegionKey, RegionLease,
@@ -585,6 +591,7 @@ pub enum AttributeKind {
     MovementSpeed,
     FollowRange,
     AttackDamage,
+    Scale,
     Custom(String),
 }
 
@@ -596,6 +603,7 @@ impl AttributeKind {
             Self::MovementSpeed => "minecraft:movement_speed",
             Self::FollowRange => "minecraft:follow_range",
             Self::AttackDamage => "minecraft:attack_damage",
+            Self::Scale => "minecraft:scale",
             Self::Custom(name) => name.as_str(),
         }
     }
@@ -645,6 +653,10 @@ impl AttributeSet {
         attrs.set_base(AttributeKind::MovementSpeed, 0.25);
         attrs.set_base(AttributeKind::FollowRange, 16.0);
         attrs.set_base(AttributeKind::AttackDamage, 0.0);
+        attrs.set_base(
+            AttributeKind::Scale,
+            f64::from(EntityScale26_1_2::DEFAULT.factor()),
+        );
         attrs
     }
 
@@ -659,6 +671,28 @@ impl AttributeSet {
 
     pub fn iter(&self) -> impl Iterator<Item = (&AttributeKind, &AttributeValue)> {
         self.values.iter()
+    }
+}
+
+impl EntitySnapshot {
+    /// Returns the effective live `minecraft:scale` carried by this snapshot.
+    #[must_use]
+    pub fn scale_26_1_2(&self) -> EntityScale26_1_2 {
+        EntityScale26_1_2::from_attribute_value(self.attributes.base(&AttributeKind::Scale))
+    }
+
+    /// Updates the snapshot projection used by the existing owner CAS path.
+    pub fn set_scale_26_1_2(&mut self, scale: EntityScale26_1_2) {
+        self.attributes
+            .set_base(AttributeKind::Scale, f64::from(scale.factor()));
+    }
+}
+
+impl EntityView<'_> {
+    /// Returns the effective live `minecraft:scale` carried by this ECS view.
+    #[must_use]
+    pub fn scale_26_1_2(&self) -> EntityScale26_1_2 {
+        EntityScale26_1_2::from_attribute_value(self.attributes.base(&AttributeKind::Scale))
     }
 }
 
@@ -2777,7 +2811,9 @@ mod tests {
         );
         assert_eq!(attrs.base(&AttributeKind::MaxHealth), Some(20.0));
         assert_eq!(attrs.base(&AttributeKind::AttackDamage), Some(3.0));
-        assert_eq!(attrs.iter().count(), 4);
+        assert_eq!(AttributeKind::Scale.vanilla_name(), "minecraft:scale");
+        assert_eq!(attrs.base(&AttributeKind::Scale), Some(1.0));
+        assert_eq!(attrs.iter().count(), 5);
     }
 
     #[test]

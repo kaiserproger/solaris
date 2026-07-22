@@ -240,6 +240,7 @@ impl SessionRegistry {
     pub(in crate::play) fn tick_animal_breeding(
         &self,
         _authority: &SimulationAuthority,
+        elapsed_ticks: u16,
     ) -> (usize, Vec<VisibilityDispatch>) {
         if !self.has_live_sessions() {
             return (0, Vec::new());
@@ -283,7 +284,7 @@ impl SessionRegistry {
 
         #[cfg(test)]
         self.pause_during_breeding_plan_for_test();
-        let breeding_plan = plan_breeding(breeding_tick, &animals);
+        let breeding_plan = plan_breeding(breeding_tick, &animals, elapsed_ticks);
 
         if animals
             .iter()

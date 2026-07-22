@@ -59,6 +59,8 @@ The script pulls a deterministic subset from `.analysis/server.jar`:
   oracles for the protocol layer.
 - `reports/minecraft/components/item/` — produced by the server's own
   Default Components provider and used by M25+ item fact loaders.
+- `reports/block_explosion.json` — one vanilla explosion-resistance value per
+  global block-state ID, generated through the public `Block` API.
 
 Everything else (advancements, full worldgen beyond the selected subset,
 structures) is left out by default — add explicit copy steps in the script when

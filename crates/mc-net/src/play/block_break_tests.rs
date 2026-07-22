@@ -11,9 +11,8 @@ use mc_protocol::packets::play::{
 use tokio::sync::mpsc;
 
 use super::block_break::{
-    BlockBreakState, DelayedBreakOutcome, HeldMiningTool, PendingBreak, StopBreakOutcome,
-    handle_block_destroy_action, mining_tool_matches, plan_break_block_edits,
-    plan_break_edit_preconditions,
+    BlockBreakState, DelayedBreakOutcome, PendingBreak, StopBreakOutcome,
+    handle_block_destroy_action, plan_break_block_edits, plan_break_edit_preconditions,
 };
 use super::inventory::PlayerInventory;
 use super::persistence::{PlayerPersistedState, XpState};
@@ -488,18 +487,11 @@ fn malformed_or_unloaded_stair_transition_dependencies_fail_closed() {
 }
 
 #[test]
-fn break_preconditions_match_the_exact_stair_selector_read_footprint() {
+fn breaking_non_stair_does_not_depend_on_neighbor_chunks() {
     let blocks = stair_test_registry();
-    let root = mc_world::BlockPos { x: 8, y: 64, z: 8 };
-    let north = relative(root, Direction::North);
-    let north_behind = relative(north, Direction::North);
-    let south = relative(root, Direction::South);
-    let west = relative(root, Direction::West);
-    let east = relative(root, Direction::East);
-    let stair = stair_state(&blocks, Direction::North, "bottom", "straight", "true");
+    let root = mc_world::BlockPos { x: 15, y: 64, z: 8 };
     let mut world = stair_test_world(Arc::clone(&blocks));
     world.set_block_at(root, mc_world::BlockStateId(1)).unwrap();
-    world.set_block_at(north, stair).unwrap();
     let expected_root = BlockMutationSnapshot {
         state: mc_world::BlockStateId(1),
         token: world.block_mutation_token(root).unwrap(),
@@ -520,7 +512,7 @@ fn break_preconditions_match_the_exact_stair_selector_read_footprint() {
             .iter()
             .map(|precondition| precondition.pos)
             .collect::<Vec<_>>(),
-        vec![root, north, north_behind, south, west, east]
+        vec![root]
     );
 }
 
@@ -717,15 +709,7 @@ async fn start_tick_is_captured_before_owner_snapshot_queue_latency() {
 fn stop_at_vanilla_threshold_completes_immediately() {
     let mut active = Some(pending(12, 40));
     let mut delayed = None;
-    let outcome = BlockBreakState::new(&mut active, &mut delayed).stop(
-        &stop(12, 5),
-        HeldMiningTool {
-            hotbar_slot: 0,
-            stack: Some(&ItemStack::new(10, 64)),
-        },
-        46,
-        0.1,
-    );
+    let outcome = BlockBreakState::new(&mut active, &mut delayed).stop(&stop(12, 5), 46, 0.1);
 
     let StopBreakOutcome::Complete(completion) = outcome else {
         panic!("expected immediate completion");
@@ -739,15 +723,7 @@ fn stop_at_vanilla_threshold_completes_immediately() {
 fn early_stop_acknowledges_and_transfers_to_delayed_progress() {
     let mut active = Some(pending(12, 40));
     let mut delayed = None;
-    let outcome = BlockBreakState::new(&mut active, &mut delayed).stop(
-        &stop(12, 5),
-        HeldMiningTool {
-            hotbar_slot: 0,
-            stack: Some(&ItemStack::new(10, 2)),
-        },
-        44,
-        0.1,
-    );
+    let outcome = BlockBreakState::new(&mut active, &mut delayed).stop(&stop(12, 5), 44, 0.1);
 
     assert_eq!(outcome, StopBreakOutcome::Acknowledge { delayed: true });
     assert!(active.is_none());
@@ -768,17 +744,10 @@ fn new_start_does_not_overwrite_existing_delayed_break() {
 fn second_early_stop_does_not_overwrite_existing_delayed_break() {
     let mut active = Some(pending(24, 50));
     let mut delayed = Some(pending(12, 40));
-    let outcome = BlockBreakState::new(&mut active, &mut delayed).stop(
-        &stop(24, 8),
-        HeldMiningTool {
-            hotbar_slot: 0,
-            stack: Some(&ItemStack::new(10, 1)),
-        },
-        52,
-        0.1,
-    );
+    let outcome = BlockBreakState::new(&mut active, &mut delayed).stop(&stop(24, 8), 52, 0.1);
 
     assert_eq!(outcome, StopBreakOutcome::Acknowledge { delayed: false });
+    assert_eq!(active.as_ref().map(|pending| pending.position), Some(24));
     assert_eq!(delayed.as_ref().map(|pending| pending.position), Some(12));
 }
 
@@ -786,15 +755,7 @@ fn second_early_stop_does_not_overwrite_existing_delayed_break() {
 fn delayed_break_completes_at_one_without_requesting_another_ack() {
     let mut active = None;
     let mut delayed = Some(pending(12, 40));
-    let held = ItemStack::new(10, 3);
-    let outcome = BlockBreakState::new(&mut active, &mut delayed).tick_delayed(
-        HeldMiningTool {
-            hotbar_slot: 0,
-            stack: Some(&held),
-        },
-        49,
-        0.1,
-    );
+    let outcome = BlockBreakState::new(&mut active, &mut delayed).tick_delayed(49, 0.1);
 
     let DelayedBreakOutcome::Complete(completion) = outcome else {
         panic!("expected delayed completion");
@@ -807,56 +768,33 @@ fn delayed_break_completes_at_one_without_requesting_another_ack() {
 fn delayed_break_remains_pending_below_one() {
     let mut active = None;
     let mut delayed = Some(pending(12, 40));
-    let held = ItemStack::new(10, 3);
-    let outcome = BlockBreakState::new(&mut active, &mut delayed).tick_delayed(
-        HeldMiningTool {
-            hotbar_slot: 0,
-            stack: Some(&held),
-        },
-        48,
-        0.1,
-    );
+    let outcome = BlockBreakState::new(&mut active, &mut delayed).tick_delayed(48, 0.1);
 
     assert_eq!(outcome, DelayedBreakOutcome::Pending);
     assert!(delayed.is_some());
 }
 
 #[test]
-fn mismatched_stop_is_acknowledged_without_delaying_or_completing() {
+fn mismatched_stop_preserves_the_active_break() {
     let mut active = Some(pending(12, 40));
     let mut delayed = None;
-    let outcome = BlockBreakState::new(&mut active, &mut delayed).stop(
-        &stop(24, 5),
-        HeldMiningTool {
-            hotbar_slot: 0,
-            stack: Some(&ItemStack::new(10, 1)),
-        },
-        49,
-        0.1,
-    );
+    let outcome = BlockBreakState::new(&mut active, &mut delayed).stop(&stop(24, 5), 49, 0.1);
 
     assert_eq!(outcome, StopBreakOutcome::Acknowledge { delayed: false });
-    assert!(active.is_none());
+    assert_eq!(active.as_ref().map(|pending| pending.position), Some(12));
     assert!(delayed.is_none());
 }
 
 #[test]
-fn delayed_break_cancels_when_tool_damage_changes() {
-    let mut active = None;
-    let mut delayed_pending = pending(12, 40);
-    delayed_pending.held_item = Some(ItemStack::new(10, 1).with_damage(3));
-    let mut delayed = Some(delayed_pending);
-    let changed_tool = ItemStack::new(10, 1).with_damage(4);
-    let outcome = BlockBreakState::new(&mut active, &mut delayed).tick_delayed(
-        HeldMiningTool {
-            hotbar_slot: 0,
-            stack: Some(&changed_tool),
-        },
-        49,
-        0.1,
-    );
+fn stop_on_another_face_of_the_same_block_completes() {
+    let mut active = Some(pending(12, 40));
+    let mut delayed = None;
+    let mut action = stop(12, 5);
+    action.direction = Direction::Down;
+    let outcome = BlockBreakState::new(&mut active, &mut delayed).stop(&action, 46, 0.1);
 
-    assert_eq!(outcome, DelayedBreakOutcome::Cancelled);
+    assert!(matches!(outcome, StopBreakOutcome::Complete(_)));
+    assert!(active.is_none());
     assert!(delayed.is_none());
 }
 
@@ -866,49 +804,8 @@ fn delayed_break_without_owner_snapshot_is_cancelled() {
     let mut delayed_pending = pending(12, 40);
     delayed_pending.expected_target = None;
     let mut delayed = Some(delayed_pending);
-    let held = ItemStack::new(10, 1);
-    let outcome = BlockBreakState::new(&mut active, &mut delayed).tick_delayed(
-        HeldMiningTool {
-            hotbar_slot: 0,
-            stack: Some(&held),
-        },
-        49,
-        0.1,
-    );
+    let outcome = BlockBreakState::new(&mut active, &mut delayed).tick_delayed(49, 0.1);
 
     assert_eq!(outcome, DelayedBreakOutcome::Cancelled);
     assert!(delayed.is_none());
-}
-
-#[test]
-fn mining_tool_identity_ignores_count_only() {
-    let expected = ItemStack::new(10, 1)
-        .with_damage(3)
-        .with_enchantment(Identifier::parse("minecraft:efficiency").unwrap(), 2);
-    let same_tool_larger_stack = ItemStack::new(10, 64)
-        .with_damage(3)
-        .with_enchantment(Identifier::parse("minecraft:efficiency").unwrap(), 2);
-    let different_item = ItemStack::new(11, 1)
-        .with_damage(3)
-        .with_enchantment(Identifier::parse("minecraft:efficiency").unwrap(), 2);
-    let different_damage = ItemStack::new(10, 1)
-        .with_damage(4)
-        .with_enchantment(Identifier::parse("minecraft:efficiency").unwrap(), 2);
-    let different_enchantment = ItemStack::new(10, 1)
-        .with_damage(3)
-        .with_enchantment(Identifier::parse("minecraft:efficiency").unwrap(), 3);
-
-    assert!(mining_tool_matches(
-        Some(&expected),
-        Some(&same_tool_larger_stack)
-    ));
-    assert!(!mining_tool_matches(Some(&expected), Some(&different_item)));
-    assert!(!mining_tool_matches(
-        Some(&expected),
-        Some(&different_damage)
-    ));
-    assert!(!mining_tool_matches(
-        Some(&expected),
-        Some(&different_enchantment)
-    ));
 }

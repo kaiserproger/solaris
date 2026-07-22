@@ -498,7 +498,7 @@ fn passive_mob_breeding_plan_pairs_each_parent_once() {
         },
     ];
 
-    let plan = plan_breeding(17, &animals);
+    let plan = plan_breeding(17, &animals, 1);
 
     assert_eq!(plan.births.len(), 1);
     assert_eq!(plan.births[0].position, Vec3::new(1.0, 64.0, 0.0));
@@ -512,6 +512,85 @@ fn passive_mob_breeding_plan_pairs_each_parent_once() {
     );
     assert_eq!(plan.updates[2].state.age_ticks, 0);
     assert_eq!(plan.updates[2].state.love_ticks, ready.love_ticks - 1);
+}
+
+#[test]
+fn batched_breeding_tick_advances_age_and_love_by_the_elapsed_ticks() {
+    let animals = [
+        BreedingAnimal {
+            id: EntityId(1),
+            type_id: 4,
+            type_name: "minecraft:cow".to_owned(),
+            position: Vec3::new(0.0, 64.0, 0.0),
+            state: mc_entity::AnimalBreedingState {
+                age_ticks: -100,
+                love_ticks: 0,
+                sheep_wool: None,
+            },
+        },
+        BreedingAnimal {
+            id: EntityId(2),
+            type_id: 4,
+            type_name: "minecraft:cow".to_owned(),
+            position: Vec3::new(8.0, 64.0, 0.0),
+            state: mc_entity::AnimalBreedingState {
+                age_ticks: 100,
+                love_ticks: 0,
+                sheep_wool: None,
+            },
+        },
+        BreedingAnimal {
+            id: EntityId(3),
+            type_id: 4,
+            type_name: "minecraft:cow".to_owned(),
+            position: Vec3::new(16.0, 64.0, 0.0),
+            state: mc_entity::AnimalBreedingState {
+                age_ticks: 0,
+                love_ticks: 100,
+                sheep_wool: None,
+            },
+        },
+    ];
+
+    let plan = plan_breeding(20, &animals, 20);
+
+    assert_eq!(plan.updates[0].state.age_ticks, -80);
+    assert_eq!(plan.updates[1].state.age_ticks, 80);
+    assert_eq!(plan.updates[2].state.love_ticks, 80);
+}
+
+#[test]
+fn batched_breeding_keeps_the_final_love_window() {
+    let ready = mc_entity::AnimalBreedingState {
+        age_ticks: 0,
+        love_ticks: 10,
+        sheep_wool: None,
+    };
+    let animals = [
+        BreedingAnimal {
+            id: EntityId(1),
+            type_id: 4,
+            type_name: "minecraft:cow".to_owned(),
+            position: Vec3::new(0.0, 64.0, 0.0),
+            state: ready,
+        },
+        BreedingAnimal {
+            id: EntityId(2),
+            type_id: 4,
+            type_name: "minecraft:cow".to_owned(),
+            position: Vec3::new(2.0, 64.0, 0.0),
+            state: ready,
+        },
+    ];
+
+    let plan = plan_breeding(20, &animals, 20);
+
+    assert_eq!(plan.births.len(), 1);
+    assert!(
+        plan.updates
+            .iter()
+            .all(|update| update.state.age_ticks == mc_entity::PARENT_BREEDING_COOLDOWN_TICKS)
+    );
 }
 
 #[test]
@@ -718,7 +797,7 @@ fn idle_adult_animal_tick_does_not_rewrite_unchanged_state() {
     let entity_id = registry.persisted_entity_records()[0].snapshot.id;
     registry.publish_active_simulation_entities_for_test([entity_id]);
 
-    let (births, dispatches) = registry.tick_animal_breeding(&SimulationAuthority::for_test());
+    let (births, dispatches) = registry.tick_animal_breeding(&SimulationAuthority::for_test(), 1);
 
     assert_eq!(births, 0);
     assert!(dispatches.is_empty());
@@ -760,7 +839,7 @@ fn animal_age_countdown_waits_for_entity_save_barrier() {
     registry.publish_active_simulation_entities_for_test([entity_id]);
     commits.store(0, Ordering::Relaxed);
 
-    let (births, dispatches) = registry.tick_animal_breeding(&SimulationAuthority::for_test());
+    let (births, dispatches) = registry.tick_animal_breeding(&SimulationAuthority::for_test(), 1);
 
     assert_eq!(births, 0);
     assert!(dispatches.is_empty());
@@ -805,7 +884,7 @@ fn breeding_tick_reads_only_current_simulation_active_animals() {
     }
     let _ = registry.tick_entities_and_collect_physics_queries(1);
 
-    let (births, dispatches) = registry.tick_animal_breeding(&SimulationAuthority::for_test());
+    let (births, dispatches) = registry.tick_animal_breeding(&SimulationAuthority::for_test(), 1);
 
     assert_eq!(births, 0);
     assert!(dispatches.is_empty());
@@ -840,7 +919,7 @@ fn breeding_tick_with_no_active_simulation_entities_skips_owner() {
     }
     registry.reset_entity_owner_requests_for_test();
 
-    let (births, dispatches) = registry.tick_animal_breeding(&SimulationAuthority::for_test());
+    let (births, dispatches) = registry.tick_animal_breeding(&SimulationAuthority::for_test(), 1);
 
     assert_eq!(births, 0);
     assert!(dispatches.is_empty());
@@ -928,7 +1007,7 @@ fn breeding_plan_does_not_hold_session_or_entity_locks() {
     let held_session = registry.lock_inner("hold session during breeding snapshot");
     let breeding_registry = Arc::clone(&registry);
     let breeding = std::thread::spawn(move || {
-        breeding_registry.tick_animal_breeding(&SimulationAuthority::for_test())
+        breeding_registry.tick_animal_breeding(&SimulationAuthority::for_test(), 1)
     });
     let snapshot_result = reached_rx.recv_timeout(Duration::from_secs(1));
     drop(held_session);
@@ -1013,7 +1092,7 @@ fn breeding_rejects_the_whole_plan_when_a_parent_changes_after_snapshot() {
 
     let breeding_registry = Arc::clone(&registry);
     let breeding = std::thread::spawn(move || {
-        breeding_registry.tick_animal_breeding(&SimulationAuthority::for_test())
+        breeding_registry.tick_animal_breeding(&SimulationAuthority::for_test(), 1)
     });
     reached_rx
         .recv_timeout(Duration::from_secs(1))
@@ -1083,7 +1162,7 @@ fn breeding_commits_and_publishes_once_across_a_region_boundary() {
     registry.publish_active_simulation_entities_for_test(parent_ids.iter().copied());
     registry.entities.reset_owner_requests_for_test();
 
-    let (births, dispatches) = registry.tick_animal_breeding(&SimulationAuthority::for_test());
+    let (births, dispatches) = registry.tick_animal_breeding(&SimulationAuthority::for_test(), 1);
 
     assert_eq!(births, 1);
     assert_eq!(registry.entities.owner_requests_for_test(), 6);
@@ -1157,7 +1236,7 @@ fn breeding_commit_releases_both_locks_before_session_publication() {
 
     let commit_registry = Arc::clone(&registry);
     let commit = std::thread::spawn(move || {
-        commit_registry.tick_animal_breeding(&SimulationAuthority::for_test())
+        commit_registry.tick_animal_breeding(&SimulationAuthority::for_test(), 1)
     });
     reached_rx
         .recv_timeout(Duration::from_secs(1))
@@ -4462,6 +4541,22 @@ fn generated_hostile_herds_stop_at_the_vanilla_global_cap() {
     );
     let inner = registry.lock_inner("inspect hostile cap index");
     assert_eq!(inner.hostile_entities.len(), VANILLA_HOSTILE_MOB_CAP);
+}
+
+#[test]
+fn natural_mobs_keep_vanilla_minimum_distance_from_players() {
+    let player = Vec3::new(0.5, 64.0, 0.5);
+
+    assert!(!super::herd_spawn_authority::spawn_far_enough_from_players(
+        &[player],
+        Vec3::new(24.5, 64.0, 0.5),
+        MIN_ENTITY_SPAWN_DISTANCE_FROM_PLAYER,
+    ));
+    assert!(super::herd_spawn_authority::spawn_far_enough_from_players(
+        &[player],
+        Vec3::new(24.500_001, 64.0, 0.5),
+        MIN_ENTITY_SPAWN_DISTANCE_FROM_PLAYER,
+    ));
 }
 
 #[test]

@@ -534,7 +534,11 @@ fn apply_quick_move_click(
                 return false;
             }
             let max_stack = item_max_stack(item_facts, items, &original);
-            let (remaining, _) = inventory.merge_stack(original.clone(), max_stack);
+            let remaining = if menu_slot == 2 {
+                inventory.merge_stack_into_ranges_reversed(original.clone(), &[9..=44], max_stack)
+            } else {
+                inventory.merge_stack(original.clone(), max_stack).0
+            };
             furnace.slots[menu_slot] = stack_to_furnace_slot(&remaining);
             remaining != original
         }

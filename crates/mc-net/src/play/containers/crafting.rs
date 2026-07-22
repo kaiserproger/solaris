@@ -629,20 +629,27 @@ impl CraftingTableWindow {
             return (false, Vec::new());
         }
         if menu_slot == 0 {
-            let result = self.result.clone();
-            if result.is_empty() {
-                return (false, Vec::new());
+            let mut crafted = false;
+            let mut discarded = Vec::new();
+            loop {
+                let result = self.result.clone();
+                if result.is_empty() {
+                    break;
+                }
+                let max_stack = item_max_stack(item_facts, items, &result);
+                let mut merged = inventory.clone();
+                let remaining =
+                    merged.merge_stack_into_ranges_reversed(result, &[9..=44], max_stack);
+                if !remaining.is_empty() {
+                    break;
+                }
+                *inventory = merged;
+                discarded.extend(consume_crafting_ingredients(
+                    items, item_facts, tags, recipes, self, inventory,
+                ));
+                crafted = true;
             }
-            let max_stack = item_max_stack(item_facts, items, &result);
-            let mut merged = inventory.clone();
-            let (remaining, _) = merged.merge_stack(result, max_stack);
-            if !remaining.is_empty() {
-                return (false, Vec::new());
-            }
-            *inventory = merged;
-            let discarded =
-                consume_crafting_ingredients(items, item_facts, tags, recipes, self, inventory);
-            return (true, discarded);
+            return (crafted, discarded);
         }
         if (1..=9).contains(&menu_slot) {
             let input_slot = menu_slot - 1;
@@ -894,17 +901,27 @@ impl PlayerInventory {
             return (false, Vec::new());
         }
         if slot == 0 {
-            let result = self.slots[0].clone();
-            let max_stack = item_max_stack(item_facts, items, &result);
-            let mut merged = self.clone();
-            let (remaining, _) = merged.merge_stack(result, max_stack);
-            if !remaining.is_empty() {
-                return (false, Vec::new());
+            let mut crafted = false;
+            let mut discarded = Vec::new();
+            loop {
+                let result = self.slots[0].clone();
+                if result.is_empty() {
+                    break;
+                }
+                let max_stack = item_max_stack(item_facts, items, &result);
+                let mut merged = self.clone();
+                let remaining =
+                    merged.merge_stack_into_ranges_reversed(result, &[9..=44], max_stack);
+                if !remaining.is_empty() {
+                    break;
+                }
+                *self = merged;
+                discarded.extend(consume_inventory_crafting_ingredients(
+                    items, item_facts, tags, recipes, self,
+                ));
+                crafted = true;
             }
-            *self = merged;
-            let discarded =
-                consume_inventory_crafting_ingredients(items, item_facts, tags, recipes, self);
-            return (true, discarded);
+            return (crafted, discarded);
         }
 
         let original = self.slots[slot].clone();

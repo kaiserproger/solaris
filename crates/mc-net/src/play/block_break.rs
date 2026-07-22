@@ -45,12 +45,6 @@ pub(super) struct PendingBreak {
     pub(super) expected_target: Option<BlockMutationSnapshot>,
 }
 
-#[derive(Debug, Clone, Copy)]
-pub(super) struct HeldMiningTool<'a> {
-    pub(super) hotbar_slot: u8,
-    pub(super) stack: Option<&'a ItemStack>,
-}
-
 #[derive(Debug, PartialEq)]
 pub(super) enum StopBreakOutcome {
     Complete(BlockBreakCompletion),
@@ -91,25 +85,30 @@ impl<'a> BlockBreakState<'a> {
     pub(super) fn stop(
         &mut self,
         action: &ServerboundPlayerAction,
-        held: HeldMiningTool<'_>,
         current_tick: u64,
         progress_per_tick: f32,
     ) -> StopBreakOutcome {
-        let Some(mut pending) = self.active.take() else {
+        let Some(pending) = self.active.as_ref() else {
             return StopBreakOutcome::Acknowledge { delayed: false };
         };
-        if !pending_break_matches(&pending, action, held) || pending.expected_target.is_none() {
+        if pending.position != action.position {
+            return StopBreakOutcome::Acknowledge { delayed: false };
+        }
+        if pending.expected_target.is_none() {
+            *self.active = None;
             return StopBreakOutcome::Acknowledge { delayed: false };
         }
         if destroy_progress(pending.started_tick, current_tick, progress_per_tick)
             >= VANILLA_STOP_DESTROY_THRESHOLD
         {
+            let pending = self.active.take().expect("checked active break");
             return StopBreakOutcome::Complete(BlockBreakCompletion {
                 pending,
                 acknowledgement: BreakAcknowledgement::Send(action.sequence),
             });
         }
         if self.delayed.is_none() {
+            let mut pending = self.active.take().expect("checked active break");
             pending.sequence = action.sequence;
             *self.delayed = Some(pending);
             return StopBreakOutcome::Acknowledge { delayed: true };
@@ -119,14 +118,13 @@ impl<'a> BlockBreakState<'a> {
 
     pub(super) fn tick_delayed(
         &mut self,
-        held: HeldMiningTool<'_>,
         current_tick: u64,
         progress_per_tick: f32,
     ) -> DelayedBreakOutcome {
         let Some(pending) = self.delayed.as_ref() else {
             return DelayedBreakOutcome::Idle;
         };
-        if !pending_tool_matches(pending, held) || pending.expected_target.is_none() {
+        if pending.expected_target.is_none() {
             *self.delayed = None;
             return DelayedBreakOutcome::Cancelled;
         }
@@ -144,36 +142,6 @@ impl<'a> BlockBreakState<'a> {
 fn destroy_progress(started_tick: u64, current_tick: u64, progress_per_tick: f32) -> f32 {
     let elapsed_with_start = current_tick.saturating_sub(started_tick).saturating_add(1);
     progress_per_tick * elapsed_with_start as f32
-}
-
-fn pending_break_matches(
-    pending: &PendingBreak,
-    action: &ServerboundPlayerAction,
-    held: HeldMiningTool<'_>,
-) -> bool {
-    pending.position == action.position
-        && pending.direction == action.direction
-        && pending_tool_matches(pending, held)
-}
-
-fn pending_tool_matches(pending: &PendingBreak, held: HeldMiningTool<'_>) -> bool {
-    pending.held_hotbar_slot == held.hotbar_slot
-        && mining_tool_matches(pending.held_item.as_ref(), held.stack)
-}
-
-pub(super) fn mining_tool_matches(
-    expected: Option<&ItemStack>,
-    current: Option<&ItemStack>,
-) -> bool {
-    match (expected, current) {
-        (None, None) => true,
-        (Some(expected), Some(current)) => {
-            expected.item_id == current.item_id
-                && expected.damage == current.damage
-                && expected.enchantments == current.enchantments
-        }
-        _ => false,
-    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -213,6 +181,10 @@ where
     let (x, y, z) = unpack_block_pos(position);
     let pos = mc_world::BlockPos { x, y, z };
     if script_events.is_some_and(|events| !events.block_mutation_allowed(pos)) {
+        debug!(
+            sequence,
+            x, y, z, "survival block break denied by plugin policy"
+        );
         write_block_resync(state, writer, position).await?;
         if acknowledgement.should_send() {
             write_block_ack(writer, state.compression, sequence).await?;
@@ -328,7 +300,9 @@ where
         if !changed_slots.is_empty() {
             write_inventory_slot_updates(state, writer, changed_slots).await?;
         }
-        return Ok(!outcome.applied.is_empty());
+        let changed = !outcome.applied.is_empty();
+        debug!(sequence, x, y, z, changed, "survival block break committed");
+        return Ok(changed);
     }
 
     if !acknowledgement.should_send() {
@@ -381,6 +355,7 @@ where
         }
     };
     let Some((edits, preconditions)) = planned else {
+        debug!(sequence, x, y, z, "block break could not be planned");
         write_block_resync(state, writer, position).await?;
         write_block_ack(writer, state.compression, sequence).await?;
         return Ok(false);
@@ -829,16 +804,11 @@ where
                         player_pose,
                     )
                 });
-                let outcome =
-                    BlockBreakState::new(&mut state.pending_break, &mut state.delayed_break).stop(
-                        &action,
-                        HeldMiningTool {
-                            hotbar_slot: state.selected_hotbar_slot,
-                            stack: current_held_stack.as_ref(),
-                        },
-                        current_tick,
-                        current_progress_per_tick,
-                    );
+                let outcome = BlockBreakState::new(
+                    &mut state.pending_break,
+                    &mut state.delayed_break,
+                )
+                .stop(&action, current_tick, current_progress_per_tick);
                 match outcome {
                     StopBreakOutcome::Complete(completion) => {
                         let changed = complete_block_break(
@@ -938,17 +908,15 @@ where
         )
     });
     let outcome = BlockBreakState::new(&mut state.pending_break, &mut state.delayed_break)
-        .tick_delayed(
-            HeldMiningTool {
-                hotbar_slot: state.selected_hotbar_slot,
-                stack: current_held_stack.as_ref(),
-            },
-            current_tick,
-            progress_per_tick,
-        );
+        .tick_delayed(current_tick, progress_per_tick);
     let DelayedBreakOutcome::Complete(completion) = outcome else {
         return Ok(());
     };
+    let (x, y, z) = unpack_block_pos(completion.pending.position);
+    debug!(
+        sequence = completion.acknowledgement.sequence(),
+        x, y, z, "delayed survival block break reached completion"
+    );
 
     let changed = complete_block_break(
         state,

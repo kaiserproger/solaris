@@ -219,9 +219,28 @@ impl PlayerInventory {
 
     pub(crate) fn merge_stack_into_ranges(
         &mut self,
+        stack: ItemStack,
+        ranges: &[std::ops::RangeInclusive<usize>],
+        max_stack: i32,
+    ) -> ItemStack {
+        self.merge_stack_into_ranges_ordered(stack, ranges, max_stack, false)
+    }
+
+    pub(crate) fn merge_stack_into_ranges_reversed(
+        &mut self,
+        stack: ItemStack,
+        ranges: &[std::ops::RangeInclusive<usize>],
+        max_stack: i32,
+    ) -> ItemStack {
+        self.merge_stack_into_ranges_ordered(stack, ranges, max_stack, true)
+    }
+
+    fn merge_stack_into_ranges_ordered(
+        &mut self,
         mut stack: ItemStack,
         ranges: &[std::ops::RangeInclusive<usize>],
         max_stack: i32,
+        reverse: bool,
     ) -> ItemStack {
         canonicalize_empty(&mut stack);
         if stack.is_empty() {
@@ -235,45 +254,49 @@ impl PlayerInventory {
             return stack;
         }
 
-        for range in ranges {
-            for slot in range.clone() {
-                let current = &mut self.slots[slot];
-                canonicalize_empty(current);
-                if !can_stack(current, &stack) || current.count >= max_stack {
-                    continue;
-                }
-                let Some(capacity) = max_stack.checked_sub(current.count) else {
-                    continue;
-                };
-                let moved = capacity.min(stack.count);
-                let Some(next_count) = current.count.checked_add(moved) else {
-                    continue;
-                };
-                let Some(remaining) = stack.count.checked_sub(moved) else {
-                    continue;
-                };
-                current.count = next_count;
-                stack.count = remaining;
-                if stack.count <= 0 {
-                    return ItemStack::EMPTY;
-                }
+        let mut slots = ranges
+            .iter()
+            .flat_map(|range| range.clone())
+            .collect::<Vec<_>>();
+        if reverse {
+            slots.reverse();
+        }
+
+        for &slot in &slots {
+            let current = &mut self.slots[slot];
+            canonicalize_empty(current);
+            if !can_stack(current, &stack) || current.count >= max_stack {
+                continue;
+            }
+            let Some(capacity) = max_stack.checked_sub(current.count) else {
+                continue;
+            };
+            let moved = capacity.min(stack.count);
+            let Some(next_count) = current.count.checked_add(moved) else {
+                continue;
+            };
+            let Some(remaining) = stack.count.checked_sub(moved) else {
+                continue;
+            };
+            current.count = next_count;
+            stack.count = remaining;
+            if stack.count <= 0 {
+                return ItemStack::EMPTY;
             }
         }
 
-        for range in ranges {
-            for slot in range.clone() {
-                canonicalize_empty(&mut self.slots[slot]);
-                if !self.slots[slot].is_empty() {
-                    continue;
-                }
-                let moved = stack.count.min(max_stack);
-                let mut moved_stack = stack.clone();
-                moved_stack.count = moved;
-                self.slots[slot] = moved_stack;
-                stack.count = stack.count.checked_sub(moved).unwrap_or_default();
-                if stack.count <= 0 {
-                    return ItemStack::EMPTY;
-                }
+        for slot in slots {
+            canonicalize_empty(&mut self.slots[slot]);
+            if !self.slots[slot].is_empty() {
+                continue;
+            }
+            let moved = stack.count.min(max_stack);
+            let mut moved_stack = stack.clone();
+            moved_stack.count = moved;
+            self.slots[slot] = moved_stack;
+            stack.count = stack.count.checked_sub(moved).unwrap_or_default();
+            if stack.count <= 0 {
+                return ItemStack::EMPTY;
             }
         }
 

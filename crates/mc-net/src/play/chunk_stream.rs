@@ -887,6 +887,12 @@ pub(crate) fn passable_block_name(name: &str) -> bool {
             | "minecraft:seagrass"
             | "minecraft:tall_seagrass"
             | "minecraft:bubble_column"
+            | "minecraft:torch"
+            | "minecraft:wall_torch"
+            | "minecraft:soul_torch"
+            | "minecraft:soul_wall_torch"
+            | "minecraft:redstone_torch"
+            | "minecraft:redstone_wall_torch"
     )
 }
 

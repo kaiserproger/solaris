@@ -139,10 +139,13 @@ impl SessionRegistry {
         else {
             return Ok(None);
         };
-        if player_state.selected_hotbar_slot != plan.held.hotbar_slot {
+        let held_slot = plan.held.inventory_slot;
+        if held_slot != PlayerInventory::OFFHAND_SLOT
+            && held_slot
+                != PlayerInventory::HOTBAR_BASE + usize::from(player_state.selected_hotbar_slot)
+        {
             return Ok(None);
         }
-        let held_slot = PlayerInventory::HOTBAR_BASE + usize::from(plan.held.hotbar_slot);
         if player_state.inventory.slots[held_slot] != plan.held.expected {
             return Ok(None);
         }

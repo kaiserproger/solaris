@@ -32,6 +32,7 @@ use super::block_placement::{
 use super::bucket_interactions::{handle_bucket_use_on, handle_cauldron_bucket_use_on};
 use super::campfire_adapter::handle_campfire_use_on;
 use super::explosions::{TNT_ENTITY_TYPE_NAME, TntIgnitionPlan};
+#[cfg(test)]
 use super::inventory::PlayerInventory;
 use super::persistence::XpState;
 use super::plants::{bonemeal_growth_edits, sweet_berry_harvest};
@@ -136,13 +137,8 @@ pub(super) async fn handle_use_item_on<W>(
 where
     W: AsyncWriteExt + Unpin,
 {
-    let Some(held) = state.inventory.held(state.selected_hotbar_slot).cloned() else {
-        debug!(
-            slot = state.selected_hotbar_slot,
-            "UseItemOn ignored for invalid selected hotbar slot"
-        );
-        return Ok(());
-    };
+    let held_slot = hand_inventory_slot(state, action.hand);
+    let held = state.inventory.slots[held_slot].clone();
     state.pending_use = None;
     clear_shield_use(state);
 
@@ -153,6 +149,8 @@ where
         clicked_y,
         clicked_z,
         direction = ?action.direction,
+        hand = ?action.hand,
+        held_slot,
         selected_slot = state.selected_hotbar_slot,
         held_item = held.item_id,
         held_count = held.count,
@@ -188,6 +186,7 @@ where
         return reject_use_item_on_with_resync(
             state,
             writer,
+            action.hand,
             action.sequence,
             target.clicked_pos,
             mc_world::BlockPos {
@@ -208,6 +207,7 @@ where
         return reject_use_item_on_with_resync(
             state,
             writer,
+            action.hand,
             action.sequence,
             target.clicked_pos,
             mc_world::BlockPos {
@@ -917,10 +917,8 @@ where
     };
 
     // M6.f: resolve the placed block from the held item.
-    let held_slot = state.selected_hotbar_slot;
-    let Some(held) = state.inventory.held(held_slot).cloned() else {
-        return Ok(());
-    };
+    let held_slot = hand_inventory_slot(state, action.hand);
+    let held = state.inventory.slots[held_slot].clone();
     if held.is_empty() {
         debug!(
             sequence = action.sequence,
@@ -931,6 +929,7 @@ where
         return reject_use_item_on_with_resync(
             state,
             writer,
+            action.hand,
             sequence,
             clicked_pos,
             mc_world::BlockPos {
@@ -1032,6 +1031,7 @@ where
             return reject_use_item_on_with_resync(
                 state,
                 writer,
+                action.hand,
                 sequence,
                 clicked_pos,
                 mc_world::BlockPos {
@@ -1048,6 +1048,7 @@ where
             return reject_use_item_on_with_resync(
                 state,
                 writer,
+                action.hand,
                 sequence,
                 clicked_pos,
                 mc_world::BlockPos {
@@ -1078,6 +1079,7 @@ where
         return reject_use_item_on_with_resync(
             state,
             writer,
+            action.hand,
             sequence,
             clicked_pos,
             mc_world::BlockPos {
@@ -1102,6 +1104,7 @@ where
         return reject_use_item_on_with_resync(
             state,
             writer,
+            action.hand,
             sequence,
             clicked_pos,
             target_pos,
@@ -1140,7 +1143,7 @@ where
             scheduled_block_ticks,
             block_facts: Arc::clone(&state.block_facts),
             held: SurvivalPlacementHeldItem {
-                hotbar_slot: held_slot,
+                inventory_slot: held_slot,
                 expected: held,
             },
             expected_game_mode: game_mode,
@@ -1152,6 +1155,7 @@ where
             return reject_use_item_on_with_resync(
                 state,
                 writer,
+                action.hand,
                 sequence,
                 clicked_pos,
                 target_pos,
@@ -1165,6 +1169,7 @@ where
             return reject_use_item_on_with_resync(
                 state,
                 writer,
+                action.hand,
                 sequence,
                 clicked_pos,
                 target_pos,
@@ -1220,9 +1225,11 @@ where
     Ok(())
 }
 
+#[allow(clippy::too_many_arguments)]
 pub(super) async fn reject_use_item_on_with_resync<W>(
     state: &mut InteractionState,
     writer: &mut W,
+    hand: InteractionHand,
     sequence: i32,
     clicked_pos: mc_world::BlockPos,
     target_pos: mc_world::BlockPos,
@@ -1234,8 +1241,8 @@ where
 {
     let held_slot_resync = match options.held_resync {
         UseItemOnHeldResync::None => None,
-        UseItemOnHeldResync::BucketOnly => bucket_held_slot_resync(state),
-        UseItemOnHeldResync::HeldItem => held_item_slot_resync(state),
+        UseItemOnHeldResync::BucketOnly => bucket_held_slot_resync(state, hand),
+        UseItemOnHeldResync::HeldItem => held_item_slot_resync(state, hand),
     };
     let updates = [clicked_pos, target_pos]
         .into_iter()
@@ -1269,9 +1276,12 @@ where
     ack_use_item_on_noop(writer, state.compression, sequence, reason).await
 }
 
-fn bucket_held_slot_resync(state: &InteractionState) -> Option<(i16, ItemStack)> {
-    let held_slot = state.selected_hotbar_slot;
-    let held = state.inventory.held(held_slot)?;
+fn bucket_held_slot_resync(
+    state: &InteractionState,
+    hand: InteractionHand,
+) -> Option<(i16, ItemStack)> {
+    let held_slot = hand_inventory_slot(state, hand);
+    let held = &state.inventory.slots[held_slot];
     if held.is_empty() {
         return None;
     }
@@ -1280,23 +1290,16 @@ fn bucket_held_slot_resync(state: &InteractionState) -> Option<(i16, ItemStack)>
         .bucket_fluid_kind(held.item_id)
         .is_some()
         || Some(held.item_id) == state.item_to_block.empty_bucket_item();
-    is_bucket.then(|| {
-        (
-            (PlayerInventory::HOTBAR_BASE + held_slot as usize) as i16,
-            held.clone(),
-        )
-    })
+    is_bucket.then(|| (held_slot as i16, held.clone()))
 }
 
-fn held_item_slot_resync(state: &InteractionState) -> Option<(i16, ItemStack)> {
-    let held_slot = state.selected_hotbar_slot;
-    let held = state.inventory.held(held_slot)?;
-    (!held.is_empty()).then(|| {
-        (
-            (PlayerInventory::HOTBAR_BASE + held_slot as usize) as i16,
-            held.clone(),
-        )
-    })
+fn held_item_slot_resync(
+    state: &InteractionState,
+    hand: InteractionHand,
+) -> Option<(i16, ItemStack)> {
+    let held_slot = hand_inventory_slot(state, hand);
+    let held = &state.inventory.slots[held_slot];
+    (!held.is_empty()).then(|| (held_slot as i16, held.clone()))
 }
 
 async fn ack_use_item_on_noop<W>(
@@ -1331,7 +1334,7 @@ async fn handle_bonemeal_use_on<W>(
     game_mode: GameMode,
     sequence: i32,
     clicked_pos: mc_world::BlockPos,
-    held_slot: u8,
+    held_slot: usize,
     held_item_id: u32,
 ) -> Result<bool, ConnectionError>
 where
@@ -1348,8 +1351,7 @@ where
         write_block_ack(writer, state.compression, sequence).await?;
         return Ok(true);
     };
-    let slot = PlayerInventory::HOTBAR_BASE + held_slot as usize;
-    let expected_held = state.inventory.slots[slot].clone();
+    let expected_held = state.inventory.slots[held_slot].clone();
     let committed = state
         .simulation
         .commit_survival_placement(SurvivalPlacementPlan {
@@ -1358,7 +1360,7 @@ where
             scheduled_block_ticks: Vec::new(),
             block_facts: Arc::clone(&state.block_facts),
             held: SurvivalPlacementHeldItem {
-                hotbar_slot: held_slot,
+                inventory_slot: held_slot,
                 expected: expected_held,
             },
             expected_game_mode: game_mode,
@@ -1376,7 +1378,7 @@ where
         write_inventory_slot_updates(
             state,
             writer,
-            vec![(slot, state.inventory.slots[slot].clone())],
+            vec![(held_slot, state.inventory.slots[held_slot].clone())],
         )
         .await?;
         write_block_ack(writer, state.compression, sequence).await?;

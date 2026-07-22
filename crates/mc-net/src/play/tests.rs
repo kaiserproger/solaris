@@ -3204,12 +3204,6 @@ async fn player_collision_rejects_wrong_properties_under_canonical_slab_name_and
 #[tokio::test]
 async fn player_collision_uses_farmland_fallback_for_exact_low_id_semantics() {
     let (state, farmland) = low_id_exact_farmland_test_state();
-    assert!(
-        mc_data::collision_shapes::vanilla_collision_shapes()
-            .get(farmland.0)
-            .is_none(),
-        "the low synthetic id must miss the canonical shape table"
-    );
     set_collision_test_block(&state, farmland).await;
 
     assert!(
@@ -3378,20 +3372,14 @@ async fn player_collision_scans_fence_below_at_deflated_top_boundary() {
 }
 
 #[tokio::test]
-async fn player_collision_falls_back_to_full_cube_for_uncovered_block() {
+async fn player_collision_uses_exact_full_cube_shape_for_stone() {
     let state = vanilla_collision_test_state();
     let stone = vanilla_collision_state_id(&state, "minecraft:stone", &[]);
-    assert!(
-        mc_data::collision_shapes::vanilla_collision_shapes()
-            .get(stone.0)
-            .is_none(),
-        "stone must exercise the collision table miss fallback"
-    );
     set_collision_test_block(&state, stone).await;
 
     assert!(
         player_pose_collides_with_solid(Some(&state), PlayerPose::new(0.5, 64.0, 0.5)).await,
-        "an uncovered solid block retains full-cube collision"
+        "the exact stone shape remains a full cube"
     );
 }
 
@@ -9020,7 +9008,7 @@ async fn scheduled_button_regions_commit_without_the_global_world_writer() {
 }
 
 #[tokio::test]
-async fn resident_scheduled_button_tick_is_durable_without_world_writer() {
+async fn resident_scheduled_button_tick_updates_without_world_writer_or_journal_wait() {
     let blocks = Arc::new(button_test_registry());
     let world = Arc::new(tokio::sync::Mutex::new(in_memory_button_world(Arc::clone(
         &blocks,
@@ -9047,17 +9035,6 @@ async fn resident_scheduled_button_tick_is_durable_without_world_writer() {
     };
     let sessions = SessionRegistry::new();
     register_loaded_button_session(&sessions, "DurableButtonRelease");
-    let temp = tempfile::tempdir().unwrap();
-    std::fs::create_dir_all(temp.path().join("region")).unwrap();
-    let (journal, pending) = super::world_journal::WorldChunkJournal::open(
-        temp.path(),
-        Arc::clone(&config.blocks),
-        Arc::clone(&config.items),
-    )
-    .unwrap();
-    assert!(pending.is_empty());
-    sessions.install_world_chunk_journal(journal);
-
     let storage = world.lock().await;
     let world_read = storage.read_view();
     let world_mutation = storage.mutation_view();
@@ -9079,25 +9056,23 @@ async fn resident_scheduled_button_tick_is_durable_without_world_writer() {
         ),
     )
     .await
-    .expect("resident button journal completion event");
+    .expect("resident button tick completion event");
     assert_eq!(report.drained, 1);
     assert_eq!(report.applied, 1);
 
-    let (reopened, pending) = super::world_journal::WorldChunkJournal::open(
-        temp.path(),
-        Arc::clone(&config.blocks),
-        Arc::clone(&config.items),
-    )
-    .unwrap();
-    let restored = reopened.decode_pending(&pending).unwrap();
-    assert_eq!(restored.len(), 1);
+    drop(world_writer);
+    let storage = world.lock().await;
     assert_eq!(
-        restored[0].get_block(1, pos.y, 1),
+        storage.get_cached_block(pos),
         Some(mc_world::BlockStateId(1))
     );
-    assert!(restored[0].scheduled_block_ticks().is_empty());
-
-    drop(world_writer);
+    assert!(
+        storage
+            .cached_chunk(ChunkPos { x: 0, z: 0 })
+            .unwrap()
+            .scheduled_block_ticks()
+            .is_empty()
+    );
 }
 
 #[tokio::test]
@@ -14498,6 +14473,24 @@ async fn stale_crafting_click_rebuilds_grid_from_owner_projection() {
     ));
 }
 
+#[test]
+fn quick_move_crafted_event_counts_every_output_batch() {
+    let result = ItemStack::new(2, 4);
+    let mut before = PlayerInventory::empty();
+    before.slots[9] = ItemStack::new(2, 5);
+    let mut after = before.clone();
+    after.slots[9] = ItemStack::new(2, 17);
+
+    assert_eq!(
+        crafted_item_from_inventory_delta(&result, &before, &after),
+        Some(CraftedItem {
+            item_id: 2,
+            count: 12,
+            craft_count: 3,
+        })
+    );
+}
+
 #[tokio::test]
 async fn crafting_table_result_commit_publishes_once_before_fifo_fence() {
     use mc_data::recipes::{
@@ -15868,6 +15861,7 @@ async fn rejected_use_item_on_resync_does_not_wait_for_world_writer() {
     let mut resync = Box::pin(reject_use_item_on_with_resync(
         &mut state,
         &mut writer,
+        InteractionHand::MainHand,
         17,
         clicked,
         target,
@@ -16387,7 +16381,7 @@ async fn idle_furnace_tick_does_not_wait_for_world_writer() {
 }
 
 #[tokio::test]
-async fn active_furnace_tick_is_durable_without_world_writer() {
+async fn active_furnace_tick_updates_resident_state_without_world_writer() {
     let blocks = Arc::new(
         mc_world::BlockRegistry::from_report(&[
             simple_block(0, "minecraft:air"),
@@ -16442,17 +16436,6 @@ async fn active_furnace_tick_is_durable_without_world_writer() {
         world: Some(Arc::clone(&world)),
         ..play_loop_slow_client_test_config()
     };
-    let temp = tempfile::tempdir().unwrap();
-    std::fs::create_dir_all(temp.path().join("region")).unwrap();
-    let (journal, pending) = super::world_journal::WorldChunkJournal::open(
-        temp.path(),
-        Arc::clone(&config.blocks),
-        Arc::clone(&config.items),
-    )
-    .unwrap();
-    assert!(pending.is_empty());
-    sessions.install_world_chunk_journal(journal);
-
     let (_simulation, owner) = simulation_channel();
     let world_writer = world.lock().await;
     let updated = tokio::time::timeout(
@@ -16460,22 +16443,15 @@ async fn active_furnace_tick_is_durable_without_world_writer() {
         owner.run_furnace_ticks(&config, &sessions, Some(&world_read), Some(&world_mutation)),
     )
     .await
-    .expect("resident furnace journal completion event");
+    .expect("resident furnace tick completion event");
     assert_eq!(updated, 1);
-
-    let (reopened, pending) = super::world_journal::WorldChunkJournal::open(
-        temp.path(),
-        Arc::clone(&config.blocks),
-        Arc::clone(&config.items),
-    )
-    .unwrap();
-    let restored = reopened.decode_pending(&pending).unwrap();
-    assert_eq!(restored.len(), 1);
     assert_eq!(
-        restored[0]
-            .furnaces
-            .get(&position)
-            .expect("journaled furnace")
+        world_read
+            .furnace_snapshots(&[cpos])
+            .into_iter()
+            .find(|(candidate, _)| *candidate == position)
+            .expect("resident furnace")
+            .1
             .burn_remaining,
         9
     );
@@ -16483,7 +16459,7 @@ async fn active_furnace_tick_is_durable_without_world_writer() {
 }
 
 #[tokio::test]
-async fn stale_furnace_tick_wave_replans_after_durable_noop() {
+async fn stale_furnace_tick_wave_replans_against_resident_state() {
     let blocks = Arc::new(
         mc_world::BlockRegistry::from_report(&[
             simple_block(0, "minecraft:air"),
@@ -16520,16 +16496,6 @@ async fn stale_furnace_tick_wave_replans_after_durable_noop() {
         ..play_loop_slow_client_test_config()
     };
     let sessions = SessionRegistry::new();
-    let temp = tempfile::tempdir().unwrap();
-    std::fs::create_dir_all(temp.path().join("region")).unwrap();
-    let (journal, pending) = super::world_journal::WorldChunkJournal::open(
-        temp.path(),
-        Arc::clone(&config.blocks),
-        Arc::clone(&config.items),
-    )
-    .unwrap();
-    assert!(pending.is_empty());
-    sessions.install_world_chunk_journal(journal);
     let stale_before = FurnaceBlockEntity {
         burn_remaining: 10,
         burn_total: 10,
@@ -16541,9 +16507,7 @@ async fn stale_furnace_tick_wave_replans_after_durable_noop() {
     let updates = commit_resident_furnace_tick_wave(
         &config,
         &sessions,
-        &world_read,
         &mutation,
-        0,
         vec![FurnaceTickPlan {
             position,
             block_state: BlockStateId(1),
@@ -16553,26 +16517,16 @@ async fn stale_furnace_tick_wave_replans_after_durable_noop() {
             slots_changed: false,
             data_changed: vec![(0, 9)],
         }],
-    )
-    .await
-    .expect("stale furnace wave replans");
+    );
     assert_eq!(updates.len(), 1);
     assert_eq!(updates[0].1.burn_remaining, 8);
-
-    let (reopened, pending) = super::world_journal::WorldChunkJournal::open(
-        temp.path(),
-        Arc::clone(&config.blocks),
-        Arc::clone(&config.items),
-    )
-    .unwrap();
-    assert_eq!(pending.len(), 2, "no-op rejection precedes retry decision");
-    let restored = reopened.decode_pending(&pending).unwrap();
-    assert_eq!(restored.len(), 1);
     assert_eq!(
-        restored[0]
-            .furnaces
-            .get(&position)
-            .expect("replanned furnace")
+        world_read
+            .furnace_snapshots(&[cpos])
+            .into_iter()
+            .find(|(candidate, _)| *candidate == position)
+            .expect("replanned resident furnace")
+            .1
             .burn_remaining,
         8
     );
@@ -16648,18 +16602,6 @@ fn active_furnace_tick_releases_world_writer_between_commits() {
         ..play_loop_slow_client_test_config()
     };
     let sessions = Arc::clone(&state.sessions);
-    let journal_blocks = Arc::clone(&config.blocks);
-    let journal_items = Arc::clone(&config.items);
-    let temp = tempfile::tempdir().unwrap();
-    std::fs::create_dir_all(temp.path().join("region")).unwrap();
-    let (journal, pending) = super::world_journal::WorldChunkJournal::open(
-        temp.path(),
-        Arc::clone(&journal_blocks),
-        Arc::clone(&journal_items),
-    )
-    .unwrap();
-    assert!(pending.is_empty());
-    sessions.install_world_chunk_journal(journal);
     let (reached_tx, reached_rx) = std::sync::mpsc::channel();
     let (resume_tx, resume_rx) = std::sync::mpsc::channel();
     sessions.install_server_furnace_commit_probe(reached_tx, resume_rx);
@@ -16694,18 +16636,6 @@ fn active_furnace_tick_releases_world_writer_between_commits() {
     assert!(
         writer_is_available,
         "furnace tick must release the world writer after each independent commit"
-    );
-    let (reopened, pending) =
-        super::world_journal::WorldChunkJournal::open(temp.path(), journal_blocks, journal_items)
-            .unwrap();
-    assert_eq!(pending.len(), 1, "one furnace pass uses one WAL decision");
-    let restored = reopened.decode_pending(&pending).unwrap();
-    assert_eq!(restored.len(), 1);
-    assert!(
-        restored[0]
-            .furnaces
-            .values()
-            .all(|furnace| furnace.burn_remaining == 9)
     );
 }
 

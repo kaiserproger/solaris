@@ -1393,7 +1393,7 @@ fn explosion_collision_boxes(
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(super) struct SurvivalPlacementHeldItem {
-    pub(super) hotbar_slot: u8,
+    pub(super) inventory_slot: usize,
     pub(super) expected: ItemStack,
 }
 
@@ -2988,8 +2988,12 @@ impl SimulationOwner {
         expired
     }
 
-    pub(crate) fn tick_animal_breeding(&self, sessions: &SessionRegistry) -> usize {
-        let (births, dispatches) = sessions.tick_animal_breeding(&self.authority);
+    pub(crate) fn tick_animal_breeding(
+        &self,
+        sessions: &SessionRegistry,
+        elapsed_ticks: u16,
+    ) -> usize {
+        let (births, dispatches) = sessions.tick_animal_breeding(&self.authority, elapsed_ticks);
         dispatch_visibility_commands(dispatches);
         births
     }
@@ -5790,7 +5794,10 @@ fn valid_survival_placement_plan(plan: &SurvivalPlacementPlan) -> bool {
         || plan.preconditions.is_empty()
         || plan.preconditions.len() > MAX_SURVIVAL_BREAK_EDITS
         || plan.scheduled_block_ticks.len() > MAX_SURVIVAL_BREAK_EDITS
-        || plan.held.hotbar_slot > 8
+        || !matches!(
+            plan.held.inventory_slot,
+            PlayerInventory::HOTBAR_BASE..=PlayerInventory::OFFHAND_SLOT
+        )
         || plan.held.expected.is_empty()
     {
         return false;
@@ -6262,7 +6269,7 @@ mod tests {
                 &test_block_reports(),
             )),
             held: SurvivalPlacementHeldItem {
-                hotbar_slot: 0,
+                inventory_slot: PlayerInventory::HOTBAR_BASE,
                 expected: ItemStack::new(item_id, count),
             },
             expected_game_mode: GameMode::Survival,
@@ -10188,11 +10195,11 @@ mod tests {
         };
         let (session_id, _) = registry.register(
             &profile,
-            chunk,
+            (0, 0),
             0,
             HashSet::from([chunk]),
             tx,
-            PlayerPose::new(16.5, 64.0, 16.5),
+            PlayerPose::new(0.5, 64.0, 0.5),
         );
         registry.mark_loaded(session_id, chunk);
         let spawns = [
@@ -11501,7 +11508,7 @@ mod tests {
         }
 
         for _ in 0..(mc_entity::ANIMAL_BREEDING_COURTSHIP_TICKS - 1) {
-            assert_eq!(owner.tick_animal_breeding(&registry), 0);
+            assert_eq!(owner.tick_animal_breeding(&registry, 1), 0);
         }
         assert_eq!(
             registry
@@ -11512,7 +11519,7 @@ mod tests {
             2
         );
 
-        assert_eq!(owner.tick_animal_breeding(&registry), 1);
+        assert_eq!(owner.tick_animal_breeding(&registry, 1), 1);
         let cows = registry
             .persisted_entity_records()
             .into_iter()
@@ -11605,7 +11612,7 @@ mod tests {
         }
 
         for _ in 0..mc_entity::ANIMAL_BREEDING_COURTSHIP_TICKS {
-            owner.tick_animal_breeding(&registry);
+            owner.tick_animal_breeding(&registry, 1);
         }
         let child = registry
             .persisted_entity_records()
@@ -12485,6 +12492,54 @@ mod tests {
         assert_eq!(
             player_state.lock().unwrap().inventory.slots[PlayerInventory::HOTBAR_BASE],
             ItemStack::new(42, 2)
+        );
+    }
+
+    #[test]
+    fn survival_placement_transaction_debits_the_offhand_slot() {
+        let (storage, support, support_token) = test_block_storage();
+        let target = BlockPos {
+            x: support.x + 1,
+            ..support
+        };
+        let target_token = storage.block_mutation_token(target).unwrap();
+        let world = Arc::new(tokio::sync::Mutex::new(storage));
+        let registry = SessionRegistry::new();
+        let session = register_test_session(&registry, "OffhandPlacement");
+        let mut inventory = PlayerInventory::empty();
+        inventory.slots[PlayerInventory::OFFHAND_SLOT] = ItemStack::new(42, 2);
+        let player_state = register_test_player_state(&registry, session, inventory);
+        let (handle, mut owner) = simulation_channel_with_capacity(1);
+        let mut plan =
+            test_survival_placement_plan(target, target_token, support, support_token, 42, 2);
+        plan.held.inventory_slot = PlayerInventory::OFFHAND_SLOT;
+        let response = handle
+            .for_session(session)
+            .enqueue_player_command(SimulationCommand::CommitSurvivalPlacement(Box::new(
+                SurvivalPlacementCommand {
+                    actor_session: session,
+                    plan,
+                },
+            )))
+            .unwrap();
+
+        assert_eq!(
+            owner
+                .process_tick_with_world(&registry, Some(&world), None, 1)
+                .processed,
+            1
+        );
+        assert!(matches!(
+            response.blocking_recv().unwrap().unwrap(),
+            SimulationResponse::SurvivalPlacement(Ok(Some(_)))
+        ));
+        assert_eq!(
+            world.blocking_lock().get_cached_block(target),
+            Some(BlockStateId(1))
+        );
+        assert_eq!(
+            player_state.lock().unwrap().inventory.slots[PlayerInventory::OFFHAND_SLOT],
+            ItemStack::new(42, 1)
         );
     }
 

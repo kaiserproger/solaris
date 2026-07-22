@@ -93,7 +93,7 @@ impl BlockCollisionHeight {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct BlockCollisionBox {
-    coordinates: [u8; 6],
+    coordinates: [i16; 6],
 }
 
 impl BlockCollisionBox {
@@ -110,17 +110,34 @@ impl BlockCollisionBox {
     ) -> Self {
         assert!(min_x < max_x && min_y < max_y && min_z < max_z);
         Self {
-            coordinates: [min_x, min_y, min_z, max_x, max_y, max_z],
+            coordinates: [
+                min_x as i16 * 256,
+                min_y as i16 * 256,
+                min_z as i16 * 256,
+                max_x as i16 * 256,
+                max_y as i16 * 256,
+                max_z as i16 * 256,
+            ],
         }
     }
 
     #[must_use]
-    pub const fn coordinates(self) -> [u8; 6] {
+    pub const fn from_fixed_4096(coordinates: [i16; 6]) -> Self {
+        assert!(
+            coordinates[0] < coordinates[3]
+                && coordinates[1] < coordinates[4]
+                && coordinates[2] < coordinates[5]
+        );
+        Self { coordinates }
+    }
+
+    #[must_use]
+    pub const fn coordinates(self) -> [i16; 6] {
         self.coordinates
     }
 
-    fn as_blocks(self) -> [f64; 6] {
-        self.coordinates.map(|value| f64::from(value) / 16.0)
+    pub fn as_blocks(self) -> [f64; 6] {
+        self.coordinates.map(|value| f64::from(value) / 4096.0)
     }
 }
 

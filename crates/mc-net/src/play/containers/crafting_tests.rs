@@ -1,6 +1,9 @@
 use mc_data::Identifier;
 use mc_data::item_components::{ItemFacts, ItemFactsTable};
 use mc_data::items::{ItemRegistry, ItemReport};
+use mc_data::recipes::{
+    Ingredient, IngredientAlternative, Recipe, RecipeKind, RecipeResult, ShapelessRecipe,
+};
 use mc_data::tags::TagsData;
 use mc_protocol::packets::play::ItemStack;
 
@@ -170,6 +173,57 @@ fn inventory_result_quick_move_is_transactional_when_only_part_fits() {
     assert!(!changed);
     assert!(discarded_remainders.is_empty());
     assert_eq!(inventory.slots, before.slots);
+}
+
+#[test]
+fn result_quick_move_crafts_every_matching_item_into_the_vanilla_reverse_range() {
+    let input = Identifier::parse("minecraft:oak_log").unwrap();
+    let output = Identifier::parse("minecraft:oak_planks").unwrap();
+    let items = ItemRegistry::from_report(&[
+        ItemReport {
+            id: input.clone(),
+            protocol_id: 7,
+        },
+        ItemReport {
+            id: output.clone(),
+            protocol_id: 42,
+        },
+    ]);
+    let recipes = [Recipe {
+        id: Identifier::parse("minecraft:oak_planks").unwrap(),
+        kind: RecipeKind::Shapeless(ShapelessRecipe {
+            ingredients: vec![Ingredient {
+                alternatives: vec![IngredientAlternative::Item(input)],
+            }],
+        }),
+        result: RecipeResult {
+            item: output,
+            count: 4,
+        },
+    }];
+    let item_facts = ItemFactsTable::default();
+    let tags = TagsData::default();
+
+    let mut inventory = PlayerInventory::empty();
+    inventory.slots[1] = ItemStack::new(7, 5);
+    super::refresh_inventory_crafting_result(&items, &item_facts, &tags, &recipes, &mut inventory);
+    let (changed, discarded) =
+        inventory.apply_crafting_quick_move_click(&items, &item_facts, &tags, &recipes, 0);
+    assert!(changed);
+    assert!(discarded.is_empty());
+    assert!(inventory.slots[1].is_empty());
+    assert_eq!(inventory.slots[44], ItemStack::new(42, 20));
+
+    let mut inventory = PlayerInventory::empty();
+    let mut window = CraftingTableWindow::new(7);
+    window.input[0] = ItemStack::new(7, 5);
+    super::refresh_crafting_result(&items, &item_facts, &tags, &recipes, &mut window);
+    let (changed, discarded) =
+        window.apply_quick_move_click(&items, &item_facts, &tags, &recipes, &mut inventory, 0);
+    assert!(changed);
+    assert!(discarded.is_empty());
+    assert!(window.input[0].is_empty());
+    assert_eq!(inventory.slots[44], ItemStack::new(42, 20));
 }
 
 #[test]

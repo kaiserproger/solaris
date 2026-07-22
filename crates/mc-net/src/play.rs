@@ -733,7 +733,7 @@ const HOSTILE_WANDER_SPEED: f64 = 1.25;
 const PASSIVE_WANDER_SPEED: f64 = 0.8;
 const MAX_PASSIVE_SPAWNS_PER_CHUNK: usize = 6;
 const MAX_HOSTILE_SPAWNS_PER_CHUNK: usize = 3;
-const MIN_ENTITY_SPAWN_DISTANCE_FROM_PLAYER: f64 = 0.5;
+const MIN_ENTITY_SPAWN_DISTANCE_FROM_PLAYER: f64 = 24.0;
 
 fn world_time_is_night(world_time: u64) -> bool {
     world_time % DAY_LENGTH_TICKS >= NIGHT_START_TICK
@@ -2349,13 +2349,12 @@ where
     let mut dropped = None;
     let mut discarded_remainders = Vec::new();
     let mut quickcraft_outcome = None;
-    let crafted = match &action {
+    let crafted_result = match &action {
         ContainerClickAction::Pickup { slot: 0, .. }
-        | ContainerClickAction::QuickMove { slot: 0 } => {
-            CraftedItem::from_single_result(&before_window.result)
-        }
+        | ContainerClickAction::QuickMove { slot: 0 } => Some(before_window.result.clone()),
         _ => None,
     };
+    let quick_moved_result = matches!(&action, ContainerClickAction::QuickMove { slot: 0 });
     let changed = match action {
         ContainerClickAction::Pickup { slot, button } => {
             let (changed, discarded) = window.apply_pickup_click(
@@ -2457,6 +2456,13 @@ where
         write_crafting_content(state, writer, &window).await?;
         return Ok(window);
     }
+    let crafted = crafted_result.as_ref().and_then(|result| {
+        if quick_moved_result {
+            crafted_item_from_inventory_delta(result, &before_inventory, &state.inventory)
+        } else {
+            CraftedItem::from_single_result(result)
+        }
+    });
     if commit_crafting_table_candidate(
         state,
         &mut window,
@@ -4226,6 +4232,13 @@ struct FurnaceTickPlan {
     data_changed: Vec<(i16, i16)>,
 }
 
+type FurnaceViewerUpdate = (
+    mc_world::BlockPos,
+    FurnaceBlockEntity,
+    bool,
+    Vec<(i16, i16)>,
+);
+
 fn replan_resident_furnace_tick(
     config: &ServerConfig,
     mutation: &mc_world::WorldMutationView,
@@ -4248,95 +4261,23 @@ fn replan_resident_furnace_tick(
     })
 }
 
-async fn commit_resident_furnace_tick_wave(
+fn commit_resident_furnace_tick_wave(
     config: &ServerConfig,
-    sessions: &SessionRegistry,
-    world_read: &mc_world::WorldReadView,
+    _sessions: &SessionRegistry,
     mutation: &mc_world::WorldMutationView,
-    world_tick: u64,
     mut pending: Vec<FurnaceTickPlan>,
-) -> Result<
-    Vec<(
-        mc_world::BlockPos,
-        FurnaceBlockEntity,
-        bool,
-        Vec<(i16, i16)>,
-    )>,
-    (),
-> {
-    let Some(journal) = sessions.world_chunk_journal() else {
-        let mut updates = Vec::new();
-        while !pending.is_empty() {
-            let mut retry = Vec::new();
-            for plan in pending {
-                match mutation.commit_furnace_tick_conditionally(
-                    plan.position,
-                    plan.block_state,
-                    &plan.before,
-                    &plan.after,
-                ) {
-                    mc_world::ResidentFurnaceTickCommitResult::Applied => {
-                        updates.push((
-                            plan.position,
-                            plan.after,
-                            plan.slots_changed,
-                            plan.data_changed,
-                        ));
-                        #[cfg(test)]
-                        sessions.pause_after_server_furnace_commit_for_test();
-                    }
-                    mc_world::ResidentFurnaceTickCommitResult::Missing => {}
-                    mc_world::ResidentFurnaceTickCommitResult::Stale => {
-                        if let Some(plan) =
-                            replan_resident_furnace_tick(config, mutation, plan.position)
-                        {
-                            retry.push(plan);
-                        }
-                    }
-                }
-            }
-            pending = retry;
-        }
-        return Ok(updates);
-    };
-
+) -> Vec<FurnaceViewerUpdate> {
     let mut updates = Vec::new();
     while !pending.is_empty() {
-        let reservation = tokio::task::spawn_blocking({
-            let journal = journal.clone();
-            move || journal.reserve_decision_ids(1)
-        })
-        .await;
-        let decision_id = match reservation {
-            Ok(Ok(ids)) => ids
-                .into_iter()
-                .next()
-                .expect("one requested journal decision id is returned"),
-            Ok(Err(error)) => {
-                warn!(%error, "resident furnace journal decision reservation failed");
-                sessions.report_world_chunk_journal_failure();
-                return Err(());
-            }
-            Err(error) => {
-                warn!(?error, "resident furnace journal reservation worker failed");
-                sessions.report_world_chunk_journal_failure();
-                return Err(());
-            }
-        };
-
         let mut retry = Vec::new();
-        let mut touched = HashSet::new();
         for plan in pending {
-            let (result, plan_touched) = mutation.commit_furnace_tick_conditionally_journaled(
-                decision_id,
+            match mutation.commit_furnace_tick_conditionally(
                 plan.position,
                 plan.block_state,
                 &plan.before,
                 &plan.after,
-            );
-            match result {
+            ) {
                 mc_world::ResidentFurnaceTickCommitResult::Applied => {
-                    touched.extend(plan_touched);
                     updates.push((
                         plan.position,
                         plan.after,
@@ -4344,7 +4285,7 @@ async fn commit_resident_furnace_tick_wave(
                         plan.data_changed,
                     ));
                     #[cfg(test)]
-                    sessions.pause_after_server_furnace_commit_for_test();
+                    _sessions.pause_after_server_furnace_commit_for_test();
                 }
                 mc_world::ResidentFurnaceTickCommitResult::Missing => {}
                 mc_world::ResidentFurnaceTickCommitResult::Stale => {
@@ -4356,48 +4297,9 @@ async fn commit_resident_furnace_tick_wave(
                 }
             }
         }
-
-        let mut touched = touched.into_iter().collect::<Vec<_>>();
-        touched.sort_unstable_by_key(|position| (position.x, position.z));
-        let snapshots = world_read.snapshot_chunks(&touched);
-        let snapshots = touched
-            .iter()
-            .filter_map(|position| snapshots.chunk(*position))
-            .collect::<Vec<_>>();
-        if snapshots.len() != touched.len() {
-            warn!("resident furnace journal snapshot was incomplete");
-            sessions.report_world_chunk_journal_failure();
-            return Err(());
-        }
-        let append = tokio::task::spawn_blocking({
-            let journal = journal.clone();
-            move || {
-                journal.record_reserved_snapshot_groups(world_tick, vec![(decision_id, snapshots)])
-            }
-        })
-        .await;
-        match append {
-            Ok(Ok(())) => {
-                mutation.clear_journal_pending_conditionally(decision_id, &touched);
-            }
-            Ok(Err(error)) => {
-                warn!(
-                    outcome_unknown = error.outcome_unknown(),
-                    %error,
-                    "resident furnace journal append failed"
-                );
-                sessions.report_world_chunk_journal_failure();
-                return Err(());
-            }
-            Err(error) => {
-                warn!(?error, "resident furnace journal append worker failed");
-                sessions.report_world_chunk_journal_failure();
-                return Err(());
-            }
-        }
         pending = retry;
     }
-    Ok(updates)
+    updates
 }
 
 async fn run_furnace_ticks_owned(
@@ -4414,8 +4316,6 @@ async fn run_furnace_ticks_owned(
     if loaded_chunks.is_empty() {
         return 0;
     }
-    let world_tick = sessions.simulation_tick();
-
     let owned_world_read = if world_read.is_none() {
         Some(world.lock().await.read_view())
     } else {
@@ -4462,14 +4362,7 @@ async fn run_furnace_ticks_owned(
     }
 
     let updates = if let Some(mutation) = world_mutation {
-        match commit_resident_furnace_tick_wave(
-            config, sessions, world_read, mutation, world_tick, plans,
-        )
-        .await
-        {
-            Ok(updates) => updates,
-            Err(()) => return 0,
-        }
+        commit_resident_furnace_tick_wave(config, sessions, mutation, plans)
     } else {
         let mut updates = Vec::new();
         for plan in plans {
@@ -5453,13 +5346,12 @@ where
     if !matches!(action, ContainerClickAction::QuickCraft(_)) {
         state.inventory_quickcraft.reset();
     }
-    let crafted = match &action {
+    let crafted_result = match &action {
         ContainerClickAction::Pickup { slot: 0, .. }
-        | ContainerClickAction::QuickMove { slot: 0 } => {
-            CraftedItem::from_single_result(&before_inventory.slots[0])
-        }
+        | ContainerClickAction::QuickMove { slot: 0 } => Some(before_inventory.slots[0].clone()),
         _ => None,
     };
+    let quick_moved_result = matches!(&action, ContainerClickAction::QuickMove { slot: 0 });
     let changed = match action {
         ContainerClickAction::Pickup { slot, button } => {
             let (changed, discarded) = state.inventory.apply_crafting_pickup_click(
@@ -5560,6 +5452,13 @@ where
         write_inventory_content_resync(state, writer).await?;
         return Ok(());
     }
+    let crafted = crafted_result.as_ref().and_then(|result| {
+        if quick_moved_result {
+            crafted_item_from_inventory_delta(result, &before_inventory, &state.inventory)
+        } else {
+            CraftedItem::from_single_result(result)
+        }
+    });
     if commit_player_inventory_candidate(
         state,
         before_inventory,
@@ -5586,6 +5485,30 @@ where
     } else {
         write_inventory_content_resync(state, writer).await
     }
+}
+
+fn crafted_item_from_inventory_delta(
+    result: &ItemStack,
+    before: &PlayerInventory,
+    after: &PlayerInventory,
+) -> Option<CraftedItem> {
+    let matching_count = |inventory: &PlayerInventory| {
+        inventory.slots[9..=44]
+            .iter()
+            .filter(|stack| can_stack(stack, result))
+            .map(|stack| u64::try_from(stack.count).unwrap_or_default())
+            .sum::<u64>()
+    };
+    let added = matching_count(after).checked_sub(matching_count(before))?;
+    let result_count = u64::try_from(result.count).ok()?;
+    if result_count == 0 || added == 0 || !added.is_multiple_of(result_count) {
+        return None;
+    }
+    Some(CraftedItem {
+        item_id: result.item_id,
+        count: added,
+        craft_count: u32::try_from(added / result_count).ok()?,
+    })
 }
 
 async fn handle_container_button_click<W>(
@@ -9540,7 +9463,6 @@ async fn run_scheduled_block_ticks_owned(
             }
         }
         if let Some(region_plans) = region_plans {
-            let mut wave = None;
             for planned in region_plans {
                 let region_due = planned.due;
                 let current_snapshot =
@@ -9572,30 +9494,16 @@ async fn run_scheduled_block_ticks_owned(
                     && let Some((edits, preconditions)) =
                         resident_block_edit_inputs(&plan.edits, &plan.preconditions, table)
                 {
-                    if wave.is_none() {
-                        wave = match ResidentWorldJournalWave::begin(sessions).await {
-                            Ok(wave) => Some(wave),
-                            Err(()) => {
-                                journal_failed = true;
-                                break;
-                            }
-                        };
-                    }
                     Some(
-                        wave.as_mut()
-                            .expect("resident journal wave was initialized")
-                            .commit_block_edits(
-                                world_mutation,
-                                ResidentBlockCommit {
-                                    edits: &edits,
-                                    preconditions: &preconditions,
-                                    consumed_block_ticks: &region_due,
-                                    consumed_fluid_ticks: &[],
-                                    scheduled_fluid_ticks: &[],
-                                    light_table: table,
-                                    leaf_trigger_tick: Some(world_tick.saturating_add(1)),
-                                },
-                            ),
+                        world_mutation.apply_scheduled_block_tick_plan_conditionally(
+                            &mc_world::ResidentScheduledBlockTickPlan {
+                                consumed_ticks: &region_due,
+                                edits: &edits,
+                                preconditions: &preconditions,
+                                light_table: table,
+                                leaf_trigger_tick: Some(world_tick.saturating_add(1)),
+                            },
+                        ),
                     )
                 } else {
                     None
@@ -9615,15 +9523,6 @@ async fn run_scheduled_block_ticks_owned(
                     | Some(mc_world::ResidentBlockEditBatchResult::CrossRegion) => {}
                 }
 
-                if let Some(current_wave) = wave.take()
-                    && current_wave
-                        .finish(sessions, world_read, world_mutation, world_tick)
-                        .await
-                        .is_err()
-                {
-                    journal_failed = true;
-                    break;
-                }
                 let Some((edits, preconditions)) =
                     resident_block_edit_inputs(&plan.edits, &plan.preconditions, table)
                 else {
@@ -9654,15 +9553,6 @@ async fn run_scheduled_block_ticks_owned(
                         break;
                     }
                 }
-            }
-            if !journal_failed
-                && let Some(current_wave) = wave
-                && current_wave
-                    .finish(sessions, world_read, world_mutation, world_tick)
-                    .await
-                    .is_err()
-            {
-                journal_failed = true;
             }
         }
         if journal_failed {

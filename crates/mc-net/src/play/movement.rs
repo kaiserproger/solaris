@@ -122,7 +122,7 @@ pub(super) fn player_pose_collides_with_solid_in_snapshot(
     let half_width = 0.3;
     let min_x = (pose.x - half_width).floor() as i32;
     let max_x = (pose.x + half_width).floor() as i32;
-    let max_collision_box_y = f64::from(collision_shapes.max_box_y()) / 16.0;
+    let max_collision_box_y = collision_shapes.max_box_y_blocks();
     let min_y = (pose.y - max_collision_box_y + COLLISION_DEFLATION).floor() as i32 + 1;
     let max_y = (pose.y + pose.body_height() - 1.0e-6).floor() as i32;
     let min_z = (pose.z - half_width).floor() as i32;
@@ -195,7 +195,6 @@ fn player_collision_state_intersects(
     ) {
         return boxes
             .iter()
-            .copied()
             .any(|collision_box| intersects(collision_box.as_blocks()));
     }
 

@@ -344,13 +344,10 @@ pub(super) fn plan_stair_state_transition(
     previous_state: BlockStateId,
     new_state: BlockStateId,
 ) -> Option<PlannedStairTransition> {
-    if matches!(
-        classify_stair_state(blocks, previous_state),
-        StairState::Malformed
-    ) || matches!(
-        classify_stair_state(blocks, new_state),
-        StairState::Malformed
-    ) {
+    let previous_stair = classify_stair_state(blocks, previous_state);
+    let new_stair = classify_stair_state(blocks, new_state);
+    if matches!(previous_stair, StairState::Malformed) || matches!(new_stair, StairState::Malformed)
+    {
         return None;
     }
     if previous_state == new_state {
@@ -360,11 +357,13 @@ pub(super) fn plan_stair_state_transition(
             dependency_preconditions: Vec::new(),
         });
     }
+    let ordinary_transition =
+        matches!(previous_stair, StairState::NotStair) && matches!(new_stair, StairState::NotStair);
 
     let read_positions = RefCell::new(Vec::new());
     let provisional_block_at =
         |read_pos| transition_block_at(world, &read_positions, pos, new_state, read_pos);
-    let target_state = match classify_stair_state(blocks, new_state) {
+    let target_state = match new_stair {
         StairState::Valid(_) => {
             stair_state_with_shape_from(blocks, pos, new_state, &provisional_block_at)?
         }
@@ -376,13 +375,36 @@ pub(super) fn plan_stair_state_transition(
     let mut neighbor_edits = Vec::new();
     for direction in HORIZONTAL_DIRECTIONS {
         let neighbor_pos = relative(pos, direction);
-        let neighbor_state = block_at(neighbor_pos)?;
+        let neighbor_state = if ordinary_transition {
+            world.get_cached_block(neighbor_pos)
+        } else {
+            block_at(neighbor_pos)
+        };
+        let Some(neighbor_state) = neighbor_state else {
+            if ordinary_transition {
+                continue;
+            }
+            return None;
+        };
         match classify_stair_state(blocks, neighbor_state) {
             StairState::NotStair => continue,
             StairState::Malformed => return None,
             StairState::Valid(_) => {}
         }
-        let updated = stair_state_with_shape_from(blocks, neighbor_pos, neighbor_state, &block_at)?;
+        if ordinary_transition {
+            let mut positions = read_positions.borrow_mut();
+            if !positions.contains(&neighbor_pos) {
+                positions.push(neighbor_pos);
+            }
+        }
+        let Some(updated) =
+            stair_state_with_shape_from(blocks, neighbor_pos, neighbor_state, &block_at)
+        else {
+            if ordinary_transition {
+                continue;
+            }
+            return None;
+        };
         if updated != neighbor_state {
             neighbor_edits.push(BlockEdit {
                 pos: neighbor_pos,
@@ -419,12 +441,13 @@ fn transition_block_at(
     if read_pos == transition_pos {
         return Some(transition_state);
     }
+    let state = world.get_cached_block(read_pos)?;
     let mut positions = read_positions.borrow_mut();
     if !positions.contains(&read_pos) {
         positions.push(read_pos);
     }
     drop(positions);
-    world.get_cached_block(read_pos)
+    Some(state)
 }
 
 #[cfg(test)]
@@ -766,15 +789,17 @@ fn has_full_sturdy_face(blocks: &BlockRegistry, state_id: BlockStateId, face: Di
     let shapes = mc_data::collision_shapes::vanilla_collision_shapes();
     if let Some(boxes) = shapes.get_for_state(state_id.0, &state.block.id, &state.properties) {
         let mut covered = [false; 16 * 16];
-        for collision_box in boxes {
+        const CELL_UNITS: i16 = mc_data::collision_shapes::COLLISION_UNITS_PER_BLOCK / 16;
+        const BLOCK_UNITS: i16 = mc_data::collision_shapes::COLLISION_UNITS_PER_BLOCK;
+        for collision_box in boxes.iter() {
             let [min_x, min_y, min_z, max_x, max_y, max_z] = collision_box.coordinates();
             let projected = match face {
                 Direction::Down if min_y == 0 => Some((min_x, max_x, min_z, max_z)),
-                Direction::Up if max_y == 16 => Some((min_x, max_x, min_z, max_z)),
+                Direction::Up if max_y == BLOCK_UNITS => Some((min_x, max_x, min_z, max_z)),
                 Direction::North if min_z == 0 => Some((min_x, max_x, min_y, max_y)),
-                Direction::South if max_z == 16 => Some((min_x, max_x, min_y, max_y)),
+                Direction::South if max_z == BLOCK_UNITS => Some((min_x, max_x, min_y, max_y)),
                 Direction::West if min_x == 0 => Some((min_z, max_z, min_y, max_y)),
-                Direction::East if max_x == 16 => Some((min_z, max_z, min_y, max_y)),
+                Direction::East if max_x == BLOCK_UNITS => Some((min_z, max_z, min_y, max_y)),
                 Direction::Down
                 | Direction::Up
                 | Direction::North
@@ -785,9 +810,19 @@ fn has_full_sturdy_face(blocks: &BlockRegistry, state_id: BlockStateId, face: Di
             let Some((min_a, max_a, min_b, max_b)) = projected else {
                 continue;
             };
-            for a in min_a.min(16)..max_a.min(16) {
-                for b in min_b.min(16)..max_b.min(16) {
-                    covered[usize::from(a) * 16 + usize::from(b)] = true;
+            for a in 0..16 {
+                for b in 0..16 {
+                    let cell_min_a = a * CELL_UNITS;
+                    let cell_max_a = cell_min_a + CELL_UNITS;
+                    let cell_min_b = b * CELL_UNITS;
+                    let cell_max_b = cell_min_b + CELL_UNITS;
+                    if min_a <= cell_min_a
+                        && max_a >= cell_max_a
+                        && min_b <= cell_min_b
+                        && max_b >= cell_max_b
+                    {
+                        covered[a as usize * 16 + b as usize] = true;
+                    }
                 }
             }
         }

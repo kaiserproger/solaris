@@ -1312,9 +1312,14 @@ impl BoundServer {
                     play::air_state_id(&entity_config.blocks),
                 );
                 let hostile_attacks_us = elapsed_us(started);
-                let started = Instant::now();
-                simulation_owner.tick_animal_breeding(&entity_sessions);
-                animal_breeding_us = animal_breeding_us.saturating_add(elapsed_us(started));
+                if tick.is_multiple_of(u64::from(ANIMAL_BREEDING_TICK_INTERVAL_TICKS)) {
+                    let started = Instant::now();
+                    simulation_owner.tick_animal_breeding(
+                        &entity_sessions,
+                        ANIMAL_BREEDING_TICK_INTERVAL_TICKS,
+                    );
+                    animal_breeding_us = animal_breeding_us.saturating_add(elapsed_us(started));
+                }
                 let entity_query_count = queries.len();
                 let (steps, entity_physics_us, entity_dispatch_us) = if physics_was_in_flight {
                     (Vec::new(), 0, 0)
@@ -1411,7 +1416,8 @@ impl BoundServer {
                     .await;
                 let campfire_tick_us = elapsed_us(started);
 
-                simulation_owner
+                let started = Instant::now();
+                let furnace_updated = simulation_owner
                     .run_furnace_ticks(
                         &entity_config,
                         &entity_sessions,
@@ -1419,6 +1425,7 @@ impl BoundServer {
                         entity_world_mutation.as_ref(),
                     )
                     .await;
+                let furnace_tick_us = elapsed_us(started);
 
                 let entity_save_us = 0;
                 if tick.is_multiple_of(simulation_policy.save_interval_ticks)
@@ -1503,6 +1510,20 @@ impl BoundServer {
 
                 let tick_us = elapsed_us(tick_started)
                     .saturating_add(simulation_command_telemetry.off_tick_elapsed_us);
+                let attributed_tick_us = simulation_commands_us
+                    .saturating_add(world_time_us)
+                    .saturating_add(animal_breeding_us)
+                    .saturating_add(hostile_attacks_us)
+                    .saturating_add(entity_goals_us)
+                    .saturating_add(entity_physics_us)
+                    .saturating_add(entity_dispatch_us)
+                    .saturating_add(campfire_tick_us)
+                    .saturating_add(furnace_tick_us)
+                    .saturating_add(entity_save_us)
+                    .saturating_add(random_tick_us)
+                    .saturating_add(block_tick_us)
+                    .saturating_add(fluid_tick_us);
+                let unattributed_tick_us = tick_us.saturating_sub(attributed_tick_us);
                 let current_tick_sample = RuntimeTickSample {
                     tick_us,
                     world_time_us,
@@ -1619,6 +1640,9 @@ impl BoundServer {
                             entity_physics_us,
                             entity_dispatch_us,
                             campfire_tick_us,
+                            furnace_tick_us,
+                            furnace_updated,
+                            unattributed_tick_us,
                             entity_save_us,
                             random_tick_us,
                             block_tick_us,
@@ -1734,6 +1758,9 @@ impl BoundServer {
                             entity_physics_us,
                             entity_dispatch_us,
                             campfire_tick_us,
+                            furnace_tick_us,
+                            furnace_updated,
+                            unattributed_tick_us,
                             entity_save_us,
                             random_tick_us,
                             block_tick_us,
@@ -3059,7 +3086,11 @@ fn prepare_entity_physics_inputs(
         .into_iter()
         .map(|position| (position, world_snapshot.chunk(position)))
         .collect();
-    let snapshot = Arc::new(EntityPhysicsSnapshot { chunks, materials });
+    let snapshot = Arc::new(EntityPhysicsSnapshot {
+        chunks,
+        materials,
+        blocks: Some(Arc::clone(&config.blocks)),
+    });
     entity_physics_inputs_from_snapshot(plans, snapshot)
 }
 
@@ -3225,6 +3256,7 @@ async fn step_entity_physics_inputs(
 }
 
 const ENTITY_PHYSICS_INLINE_LIMIT: usize = 256;
+const ANIMAL_BREEDING_TICK_INTERVAL_TICKS: u16 = 20;
 
 fn entity_physics_worker_count(
     cpu_resources: &ChunkPipelineResources,
@@ -3255,6 +3287,7 @@ struct EntityPhysicsSamplePlan {
 struct EntityPhysicsSnapshot {
     chunks: HashMap<mc_world::ChunkPos, Option<mc_world::ChunkSnapshot>>,
     materials: Arc<BlockMaterialIds>,
+    blocks: Option<Arc<BlockRegistry>>,
 }
 
 struct SampledPhysicsWorld {
@@ -3412,19 +3445,17 @@ fn collision_block_touching_arrow_endpoint(
                         box_max_x,
                         box_max_y,
                         box_max_z,
-                    ] = collision_box.coordinates();
+                    ] = collision_box.as_blocks();
                     let touches = position.x + aabb.half_width + CONTACT_EPSILON
-                        >= f64::from(x) + f64::from(box_min_x) / 16.0
+                        >= f64::from(x) + box_min_x
                         && position.x - aabb.half_width - CONTACT_EPSILON
-                            <= f64::from(x) + f64::from(box_max_x) / 16.0
-                        && position.y + aabb.height + CONTACT_EPSILON
-                            >= f64::from(y) + f64::from(box_min_y) / 16.0
-                        && position.y - CONTACT_EPSILON
-                            <= f64::from(y) + f64::from(box_max_y) / 16.0
+                            <= f64::from(x) + box_max_x
+                        && position.y + aabb.height + CONTACT_EPSILON >= f64::from(y) + box_min_y
+                        && position.y - CONTACT_EPSILON <= f64::from(y) + box_max_y
                         && position.z + aabb.half_width + CONTACT_EPSILON
-                            >= f64::from(z) + f64::from(box_min_z) / 16.0
+                            >= f64::from(z) + box_min_z
                         && position.z - aabb.half_width - CONTACT_EPSILON
-                            <= f64::from(z) + f64::from(box_max_z) / 16.0;
+                            <= f64::from(z) + box_max_z;
                     if touches {
                         let candidate = (x, y, z, state);
                         if first_colliding_state.is_none_or(|first| candidate < first) {
@@ -3467,18 +3498,30 @@ impl BlockSampler for SampledPhysicsWorld {
     }
 
     fn max_collision_box_y(&self) -> u8 {
-        mc_data::collision_shapes::vanilla_collision_shapes().max_box_y()
+        let max_y = mc_data::collision_shapes::vanilla_collision_shapes().max_box_y();
+        u8::try_from((max_y + 255) / 256).expect("vanilla collision height fits u8")
     }
 
     fn collision_boxes_at(&self, x: i32, y: i32, z: i32, emit: &mut dyn FnMut(BlockCollisionBox)) {
         let Some(state) = self.state_id_at(x, y, z) else {
             return;
         };
-        if let Some(boxes) = mc_data::collision_shapes::vanilla_collision_shapes().get(state) {
-            for collision_box in boxes {
-                let [min_x, min_y, min_z, max_x, max_y, max_z] = collision_box.coordinates();
-                emit(BlockCollisionBox::from_sixteenths(
-                    min_x, min_y, min_z, max_x, max_y, max_z,
+        let exact_shape = self
+            .snapshot
+            .blocks
+            .as_ref()
+            .and_then(|blocks| blocks.by_id(mc_world::BlockStateId(state)))
+            .and_then(|block| {
+                mc_data::collision_shapes::vanilla_collision_shapes().get_for_state(
+                    state,
+                    &block.block.id,
+                    &block.properties,
+                )
+            });
+        if let Some(boxes) = exact_shape {
+            for collision_box in boxes.iter() {
+                emit(BlockCollisionBox::from_fixed_4096(
+                    collision_box.coordinates(),
                 ));
             }
         } else if let Some(height) = self.snapshot.materials.collision_height(state) {
@@ -3499,6 +3542,7 @@ fn sample_entity_physics_input(
     let snapshot = Arc::new(EntityPhysicsSnapshot {
         chunks,
         materials: Arc::new(materials.clone()),
+        blocks: Some(storage.registry_arc()),
     });
     entity_physics_inputs_from_snapshot(std::mem::take(&mut plans), snapshot)
         .pop()
@@ -5199,6 +5243,7 @@ end
         let snapshot = Arc::new(EntityPhysicsSnapshot {
             chunks: HashMap::new(),
             materials: Arc::new(BlockMaterialIds::new(0, None, None)),
+            blocks: None,
         });
         let inputs = (0..198)
             .map(|id| EntityPhysicsInput {
@@ -5238,6 +5283,7 @@ end
             snapshot: Arc::new(EntityPhysicsSnapshot {
                 chunks: HashMap::new(),
                 materials: Arc::new(BlockMaterialIds::new(0, None, None)),
+                blocks: None,
             }),
             complete_samples: false,
         }];
@@ -5261,6 +5307,7 @@ end
         let snapshot = Arc::new(EntityPhysicsSnapshot {
             chunks: HashMap::new(),
             materials: Arc::new(BlockMaterialIds::new(0, None, None)),
+            blocks: None,
         });
         let inputs = (0..257)
             .map(|id| EntityPhysicsInput {
@@ -5311,6 +5358,7 @@ end
         let snapshot = Arc::new(EntityPhysicsSnapshot {
             chunks: HashMap::new(),
             materials: Arc::new(BlockMaterialIds::new(0, None, None)),
+            blocks: None,
         });
         let queries = (0..257)
             .map(|id| play::EntityPhysicsQuery {
@@ -5381,6 +5429,7 @@ end
         let snapshot = EntityPhysicsSnapshot {
             chunks: HashMap::from([(chunk, captured.chunk(chunk))]),
             materials: Arc::new(BlockMaterialIds::new(0, None, None)),
+            blocks: None,
         };
 
         assert!(entity_physics_snapshot_is_current(&world_read, &snapshot));
@@ -5619,6 +5668,7 @@ end
         let snapshot = Arc::new(EntityPhysicsSnapshot {
             chunks: HashMap::from([(chunk, captured.chunk(chunk))]),
             materials: Arc::new(BlockMaterialIds::new(0, None, None)),
+            blocks: None,
         });
         let query = play::EntityPhysicsQuery {
             id: mc_entity::EntityId(73),
@@ -6076,6 +6126,7 @@ end
             snapshot: Arc::new(EntityPhysicsSnapshot {
                 chunks: HashMap::new(),
                 materials: Arc::new(BlockMaterialIds::new(0, None, None)),
+                blocks: None,
             }),
             complete_samples: false,
         });
@@ -6375,6 +6426,7 @@ end
         let snapshot = Arc::new(EntityPhysicsSnapshot {
             chunks,
             materials: Arc::new(materials),
+            blocks: Some(storage.registry_arc()),
         });
         let inputs = entity_physics_inputs_from_snapshot(plans, snapshot);
 

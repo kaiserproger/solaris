@@ -39,7 +39,13 @@ pub(super) struct BreedingPlan {
     pub(super) became_adults: Vec<EntityId>,
 }
 
-pub(super) fn plan_breeding(simulation_tick: u64, animals: &[BreedingAnimal]) -> BreedingPlan {
+pub(super) fn plan_breeding(
+    simulation_tick: u64,
+    animals: &[BreedingAnimal],
+    elapsed_ticks: u16,
+) -> BreedingPlan {
+    let elapsed_age_ticks = i32::from(elapsed_ticks.max(1));
+    let elapsed_love_ticks = elapsed_ticks.max(1);
     let mut updates = animals
         .iter()
         .map(|animal| BreedingStateUpdate {
@@ -51,12 +57,20 @@ pub(super) fn plan_breeding(simulation_tick: u64, animals: &[BreedingAnimal]) ->
     for update in &mut updates {
         let was_baby = update.state.is_baby();
         if update.state.age_ticks < 0 {
-            update.state.age_ticks += 1;
+            update.state.age_ticks = update
+                .state
+                .age_ticks
+                .saturating_add(elapsed_age_ticks)
+                .min(0);
         } else if update.state.age_ticks > 0 {
-            update.state.age_ticks -= 1;
+            update.state.age_ticks = update
+                .state
+                .age_ticks
+                .saturating_sub(elapsed_age_ticks)
+                .max(0);
         }
         if update.state.age_ticks == 0 {
-            update.state.love_ticks = update.state.love_ticks.saturating_sub(1);
+            update.state.love_ticks = update.state.love_ticks.saturating_sub(elapsed_love_ticks);
         } else {
             update.state.love_ticks = 0;
         }
@@ -73,8 +87,11 @@ pub(super) fn plan_breeding(simulation_tick: u64, animals: &[BreedingAnimal]) ->
         let first_state = updates[first_index].state;
         if paired[first_index]
             || first_state.age_ticks != 0
-            || first_state.love_ticks == 0
-            || first_state.love_ticks > courtship_complete
+            || !love_window_crossed(
+                animals[first_index].state.love_ticks,
+                elapsed_love_ticks,
+                courtship_complete,
+            )
         {
             continue;
         }
@@ -84,8 +101,11 @@ pub(super) fn plan_breeding(simulation_tick: u64, animals: &[BreedingAnimal]) ->
             !paired[second_index]
                 && second.type_name == first.type_name
                 && second_state.age_ticks == 0
-                && second_state.love_ticks > 0
-                && second_state.love_ticks <= courtship_complete
+                && love_window_crossed(
+                    animals[second_index].state.love_ticks,
+                    elapsed_love_ticks,
+                    courtship_complete,
+                )
                 && distance_sq(first.position, second.position) < 9.0
         }) else {
             continue;
@@ -138,6 +158,12 @@ pub(super) fn plan_breeding(simulation_tick: u64, animals: &[BreedingAnimal]) ->
         births,
         became_adults,
     }
+}
+
+fn love_window_crossed(love_ticks: u16, elapsed_ticks: u16, courtship_complete: u16) -> bool {
+    let first_tick = love_ticks.saturating_sub(1);
+    let last_tick = love_ticks.saturating_sub(elapsed_ticks.max(1));
+    first_tick >= 1 && last_tick <= courtship_complete
 }
 
 #[derive(Debug, Clone, PartialEq)]

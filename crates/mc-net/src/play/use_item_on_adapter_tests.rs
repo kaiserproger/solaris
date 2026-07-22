@@ -140,6 +140,38 @@ fn assert_held_count(harness: &PlacementHarness, expected: i32) {
     );
 }
 
+fn assert_offhand_count(harness: &PlacementHarness, expected: i32) {
+    let held = &harness.state.inventory.slots[PlayerInventory::OFFHAND_SLOT];
+    let expected = ItemStack::new(held.item_id, expected);
+    assert_eq!(held, &expected);
+    assert_eq!(
+        harness.persisted.lock().unwrap().inventory.slots[PlayerInventory::OFFHAND_SLOT],
+        expected
+    );
+}
+
+#[tokio::test]
+async fn offhand_use_item_on_places_and_debits_the_packet_selected_hand() {
+    let mut harness = placement_harness(STONE_ITEM_ID).await;
+    harness.state.inventory.slots[PlayerInventory::OFFHAND_SLOT] = ItemStack::new(STONE_ITEM_ID, 2);
+    *harness.state.inventory.held_mut(0).unwrap() = ItemStack::EMPTY;
+    harness.persisted.lock().unwrap().inventory = harness.state.inventory.clone();
+    let clicked = BlockPos { x: 4, y: 64, z: 4 };
+    let target = BlockPos { x: 5, ..clicked };
+    set_block(&harness.state, clicked, BlockStateId(1)).await;
+    let mut action = use_item_on(clicked, Direction::East, 0.5);
+    action.hand = InteractionHand::OffHand;
+
+    run_accepted_placement(&mut harness, clicked, &action).await;
+
+    assert_eq!(
+        harness.state.world.lock().await.get_cached_block(target),
+        Some(BlockStateId(1))
+    );
+    assert!(harness.state.inventory.held(0).unwrap().is_empty());
+    assert_offhand_count(&harness, 1);
+}
+
 #[tokio::test]
 async fn ordinary_stair_placement_passes_the_real_validator_and_debits_once() {
     let mut harness = placement_harness(STAIR_ITEM_ID).await;

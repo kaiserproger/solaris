@@ -17,7 +17,7 @@ struct CanonicalPathingStateFact {
 
 enum PathingCollisionShape<'a> {
     FullCube,
-    Voxel(&'a [mc_data::collision_shapes::CollisionBox]),
+    Voxel(mc_data::collision_shapes::CollisionShape<'a>),
 }
 
 fn canonical_pathing_state_facts() -> &'static [Option<CanonicalPathingStateFact>] {
@@ -236,7 +236,7 @@ impl PathingProbe for LoadedChunkPathingProbe<'_> {
         let min_z = (position.z - aabb.half_width + EPSILON).floor() as i32;
         let max_z = (position.z + aabb.half_width - EPSILON).floor() as i32;
         let collision_shapes = mc_data::collision_shapes::vanilla_collision_shapes();
-        let max_collision_box_y = f64::from(collision_shapes.max_box_y()) / 16.0;
+        let max_collision_box_y = collision_shapes.max_box_y_blocks();
         let body_root_min_y =
             ((position.y - max_collision_box_y).floor() as i32).max(mc_world::chunk::MIN_Y);
         let max_y = (position.y + aabb.height - EPSILON).floor() as i32;
@@ -331,7 +331,7 @@ impl LoadedChunkPathingProbe<'_> {
             PathingCollisionShape::FullCube => {
                 Self::body_intersects_box(position, aabb, x, y, z, [0.0, 0.0, 0.0, 1.0, 1.0, 1.0])
             }
-            PathingCollisionShape::Voxel(boxes) => boxes.iter().copied().any(|collision_box| {
+            PathingCollisionShape::Voxel(boxes) => boxes.iter().any(|collision_box| {
                 Self::body_intersects_voxel_box(position, aabb, x, y, z, collision_box.as_blocks())
             }),
         }
@@ -350,7 +350,7 @@ impl LoadedChunkPathingProbe<'_> {
         else {
             return PathingCollisionShape::FullCube;
         };
-        if boxes.len() == 1 && boxes[0].coordinates() == [0, 0, 0, 16, 16, 16] {
+        if boxes.is_full_cube() {
             PathingCollisionShape::FullCube
         } else {
             PathingCollisionShape::Voxel(boxes)
@@ -444,7 +444,7 @@ impl LoadedChunkPathingProbe<'_> {
                     && position.z - aabb.half_width < f64::from(z) + 1.0
                     && position.z + aabb.half_width > f64::from(z)
             }
-            PathingCollisionShape::Voxel(boxes) => boxes.iter().copied().any(|collision_box| {
+            PathingCollisionShape::Voxel(boxes) => boxes.iter().any(|collision_box| {
                 let [min_x, min_y, min_z, max_x, max_y, max_z] = collision_box.as_blocks();
                 Self::voxel_shape_axis_intersects(
                     position.y - SUPPORT_CONTACT_DEPTH,

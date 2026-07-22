@@ -1,5 +1,112 @@
 use super::*;
 
+#[test]
+fn collision_geometry_scales_width_height_and_eye_height_with_java_float_math() {
+    let base = EntityCollisionDimensions {
+        width: 0.9,
+        height: 1.4,
+        eye_height: 1.33,
+        fixed: false,
+    };
+
+    let default = scale_entity_collision_geometry(base, 1.0).unwrap();
+    assert_eq!(default.aabb.half_width, f64::from(0.45_f32));
+    assert_eq!(default.aabb.height, f64::from(1.4_f32));
+    assert_eq!(default.eye_height, f64::from(1.33_f32));
+
+    let doubled = scale_entity_collision_geometry(base, 2.0).unwrap();
+    assert_eq!(doubled.aabb.half_width, f64::from(0.9_f32));
+    assert_eq!(doubled.aabb.height, f64::from(2.8_f32));
+    assert_eq!(doubled.eye_height, f64::from(2.66_f32));
+}
+
+#[test]
+fn collision_geometry_accepts_exact_scale_bounds() {
+    let base = EntityCollisionDimensions {
+        width: 0.9,
+        height: 1.4,
+        eye_height: 1.33,
+        fixed: false,
+    };
+
+    let minimum = scale_entity_collision_geometry(base, 0.0625).unwrap();
+    assert_eq!(minimum.aabb.height, f64::from(1.4_f32 * 0.0625_f32));
+    assert_eq!(minimum.eye_height, f64::from(1.33_f32 * 0.0625_f32));
+
+    let maximum = scale_entity_collision_geometry(base, 16.0).unwrap();
+    assert_eq!(maximum.aabb.half_width, f64::from(0.9_f32 * 16.0_f32 / 2.0));
+    assert_eq!(maximum.aabb.height, f64::from(1.4_f32 * 16.0_f32));
+    assert_eq!(maximum.eye_height, f64::from(1.33_f32 * 16.0_f32));
+}
+
+#[test]
+fn fixed_and_zero_width_dimensions_follow_entity_dimensions_scale() {
+    let fixed = EntityCollisionDimensions {
+        width: 0.9,
+        height: 1.4,
+        eye_height: 1.33,
+        fixed: true,
+    };
+    let unchanged = scale_entity_collision_geometry(fixed, 2.0).unwrap();
+    assert_eq!(unchanged.aabb.half_width, f64::from(0.45_f32));
+    assert_eq!(unchanged.aabb.height, f64::from(1.4_f32));
+    assert_eq!(unchanged.eye_height, f64::from(1.33_f32));
+
+    let zero_width = EntityCollisionDimensions {
+        width: 0.0,
+        fixed: false,
+        ..fixed
+    };
+    let scaled = scale_entity_collision_geometry(zero_width, 2.0).unwrap();
+    assert_eq!(scaled.aabb.half_width, 0.0);
+    assert_eq!(scaled.aabb.height, f64::from(2.8_f32));
+    assert_eq!(scaled.eye_height, f64::from(2.66_f32));
+}
+
+#[test]
+fn collision_geometry_rejects_invalid_dimensions_and_scale() {
+    let valid = EntityCollisionDimensions {
+        width: 0.9,
+        height: 1.4,
+        eye_height: 1.33,
+        fixed: false,
+    };
+    for scale in [
+        0.0,
+        0.0625_f32.next_down(),
+        16.0_f32.next_up(),
+        -1.0,
+        f32::NAN,
+        f32::INFINITY,
+        f32::NEG_INFINITY,
+    ] {
+        assert_eq!(
+            scale_entity_collision_geometry(valid, scale),
+            Err(EntityContactError::InvalidScale)
+        );
+    }
+
+    for dimensions in [
+        EntityCollisionDimensions {
+            width: f32::NAN,
+            ..valid
+        },
+        EntityCollisionDimensions {
+            height: f32::NAN,
+            ..valid
+        },
+        EntityCollisionDimensions {
+            eye_height: f32::INFINITY,
+            ..valid
+        },
+    ] {
+        assert_eq!(
+            scale_entity_collision_geometry(dimensions, 1.0),
+            Err(EntityContactError::InvalidDimensions)
+        );
+    }
+}
+
 fn push_input(
     caller_to_other_x: f64,
     caller_to_other_z: f64,

@@ -5,7 +5,7 @@
 //! team and vehicle fact ownership, velocity publication, and damage commits
 //! remain with their owning callers.
 
-use crate::Vec3;
+use crate::{Aabb, Vec3};
 
 /// `0.01F` from `Entity.push(Entity)`, widened exactly as Java widens it.
 pub const MIN_PUSH_DISTANCE: f64 = 0.01_f32 as f64;
@@ -15,6 +15,57 @@ pub const PUSH_STRENGTH: f64 = 0.05_f32 as f64;
 pub const CRAMMING_ROLL_DENOMINATOR: u8 = 4;
 /// Damage passed to `hurtServer` after a successful cramming roll.
 pub const CRAMMING_DAMAGE: f32 = 6.0;
+
+// `Attributes.SCALE` bounds from the bundled Java Edition 26.1.2 server.
+const MIN_ENTITY_SCALE: f32 = 0.0625;
+const MAX_ENTITY_SCALE: f32 = 16.0;
+
+/// Unscaled living-entity geometry from the 26.1.2 entity contract.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct EntityCollisionDimensions {
+    pub width: f32,
+    pub height: f32,
+    pub eye_height: f32,
+    pub fixed: bool,
+}
+
+/// Collision and eye geometry after applying the authoritative live scale.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct ScaledEntityCollisionGeometry {
+    pub aabb: Aabb,
+    pub eye_height: f64,
+}
+
+/// Applies `EntityDimensions.scale(float)` semantics from Java Edition 26.1.2.
+pub fn scale_entity_collision_geometry(
+    dimensions: EntityCollisionDimensions,
+    scale: f32,
+) -> Result<ScaledEntityCollisionGeometry, EntityContactError> {
+    if !scale.is_finite() || !(MIN_ENTITY_SCALE..=MAX_ENTITY_SCALE).contains(&scale) {
+        return Err(EntityContactError::InvalidScale);
+    }
+    if !dimensions.width.is_finite()
+        || !dimensions.height.is_finite()
+        || !dimensions.eye_height.is_finite()
+    {
+        return Err(EntityContactError::InvalidDimensions);
+    }
+
+    let effective_scale = if dimensions.fixed { 1.0 } else { scale };
+    let width = dimensions.width * effective_scale;
+    let height = dimensions.height * effective_scale;
+    let eye_height = dimensions.eye_height * effective_scale;
+    if !width.is_finite() || !height.is_finite() || !eye_height.is_finite() {
+        return Err(EntityContactError::InvalidDimensions);
+    }
+    Ok(ScaledEntityCollisionGeometry {
+        aabb: Aabb {
+            half_width: f64::from(width / 2.0),
+            height: f64::from(height),
+        },
+        eye_height: f64::from(eye_height),
+    })
+}
 
 /// Vanilla scoreboard collision rules used by `EntitySelector.pushableBy`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -119,6 +170,8 @@ impl EntityPushImpulses {
 pub enum EntityContactError {
     NonFinitePushDelta,
     InvalidCrammingRoll { roll: u8 },
+    InvalidDimensions,
+    InvalidScale,
 }
 
 /// Computes the vanilla impulse for exactly one caller-selected recipient.
