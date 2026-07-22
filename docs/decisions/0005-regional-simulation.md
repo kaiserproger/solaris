@@ -497,6 +497,11 @@ lane admission only while they are enqueued, then release it before owner
 computation. Exact goal-input snapshots and leases reject stale plans at apply.
 A slow lane therefore does not hold admissions or stop direct work in another
 lane.
+Prepared-goal apply uses shared topology plus the admissions resolved from its
+active goal inputs, follow-target sources, lease/batch regions, and any requested
+post-apply kinematics IDs. Its multi-lane prepare/commit/finalize remains atomic
+across participating lanes, while direct mutations in unrelated lanes continue
+independently.
 Hostile goal planning now compares the computed goal with the goal already in
 the simulation view. Equal wander, follow-position, or idle goals are removed
 before the owner call, and an empty diff sends no command. This reduces the

@@ -51,6 +51,10 @@ Current runtime facts:
   topology only; each lane admission is held briefly while its read message is
   enqueued. Owner queues order local reads and exact-snapshot apply rejects
   stale plans.
+- Prepared-goal apply holds shared topology and only the admissions named by
+  its active inputs, follow targets, lease/batch regions, and requested
+  post-apply kinematics IDs. Multi-lane apply remains atomic across those
+  participants without taking the exclusive topology gate.
 - Physics owner CAS returns its committed kinematics batch directly. The
   network adapter must not restore the removed immediate owner reread; it keeps
   one current-state read at the publication boundary.

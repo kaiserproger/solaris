@@ -1076,6 +1076,8 @@ pub struct RegionalOwnerHandle {
     actor_snapshot_probe: Arc<std::sync::Mutex<Option<SelectedReadProbe>>>,
     #[cfg(test)]
     goal_prepare_probe: Arc<std::sync::Mutex<Option<std::sync::mpsc::Sender<()>>>>,
+    #[cfg(test)]
+    goal_apply_topology_probe: Arc<std::sync::Mutex<Option<std::sync::mpsc::Sender<()>>>>,
 }
 
 #[cfg(test)]
@@ -1347,6 +1349,10 @@ enum RegionalOwnerCommand {
 
 enum RegionalOwnerLaneScope {
     Entities(Vec<EntityId>),
+    EntitiesAndRegions {
+        entities: Vec<EntityId>,
+        regions: Vec<RegionKey>,
+    },
     All,
     TopologyOnly,
 }
@@ -1395,6 +1401,12 @@ impl RegionalOwnerCommand {
                 velocities.iter().map(|(entity, _)| *entity).collect(),
             )),
             Self::PrepareGoalTick { .. } => Some(RegionalOwnerLaneScope::TopologyOnly),
+            Self::ApplyPreparedGoalTick { resolved, .. } => {
+                Some(goal_apply_lane_scope(resolved, std::iter::empty()))
+            }
+            Self::ApplyPreparedGoalTickAndKinematics {
+                resolved, entities, ..
+            } => Some(goal_apply_lane_scope(resolved, entities.iter().copied())),
             #[cfg(test)]
             Self::HoldLaneForTest { entity, .. } => {
                 Some(RegionalOwnerLaneScope::Entities(vec![*entity]))
@@ -1447,7 +1459,7 @@ fn owner_readers_for_scope(
     coordinator: &RegionalOwnerCoordinator,
     scope: &RegionalOwnerLaneScope,
 ) -> Result<Vec<RegionalOwnerLaneReader>, RegionOwnerLaneError> {
-    let entities = match scope {
+    let (entities, regions): (&[EntityId], &[RegionKey]) = match scope {
         RegionalOwnerLaneScope::All => {
             return Ok(coordinator
                 .lanes
@@ -1456,7 +1468,8 @@ fn owner_readers_for_scope(
                 .collect());
         }
         RegionalOwnerLaneScope::TopologyOnly => return Ok(Vec::new()),
-        RegionalOwnerLaneScope::Entities(entities) => entities,
+        RegionalOwnerLaneScope::Entities(entities) => (entities, &[]),
+        RegionalOwnerLaneScope::EntitiesAndRegions { entities, regions } => (entities, regions),
     };
     let mut readers = BTreeMap::new();
     for entity in entities {
@@ -1473,7 +1486,45 @@ fn owner_readers_for_scope(
             .ok_or(RegionOwnerLaneError::WrongLane)?;
         readers.entry(lease.lane).or_insert_with(|| owner.reader());
     }
+    for key in regions {
+        let lease = coordinator
+            .ownership
+            .lease(*key)
+            .ok_or(RegionOwnerLaneError::StaleLease)?;
+        let owner = coordinator
+            .lanes
+            .get(&lease.lane)
+            .ok_or(RegionOwnerLaneError::WrongLane)?;
+        readers.entry(lease.lane).or_insert_with(|| owner.reader());
+    }
     Ok(readers.into_values().collect())
+}
+
+fn goal_apply_lane_scope(
+    resolved: &RegionalResolvedGoalTick,
+    extra_entities: impl IntoIterator<Item = EntityId>,
+) -> RegionalOwnerLaneScope {
+    RegionalOwnerLaneScope::EntitiesAndRegions {
+        entities: resolved
+            .goal_inputs
+            .keys()
+            .chain(resolved.follow_target_sources.keys())
+            .copied()
+            .chain(extra_entities)
+            .collect(),
+        regions: resolved
+            .leases
+            .keys()
+            .chain(resolved.batches.keys())
+            .copied()
+            .chain(
+                resolved
+                    .follow_target_sources
+                    .values()
+                    .map(|source| source.region),
+            )
+            .collect(),
+    }
 }
 
 fn topology_access_for_command(
@@ -1757,6 +1808,14 @@ impl RegionalOwnerHandle {
     fn notify_goal_prepare_entered_for_test(&self, entered: std::sync::mpsc::Sender<()>) {
         *self
             .goal_prepare_probe
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(entered);
+    }
+
+    #[cfg(test)]
+    fn notify_goal_apply_topology_for_test(&self, entered: std::sync::mpsc::Sender<()>) {
+        *self
+            .goal_apply_topology_probe
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(entered);
     }
@@ -2766,6 +2825,10 @@ impl RegionalOwnerRuntime {
         let goal_prepare_probe = Arc::new(std::sync::Mutex::new(None));
         #[cfg(test)]
         let runtime_goal_prepare_probe = Arc::clone(&goal_prepare_probe);
+        #[cfg(test)]
+        let goal_apply_topology_probe = Arc::new(std::sync::Mutex::new(None));
+        #[cfg(test)]
+        let runtime_goal_apply_topology_probe = Arc::clone(&goal_apply_topology_probe);
         let (sender, receiver) = sync_channel(64);
         let (start, started) = channel();
         let worker = match std::thread::Builder::new()
@@ -2780,6 +2843,8 @@ impl RegionalOwnerRuntime {
                     runtime_actor_snapshot_probe,
                     #[cfg(test)]
                     runtime_goal_prepare_probe,
+                    #[cfg(test)]
+                    runtime_goal_apply_topology_probe,
                 );
             }) {
             Ok(worker) => worker,
@@ -2815,6 +2880,8 @@ impl RegionalOwnerRuntime {
                 actor_snapshot_probe,
                 #[cfg(test)]
                 goal_prepare_probe,
+                #[cfg(test)]
+                goal_apply_topology_probe,
             },
             worker: Some(worker),
         })
@@ -2870,6 +2937,9 @@ fn run_regional_owner_runtime(
     mutation_gate: Arc<RwLock<()>>,
     #[cfg(test)] actor_snapshot_probe: Arc<std::sync::Mutex<Option<SelectedReadProbe>>>,
     #[cfg(test)] goal_prepare_probe: Arc<std::sync::Mutex<Option<std::sync::mpsc::Sender<()>>>>,
+    #[cfg(test)] goal_apply_topology_probe: Arc<
+        std::sync::Mutex<Option<std::sync::mpsc::Sender<()>>>,
+    >,
 ) {
     let Ok(mut coordinator) = started.recv() else {
         return;
@@ -2888,6 +2958,18 @@ fn run_regional_owner_runtime(
                     .write()
                     .unwrap_or_else(|poisoned| poisoned.into_inner())
             });
+        #[cfg(test)]
+        if matches!(
+            command,
+            RegionalOwnerCommand::ApplyPreparedGoalTick { .. }
+                | RegionalOwnerCommand::ApplyPreparedGoalTickAndKinematics { .. }
+        ) && let Some(probe) = goal_apply_topology_probe
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .take()
+        {
+            let _ = probe.send(());
+        }
         let _lane_admissions = match &topology_access {
             RegionalOwnerTopologyAccess::Shared(readers) => Some(
                 readers
@@ -13438,6 +13520,164 @@ mod tests {
 
         drop(handle);
         runtime.shutdown().expect("runtime shutdown");
+    }
+
+    #[test]
+    fn goal_apply_blocks_only_its_participant_lanes() {
+        let runtime = super::RegionalOwnerRuntime::from_store(RegionalEntityStore::new(), 2)
+            .expect("owner runtime");
+        let handle = runtime.handle();
+        let west = handle
+            .spawn(cow(Vec3::new(0.5, 64.0, 0.5)))
+            .expect("west cow");
+        let east = handle
+            .spawn(cow(Vec3::new(128.5, 64.0, 0.5)))
+            .expect("east cow");
+        let snapshots = handle
+            .snapshots_for_ids(&HashSet::from([west, east]))
+            .expect("warm owner routes");
+        let east_snapshot = snapshots
+            .iter()
+            .find(|snapshot| snapshot.id == east)
+            .expect("east snapshot")
+            .clone();
+        let west_owner = {
+            let routes = handle
+                .selected_read_routes
+                .read()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            assert_ne!(routes[&west].lease.lane, routes[&east].lease.lane);
+            routes[&west].owner.clone()
+        };
+        let resolved = handle
+            .prepare_goal_tick_with_pathing_for_ids(19, &HashSet::from([west]))
+            .expect("prepare west goal")
+            .resolve(&WalkablePathing, PathingBudget::DEFAULT);
+
+        let west_admission = west_owner
+            .admission()
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let (apply_entered, apply_entered_rx) = mpsc::channel();
+        handle.notify_goal_apply_topology_for_test(apply_entered);
+        let (apply_complete, apply_complete_rx) = mpsc::channel();
+        let apply_handle = handle.clone();
+        let apply = std::thread::spawn(move || {
+            apply_complete
+                .send(apply_handle.apply_prepared_goal_tick(resolved))
+                .expect("publish goal apply");
+        });
+        apply_entered_rx
+            .recv()
+            .expect("goal apply acquired topology fence");
+        {
+            let shared_topology = handle.mutation_gate.try_read();
+            assert!(shared_topology.is_ok());
+        }
+
+        assert!(
+            handle
+                .apply_kinematics_if_current([(
+                    east_snapshot,
+                    movement(east, Vec3::new(129.0, 64.0, 0.5)),
+                )])
+                .expect("east mutation during west goal apply")
+        );
+        assert!(matches!(
+            apply_complete_rx.try_recv(),
+            Err(mpsc::TryRecvError::Empty)
+        ));
+
+        drop(west_admission);
+        apply_complete_rx
+            .recv()
+            .expect("goal apply result")
+            .expect("west goal apply");
+        apply.join().expect("join goal apply");
+
+        drop(handle);
+        runtime.shutdown().expect("runtime shutdown");
+    }
+
+    #[test]
+    fn goal_apply_scope_covers_batch_target_and_kinematics_lanes() {
+        let mut coordinator =
+            super::RegionalOwnerCoordinator::from_store(RegionalEntityStore::new(), 3)
+                .expect("owner coordinator");
+        let active = coordinator
+            .spawn(cow(Vec3::new(0.5, 64.0, 0.5)))
+            .expect("active cow");
+        let target = coordinator
+            .spawn(cow(Vec3::new(128.5, 64.0, 0.5)))
+            .expect("target cow");
+        let kinematics = coordinator
+            .spawn(cow(Vec3::new(256.5, 64.0, 0.5)))
+            .expect("kinematics cow");
+        assert!(
+            coordinator
+                .set_goal(
+                    active,
+                    GoalState::FollowTarget {
+                        target,
+                        speed: 0.25,
+                    },
+                )
+                .expect("follow target goal")
+        );
+        let active_region = coordinator.locations[&active];
+        let target_region = coordinator.locations[&target];
+        let kinematics_region = coordinator.locations[&kinematics];
+        let lanes = [active_region, target_region, kinematics_region]
+            .into_iter()
+            .map(|key| coordinator.ownership.lease(key).expect("region lease").lane)
+            .collect::<HashSet<_>>();
+        assert_eq!(lanes.len(), 3);
+
+        let mut resolved = coordinator
+            .prepare_goal_tick_with_pathing_for_ids(20, &HashSet::from([active]))
+            .expect("prepare active goal")
+            .resolve(&WalkablePathing, PathingBudget::DEFAULT);
+        assert!(resolved.batches.contains_key(&active_region));
+        assert!(resolved.follow_target_sources.contains_key(&target));
+        resolved.goal_inputs.remove(&active);
+        resolved.leases.remove(&active_region);
+
+        let (reply, _) = mpsc::channel();
+        let command = super::RegionalOwnerCommand::ApplyPreparedGoalTickAndKinematics {
+            resolved: Box::new(resolved),
+            entities: HashSet::from([kinematics]),
+            defer_journal: false,
+            reply,
+        };
+        let scope = command.lane_scope().expect("goal apply scope");
+        assert_eq!(
+            super::owner_readers_for_scope(&coordinator, &scope)
+                .expect("all participant routes")
+                .len(),
+            3
+        );
+
+        let active_lease = coordinator
+            .ownership
+            .lease(active_region)
+            .expect("active lease");
+        coordinator
+            .ownership
+            .unassign(active_lease)
+            .expect("remove batch route");
+        assert!(matches!(
+            super::topology_access_for_command(&coordinator, &command),
+            super::RegionalOwnerTopologyAccess::Exclusive
+        ));
+        assert_eq!(
+            coordinator
+                .ownership
+                .assign(active_region, active_lease.lane)
+                .expect("restore batch route"),
+            active_lease
+        );
+
+        coordinator.shutdown().expect("coordinator shutdown");
     }
 
     #[test]
