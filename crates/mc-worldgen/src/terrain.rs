@@ -158,7 +158,6 @@ struct DecorationBlocks {
     short_grass: Option<BlockStateId>,
     dandelion: Option<BlockStateId>,
     poppy: Option<BlockStateId>,
-    grass_patch_spacing: u64,
     pumpkin: Option<BlockStateId>,
     sugar_cane: Option<BlockStateId>,
     cactus: Option<BlockStateId>,
@@ -187,7 +186,6 @@ impl DecorationBlocks {
             short_grass: optional_block(registry, "minecraft:short_grass"),
             dandelion: optional_block(registry, "minecraft:dandelion"),
             poppy: optional_block(registry, "minecraft:poppy"),
-            grass_patch_spacing: 17,
             pumpkin: optional_block(registry, "minecraft:pumpkin"),
             sugar_cane: optional_block(registry, "minecraft:sugar_cane"),
             cactus: optional_block(registry, "minecraft:cactus"),
@@ -1122,13 +1120,15 @@ impl TerrainGenerator {
                     || self.biomes.jungle.contains(biome))
                     && (surface == self.grass_block || surface == self.podzol)
                 {
+                    let (grass_spacing, dandelion_spacing, poppy_spacing) =
+                        self.plant_spacing_for_biome(biome);
                     let plant = if h.is_multiple_of(1021) {
                         self.decorations.pumpkin
-                    } else if h.is_multiple_of(61) {
+                    } else if h.is_multiple_of(dandelion_spacing) {
                         self.decorations.dandelion
-                    } else if h.is_multiple_of(67) {
+                    } else if h.is_multiple_of(poppy_spacing) {
                         self.decorations.poppy
-                    } else if h.is_multiple_of(self.decorations.grass_patch_spacing) {
+                    } else if h.is_multiple_of(grass_spacing) {
                         self.decorations.short_grass
                     } else {
                         None
@@ -1191,15 +1191,25 @@ impl TerrainGenerator {
 
     fn tree_spacing_for_biome(&self, biome: &Identifier) -> Option<u64> {
         if self.biomes.jungle.contains(biome) {
-            Some(23)
-        } else if self.biomes.temperate_forest.contains(biome) {
             Some(31)
+        } else if self.biomes.temperate_forest.contains(biome) {
+            Some(47)
         } else if self.biomes.cold.contains(biome) {
-            Some(37)
+            Some(53)
         } else if self.biomes.grassland.contains(biome) {
-            Some(127)
+            Some(181)
         } else {
             None
+        }
+    }
+
+    fn plant_spacing_for_biome(&self, biome: &Identifier) -> (u64, u64, u64) {
+        if self.biomes.jungle.contains(biome) {
+            (17, 103, 109)
+        } else if self.biomes.temperate_forest.contains(biome) {
+            (29, 127, 137)
+        } else {
+            (19, 61, 67)
         }
     }
 

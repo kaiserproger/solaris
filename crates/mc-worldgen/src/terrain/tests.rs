@@ -1710,6 +1710,78 @@ fn pumpkins_remain_a_rare_surface_decoration() {
 }
 
 #[test]
+fn surface_vegetation_density_is_moderate_and_biome_specific() {
+    let generator = TerrainGenerator::new(42, tiny_registry());
+    let plants = [
+        generator.decorations.short_grass,
+        generator.decorations.dandelion,
+        generator.decorations.poppy,
+        generator.decorations.pumpkin,
+    ];
+    let logs = [
+        generator.decorations.oak_log,
+        generator.decorations.forest_log,
+        generator.decorations.cold_log,
+        generator.decorations.jungle_log,
+    ];
+    let mut eligible = [0usize; 3];
+    let mut decorated = [0usize; 3];
+
+    for chunk_x in (-256..=256).step_by(32) {
+        for chunk_z in (-256..=256).step_by(32) {
+            let pos = ChunkPos {
+                x: chunk_x,
+                z: chunk_z,
+            };
+            let chunk = generator.generate(pos);
+            for lx in 0..16u8 {
+                for lz in 0..16u8 {
+                    let plan = generator.plan_column(pos, lx, lz);
+                    let category = if generator.biomes.jungle.contains(&plan.biome) {
+                        2
+                    } else if generator.biomes.temperate_forest.contains(&plan.biome) {
+                        1
+                    } else if generator.biomes.grassland.contains(&plan.biome) {
+                        0
+                    } else {
+                        continue;
+                    };
+                    if plan.surface != generator.grass_block && plan.surface != generator.podzol {
+                        continue;
+                    }
+                    eligible[category] += 1;
+                    let decoration = chunk.get_block(lx, plan.height + 1, lz);
+                    decorated[category] +=
+                        usize::from(plants.contains(&decoration) || logs.contains(&decoration));
+                }
+            }
+        }
+    }
+
+    for (index, label) in ["grassland", "forest", "jungle"].into_iter().enumerate() {
+        let eligible_count = eligible[index];
+        let decorated_count = decorated[index];
+        assert!(
+            eligible_count > 256,
+            "sampled only {eligible_count} {label} columns"
+        );
+        assert!(decorated_count > 20, "{label} vegetation became too sparse");
+        assert!(
+            decorated_count * 8 <= eligible_count,
+            "{label} vegetation is too dense: {decorated_count}/{eligible_count} eligible columns"
+        );
+    }
+    assert!(
+        decorated[2] * eligible[1] > decorated[1] * eligible[2],
+        "jungle should be denser than forest: {}/{} versus {}/{}",
+        decorated[2],
+        eligible[2],
+        decorated[1],
+        eligible[1]
+    );
+}
+
+#[test]
 fn generated_tree_trunks_start_on_the_planned_surface() {
     let registry = tiny_registry();
     let mut trees = 0usize;

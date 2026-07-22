@@ -52,13 +52,20 @@ verification and keep ordinary survival play ahead of rare edge cases.
   must never leave unsupported floating foliage/trunks after generation. Oak,
   birch, spruce, and jungle profiles now have distinct tapered layers, hashed
   edge variation, stable support, and generated-shape regressions.
-- [ ] Biomes need coherent, longer terrain forms instead of noisy short-scale
+- [x] Biomes need coherent, longer terrain forms instead of noisy short-scale
   height changes. Vegetation density must stay moderate and biome-appropriate.
-  The existing router already uses 340-3,600 block landform scales; decoration
-  density is now biome-specific, grass/flowers are sparser, and pumpkins are
-  bounded below one per 256 eligible columns in the sampled regression.
-- [ ] Generated plants use their exact embedded vanilla collision shape; grass,
-  flowers, crops, and saplings must never become full cubes.
+  Continental, erosion, mountain, and river fields use 610-3,600 block scales;
+  rolling hills now use a rotated 720x280-block field and weaker 190-block
+  detail. Behavior checks require regional change to dominate half-chunk noise,
+  while actual generated vegetation remains below 12.5% of eligible columns.
+  Tree, grass, and flower density is biome-specific, and pumpkins remain below
+  one per 256 eligible columns.
+- [x] Generated plants use their exact embedded vanilla collision shape; grass,
+  flowers, crops, and saplings must never become full cubes. The complete
+  embedded 26.1.2 state identities for generated/growable plants are checked
+  against the collision oracle, including every age/stage state; the runtime
+  physics sampler also reproduces an exact partial pitcher-crop shape instead
+  of its full-block fallback.
 - [ ] Keep vanilla-compatible world load/save while producing coherent terrain
   quality comparable in intent to Tectonic/Tellus.
 - [ ] Verify vanilla ore height/distribution when the vanilla ore pass is active.
@@ -131,3 +138,10 @@ logs in over TCP, and verifies the actual selected spawn across extreme and
 dispersed seeds. Independent review requested explicit collision/hazard checks
 for spawn cells and an exact cave-cutoff definition; both are covered in the
 final regressions, followed by full repository gates.
+
+The 2026-07-22 biome-coherence checkpoint replaced round short-scale hills with
+rotated elongated relief, reduced fine detail, and made vegetation density
+biome-specific. Focused behavior checks cover the isolated rolling-hill signal,
+actual per-biome generated surface density, and runtime exact plant collision
+shapes. A visual fresh-world client pass remains required by the broader
+Tellus/Tectonic-quality item rather than being inferred from numeric tests.

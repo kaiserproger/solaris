@@ -74,6 +74,17 @@ hardening. An already-open lower-priority diff does not override this order.
 
 ## Recent Evidence
 
+- Worldgen rolling relief now uses a rotated 720x280-block field with weaker
+  190-block detail, while continent, erosion, mountain and river authorities
+  remain at 610-3,600-block scales. A behavior gate requires 128-block regional
+  height change to dominate eight-block change. Actual generated grassland,
+  forest and jungle vegetation remains present but below 12.5% of eligible
+  columns, with separate tree/grass/flower density per biome. The embedded
+  collision oracle verifies every state of generated and growable plants is not
+  a full cube, and the runtime sampler reproduces an exact partial pitcher-crop
+  shape. This is measurable coherence/collision evidence; the broader
+  Tellus/Tectonic visual gate remains open.
+
 - A normal 26.1.2 client is now fenced from combat between respawn and its
   `ServerboundPlayerLoaded` acknowledgement, matching vanilla's load gate.
   While unloaded it remains simulated but cannot be selected or damaged; the

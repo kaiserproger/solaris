@@ -4678,6 +4678,10 @@ pub async fn run(config: ServerConfig) -> std::io::Result<()> {
 }
 
 #[cfg(test)]
+#[path = "server_collision_tests.rs"]
+mod server_collision_tests;
+
+#[cfg(test)]
 mod tests {
     use super::*;
     use mc_data::blocks::{BlockReport, BlockStateReport};

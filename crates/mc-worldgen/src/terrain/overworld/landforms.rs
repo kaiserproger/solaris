@@ -8,8 +8,9 @@ const WARP_SCALE: f64 = 1_500.0;
 const WARP_STRENGTH: f64 = 180.0;
 const EROSION_SCALE: f64 = 1_650.0;
 const UPLAND_SCALE: f64 = 820.0;
-const HILL_SCALE: f64 = 340.0;
-const DETAIL_SCALE: f64 = 135.0;
+const HILL_LONG_SCALE: f64 = 720.0;
+const HILL_CROSS_SCALE: f64 = 280.0;
+const DETAIL_SCALE: f64 = 190.0;
 const MOUNTAIN_SCALE_A: f64 = 2_200.0;
 const MOUNTAIN_SCALE_B: f64 = 1_550.0;
 const RIVER_SCALE: f64 = 1_850.0;
@@ -77,13 +78,7 @@ pub(super) fn sample(router: OverworldRouter, block_x: i32, block_z: i32) -> Ter
         3,
         0.5,
     );
-    let hills = fbm_2d(
-        wx / (HILL_SCALE * scale),
-        wz / (HILL_SCALE * scale),
-        router.seed ^ 0x4849_4C4C,
-        3,
-        0.5,
-    );
+    let hills = rolling_hills(router, wx, wz, scale);
     let detail = fbm_2d(
         x / (DETAIL_SCALE * scale),
         z / (DETAIL_SCALE * scale),
@@ -130,7 +125,7 @@ pub(super) fn sample(router: OverworldRouter, block_x: i32, block_z: i32) -> Ter
         + continentalness.max(0.0) * 20.0 * land_scale
         + upland * (5.0 + (1.0 - erosion) * 8.0) * land_scale
         + hills * 3.5 * land_scale
-        + detail * 1.5 * land_scale;
+        + detail * land_scale;
     let mountain_height = settings.map_or(98.0, |_| 142.0) * land_scale;
     let mut height = lerp(ocean_floor, rolling_land + ridges * mountain_height, land);
 
@@ -176,6 +171,18 @@ pub(super) fn sample(router: OverworldRouter, block_x: i32, block_z: i32) -> Ter
         temperature,
         moisture,
     }
+}
+
+pub(super) fn rolling_hills(router: OverworldRouter, x: f64, z: f64, scale: f64) -> f64 {
+    // Stretch and rotate rolling relief so hills form long shoulders instead
+    // of round, short-scale bumps independent from the mountain ranges.
+    fbm_2d(
+        (x + z * 0.34) / (HILL_LONG_SCALE * scale),
+        (z - x * 0.18) / (HILL_CROSS_SCALE * scale),
+        router.seed ^ 0x4849_4C4C,
+        3,
+        0.5,
+    )
 }
 
 pub(super) fn temperature(router: OverworldRouter, x: f64, height: f64, z: f64) -> f64 {

@@ -480,6 +480,58 @@ mod tests {
     }
 
     #[test]
+    fn generated_and_growable_plants_never_use_full_cube_collision() {
+        let blocks = solaris_required_blocks_report();
+        let table = vanilla_collision_shapes();
+        for block_name in [
+            "minecraft:short_grass",
+            "minecraft:tall_grass",
+            "minecraft:fern",
+            "minecraft:large_fern",
+            "minecraft:dandelion",
+            "minecraft:poppy",
+            "minecraft:oak_sapling",
+            "minecraft:birch_sapling",
+            "minecraft:spruce_sapling",
+            "minecraft:jungle_sapling",
+            "minecraft:acacia_sapling",
+            "minecraft:dark_oak_sapling",
+            "minecraft:cherry_sapling",
+            "minecraft:wheat",
+            "minecraft:carrots",
+            "minecraft:potatoes",
+            "minecraft:beetroots",
+            "minecraft:torchflower_crop",
+            "minecraft:pitcher_crop",
+            "minecraft:pumpkin_stem",
+            "minecraft:melon_stem",
+        ] {
+            let block = blocks
+                .iter()
+                .find(|block| block.id.as_str() == block_name)
+                .unwrap_or_else(|| panic!("missing plant block {block_name}"));
+            for state in &block.states {
+                let shape = table
+                    .get_for_state(
+                        state.id,
+                        &block.id,
+                        &state
+                            .properties
+                            .iter()
+                            .map(|(name, value)| (name.clone(), value.clone()))
+                            .collect::<Vec<_>>(),
+                    )
+                    .unwrap_or_else(|| panic!("missing collision shape for {block_name}"));
+                assert!(
+                    !shape.is_full_cube(),
+                    "plant {block_name} state {} became a full cube",
+                    state.id
+                );
+            }
+        }
+    }
+
+    #[test]
     fn exact_lookup_accepts_canonical_slab_stair_fence_and_farmland_states() {
         let table = vanilla_collision_shapes();
         for (block_name, properties) in [

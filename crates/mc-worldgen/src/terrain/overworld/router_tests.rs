@@ -51,6 +51,49 @@ fn chunk_borders_have_the_same_slope_budget_as_interior_columns() {
 }
 
 #[test]
+fn rolling_terrain_changes_over_regions_not_single_chunks() {
+    let mut near_change = 0.0;
+    let mut regional_change = 0.0;
+    let mut comparisons = 0u64;
+
+    for seed in [-11, 0, 23] {
+        let router = OverworldRouter::new(seed, OVERWORLD_GEOMETRY, WorldgenMode::VanillaLike);
+        for z in (-2_048..=2_048).step_by(137) {
+            for x in (-2_048..=2_048).step_by(131) {
+                let center = landforms::rolling_hills(router, f64::from(x), f64::from(z), 1.0);
+                for (near_x, near_z, far_x, far_z) in
+                    [(x + 8, z, x + 128, z), (x, z + 8, x, z + 128)]
+                {
+                    near_change += (center
+                        - landforms::rolling_hills(
+                            router,
+                            f64::from(near_x),
+                            f64::from(near_z),
+                            1.0,
+                        ))
+                    .abs();
+                    regional_change += (center
+                        - landforms::rolling_hills(
+                            router,
+                            f64::from(far_x),
+                            f64::from(far_z),
+                            1.0,
+                        ))
+                    .abs();
+                    comparisons += 1;
+                }
+            }
+        }
+    }
+
+    assert!(comparisons > 5_000);
+    assert!(
+        near_change * 4.0 < regional_change,
+        "terrain changes too much at single-chunk scale: near={near_change}, regional={regional_change}"
+    );
+}
+
+#[test]
 fn landforms_do_not_create_isolated_craters() {
     for (seed, mode) in [
         (-11, WorldgenMode::VanillaLike),
