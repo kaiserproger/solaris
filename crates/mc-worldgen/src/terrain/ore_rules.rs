@@ -19,22 +19,291 @@ pub const MAX_ORE_RULES: usize = 64;
 pub const MAX_ORE_WORK_UNITS_PER_CHUNK: u64 = 2_000_000;
 const ORE_CHUNK_HALO_CELLS_PER_LAYER: u64 = 36;
 
-const COAL_MIN_Y: i32 = 0;
-const COAL_MAX_Y: i32 = 192;
-const IRON_MIN_Y: i32 = -24;
-const IRON_MAX_Y: i32 = 72;
-const COPPER_MIN_Y: i32 = -16;
-const COPPER_MAX_Y: i32 = 112;
-const GOLD_MIN_Y: i32 = -64;
-const GOLD_MAX_Y: i32 = 32;
-const REDSTONE_MIN_Y: i32 = -64;
-const REDSTONE_MAX_Y: i32 = 15;
-const DIAMOND_MIN_Y: i32 = -64;
-const DIAMOND_MAX_Y: i32 = 16;
-const LAPIS_MIN_Y: i32 = -64;
-const LAPIS_MAX_Y: i32 = 64;
-const EMERALD_MIN_Y: i32 = -16;
-const EMERALD_MAX_Y: i32 = 320;
+#[derive(Clone, Copy)]
+enum EmbeddedOreScope {
+    Any,
+    EmeraldBiomes,
+    Badlands,
+}
+
+const EMERALD_ORE_BIOMES: &[&str] = &[
+    "minecraft:cherry_grove",
+    "minecraft:frozen_peaks",
+    "minecraft:grove",
+    "minecraft:jagged_peaks",
+    "minecraft:meadow",
+    "minecraft:snowy_slopes",
+    "minecraft:stony_peaks",
+    "minecraft:windswept_forest",
+    "minecraft:windswept_gravelly_hills",
+    "minecraft:windswept_hills",
+];
+
+const EXTRA_GOLD_BIOMES: &[&str] = &[
+    "minecraft:badlands",
+    "minecraft:eroded_badlands",
+    "minecraft:wooded_badlands",
+];
+
+#[derive(Clone, Copy)]
+enum EmbeddedOreDistribution {
+    Uniform,
+    Trapezoid,
+}
+
+#[derive(Clone, Copy)]
+struct EmbeddedOrePass {
+    placed_feature: &'static str,
+    normal: &'static str,
+    deepslate: &'static str,
+    min: HeightAnchor,
+    max: HeightAnchor,
+    attempts_numerator: u32,
+    attempts_denominator: u32,
+    distribution: EmbeddedOreDistribution,
+    size: u32,
+    discard_chance_on_air_exposure: f64,
+    scope: EmbeddedOreScope,
+}
+
+// Compact facts extracted from the vanilla 26.1.2 placed/configured features.
+// Separate passes matter: merging them changes both height peaks and abundance.
+const VANILLA_OVERWORLD_ORE_PASSES: &[EmbeddedOrePass] = &[
+    EmbeddedOrePass {
+        placed_feature: "minecraft:ore_coal_upper",
+        normal: "minecraft:coal_ore",
+        deepslate: "minecraft:deepslate_coal_ore",
+        min: HeightAnchor::Absolute(136),
+        max: HeightAnchor::BelowTop(0),
+        attempts_numerator: 30,
+        attempts_denominator: 1,
+        distribution: EmbeddedOreDistribution::Uniform,
+        size: 17,
+        discard_chance_on_air_exposure: 0.0,
+        scope: EmbeddedOreScope::Any,
+    },
+    EmbeddedOrePass {
+        placed_feature: "minecraft:ore_coal_lower",
+        normal: "minecraft:coal_ore",
+        deepslate: "minecraft:deepslate_coal_ore",
+        min: HeightAnchor::Absolute(0),
+        max: HeightAnchor::Absolute(192),
+        attempts_numerator: 20,
+        attempts_denominator: 1,
+        distribution: EmbeddedOreDistribution::Trapezoid,
+        size: 17,
+        discard_chance_on_air_exposure: 0.5,
+        scope: EmbeddedOreScope::Any,
+    },
+    EmbeddedOrePass {
+        placed_feature: "minecraft:ore_iron_upper",
+        normal: "minecraft:iron_ore",
+        deepslate: "minecraft:deepslate_iron_ore",
+        min: HeightAnchor::Absolute(80),
+        max: HeightAnchor::Absolute(384),
+        attempts_numerator: 90,
+        attempts_denominator: 1,
+        distribution: EmbeddedOreDistribution::Trapezoid,
+        size: 9,
+        discard_chance_on_air_exposure: 0.0,
+        scope: EmbeddedOreScope::Any,
+    },
+    EmbeddedOrePass {
+        placed_feature: "minecraft:ore_iron_middle",
+        normal: "minecraft:iron_ore",
+        deepslate: "minecraft:deepslate_iron_ore",
+        min: HeightAnchor::Absolute(-24),
+        max: HeightAnchor::Absolute(56),
+        attempts_numerator: 10,
+        attempts_denominator: 1,
+        distribution: EmbeddedOreDistribution::Trapezoid,
+        size: 9,
+        discard_chance_on_air_exposure: 0.0,
+        scope: EmbeddedOreScope::Any,
+    },
+    EmbeddedOrePass {
+        placed_feature: "minecraft:ore_iron_small",
+        normal: "minecraft:iron_ore",
+        deepslate: "minecraft:deepslate_iron_ore",
+        min: HeightAnchor::AboveBottom(0),
+        max: HeightAnchor::Absolute(72),
+        attempts_numerator: 10,
+        attempts_denominator: 1,
+        distribution: EmbeddedOreDistribution::Uniform,
+        size: 4,
+        discard_chance_on_air_exposure: 0.0,
+        scope: EmbeddedOreScope::Any,
+    },
+    EmbeddedOrePass {
+        placed_feature: "minecraft:ore_gold",
+        normal: "minecraft:gold_ore",
+        deepslate: "minecraft:deepslate_gold_ore",
+        min: HeightAnchor::Absolute(-64),
+        max: HeightAnchor::Absolute(32),
+        attempts_numerator: 4,
+        attempts_denominator: 1,
+        distribution: EmbeddedOreDistribution::Trapezoid,
+        size: 9,
+        discard_chance_on_air_exposure: 0.5,
+        scope: EmbeddedOreScope::Any,
+    },
+    EmbeddedOrePass {
+        placed_feature: "minecraft:ore_gold_lower",
+        normal: "minecraft:gold_ore",
+        deepslate: "minecraft:deepslate_gold_ore",
+        min: HeightAnchor::Absolute(-64),
+        max: HeightAnchor::Absolute(-48),
+        attempts_numerator: 1,
+        attempts_denominator: 2,
+        distribution: EmbeddedOreDistribution::Uniform,
+        size: 9,
+        discard_chance_on_air_exposure: 0.5,
+        scope: EmbeddedOreScope::Any,
+    },
+    EmbeddedOrePass {
+        placed_feature: "minecraft:ore_redstone",
+        normal: "minecraft:redstone_ore",
+        deepslate: "minecraft:deepslate_redstone_ore",
+        min: HeightAnchor::AboveBottom(0),
+        max: HeightAnchor::Absolute(15),
+        attempts_numerator: 4,
+        attempts_denominator: 1,
+        distribution: EmbeddedOreDistribution::Uniform,
+        size: 8,
+        discard_chance_on_air_exposure: 0.0,
+        scope: EmbeddedOreScope::Any,
+    },
+    EmbeddedOrePass {
+        placed_feature: "minecraft:ore_redstone_lower",
+        normal: "minecraft:redstone_ore",
+        deepslate: "minecraft:deepslate_redstone_ore",
+        min: HeightAnchor::AboveBottom(-32),
+        max: HeightAnchor::AboveBottom(32),
+        attempts_numerator: 8,
+        attempts_denominator: 1,
+        distribution: EmbeddedOreDistribution::Trapezoid,
+        size: 8,
+        discard_chance_on_air_exposure: 0.0,
+        scope: EmbeddedOreScope::Any,
+    },
+    EmbeddedOrePass {
+        placed_feature: "minecraft:ore_diamond",
+        normal: "minecraft:diamond_ore",
+        deepslate: "minecraft:deepslate_diamond_ore",
+        min: HeightAnchor::AboveBottom(-80),
+        max: HeightAnchor::AboveBottom(80),
+        attempts_numerator: 7,
+        attempts_denominator: 1,
+        distribution: EmbeddedOreDistribution::Trapezoid,
+        size: 4,
+        discard_chance_on_air_exposure: 0.5,
+        scope: EmbeddedOreScope::Any,
+    },
+    EmbeddedOrePass {
+        placed_feature: "minecraft:ore_diamond_medium",
+        normal: "minecraft:diamond_ore",
+        deepslate: "minecraft:deepslate_diamond_ore",
+        min: HeightAnchor::Absolute(-64),
+        max: HeightAnchor::Absolute(-4),
+        attempts_numerator: 2,
+        attempts_denominator: 1,
+        distribution: EmbeddedOreDistribution::Uniform,
+        size: 8,
+        discard_chance_on_air_exposure: 0.5,
+        scope: EmbeddedOreScope::Any,
+    },
+    EmbeddedOrePass {
+        placed_feature: "minecraft:ore_diamond_large",
+        normal: "minecraft:diamond_ore",
+        deepslate: "minecraft:deepslate_diamond_ore",
+        min: HeightAnchor::AboveBottom(-80),
+        max: HeightAnchor::AboveBottom(80),
+        attempts_numerator: 1,
+        attempts_denominator: 9,
+        distribution: EmbeddedOreDistribution::Trapezoid,
+        size: 12,
+        discard_chance_on_air_exposure: 0.7,
+        scope: EmbeddedOreScope::Any,
+    },
+    EmbeddedOrePass {
+        placed_feature: "minecraft:ore_diamond_buried",
+        normal: "minecraft:diamond_ore",
+        deepslate: "minecraft:deepslate_diamond_ore",
+        min: HeightAnchor::AboveBottom(-80),
+        max: HeightAnchor::AboveBottom(80),
+        attempts_numerator: 4,
+        attempts_denominator: 1,
+        distribution: EmbeddedOreDistribution::Trapezoid,
+        size: 8,
+        discard_chance_on_air_exposure: 1.0,
+        scope: EmbeddedOreScope::Any,
+    },
+    EmbeddedOrePass {
+        placed_feature: "minecraft:ore_lapis",
+        normal: "minecraft:lapis_ore",
+        deepslate: "minecraft:deepslate_lapis_ore",
+        min: HeightAnchor::Absolute(-32),
+        max: HeightAnchor::Absolute(32),
+        attempts_numerator: 2,
+        attempts_denominator: 1,
+        distribution: EmbeddedOreDistribution::Trapezoid,
+        size: 7,
+        discard_chance_on_air_exposure: 0.0,
+        scope: EmbeddedOreScope::Any,
+    },
+    EmbeddedOrePass {
+        placed_feature: "minecraft:ore_lapis_buried",
+        normal: "minecraft:lapis_ore",
+        deepslate: "minecraft:deepslate_lapis_ore",
+        min: HeightAnchor::AboveBottom(0),
+        max: HeightAnchor::Absolute(64),
+        attempts_numerator: 4,
+        attempts_denominator: 1,
+        distribution: EmbeddedOreDistribution::Uniform,
+        size: 7,
+        discard_chance_on_air_exposure: 1.0,
+        scope: EmbeddedOreScope::Any,
+    },
+    EmbeddedOrePass {
+        placed_feature: "minecraft:ore_copper",
+        normal: "minecraft:copper_ore",
+        deepslate: "minecraft:deepslate_copper_ore",
+        min: HeightAnchor::Absolute(-16),
+        max: HeightAnchor::Absolute(112),
+        attempts_numerator: 16,
+        attempts_denominator: 1,
+        distribution: EmbeddedOreDistribution::Trapezoid,
+        size: 10,
+        discard_chance_on_air_exposure: 0.0,
+        scope: EmbeddedOreScope::Any,
+    },
+    EmbeddedOrePass {
+        placed_feature: "minecraft:ore_emerald",
+        normal: "minecraft:emerald_ore",
+        deepslate: "minecraft:deepslate_emerald_ore",
+        min: HeightAnchor::Absolute(-16),
+        max: HeightAnchor::Absolute(480),
+        attempts_numerator: 100,
+        attempts_denominator: 1,
+        distribution: EmbeddedOreDistribution::Trapezoid,
+        size: 3,
+        discard_chance_on_air_exposure: 0.0,
+        scope: EmbeddedOreScope::EmeraldBiomes,
+    },
+    EmbeddedOrePass {
+        placed_feature: "minecraft:ore_gold_extra",
+        normal: "minecraft:gold_ore",
+        deepslate: "minecraft:deepslate_gold_ore",
+        min: HeightAnchor::Absolute(32),
+        max: HeightAnchor::Absolute(256),
+        attempts_numerator: 50,
+        attempts_denominator: 1,
+        distribution: EmbeddedOreDistribution::Uniform,
+        size: 9,
+        discard_chance_on_air_exposure: 0.0,
+        scope: EmbeddedOreScope::Badlands,
+    },
+];
 
 #[derive(Debug, Clone)]
 pub struct OreRules {
@@ -72,96 +341,45 @@ impl OreRules {
     #[must_use]
     pub fn solaris_default(
         registry: &BlockRegistry,
-        biomes: &BiomeRules,
+        _biomes: &BiomeRules,
         fallback: BlockStateId,
     ) -> Self {
         let state = |name: &str| resolve_block_or(registry, name, fallback);
-        // Coarse family sizes for embedded operation; this is not Mojang's
-        // placement algorithm and does not imply vanilla worldgen parity.
-        Self::new(vec![
-            OreRule {
-                normal: state("minecraft:emerald_ore"),
-                deepslate: state("minecraft:deepslate_emerald_ore"),
-                y: YRange::new(EMERALD_MIN_Y, EMERALD_MAX_Y),
-                spacing: OreSpacing::peaked(224, 130, 260),
-                biomes: BiomeScope::only(biomes.mountain.clone()),
-                size: 3,
-                discard_chance_on_air_exposure: 0.0,
-            },
-            OreRule {
-                normal: state("minecraft:gold_ore"),
-                deepslate: state("minecraft:deepslate_gold_ore"),
-                y: YRange::new(GOLD_MIN_Y, 112),
-                spacing: OreSpacing::Fixed(58),
-                biomes: BiomeScope::only(biomes.hot_dry.clone()),
-                size: 9,
-                discard_chance_on_air_exposure: 0.0,
-            },
-            OreRule {
-                normal: state("minecraft:diamond_ore"),
-                deepslate: state("minecraft:deepslate_diamond_ore"),
-                y: YRange::new(DIAMOND_MIN_Y, DIAMOND_MAX_Y),
-                spacing: OreSpacing::peaked(-56, 210, 380),
-                biomes: BiomeScope::Any,
-                size: 8,
-                discard_chance_on_air_exposure: 0.0,
-            },
-            OreRule {
-                normal: state("minecraft:redstone_ore"),
-                deepslate: state("minecraft:deepslate_redstone_ore"),
-                y: YRange::new(REDSTONE_MIN_Y, REDSTONE_MAX_Y),
-                spacing: OreSpacing::peaked(-48, 95, 115),
-                biomes: BiomeScope::Any,
-                size: 8,
-                discard_chance_on_air_exposure: 0.0,
-            },
-            OreRule {
-                normal: state("minecraft:lapis_ore"),
-                deepslate: state("minecraft:deepslate_lapis_ore"),
-                y: YRange::new(LAPIS_MIN_Y, LAPIS_MAX_Y),
-                spacing: OreSpacing::peaked(0, 150, 210),
-                biomes: BiomeScope::Any,
-                size: 7,
-                discard_chance_on_air_exposure: 0.0,
-            },
-            OreRule {
-                normal: state("minecraft:gold_ore"),
-                deepslate: state("minecraft:deepslate_gold_ore"),
-                y: YRange::new(GOLD_MIN_Y, GOLD_MAX_Y),
-                spacing: OreSpacing::peaked(-16, 105, 160),
-                biomes: BiomeScope::Any,
-                size: 9,
-                discard_chance_on_air_exposure: 0.0,
-            },
-            OreRule {
-                normal: state("minecraft:iron_ore"),
-                deepslate: state("minecraft:deepslate_iron_ore"),
-                y: YRange::new(IRON_MIN_Y, IRON_MAX_Y),
-                spacing: OreSpacing::peaked(16, 97, 140),
-                biomes: BiomeScope::Any,
-                size: 9,
-                discard_chance_on_air_exposure: 0.0,
-            },
-            OreRule {
-                normal: state("minecraft:copper_ore"),
-                deepslate: state("minecraft:deepslate_copper_ore"),
-                y: YRange::new(COPPER_MIN_Y, COPPER_MAX_Y),
-                spacing: OreSpacing::peaked(48, 89, 130),
-                biomes: BiomeScope::Any,
-                size: 10,
-                discard_chance_on_air_exposure: 0.0,
-            },
-            OreRule {
-                normal: state("minecraft:coal_ore"),
-                deepslate: state("minecraft:deepslate_coal_ore"),
-                y: YRange::new(COAL_MIN_Y, COAL_MAX_Y),
-                spacing: OreSpacing::peaked(96, 83, 120),
-                biomes: BiomeScope::Any,
-                size: 17,
-                discard_chance_on_air_exposure: 0.0,
-            },
-        ])
-        .expect("embedded ore rules fit the admission budget")
+        let geometry = mc_world::chunk::OVERWORLD_GEOMETRY;
+        let rules = VANILLA_OVERWORLD_ORE_PASSES
+            .iter()
+            .filter_map(|pass| {
+                debug_assert!(pass.placed_feature.starts_with("minecraft:ore_"));
+                let (y, raw_min, raw_max) = resolve_height_range(pass.min, pass.max, geometry)?;
+                let spacing = spacing_for_attempts(
+                    raw_min,
+                    raw_max,
+                    pass.attempts_numerator,
+                    pass.attempts_denominator,
+                    pass.size,
+                    matches!(pass.distribution, EmbeddedOreDistribution::Trapezoid),
+                );
+                let scope = match pass.scope {
+                    EmbeddedOreScope::Any => BiomeScope::Any,
+                    EmbeddedOreScope::EmeraldBiomes => {
+                        BiomeScope::only(embedded_biomes(EMERALD_ORE_BIOMES))
+                    }
+                    EmbeddedOreScope::Badlands => {
+                        BiomeScope::only(embedded_biomes(EXTRA_GOLD_BIOMES))
+                    }
+                };
+                Some(OreRule {
+                    normal: state(pass.normal),
+                    deepslate: state(pass.deepslate),
+                    y,
+                    spacing,
+                    biomes: scope,
+                    size: pass.size,
+                    discard_chance_on_air_exposure: pass.discard_chance_on_air_exposure,
+                })
+            })
+            .collect();
+        Self::new(rules).expect("embedded ore rules fit the admission budget")
     }
 
     /// Converts sidecar features into bounded generation rules.
@@ -189,10 +407,12 @@ impl OreRules {
             let Some(height) = &feature.placement.height else {
                 continue;
             };
-            let Some(y) = resolve_height_range(height.min, height.max, geometry) else {
+            let Some((y, raw_min, raw_max)) =
+                resolve_height_range(height.min, height.max, geometry)
+            else {
                 continue;
             };
-            let spacing = ore_spacing(&feature.placement, y);
+            let spacing = ore_spacing(&feature.placement, raw_min, raw_max, feature.size);
             let feature_biomes = biome_data
                 .map(|data| data.biomes_for_feature(&feature.placed_feature))
                 .unwrap_or_default();
@@ -284,6 +504,11 @@ pub enum OreSpacing {
         min_spacing: u64,
         range: u64,
     },
+    Trapezoid {
+        raw_min: i64,
+        raw_max: i64,
+        average_spacing: u64,
+    },
 }
 
 impl OreSpacing {
@@ -304,13 +529,33 @@ impl OreSpacing {
                 min_spacing,
                 range: spacing_range,
             } => peaked_spacing(y, range.min, range.max, peak_y, min_spacing, spacing_range),
+            Self::Trapezoid {
+                raw_min,
+                raw_max,
+                average_spacing,
+            } => trapezoid_spacing(y, raw_min, raw_max, average_spacing),
         }
     }
 
-    const fn minimum(self) -> u64 {
+    fn minimum(self) -> u64 {
         match self {
             Self::Fixed(spacing) => spacing,
             Self::Peaked { min_spacing, .. } => min_spacing,
+            Self::Trapezoid {
+                raw_min,
+                raw_max,
+                average_spacing,
+            } => {
+                let midpoint = raw_min.saturating_add(raw_max.saturating_sub(raw_min) / 2);
+                let midpoint = i32::try_from(midpoint).unwrap_or_else(|_| {
+                    if midpoint.is_negative() {
+                        i32::MIN
+                    } else {
+                        i32::MAX
+                    }
+                });
+                trapezoid_spacing(midpoint, raw_min, raw_max, average_spacing)
+            }
         }
     }
 }
@@ -335,6 +580,13 @@ impl BiomeScope {
     }
 }
 
+fn embedded_biomes(names: &[&str]) -> Vec<Identifier> {
+    names
+        .iter()
+        .map(|name| Identifier::parse(*name).expect("embedded biome identifier"))
+        .collect()
+}
+
 fn ore_targets(
     registry: &BlockRegistry,
     targets: &[OreTarget],
@@ -356,15 +608,24 @@ fn resolve_height_range(
     min: HeightAnchor,
     max: HeightAnchor,
     geometry: ChunkGeometry,
-) -> Option<YRange> {
-    let min = height_anchor_y(min, geometry).max(i64::from(geometry.min_y()));
-    let max = height_anchor_y(max, geometry).min(i64::from(geometry.max_y()) - 1);
-    if min > max {
+) -> Option<(YRange, i64, i64)> {
+    let raw_min = height_anchor_y(min, geometry);
+    let raw_max = height_anchor_y(max, geometry);
+    if raw_min > raw_max {
         return None;
     }
-    Some(YRange::new(
-        i32::try_from(min).ok()?,
-        i32::try_from(max).ok()?,
+    let clipped_min = raw_min.max(i64::from(geometry.min_y()));
+    let clipped_max = raw_max.min(i64::from(geometry.max_y()) - 1);
+    if clipped_min > clipped_max {
+        return None;
+    }
+    Some((
+        YRange::new(
+            i32::try_from(clipped_min).ok()?,
+            i32::try_from(clipped_max).ok()?,
+        ),
+        raw_min,
+        raw_max,
     ))
 }
 
@@ -376,27 +637,87 @@ fn height_anchor_y(anchor: HeightAnchor, geometry: ChunkGeometry) -> i64 {
     }
 }
 
-fn ore_spacing(placement: &mc_data::worldgen_ores::OrePlacement, y: YRange) -> OreSpacing {
-    let count = match placement.count {
-        Some(OrePlacementCount::Constant(count)) => u64::from(count.max(1)),
+fn ore_spacing(
+    placement: &mc_data::worldgen_ores::OrePlacement,
+    raw_min: i64,
+    raw_max: i64,
+    size: u32,
+) -> OreSpacing {
+    let (attempts_numerator, mut attempts_denominator): (u64, u64) = match placement.count {
+        Some(OrePlacementCount::Constant(count)) => (u64::from(count), 1),
         Some(OrePlacementCount::Uniform { min, max }) => {
-            ((u64::from(min) + u64::from(max)) / 2).max(1)
+            (u64::from(min).saturating_add(u64::from(max)), 2)
         }
-        None => 1,
+        None => (1, 1),
     };
-    let density = count.saturating_mul(7).max(1);
-    let base = 512u64.saturating_div(density).max(5);
-    if placement
-        .height
-        .as_ref()
-        .is_some_and(|height| height.kind.as_str() == "minecraft:trapezoid")
-    {
-        let midpoint = (i64::from(y.min) + i64::from(y.max)) / 2;
-        let peak_y = i32::try_from(midpoint).unwrap_or(y.min);
-        OreSpacing::peaked(peak_y, base, base * 3)
-    } else {
-        OreSpacing::Fixed(base)
+    if let Some(chance) = placement.rarity_chance {
+        attempts_denominator = attempts_denominator.saturating_mul(u64::from(chance.max(1)));
     }
+    spacing_for_attempts(
+        raw_min,
+        raw_max,
+        u32::try_from(attempts_numerator).unwrap_or(u32::MAX),
+        u32::try_from(attempts_denominator).unwrap_or(u32::MAX),
+        size,
+        placement
+            .height
+            .as_ref()
+            .is_some_and(|height| height.kind.as_str() == "minecraft:trapezoid"),
+    )
+}
+
+fn spacing_for_attempts(
+    raw_min: i64,
+    raw_max: i64,
+    attempts_numerator: u32,
+    attempts_denominator: u32,
+    size: u32,
+    trapezoid: bool,
+) -> OreSpacing {
+    let raw_height = u64::try_from(raw_max.saturating_sub(raw_min).saturating_add(1))
+        .unwrap_or(u64::MAX)
+        .max(1);
+    let numerator = raw_height
+        .saturating_mul(256)
+        .saturating_mul(u64::from(attempts_denominator.max(1)));
+    let expected_blocks = u64::from(attempts_numerator)
+        .saturating_mul(u64::from(size.max(1)))
+        .max(1);
+    let uniform_spacing = numerator.div_ceil(expected_blocks).max(5);
+    if trapezoid {
+        OreSpacing::Trapezoid {
+            raw_min,
+            raw_max,
+            average_spacing: uniform_spacing,
+        }
+    } else {
+        OreSpacing::Fixed(uniform_spacing)
+    }
+}
+
+fn trapezoid_spacing(y: i32, raw_min: i64, raw_max: i64, average_spacing: u64) -> u64 {
+    if raw_min > raw_max {
+        return u64::MAX;
+    }
+    let y = i64::from(y).clamp(raw_min, raw_max);
+    let levels = u128::try_from(raw_max.saturating_sub(raw_min).saturating_add(1))
+        .unwrap_or(u128::MAX)
+        .max(1);
+    let index = u128::try_from(y.saturating_sub(raw_min)).unwrap_or(0);
+    let weight = (index + 1).min(levels.saturating_sub(index)).max(1);
+    let half = levels / 2;
+    let weight_sum = if levels.is_multiple_of(2) {
+        half.saturating_mul(half.saturating_add(1))
+    } else {
+        half.saturating_add(1).saturating_pow(2)
+    };
+    u64::try_from(
+        u128::from(average_spacing)
+            .saturating_mul(weight_sum)
+            .div_ceil(levels.saturating_mul(weight)),
+    )
+    .unwrap_or(u64::MAX)
+    .max(1)
 }
 
 fn peaked_spacing(

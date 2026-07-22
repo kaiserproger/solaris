@@ -74,6 +74,18 @@ hardening. An already-open lower-priority diff does not override this order.
 
 ## Recent Evidence
 
+- Default ore generation now embeds 18 separate vanilla 26.1.2 placement passes
+  instead of nine merged family approximations. It preserves raw height anchors
+  before world clipping, so diamond and lower-redstone trapezoids peak at
+  `Y=-64`; rarity filters and uniform `0..1` counts retain fractional attempt
+  density. Emerald and extra gold use the exact vanilla biome lists rather than
+  broad terrain groups. The local extracted oracle matches all embedded
+  anchors, placement kinds, counts/rarities, sizes, discard chances, targets,
+  and scoped biome lists. Generated 9x9 chunk evidence keeps each family inside
+  its bands, makes diamond/redstone bottom-heavy, and retains iron at ordinary
+  branch-mining heights. Vein shape remains Solaris-owned deterministic
+  connected geometry, not vanilla RNG.
+
 - Worldgen rolling relief now uses a rotated 720x280-block field with weaker
   190-block detail, while continent, erosion, mountain and river authorities
   remain at 610-3,600-block scales. A behavior gate requires 128-block regional

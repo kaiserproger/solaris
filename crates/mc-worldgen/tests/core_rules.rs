@@ -1,4 +1,4 @@
-use std::collections::BTreeSet;
+use std::collections::{BTreeSet, HashMap};
 use std::sync::Arc;
 
 use mc_data::Identifier;
@@ -411,6 +411,121 @@ fn sidecar_ore_rules_preserve_vein_shape_parameters() {
     let rule = &rules.rules()[0];
     assert_eq!(rule.size, 11);
     assert_eq!(rule.discard_chance_on_air_exposure, 0.75);
+}
+
+#[test]
+fn default_ore_pass_generates_vanilla_height_bands_and_deep_peaks() {
+    let (generator, registry, _) = generator();
+    let families = [
+        (
+            "coal",
+            default_state(&registry, "minecraft:coal_ore"),
+            default_state(&registry, "minecraft:deepslate_coal_ore"),
+        ),
+        (
+            "iron",
+            default_state(&registry, "minecraft:iron_ore"),
+            default_state(&registry, "minecraft:deepslate_iron_ore"),
+        ),
+        (
+            "copper",
+            default_state(&registry, "minecraft:copper_ore"),
+            default_state(&registry, "minecraft:deepslate_copper_ore"),
+        ),
+        (
+            "gold",
+            default_state(&registry, "minecraft:gold_ore"),
+            default_state(&registry, "minecraft:deepslate_gold_ore"),
+        ),
+        (
+            "redstone",
+            default_state(&registry, "minecraft:redstone_ore"),
+            default_state(&registry, "minecraft:deepslate_redstone_ore"),
+        ),
+        (
+            "diamond",
+            default_state(&registry, "minecraft:diamond_ore"),
+            default_state(&registry, "minecraft:deepslate_diamond_ore"),
+        ),
+        (
+            "lapis",
+            default_state(&registry, "minecraft:lapis_ore"),
+            default_state(&registry, "minecraft:deepslate_lapis_ore"),
+        ),
+    ];
+    let state_family = families
+        .iter()
+        .enumerate()
+        .flat_map(|(index, (_, normal, deep))| [(*normal, index), (*deep, index)])
+        .collect::<HashMap<_, _>>();
+    let mut heights = vec![vec![0usize; (MAX_Y - mc_world::MIN_Y) as usize]; families.len()];
+
+    for cx in -4..=4 {
+        for cz in -4..=4 {
+            let chunk = generator.generate(ChunkPos { x: cx, z: cz });
+            for y in mc_world::MIN_Y..MAX_Y {
+                for lx in 0..16u8 {
+                    for lz in 0..16u8 {
+                        let Some(family) = chunk
+                            .get_block(lx, y, lz)
+                            .and_then(|state| state_family.get(&state).copied())
+                        else {
+                            continue;
+                        };
+                        let world_x = cx * 16 + i32::from(lx);
+                        let world_z = cz * 16 + i32::from(lz);
+                        if y >= generator.surface_height(world_x, world_z) {
+                            continue;
+                        }
+                        heights[family][(y - mc_world::MIN_Y) as usize] += 1;
+                    }
+                }
+            }
+        }
+    }
+
+    let count = |family: usize, range: std::ops::RangeInclusive<i32>| -> usize {
+        range
+            .map(|y| heights[family][(y - mc_world::MIN_Y) as usize])
+            .sum()
+    };
+    for (index, (name, _, _)) in families.iter().enumerate() {
+        assert!(
+            heights[index].iter().sum::<usize>() > 20,
+            "generated too little {name} ore"
+        );
+    }
+    assert_eq!(
+        count(0, mc_world::MIN_Y..=-1),
+        0,
+        "coal generated below Y=0"
+    );
+    assert_eq!(
+        count(1, 73..=79),
+        0,
+        "iron generated between its vanilla passes"
+    );
+    assert_eq!(
+        count(2, mc_world::MIN_Y..=-17),
+        0,
+        "copper generated below Y=-16"
+    );
+    assert_eq!(count(2, 113..=MAX_Y - 1), 0, "copper generated above Y=112");
+    assert_eq!(count(4, 16..=MAX_Y - 1), 0, "redstone generated above Y=15");
+    assert_eq!(count(5, 17..=MAX_Y - 1), 0, "diamond generated above Y=16");
+    assert_eq!(count(6, 65..=MAX_Y - 1), 0, "lapis generated above Y=64");
+    assert!(
+        count(4, -64..=-48) > count(4, -16..=15),
+        "redstone must become more common toward the bottom"
+    );
+    assert!(
+        count(5, -64..=-48) > count(5, -16..=16),
+        "diamond must become more common toward the bottom"
+    );
+    assert!(
+        count(1, 8..=32) > 20,
+        "ordinary Y=16 branch mining should encounter iron"
+    );
 }
 
 fn ore_positions(

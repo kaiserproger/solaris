@@ -68,7 +68,15 @@ verification and keep ordinary survival play ahead of rare edge cases.
   of its full-block fallback.
 - [ ] Keep vanilla-compatible world load/save while producing coherent terrain
   quality comparable in intent to Tectonic/Tellus.
-- [ ] Verify vanilla ore height/distribution when the vanilla ore pass is active.
+- [x] Verify vanilla ore height/distribution when the vanilla ore pass is active.
+  The default embedded pass now preserves all 18 relevant vanilla 26.1.2
+  placed/configured ore facts: separate passes, height anchors, uniform versus
+  trapezoid distribution, count/rarity, vein size, air-discard chance, and
+  exact emerald/badlands biome scopes. Generated-chunk regressions enforce
+  family height bands, bottom-heavy diamond/redstone, and ordinary iron
+  availability at branch-mining heights. Solaris still uses deterministic
+  connected vein geometry rather than claiming byte-identical vanilla chunk
+  RNG.
 - [ ] Add an optional plugin that disables the vanilla ore pass and generates
   large geological mines/deposits in the style of TerraFirmaCraft. It must be
   switchable per world without changing the default.
@@ -145,3 +153,10 @@ biome-specific. Focused behavior checks cover the isolated rolling-hill signal,
 actual per-biome generated surface density, and runtime exact plant collision
 shapes. A visual fresh-world client pass remains required by the broader
 Tellus/Tectonic-quality item rather than being inferred from numeric tests.
+
+The 2026-07-23 vanilla-ore checkpoint replaced nine merged approximate families
+with 18 independent embedded 26.1.2 passes. Local extracted data verifies every
+anchor, placement kind, attempt/rarity ratio, size, discard chance and target;
+the same oracle checks exact emerald and extra-gold biome lists. Runtime
+generation checks the resulting bands and deep peaks without requiring
+`data/vanilla` at startup.

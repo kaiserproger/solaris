@@ -2466,7 +2466,7 @@ fn expanded_ore_families_are_reachable_and_biome_scoped() {
     let g = TerrainGenerator::new(42, tiny_registry());
     let plains = Identifier::parse("minecraft:plains").unwrap();
     let mountain = Identifier::parse("minecraft:jagged_peaks").unwrap();
-    let hot_dry = Identifier::parse("minecraft:badlands").unwrap();
+    let badlands = Identifier::parse("minecraft:badlands").unwrap();
 
     for (y, biome, stone_ore, deepslate_ore) in [
         (-16, &plains, BlockStateId(15), BlockStateId(20)),
@@ -2474,25 +2474,58 @@ fn expanded_ore_families_are_reachable_and_biome_scoped() {
         (-56, &plains, BlockStateId(17), BlockStateId(22)),
         (64, &plains, BlockStateId(18), BlockStateId(23)),
         (224, &mountain, BlockStateId(19), BlockStateId(24)),
-        (80, &hot_dry, BlockStateId(15), BlockStateId(20)),
+        (80, &badlands, BlockStateId(15), BlockStateId(20)),
     ] {
         let (x, z) = find_ore_cell(&g, y, biome, stone_ore);
         assert_eq!(g.ore_for(x, y, z, g.deepslate, biome), deepslate_ore);
     }
 
     let (emerald_x, emerald_z) = find_ore_cell(&g, 224, &mountain, BlockStateId(19));
-    assert_eq!(
-        g.ore_for(emerald_x, 224, emerald_z, g.stone, &plains),
-        g.stone,
-        "emerald should stay mountain-scoped"
-    );
+    for biome in [
+        "minecraft:cherry_grove",
+        "minecraft:frozen_peaks",
+        "minecraft:grove",
+        "minecraft:jagged_peaks",
+        "minecraft:meadow",
+        "minecraft:snowy_slopes",
+        "minecraft:stony_peaks",
+        "minecraft:windswept_forest",
+        "minecraft:windswept_gravelly_hills",
+        "minecraft:windswept_hills",
+    ] {
+        let biome = Identifier::parse(biome).unwrap();
+        assert_eq!(
+            g.ore_for(emerald_x, 224, emerald_z, g.stone, &biome),
+            BlockStateId(19)
+        );
+    }
+    for biome in ["minecraft:plains", "minecraft:desert"] {
+        let biome = Identifier::parse(biome).unwrap();
+        assert_eq!(
+            g.ore_for(emerald_x, 224, emerald_z, g.stone, &biome),
+            g.stone
+        );
+    }
 
-    let (gold_x, gold_z) = find_ore_cell(&g, 80, &hot_dry, BlockStateId(15));
-    assert_ne!(
-        g.ore_for(gold_x, 80, gold_z, g.stone, &plains),
-        BlockStateId(15),
-        "high gold boost should stay hot-dry scoped"
-    );
+    let (gold_x, gold_z) = find_ore_cell(&g, 80, &badlands, BlockStateId(15));
+    for biome in [
+        "minecraft:badlands",
+        "minecraft:eroded_badlands",
+        "minecraft:wooded_badlands",
+    ] {
+        let biome = Identifier::parse(biome).unwrap();
+        assert_eq!(
+            g.ore_for(gold_x, 80, gold_z, g.stone, &biome),
+            BlockStateId(15)
+        );
+    }
+    for biome in ["minecraft:plains", "minecraft:desert", "minecraft:savanna"] {
+        let biome = Identifier::parse(biome).unwrap();
+        assert_ne!(
+            g.ore_for(gold_x, 80, gold_z, g.stone, &biome),
+            BlockStateId(15)
+        );
+    }
 }
 
 #[test]
