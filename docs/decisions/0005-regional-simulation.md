@@ -449,8 +449,8 @@ the fanout only when those versions remain unchanged. A writer in another lane
 therefore cannot force an unrelated read back through the coordinator. This
 still prevents one result from combining pre-commit state from one lane with
 post-commit state from another. Versioned reads used by referenced multi-entity
-goal validation retain the global active-writer and state-version fence because
-their contract spans every referenced entity. Direct fanout is limited to 16
+goal validation carry the same exact lane-version vector instead of a global
+writer counter. Direct fanout is limited to 16
 concurrent batches, leaving at least 48 slots in each 64-message owner queue for
 prepare/commit/finalize traffic. Reconfiguration clears cached lane senders,
 and a region crossing invalidates routes before the mutation reply. This
@@ -468,13 +468,18 @@ Coordinator snapshot, selected-snapshot, breeding, and goal-prepare reads also
 take that exclusive side, so they cannot publish direct lane state
 before journal durability or after a safe rollback. Cached ordinary reads are
 lock-free with respect to distinct lane commits and validate only their touched
-lane versions. Cross-lane/versioned transactions retain the global fence until
-their authority contract moves to a version vector.
+lane versions. Referenced goal CAS takes the shared side of the topology gate,
+locks only its selected owner lanes in lane-id order, and validates that exact
+version vector before commit. Direct writers in unrelated lanes can continue;
+coordinator-owned index changes, actor fallbacks, and reconfiguration still
+wait for the topology gate.
 The direct helper validates every `(id, UUID, lease)` under the read side of the
 mutation gate before releasing the route cache, rejects duplicate IDs, reserves
 one sequence per mutation, and journals the complete post-state set as one
-decision. This gate order prevents reconfiguration or migration from making a
-validated route stale before prepare.
+decision. Referenced mutations additionally validate every selected entity,
+including non-mutated targets, while holding the corresponding lane admissions.
+This order prevents reconfiguration, migration, or a target mutation from
+making a validated route stale before prepare.
 Hostile goal planning now compares the computed goal with the goal already in
 the simulation view. Equal wander, follow-position, or idle goals are removed
 before the owner call, and an empty diff sends no command. This reduces the

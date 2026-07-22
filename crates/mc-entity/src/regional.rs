@@ -1063,8 +1063,6 @@ pub struct RegionalOwnerHandle {
     sender: SyncSender<RegionalOwnerCommand>,
     authority: RegionalAuthorityId,
     selected_read_routes: Arc<RwLock<HashMap<EntityId, CachedEntityReadRoute>>>,
-    entity_state_version: Arc<AtomicU64>,
-    active_entity_writers: Arc<AtomicUsize>,
     mutation_gate: Arc<RwLock<()>>,
     direct_selected_reads: Arc<AtomicUsize>,
     commit_state: Arc<RegionalOwnerCommitState>,
@@ -1113,25 +1111,6 @@ impl Drop for DirectSelectedReadPermit {
     }
 }
 
-struct EntityWriterPermit {
-    active: Arc<AtomicUsize>,
-    version: Arc<AtomicU64>,
-}
-
-impl EntityWriterPermit {
-    fn enter(active: Arc<AtomicUsize>, version: Arc<AtomicU64>) -> Self {
-        active.fetch_add(1, Ordering::AcqRel);
-        Self { active, version }
-    }
-}
-
-impl Drop for EntityWriterPermit {
-    fn drop(&mut self) {
-        self.version.fetch_add(1, Ordering::Release);
-        self.active.fetch_sub(1, Ordering::Release);
-    }
-}
-
 #[derive(Clone)]
 struct CachedEntityReadRoute {
     lease: RegionLease,
@@ -1149,7 +1128,7 @@ pub struct RegionalOwnerStatus {
 #[derive(Debug, Clone)]
 pub struct VersionedEntitySnapshots {
     authority: RegionalAuthorityId,
-    version: u64,
+    fence: RegionalVersionFence,
     snapshots: Vec<EntitySnapshot>,
 }
 
@@ -1162,6 +1141,17 @@ impl VersionedEntitySnapshots {
     fn into_snapshots(self) -> Vec<EntitySnapshot> {
         self.snapshots
     }
+}
+
+#[derive(Debug, Clone)]
+struct RegionalVersionFence {
+    leases: BTreeMap<EntityId, RegionLease>,
+    lane_versions: BTreeMap<usize, u64>,
+}
+
+struct SelectedEntitySnapshots {
+    fence: RegionalVersionFence,
+    snapshots: Vec<EntitySnapshot>,
 }
 
 pub struct RegionalOwnerRuntime {
@@ -1395,8 +1385,8 @@ impl RegionalOwnerHandle {
         entity: EntityId,
     ) -> Result<Option<EntitySnapshot>, RegionOwnerLaneError> {
         self.commit_state.ensure_committed_state()?;
-        if let Some(mut snapshots) = self.read_cached_selected_entities(&HashSet::from([entity])) {
-            return Ok(snapshots.pop());
+        if let Some(mut selected) = self.read_cached_selected_entities(&HashSet::from([entity])) {
+            return Ok(selected.snapshots.pop());
         }
         let (reply, result) = channel();
         self.sender
@@ -1450,8 +1440,8 @@ impl RegionalOwnerHandle {
         &self,
         entities: &HashSet<EntityId>,
     ) -> Result<Vec<EntitySnapshot>, RegionOwnerLaneError> {
-        if let Some(snapshots) = self.read_cached_selected_entities(entities) {
-            return Ok(snapshots);
+        if let Some(selected) = self.read_cached_selected_entities(entities) {
+            return Ok(selected.snapshots);
         }
         let (reply, result) = channel();
         self.sender
@@ -1470,12 +1460,8 @@ impl RegionalOwnerHandle {
         &self,
         entities: &HashSet<EntityId>,
     ) -> Result<VersionedEntitySnapshots, RegionOwnerLaneError> {
-        if let Some((version, snapshots)) = self.read_cached_selected_entities_versioned(entities) {
-            return Ok(VersionedEntitySnapshots {
-                authority: self.authority,
-                version,
-                snapshots,
-            });
+        if let Some(selected) = self.read_cached_selected_entities_versioned(entities) {
+            return Ok(selected);
         }
         let (reply, result) = channel();
         self.sender
@@ -1490,29 +1476,19 @@ impl RegionalOwnerHandle {
     fn read_cached_selected_entities_versioned(
         &self,
         entities: &HashSet<EntityId>,
-    ) -> Option<(u64, Vec<EntitySnapshot>)> {
-        self.commit_state.ensure_committed_state().ok()?;
-        let version_before = self.entity_state_version.load(Ordering::Acquire);
-        if self.active_entity_writers.load(Ordering::Acquire) != 0 {
-            return None;
-        }
-        let snapshots = self.read_cached_selected_entities(entities)?;
-        if self.active_entity_writers.load(Ordering::Acquire) != 0 {
-            return None;
-        }
-        let version_after = self.entity_state_version.load(Ordering::Acquire);
-        if version_after != version_before {
-            #[cfg(test)]
-            self.notify_referenced_goal_fallback_probe();
-            return None;
-        }
-        Some((version_after, snapshots))
+    ) -> Option<VersionedEntitySnapshots> {
+        let selected = self.read_cached_selected_entities(entities)?;
+        Some(VersionedEntitySnapshots {
+            authority: self.authority,
+            fence: selected.fence,
+            snapshots: selected.snapshots,
+        })
     }
 
     fn read_cached_selected_entities(
         &self,
         entities: &HashSet<EntityId>,
-    ) -> Option<Vec<EntitySnapshot>> {
+    ) -> Option<SelectedEntitySnapshots> {
         self.commit_state.ensure_committed_state().ok()?;
         let _admission =
             DirectSelectedReadPermit::try_acquire(Arc::clone(&self.direct_selected_reads))?;
@@ -1537,11 +1513,13 @@ impl RegionalOwnerHandle {
         drop(routes);
 
         let mut pending = Vec::with_capacity(requests.len());
-        let mut lane_versions = Vec::with_capacity(requests.len());
-        for (_, (owner, entities)) in requests {
+        let mut lane_versions = BTreeMap::new();
+        let mut lane_owners = Vec::with_capacity(requests.len());
+        for (lane, (owner, entities)) in requests {
             let version = owner.state_version();
             pending.push(owner.request_snapshots_for_ids(entities).ok()?);
-            lane_versions.push((owner, version));
+            lane_versions.insert(lane, version);
+            lane_owners.push((owner, version));
         }
         #[cfg(test)]
         if let Some(probe) = self
@@ -1571,7 +1549,7 @@ impl RegionalOwnerHandle {
                 return None;
             }
         }
-        if lane_versions
+        if lane_owners
             .iter()
             .any(|(owner, version)| owner.state_version() != *version)
         {
@@ -1580,7 +1558,17 @@ impl RegionalOwnerHandle {
             return None;
         }
         self.commit_state.ensure_committed_state().ok()?;
-        Some(snapshots)
+        let leases = expected
+            .iter()
+            .map(|(&entity, &(lease, _))| (entity, lease))
+            .collect();
+        Some(SelectedEntitySnapshots {
+            fence: RegionalVersionFence {
+                leases,
+                lane_versions,
+            },
+            snapshots,
+        })
     }
 
     #[cfg(test)]
@@ -1910,11 +1898,12 @@ impl RegionalOwnerHandle {
         let mut selected = ids.clone();
         selected.extend(goals.iter().filter_map(|(_, goal)| goal_reference(goal)));
         if ids.len() == goals.len()
-            && let Some((version, snapshots)) =
-                self.read_cached_selected_entities_versioned(&selected)
+            && let Some(selected) = self.read_cached_selected_entities_versioned(&selected)
         {
-            let current = snapshots
-                .into_iter()
+            let current = selected
+                .snapshots()
+                .iter()
+                .cloned()
                 .map(|snapshot| (snapshot.id, snapshot))
                 .collect::<HashMap<_, _>>();
             let direct = goals
@@ -1932,7 +1921,7 @@ impl RegionalOwnerHandle {
                 .collect();
             let referenced = goals.iter().any(|(_, goal)| goal_reference(goal).is_some());
             let result = if referenced {
-                self.try_commit_cached_referenced_snapshot_mutations(direct, version)
+                self.try_commit_cached_referenced_snapshot_mutations(direct, &selected)
             } else {
                 self.try_commit_cached_snapshot_mutations(direct)
             };
@@ -2040,6 +2029,7 @@ impl RegionalOwnerHandle {
             journal_commit,
             false,
             false,
+            false,
         )
     }
 
@@ -2053,26 +2043,67 @@ impl RegionalOwnerHandle {
             journal_commit,
             true,
             false,
+            false,
         )
     }
 
     fn try_commit_cached_referenced_snapshot_mutations(
         &self,
         expected_mutations: Vec<(EntitySnapshot, RegionOwnerMutation)>,
-        expected_version: u64,
+        selected: &VersionedEntitySnapshots,
     ) -> Option<Result<Vec<EntitySnapshot>, RegionOwnerLaneError>> {
+        if selected.authority != self.authority
+            || selected.fence.leases.len() != selected.snapshots.len()
+        {
+            return None;
+        }
         let _mutation_gate = self
             .mutation_gate
-            .write()
+            .read()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
-        if self.active_entity_writers.load(Ordering::Acquire) != 0
-            || self.entity_state_version.load(Ordering::Acquire) != expected_version
-        {
+        let routes = self
+            .selected_read_routes
+            .read()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let mut owners = BTreeMap::new();
+        for snapshot in selected.snapshots() {
+            let route = routes.get(&snapshot.id)?;
+            if route.uuid != snapshot.uuid
+                || RegionKey::from_position(snapshot.position) != Some(route.lease.key)
+                || selected.fence.leases.get(&snapshot.id) != Some(&route.lease)
+                || !selected.fence.lane_versions.contains_key(&route.lease.lane)
+            {
+                return None;
+            }
+            owners
+                .entry(route.lease.lane)
+                .or_insert_with(|| route.owner.clone());
+        }
+        if owners.len() != selected.fence.lane_versions.len() {
+            return None;
+        }
+        drop(routes);
+        let _lane_admissions = owners
+            .values()
+            .map(|owner| {
+                owner
+                    .admission()
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner())
+            })
+            .collect::<Vec<_>>();
+        if owners.iter().any(|(lane, owner)| {
+            selected
+                .fence
+                .lane_versions
+                .get(lane)
+                .is_none_or(|version| owner.state_version() != *version)
+        }) {
             #[cfg(test)]
             self.notify_referenced_goal_fallback_probe();
             return None;
         }
-        self.try_commit_cached_snapshot_mutations_inner(expected_mutations, true, false, true)
+        self.try_commit_cached_snapshot_mutations_inner(expected_mutations, true, false, true, true)
     }
 
     fn try_commit_cached_snapshot_mutations_inner(
@@ -2081,6 +2112,7 @@ impl RegionalOwnerHandle {
         journal_commit: bool,
         require_standalone: bool,
         mutation_gate_held: bool,
+        lane_admission_held: bool,
     ) -> Option<Result<Vec<EntitySnapshot>, RegionOwnerLaneError>> {
         if expected_mutations.is_empty() {
             return Some(Ok(Vec::new()));
@@ -2134,14 +2166,12 @@ impl RegionalOwnerHandle {
         drop(cached);
         let owner = routes.values().next()?.owner.clone();
         Some((|| {
-            let _lane_admission = owner
-                .admission()
-                .lock()
-                .unwrap_or_else(|poisoned| poisoned.into_inner());
-            let _writer = EntityWriterPermit::enter(
-                Arc::clone(&self.active_entity_writers),
-                Arc::clone(&self.entity_state_version),
-            );
+            let _lane_admission = (!lane_admission_held).then(|| {
+                owner
+                    .admission()
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner())
+            });
             let (first_sequence, sequence) = self
                 .commit_state
                 .reserve_sequences(expected_mutations.len())?;
@@ -2544,10 +2574,6 @@ impl RegionalOwnerRuntime {
         let commit_state = Arc::clone(&coordinator.commit_state);
         let selected_read_routes = Arc::new(RwLock::new(HashMap::new()));
         let runtime_selected_read_routes = Arc::clone(&selected_read_routes);
-        let entity_state_version = Arc::new(AtomicU64::new(0));
-        let runtime_entity_state_version = Arc::clone(&entity_state_version);
-        let active_entity_writers = Arc::new(AtomicUsize::new(0));
-        let runtime_active_entity_writers = Arc::clone(&active_entity_writers);
         let mutation_gate = Arc::new(RwLock::new(()));
         let runtime_mutation_gate = Arc::clone(&mutation_gate);
         let direct_selected_reads = Arc::new(AtomicUsize::new(0));
@@ -2564,8 +2590,6 @@ impl RegionalOwnerRuntime {
                     started,
                     receiver,
                     runtime_selected_read_routes,
-                    runtime_entity_state_version,
-                    runtime_active_entity_writers,
                     runtime_mutation_gate,
                 );
             }) {
@@ -2589,8 +2613,6 @@ impl RegionalOwnerRuntime {
                 sender,
                 authority,
                 selected_read_routes,
-                entity_state_version,
-                active_entity_writers,
                 mutation_gate,
                 direct_selected_reads,
                 commit_state,
@@ -2650,24 +2672,18 @@ fn run_regional_owner_runtime(
     started: Receiver<RegionalOwnerCoordinator>,
     receiver: Receiver<RegionalOwnerCommand>,
     selected_read_routes: Arc<RwLock<HashMap<EntityId, CachedEntityReadRoute>>>,
-    entity_state_version: Arc<AtomicU64>,
-    active_entity_writers: Arc<AtomicUsize>,
     mutation_gate: Arc<RwLock<()>>,
 ) {
     let Ok(mut coordinator) = started.recv() else {
         return;
     };
     while let Ok(command) = receiver.recv() {
-        let mutates_entity_snapshots = command.mutates_entity_snapshots();
         let exclusive_lane_access = command.requires_exclusive_lane_access();
         let _mutation_guard = exclusive_lane_access.then(|| {
             mutation_gate
                 .write()
                 .unwrap_or_else(|poisoned| poisoned.into_inner())
         });
-        if mutates_entity_snapshots {
-            active_entity_writers.fetch_add(1, Ordering::AcqRel);
-        }
         match command {
             RegionalOwnerCommand::Snapshot { entity, reply } => {
                 let result = coordinator.snapshot(entity);
@@ -2702,13 +2718,16 @@ fn run_regional_owner_runtime(
                 let _ = reply.send(result);
             }
             RegionalOwnerCommand::SnapshotsForIds { entities, reply } => {
-                let result = coordinator.snapshots_for_ids(&entities).map(|snapshots| {
-                    VersionedEntitySnapshots {
-                        authority: coordinator.authority,
-                        version: entity_state_version.load(Ordering::Acquire),
-                        snapshots,
-                    }
-                });
+                let result = coordinator
+                    .snapshots_for_ids(&entities)
+                    .and_then(|snapshots| {
+                        let fence = selected_version_fence(&coordinator, &snapshots)?;
+                        Ok(VersionedEntitySnapshots {
+                            authority: coordinator.authority,
+                            fence,
+                            snapshots,
+                        })
+                    });
                 if let Ok(selected) = &result {
                     publish_selected_read_routes(
                         &coordinator,
@@ -2992,10 +3011,7 @@ fn run_regional_owner_runtime(
                 reply,
             } => {
                 let selected = selected
-                    .filter(|selected| {
-                        selected.authority == coordinator.authority
-                            && selected.version == entity_state_version.load(Ordering::Acquire)
-                    })
+                    .filter(|selected| versioned_snapshots_are_current(&coordinator, selected))
                     .map(VersionedEntitySnapshots::into_snapshots);
                 let _ = reply.send(
                     coordinator.prepare_goal_tick_with_pathing_for_ids_from_snapshots(
@@ -3040,10 +3056,6 @@ fn run_regional_owner_runtime(
                 return;
             }
         }
-        if mutates_entity_snapshots {
-            entity_state_version.fetch_add(1, Ordering::Release);
-            active_entity_writers.fetch_sub(1, Ordering::Release);
-        }
     }
     let _ = coordinator.shutdown();
 }
@@ -3056,6 +3068,75 @@ fn snapshot_kinematics(snapshot: EntitySnapshot) -> EntityKinematics {
         velocity: snapshot.velocity,
         on_ground: snapshot.on_ground,
     }
+}
+
+fn selected_version_fence(
+    coordinator: &RegionalOwnerCoordinator,
+    snapshots: &[EntitySnapshot],
+) -> Result<RegionalVersionFence, RegionOwnerLaneError> {
+    let mut leases = BTreeMap::new();
+    let mut versions = BTreeMap::new();
+    for snapshot in snapshots {
+        let key = coordinator
+            .locations
+            .get(&snapshot.id)
+            .copied()
+            .ok_or(RegionOwnerLaneError::UnknownEntity)?;
+        let lease = coordinator
+            .ownership
+            .lease(key)
+            .ok_or(RegionOwnerLaneError::UnknownRegion)?;
+        let owner = coordinator
+            .lanes
+            .get(&lease.lane)
+            .ok_or(RegionOwnerLaneError::WrongLane)?;
+        if coordinator.uuids.get(&snapshot.uuid).copied() != Some(snapshot.id)
+            || RegionKey::from_position(snapshot.position) != Some(key)
+        {
+            return Err(RegionOwnerLaneError::InvalidMutation);
+        }
+        leases.insert(snapshot.id, lease);
+        versions
+            .entry(lease.lane)
+            .or_insert_with(|| owner.reader().state_version());
+    }
+    Ok(RegionalVersionFence {
+        leases,
+        lane_versions: versions,
+    })
+}
+
+fn versioned_snapshots_are_current(
+    coordinator: &RegionalOwnerCoordinator,
+    selected: &VersionedEntitySnapshots,
+) -> bool {
+    let selected_lanes = selected
+        .fence
+        .leases
+        .values()
+        .map(|lease| lease.lane)
+        .collect::<BTreeSet<_>>();
+    selected.authority == coordinator.authority
+        && selected.fence.leases.len() == selected.snapshots.len()
+        && selected_lanes
+            .iter()
+            .eq(selected.fence.lane_versions.keys())
+        && selected.snapshots.iter().all(|snapshot| {
+            coordinator
+                .locations
+                .get(&snapshot.id)
+                .and_then(|key| coordinator.ownership.lease(*key))
+                .is_some_and(|lease| {
+                    selected.fence.leases.get(&snapshot.id) == Some(&lease)
+                        && coordinator.uuids.get(&snapshot.uuid).copied() == Some(snapshot.id)
+                })
+        })
+        && selected.fence.lane_versions.iter().all(|(lane, version)| {
+            coordinator
+                .lanes
+                .get(lane)
+                .is_some_and(|owner| owner.reader().state_version() == *version)
+        })
 }
 
 fn publish_selected_read_routes(
@@ -11855,6 +11936,99 @@ mod tests {
     }
 
     #[test]
+    fn cached_follow_target_goal_ignores_unrelated_lane_writer() {
+        let runtime = super::RegionalOwnerRuntime::from_store(RegionalEntityStore::new(), 2)
+            .expect("owner runtime");
+        let handle = runtime.handle();
+        let target = handle
+            .spawn(cow(Vec3::new(0.5, 64.0, 0.5)))
+            .expect("target cow");
+        let follower = handle
+            .spawn(cow(Vec3::new(1.5, 64.0, 0.5)))
+            .expect("follower cow");
+        let unrelated = handle
+            .spawn(cow(Vec3::new(128.5, 64.0, 0.5)))
+            .expect("unrelated cow");
+        let selected = HashSet::from([target, follower, unrelated]);
+        let snapshots = handle
+            .snapshots_for_ids(&selected)
+            .expect("warm all routes");
+        let unrelated_snapshot = snapshots
+            .into_iter()
+            .find(|snapshot| snapshot.id == unrelated)
+            .expect("unrelated snapshot");
+        {
+            let routes = handle
+                .selected_read_routes
+                .read()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            assert_eq!(routes[&target].lease.lane, routes[&follower].lease.lane);
+            assert_ne!(routes[&target].lease.lane, routes[&unrelated].lease.lane);
+        }
+
+        let (coordinator_entered, coordinator_entered_rx) = mpsc::channel();
+        let (coordinator_release, coordinator_release_rx) = mpsc::channel();
+        handle
+            .hold_coordinator_for_test(coordinator_entered, coordinator_release_rx)
+            .expect("queue coordinator hold");
+        coordinator_entered_rx
+            .recv()
+            .expect("coordinator entered hold");
+
+        let (read_entered, read_entered_rx) = mpsc::channel();
+        let (read_release, read_release_rx) = mpsc::channel();
+        handle.pause_selected_read_after_dispatch_for_test(read_entered, read_release_rx);
+        let mutation_handle = handle.clone();
+        let (mutation_complete, mutation_complete_rx) = mpsc::channel();
+        let mutation = std::thread::spawn(move || {
+            mutation_complete
+                .send(mutation_handle.set_goals([(
+                    follower,
+                    GoalState::FollowTarget {
+                        target,
+                        speed: 0.25,
+                    },
+                )]))
+                .expect("publish referenced goal mutation");
+        });
+        read_entered_rx
+            .recv()
+            .expect("referenced read dispatched to owner lanes");
+
+        assert!(
+            handle
+                .apply_kinematics_if_current([(
+                    unrelated_snapshot,
+                    movement(unrelated, Vec3::new(129.0, 64.0, 0.5)),
+                )])
+                .expect("unrelated lane mutation")
+        );
+        read_release.send(()).expect("release referenced read");
+        let direct = mutation_complete_rx.recv_timeout(Duration::from_secs(1));
+        coordinator_release.send(()).expect("release coordinator");
+        mutation.join().expect("join referenced mutation");
+
+        assert_eq!(
+            direct.expect("unrelated lane writer must not force actor fallback"),
+            Ok(1)
+        );
+        assert_eq!(
+            handle
+                .snapshot(follower)
+                .expect("follower read")
+                .expect("follower snapshot")
+                .goal,
+            GoalState::FollowTarget {
+                target,
+                speed: 0.25,
+            }
+        );
+
+        drop(handle);
+        runtime.shutdown().expect("runtime shutdown");
+    }
+
+    #[test]
     fn cached_follow_target_goal_falls_back_after_target_migration() {
         let runtime = super::RegionalOwnerRuntime::from_store(RegionalEntityStore::new(), 2)
             .expect("owner runtime");
@@ -12737,6 +12911,7 @@ mod tests {
         let snapshot = handle
             .read_cached_selected_entities(&selected)
             .expect("refreshed target route remains direct")
+            .snapshots
             .pop()
             .expect("target snapshot");
         assert_eq!(snapshot.position, Vec3::new(128.5, 64.0, 0.5));
@@ -12839,6 +13014,40 @@ mod tests {
         assert_ne!(snapshot.velocity, Vec3::ZERO);
         drop(handle);
         runtime.shutdown().expect("runtime shutdown");
+    }
+
+    #[test]
+    fn versioned_snapshot_fence_rejects_lane_reassignment() {
+        let mut coordinator =
+            super::RegionalOwnerCoordinator::from_store(RegionalEntityStore::new(), 2)
+                .expect("owner coordinator");
+        coordinator
+            .spawn(cow(Vec3::new(0.5, 64.0, 0.5)))
+            .expect("west anchor");
+        let selected_id = coordinator
+            .spawn(cow(Vec3::new(128.5, 64.0, 0.5)))
+            .expect("east cow");
+        let snapshots = coordinator
+            .snapshots_for_ids(&HashSet::from([selected_id]))
+            .expect("selected snapshot");
+        let fence = super::selected_version_fence(&coordinator, &snapshots).expect("version fence");
+        let selected = super::VersionedEntitySnapshots {
+            authority: coordinator.authority,
+            fence,
+            snapshots,
+        };
+        assert!(super::versioned_snapshots_are_current(
+            &coordinator,
+            &selected
+        ));
+
+        assert_eq!(coordinator.reconfigure_lanes(1), Ok(1));
+        assert!(!super::versioned_snapshots_are_current(
+            &coordinator,
+            &selected
+        ));
+
+        coordinator.shutdown().expect("coordinator shutdown");
     }
 
     #[test]
