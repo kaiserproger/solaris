@@ -1011,6 +1011,7 @@ impl WorldMutationView {
         &self,
         position: BlockPos,
         expected_state: BlockStateId,
+        updated_state: BlockStateId,
         expected: &FurnaceBlockEntity,
         updated: &FurnaceBlockEntity,
     ) -> ResidentFurnaceTickCommitResult {
@@ -1018,6 +1019,7 @@ impl WorldMutationView {
             None,
             position,
             expected_state,
+            updated_state,
             expected,
             updated,
         )
@@ -1029,6 +1031,7 @@ impl WorldMutationView {
         decision_id: u64,
         position: BlockPos,
         expected_state: BlockStateId,
+        updated_state: BlockStateId,
         expected: &FurnaceBlockEntity,
         updated: &FurnaceBlockEntity,
     ) -> (ResidentFurnaceTickCommitResult, Vec<ChunkPos>) {
@@ -1036,6 +1039,7 @@ impl WorldMutationView {
             Some(decision_id),
             position,
             expected_state,
+            updated_state,
             expected,
             updated,
         )
@@ -1046,6 +1050,7 @@ impl WorldMutationView {
         decision_id: Option<u64>,
         position: BlockPos,
         expected_state: BlockStateId,
+        updated_state: BlockStateId,
         expected: &FurnaceBlockEntity,
         updated: &FurnaceBlockEntity,
     ) -> (ResidentFurnaceTickCommitResult, Vec<ChunkPos>) {
@@ -1069,20 +1074,40 @@ impl WorldMutationView {
         {
             return (ResidentFurnaceTickCommitResult::Stale, Vec::new());
         }
+        let air = self
+            .resident
+            .registry
+            .block(&Identifier::parse("minecraft:air").expect("static identifier"))
+            .map(|block| block.default)
+            .unwrap_or(BlockStateId(0));
         let changed = self
             .resident
             .read_view
             .update_chunk(chunk_position, chunk, |chunk| {
+                let mut changed = false;
+                if expected_state != updated_state {
+                    let previous = chunk
+                        .set_block_and_update_retaining_baked_light(
+                            local_x,
+                            position.y,
+                            local_z,
+                            updated_state,
+                            air,
+                        )
+                        .expect("validated furnace position remains in chunk");
+                    changed |= previous != updated_state;
+                }
                 if chunk.furnaces.get(&position) != Some(updated) {
                     chunk.furnaces.insert(position, updated.clone());
+                    changed = true;
+                }
+                if changed {
                     chunk.mark_dirty();
                     if let Some(decision_id) = decision_id {
                         chunk.set_world_journal_lsn(decision_id);
                     }
-                    true
-                } else {
-                    false
                 }
+                changed
             });
         self.resident
             .read_view

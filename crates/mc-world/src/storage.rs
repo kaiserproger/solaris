@@ -2205,6 +2205,7 @@ mod tests {
             mutation.commit_furnace_tick_conditionally(
                 position,
                 BlockStateId(2),
+                BlockStateId(2),
                 &initial,
                 &stale_update,
             ),
@@ -2213,6 +2214,44 @@ mod tests {
         assert_eq!(
             mutation.furnace_tick_snapshot(position),
             Some((BlockStateId(2), current))
+        );
+    }
+
+    #[test]
+    fn resident_furnace_tick_commit_changes_state_and_entity_together() {
+        let registry = air_stone_furnace_registry();
+        let mut world = WorldStorage::in_memory(registry);
+        let cpos = ChunkPos { x: 0, z: 0 };
+        let position = BlockPos { x: 1, y: 2, z: 3 };
+        let biome = mc_data::Identifier::parse("minecraft:plains").unwrap();
+        world
+            .insert_generated_chunk(cpos, Chunk::empty(cpos, BlockStateId(0), biome))
+            .unwrap();
+        world.set_block_at(position, BlockStateId(2)).unwrap();
+        let initial = FurnaceBlockEntity::default();
+        world
+            .set_furnace_block_entity(position, initial.clone())
+            .unwrap();
+        let updated = FurnaceBlockEntity {
+            burn_remaining: 20,
+            burn_total: 20,
+            ..initial.clone()
+        };
+        let mutation = world.mutation_view();
+
+        assert_eq!(
+            mutation.commit_furnace_tick_conditionally(
+                position,
+                BlockStateId(2),
+                BlockStateId(3),
+                &initial,
+                &updated,
+            ),
+            crate::ResidentFurnaceTickCommitResult::Applied
+        );
+        assert_eq!(
+            mutation.furnace_tick_snapshot(position),
+            Some((BlockStateId(3), updated))
         );
     }
 

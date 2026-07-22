@@ -133,12 +133,28 @@ pub(super) fn air_stone_furnace_registry() -> Arc<BlockRegistry> {
             },
             mc_data::blocks::BlockReport {
                 id: Identifier::parse("minecraft:furnace").unwrap(),
-                properties: std::collections::BTreeMap::new(),
-                states: vec![mc_data::blocks::BlockStateReport {
-                    id: 2,
-                    default: true,
-                    properties: std::collections::BTreeMap::new(),
-                }],
+                properties: std::collections::BTreeMap::from([(
+                    "lit".to_string(),
+                    vec!["false".to_string(), "true".to_string()],
+                )]),
+                states: vec![
+                    mc_data::blocks::BlockStateReport {
+                        id: 2,
+                        default: true,
+                        properties: std::collections::BTreeMap::from([(
+                            "lit".to_string(),
+                            "false".to_string(),
+                        )]),
+                    },
+                    mc_data::blocks::BlockStateReport {
+                        id: 3,
+                        default: false,
+                        properties: std::collections::BTreeMap::from([(
+                            "lit".to_string(),
+                            "true".to_string(),
+                        )]),
+                    },
+                ],
             },
         ])
         .unwrap(),

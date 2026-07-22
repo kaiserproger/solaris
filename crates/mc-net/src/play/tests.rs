@@ -1904,6 +1904,17 @@ fn simple_block(id: u32, name: &str) -> BlockReport {
     }
 }
 
+fn furnace_block(unlit_id: u32, lit_id: u32) -> BlockReport {
+    BlockReport {
+        id: Identifier::parse("minecraft:furnace").unwrap(),
+        properties: prop_schema(&[("facing", &["north"]), ("lit", &["false", "true"])]),
+        states: vec![
+            state(unlit_id, true, &[("facing", "north"), ("lit", "false")]),
+            state(lit_id, false, &[("facing", "north"), ("lit", "true")]),
+        ],
+    }
+}
+
 fn staged_sapling_block(stage_zero_id: u32, stage_one_id: u32, name: &str) -> BlockReport {
     BlockReport {
         id: Identifier::parse(name).unwrap(),
@@ -16385,7 +16396,7 @@ async fn active_furnace_tick_updates_resident_state_without_world_writer() {
     let blocks = Arc::new(
         mc_world::BlockRegistry::from_report(&[
             simple_block(0, "minecraft:air"),
-            simple_block(1, "minecraft:furnace"),
+            furnace_block(1, 2),
         ])
         .unwrap(),
     );
@@ -16426,7 +16437,7 @@ async fn active_furnace_tick_updates_resident_state_without_world_writer() {
         &profile,
         (0, 0),
         0,
-        HashSet::new(),
+        HashSet::from([(0, 0)]),
         tx,
         PlayerPose::new(0.5, 65.0, 0.5),
     );
@@ -16445,6 +16456,7 @@ async fn active_furnace_tick_updates_resident_state_without_world_writer() {
     .await
     .expect("resident furnace tick completion event");
     assert_eq!(updated, 1);
+    assert_eq!(world_read.get_cached_block(position), Some(BlockStateId(2)));
     assert_eq!(
         world_read
             .furnace_snapshots(&[cpos])
@@ -16456,6 +16468,121 @@ async fn active_furnace_tick_updates_resident_state_without_world_writer() {
         9
     );
     drop(world_writer);
+}
+
+#[tokio::test]
+async fn active_furnace_tick_publishes_lit_block_and_light() {
+    let blocks = Arc::new(
+        mc_world::BlockRegistry::from_report(&[
+            simple_block(0, "minecraft:air"),
+            furnace_block(1, 2),
+        ])
+        .unwrap(),
+    );
+    let mut storage = mc_world::WorldStorage::in_memory(Arc::clone(&blocks));
+    let cpos = ChunkPos { x: 0, z: 0 };
+    let position = mc_world::BlockPos { x: 1, y: 64, z: 1 };
+    storage
+        .insert_generated_chunk(
+            cpos,
+            Chunk::empty(
+                cpos,
+                BlockStateId(0),
+                Identifier::parse("minecraft:plains").unwrap(),
+            ),
+        )
+        .unwrap();
+    storage.set_block_at(position, BlockStateId(1)).unwrap();
+    storage
+        .set_baked_light(cpos, &mc_world::light::ChunkLight::filled(15, 0))
+        .unwrap();
+    storage
+        .set_furnace_block_entity(
+            position,
+            FurnaceBlockEntity {
+                burn_remaining: 10,
+                burn_total: 10,
+                ..FurnaceBlockEntity::default()
+            },
+        )
+        .unwrap();
+    let world_read = storage.read_view();
+    let world_mutation = storage.mutation_view();
+    let world = Arc::new(tokio::sync::Mutex::new(storage));
+    let sessions = SessionRegistry::new();
+    let profile = LoggedInProfile {
+        uuid: uuid::Uuid::from_u128(75),
+        name: "LitFurnace".to_string(),
+    };
+    let (tx, mut rx) = mpsc::channel(8);
+    let (session_id, _) = sessions.register(
+        &profile,
+        (0, 0),
+        0,
+        HashSet::from([(0, 0)]),
+        tx,
+        PlayerPose::new(0.5, 65.0, 0.5),
+    );
+    sessions.mark_loaded(session_id, (0, 0));
+    let config = ServerConfig {
+        blocks: Arc::clone(&blocks),
+        block_light: Some(Arc::new(
+            mc_data::block_light::BlockLightTable::from_arrays(
+                "furnace lit test",
+                vec![0, 0, 13],
+                vec![0, 15, 15],
+                vec![true, false, false],
+            ),
+        )),
+        world: Some(world),
+        ..play_loop_slow_client_test_config()
+    };
+    let (_simulation, owner) = simulation_channel();
+
+    assert_eq!(
+        owner
+            .run_furnace_ticks(&config, &sessions, Some(&world_read), Some(&world_mutation))
+            .await,
+        1
+    );
+    let commands = std::iter::from_fn(|| rx.try_recv().ok()).collect::<Vec<_>>();
+    assert!(commands.iter().any(|command| matches!(
+        command,
+        OutboundCommand::BlockDeltas(deltas)
+            if deltas == &[BlockDelta {
+                x: position.x,
+                y: position.y,
+                z: position.z,
+                state_id: BlockStateId(2),
+            }]
+    )));
+    assert!(commands.iter().any(|command| matches!(
+        command,
+        OutboundCommand::LightUpdates(updates)
+            if updates.iter().any(|update| update.pos == cpos)
+    )));
+}
+
+#[test]
+fn furnace_tick_block_state_tracks_burning_state() {
+    let blocks = mc_world::BlockRegistry::from_report(&[
+        simple_block(0, "minecraft:air"),
+        furnace_block(1, 2),
+    ])
+    .unwrap();
+    let burning = FurnaceBlockEntity {
+        burn_remaining: 1,
+        ..FurnaceBlockEntity::default()
+    };
+
+    assert_eq!(
+        furnace_tick_block_state(&blocks, BlockStateId(1), &burning),
+        BlockStateId(2)
+    );
+    assert_eq!(
+        furnace_tick_block_state(&blocks, BlockStateId(2), &FurnaceBlockEntity::default()),
+        BlockStateId(1)
+    );
 }
 
 #[tokio::test]
@@ -16511,6 +16638,7 @@ async fn stale_furnace_tick_wave_replans_against_resident_state() {
         vec![FurnaceTickPlan {
             position,
             block_state: BlockStateId(1),
+            after_block_state: BlockStateId(1),
             kind: FurnaceKind::Furnace,
             before: stale_before,
             after: stale_after,

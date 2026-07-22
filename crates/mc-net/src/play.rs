@@ -4225,6 +4225,7 @@ fn hand_inventory_slot(state: &InteractionState, hand: InteractionHand) -> usize
 struct FurnaceTickPlan {
     position: mc_world::BlockPos,
     block_state: BlockStateId,
+    after_block_state: BlockStateId,
     kind: FurnaceKind,
     before: FurnaceBlockEntity,
     after: FurnaceBlockEntity,
@@ -4237,7 +4238,21 @@ type FurnaceViewerUpdate = (
     FurnaceBlockEntity,
     bool,
     Vec<(i16, i16)>,
+    Option<(BlockStateId, BlockStateId)>,
 );
+
+fn furnace_tick_block_state(
+    blocks: &mc_world::BlockRegistry,
+    block_state: BlockStateId,
+    furnace: &FurnaceBlockEntity,
+) -> BlockStateId {
+    blocks
+        .by_id(block_state)
+        .and_then(|state| {
+            sibling_state_with_bool_property(blocks, state, "lit", furnace.burn_remaining > 0)
+        })
+        .unwrap_or(block_state)
+}
 
 fn replan_resident_furnace_tick(
     config: &ServerConfig,
@@ -4250,15 +4265,18 @@ fn replan_resident_furnace_tick(
         .by_id(block_state)
         .and_then(|state| furnace_kind_for_block_id(state.block.id.as_str()))?;
     let tick = tick_furnace_rules(&config.recipes, &config.items, &config.tags, &before, kind);
-    (tick.slots_changed || !tick.data_changed.is_empty()).then_some(FurnaceTickPlan {
-        position,
-        block_state,
-        kind,
-        before,
-        after: tick.furnace,
-        slots_changed: tick.slots_changed,
-        data_changed: tick.data_changed,
-    })
+    let after_block_state = furnace_tick_block_state(&config.blocks, block_state, &tick.furnace);
+    (tick.slots_changed || !tick.data_changed.is_empty() || after_block_state != block_state)
+        .then_some(FurnaceTickPlan {
+            position,
+            block_state,
+            after_block_state,
+            kind,
+            before,
+            after: tick.furnace,
+            slots_changed: tick.slots_changed,
+            data_changed: tick.data_changed,
+        })
 }
 
 fn commit_resident_furnace_tick_wave(
@@ -4274,6 +4292,7 @@ fn commit_resident_furnace_tick_wave(
             match mutation.commit_furnace_tick_conditionally(
                 plan.position,
                 plan.block_state,
+                plan.after_block_state,
                 &plan.before,
                 &plan.after,
             ) {
@@ -4283,6 +4302,8 @@ fn commit_resident_furnace_tick_wave(
                         plan.after,
                         plan.slots_changed,
                         plan.data_changed,
+                        (plan.block_state != plan.after_block_state)
+                            .then_some((plan.block_state, plan.after_block_state)),
                     ));
                     #[cfg(test)]
                     _sessions.pause_after_server_furnace_commit_for_test();
@@ -4345,10 +4366,13 @@ async fn run_furnace_ticks_owned(
             continue;
         };
         let tick = tick_furnace_rules(&config.recipes, &config.items, &config.tags, &before, kind);
-        if tick.slots_changed || !tick.data_changed.is_empty() {
+        let after_block_state =
+            furnace_tick_block_state(&config.blocks, block_state, &tick.furnace);
+        if tick.slots_changed || !tick.data_changed.is_empty() || after_block_state != block_state {
             plans.push(FurnaceTickPlan {
                 position,
                 block_state,
+                after_block_state,
                 kind,
                 before,
                 after: tick.furnace,
@@ -4385,9 +4409,14 @@ async fn run_furnace_ticks_owned(
                     continue;
                 }
             };
-            let (furnace, slots_changed, data_changed) =
+            let (furnace, slots_changed, data_changed, after_block_state) =
                 if current_kind == plan.kind && current == plan.before {
-                    (plan.after, plan.slots_changed, plan.data_changed)
+                    (
+                        plan.after,
+                        plan.slots_changed,
+                        plan.data_changed,
+                        plan.after_block_state,
+                    )
                 } else {
                     let tick = tick_furnace_rules(
                         &config.recipes,
@@ -4396,18 +4425,40 @@ async fn run_furnace_ticks_owned(
                         &current,
                         current_kind,
                     );
-                    if !tick.slots_changed && tick.data_changed.is_empty() {
+                    let after_block_state =
+                        furnace_tick_block_state(&config.blocks, block_state, &tick.furnace);
+                    if !tick.slots_changed
+                        && tick.data_changed.is_empty()
+                        && after_block_state == block_state
+                    {
                         continue;
                     }
-                    (tick.furnace, tick.slots_changed, tick.data_changed)
+                    (
+                        tick.furnace,
+                        tick.slots_changed,
+                        tick.data_changed,
+                        after_block_state,
+                    )
                 };
-            let update = match storage.set_furnace_block_entity(plan.position, furnace.clone()) {
-                Ok(true) => Some((plan.position, furnace, slots_changed, data_changed)),
-                Ok(false) => None,
-                Err(error) => {
-                    warn!(%error, position = ?plan.position, "furnace tick write failed");
-                    None
-                }
+            let block_change =
+                (block_state != after_block_state).then_some((block_state, after_block_state));
+            let mutation = storage.mutation_view();
+            let update = match mutation.commit_furnace_tick_conditionally(
+                plan.position,
+                block_state,
+                after_block_state,
+                &current,
+                &furnace,
+            ) {
+                mc_world::ResidentFurnaceTickCommitResult::Applied => Some((
+                    plan.position,
+                    furnace,
+                    slots_changed,
+                    data_changed,
+                    block_change,
+                )),
+                mc_world::ResidentFurnaceTickCommitResult::Missing
+                | mc_world::ResidentFurnaceTickCommitResult::Stale => None,
             };
             if let Some(update) = update {
                 updates.push(update);
@@ -4420,7 +4471,28 @@ async fn run_furnace_ticks_owned(
 
     let updated = updates.len();
     let mut dispatches = Vec::new();
-    for (position, furnace, slots_changed, data_changed) in updates {
+    let mut lit_outcome = BlockEditBatchOutcome::default();
+    let light_table = config.block_light.as_deref();
+    for (position, furnace, slots_changed, data_changed, block_change) in updates {
+        if let Some((previous, new_state)) = block_change {
+            lit_outcome.applied.push(AppliedBlockEdit {
+                pos: position,
+                previous,
+                new_state,
+            });
+            lit_outcome.deltas.push(BlockDelta {
+                x: position.x,
+                y: position.y,
+                z: position.z,
+                state_id: new_state,
+            });
+            let chunk = (position.x.div_euclid(16), position.z.div_euclid(16));
+            lit_outcome.edit_chunks.insert(chunk);
+            if light_table.is_some_and(|table| block_edit_changes_light(table, previous, new_state))
+            {
+                lit_outcome.light_edit_chunks.insert(chunk);
+            }
+        }
         if slots_changed {
             dispatches.extend(
                 sessions
@@ -4430,6 +4502,25 @@ async fn run_furnace_ticks_owned(
         }
         if !data_changed.is_empty() {
             dispatches.extend(sessions.server_furnace_data_dispatches(position, data_changed));
+        }
+    }
+    if !lit_outcome.applied.is_empty() {
+        sessions.invalidate_prepared_chunks(&lit_outcome.edit_chunks);
+        broadcast_block_deltas_to_sessions(
+            sessions,
+            &lit_outcome.edit_chunks,
+            &lit_outcome.deltas,
+            None,
+        );
+        if let Some(table) = light_table
+            && !lit_outcome.light_edit_chunks.is_empty()
+        {
+            let light_updates =
+                collect_server_origin_light_updates(world, sessions, table, &lit_outcome).await;
+            if !light_updates.is_empty() {
+                sessions.invalidate_prepared_chunks(&light_update_chunks(&light_updates));
+                broadcast_light_updates_to_sessions(sessions, &light_updates, None);
+            }
         }
     }
     dispatch_visibility_commands(dispatches);

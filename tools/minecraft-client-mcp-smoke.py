@@ -24,6 +24,7 @@ REQUIRED_TOOLS = {
     "minecraft_wait_for_visible_entity",
     "minecraft_wait_for_health_below",
     "minecraft_wait_for_inventory",
+    "minecraft_wait_for_container_slot",
     "minecraft_wait_for_visible_item",
     "minecraft_wait_for_no_visible_item",
     "minecraft_connect",

@@ -48,8 +48,13 @@ verification and keep ordinary survival play ahead of rare edge cases.
   61-item stone stack into and back out of a chest. Reopening the crafting table
   and chest kept the final authoritative slots with no delayed correction or
   disconnect.
-- [ ] Furnace state must visibly become lit while cooking, open promptly, and
-  deliver slot/cook events without delayed bursts.
+- [x] Furnace state must visibly become lit while cooking, open promptly, and
+  deliver slot/cook events without delayed bursts. The furnace tick now commits
+  its block state and block entity atomically, publishes the `lit` block delta,
+  and retains baked light as the input to incremental relighting instead of
+  forcing a full chunk relight. A real 26.1.2 client opened the menu in 75 ms,
+  observed `lit=true` with block light 13, and received cooked porkchop through
+  an event-driven exact-slot wait. The rerun produced no over-budget tick.
 - [ ] Player melee reach and damage must match ordinary vanilla survival closely:
   a sheep at two blocks is hittable and normal mobs do not die in one bare hit.
 - [ ] Hostiles must react without waiting for player movement, cannot hit from

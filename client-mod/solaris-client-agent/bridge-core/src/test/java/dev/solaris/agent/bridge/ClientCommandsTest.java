@@ -958,10 +958,15 @@ final class ClientCommandsTest {
             "{\"button_id\":2,\"timeout_seconds\":9.0}"
         ));
 
+        JsonObject waited = registry.find("wait_for_container_slot").orElseThrow().execute(request(
+            "wait_for_container_slot",
+            "{\"slot\":2,\"item_id\":\"minecraft:cooked_porkchop\",\"count\":1,\"timeout_seconds\":12.0}"
+        ));
         assertTrue(quickMove.get("confirmed").getAsBoolean());
         assertTrue(click.get("confirmed").getAsBoolean());
         assertTrue(button.get("confirmed").getAsBoolean());
         assertEquals(37, client.quickMovedContainerSlot);
+        assertTrue(waited.get("matched").getAsBoolean());
         assertEquals(Duration.ofSeconds(8), client.quickMoveContainerTimeout);
         assertEquals(3, client.clickedContainerSlot);
         assertEquals("secondary", client.containerSlotButton);
@@ -969,6 +974,10 @@ final class ClientCommandsTest {
         assertEquals(2, client.clickedContainerButton);
         assertEquals(Duration.ofSeconds(9), client.containerButtonTimeout);
         assertEquals(0, executor.calls, "facade owns the packet-event wait");
+        assertEquals(2, client.waitedContainerSlot);
+        assertEquals("minecraft:cooked_porkchop", client.waitedContainerItemId);
+        assertEquals(1, client.waitedContainerCount);
+        assertEquals(Duration.ofSeconds(12), client.waitedContainerTimeout);
 
         assertThrows(IllegalArgumentException.class, () ->
             registry.find("quick_move_container_slot").orElseThrow().execute(request(
@@ -1001,6 +1010,12 @@ final class ClientCommandsTest {
             ))
         );
     }
+        assertThrows(IllegalArgumentException.class, () ->
+            registry.find("wait_for_container_slot").orElseThrow().execute(request(
+                "wait_for_container_slot",
+                "{\"slot\":0,\"item_id\":\"minecraft:stone\",\"count\":0}"
+            ))
+        );
 
     private static BridgeRequest request(String command, String payload) {
         return BridgeCodec.decodeRequest(
@@ -1074,6 +1089,10 @@ final class ClientCommandsTest {
         Duration dropTimeout;
         int quickMovedContainerSlot = -1;
         Duration quickMoveContainerTimeout;
+        int waitedContainerSlot = -1;
+        String waitedContainerItemId;
+        int waitedContainerCount;
+        Duration waitedContainerTimeout;
         int clickedContainerSlot = -1;
         String containerSlotButton;
         Duration containerSlotTimeout;
@@ -1369,6 +1388,22 @@ final class ClientCommandsTest {
             containerSlotTimeout = timeout;
             JsonObject result = new JsonObject();
             result.addProperty("confirmed", true);
+            return result;
+        }
+
+        @Override
+        public JsonObject waitForContainerSlot(
+            int slot,
+            String itemId,
+            int count,
+            Duration timeout
+        ) {
+            waitedContainerSlot = slot;
+            waitedContainerItemId = itemId;
+            waitedContainerCount = count;
+            waitedContainerTimeout = timeout;
+            JsonObject result = new JsonObject();
+            result.addProperty("matched", true);
             return result;
         }
 

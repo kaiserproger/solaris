@@ -432,6 +432,13 @@ pub struct SectionLight {
     pub sky: Option<Vec<u8>>,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum BlockLightMutation {
+    Invalidate,
+    PreserveInert,
+    RetainForRelight,
+}
+
 /// A 16×height×16 column.
 #[derive(Debug, Clone)]
 pub struct Chunk {
@@ -689,7 +696,7 @@ impl Chunk {
         state: BlockStateId,
         air: BlockStateId,
     ) -> Option<BlockStateId> {
-        self.set_block_and_update_inner(x, y, z, state, air, true)
+        self.set_block_and_update_inner(x, y, z, state, air, BlockLightMutation::Invalidate)
     }
 
     /// Mutate a block without discarding baked light. The caller must prove
@@ -702,7 +709,20 @@ impl Chunk {
         state: BlockStateId,
         air: BlockStateId,
     ) -> Option<BlockStateId> {
-        self.set_block_and_update_inner(x, y, z, state, air, false)
+        self.set_block_and_update_inner(x, y, z, state, air, BlockLightMutation::PreserveInert)
+    }
+
+    /// Retain the old baked light as input for an immediate incremental relight.
+    /// Unlike a light-inert update, this still advances the light-source token.
+    pub fn set_block_and_update_retaining_baked_light(
+        &mut self,
+        x: u8,
+        y: i32,
+        z: u8,
+        state: BlockStateId,
+        air: BlockStateId,
+    ) -> Option<BlockStateId> {
+        self.set_block_and_update_inner(x, y, z, state, air, BlockLightMutation::RetainForRelight)
     }
 
     fn set_block_and_update_inner(
@@ -712,9 +732,9 @@ impl Chunk {
         z: u8,
         state: BlockStateId,
         air: BlockStateId,
-        clear_baked_light: bool,
+        light_mutation: BlockLightMutation,
     ) -> Option<BlockStateId> {
-        let prev = if clear_baked_light {
+        let prev = if light_mutation != BlockLightMutation::PreserveInert {
             self.set_block(x, y, z, state)?
         } else {
             self.set_block_preserving_light_source(x, y, z, state)?
@@ -728,7 +748,7 @@ impl Chunk {
             .checked_add(1)
             .expect("block mutation version exhausted");
         self.mark_dirty();
-        if clear_baked_light {
+        if light_mutation == BlockLightMutation::Invalidate {
             self.clear_baked_light();
         }
         // Heightmap entries store `height + 1`-style values (the Y of
@@ -1268,6 +1288,23 @@ mod tests {
         assert_eq!(prev, air());
         assert_eq!(c.section_lights, expected);
         assert_eq!(c.light_source_token(), light_source);
+    }
+
+    #[test]
+    fn incremental_relight_update_retains_baked_light_and_changes_source_token() {
+        let mut c = Chunk::empty(ChunkPos { x: 0, z: 0 }, air(), plains());
+        c.section_lights[0].sky = Some(vec![0xFF; LIGHT_LAYER_BYTES]);
+        c.section_lights[0].block = Some(vec![0x11; LIGHT_LAYER_BYTES]);
+        let expected = c.section_lights.clone();
+        let light_source = c.light_source_token();
+
+        let prev = c
+            .set_block_and_update_retaining_baked_light(0, 0, 0, stone(), air())
+            .unwrap();
+
+        assert_eq!(prev, air());
+        assert_eq!(c.section_lights, expected);
+        assert_ne!(c.light_source_token(), light_source);
     }
 
     #[test]

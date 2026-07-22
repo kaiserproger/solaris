@@ -56,6 +56,13 @@ public interface ClientFacade {
 
     JsonObject waitForInventoryCount(String itemId, int count, Duration timeout) throws Exception;
 
+    JsonObject waitForContainerSlot(
+        int slot,
+        String itemId,
+        int count,
+        Duration timeout
+    ) throws Exception;
+
     JsonObject waitForVisibleItem(String itemId, int x, int y, int z, Duration timeout) throws Exception;
 
     JsonObject waitForNoVisibleItem(String itemId, int x, int y, int z, Duration timeout) throws Exception;

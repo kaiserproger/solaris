@@ -317,6 +317,27 @@ public final class MinecraftClientFacade implements ClientFacade {
         return result;
     }
 
+    @Override
+    public JsonObject waitForContainerSlot(
+        int slot,
+        String itemId,
+        int count,
+        java.time.Duration timeout
+    ) throws Exception {
+        MinecraftScenarioClient client = new MinecraftScenarioClient(new MinecraftClientExecutor());
+        if (!client.waitForContainerSlot(slot, itemId, count, timeout)) {
+            throw new IllegalStateException(
+                "container slot " + slot + " did not reach " + itemId + " x" + count
+            );
+        }
+        JsonObject result = new JsonObject();
+        result.addProperty("matched", true);
+        result.addProperty("slot", slot);
+        result.addProperty("item_id", itemId);
+        result.addProperty("count", count);
+        return result;
+    }
+
     private static JsonObject visibleEntityOnClientThread(String entityType, double radius) {
         JsonObject visible = MinecraftClientObservation.listEntities(
             requireInPlay(),

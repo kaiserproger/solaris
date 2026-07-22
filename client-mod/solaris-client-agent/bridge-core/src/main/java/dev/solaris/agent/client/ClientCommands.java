@@ -154,6 +154,15 @@ public final class ClientCommands {
                 eventTimeout(payload)
             );
         });
+        registry.registerConcurrent("wait_for_container_slot", request -> {
+            JsonObject payload = request.payload();
+            return client.waitForContainerSlot(
+                boundedInt(payload, "slot", 0, Short.MAX_VALUE),
+                boundedString(payload, "item_id", 128),
+                boundedInt(payload, "count", 1, 4096),
+                eventTimeout(payload)
+            );
+        });
         registry.registerConcurrent("wait_visible_item", request -> {
             JsonObject payload = request.payload();
             return client.waitForVisibleItem(

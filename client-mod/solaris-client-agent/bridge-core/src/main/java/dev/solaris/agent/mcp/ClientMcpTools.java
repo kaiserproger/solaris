@@ -103,6 +103,20 @@ public final class ClientMcpTools {
             inventoryWaitSchema()
         ),
         readOnly(
+            "minecraft_wait_for_container_slot",
+            "Wait for an exact item stack in one visible container slot using client state events.",
+            "wait_for_container_slot",
+            objectSchema(
+                properties(
+                    "slot", integer(0, Short.MAX_VALUE),
+                    "item_id", string(128),
+                    "count", integer(1, 4096),
+                    "timeout_seconds", number(0.1, 120.0, 8.0)
+                ),
+                List.of("slot", "item_id", "count")
+            )
+        ),
+        readOnly(
             "minecraft_wait_for_visible_item",
             "Wait for an item entity to become client-visible near a block position.",
             "wait_visible_item",

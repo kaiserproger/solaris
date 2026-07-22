@@ -27,6 +27,7 @@ final class ClientMcpToolsTest {
             "minecraft_wait_for_entity_removed",
             "minecraft_wait_for_health_below",
             "minecraft_wait_for_inventory",
+            "minecraft_wait_for_container_slot",
             "minecraft_wait_for_visible_item",
             "minecraft_wait_for_no_visible_item",
             "minecraft_connect",
@@ -303,6 +304,7 @@ final class ClientMcpToolsTest {
         assertTrue(find(tools, "minecraft_wait_for_entity_removed").readOnly());
         assertTrue(find(tools, "minecraft_wait_for_health_below").readOnly());
         assertTrue(find(tools, "minecraft_wait_for_inventory").readOnly());
+        assertTrue(find(tools, "minecraft_wait_for_container_slot").readOnly());
         assertTrue(find(tools, "minecraft_wait_for_visible_item").readOnly());
         assertTrue(find(tools, "minecraft_wait_for_no_visible_item").readOnly());
         assertTrue(find(tools, "minecraft_wait_ticks").readOnly());

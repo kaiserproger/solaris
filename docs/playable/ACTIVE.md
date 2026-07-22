@@ -736,6 +736,15 @@ hardening. An already-open lower-priority diff does not override this order.
   warned tick was `56.709 ms`, with goals at `9.575 ms`, physics at `1.264 ms`,
   and dispatch at `11.671 ms`. This closes the catastrophic cold-table stall;
   it is not a replacement for a longer performance soak.
+- Furnace cooking now changes the authoritative block state and block entity in
+  one resident commit. Both resident and locked fallback paths retain the old
+  baked light only as the base for immediate incremental relighting, while
+  advancing the light-source token; this removes the 123-127 ms full chunk
+  relight seen when a furnace toggled. The embedded 26.1.2 client opened a fresh
+  furnace in 75 ms, observed `lit=true` and block light 13, then received
+  `minecraft:cooked_porkchop` in output slot 2 through the new event-driven
+  `minecraft_wait_for_container_slot` tool. No tick-budget warning occurred in
+  the corrected rerun. This is focused furnace evidence, not a broad soak.
 
 ## Manual And Agent Gates
 
