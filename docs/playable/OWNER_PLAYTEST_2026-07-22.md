@@ -55,8 +55,12 @@ verification and keep ordinary survival play ahead of rare edge cases.
   forcing a full chunk relight. A real 26.1.2 client opened the menu in 75 ms,
   observed `lit=true` with block light 13, and received cooked porkchop through
   an event-driven exact-slot wait. The rerun produced no over-budget tick.
-- [ ] Player melee reach and damage must match ordinary vanilla survival closely:
+- [x] Player melee reach and damage must match ordinary vanilla survival closely:
   a sheep at two blocks is hittable and normal mobs do not die in one bare hit.
+  Focused geometry covers the exact two-block sheep path and the existing far
+  rejection boundary. An embedded real 26.1.2 client attacked with an empty
+  selected slot at full strength, received an authoritative motion update, and
+  observed the sheep remain alive at `7/8` health after exactly `1.0` damage.
 - [ ] Hostiles must react without waiting for player movement, cannot hit from
   behind/out of reach, and stop attacking dead players.
 - [ ] Skeletons fire arrows and creepers fuse/explode through authoritative paths.

@@ -745,6 +745,14 @@ hardening. An already-open lower-priority diff does not override this order.
   `minecraft:cooked_porkchop` in output slot 2 through the new event-driven
   `minecraft_wait_for_container_slot` tool. No tick-budget warning occurred in
   the corrected rerun. This is focused furnace evidence, not a broad soak.
+- Player melee reach and bare-hand damage are client-verified. A focused
+  geometry regression accepts an ordinary survival attack against a sheep
+  exactly two blocks away while the existing boundary regression rejects a far
+  target. An embedded 26.1.2 client selected an empty hotbar slot, dispatched a
+  full-strength attack, received the sheep's authoritative motion update, and
+  observed health change from `8` to `7`; the sheep remained alive. The client
+  stayed connected. This proves the requested common melee path, not broad
+  combat balance across every item, enchantment, effect, or mob.
 
 ## Manual And Agent Gates
 

@@ -3,7 +3,8 @@ use mc_physics::Aabb;
 use mc_protocol::packets::play::{GameMode, pack_block_pos};
 
 use super::interaction_geometry::{
-    player_aabb_for_pose, within_block_reach, within_entity_attack_reach, within_entity_reach,
+    entity_aabb, player_aabb_for_pose, within_block_reach, within_entity_attack_reach,
+    within_entity_reach,
 };
 use crate::play::PlayerPose;
 
@@ -75,6 +76,20 @@ fn entity_interaction_and_default_attack_keep_their_distinct_boundaries() {
         position,
         aabb,
         GameMode::Creative,
+        None,
+    ));
+}
+
+#[test]
+fn survival_player_can_attack_a_sheep_two_blocks_away() {
+    let player = PlayerPose::new(0.5, 64.0, 0.5);
+    let sheep = Vec3::new(2.5, 64.0, 0.5);
+
+    assert!(within_entity_attack_reach(
+        player,
+        sheep,
+        entity_aabb("minecraft:sheep"),
+        GameMode::Survival,
         None,
     ));
 }
