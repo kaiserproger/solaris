@@ -19774,6 +19774,7 @@ async fn campfire_test_interaction_state(pos: mc_world::BlockPos) -> Interaction
             held_hotbar_slot: 0,
             held_item: None,
             expected_target: None,
+            stop_received: false,
         }),
         delayed_break: None,
         pending_use: None,

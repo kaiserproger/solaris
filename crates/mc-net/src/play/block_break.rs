@@ -43,6 +43,7 @@ pub(super) struct PendingBreak {
     pub(super) held_hotbar_slot: u8,
     pub(super) held_item: Option<ItemStack>,
     pub(super) expected_target: Option<BlockMutationSnapshot>,
+    pub(super) stop_received: bool,
 }
 
 #[derive(Debug, PartialEq)]
@@ -113,7 +114,10 @@ impl<'a> BlockBreakState<'a> {
             *self.delayed = Some(pending);
             return StopBreakOutcome::Acknowledge { delayed: true };
         }
-        StopBreakOutcome::Acknowledge { delayed: false }
+        let pending = self.active.as_mut().expect("checked active break");
+        pending.sequence = action.sequence;
+        pending.stop_received = true;
+        StopBreakOutcome::Acknowledge { delayed: true }
     }
 
     pub(super) fn tick_delayed(
@@ -126,16 +130,28 @@ impl<'a> BlockBreakState<'a> {
         };
         if pending.expected_target.is_none() {
             *self.delayed = None;
+            self.promote_stopped_active();
             return DelayedBreakOutcome::Cancelled;
         }
         if destroy_progress(pending.started_tick, current_tick, progress_per_tick) < 1.0 {
             return DelayedBreakOutcome::Pending;
         }
         let pending = self.delayed.take().expect("checked delayed break");
+        self.promote_stopped_active();
         DelayedBreakOutcome::Complete(BlockBreakCompletion {
             acknowledgement: BreakAcknowledgement::AlreadySent(pending.sequence),
             pending,
         })
+    }
+
+    fn promote_stopped_active(&mut self) {
+        if self
+            .active
+            .as_ref()
+            .is_some_and(|pending| pending.stop_received)
+        {
+            *self.delayed = self.active.take();
+        }
     }
 }
 
@@ -734,6 +750,7 @@ where
                         held_hotbar_slot,
                         held_item: held_item.clone(),
                         expected_target,
+                        stop_received: false,
                     },
                 );
                 debug!(

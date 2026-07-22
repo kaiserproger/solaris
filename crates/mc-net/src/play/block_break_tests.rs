@@ -43,6 +43,7 @@ fn pending(position: i64, started_tick: u64) -> PendingBreak {
         held_hotbar_slot: 0,
         held_item: Some(ItemStack::new(10, 1)),
         expected_target: Some(target(1)),
+        stop_received: false,
     }
 }
 
@@ -741,14 +742,43 @@ fn new_start_does_not_overwrite_existing_delayed_break() {
 }
 
 #[test]
-fn second_early_stop_does_not_overwrite_existing_delayed_break() {
+fn second_early_stop_queues_active_behind_existing_delayed_break() {
     let mut active = Some(pending(24, 50));
     let mut delayed = Some(pending(12, 40));
     let outcome = BlockBreakState::new(&mut active, &mut delayed).stop(&stop(24, 8), 52, 0.1);
 
-    assert_eq!(outcome, StopBreakOutcome::Acknowledge { delayed: false });
+    assert_eq!(outcome, StopBreakOutcome::Acknowledge { delayed: true });
     assert_eq!(active.as_ref().map(|pending| pending.position), Some(24));
+    assert!(active.as_ref().is_some_and(|pending| pending.stop_received));
     assert_eq!(delayed.as_ref().map(|pending| pending.position), Some(12));
+}
+
+#[test]
+fn completed_delayed_break_promotes_the_queued_stop() {
+    let mut active = Some(pending(24, 45));
+    active.as_mut().unwrap().stop_received = true;
+    let mut delayed = Some(pending(12, 40));
+
+    let outcome = BlockBreakState::new(&mut active, &mut delayed).tick_delayed(49, 0.1);
+
+    assert!(matches!(outcome, DelayedBreakOutcome::Complete(_)));
+    assert!(active.is_none());
+    assert_eq!(delayed.as_ref().map(|pending| pending.position), Some(24));
+}
+
+#[test]
+fn cancelled_delayed_break_promotes_the_queued_stop() {
+    let mut active = Some(pending(24, 45));
+    active.as_mut().unwrap().stop_received = true;
+    let mut cancelled = pending(12, 40);
+    cancelled.expected_target = None;
+    let mut delayed = Some(cancelled);
+
+    let outcome = BlockBreakState::new(&mut active, &mut delayed).tick_delayed(49, 0.1);
+
+    assert_eq!(outcome, DelayedBreakOutcome::Cancelled);
+    assert!(active.is_none());
+    assert_eq!(delayed.as_ref().map(|pending| pending.position), Some(24));
 }
 
 #[test]

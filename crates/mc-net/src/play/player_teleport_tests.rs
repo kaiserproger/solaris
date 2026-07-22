@@ -66,6 +66,7 @@ fn committed_teleport_clears_every_position_bound_interaction() {
         held_hotbar_slot: 0,
         held_item: Some(ItemStack::new(4, 1)),
         expected_target: None,
+        stop_received: false,
     };
     state.pending_break = Some(pending_break.clone());
     state.delayed_break = Some(pending_break);

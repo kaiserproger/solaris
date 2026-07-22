@@ -9,8 +9,12 @@ verification and keep ordinary survival play ahead of rare edge cases.
 - [ ] Block breaking must not intermittently reject valid survival breaks.
   Evidence: stone at `x = 31` repeatedly rejected while nearby blocks broke;
   chat and movement remained live. The first proven cause is unnecessary stair
-  dependency reads for non-stair-to-non-stair edits at a chunk edge. The
-  chunk-edge regression is green; owner/client confirmation is still pending.
+  dependency reads for non-stair-to-non-stair edits at a chunk edge. A second
+  proven cause was an early `STOP` becoming permanently orphaned when another
+  delayed break already occupied the single delayed slot. The older break now
+  promotes the queued stop on either completion or cancellation. Both focused
+  state-machine regressions and the full `mc-net` library suite are green;
+  owner/client confirmation is still pending.
 - [ ] Block placement must work on every valid face and from either hand. The
   owner transaction now accepts and debits the offhand slot, with a focused
   regression; owner/client confirmation is still pending.

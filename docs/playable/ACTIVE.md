@@ -74,6 +74,13 @@ hardening. An already-open lower-priority diff does not override this order.
 
 ## Recent Evidence
 
+- Rapid sequential mining no longer strands the second valid early `STOP`
+  behind an existing delayed break. The stop is retained as queued work, and
+  completion or cancellation of the older delayed break promotes it into the
+  single delayed slot for event-driven completion. Focused coverage proves
+  both transitions alongside the existing chunk-edge precondition regression;
+  owner/client confirmation remains pending.
+
 - Survival block loot remains a server-owned world item before pickup rather
   than a direct inventory credit. The focused TCP gate observed the committed
   block update/ack and tool durability update before `AddEntity` plus item
