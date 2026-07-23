@@ -244,8 +244,11 @@ verification and keep ordinary survival play ahead of rare edge cases.
 
 ## Runtime And Distribution
 
-- [ ] Remove autoscaler oscillation and repeated no-op scale-up logging; scaling
-  must not disconnect clients or delay gameplay packets.
+- [x] Remove autoscaler oscillation and repeated no-op scale-up logging; scaling
+  must not disconnect clients or delay gameplay packets. The exact 5,227-entity
+  O3 rerun completed 975 real-client ticks in play with no runtime work-budget
+  info spam, disconnect, reliable drop, or retry. The only CPU-admission info
+  transition was the requested shutdown drain.
 - [ ] Investigate measured tick spikes from the playtest profile. Common spikes
   were in breeding, entity goals/dispatch, and some block-edit batches; aggregate
   mutex wait totals alone did not prove contention. Breeding state now advances
@@ -296,6 +299,19 @@ verification and keep ordinary survival play ahead of rare edge cases.
   1,020-tick real-client run with 11-16 visible natural entities emitted no
   over-budget tick warning. Fluid, far-travel, and scheduled-block spikes remain
   open.
+  The exact dense fixture then exposed three remaining full-population reads:
+  AI/physics selected all 5,208 active cows, sheep grazing read every loaded
+  entity before filtering type, and breeding repeatedly read idle adults.
+  Autoscaler-derived fair cohorts now cap dense simulation while leaving
+  ordinary populations at 20 Hz; grazing and breeding use exact maintained
+  indexes. Across the same 975-client-tick gate, over-budget warnings fell from
+  223 to 8. Conditional warning p50 fell from `93,123 us` to `56,775 us`,
+  entity-goal p50 from `78,237 us` to `17,473 us`, and grazing p50 from
+  `8,389 us` to `234 us`; breeding was at most `1 us` in an over-budget sample.
+  The 26.1.2 client remained in play with no disconnect, reliable-command loss,
+  or runtime work-budget info spam. This closes the dense entity-read causes;
+  scheduled block/fluid work and an interactive menu/block/attack natural-load
+  gate remain open.
 - [ ] Bound scheduled-block work per tick and move expensive preparation off
   the tick owner. No block batch may stall packet processing.
 - [ ] Make animal and hostile movement visually alive: smooth velocity/rotation,
@@ -309,7 +325,8 @@ verification and keep ordinary survival play ahead of rare edge cases.
   natural mob/chunk load. The biased entity-owner select used to check an
   overdue 50 ms tick before its pushed command notification, allowing sustained
   over-budget ticks to starve player transactions. Command readiness now wins
-  before the ticker; the broader natural-load responsiveness gate remains.
+  before the ticker. Dense real-client movement now remains connected after the
+  fair-cohort and exact-index fixes above; the broader interactive gate remains.
 - [x] Make an autonomous MCP survival pass reliably reach the first crafting
   table without operator commands or deterministic scenarios. A fresh real
   26.1.2 client found a natural jungle log, navigated to it, mined and collected

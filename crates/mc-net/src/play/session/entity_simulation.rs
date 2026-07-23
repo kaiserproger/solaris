@@ -1,5 +1,6 @@
 use super::entity_lifecycle::{
     remove_server_entity_locked, schedule_entity_death_locked, track_entity_chunk_locked,
+    update_breeding_tick_tracking_locked,
 };
 use super::entity_physics_class::entity_type_uses_aquatic_physics;
 use super::explosion_authority::schedule_primed_tnt_deadline_locked;
@@ -212,6 +213,32 @@ impl SessionRegistry {
             }
         }
         let terrain_pathing_entities = self.simulation_inputs.terrain_pathing_entities();
+        let active_population_ids = active_entity_candidates
+            .into_iter()
+            .filter(|&entity| {
+                self.simulation_inputs
+                    .entity_chunk(entity)
+                    .is_some_and(|chunk| {
+                        active_chunks.contains(&chunk)
+                            && entity_is_near_player_chunk(
+                                chunk,
+                                &player_positions,
+                                simulation_distance,
+                            )
+                    })
+            })
+            .collect::<HashSet<_>>();
+        let simulation_budget = cpu_resources.map_or(usize::MAX, |cpu| {
+            cpu.cpu_limit()
+                .max(1)
+                .saturating_mul(ENTITY_SIMULATION_UPDATES_PER_LANE_PER_TICK)
+        });
+        let simulation_overloaded = active_population_ids.len() > simulation_budget;
+        let active_entity_candidates = if simulation_overloaded {
+            bounded_entity_ids_due_for_tick(&active_population_ids, tick, simulation_budget)
+        } else {
+            active_population_ids.clone()
+        };
         let mut entities = self.lock_entities("prepare entity goals");
         if active_chunks.is_empty() {
             self.clear_active_simulation_entities();
@@ -228,9 +255,7 @@ impl SessionRegistry {
                 .fetch_add(1, Ordering::Relaxed);
             if entity.lifecycle == EntityLifecycle::Alive {
                 let chunk = chunk_pos_from_coords(entity.position.x, entity.position.z);
-                if active_chunks.contains(&chunk)
-                    && entity_is_near_player_chunk(chunk, &player_positions, simulation_distance)
-                {
+                if active_chunks.contains(&chunk) {
                     active_entity_ids.insert(entity.id);
                     if is_hostile_entity(entity.type_name) {
                         active_hostile_ids.insert(entity.id);
@@ -271,23 +296,30 @@ impl SessionRegistry {
                 }
             }
         });
-        self.publish_active_entity_selection(
-            live_session_generation,
-            active_entity_ids.clone(),
-            active_hostile_ids,
-        );
         if active_entity_ids.is_empty() {
+            self.publish_active_entity_selection(
+                live_session_generation,
+                active_population_ids,
+                active_hostile_ids,
+            );
             return Vec::new();
         }
         update_hostile_targets(
             &mut entities,
             &hostile_target_positions,
-            Some(&active_entity_ids),
+            Some(&active_hostile_ids),
         );
-        let goal_entity_ids = active_entity_ids
+        self.publish_active_entity_selection(
+            live_session_generation,
+            active_population_ids,
+            active_hostile_ids,
+        );
+        let eligible_goal_entity_ids = active_entity_ids
             .difference(&sheep_grazing_entities)
             .copied()
             .collect::<HashSet<_>>();
+        let goal_entity_ids =
+            entity_goal_ids_due_for_tick(&eligible_goal_entity_ids, tick, simulation_overloaded);
         let unprojected_entity_ids = active_entity_ids
             .difference(&goal_entity_ids)
             .copied()
@@ -496,6 +528,10 @@ impl SessionRegistry {
             } else if entity.animal.is_some() {
                 inner.natural_ground_mobs.insert(entity_id);
             }
+            if entity.type_name == "minecraft:sheep" {
+                inner.sheep_entities.insert(entity_id);
+            }
+            update_breeding_tick_tracking_locked(&mut inner, entity_id, entity.animal);
             schedule_entity_death_locked(&mut inner, &entity);
             schedule_primed_tnt_deadline_locked(
                 &mut inner,
@@ -905,6 +941,20 @@ impl SessionRegistry {
             ));
         }
         let ordinary_tracking_turn = tick.is_multiple_of(ENTITY_MOVE_SEND_INTERVAL_TICKS);
+        let natural_tracker_ids = steps
+            .iter()
+            .filter(|step| {
+                inner.natural_hostile_mobs.contains(&step.id)
+                    || inner.natural_ground_mobs.contains(&step.id)
+                    || inner.natural_aquatic_mobs.contains(&step.id)
+            })
+            .map(|step| step.id)
+            .collect::<HashSet<_>>();
+        let natural_tracker_ids_due = bounded_entity_ids_due_for_tick(
+            &natural_tracker_ids,
+            tick,
+            ENTITY_MOVEMENT_TARGET_UPDATES_PER_TRACKING_TURN,
+        );
         let mut tracker_inputs = Vec::with_capacity(steps.len());
         for step in steps {
             let Some(motion) = inner.entities.motion_state(step.id) else {
@@ -914,6 +964,9 @@ impl SessionRegistry {
             let smooth_natural_mob = inner.natural_hostile_mobs.contains(&step.id)
                 || inner.natural_ground_mobs.contains(&step.id)
                 || inner.natural_aquatic_mobs.contains(&step.id);
+            if smooth_natural_mob && !natural_tracker_ids_due.contains(&step.id) {
+                continue;
+            }
             if !ordinary_tracking_turn && !latency_sensitive && !smooth_natural_mob {
                 continue;
             }

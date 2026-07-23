@@ -125,10 +125,16 @@ pub(super) fn spawn_command_entity_locked(
     apply_default_mob_goal(&mut entity, hostile);
     entity.retained.spawn_tick = inner.entity_lifecycle_tick;
     let aabb = entity_aabb(&entity.type_name);
+    let is_sheep = entity.type_name == "minecraft:sheep";
+    let animal = entity.animal;
     let id = inner.entities.spawn(entity);
     if hostile {
         inner.hostile_entities.insert(id);
     }
+    if is_sheep {
+        inner.sheep_entities.insert(id);
+    }
+    update_breeding_tick_tracking_locked(inner, id, animal);
     inner
         .entity_type_aabbs
         .entry(entity_type_id)
@@ -310,8 +316,20 @@ pub(super) fn clear_removed_entity_tracking_locked(
     inner.natural_hostile_mobs.remove(&entity_id);
     inner.natural_ground_mobs.remove(&entity_id);
     inner.natural_aquatic_mobs.remove(&entity_id);
+    inner.sheep_entities.remove(&entity_id);
+    update_breeding_tick_tracking_locked(inner, entity_id, None);
     inner.simulation_inputs.remove_terrain_pathing([entity_id]);
     untrack_entity_chunk_locked(inner, entity_id);
+}
+
+pub(super) fn update_breeding_tick_tracking_locked(
+    inner: &mut SessionRegistryInner,
+    entity_id: EntityId,
+    animal: Option<mc_entity::AnimalBreedingState>,
+) {
+    inner
+        .simulation_inputs
+        .update_breeding_tick_entity(entity_id, animal);
 }
 
 pub(super) fn remove_server_entity_locked(

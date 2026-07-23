@@ -590,6 +590,75 @@ fn dense_entity_movement_tracking_rotates_bounded_shards() {
 }
 
 #[test]
+fn dense_natural_movement_tracking_rotates_every_tick() {
+    let entity_count = ENTITY_MOVEMENT_TARGET_UPDATES_PER_TRACKING_TURN * 10;
+    let entities = (0..entity_count)
+        .map(|id| EntityId(i32::try_from(id).unwrap()))
+        .collect::<HashSet<_>>();
+    let mut visits = vec![0; entity_count];
+
+    for tick in 0..10 {
+        let due = bounded_entity_ids_due_for_tick(
+            &entities,
+            tick,
+            ENTITY_MOVEMENT_TARGET_UPDATES_PER_TRACKING_TURN,
+        );
+        assert_eq!(due.len(), ENTITY_MOVEMENT_TARGET_UPDATES_PER_TRACKING_TURN);
+        for entity in due {
+            visits[usize::try_from(entity.0).unwrap()] += 1;
+        }
+    }
+    assert!(visits.into_iter().all(|visits| visits == 1));
+}
+
+#[test]
+fn dense_entity_goal_updates_rotate_bounded_cohorts() {
+    let entity_count = ENTITY_GOAL_UPDATES_PER_TICK * 10;
+    let entities = (0..entity_count)
+        .map(|id| EntityId(i32::try_from(id).unwrap()))
+        .collect::<HashSet<_>>();
+    let mut visits = vec![0; entity_count];
+
+    for tick in 0..10 {
+        let due = entity_goal_ids_due_for_tick(&entities, tick, true);
+        assert_eq!(due.len(), ENTITY_GOAL_UPDATES_PER_TICK);
+        for entity in due {
+            visits[usize::try_from(entity.0).unwrap()] += 1;
+        }
+    }
+    assert!(visits.into_iter().all(|visits| visits == 1));
+}
+
+#[test]
+fn ordinary_entity_goal_updates_keep_full_tick_cadence() {
+    let entity_count = ENTITY_GOAL_UPDATES_PER_TICK + 88;
+    let entities = (0..entity_count)
+        .map(|id| EntityId(i32::try_from(id).unwrap()))
+        .collect::<HashSet<_>>();
+
+    assert_eq!(entity_goal_ids_due_for_tick(&entities, 7, false), entities);
+}
+
+#[test]
+fn dense_entity_simulation_rotates_lane_sized_cohorts() {
+    let limit = ENTITY_SIMULATION_UPDATES_PER_LANE_PER_TICK * 2;
+    let entity_count = limit * 10;
+    let entities = (0..entity_count)
+        .map(|id| EntityId(i32::try_from(id).unwrap()))
+        .collect::<HashSet<_>>();
+    let mut visits = vec![0; entity_count];
+
+    for tick in 0..10 {
+        let due = bounded_entity_ids_due_for_tick(&entities, tick, limit);
+        assert_eq!(due.len(), limit);
+        for entity in due {
+            visits[usize::try_from(entity.0).unwrap()] += 1;
+        }
+    }
+    assert!(visits.into_iter().all(|visits| visits == 1));
+}
+
+#[test]
 fn only_vanilla_outside_slot_sentinel_can_drop_the_cursor() {
     let click = |slot_num| ServerboundContainerClick {
         container_id: 0,

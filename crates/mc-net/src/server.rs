@@ -1147,8 +1147,8 @@ impl BoundServer {
                                     observation.scheduled_budget_exhausted,
                                 )),
                             );
-                            if let Some(RuntimeControlOutcome::Work(decision)) = outcome
-                                && decision.action != crate::AutoscaleAction::Hold
+                            if let Some(RuntimeControlOutcome::Work(decision)) = outcome.as_ref()
+                                && decision.action == crate::AutoscaleAction::ScaleDown
                             {
                                 info!(
                                     tick,
@@ -1162,6 +1162,21 @@ impl BoundServer {
                                     scheduled_tick_budget = decision.budgets.scheduled_ticks,
                                     reason = %decision.reason,
                                     "runtime work budgets changed"
+                                );
+                            } else if let Some(RuntimeControlOutcome::Work(decision)) =
+                                outcome.as_ref()
+                                && decision.action == crate::AutoscaleAction::ScaleUp
+                            {
+                                debug!(
+                                    tick,
+                                    source_tick = observation.percentiles.source_tick,
+                                    entity_pathing_candidates =
+                                        decision.budgets.entity_pathing_candidates,
+                                    random_tick_chunk_budget =
+                                        decision.budgets.random_tick_chunks,
+                                    scheduled_tick_budget = decision.budgets.scheduled_ticks,
+                                    reason = %decision.reason,
+                                    "runtime work budgets recovering"
                                 );
                             }
                         }

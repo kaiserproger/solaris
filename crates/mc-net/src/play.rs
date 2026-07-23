@@ -562,6 +562,8 @@ const OUTBOUND_COMMANDS_PER_PLAYER_BURST: usize = 16;
 const ENTITY_SPAWNS_PER_WRITE_TURN: usize = 16;
 const ENTITY_MOVEMENTS_PER_WRITE_TURN: usize = 256;
 const ENTITY_MOVEMENT_TARGET_UPDATES_PER_TRACKING_TURN: usize = 512;
+const ENTITY_GOAL_UPDATES_PER_TICK: usize = 512;
+const ENTITY_SIMULATION_UPDATES_PER_LANE_PER_TICK: usize = 256;
 const TELEPORT_RESEND_DELAY_TICKS: u64 = 20;
 
 const SPAWN_X: f64 = 0.5;
@@ -646,6 +648,35 @@ fn ordinary_entity_is_due_for_movement_tracking(
     let start = (turn as usize * ENTITY_MOVEMENT_TARGET_UPDATES_PER_TRACKING_TURN) % entity_count;
     (ordinal + entity_count - start) % entity_count
         < ENTITY_MOVEMENT_TARGET_UPDATES_PER_TRACKING_TURN
+}
+
+fn bounded_entity_ids_due_for_tick(
+    eligible_ids: &HashSet<EntityId>,
+    tick: u64,
+    limit: usize,
+) -> HashSet<EntityId> {
+    let limit = limit.max(1);
+    if eligible_ids.len() <= limit {
+        return eligible_ids.clone();
+    }
+    let mut ordered = eligible_ids.iter().copied().collect::<Vec<_>>();
+    ordered.sort_unstable();
+    let start = (tick as usize).wrapping_mul(limit) % ordered.len();
+    (0..limit)
+        .map(|offset| ordered[(start + offset) % ordered.len()])
+        .collect()
+}
+
+fn entity_goal_ids_due_for_tick(
+    eligible_ids: &HashSet<EntityId>,
+    tick: u64,
+    simulation_overloaded: bool,
+) -> HashSet<EntityId> {
+    if simulation_overloaded {
+        bounded_entity_ids_due_for_tick(eligible_ids, tick, ENTITY_GOAL_UPDATES_PER_TICK)
+    } else {
+        eligible_ids.clone()
+    }
 }
 const WORLD_TIME_SYNC_PERIOD: Duration = Duration::from_secs(1);
 struct RegisteredSessionCleanup {

@@ -1,4 +1,6 @@
-use super::super::entity_lifecycle::track_entity_chunk_locked;
+use super::super::entity_lifecycle::{
+    track_entity_chunk_locked, update_breeding_tick_tracking_locked,
+};
 use super::super::interaction_geometry::{entity_aabb, entity_geometry, within_entity_reach};
 use super::super::{
     OutboundCommand, SessionId, SessionRegistry, VisibilityDispatch, apply_entity_facts,
@@ -111,6 +113,7 @@ impl SessionRegistry {
         if let Some(snapshot) = inner.published_entity_snapshots.get_mut(&plan.entity_id) {
             snapshot.animal = Some(animal);
         }
+        update_breeding_tick_tracking_locked(&mut inner, plan.entity_id, Some(animal));
         player_state.replace_inventory(inventory.clone());
         let dispatches = entity_event_dispatches_locked(&inner, plan.entity_id, 18);
         Some(CommittedAnimalFeed {
@@ -250,6 +253,23 @@ impl SessionRegistry {
         if active_entity_ids.is_empty() {
             return (0, Vec::new());
         }
+        let breeding_tick_entities = self.simulation_inputs.breeding_tick_entities();
+        let active_entity_ids: HashSet<EntityId> = {
+            if breeding_tick_entities.len() < active_entity_ids.len() {
+                breeding_tick_entities
+                    .intersection(&active_entity_ids)
+                    .copied()
+                    .collect()
+            } else {
+                active_entity_ids
+                    .intersection(&breeding_tick_entities)
+                    .copied()
+                    .collect()
+            }
+        };
+        if active_entity_ids.is_empty() {
+            return (0, Vec::new());
+        }
         let entities = self.lock_entities("snapshot animal breeding");
         let mut animals = Vec::new();
         entities.visit_simulation_entities_for_ids(&active_entity_ids, |entity| {
@@ -382,6 +402,7 @@ impl SessionRegistry {
         let mut inner = self.lock_inner("publish animal breeding");
         for committed in committed_animals {
             let entity_id = committed.id;
+            update_breeding_tick_tracking_locked(&mut inner, entity_id, committed.animal);
             if let Some(snapshot) = inner.published_entity_snapshots.get_mut(&entity_id) {
                 snapshot.animal = committed.animal;
             }
@@ -411,6 +432,10 @@ impl SessionRegistry {
         let birth_count = children.len();
         for child in children {
             let child_id = child.id;
+            update_breeding_tick_tracking_locked(&mut inner, child_id, child.animal);
+            if child.type_name == "minecraft:sheep" {
+                inner.sheep_entities.insert(child_id);
+            }
             inner
                 .entity_type_aabbs
                 .entry(child.type_id)
@@ -430,9 +455,24 @@ impl SessionRegistry {
         tick: u64,
     ) -> SheepGrazingPlan {
         let (_, loaded_entity_ids) = self.simulation_inputs.active_entity_candidates();
+        let loaded_sheep_ids = {
+            let inner = self.lock_inner("snapshot loaded sheep index");
+            if inner.sheep_entities.len() < loaded_entity_ids.len() {
+                inner
+                    .sheep_entities
+                    .intersection(&loaded_entity_ids)
+                    .copied()
+                    .collect()
+            } else {
+                loaded_entity_ids
+                    .intersection(&inner.sheep_entities)
+                    .copied()
+                    .collect()
+            }
+        };
         let mut entities = self.lock_entities("snapshot sheep grazing candidates");
         let mut sheep_ids = Vec::new();
-        entities.visit_sheep_entities_for_ids(&loaded_entity_ids, |entity| {
+        entities.visit_sheep_entities_for_ids(&loaded_sheep_ids, |entity| {
             #[cfg(test)]
             self.sheep_grazing_entity_visits
                 .fetch_add(1, Ordering::Relaxed);
@@ -626,6 +666,7 @@ impl SessionRegistry {
                 continue;
             }
             if let Some(animal) = animal {
+                update_breeding_tick_tracking_locked(&mut inner, entity_id, Some(animal));
                 let Some(snapshot) = inner.published_entity_snapshots.get_mut(&entity_id) else {
                     continue;
                 };

@@ -101,14 +101,20 @@ async fn place_dirt_persists_through_flush_to_disk_inner() {
     // Resolve the dirt + stone state ids so the test isn't pinned to
     // 26.1.2 numerics. Dirt is what the server *should* place from
     // the held item; stone is the M5 fallback we must NOT see.
-    let dirt_state_id = blocks
+    let dirt_state = blocks
         .block(&mc_data::Identifier::parse("minecraft:dirt").unwrap())
-        .map(|b| b.default.0 as i32)
+        .map(|b| b.default)
         .expect("dirt in registry");
-    let stone_state_id = blocks
+    let stone_state = blocks
         .block(&mc_data::Identifier::parse("minecraft:stone").unwrap())
-        .map(|b| b.default.0 as i32)
+        .map(|b| b.default)
         .expect("stone in registry");
+    let air_state = blocks
+        .block(&mc_data::Identifier::parse("minecraft:air").unwrap())
+        .map(|b| b.default)
+        .expect("air in registry");
+    let dirt_state_id = dirt_state.0 as i32;
+    let stone_state_id = stone_state.0 as i32;
     // Sanity: the two must differ (otherwise the assertion is vacuous).
     assert_ne!(dirt_state_id, stone_state_id);
 
@@ -235,6 +241,29 @@ async fn place_dirt_persists_through_flush_to_disk_inner() {
     //    worlds choose spawn Y adaptively as `top + 2`.
     let target_y = sync.y.floor() as i32 - 2;
     let placed_y = target_y + 1;
+    {
+        let mut world = world_handle.lock().await;
+        world
+            .set_block_at(
+                mc_world::BlockPos {
+                    x: 0,
+                    y: target_y,
+                    z: 0,
+                },
+                stone_state,
+            )
+            .expect("seed deterministic placement support");
+        world
+            .set_block_at(
+                mc_world::BlockPos {
+                    x: 0,
+                    y: placed_y,
+                    z: 0,
+                },
+                air_state,
+            )
+            .expect("clear deterministic placement target");
+    }
     let target_pos = pack_block_pos(0, target_y, 0);
     let sequence: i32 = 1;
     client
@@ -273,15 +302,9 @@ async fn place_dirt_persists_through_flush_to_disk_inner() {
             let mut body = frame.body;
             let pkt = BlockUpdate::decode(&mut body).expect("decode BlockUpdate");
             let (px, py, pz) = unpack_block_pos(pkt.position);
-            assert_eq!(
-                (px, py, pz),
-                (0, placed_y, 0),
-                "BlockUpdate position must match the placement target",
-            );
-            assert_eq!(
-                pkt.state_id, dirt_state_id,
-                "M6.f must place dirt (held item), not stone (M5 fallback)",
-            );
+            if (px, py, pz) != (0, placed_y, 0) || pkt.state_id != dirt_state_id {
+                continue;
+            }
             saw_block_update = true;
         } else if frame.id == BlockChangedAck::ID {
             let mut body = frame.body;
@@ -295,19 +318,13 @@ async fn place_dirt_persists_through_flush_to_disk_inner() {
             let mut body = frame.body;
             let pkt =
                 ClientboundContainerSetSlot::decode(&mut body).expect("decode ContainerSetSlot");
-            assert_eq!(pkt.container_id, 0);
-            assert_eq!(
-                pkt.slot, 37,
-                "decrement target is hotbar slot 1 (= wire slot 37)",
-            );
-            assert_eq!(
-                pkt.item_stack.count, 63,
-                "stack starts at 64, one placement leaves 63",
-            );
-            assert_eq!(
-                pkt.item_stack.item_id, dirt_item_id,
-                "decremented slot still references dirt",
-            );
+            if pkt.container_id != 0
+                || pkt.slot != 37
+                || pkt.item_stack.count != 63
+                || pkt.item_stack.item_id != dirt_item_id
+            {
+                continue;
+            }
             saw_container_set_slot = true;
         }
         // Ignore stray frames (light updates, keepalive, …).

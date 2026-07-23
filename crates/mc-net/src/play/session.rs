@@ -354,6 +354,7 @@ struct SessionRegistryInner {
     natural_hostile_mobs: HashSet<EntityId>,
     natural_ground_mobs: HashSet<EntityId>,
     natural_aquatic_mobs: HashSet<EntityId>,
+    sheep_entities: HashSet<EntityId>,
     published_entity_snapshots: HashMap<EntityId, ServerEntitySnapshot>,
     entity_type_aabbs: HashMap<i32, mc_physics::Aabb>,
     simulation_inputs: Arc<SimulationInputPublication>,
@@ -1065,11 +1066,27 @@ impl SessionRegistry {
         &self,
         entities: impl IntoIterator<Item = EntityId>,
     ) {
+        let entities = entities.into_iter().collect::<HashSet<_>>();
+        self.refresh_breeding_tick_entities_for_test(entities.iter().copied());
         self.publish_active_entity_selection(
             self.live_session_generation.load(Ordering::Acquire),
-            entities.into_iter().collect(),
+            entities,
             HashSet::new(),
         );
+    }
+
+    #[cfg(test)]
+    fn refresh_breeding_tick_entities_for_test(
+        &self,
+        entities: impl IntoIterator<Item = EntityId>,
+    ) {
+        let owner = self.lock_entities("publish test active breeding entities");
+        for entity_id in entities {
+            self.simulation_inputs.update_breeding_tick_entity(
+                entity_id,
+                owner.snapshot(entity_id).and_then(|entity| entity.animal),
+            );
+        }
     }
 
     fn lock_entities(&self, operation: &'static str) -> EntityStoreGuard<'_> {

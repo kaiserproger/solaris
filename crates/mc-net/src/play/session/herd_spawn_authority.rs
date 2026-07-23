@@ -12,7 +12,7 @@ use crate::play::{
 };
 
 use super::entity_goal_defaults::apply_default_mob_goal;
-use super::entity_lifecycle::track_entity_chunk_locked;
+use super::entity_lifecycle::{track_entity_chunk_locked, update_breeding_tick_tracking_locked};
 use super::entity_owner::owner_result;
 use super::entity_physics_class::entity_type_uses_aquatic_physics;
 use super::interaction_geometry::{distance_sq, entity_aabb};
@@ -489,6 +489,10 @@ pub(in crate::play::session) fn install_committed_herd_spawns_locked(
 ) -> Vec<VisibilityDispatch> {
     let mut snapshots = Vec::with_capacity(committed.len());
     for entity in committed {
+        update_breeding_tick_tracking_locked(inner, entity.id, entity.animal);
+        if entity.type_name == "minecraft:sheep" {
+            inner.sheep_entities.insert(entity.id);
+        }
         if is_hostile_entity(&entity.type_name) {
             inner.hostile_entities.insert(entity.id);
             inner.natural_hostile_mobs.insert(entity.id);

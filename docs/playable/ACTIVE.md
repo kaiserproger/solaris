@@ -397,6 +397,23 @@ hardening. An already-open lower-priority diff does not override this order.
   `.analysis/codex-logs/dense-5132-release-build-v5.log`,
   `.analysis/codex-logs/dense-5132-keepalive-fixed-v5.json`, and
   `.analysis/codex-logs/dense-5132-fixed-v5-server.log`.
+- A current-head O3 rerun addressed the dense world's remaining latency rather
+  than only its keepalive symptom. With 5,208 active cows, AI/physics now uses
+  autoscaler-sized deterministic cohorts, natural movement publication rotates
+  a bounded entity-id cohort, sheep grazing reads an exact sheep index, and
+  breeding reads only indexed babies/animals in love while retaining the full
+  active population. Ordinary populations below the limits retain per-tick
+  simulation. The same 975-client-tick gate reduced over-budget warnings from
+  223 to 8; conditional warning p50 changed from 93.123 ms to 56.775 ms,
+  entity-goal p50 from 78.237 ms to 17.473 ms, and grazing p50 from 8.389 ms to
+  0.234 ms. The 26.1.2 client stayed in play with no disconnect, reliable drop,
+  retry, or runtime work-budget info spam; the only CPU-admission info
+  transition was the requested shutdown drain. Evidence:
+  `.analysis/codex-logs/natural-load-current-o3-server.log`,
+  `.analysis/codex-logs/natural-load-indexed-breeding-o3-server.log`, and
+  `.analysis/codex-logs/natural-load-indexed-breeding-o3-client-gate.json`.
+  This is an artificial overcrowding overload gate; interactive block, menu,
+  and combat response under a representative natural population remains open.
 
 - The shipped `basic-economy` plugin now provides durable virtual balances,
   operator self-grants, and an inventory shop whose item grant and balance CAS

@@ -155,6 +155,18 @@ and is not startup context.
   swimming pose, air depletion, drowning damage and connection continuity.
   Evidence is `.analysis/codex-logs/deep-water-real-client-final.json`. The
   hostile-combat functional follow-up is recorded above.
+- The dense-world latency follow-up bounds work instead of treating every
+  artificial cow as a 20 Hz obligation. Populations within the autoscaler
+  budget remain full cadence; larger active sets rotate deterministic
+  `256 * cpu_limit` simulation cohorts, with 512 goal and dense natural-movement
+  limits. Sheep grazing uses a maintained sheep index, while breeding uses a
+  lock-free index of babies and animals in love without shrinking its full
+  active eligibility to the physics cohort. In the exact 5,227-entity O3
+  975-client-tick gate, over-budget warnings fell from 223 to 8, entity-goal
+  warning p50 from 78.237 ms to 17.473 ms, and grazing warning p50 from
+  8.389 ms to 0.234 ms. The client remained in play with no disconnect,
+  reliable-command loss, or runtime work-budget info spam. Representative
+  interactive block/menu/combat latency remains open.
 - `7cdd917` fixes the ordinary active-game save path exposed by the natural
   furnace loop. A resident mutation during out-of-lock whole-region encoding
   now skips that Anvil region before filesystem installation and leaves it

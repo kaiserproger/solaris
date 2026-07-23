@@ -882,6 +882,7 @@ fn breeding_tick_reads_only_current_simulation_active_animals() {
         assert!(entities.set_animal_state(west, mc_entity::AnimalBreedingState::baby()));
         assert!(entities.set_animal_state(east, mc_entity::AnimalBreedingState::baby()));
     }
+    registry.refresh_breeding_tick_entities_for_test([west, east]);
     let _ = registry.tick_entities_and_collect_physics_queries(1);
 
     let (births, dispatches) = registry.tick_animal_breeding(&SimulationAuthority::for_test(), 1);
@@ -3645,6 +3646,51 @@ fn unloaded_entities_do_not_run_goal_ticks() {
         .find(|entity| entity.position.x > 100.0)
         .expect("far zombie");
     assert_eq!(far.velocity, Vec3::ZERO);
+}
+
+#[test]
+fn dense_simulation_cohort_keeps_the_full_active_breeding_population() {
+    let registry = SessionRegistry::new();
+    let player = register_test_session(&registry, "DenseBreedingPopulationAlice");
+    assert!(registry.mark_loaded(player, (0, 0)).is_empty());
+    for index in 0..300 {
+        registry.spawn_command_entity(
+            &SimulationAuthority::for_test(),
+            4,
+            "minecraft:cow".to_owned(),
+            Vec3::new(
+                0.5 + f64::from(index % 15),
+                64.0,
+                0.5 + f64::from((index / 15) % 15),
+            ),
+        );
+    }
+    let resources = crate::chunk_pipeline::ChunkPipelineResources::with_limits(1, 1);
+
+    let queries = registry.tick_entities_and_collect_physics_queries_owned(
+        &SimulationAuthority::for_test(),
+        &resources,
+        20,
+        8,
+        DEFAULT_VIEW_DISTANCE,
+        None,
+    );
+
+    assert_eq!(queries.len(), ENTITY_SIMULATION_UPDATES_PER_LANE_PER_TICK);
+    assert_eq!(
+        registry.active_simulation_entities.load().len(),
+        300,
+        "breeding must see the full active population even when physics uses a cohort"
+    );
+    registry.entities.reset_owner_requests_for_test();
+    let (births, dispatches) = registry.tick_animal_breeding(&SimulationAuthority::for_test(), 20);
+    assert_eq!(births, 0);
+    assert!(dispatches.is_empty());
+    assert_eq!(
+        registry.entities.owner_requests_for_test(),
+        0,
+        "idle adult animals must not trigger a dense owner snapshot"
+    );
 }
 
 #[test]

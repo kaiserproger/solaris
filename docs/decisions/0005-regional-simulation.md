@@ -556,6 +556,23 @@ chunks, a 64-shard chunk-to-entity index, terrain-pathing IDs, and per-session
 combat-target poses. It therefore does not enter `SessionRegistry.inner`.
 One revision fence covers active-chunk and entity-index publication so a
 cross-shard move cannot disappear from a concurrent snapshot.
+Ordinary active populations still receive one AI and physics turn every server
+tick. When the active population exceeds the autoscaler's current CPU capacity,
+the network owner selects a deterministic entity-id cohort of
+`256 * cpu_limit` each tick. Cohorts rotate by tick and cover every active
+entity without an operator worker-percentage setting. Goal resolution is
+independently capped at 512 entities inside that cohort. Natural-mob movement
+publication remains every tick through 512 active mobs; larger populations use
+the same deterministic 512-entity rotation. This is bounded overload behavior,
+not a vanilla-cadence claim for artificial overcrowding.
+Sheep grazing keeps exact per-tick timers but now intersects loaded entities
+with a session-owned sheep index before asking regional owners for snapshots.
+Breeding similarly intersects the full active population with a lock-free index
+containing only babies and animals in love. Feed, birth, grazing age changes,
+restore, and removal maintain that index. Idle adults therefore do not cause a
+regional snapshot, while every active animal that needs time advancement
+remains eligible even when physics uses a smaller overload cohort. These
+indexes remove broad reads without becoming mutation authority.
 The publication owns both chunk-to-entity and entity-to-chunk routing. The
 duplicate maps formerly stored in `SessionRegistry.inner` were deleted;
 visibility, projectile collision, sheep grazing, lifecycle radius queries, and

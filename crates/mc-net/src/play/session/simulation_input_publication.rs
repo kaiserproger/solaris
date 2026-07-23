@@ -25,6 +25,7 @@ pub(super) struct SimulationInputPublication {
     entity_chunks: [arc_swap::ArcSwap<ChunkEntityIndex>; ENTITY_INDEX_SHARDS],
     chunks_by_entity: [arc_swap::ArcSwap<EntityChunkIndex>; ENTITY_INDEX_SHARDS],
     terrain_pathing_entities: arc_swap::ArcSwap<HashSet<EntityId>>,
+    breeding_tick_entities: arc_swap::ArcSwap<HashSet<EntityId>>,
 }
 
 impl Default for SimulationInputPublication {
@@ -37,6 +38,7 @@ impl Default for SimulationInputPublication {
                 arc_swap::ArcSwap::from_pointee(HashMap::new())
             }),
             terrain_pathing_entities: arc_swap::ArcSwap::from_pointee(HashSet::new()),
+            breeding_tick_entities: arc_swap::ArcSwap::from_pointee(HashSet::new()),
         }
     }
 }
@@ -269,6 +271,30 @@ impl SimulationInputPublication {
 
     pub(super) fn terrain_pathing_entities(&self) -> Arc<HashSet<EntityId>> {
         self.terrain_pathing_entities.load_full()
+    }
+
+    pub(super) fn update_breeding_tick_entity(
+        &self,
+        entity: EntityId,
+        animal: Option<mc_entity::AnimalBreedingState>,
+    ) {
+        let should_tick = animal.is_some_and(|animal| animal.needs_breeding_tick());
+        self.breeding_tick_entities.rcu(|current| {
+            if current.contains(&entity) == should_tick {
+                return Arc::clone(current);
+            }
+            let mut next = (**current).clone();
+            if should_tick {
+                next.insert(entity);
+            } else {
+                next.remove(&entity);
+            }
+            Arc::new(next)
+        });
+    }
+
+    pub(super) fn breeding_tick_entities(&self) -> Arc<HashSet<EntityId>> {
+        self.breeding_tick_entities.load_full()
     }
 
     fn update_chunk(&self, chunk: (i32, i32), update: impl FnOnce(&mut HashSet<EntityId>)) {
