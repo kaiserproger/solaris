@@ -228,7 +228,8 @@ public final class ClientCommands {
             return client.attackEntityOnce(
                 boundedInt(payload, "entity_id", 0, Integer.MAX_VALUE),
                 boundedUuid(payload, "entity_uuid"),
-                boundedString(payload, "entity_type", 128)
+                boundedString(payload, "entity_type", 128),
+                eventTimeout(payload)
             );
         });
         registry.register("attack_entity_until_drop_collected", request -> {

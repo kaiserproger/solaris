@@ -79,7 +79,12 @@ public interface ClientFacade {
 
     JsonObject interactEntity(int entityId, UUID entityUuid, String entityType, String hand) throws Exception;
 
-    JsonObject attackEntityOnce(int entityId, UUID entityUuid, String entityType) throws Exception;
+    JsonObject attackEntityOnce(
+        int entityId,
+        UUID entityUuid,
+        String entityType,
+        Duration timeout
+    ) throws Exception;
 
     JsonObject attackEntityUntilDropCollected(
         int entityId,

@@ -262,8 +262,15 @@ verification and keep ordinary survival play ahead of rare edge cases.
   client stayed connected for `27,490` exposed server ticks, broke and picked up
   a jungle log, survived save/rejoin, and saw natural passive/hostile spawns,
   but navigation timed out once, pickup confirmation initially lagged behind
-  the actual pickup, combat attempts did not damage the selected zombie, and
-  nine deaths prevented the wood-to-crafting loop from completing.
+  the actual pickup, and nine deaths prevented the wood-to-crafting loop from
+  completing. The apparent combat failure was a client-MCP observation race:
+  the server had already committed zombie health `20 -> 19`, while
+  `minecraft_attack_entity_once` returned before the applied entity update.
+  The tool now sends the look rotation first and waits on pushed client-state
+  events for damage or removal. A natural, non-operator zombie returned
+  `confirmed=true` with health `19 -> 18`; an attack from the death screen now
+  fails instead of reporting a false dispatch. Navigation and survival
+  decision quality remain open.
 - [x] Accumulate vanilla-style per-chunk `InhabitedTime` while players keep a
   chunk active. The tick owner uses vanilla's strict 128-block chunk-center
   range around non-spectator players, counts each spawning chunk once per game

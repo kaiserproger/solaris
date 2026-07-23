@@ -1257,6 +1257,47 @@ public final class MinecraftScenarioClient implements ScenarioClient {
         return waitForEntityRemoved(entityWaitSource(identity), timeout);
     }
 
+    public EntityAttackConfirmation waitForEntityAttackConfirmation(
+        ScenarioEntityIdentity identity,
+        Object expectedLevel,
+        float healthBefore,
+        Duration timeout
+    ) throws Exception {
+        return waitForEntityAttackConfirmation(
+            entityAttackWaitSource(identity),
+            expectedLevel,
+            healthBefore,
+            timeout
+        );
+    }
+
+    static EntityAttackConfirmation waitForEntityAttackConfirmation(
+        EntityAttackWaitSource source,
+        Object expectedLevel,
+        float healthBefore,
+        Duration timeout
+    ) throws Exception {
+        long deadlineNanos = System.nanoTime() + timeout.toNanos();
+        while (true) {
+            long observedVersion = source.stateVersion();
+            EntityAttackStateSnapshot snapshot = source.snapshot();
+            requireSameClientLevel(expectedLevel, snapshot.level());
+            if (!snapshot.present()) {
+                return new EntityAttackConfirmation(true, true, snapshot.health());
+            }
+            if (
+                Float.isFinite(healthBefore)
+                    && Float.isFinite(snapshot.health())
+                    && snapshot.health() < healthBefore
+            ) {
+                return new EntityAttackConfirmation(true, false, snapshot.health());
+            }
+            if (!source.awaitStateChange(observedVersion, deadlineNanos)) {
+                return new EntityAttackConfirmation(false, false, snapshot.health());
+            }
+        }
+    }
+
     static boolean waitForEntityRemoved(EntityWaitSource source, Duration timeout) throws Exception {
         Object expectedLevel = source.captureLevel();
         long deadlineNanos = System.nanoTime() + timeout.toNanos();
@@ -1286,6 +1327,47 @@ public final class MinecraftScenarioClient implements ScenarioClient {
                     Minecraft minecraft = requireInPlay();
                     EntityMotionSample motion = entityMotionSampleOnClientThread(identity);
                     return new EntityStateSnapshot(minecraft.level, motion, motion != null);
+                });
+            }
+
+            @Override
+            public long stateVersion() {
+                return ClientStateEvents.version();
+            }
+
+            @Override
+            public boolean awaitStateChange(long observedVersion, long deadlineNanos)
+                throws InterruptedException {
+                return awaitClientStateChange(observedVersion, deadlineNanos);
+            }
+        };
+    }
+
+    private EntityAttackWaitSource entityAttackWaitSource(ScenarioEntityIdentity identity) {
+        return new EntityAttackWaitSource() {
+            @Override
+            public EntityAttackStateSnapshot snapshot() throws Exception {
+                return executor.callOnClientThread(() -> {
+                    Minecraft minecraft = requireInPlay();
+                    Entity entity = minecraft.level.getEntity(identity.entityId());
+                    if (
+                        entity == null
+                            || !identity.matches(
+                                entity.getId(),
+                                entity.getUUID(),
+                                BuiltInRegistries.ENTITY_TYPE.getKey(entity.getType()).toString()
+                            )
+                    ) {
+                        return new EntityAttackStateSnapshot(
+                            minecraft.level,
+                            false,
+                            Float.NaN
+                        );
+                    }
+                    float health = entity instanceof net.minecraft.world.entity.LivingEntity living
+                        ? living.getHealth()
+                        : Float.NaN;
+                    return new EntityAttackStateSnapshot(minecraft.level, true, health);
                 });
             }
 
@@ -4425,6 +4507,15 @@ public final class MinecraftScenarioClient implements ScenarioClient {
             throws InterruptedException;
     }
 
+    interface EntityAttackWaitSource {
+        EntityAttackStateSnapshot snapshot() throws Exception;
+
+        long stateVersion();
+
+        boolean awaitStateChange(long observedVersion, long deadlineNanos)
+            throws InterruptedException;
+    }
+
     interface RespawnWaitSource {
         long healthVersion();
 
@@ -4445,6 +4536,12 @@ public final class MinecraftScenarioClient implements ScenarioClient {
     }
 
     record EntityStateSnapshot(Object level, EntityMotionSample motion, boolean present) {
+    }
+
+    record EntityAttackStateSnapshot(Object level, boolean present, float health) {
+    }
+
+    record EntityAttackConfirmation(boolean confirmed, boolean removed, float healthAfter) {
     }
 
     record EntityMotionSample(

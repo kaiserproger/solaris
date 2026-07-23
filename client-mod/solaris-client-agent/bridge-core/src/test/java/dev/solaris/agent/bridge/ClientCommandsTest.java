@@ -615,12 +615,13 @@ final class ClientCommandsTest {
         JsonObject attackOnceResult = attackOnce.execute(request(
             "attack_entity_once",
             "{\"entity_id\":42,\"entity_uuid\":\"" + entityUuid
-                + "\",\"entity_type\":\"minecraft:zombie\"}"
+                + "\",\"entity_type\":\"minecraft:zombie\",\"timeout_seconds\":5.0}"
         ));
         assertTrue(attackOnceResult.get("dispatched").getAsBoolean());
         assertEquals(42, client.attackedOnceEntityId);
         assertEquals(entityUuid, client.attackedOnceEntityUuid);
         assertEquals("minecraft:zombie", client.attackedOnceEntityType);
+        assertEquals(Duration.ofSeconds(5), client.attackOnceTimeout);
 
         JsonObject attackResult = attack.execute(request(
             "attack_entity_until_drop_collected",
@@ -1154,6 +1155,7 @@ final class ClientCommandsTest {
         int attackedOnceEntityId;
         UUID attackedOnceEntityUuid;
         String attackedOnceEntityType;
+        Duration attackOnceTimeout;
         String expectedDropItemId;
         int expectedDropCount;
         Duration attackEntityTimeout;
@@ -1345,10 +1347,16 @@ final class ClientCommandsTest {
         }
 
         @Override
-        public JsonObject attackEntityOnce(int entityId, UUID entityUuid, String entityType) {
+        public JsonObject attackEntityOnce(
+            int entityId,
+            UUID entityUuid,
+            String entityType,
+            Duration timeout
+        ) {
             attackedOnceEntityId = entityId;
             attackedOnceEntityUuid = entityUuid;
             attackedOnceEntityType = entityType;
+            attackOnceTimeout = timeout;
             JsonObject result = new JsonObject();
             result.addProperty("dispatched", true);
             return result;

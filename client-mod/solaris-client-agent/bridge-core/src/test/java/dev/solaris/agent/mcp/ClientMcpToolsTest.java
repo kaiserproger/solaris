@@ -217,6 +217,18 @@ final class ClientMcpToolsTest {
         assertEquals(Integer.MAX_VALUE, approach.get("entity_id").getAsJsonObject().get("maximum").getAsInt());
         assertEquals(120.0, approach.get("timeout_seconds").getAsJsonObject().get("maximum").getAsDouble());
         assertEquals(36, interact.get("entity_uuid").getAsJsonObject().get("maxLength").getAsInt());
+        JsonObject attackOnce = properties(find(
+            ClientMcpTools.definitions(),
+            "minecraft_attack_entity_once"
+        ));
+        assertEquals(
+            120.0,
+            attackOnce.get("timeout_seconds").getAsJsonObject().get("maximum").getAsDouble()
+        );
+        assertEquals(
+            8.0,
+            attackOnce.get("timeout_seconds").getAsJsonObject().get("default").getAsDouble()
+        );
         assertEquals(
             List.of("main_hand", "off_hand"),
             interact.get("hand").getAsJsonObject().getAsJsonArray("enum")

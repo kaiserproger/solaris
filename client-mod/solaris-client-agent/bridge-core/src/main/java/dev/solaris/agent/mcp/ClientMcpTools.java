@@ -201,9 +201,9 @@ public final class ClientMcpTools {
         ),
         mutating(
             "minecraft_attack_entity_once",
-            "Dispatch one ordinary vanilla attack against a UUID- and type-fenced visible entity.",
+            "Dispatch one ordinary vanilla attack and wait for authoritative damage or removal.",
             "attack_entity_once",
-            entityIdentitySchema()
+            entityAttackOnceSchema()
         ),
         mutating(
             "minecraft_attack_entity_until_drop_collected",
@@ -606,6 +606,18 @@ public final class ClientMcpTools {
                 "entity_id", integer(0, Integer.MAX_VALUE),
                 "entity_uuid", string(36),
                 "entity_type", string(128)
+            ),
+            List.of("entity_id", "entity_uuid", "entity_type")
+        );
+    }
+
+    private static JsonObject entityAttackOnceSchema() {
+        return objectSchema(
+            properties(
+                "entity_id", integer(0, Integer.MAX_VALUE),
+                "entity_uuid", string(36),
+                "entity_type", string(128),
+                "timeout_seconds", number(0.1, 120.0, 8.0)
             ),
             List.of("entity_id", "entity_uuid", "entity_type")
         );

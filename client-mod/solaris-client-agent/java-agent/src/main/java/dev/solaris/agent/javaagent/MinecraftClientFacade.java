@@ -551,9 +551,15 @@ public final class MinecraftClientFacade implements ClientFacade {
     }
 
     @Override
-    public JsonObject attackEntityOnce(int entityId, UUID entityUuid, String entityType)
+    public JsonObject attackEntityOnce(
+        int entityId,
+        UUID entityUuid,
+        String entityType,
+        Duration timeout
+    )
         throws Exception {
-        return new MinecraftClientExecutor().callOnClientThread(() -> {
+        MinecraftClientExecutor executor = new MinecraftClientExecutor();
+        EntityAttackDispatch dispatched = executor.callOnClientThread(() -> {
             Minecraft minecraft = requireInPlay();
             var entity = minecraft.level.getEntity(entityId);
             if (entity == null) {
@@ -566,20 +572,55 @@ public final class MinecraftClientFacade implements ClientFacade {
             minecraft.player.lookAt(EntityAnchorArgument.Anchor.EYES, entity.getBoundingBox().getCenter());
             float healthBefore = entity instanceof LivingEntity living ? living.getHealth() : -1.0F;
             float attackStrengthBefore = minecraft.player.getAttackStrengthScale(0.0F);
+            minecraft.getConnection().send(
+                new ServerboundMovePlayerPacket.Rot(
+                    minecraft.player.getYRot(),
+                    minecraft.player.getXRot(),
+                    minecraft.player.onGround(),
+                    minecraft.player.horizontalCollision
+                )
+            );
             minecraft.gameMode.attack(minecraft.player, entity);
             minecraft.player.swing(InteractionHand.MAIN_HAND);
-
-            JsonObject result = new JsonObject();
-            result.addProperty("entity_id", entityId);
-            result.addProperty("entity_uuid", entityUuid.toString());
-            result.addProperty("entity_type", entityType);
-            result.addProperty("dispatched", true);
-            if (healthBefore >= 0.0F) {
-                result.addProperty("health_before", healthBefore);
-            }
-            result.addProperty("attack_strength_before", attackStrengthBefore);
-            return result;
+            return new EntityAttackDispatch(
+                minecraft.level,
+                healthBefore,
+                attackStrengthBefore
+            );
         });
+
+        MinecraftScenarioClient.EntityAttackConfirmation confirmation =
+            new MinecraftScenarioClient(executor).waitForEntityAttackConfirmation(
+                new ScenarioEntityIdentity(entityId, entityUuid, entityType),
+                dispatched.level(),
+                dispatched.healthBefore(),
+                timeout
+            );
+        if (!confirmation.confirmed()) {
+            throw new TimeoutException(
+                "attack was not confirmed by entity damage or removal id=" + entityId
+            );
+        }
+
+        JsonObject result = entityIdentity(entityId, entityUuid, entityType);
+        result.addProperty("dispatched", true);
+        result.addProperty("confirmed", true);
+        result.addProperty("removed", confirmation.removed());
+        if (dispatched.healthBefore() >= 0.0F) {
+            result.addProperty("health_before", dispatched.healthBefore());
+        }
+        if (Float.isFinite(confirmation.healthAfter())) {
+            result.addProperty("health_after", confirmation.healthAfter());
+        }
+        result.addProperty("attack_strength_before", dispatched.attackStrengthBefore());
+        return result;
+    }
+
+    private record EntityAttackDispatch(
+        Object level,
+        float healthBefore,
+        float attackStrengthBefore
+    ) {
     }
 
     @Override

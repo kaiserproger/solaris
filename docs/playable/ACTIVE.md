@@ -81,6 +81,16 @@ hardening. An already-open lower-priority diff does not override this order.
 
 ## Recent Evidence
 
+- The autonomous survival run's apparent natural-zombie combat failure was in
+  the MCP observation boundary, not server combat. The server log had committed
+  health `20 -> 19`, but `minecraft_attack_entity_once` returned before the
+  client applied the entity update. The tool now sends the player's exact
+  rotation before the attack and waits on applied-state notifications for
+  target damage or removal, with UUID/type and client-level fences. A fresh
+  26.1.2 client attacked the same naturally spawned zombie without operator
+  setup and returned `confirmed=true`, health `19 -> 18`. The dead-player path
+  timed out as an error instead of producing a false success.
+
 - Worldgen revision 8 passed an agent-run MCP route with a fresh 26.1.2 client,
   seed `918273645`, and `tellus_like` mode over forest, coast, ocean, and the
   representative high-relief range around `(-78080, -28928)`. The first route

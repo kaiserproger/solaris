@@ -12,6 +12,7 @@ import java.util.concurrent.atomic.AtomicInteger;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
+import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
 final class MinecraftScenarioClientTest {
@@ -383,6 +384,71 @@ final class MinecraftScenarioClientTest {
     }
 
     @Test
+    void entityAttackWaitConfirmsOnlyAppliedDamageOrRemoval() throws Exception {
+        Object level = new Object();
+        EntityAttackWaitProbe damage = new EntityAttackWaitProbe(
+            new MinecraftScenarioClient.EntityAttackStateSnapshot(level, true, 20.0F),
+            new MinecraftScenarioClient.EntityAttackStateSnapshot(level, true, 19.0F)
+        );
+
+        var damaged = MinecraftScenarioClient.waitForEntityAttackConfirmation(
+            damage,
+            level,
+            20.0F,
+            Duration.ofSeconds(1)
+        );
+        assertTrue(damaged.confirmed());
+        assertFalse(damaged.removed());
+        assertEquals(19.0F, damaged.healthAfter());
+
+        EntityAttackWaitProbe timeout = new EntityAttackWaitProbe(
+            new MinecraftScenarioClient.EntityAttackStateSnapshot(level, true, 20.0F)
+        );
+        var unconfirmed = MinecraftScenarioClient.waitForEntityAttackConfirmation(
+            timeout,
+            level,
+            20.0F,
+            Duration.ZERO
+        );
+        assertFalse(unconfirmed.confirmed());
+
+        EntityAttackWaitProbe removed = new EntityAttackWaitProbe(
+            new MinecraftScenarioClient.EntityAttackStateSnapshot(level, false, Float.NaN)
+        );
+        var removal = MinecraftScenarioClient.waitForEntityAttackConfirmation(
+            removed,
+            level,
+            20.0F,
+            Duration.ofSeconds(1)
+        );
+        assertTrue(removal.confirmed());
+        assertTrue(removal.removed());
+    }
+
+    @Test
+    void entityAttackWaitRejectsWorldTransitionAsRemoval() {
+        Object originalLevel = new Object();
+        EntityAttackWaitProbe transitioned = new EntityAttackWaitProbe(
+            new MinecraftScenarioClient.EntityAttackStateSnapshot(
+                new Object(),
+                false,
+                Float.NaN
+            )
+        );
+
+        IllegalStateException failure = assertThrows(
+            IllegalStateException.class,
+            () -> MinecraftScenarioClient.waitForEntityAttackConfirmation(
+                transitioned,
+                originalLevel,
+                20.0F,
+                Duration.ofSeconds(1)
+            )
+        );
+        assertTrue(failure.getMessage().contains("client level changed"));
+    }
+
+    @Test
     void entityAttackWaitsForVanillaCooldown() {
         assertFalse(AttackCadence.ready(0.89F));
         assertTrue(AttackCadence.ready(0.90F));
@@ -544,6 +610,39 @@ final class MinecraftScenarioClientTest {
         private void publishChange() {
             version += 1;
             changed.countDown();
+        }
+    }
+
+    private static final class EntityAttackWaitProbe
+        implements MinecraftScenarioClient.EntityAttackWaitSource {
+        private final MinecraftScenarioClient.EntityAttackStateSnapshot[] samples;
+        private int index;
+        private long version;
+
+        private EntityAttackWaitProbe(
+            MinecraftScenarioClient.EntityAttackStateSnapshot... samples
+        ) {
+            this.samples = samples;
+        }
+
+        @Override
+        public MinecraftScenarioClient.EntityAttackStateSnapshot snapshot() {
+            return samples[index];
+        }
+
+        @Override
+        public long stateVersion() {
+            return version;
+        }
+
+        @Override
+        public boolean awaitStateChange(long observedVersion, long deadlineNanos) {
+            if (index + 1 >= samples.length || deadlineNanos <= System.nanoTime()) {
+                return false;
+            }
+            index += 1;
+            version += 1;
+            return true;
         }
     }
 
