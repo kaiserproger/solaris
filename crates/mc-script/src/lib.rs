@@ -556,6 +556,32 @@ impl fmt::Display for ScriptDtoError {
 
 impl std::error::Error for ScriptDtoError {}
 
+/// Generic actor policy attached to a protected zone by its owning plugin.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ScriptZoneProtection {
+    allowed_actor_uuid: String,
+}
+
+impl ScriptZoneProtection {
+    pub fn try_actor_or_operator(
+        allowed_actor_uuid: impl AsRef<str>,
+    ) -> Result<Self, ScriptDtoError> {
+        Ok(Self {
+            allowed_actor_uuid: normalize_player_uuid(allowed_actor_uuid.as_ref())?,
+        })
+    }
+
+    pub fn allowed_actor_uuid(&self) -> &str {
+        &self.allowed_actor_uuid
+    }
+
+    pub fn allows_actor(&self, actor_uuid: &str, operator: bool) -> bool {
+        operator
+            || normalize_player_uuid(actor_uuid)
+                .is_ok_and(|actor_uuid| actor_uuid == self.allowed_actor_uuid)
+    }
+}
+
 /// A bounded axis-aligned zone definition. The server owns its lifecycle and membership checks.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ScriptAxisAlignedZone {
@@ -563,6 +589,7 @@ pub struct ScriptAxisAlignedZone {
     dimension: String,
     minimum: ScriptPosition,
     maximum: ScriptPosition,
+    protection: Option<ScriptZoneProtection>,
 }
 
 impl ScriptAxisAlignedZone {
@@ -572,6 +599,16 @@ impl ScriptAxisAlignedZone {
         minimum: ScriptPosition,
         maximum: ScriptPosition,
     ) -> Result<Self, ScriptDtoError> {
+        Self::try_new_with_protection(id, dimension, minimum, maximum, None)
+    }
+
+    pub fn try_new_with_protection(
+        id: impl AsRef<str>,
+        dimension: impl AsRef<str>,
+        minimum: ScriptPosition,
+        maximum: ScriptPosition,
+        protection: Option<ScriptZoneProtection>,
+    ) -> Result<Self, ScriptDtoError> {
         if minimum.x() > maximum.x() || minimum.y() > maximum.y() || minimum.z() > maximum.z() {
             return Err(ScriptDtoError::InvalidBounds);
         }
@@ -580,6 +617,7 @@ impl ScriptAxisAlignedZone {
             dimension: validate_contract_resource_id(dimension.as_ref())?,
             minimum,
             maximum,
+            protection,
         })
     }
 
@@ -597,6 +635,10 @@ impl ScriptAxisAlignedZone {
 
     pub fn maximum(&self) -> ScriptPosition {
         self.maximum
+    }
+
+    pub fn protection(&self) -> Option<&ScriptZoneProtection> {
+        self.protection.as_ref()
     }
 }
 
@@ -3011,11 +3053,12 @@ impl ScriptCommand {
                 ScriptInventoryMenu::try_new(menu.id(), menu.title(), menu.slots().to_vec())
                     .map(drop)
             }
-            Self::UpsertZone { zone } => ScriptAxisAlignedZone::try_new(
+            Self::UpsertZone { zone } => ScriptAxisAlignedZone::try_new_with_protection(
                 zone.id(),
                 zone.dimension(),
                 zone.minimum(),
                 zone.maximum(),
+                zone.protection().cloned(),
             )
             .map(drop),
             Self::PluginStorageGet { request } => {
@@ -5111,6 +5154,22 @@ fn validate_player_identity(uuid: &str, username: &str) -> Result<(), ScriptDtoE
     Ok(())
 }
 
+fn normalize_player_uuid(uuid: &str) -> Result<String, ScriptDtoError> {
+    let normalized = uuid
+        .bytes()
+        .filter(|byte| *byte != b'-')
+        .map(char::from)
+        .collect::<String>()
+        .to_ascii_lowercase();
+    if normalized.len() != 32 || !normalized.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+        return Err(ScriptDtoError::InvalidId {
+            field: "protection actor uuid",
+            actual_bytes: uuid.len(),
+        });
+    }
+    Ok(normalized)
+}
+
 fn validate_contract_resource_id(value: &str) -> Result<String, ScriptDtoError> {
     if value.len() > MAX_SCRIPT_RESOURCE_ID_BYTES {
         return Err(ScriptDtoError::ValueTooLong {
@@ -6726,6 +6785,27 @@ mod tests {
                 MAX_VILLAGER_BINDING_RADIUS + 1.0,
             ),
             Err(ScriptDtoError::InvalidBounds)
+        ));
+    }
+
+    #[test]
+    fn zone_protection_is_explicit_normalized_and_plugin_agnostic() {
+        let protection =
+            ScriptZoneProtection::try_actor_or_operator("12345678-1234-5678-1234-567812345678")
+                .unwrap();
+        assert_eq!(
+            protection.allowed_actor_uuid(),
+            "12345678123456781234567812345678"
+        );
+        assert!(protection.allows_actor("12345678123456781234567812345678", false));
+        assert!(protection.allows_actor("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", true));
+        assert!(!protection.allows_actor("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", false));
+        assert!(matches!(
+            ScriptZoneProtection::try_actor_or_operator("claim-owner"),
+            Err(ScriptDtoError::InvalidId {
+                field: "protection actor uuid",
+                ..
+            })
         ));
     }
 

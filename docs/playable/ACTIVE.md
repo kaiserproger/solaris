@@ -450,11 +450,17 @@ hardening. An already-open lower-priority diff does not override this order.
   bucket placement, double-container access, living-entity interaction at the
   authoritative target position, and explosion block damage. Every
   chest/furnace click rechecks its backing positions. Explosion planning uses
-  one immutable claim snapshot only after an explosion becomes due and before
+  one immutable generic protection snapshot only after an explosion becomes due and before
   the world lock, not one zone lock per candidate or one clone per idle tick.
   The production wire gate proves foreign break, placement, and filled-bucket
   placement leave the claimed world unchanged. Fire spread and piston movement
   are not implemented yet, so the owner item remains open.
+
+- Land-claim semantics are no longer embedded in Rust. The generic
+  `solaris.upsert_protected_zone` API carries an actor-or-operator policy in the
+  typed zone DTO; the zone adapter does not match plugin ids or parse zone ids.
+  `examples/plugins/land-claims/main.lua` owns claim identity, persistence,
+  registration, removal, and rollback.
 
 - Mob death completion no longer scans every server entity every tick. Lethal
   melee, projectile/effect damage, test ingress, and persisted restore enqueue

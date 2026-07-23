@@ -78,11 +78,13 @@ and is not startup context.
   positions, and explosion block candidates in addition to direct break/place.
   Every chest/furnace click rechecks the backing positions. Player actions keep
   the bounded authoritative actor check. Explosion planning clones one
-  immutable claim snapshot only when an explosion is due and before the world
+  immutable generic protection snapshot only when an explosion is due and before the world
   lock, so idle ticks do not copy zones and the candidate loop takes no zone
   mutex. Fire spread and piston movement remain absent mechanics, and the
-  temporary plugin-id/zone-id convention still needs the explicit published
-  policy index described by ADR 0009.
+  bounded actor lookup still needs the published policy index described by ADR
+  0009. Rust contains no `land-claims` plugin-id or zone-id convention:
+  `solaris.upsert_protected_zone` carries a typed actor-or-operator policy, and
+  the Lua plugin owns claim identity, persistence, and lifecycle.
 - The agent-run real-client hostile-combat functional gate is closed on an
   isolated O3 server. Ordinary 26.1.2 client actions selected an iron sword,
   killed a zombie, observed and collected its rotten-flesh drop, observed a
@@ -311,6 +313,15 @@ two priorities unless it becomes a common-play blocker or corruption risk.
   Markdown/instruction-only work gets static/path/diff checks, not Cargo tests.
 - Self-check every completed task and use exactly one independent read-only
   reviewer. Extra workers require an explicit owner request.
+- Keep a checkpoint within 8 soft and 12 hard model roundtrips, six shell
+  batches, one stateless subagent, one L2 run, and zero compactions. Continue
+  the next checkpoint in a fresh session from a compact cursor.
+- Never use a full-history subagent fork. Give the reviewer or worker only its
+  bounded task, base commit, owned paths, acceptance checks, and relevant
+  evidence, then close it after its single result.
+- Batch independent calls. Treat repeated one-tool model rounds, broad
+  truncated discovery, progress polling, and L2 before a commit candidate as
+  workflow failures rather than normal execution.
 - Runtime event delivery, hard counters/fresh continuations, validation cache,
   compact subagent results, and conditional completion/blocked audits remain
   external Codex work described in `docs/GOAL_WRAPPER_V2.md`; repo prose must

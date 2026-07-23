@@ -483,23 +483,24 @@ Other accepted concrete boundaries in this staged migration are:
   entity or registry handles. Accepted mixed transitions publish deterministic
   exits before entries; rejected movement and cleanup cannot publish membership
   events.
-- `script::zone` also owns the temporary shipped land-claim lookup. Only the
-  exact `land-claims` plugin and its documented owner-UUID zone-id convention
-  have protection semantics. `play::block_break`,
-  `play::use_item_on_adapter`, chest opening, and entity interaction call that
-  lookup before authoritative player mutation and resynchronize denied block
-  actions; they do not parse plugin ids or claim ownership themselves. The
+- `script::zone` owns the generic typed zone-protection index. A Lua plugin
+  explicitly attaches an actor-or-operator policy through
+  `solaris.upsert_protected_zone`; ordinary zones remain membership-only.
+  Neither `mc-net` nor `mc-script` matches a plugin id or interprets a zone id.
+  `play::block_break`, `play::use_item_on_adapter`, chest opening, and entity
+  interaction call the generic lookup before authoritative player mutation and
+  resynchronize denied block actions. The
   registry lock is held only for the bounded actor lookup, which is the
   linearization point for an admitted player action; a claim command ordered
   afterward cannot retroactively cancel that in-flight action. Open
   chest/furnace windows repeat that admission at each click. Explosion planning
-  clones one immutable claim-only snapshot after claiming due explosions and
+  clones one immutable protection-only snapshot after claiming due explosions and
   before taking the world lock, then performs candidate checks without the zone
   mutex or idle-tick cloning. Zone commands
   publish a targeted accepted/rejected result so durable claim storage can roll
-  back an unapplied registry change. This bridge must be deleted when the
-  script zone DTO gains an explicit protection policy and the actor path moves
-  to the versioned published policy index required by ADR 0009.
+  back an unapplied registry change. Moving the bounded actor path from the
+  registry mutex to the versioned published policy index remains the next
+  implementation stage from ADR 0009.
 - The `mc-script` Lua loader owns optional per-plugin `config.toml` discovery,
   bounded parsing, recursive type/shape validation, and the immutable startup
   snapshot exposed by `solaris.config()`. Each call materializes a fresh Lua

@@ -1131,12 +1131,12 @@ impl BoundServer {
                                 entity_pathing_materials.as_deref(),
                                 || {
                                     entity_script_zones.as_ref().map(|zones| {
-                                        zones.claim_protection_snapshot().unwrap_or_else(|error| {
+                                        zones.protection_snapshot().unwrap_or_else(|error| {
                                             warn!(
                                                 ?error,
-                                                "claim snapshot unavailable; denying explosion block damage"
+                                                "zone protection snapshot unavailable; denying explosion block damage"
                                             );
-                                            crate::script::ClaimProtectionSnapshot::unavailable()
+                                            crate::script::ZoneProtectionSnapshot::unavailable()
                                         })
                                     })
                                 },
@@ -1450,12 +1450,12 @@ impl BoundServer {
                             entity_pathing_materials.as_deref(),
                             || {
                                 entity_script_zones.as_ref().map(|zones| {
-                                    zones.claim_protection_snapshot().unwrap_or_else(|error| {
+                                    zones.protection_snapshot().unwrap_or_else(|error| {
                                         warn!(
                                             ?error,
-                                            "claim snapshot unavailable; denying explosion block damage"
+                                            "zone protection snapshot unavailable; denying explosion block damage"
                                         );
-                                        crate::script::ClaimProtectionSnapshot::unavailable()
+                                        crate::script::ZoneProtectionSnapshot::unavailable()
                                     })
                                 })
                             },

@@ -132,6 +132,8 @@ async fn shipped_basic_economy_and_land_claims_route_real_lua_commands() {
         ScriptCommand::UpsertZone { zone }
             if zone.id() == "claim-12345678123456781234567812345678-p0-p0"
                 && zone.dimension() == "minecraft:overworld"
+                && zone.protection().is_some_and(|policy|
+                    policy.allowed_actor_uuid() == "12345678123456781234567812345678")
     ));
     let (claim_target, claim_zone) = first.into_upsert_zone().expect("consume claim zone");
     boundary

@@ -2701,10 +2701,10 @@ impl SimulationOwner {
         block_facts: &BlockFactsTable,
         blocks: &BlockRegistry,
         materials: Option<&BlockMaterialIds>,
-        claim_protection: F,
+        zone_protection: F,
     ) -> usize
     where
-        F: FnOnce() -> Option<crate::script::ClaimProtectionSnapshot>,
+        F: FnOnce() -> Option<crate::script::ZoneProtectionSnapshot>,
     {
         let current_tick = sessions.simulation_tick();
         let expired_tnt = sessions.claim_due_primed_tnt(&self.authority, current_tick);
@@ -2720,7 +2720,7 @@ impl SimulationOwner {
             dispatch_visibility_commands(dispatches);
             return expired;
         }
-        let claim_protection = claim_protection();
+        let zone_protection = zone_protection();
 
         let entity_targets = expired_tnt
             .iter()
@@ -2772,7 +2772,7 @@ impl SimulationOwner {
                         };
                         Some(ExplosionBlockSample {
                             resistance,
-                            explodable: claim_protection.as_ref().is_none_or(|protection| {
+                            explodable: zone_protection.as_ref().is_none_or(|protection| {
                                 protection
                                     .ambient_block_mutation_allowed("minecraft:overworld", position)
                             }),
@@ -15607,7 +15607,7 @@ mod tests {
                     &block_facts,
                     &blocks,
                     Some(&materials),
-                    || panic!("claim snapshot must stay lazy without a due explosion"),
+                    || panic!("protection snapshot must stay lazy without a due explosion"),
                 )
                 .await,
             0
@@ -15617,7 +15617,7 @@ mod tests {
             Some(BlockStateId(5))
         );
         owner.advance_world_time(&sessions, 1);
-        let claim_protection = crate::script::ClaimProtectionSnapshot::from_zones(vec![
+        let zone_protection = crate::script::ZoneProtectionSnapshot::from_zones(vec![
             ScriptAxisAlignedZone::try_new(
                 "protected-test",
                 "minecraft:overworld",
@@ -15645,7 +15645,7 @@ mod tests {
                     &block_facts,
                     &blocks,
                     Some(&materials),
-                    || Some(claim_protection),
+                    || Some(zone_protection),
                 )
                 .await,
             1
@@ -15657,7 +15657,7 @@ mod tests {
         assert_eq!(
             world.lock().await.get_block(protected).unwrap(),
             Some(BlockStateId(6)),
-            "claim snapshot must remove protected blocks from explosion candidates"
+            "protection snapshot must remove protected blocks from explosion candidates"
         );
         let chained_fuses = sessions.primed_tnt_fuses_for_test();
         assert_eq!(chained_fuses.len(), 1);

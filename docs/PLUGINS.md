@@ -97,7 +97,7 @@ configuration skips only that plugin before it can claim command roots.
 | `inventory_menus` | `open_inventory_menu`, `close_inventory_menu` |
 | `inventory_storage_transactions` | `inventory_storage_transaction` |
 | `player_inventory` | `inventory_transaction` |
-| `zones` | `upsert_zone`, `remove_zone`, owned zone entry/exit events |
+| `zones` | `upsert_zone`, `upsert_protected_zone`, `remove_zone`, owned zone entry/exit events |
 | `colonies` | `upsert_colony`, `bind_nearest_villager`, `set_villager_order` |
 | `player_teleport` | `teleport_player` |
 | `player_queries` | `list_online_players` |
@@ -496,26 +496,34 @@ the owner or an operator. API `0.6.0` player command snapshots do not expose a
 dimension, so every command maps to the configured dimension; the shipped
 plugin is restricted to the current single-dimension runtime.
 
-The current server adapter recognizes only zones owned by plugin id
-`land-claims` whose ids follow
-`claim-<32 lowercase hex owner UUID>-<chunk-x id>-<chunk-z id>`. Before a player
-break or placement commits, the adapter allows the owner and operators and
-resynchronizes a denied client. Ordinary plugin zones retain membership-only
-semantics, including malformed claim-shaped ids. The plugin waits for the
-targeted zone result before reporting success and rolls its storage CAS back
-when the registry rejects the zone change. This convention is a documented temporary bridge: a future
-first-class protection policy in the zone command must replace the plugin-id
-special case and migrate this shipped plugin in the same change. Protection
-covers direct break/place, right-click block interactions including containers
-and buckets, living-entity interaction at the target position, and explosion
-block damage. Player actions use the authoritative actor check, and every
-chest/furnace click rechecks all backing block positions so a claim created
-after opening still denies mutation. Explosion planning takes one immutable
-claim snapshot after claiming due explosions and before the world lock; it does
-not copy zones on idle ticks or lock the registry per candidate block. Piston
-movement and fire spread are not implemented gameplay mutations yet; their
-future commit paths must consume the same ambient-protection snapshot before
-publication.
+Protection is a generic `zones` capability, not knowledge of this shipped
+plugin in the Rust server. Any plugin may register an actor-or-operator policy:
+
+```lua
+solaris.upsert_protected_zone(
+    "home", "minecraft:overworld", owner_uuid,
+    min_x, min_y, min_z, max_x, max_y, max_z
+)
+```
+
+The zone id is opaque and scoped to the calling plugin. `mc-script` validates
+and normalizes the allowed actor UUID into the typed zone DTO; `mc-net`
+evaluates only that policy. It never matches a plugin id or parses a zone id. Ordinary
+`solaris.upsert_zone(...)` zones remain membership-only. The claims plugin
+decides which chunks exist, who owns them, how they persist, and when their
+policies are inserted or removed. It waits for the targeted zone result before
+reporting success and rolls its storage CAS back when registration fails.
+
+Protection covers direct break/place, right-click block interactions including
+containers and buckets, living-entity interaction at the target position, and
+explosion block damage. Player actions use the authoritative actor check, and
+every chest/furnace click rechecks all backing block positions so a policy
+created after opening still denies mutation. Explosion planning takes one
+immutable generic zone-protection snapshot after claiming due explosions and
+before the world lock; it does not copy zones on idle ticks or lock the registry
+per candidate block. Piston movement and fire spread are not implemented
+gameplay mutations yet; their future commit paths must consume the same ambient
+protection snapshot before publication.
 
 Player teleports are same-dimension authoritative mutations:
 

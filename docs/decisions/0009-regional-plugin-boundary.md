@@ -48,6 +48,11 @@ holding a region tick. Their owner service publishes an immutable versioned
 policy index for local reads. Updating a rule changes that publication; normal
 block admission remains local to the region.
 
+Plugins register those rules through generic typed policy commands. The current
+actor-or-operator zone policy carries an opaque plugin-scoped zone id, bounds,
+and one normalized allowed actor UUID. Core routing never matches a plugin id or parses an
+id convention; the plugin owns claim meaning and persistence.
+
 If an uncommon custom decision later needs synchronous-looking admission, its
 adapter may suspend only the initiating action while the host processes it.
 The region must continue ticking and may resume the action only from an exact
@@ -87,9 +92,11 @@ default and cannot weaken per-plugin FIFO ordering.
 
 `mc-script` already provides isolated Lua states multiplexed by one serial host
 thread, bounded immutable DTOs, capability-gated command batches, targeted
-result events, and instruction and memory limits. `mc-net` already has
-production adapters for storage, zones, menus, player inventory transactions,
-teleports, colonies, and villager bindings. There is no general coroutine wait
-API or custom-action suspension adapter. This ADR fixes the architectural
-direction; it does not claim that every gameplay transaction or published
-policy index is complete.
+result events, instruction and memory limits, and generic typed protected
+zones. `mc-net` already has production adapters for storage, zones, menus,
+player inventory transactions, teleports, colonies, and villager bindings. The
+actor protection path still reads the bounded registry mutex; explosion
+planning uses an immutable snapshot. There is no general coroutine wait API,
+custom-action suspension adapter, or published versioned actor-policy index.
+This ADR fixes the architectural direction; it does not claim that every
+gameplay transaction or publication stage is complete.

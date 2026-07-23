@@ -18,6 +18,18 @@ Use this note after compaction, interruption, retry, or a long unattended run.
 7. Self-review, then request exactly one independent read-only second opinion.
 8. Commit only owned files when the owner has authorized commits.
 
+Keep one checkpoint within 8 soft and 12 hard model roundtrips, six shell
+batches, one stateless subagent, one L2 run, and zero compactions. Close or
+snapshot before crossing those limits, then start a fresh session from a
+compact cursor. Never fork the long parent conversation into a subagent: pass
+only its bounded task, base commit, owned paths, acceptance checks, and relevant
+evidence. Close completed agents immediately.
+
+One-tool-per-model-round is a failure mode when calls are independent. Batch
+bounded discovery, edits, and focused validation. Do not run L2 until the tree
+is a commit candidate. Launch long work once and consume one completion event;
+do not create model rounds from progress polling.
+
 Before a planned reboot, stop active processes and agents, classify every
 active slice as committed, complete-but-unverified, or partial, and write an
 ignored continuation checkpoint with the exact next command. After restart,

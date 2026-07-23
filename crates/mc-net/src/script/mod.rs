@@ -23,4 +23,4 @@ mod zone_tests;
 pub(crate) use router::{ScriptRouter, ScriptRouterExit};
 pub(crate) use storage::PluginStorageHandle;
 pub use storage::PluginStorageStartError;
-pub(crate) use zone::{ClaimProtectionSnapshot, PluginZoneAdapter};
+pub(crate) use zone::{PluginZoneAdapter, ZoneProtectionSnapshot};

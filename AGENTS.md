@@ -64,18 +64,24 @@ validation command twice for the same working-tree fingerprint.
 Default checkpoint budget unless the wrapper supplies another value:
 
 ```yaml
-model_roundtrips_soft: 80
-model_roundtrips_hard: 120
-shell_batches: 24
-subagents: 2
+model_roundtrips_soft: 8
+model_roundtrips_hard: 12
+shell_batches: 6
+subagents: 1
 l2_validation_runs: 1
-context_compactions: 1
+context_compactions: 0
 ```
 
 At the hard budget, stop expanding scope. Record evidence and a precise resume
 cursor, close the checkpoint as `complete`, `partial`, or `checkpoint-blocked`,
 and let runtime start a fresh continuation. These checkpoint states do not
 complete or block the persistent `/goal`.
+
+Do not carry a completed checkpoint into another compaction. Start the next
+checkpoint in a fresh session with a compact cursor containing only the
+request, route, base tree, owned changed files, evidence, and one next action.
+If inherited history already spans multiple checkpoints, close or snapshot the
+current checkpoint before more discovery.
 
 ## Discovery Contract
 
@@ -140,6 +146,11 @@ Use subagents only when owner/runtime authorizes delegation. At most two may run
 concurrently, with disjoint responsibilities and write sets. Do not delegate
 the immediate blocker and then wait for it. Prefer `sol` medium/high or `luna`
 xhigh; do not use `terra`.
+
+Never fork the full parent conversation into a subagent. Spawn it without
+history and pass a bounded task, base commit, owned paths, and required
+evidence. A reviewer needs the diff and acceptance contract, not the parent
+transcript. Close completed agents immediately.
 
 One agent returns one compact result per revision:
 

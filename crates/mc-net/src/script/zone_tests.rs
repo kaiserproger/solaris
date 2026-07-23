@@ -77,12 +77,12 @@ fn context(x: f64, y: f64, z: f64) -> ScriptPlayerContext {
 }
 
 #[tokio::test]
-async fn shipped_land_claim_zone_blocks_strangers_but_not_owner_or_operator() {
+async fn protected_zone_policy_blocks_strangers_but_not_owner_or_operator() {
     let owner_uuid = "12345678123456781234567812345678";
     let mut commands = admitted_zone_commands(
-        "land-claims",
+        "protection-test",
         &format!(
-            "    solaris.upsert_zone(\"claim-{owner_uuid}-p0-p0\", \"minecraft:overworld\", 0, -64, 0, 15, 319, 15)"
+            "    solaris.upsert_protected_zone(\"owned-area\", \"minecraft:overworld\", \"{owner_uuid}\", 0, -64, 0, 15, 319, 15)"
         ),
         1,
     )
@@ -132,7 +132,7 @@ async fn shipped_land_claim_zone_blocks_strangers_but_not_owner_or_operator() {
         Ok(true)
     );
 
-    let snapshot = adapter.claim_protection_snapshot().unwrap();
+    let snapshot = adapter.protection_snapshot().unwrap();
     assert!(!snapshot.ambient_block_mutation_allowed("minecraft:overworld", claimed));
     assert!(snapshot.ambient_block_mutation_allowed("minecraft:overworld", outside));
     assert!(snapshot.ambient_block_mutation_allowed("minecraft:the_nether", claimed));
@@ -162,7 +162,7 @@ async fn ordinary_plugin_zones_never_protect_blocks() {
     );
     assert!(
         adapter
-            .claim_protection_snapshot()
+            .protection_snapshot()
             .unwrap()
             .ambient_block_mutation_allowed(
                 "minecraft:overworld",
@@ -172,12 +172,12 @@ async fn ordinary_plugin_zones_never_protect_blocks() {
 }
 
 #[tokio::test]
-async fn malformed_shipped_claim_zone_does_not_enable_protection() {
+async fn plugin_names_and_zone_ids_do_not_enable_protection() {
     let owner_uuid = "12345678123456781234567812345678";
     let mut commands = admitted_zone_commands(
-        "land-claims",
+        "well-known-plugin",
         &format!(
-            "    solaris.upsert_zone(\"claim-{owner_uuid}-p0\", \"minecraft:overworld\", 0, -64, 0, 15, 319, 15)"
+            "    solaris.upsert_zone(\"claim-{owner_uuid}-p0-p0\", \"minecraft:overworld\", 0, -64, 0, 15, 319, 15)"
         ),
         1,
     )
@@ -198,7 +198,7 @@ async fn malformed_shipped_claim_zone_does_not_enable_protection() {
     );
     assert!(
         adapter
-            .claim_protection_snapshot()
+            .protection_snapshot()
             .unwrap()
             .ambient_block_mutation_allowed(
                 "minecraft:overworld",

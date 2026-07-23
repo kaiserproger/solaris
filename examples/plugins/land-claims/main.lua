@@ -45,9 +45,10 @@ local function zone_id(claim)
 end
 
 local function register_claim(claim)
-    solaris.upsert_zone(
+    solaris.upsert_protected_zone(
         zone_id(claim),
         config.dimension,
+        claim.owner,
         claim.x * 16,
         config.minimum_y,
         claim.z * 16,

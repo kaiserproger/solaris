@@ -28,7 +28,8 @@ use crate::{
     ScriptPluginManifest, ScriptPluginStorageCompareAndSwapRequest,
     ScriptPluginStorageDeleteRequest, ScriptPluginStorageGetRequest, ScriptPosition, ScriptRuntime,
     ScriptStorageMutation, ScriptVillagerBindingRequest, ScriptVillagerOrder,
-    ScriptVillagerOrderRequest, ValidatedScriptPluginManifest, script_boundary_pair,
+    ScriptVillagerOrderRequest, ScriptZoneProtection, ValidatedScriptPluginManifest,
+    script_boundary_pair,
 };
 
 const EVENT_QUEUE_CAPACITY: usize = 1_024;
@@ -1334,6 +1335,66 @@ fn install_solaris_api(
                 let zone = ScriptAxisAlignedZone::try_new(&zone_id, &dimension, minimum, maximum)
                     .map_err(dto_error)?;
                 push_command(&upsert_zone_invocation, ScriptCommand::UpsertZone { zone })
+            },
+        )?,
+    )?;
+    let upsert_protected_zone_invocation = Arc::clone(&invocation);
+    api.set(
+        "upsert_protected_zone",
+        lua.create_function(
+            move |_,
+                  (
+                zone_id,
+                dimension,
+                allowed_actor_uuid,
+                min_x,
+                min_y,
+                min_z,
+                max_x,
+                max_y,
+                max_z,
+            ): (
+                LuaString,
+                LuaString,
+                LuaString,
+                f64,
+                f64,
+                f64,
+                f64,
+                f64,
+                f64,
+            )| {
+                let zone_id = bounded_script_id(zone_id, "zone_id")?;
+                let dimension = bounded_lua_string(
+                    dimension,
+                    "dimension",
+                    crate::MAX_SCRIPT_RESOURCE_ID_BYTES,
+                    false,
+                )?;
+                let allowed_actor_uuid = bounded_lua_string(
+                    allowed_actor_uuid,
+                    "allowed_actor_uuid",
+                    crate::MAX_SCRIPT_PLAYER_UUID_BYTES,
+                    false,
+                )?;
+                let minimum = ScriptPosition::try_new(min_x, min_y, min_z)
+                    .ok_or_else(|| lua_input_error("zone_minimum", "invalid"))?;
+                let maximum = ScriptPosition::try_new(max_x, max_y, max_z)
+                    .ok_or_else(|| lua_input_error("zone_maximum", "invalid"))?;
+                let protection = ScriptZoneProtection::try_actor_or_operator(allowed_actor_uuid)
+                    .map_err(dto_error)?;
+                let zone = ScriptAxisAlignedZone::try_new_with_protection(
+                    zone_id,
+                    dimension,
+                    minimum,
+                    maximum,
+                    Some(protection),
+                )
+                .map_err(dto_error)?;
+                push_command(
+                    &upsert_protected_zone_invocation,
+                    ScriptCommand::UpsertZone { zone },
+                )
             },
         )?,
     )?;
@@ -3233,6 +3294,11 @@ mod tests {
                 "upsert_zone.dimension",
                 "solaris.upsert_zone('shop', string.rep('x', 129), 0, 0, 0, 1, 1, 1)",
                 "dimension:too_long",
+            ),
+            (
+                "upsert_protected_zone.actor",
+                "solaris.upsert_protected_zone('claim', 'minecraft:overworld', 'not-a-uuid', 0, 0, 0, 1, 1, 1)",
+                "id:invalid",
             ),
             (
                 "remove_zone",

@@ -13,8 +13,6 @@ const MAX_ZONES: usize = 4_096;
 const MAX_ZONES_PER_PLUGIN: usize = 256;
 const MAX_TRACKED_PLAYERS: usize = 16_384;
 const MAX_ZONE_MEMBERSHIPS: usize = 262_144;
-const LAND_CLAIMS_PLUGIN_ID: &str = "land-claims";
-const LAND_CLAIM_ZONE_PREFIX: &str = "claim-";
 
 #[derive(Debug, Clone, Copy)]
 pub(super) struct ZoneLimits {
@@ -80,12 +78,12 @@ struct RegisteredZone {
 }
 
 #[derive(Debug, Clone, Default)]
-pub(crate) struct ClaimProtectionSnapshot {
+pub(crate) struct ZoneProtectionSnapshot {
     zones: Vec<ScriptAxisAlignedZone>,
     deny_all: bool,
 }
 
-impl ClaimProtectionSnapshot {
+impl ZoneProtectionSnapshot {
     #[cfg(test)]
     pub(crate) fn from_zones(zones: Vec<ScriptAxisAlignedZone>) -> Self {
         Self {
@@ -226,33 +224,21 @@ impl ZoneRegistry {
         dimension: &str,
         position: mc_world::BlockPos,
     ) -> bool {
-        if operator {
-            return true;
-        }
-        let actor_uuid = actor_uuid
-            .bytes()
-            .filter(|byte| *byte != b'-')
-            .map(char::from)
-            .collect::<String>()
-            .to_ascii_lowercase();
         self.zones
-            .iter()
-            .filter(|(key, _)| key.plugin_id == LAND_CLAIMS_PLUGIN_ID)
-            .filter(|(_, registered)| zone_contains_block(&registered.zone, dimension, position))
-            .filter_map(|(key, _)| claim_owner_uuid(&key.zone_id))
-            .all(|owner| owner == actor_uuid)
+            .values()
+            .filter(|registered| zone_contains_block(&registered.zone, dimension, position))
+            .filter_map(|registered| registered.zone.protection())
+            .all(|protection| protection.allows_actor(actor_uuid, operator))
     }
 
-    fn claim_protection_snapshot(&self) -> ClaimProtectionSnapshot {
+    fn protection_snapshot(&self) -> ZoneProtectionSnapshot {
         let zones = self
             .zones
-            .iter()
-            .filter(|(key, _)| {
-                key.plugin_id == LAND_CLAIMS_PLUGIN_ID && claim_owner_uuid(&key.zone_id).is_some()
-            })
-            .map(|(_, registered)| registered.zone.clone())
+            .values()
+            .filter(|registered| registered.zone.protection().is_some())
+            .map(|registered| registered.zone.clone())
             .collect();
-        ClaimProtectionSnapshot {
+        ZoneProtectionSnapshot {
             zones,
             deny_all: false,
         }
@@ -517,14 +503,12 @@ impl PluginZoneAdapter {
             .block_mutation_allowed(actor_uuid, operator, dimension, position))
     }
 
-    pub(crate) fn claim_protection_snapshot(
-        &self,
-    ) -> Result<ClaimProtectionSnapshot, ZoneAdapterError> {
+    pub(crate) fn protection_snapshot(&self) -> Result<ZoneProtectionSnapshot, ZoneAdapterError> {
         Ok(self
             .registry
             .lock()
             .map_err(|_| ZoneAdapterError::StateUnavailable)?
-            .claim_protection_snapshot())
+            .protection_snapshot())
     }
 
     pub(crate) fn close(&self) -> Result<(), ZoneAdapterError> {
@@ -552,25 +536,4 @@ fn zone_contains_block(
         && f64::from(position.y) <= maximum.y()
         && f64::from(position.z) >= minimum.z()
         && f64::from(position.z) <= maximum.z()
-}
-
-fn claim_owner_uuid(zone_id: &str) -> Option<&str> {
-    let mut parts = zone_id.strip_prefix(LAND_CLAIM_ZONE_PREFIX)?.split('-');
-    let owner = parts.next()?;
-    let chunk_x = parts.next()?;
-    let chunk_z = parts.next()?;
-    let valid = parts.next().is_none()
-        && owner.len() == 32
-        && owner
-            .bytes()
-            .all(|byte| byte.is_ascii_digit() || matches!(byte, b'a'..=b'f'))
-        && valid_claim_coordinate_id(chunk_x)
-        && valid_claim_coordinate_id(chunk_z);
-    valid.then_some(owner)
-}
-
-fn valid_claim_coordinate_id(value: &str) -> bool {
-    matches!(value.as_bytes().first(), Some(b'p' | b'n'))
-        && value.len() > 1
-        && value.as_bytes()[1..].iter().all(u8::is_ascii_digit)
 }

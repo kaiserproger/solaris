@@ -249,11 +249,13 @@ verification and keep ordinary survival play ahead of rare edge cases.
   living-entity interaction is checked at the authoritative target position.
   Every chest/furnace click rechecks the backing positions, including windows
   opened before a claim was created. Explosion block planning consumes one
-  immutable claim snapshot only after due explosions are claimed and before
+  immutable generic protection snapshot only after due explosions are claimed and before
   taking the world lock, so idle ticks do not copy zones, protected blocks are
   not candidates, and no per-block zone mutex is added. Piston movement and
   fire spread have no implemented mutation path yet; keep this item open until
   those mechanics exist and consume the ambient protection snapshot.
+  Protection is plugin-authored through `solaris.upsert_protected_zone`; Rust
+  does not match `land-claims` or parse its zone ids.
 - [ ] Keep plugin APIs region-aware without exposing locks or requiring plugin
   authors to reason about worker ownership.
 - [ ] Prototype villages from extracted vanilla structure/template data, with
