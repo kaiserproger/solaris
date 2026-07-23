@@ -293,17 +293,18 @@ two priorities unless it becomes a common-play blocker or corruption risk.
   derived once; pushed measurements and bounded admissions drive allocation.
 - Serverbound protocol collections/strings/blobs have a complete bounded
   allocation audit, symmetric encode limits, and no-partial-output tests.
-- Production worldgen revision 8 consumes explicit `ChunkGeometry` for terrain,
+- Production worldgen revision 9 consumes explicit `ChunkGeometry` for terrain,
   ores, structures, and biomes. Separate landform and cave stages provide
   domain-warped continents, branching mountain ranges, substantially carved
   river-valley contours, and bounded tunnel caves behind a 32-block surface shell.
   Trees require exact planned support and a stable 5x5 footprint.
   Solaris worlds persist revision/seed/mode/ore-profile/geometry; unversioned
   Anvil worlds open without fallback generation and reject plugin worldgen
-  profiles. The playable profile uses `.analysis/test-world-v8`. Revision 8
+  profiles. The playable profile uses `.analysis/test-world-v9`. Revision 8
   adds visible anisotropic mountain detail, stronger long relief, elevation-
   aware mountain surfaces, and an explicit dry-spawn floor; the fresh-client
-  forest/coast/ocean/high-relief route is complete.
+  forest/coast/ocean/high-relief route is complete. Revision 9 removes filled
+  3x3 upper leaf boxes in favor of connected irregular oak/jungle crowns.
 - Lua API 0.6 has bounded DTO/files/batches, optional bounded startup-only TOML
   configuration with fresh Lua copies, push-driven bounded simulation timers,
   one-shot host admission, an attested `mc-net` router, and durable plugin

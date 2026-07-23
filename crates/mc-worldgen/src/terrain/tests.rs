@@ -2059,6 +2059,51 @@ fn generated_tree_canopies_narrow_above_the_main_crown() {
 }
 
 #[test]
+fn radius_one_tree_crowns_are_raised_and_irregular() {
+    let registry = tiny_registry();
+    let generator = TerrainGenerator::new(42, registry);
+    let plan = generator.plan_column(ChunkPos { x: 0, z: 0 }, 8, 8);
+    let trunk_top_y = plan.height + 5;
+
+    let layer = |kind, relative_y| {
+        (-1..=1)
+            .flat_map(|dx| (-1..=1).map(move |dz| (dx, dz)))
+            .filter(|(dx, dz)| {
+                generator.tree_leaf_is_present(
+                    &plan,
+                    kind,
+                    trunk_top_y,
+                    TreeLeafOffset {
+                        relative_y,
+                        dx: *dx,
+                        dz: *dz,
+                        radius: 1,
+                    },
+                )
+            })
+            .collect::<Vec<_>>()
+    };
+
+    assert_eq!(tree_canopy_radius(TreeKind::Oak, 0), Some(1));
+    let main = layer(TreeKind::Oak, 0);
+    assert_eq!(main.len(), 8, "main oak crown keeps three corners");
+
+    for kind in [TreeKind::Oak, TreeKind::Jungle] {
+        assert_eq!(tree_canopy_radius(kind, 1), Some(1));
+        let raised = layer(kind, 1);
+        assert_eq!(raised.len(), 6, "raised crown keeps one corner");
+        assert!(
+            raised.contains(&(0, 0))
+                && raised.contains(&(-1, 0))
+                && raised.contains(&(1, 0))
+                && raised.contains(&(0, -1))
+                && raised.contains(&(0, 1)),
+            "raised crown keeps a connected cross"
+        );
+    }
+}
+
+#[test]
 fn structures_precede_tree_and_single_plant_decoration() {
     let registry = tiny_registry();
     let seed = 42;

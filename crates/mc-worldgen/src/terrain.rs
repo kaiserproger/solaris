@@ -214,6 +214,14 @@ struct TreeBlocks {
     leaves: BlockStateId,
 }
 
+#[derive(Debug, Clone, Copy)]
+struct TreeLeafOffset {
+    relative_y: i32,
+    dx: i8,
+    dz: i8,
+    radius: i8,
+}
+
 fn tree_canopy_radius(kind: TreeKind, relative_y: i32) -> Option<i8> {
     match (kind, relative_y) {
         (TreeKind::Oak, -2 | -1) => Some(2),
@@ -1299,7 +1307,13 @@ impl TerrainGenerator {
             };
             for dz in -radius..=radius {
                 for dx in -radius..=radius {
-                    if !self.tree_leaf_is_present(plan, blocks.kind, y, dx, dz, radius) {
+                    let offset = TreeLeafOffset {
+                        relative_y,
+                        dx,
+                        dz,
+                        radius,
+                    };
+                    if !self.tree_leaf_is_present(plan, blocks.kind, trunk_top_y, offset) {
                         continue;
                     }
                     let x = lx.wrapping_add_signed(dx);
@@ -1347,18 +1361,43 @@ impl TerrainGenerator {
         &self,
         plan: &ColumnPlan,
         kind: TreeKind,
-        y: i32,
-        dx: i8,
-        dz: i8,
-        radius: i8,
+        trunk_top_y: i32,
+        offset: TreeLeafOffset,
     ) -> bool {
+        let TreeLeafOffset {
+            relative_y,
+            dx,
+            dz,
+            radius,
+        } = offset;
+        let y = trunk_top_y + relative_y;
         if radius == 0 {
             return dx == 0 && dz == 0;
         }
         let edge_x = dx.unsigned_abs() == radius as u8;
         let edge_z = dz.unsigned_abs() == radius as u8;
         if edge_x && edge_z {
-            return false;
+            if radius >= 2 {
+                return false;
+            }
+            let corner = match (dx.is_positive(), dz.is_positive()) {
+                (false, false) => 0,
+                (true, false) => 1,
+                (true, true) => 2,
+                (false, true) => 3,
+            };
+            let salt = match kind {
+                TreeKind::Oak => 0x0A4,
+                TreeKind::Birch => 0xB17C,
+                TreeKind::Spruce => 0x5A9C,
+                TreeKind::Jungle => 0xA6E1,
+            };
+            let rotation = feature_hash(self.seed, plan.wx, trunk_top_y, plan.wz, salt) as u8 & 3;
+            return if relative_y > 0 {
+                corner == rotation
+            } else {
+                corner != rotation
+            };
         }
         if radius < 2 || !(edge_x || edge_z) {
             return true;

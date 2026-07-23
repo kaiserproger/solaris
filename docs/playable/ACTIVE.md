@@ -255,8 +255,8 @@ hardening. An already-open lower-priority diff does not override this order.
   before world validation and is reused to start Lua later. The profile removes
   the vanilla ore rules and generates deterministic elongated deposits larger
   than 512 connected blocks across chunk boundaries. World contract schema 2
-  persists the profile under worldgen revision 8 and rejects a later profile
-  change; no declaration remains the vanilla default.
+  persists the profile under the current worldgen revision and rejects a later
+  profile change; no declaration remains the vanilla default.
 
 - Default ore generation now embeds 18 separate vanilla 26.1.2 placement passes
   instead of nine merged family approximations. It preserves raw height anchors
@@ -279,7 +279,7 @@ hardening. An already-open lower-priority diff does not override this order.
   collision oracle verifies every state of generated and growable plants is not
   a full cube, and the runtime sampler reproduces an exact partial pitcher-crop
   shape. This is measurable coherence/collision evidence; the bounded
-  Tellus/Tectonic visual gate is now closed by the revision-8 route above.
+  Tellus/Tectonic visual gate is now closed by the revision-9 route below.
 
 - A normal 26.1.2 client is now fenced from combat between respawn and its
   `ServerboundPlayerLoaded` acknowledgement, matching vanilla's load gate.
@@ -303,7 +303,7 @@ hardening. An already-open lower-priority diff does not override this order.
   or 401s, moved from z=0.598 to z=9.956, and remained in play at full health.
   The current-build 20-minute autonomous survival session remains pending.
 
-- Worldgen revision 8 keeps the revision-6 cave stage and revises landforms:
+- Worldgen revision 9 keeps the revision-6 cave stage and revision-8 landforms:
   domain-warped continents, shaped branching mountain ranges, and warped
   river-valley contours that become river biomes only after substantial carving.
   Tests cover a dry walkable 193x193 spawn window across a seed grid, full
@@ -311,10 +311,19 @@ hardening. An already-open lower-priority diff does not override this order.
   shells, exact tree support, spawn resources, extreme vertical geometry, and
   wire-level generated world use.
   Fresh Solaris worlds persist revision/seed/mode/ore-profile/geometry in
-  `solaris/world.json`; unversioned vanilla Anvil worlds open without Solaris
-  fallback generation, so terrain authorities cannot mix. `playable.toml` now
-  uses `.analysis/test-world-v8` with seed `0` and `tellus_like`; both that exact
-  profile and seed `918273645` received bounded fresh-client inspection.
+  `solaris/world.json`; revision 9 also replaces filled square upper leaf
+  layers with connected irregular oak/jungle crowns. Unversioned vanilla Anvil
+  worlds open without Solaris fallback generation, so terrain authorities
+  cannot mix. `playable.toml` now
+  uses `.analysis/test-world-v9` with seed `0` and `tellus_like`; the earlier
+  revision-8 profile and seed `918273645` received bounded fresh-client
+  inspection. A fresh revision-9 pass measured an isolated six-leaf raised
+  crown, 8.84% decorated columns in a 31x31 spawn sample, and empty collision
+  for 24 generated grass/flower samples. Existing exact-table gates cover all
+  states of seven sapling species, eight crop/stem families, both oak-door
+  planes, and the runtime torch/campfire pair. The separate seed-918273645 pass
+  rendered the long snow range at `(-78080,215,-28928)`; exact coordinates and
+  artifacts are recorded in the owner playtest queue.
 
 - Hostile melee now keeps a zero-speed target-facing goal while in reach, so a
   stationary zombie stops without freezing its body/head rotation and publishes

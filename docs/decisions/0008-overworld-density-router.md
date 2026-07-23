@@ -1,7 +1,7 @@
 # ADR 0008 - Overworld generation pipeline
 
 **Date:** 2026-07-22
-**Status:** Accepted, worldgen revision 8
+**Status:** Accepted, worldgen revision 9
 
 ## Context
 
@@ -12,6 +12,12 @@ height or decoration fix can remove. Tree placement also accepted any non-fluid
 block as support instead of the surface planned for that column.
 
 ## Decision
+
+Worldgen revision 9 removes the filled 3x3 upper leaf boxes left by revision 8.
+Oak and jungle trees retain a broad main canopy but use a connected,
+deterministically rotated irregular crown above it. This changes generated
+chunks, so the persisted revision advances instead of mixing both silhouettes
+inside one Solaris world.
 
 Worldgen revision 8 retains the revision-7 pipeline and corrects terrain that a
 real 26.1.2 client exposed as broad flat gravel plateaus. Long rolling relief
@@ -63,7 +69,7 @@ Anvil open.
 An existing unversioned Anvil world is treated as a vanilla import and opens
 without Solaris fallback generation, so missing chunks cannot mix both terrain
 authorities. Existing worlds are never rewritten. The local playable profile
-uses `.analysis/test-world-v8`.
+uses `.analysis/test-world-v9`.
 
 Anvil root metadata belongs to the chunk serialization boundary, not a concrete
 terrain generator. The encoder emits one `DataVersion`, `LastUpdate`, and
@@ -103,7 +109,8 @@ seed coverage or owner-approved visual parity.
 - sparse locally coherent tunnel caves with no chamber field, surface mouth, or
   long vertical shaft;
 - a 32-block solid protected surface shell across sampled seeds;
-- exact-surface tree support over a stable 5x5 footprint;
+- exact-surface tree support over a stable 5x5 footprint and an irregular
+  raised crown;
 - vanilla-import isolation plus rejection of mismatched revision/seed/mode/geometry;
 - canonical vanilla root metadata through an actual Anvil write/read at a
   nonzero simulation tick;
@@ -116,4 +123,6 @@ seed coverage or owner-approved visual parity.
   over forest, coast, ocean, and high-relief terrain;
 - agent-run 26.1.2 MCP inspection of the exact shipped `playable.toml` seed-0
   `tellus_like` forest spawn;
+- agent-run revision-9 inspection of an isolated raised tree crown and the
+  seed-918273645 long snow slope at `(-78080,215,-28928)`;
 - `cargo test -p mc-worldgen`.

@@ -158,7 +158,7 @@ verification and keep ordinary survival play ahead of rare edge cases.
   against the collision oracle, including every age/stage state; the runtime
   physics sampler also reproduces an exact partial pitcher-crop shape instead
   of its full-block fallback.
-- [ ] Repeat the fresh-world visual gate after the latest owner report instead
+- [x] Repeat the fresh-world visual gate after the latest owner report instead
   of relying on shape/density regressions alone. Ordinary trees must have a
   raised irregular crown above the main canopy rather than a rectangular leaf
   prism; terrain forms must read as long coherent ranges; vegetation must stay
@@ -166,6 +166,22 @@ verification and keep ordinary survival play ahead of rare edge cases.
   other generated decorations must use their embedded vanilla collision
   shapes. Record the seed, coordinates, screenshots/client observations, and
   exact collision samples in this file before closing the gate.
+  Worldgen revision 9 removes the filled 3x3 upper oak/jungle layers. On the
+  exact shipped seed-0 `tellus_like` profile, the isolated jungle tree rooted
+  at `(12,85,-5)` had leaf-layer counts `19,16,17,6` at Y `88..91`; its nearest
+  other trunk was ten blocks away, so the six-leaf raised crown was not an
+  overlap artifact. A `31x31` spawn sample used 85 decorated columns
+  (`8.84%`), and 24 client-visible grass/poppy/dandelion samples all reported
+  empty collision. The complete embedded-table gates additionally sampled all
+  states of seven sapling species and eight crop/stem families, both oak-door
+  planes, and the runtime torch/campfire pair; none fell back to a full cube.
+  A second fresh world used seed `918273645`; at
+  `(-78080,215,-28928)` the client rendered a continuous long snow slope rather
+  than a round hill, hole, or floating shelf. Evidence:
+  `.analysis/codex-logs/worldgen-v9-visual-summary-20260723.json`,
+  `.analysis/minecraft-mcp-worldgen-v9/screenshots/worldgen-v9-isolated-tree-clean.png`,
+  and
+  `.analysis/minecraft-mcp-worldgen-v9/screenshots/worldgen-v9-seed918-high-relief-215.png`.
 - [x] Keep vanilla-compatible world load/save while producing coherent terrain
   quality comparable in intent to Tectonic/Tellus. The Anvil encoder now emits
   exactly one `DataVersion`, `LastUpdate`, and `InhabitedTime` root field for
@@ -180,9 +196,11 @@ verification and keep ordinary survival play ahead of rare edge cases.
   window dry. An agent-run MCP
   route used a fresh 26.1.2 client, seed `918273645`, and `tellus_like` mode to
   inspect the forest spawn, coast, ocean, and the representative
-  high-relief range around `(-78080, -28928)`: trees had raised irregular
-  crowns, terrain stayed solid, vegetation remained coherent, and the mountain
-  had a continuous elongated slope instead of the original flat gravel plateau.
+  high-relief range around `(-78080, -28928)`: canopies tapered above their
+  broad layers, terrain stayed solid, vegetation remained coherent, and the
+  mountain had a continuous elongated slope instead of the original flat
+  gravel plateau. The later owner screenshot exposed that revision 8 still
+  filled its upper 3x3 leaf layers; revision 9 closes that narrower visual gap.
   A second agent-run MCP pass used the exact shipped `playable.toml` profile
   (`seed=0`, `tellus_like`) and found a dry, solid, moderately decorated forest
   spawn with the same raised tree crowns. The exact shipped-profile gate also
@@ -374,4 +392,5 @@ declaration to the plugin manifest. Plugin discovery is prepared once before
 the world contract and reused by the Lua host. The geological profile empties
 the vanilla ore rules and creates deterministic elongated deposits spanning
 chunk boundaries; the default profile remains unchanged. World contract schema
-2 persists the ore profile and worldgen revision 8 fences mixed-profile worlds.
+2 persists the ore profile and the current worldgen revision fences
+mixed-profile worlds.
