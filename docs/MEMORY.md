@@ -174,7 +174,14 @@ and is not startup context.
   warning p50 from 78.237 ms to 17.473 ms, and grazing warning p50 from
   8.389 ms to 0.234 ms. The client remained in play with no disconnect,
   reliable-command loss, or runtime work-budget info spam. Representative
-  interactive block/menu/combat latency remains open.
+  interaction is also green: a fresh agent-run 26.1.2 `playable-12` gate on the
+  optimized dev profile completed natural block breaks and drops, maximum-count
+  crafting, crafting-table and chest placement/opening, natural pig combat and
+  pickup, and a container transfer in 22 seconds with nine natural entities and
+  active chunk streaming. The server emitted no tick-budget, packet-dispatch,
+  reliable-command, or disconnect warning. This is representative ordinary-play
+  smoke evidence, not a per-action latency SLO or broad overload soak. Evidence is
+  `.analysis/real-client-runs/responsiveness-o3/20260723T103459Z-real-client-playable-loop-4vVxYV`.
 - Scheduled-block planning uses autoscaler CPU admission and the blocking pool.
   The phase services pushed simulation commands while the job runs, then joins
   it before fluid or later phases. One shared admission fence covers every

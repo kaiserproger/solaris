@@ -418,8 +418,18 @@ hardening. An already-open lower-priority diff does not override this order.
   `.analysis/codex-logs/natural-load-current-o3-server.log`,
   `.analysis/codex-logs/natural-load-indexed-breeding-o3-server.log`, and
   `.analysis/codex-logs/natural-load-indexed-breeding-o3-client-gate.json`.
-  This is an artificial overcrowding overload gate; interactive block, menu,
-  and combat response under a representative natural population remains open.
+  This remains an artificial overcrowding overload gate. The complementary
+  representative natural-load interaction gate is now also green: a fresh
+  agent-run 26.1.2 `playable-12` gate on the optimized dev profile broke three
+  natural logs with visible drops, used maximum-count inventory crafting,
+  placed/opened a crafting table, killed and collected the drop from a natural
+  pig, placed/opened a chest, and transferred the food through the normal
+  container path in 22 seconds. Nine natural entities were present and new
+  chunk rings streamed during the run. The client stayed in play and the server
+  emitted no tick-budget, packet-dispatch, reliable-command, or disconnect
+  warning. This is a representative ordinary-play responsiveness smoke gate,
+  not a per-action latency SLO or broad overload soak. Evidence is
+  `.analysis/real-client-runs/responsiveness-o3/20260723T103459Z-real-client-playable-loop-4vVxYV`.
 
 - The shipped `basic-economy` plugin now provides durable virtual balances,
   operator self-grants, and an inventory shop whose item grant and balance CAS
@@ -990,8 +1000,8 @@ hardening. An already-open lower-priority diff does not override this order.
   points. A deterministic 256-button regression held the only CPU permit,
   completed an owner command before release, rejected duplicate admission, and
   then committed all ticks. The optimized `-O3` batch took `1,666 us`. This
-  closes scheduled-block owner starvation, not the separate full interactive
-  natural-load client gate.
+  closes scheduled-block owner starvation. The separate interactive
+  natural-load client gate is recorded with the dense-load evidence above.
 
 ## Manual And Agent Gates
 

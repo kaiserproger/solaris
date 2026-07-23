@@ -321,8 +321,8 @@ verification and keep ordinary survival play ahead of rare edge cases.
   command completes before release, rejects duplicate admission, and then
   commits all 256 due button ticks. The optimized `-O3` gate applied the batch
   in `1,666 us`. This proves simulation-owner responsiveness, single authority,
-  and same-tick phase ordering; the broader interactive natural-load client
-  gate remains tracked below.
+  and same-tick phase ordering. The representative interactive natural-load
+  client gate is closed below.
 - [x] Make animal and hostile movement visually alive. Ground wanderers now
   retain a deterministic 3-7-block destination until arrival, pause for a
   per-entity interval, and choose independent destinations instead of replacing
@@ -355,12 +355,22 @@ verification and keep ordinary survival play ahead of rare edge cases.
   full-cube fallback. Deterministic tests cover tag routing, query projection,
   fall accumulation/reset, above/inside behavior, both falling-block branches,
   long-falling ordinary mobs, and the fingerprint mismatch.
-- [ ] Keep menus, inventory actions, block events, and attacks responsive under
+- [x] Keep menus, inventory actions, block events, and attacks responsive under
   natural mob/chunk load. The biased entity-owner select used to check an
   overdue 50 ms tick before its pushed command notification, allowing sustained
   over-budget ticks to starve player transactions. Command readiness now wins
-  before the ticker. Dense real-client movement now remains connected after the
-  fair-cohort and exact-index fixes above; the broader interactive gate remains.
+  before the ticker. Dense real-client movement remains connected after the
+  fair-cohort and exact-index fixes above. A fresh agent-run 26.1.2
+  `playable-12` gate on the optimized dev profile then completed three natural
+  block breaks with visible drops, maximum-count inventory crafting,
+  crafting-table placement/opening, natural pig combat and pickup, chest
+  placement/opening, and a normal container transfer in 22 seconds. The world
+  had nine natural entities and streamed new chunk rings during the run. The
+  client stayed in play, every action converged, and the server emitted no
+  tick-budget, packet-dispatch, reliable-command, or disconnect warning. This
+  closes the representative ordinary-play responsiveness smoke gate; it is not
+  a per-action latency SLO or a broad overload soak. Evidence is
+  `.analysis/real-client-runs/responsiveness-o3/20260723T103459Z-real-client-playable-loop-4vVxYV`.
 - [x] Make an autonomous MCP survival pass reliably reach the first crafting
   table without operator commands or deterministic scenarios. A fresh real
   26.1.2 client found a natural jungle log, navigated to it, mined and collected
