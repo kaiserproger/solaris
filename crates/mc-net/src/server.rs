@@ -917,19 +917,6 @@ impl BoundServer {
         let script_storage = self.script_storage;
         let script_zones = self.script_zones;
         let shutdown = config.shutdown.clone();
-        let connection_services = ConnectionServices {
-            config: Arc::clone(&config),
-            online_authentication,
-            chunk_geometry,
-            connection_world: connection_world.clone(),
-            sessions: Arc::clone(&sessions),
-            chunk_pipeline_resources: chunk_pipeline_resources.clone(),
-            runtime_control: runtime_control.clone(),
-            simulation: simulation.clone(),
-            extension: extension.clone(),
-            scripts: scripts.clone(),
-            script_zones: script_zones.clone(),
-        };
         if let Some(scripts) = scripts.as_ref() {
             scripts.enqueue_event(ScriptEvent::server_started());
         }
@@ -1025,6 +1012,20 @@ impl BoundServer {
         if let Some(requests) = periodic_save_requests.as_ref() {
             enqueue_startup_dirty_flush(&config, requests).await;
         }
+        let connection_services = ConnectionServices {
+            config: Arc::clone(&config),
+            online_authentication,
+            chunk_geometry,
+            connection_world: connection_world.clone(),
+            sessions: Arc::clone(&sessions),
+            chunk_pipeline_resources: chunk_pipeline_resources.clone(),
+            dirty_flush: periodic_save_requests.clone(),
+            runtime_control: runtime_control.clone(),
+            simulation: simulation.clone(),
+            extension: extension.clone(),
+            scripts: scripts.clone(),
+            script_zones: script_zones.clone(),
+        };
         let (entity_shutdown, mut entity_shutdown_requested) = tokio::sync::oneshot::channel();
         let mut entity_ticker = tokio::spawn(async move {
             let _pathing_tables_ready = prewarmed_entity_pathing_states;

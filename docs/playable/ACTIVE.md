@@ -160,7 +160,15 @@ hardening. An already-open lower-priority diff does not override this order.
   spawn selection now rejects leaves, matching vanilla's no-leaves heightmap
   intent. The first run exposed a pending
   31-second far-travel chunk stream under dirty-cache flush pressure; that is a
-  runtime latency item, not accepted worldgen performance evidence.
+  runtime latency item, not accepted worldgen performance evidence. The
+  follow-up removed per-request full dirty flushes from production chunk
+  preparation. Pressure now goes through the server-owned push worker with an
+  exact completion ticket, while a changed stream generation cancels stale
+  waiters. Three fresh O3 289-chunk windows completed in 3.195, 2.726, and
+  2.608 seconds with 42-74 ms first-chunk latency and no client disconnect;
+  direct shutdown also drained without timeout. This closes the 31-second
+  far-travel regression, not the broader worldgen-quality or weak-machine
+  targets.
 
 - Fresh and legacy Solaris chunks now serialize the mandatory vanilla Anvil
   metadata at the codec boundary rather than in one generator. `DataVersion`

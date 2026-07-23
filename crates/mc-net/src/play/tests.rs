@@ -392,6 +392,7 @@ async fn initial_play_sync_sends_recipe_update_once_before_recipe_book_packets()
         sessions,
         ChunkPipelineResources::with_limits(1, 1),
         None,
+        None,
         simulation,
         Vec::new(),
         None,

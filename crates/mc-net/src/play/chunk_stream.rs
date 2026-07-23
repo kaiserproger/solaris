@@ -67,6 +67,7 @@ const INITIAL_CHUNK_MIN_RING: i32 = 2;
 const CHUNK_STAGE_SLOW_MS: u64 = 50;
 const CHUNK_BACKPRESSURE_MAX_RETRIES: usize = 16;
 const PREPARED_IN_FLIGHT_DEFERRAL_LIMIT: usize = 2;
+const PRESSURE_FLUSH_MAX_CHUNKS: usize = 8;
 const PRESSURE_FLUSH_STALE_REGION_RETRIES: usize = 3;
 const PREWARM_EDGE_RING_LIMIT: usize = 40;
 const PREWARM_PREPARED_CACHE_LIMIT: usize = 64;
@@ -95,7 +96,9 @@ pub(super) struct ChunkStreamState {
     simulation: Option<SimulationHandle>,
     session_id: SessionId,
     resources: ChunkPipelineResources,
+    dirty_flush: Option<crate::dirty_flush::DirtyFlushNotifier>,
     active_generation: Arc<AtomicU64>,
+    generation_changed: Arc<tokio::sync::Notify>,
     result_tx: mpsc::Sender<ChunkPrepareResult>,
     result_rx: mpsc::Receiver<ChunkPrepareResult>,
     progress_notify: Arc<tokio::sync::Notify>,
@@ -965,7 +968,9 @@ impl ChunkStreamState {
             simulation: None,
             session_id,
             resources,
+            dirty_flush: None,
             active_generation,
+            generation_changed: Arc::new(tokio::sync::Notify::new()),
             result_tx,
             result_rx,
             progress_notify,
@@ -1091,6 +1096,20 @@ impl ChunkStreamState {
         self
     }
 
+    pub(super) fn with_dirty_flush(
+        mut self,
+        dirty_flush: Option<crate::dirty_flush::DirtyFlushNotifier>,
+    ) -> Self {
+        self.dirty_flush = dirty_flush;
+        self
+    }
+
+    fn publish_active_generation(&self) {
+        self.active_generation
+            .store(self.scheduler.current_generation().0, Ordering::Release);
+        self.generation_changed.notify_waiters();
+    }
+
     pub(super) fn is_complete(&self) -> bool {
         self.scheduler.is_complete()
     }
@@ -1156,8 +1175,7 @@ impl ChunkStreamState {
             self.view_distance,
             self.direction_yaw,
         ));
-        self.active_generation
-            .store(self.scheduler.current_generation().0, Ordering::Release);
+        self.publish_active_generation();
         self.reset_window_metrics();
         unloads
     }
@@ -1208,8 +1226,7 @@ impl ChunkStreamState {
             self.view_distance,
             self.direction_yaw,
         ));
-        self.active_generation
-            .store(self.scheduler.current_generation().0, Ordering::Release);
+        self.publish_active_generation();
         self.reset_window_metrics();
         unloads
     }
@@ -1235,8 +1252,7 @@ impl ChunkStreamState {
             self.view_distance,
             self.direction_yaw,
         ));
-        self.active_generation
-            .store(self.scheduler.current_generation().0, Ordering::Release);
+        self.publish_active_generation();
         self.reset_window_metrics();
     }
 
@@ -1647,8 +1663,7 @@ impl ChunkStreamState {
             self.view_distance,
             self.direction_yaw,
         ));
-        self.active_generation
-            .store(self.scheduler.current_generation().0, Ordering::Release);
+        self.publish_active_generation();
         self.memory_pressure_shed_runs += 1;
         self.memory_pressure_shed_ready += ready;
         self.memory_pressure_shed_in_flight += active;
@@ -1728,7 +1743,9 @@ impl ChunkStreamState {
         let entity_types = Arc::clone(&self.entity_types);
         let resources = self.resources.clone();
         let prepare_task = resources.begin_prepare_task();
+        let dirty_flush = self.dirty_flush.clone();
         let active_generation = Arc::clone(&self.active_generation);
+        let generation_changed = Arc::clone(&self.generation_changed);
         let compression = self.compression;
         let current_tick = self.sessions.simulation_tick();
         let sessions = Arc::clone(&self.sessions);
@@ -1778,7 +1795,9 @@ impl ChunkStreamState {
                     entity_types,
                     compression,
                     resources,
+                    dirty_flush,
                     active_generation,
+                    generation_changed,
                     current_tick,
                 )
                 .await
@@ -1828,6 +1847,7 @@ impl ChunkStreamState {
         let entity_types = Arc::clone(&self.entity_types);
         let resources = self.resources.clone();
         let prepare_task = resources.begin_prepare_task();
+        let dirty_flush = self.dirty_flush.clone();
         let compression = self.compression;
         let current_tick = self.sessions.simulation_tick();
         let sessions = Arc::clone(&self.sessions);
@@ -1881,6 +1901,7 @@ impl ChunkStreamState {
                     let passive_spawn_rules = Arc::clone(&passive_spawn_rules);
                     let entity_types = Arc::clone(&entity_types);
                     let resources = resources.clone();
+                    let dirty_flush = dirty_flush.clone();
                     let sessions = Arc::clone(&sessions);
                     workers.spawn(async move {
                         if sessions.session_registration_epoch() > session_registration_epoch
@@ -1917,7 +1938,9 @@ impl ChunkStreamState {
                             Arc::clone(&entity_types),
                             compression,
                             resources.clone(),
+                            dirty_flush,
                             Arc::new(AtomicU64::new(request.generation.0)),
+                            Arc::new(tokio::sync::Notify::new()),
                             current_tick,
                         )
                         .await;
@@ -2382,6 +2405,7 @@ impl Drop for ChunkStreamState {
     fn drop(&mut self) {
         self.recover_runtime_control_sources();
         self.active_generation.store(0, Ordering::Release);
+        self.generation_changed.notify_waiters();
         let cancelled_requests = self.scheduler.queued_len()
             + self.scheduler.in_flight_len()
             + self.prewarm_in_flight.len();
@@ -2706,7 +2730,9 @@ async fn prepare_chunk_request(
     entity_types: Arc<mc_data::entity_types::EntityTypeRegistry>,
     compression: Compression,
     resources: ChunkPipelineResources,
+    dirty_flush: Option<crate::dirty_flush::DirtyFlushNotifier>,
     active_generation: Arc<AtomicU64>,
+    generation_changed: Arc<tokio::sync::Notify>,
     current_tick: u64,
 ) -> ChunkPrepareResult {
     if !is_active_request(request, &active_generation) {
@@ -2751,19 +2777,15 @@ async fn prepare_chunk_request(
 
     let Some(centre) = centre else {
         if backpressured {
-            let pressure_flush = match flush_dirty_chunks_for_pressure(
+            let pressure_flush = relieve_dirty_pressure(
                 Arc::clone(&world),
                 request,
                 current_tick,
+                dirty_flush.as_ref(),
+                &active_generation,
+                &generation_changed,
             )
-            .await
-            {
-                Ok(timing) => timing,
-                Err(err) => {
-                    warn!(cx = request.chunk_x, cz = request.chunk_z, error = %err, "dirty pressure flush failed");
-                    PressureFlushTiming::default()
-                }
-            };
+            .await;
             return ChunkPrepareResult {
                 request,
                 prepare_claim: None,
@@ -2784,19 +2806,15 @@ async fn prepare_chunk_request(
     };
 
     if backpressured {
-        let pressure_flush = match flush_dirty_chunks_for_pressure(
+        let pressure_flush = relieve_dirty_pressure(
             Arc::clone(&world),
             request,
             current_tick,
+            dirty_flush.as_ref(),
+            &active_generation,
+            &generation_changed,
         )
-        .await
-        {
-            Ok(timing) => timing,
-            Err(err) => {
-                warn!(cx = request.chunk_x, cz = request.chunk_z, error = %err, "dirty pressure flush failed");
-                PressureFlushTiming::default()
-            }
-        };
+        .await;
         return ChunkPrepareResult {
             request,
             prepare_claim: None,
@@ -3015,6 +3033,57 @@ fn stale_chunk_result(
     }
 }
 
+async fn relieve_dirty_pressure(
+    world: WorldHandle,
+    request: ChunkRequest,
+    current_tick: u64,
+    dirty_flush: Option<&crate::dirty_flush::DirtyFlushNotifier>,
+    active_generation: &AtomicU64,
+    generation_changed: &tokio::sync::Notify,
+) -> PressureFlushTiming {
+    if let Some(ticket) =
+        dirty_flush.and_then(crate::dirty_flush::DirtyFlushNotifier::request_dirty_flush_ticket)
+    {
+        let completion = ticket.wait();
+        tokio::pin!(completion);
+        loop {
+            let changed = generation_changed.notified();
+            tokio::pin!(changed);
+            changed.as_mut().enable();
+            if !is_active_request(request, active_generation) {
+                return PressureFlushTiming::default();
+            }
+            tokio::select! {
+                biased;
+                completed = completion.as_mut() => {
+                    if !completed {
+                        debug!(
+                            cx = request.chunk_x,
+                            cz = request.chunk_z,
+                            "dirty flush worker stopped before pressure request completed"
+                        );
+                    }
+                    return PressureFlushTiming::default();
+                }
+                () = changed.as_mut() => {}
+            }
+        }
+    }
+
+    match flush_dirty_chunks_for_pressure(world, request, current_tick).await {
+        Ok(timing) => timing,
+        Err(err) => {
+            warn!(
+                cx = request.chunk_x,
+                cz = request.chunk_z,
+                error = %err,
+                "dirty pressure flush failed"
+            );
+            PressureFlushTiming::default()
+        }
+    }
+}
+
 async fn flush_dirty_chunks_for_pressure(
     world: WorldHandle,
     request: ChunkRequest,
@@ -3039,7 +3108,7 @@ async fn flush_dirty_chunks_for_pressure(
                 return Ok(timing);
             }
             storage
-                .plan_dirty_flush_at_tick(current_tick)
+                .plan_dirty_flush_at_tick_bounded(current_tick, PRESSURE_FLUSH_MAX_CHUNKS)
                 .map_err(|err| err.to_string())?
         };
         timing.plan_ms += plan_started.elapsed().as_millis() as u64;
@@ -3805,7 +3874,7 @@ mod tests {
     use mc_world::{BlockStateId, ChunkGenerator, ChunkPos, WorldStorage};
     use std::collections::{BTreeMap, BTreeSet};
     use std::sync::atomic::{AtomicBool, AtomicUsize};
-    use tokio::sync::Mutex;
+    use tokio::sync::{Mutex, oneshot};
 
     fn canonical_entity_type_report() -> Vec<mc_data::entity_types::EntityTypeReport> {
         (0..mc_data::entity_types::ENTITY_TYPE_COUNT as u32)
@@ -4870,7 +4939,9 @@ mod tests {
             Arc::new(mc_data::entity_types::solaris_required_entity_types()),
             Compression::Disabled,
             resources,
+            None,
             Arc::new(AtomicU64::new(2)),
+            Arc::new(tokio::sync::Notify::new()),
             0,
         )
         .await;
@@ -4984,7 +5055,9 @@ mod tests {
             Arc::new(mc_data::entity_types::solaris_required_entity_types()),
             Compression::Disabled,
             ChunkPipelineResources::with_limits(1, 1),
+            None,
             Arc::new(AtomicU64::new(1)),
+            Arc::new(tokio::sync::Notify::new()),
             0,
         )
         .await;
@@ -5528,7 +5601,9 @@ mod tests {
             Arc::new(mc_data::entity_types::solaris_required_entity_types()),
             Compression::Disabled,
             ChunkPipelineResources::with_limits(1, 1),
+            None,
             Arc::clone(&stream.active_generation),
+            Arc::clone(&stream.generation_changed),
             0,
         )
         .await;
@@ -8203,7 +8278,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn concurrent_pressure_flush_replans_after_stale_region_replace() {
+    async fn concurrent_pressure_flush_coalesces_one_bounded_batch() {
         let registry = Arc::new(air_block_registry());
         let biome = Identifier::parse("minecraft:plains").unwrap();
         let temp = tempfile::tempdir().unwrap();
@@ -8239,16 +8314,79 @@ mod tests {
         }
 
         let mut pressure_flush_runs = 0;
+        let mut pressure_flush_planned = 0;
         for flush in flushes {
-            pressure_flush_runs += flush
-                .await
-                .unwrap()
-                .expect("pressure flush must replan stale region writes")
-                .runs;
+            let timing = flush.await.unwrap().expect("pressure flush must complete");
+            pressure_flush_runs += timing.runs;
+            pressure_flush_planned += timing.planned_chunks;
         }
 
         assert_eq!(pressure_flush_runs, 1);
-        assert_eq!(world.lock().await.dirty_count(), 0);
+        assert_eq!(pressure_flush_planned, PRESSURE_FLUSH_MAX_CHUNKS);
+        assert_eq!(
+            world.lock().await.dirty_count(),
+            32 - PRESSURE_FLUSH_MAX_CHUNKS
+        );
+    }
+
+    #[tokio::test]
+    async fn stale_pressure_wait_wakes_on_stream_generation_change() {
+        let registry = Arc::new(air_block_registry());
+        let world = Arc::new(Mutex::new(WorldStorage::in_memory(Arc::clone(&registry))));
+        let (started, started_rx) = oneshot::channel();
+        let (release, release_rx) = oneshot::channel();
+        let mut started = Some(started);
+        let mut release_rx = Some(release_rx);
+        let coordinator = crate::dirty_flush::DirtyFlushCoordinator::spawn_actions(
+            move || {
+                let started = started.take().expect("one dirty action");
+                let release_rx = release_rx.take().expect("one dirty action");
+                async move {
+                    let _ = started.send(());
+                    let _ = release_rx.await;
+                    crate::dirty_flush::DirtyFlushCompletion::Complete
+                }
+            },
+            || async {},
+        );
+        let notifier = coordinator.notifier();
+        let request = ChunkRequest {
+            chunk_x: 32,
+            chunk_z: 0,
+            priority: ChunkPriority {
+                ring: 0,
+                sequence: 0,
+            },
+            generation: ChunkPipelineGeneration(1),
+        };
+        let active_generation = Arc::new(AtomicU64::new(1));
+        let generation_changed = Arc::new(tokio::sync::Notify::new());
+        let wait = tokio::spawn({
+            let active_generation = Arc::clone(&active_generation);
+            let generation_changed = Arc::clone(&generation_changed);
+            async move {
+                relieve_dirty_pressure(
+                    world,
+                    request,
+                    0,
+                    Some(&notifier),
+                    &active_generation,
+                    &generation_changed,
+                )
+                .await
+            }
+        });
+
+        started_rx.await.expect("dirty action starts");
+        active_generation.store(2, Ordering::Release);
+        generation_changed.notify_waiters();
+
+        assert_eq!(wait.await.unwrap().runs, 0);
+        release.send(()).expect("release dirty action");
+        assert!(matches!(
+            coordinator.drain().await,
+            crate::dirty_flush::DirtyFlushDrainOutcome::Complete
+        ));
     }
 
     #[tokio::test]
@@ -8325,7 +8463,9 @@ mod tests {
             Arc::new(mc_data::entity_types::solaris_required_entity_types()),
             Compression::Disabled,
             ChunkPipelineResources::with_limits(1, 1),
+            None,
             Arc::clone(&stream.active_generation),
+            Arc::clone(&stream.generation_changed),
             0,
         )
         .await;

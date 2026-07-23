@@ -95,3 +95,9 @@ Negative:
   over `WorldStorage`.
 - M68.b and M68.c are examples of acceptable transitional cleanup: they clarify
   control flow without changing world ownership.
+- Dirty-cache pressure has one production persistence authority: the
+  server-owned `DirtyFlushCoordinator`. Chunk preparation publishes a
+  coalesced request and waits for the exact accepted worker action; a stream
+  generation change wakes and cancels stale waiters. It must not start a
+  competing full flush. Tests without the server worker may use the bounded
+  eight-chunk fallback, but that fallback is not a second production owner.

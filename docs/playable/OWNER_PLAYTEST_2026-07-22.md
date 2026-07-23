@@ -158,6 +158,14 @@ verification and keep ordinary survival play ahead of rare edge cases.
   against the collision oracle, including every age/stage state; the runtime
   physics sampler also reproduces an exact partial pitcher-crop shape instead
   of its full-block fallback.
+- [ ] Repeat the fresh-world visual gate after the latest owner report instead
+  of relying on shape/density regressions alone. Ordinary trees must have a
+  raised irregular crown above the main canopy rather than a rectangular leaf
+  prism; terrain forms must read as long coherent ranges; vegetation must stay
+  moderate; and sampled grass, flowers, crops, saplings, torches, doors, and
+  other generated decorations must use their embedded vanilla collision
+  shapes. Record the seed, coordinates, screenshots/client observations, and
+  exact collision samples in this file before closing the gate.
 - [x] Keep vanilla-compatible world load/save while producing coherent terrain
   quality comparable in intent to Tectonic/Tellus. The Anvil encoder now emits
   exactly one `DataVersion`, `LastUpdate`, and `InhabitedTime` root field for
@@ -238,9 +246,18 @@ verification and keep ordinary survival play ahead of rare edge cases.
   `.analysis/codex-logs/scheduled-fluid-coalesced-o3-summary-20260723.json`.
   The terrain visual run also exposed a separate far-travel path: a 289-chunk
   stream took about 31 seconds while dirty-cache pressure forced a 3.5-second
-  flush and chunk fetch/light work accumulated behind it. Fix that common
-  exploration stall and the observed shutdown-drain timeout before using
-  far-travel results as a latency benchmark.
+  flush and chunk fetch/light work accumulated behind it. That path is now
+  closed. Chunk preparation no longer starts a second full dirty flush; it
+  requests the server-owned save worker and waits for that exact accepted
+  action or for stream-generation cancellation. The fallback path without a
+  save worker is capped at eight chunks. Three fresh O3 view-distance-8 streams
+  each emitted all 289 chunks in `3,195 ms`, `2,726 ms`, and `2,608 ms`;
+  first chunks arrived in `74 ms`, `42 ms`, and `48 ms`. The client remained in
+  play with no pressure abandonment, slow-client warning, or disconnect. A
+  direct O3 shutdown then drained and saved without a timeout. Evidence:
+  `.analysis/codex-logs/far-travel-o3-server-20260723.log`,
+  `.analysis/codex-logs/far-travel-o3-mcp2-20260723.json`, and
+  `.analysis/codex-logs/far-travel-o3-shutdown-20260723.log`.
   Explosion expiry no longer scans every entity and cannot process an unbounded
   simultaneous batch under one world lock. An O3 full-path benchmark with 4,096
   background cows, 64 due explosions, a fresh 27-block solid dirt volume for

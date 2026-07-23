@@ -1456,6 +1456,7 @@ pub(crate) async fn handle<R, W>(
     connection_world: crate::server::ConnectionWorld,
     sessions: Arc<SessionRegistry>,
     chunk_pipeline_resources: ChunkPipelineResources,
+    dirty_flush: Option<crate::dirty_flush::DirtyFlushNotifier>,
     runtime_control: Option<RuntimeControlHandle>,
     simulation: SimulationHandle,
     configuration_custom_payloads: Vec<ConfigurationCustomPayload>,
@@ -1835,6 +1836,7 @@ where
             .with_world_mutation(world_mutation.clone())
             .with_chunk_source(chunk_source)
             .with_simulation(simulation.clone())
+            .with_dirty_flush(dirty_flush)
             .with_runtime_control(runtime_control.clone()),
         )
     });

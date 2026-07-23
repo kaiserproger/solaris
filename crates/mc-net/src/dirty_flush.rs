@@ -61,6 +61,8 @@ pub(crate) async fn sync_dirty_flush_install_blocking_typed(
 struct DirtyFlushState {
     dirty_flush: bool,
     full_checkpoint: bool,
+    dirty_request_generation: u64,
+    dirty_completed_generation: u64,
     drain: Option<oneshot::Sender<()>>,
     stopped: bool,
 }
@@ -69,6 +71,24 @@ struct DirtyFlushState {
 struct DirtyFlushShared {
     state: Mutex<DirtyFlushState>,
     wake: Notify,
+    completed: Notify,
+}
+
+struct DirtyFlushWorkerExit {
+    shared: Arc<DirtyFlushShared>,
+}
+
+impl Drop for DirtyFlushWorkerExit {
+    fn drop(&mut self) {
+        let mut state = self
+            .shared
+            .state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        state.stopped = true;
+        drop(state);
+        self.shared.completed.notify_waiters();
+    }
 }
 
 /// Push-only producer handle for the server-owned save worker.
@@ -87,15 +107,34 @@ impl DirtyFlushNotifier {
     /// Mark a dirty-only flush pending. Repeated notifications coalesce until
     /// the consumer starts its next flush.
     pub(crate) fn request_dirty_flush(&self) {
-        self.request_action(DirtyFlushRequest::DirtyOnly);
+        let _ = self.request_dirty_flush_ticket();
+    }
+
+    /// Request dirty-only work and return an exact completion event for the
+    /// batch that accepted this request.
+    pub(crate) fn request_dirty_flush_ticket(&self) -> Option<DirtyFlushTicket> {
+        let shared = self.shared.upgrade()?;
+        let generation = {
+            let mut state = shared
+                .state
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            if state.stopped {
+                return None;
+            }
+            state.dirty_request_generation = state.dirty_request_generation.saturating_add(1);
+            state.dirty_flush = true;
+            state.dirty_request_generation
+        };
+        shared.wake.notify_one();
+        Some(DirtyFlushTicket {
+            shared: Arc::downgrade(&shared),
+            generation,
+        })
     }
 
     /// Mark a full player/entity/metadata/WAL checkpoint pending.
     pub(crate) fn request_full_checkpoint(&self) {
-        self.request_action(DirtyFlushRequest::FullCheckpoint);
-    }
-
-    fn request_action(&self, request: DirtyFlushRequest) {
         let Some(shared) = self.shared.upgrade() else {
             return;
         };
@@ -107,18 +146,43 @@ impl DirtyFlushNotifier {
             tracing::warn!("dirty flush worker stopped before producer notification");
             return;
         }
-        match request {
-            DirtyFlushRequest::DirtyOnly => state.dirty_flush = true,
-            DirtyFlushRequest::FullCheckpoint => state.full_checkpoint = true,
-        }
+        state.full_checkpoint = true;
         drop(state);
         shared.wake.notify_one();
     }
 }
 
-enum DirtyFlushRequest {
-    DirtyOnly,
-    FullCheckpoint,
+pub(crate) struct DirtyFlushTicket {
+    shared: Weak<DirtyFlushShared>,
+    generation: u64,
+}
+
+impl DirtyFlushTicket {
+    /// Wait for the worker action that includes this request. Returns false
+    /// only when the worker stops before acknowledging it.
+    pub(crate) async fn wait(self) -> bool {
+        let Some(shared) = self.shared.upgrade() else {
+            return false;
+        };
+        loop {
+            let completed = shared.completed.notified();
+            tokio::pin!(completed);
+            completed.as_mut().enable();
+            {
+                let state = shared
+                    .state
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner());
+                if state.dirty_completed_generation >= self.generation {
+                    return true;
+                }
+                if state.stopped {
+                    return false;
+                }
+            }
+            completed.await;
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -223,6 +287,9 @@ impl DirtyFlushCoordinator {
         let shared = Arc::new(DirtyFlushShared::default());
         let worker_shared = Arc::clone(&shared);
         let worker = tokio::spawn(async move {
+            let _exit = DirtyFlushWorkerExit {
+                shared: Arc::clone(&worker_shared),
+            };
             loop {
                 worker_shared.wake.notified().await;
                 loop {
@@ -238,10 +305,10 @@ impl DirtyFlushCoordinator {
                             // Requests published during the checkpoint set the
                             // bit again and run afterward.
                             state.dirty_flush = false;
-                            DirtyFlushAction::FullCheckpoint
+                            DirtyFlushAction::FullCheckpoint(state.dirty_request_generation)
                         } else if state.dirty_flush {
                             state.dirty_flush = false;
-                            DirtyFlushAction::DirtyOnly
+                            DirtyFlushAction::DirtyOnly(state.dirty_request_generation)
                         } else if let Some(completed) = state.drain.take() {
                             state.stopped = true;
                             DirtyFlushAction::Stop(completed)
@@ -250,8 +317,10 @@ impl DirtyFlushCoordinator {
                         }
                     };
                     match action {
-                        DirtyFlushAction::DirtyOnly => {
-                            if dirty_flush().await == DirtyFlushCompletion::MoreDirty {
+                        DirtyFlushAction::DirtyOnly(generation) => {
+                            let completion = dirty_flush().await;
+                            complete_dirty_generation(&worker_shared, generation);
+                            if completion == DirtyFlushCompletion::MoreDirty {
                                 let mut state = worker_shared
                                     .state
                                     .lock()
@@ -261,8 +330,12 @@ impl DirtyFlushCoordinator {
                                 worker_shared.wake.notify_one();
                             }
                         }
-                        DirtyFlushAction::FullCheckpoint => full_checkpoint().await,
+                        DirtyFlushAction::FullCheckpoint(generation) => {
+                            full_checkpoint().await;
+                            complete_dirty_generation(&worker_shared, generation);
+                        }
                         DirtyFlushAction::Stop(completed) => {
+                            worker_shared.completed.notify_waiters();
                             let _ = completed.send(());
                             return;
                         }
@@ -328,22 +401,188 @@ impl DirtyFlushCoordinator {
 }
 
 enum DirtyFlushAction {
-    DirtyOnly,
-    FullCheckpoint,
+    DirtyOnly(u64),
+    FullCheckpoint(u64),
     Stop(oneshot::Sender<()>),
     Wait,
+}
+
+fn complete_dirty_generation(shared: &DirtyFlushShared, generation: u64) {
+    let mut state = shared
+        .state
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    state.dirty_completed_generation = state.dirty_completed_generation.max(generation);
+    drop(state);
+    shared.completed.notify_waiters();
 }
 
 #[cfg(test)]
 mod tests {
     use std::sync::Arc;
-    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
     use tokio::sync::{mpsc, oneshot};
 
     use super::{
         DirtyFlushCompletion, DirtyFlushCoordinator, DirtyFlushDrainError, DirtyFlushDrainOutcome,
     };
+
+    #[tokio::test]
+    async fn dirty_flush_ticket_wakes_after_accepted_action() {
+        let (started, started_rx) = oneshot::channel();
+        let (release, release_rx) = oneshot::channel();
+        let mut started = Some(started);
+        let mut release_rx = Some(release_rx);
+        let coordinator = DirtyFlushCoordinator::spawn_actions(
+            move || {
+                let started = started.take().expect("one dirty action");
+                let release_rx = release_rx.take().expect("one dirty action");
+                async move {
+                    let _ = started.send(());
+                    let _ = release_rx.await;
+                    DirtyFlushCompletion::Complete
+                }
+            },
+            || async {},
+        );
+
+        let ticket = coordinator
+            .notifier()
+            .request_dirty_flush_ticket()
+            .expect("worker accepts request");
+        started_rx.await.expect("dirty action starts");
+        let waiter = tokio::spawn(ticket.wait());
+        release.send(()).expect("release dirty action");
+
+        assert!(waiter.await.expect("ticket waiter joins"));
+        assert!(matches!(
+            coordinator.drain().await,
+            DirtyFlushDrainOutcome::Complete
+        ));
+    }
+
+    #[tokio::test]
+    async fn ticket_during_active_flush_waits_for_followup_action() {
+        let (first_started, first_started_rx) = oneshot::channel();
+        let (second_started, second_started_rx) = oneshot::channel();
+        let (first_release, first_release_rx) = oneshot::channel();
+        let (second_release, second_release_rx) = oneshot::channel();
+        let mut actions = std::collections::VecDeque::from([
+            (first_started, first_release_rx),
+            (second_started, second_release_rx),
+        ]);
+        let coordinator = DirtyFlushCoordinator::spawn_actions(
+            move || {
+                let (started, release) = actions.pop_front().expect("two dirty actions");
+                async move {
+                    let _ = started.send(());
+                    let _ = release.await;
+                    DirtyFlushCompletion::Complete
+                }
+            },
+            || async {},
+        );
+        let notifier = coordinator.notifier();
+        notifier.request_dirty_flush();
+        first_started_rx.await.expect("first action starts");
+
+        let ticket = notifier
+            .request_dirty_flush_ticket()
+            .expect("followup request accepted");
+        let completed = Arc::new(AtomicBool::new(false));
+        let waiter = tokio::spawn({
+            let completed = Arc::clone(&completed);
+            async move {
+                let result = ticket.wait().await;
+                completed.store(true, Ordering::Release);
+                result
+            }
+        });
+        first_release.send(()).expect("release first action");
+        second_started_rx.await.expect("followup action starts");
+        assert!(!completed.load(Ordering::Acquire));
+        second_release.send(()).expect("release followup action");
+
+        assert!(waiter.await.expect("ticket waiter joins"));
+        assert!(matches!(
+            coordinator.drain().await,
+            DirtyFlushDrainOutcome::Complete
+        ));
+    }
+
+    #[tokio::test]
+    async fn full_checkpoint_completion_subsumes_pending_dirty_ticket() {
+        let dirty_calls = Arc::new(AtomicUsize::new(0));
+        let (full_started, full_started_rx) = oneshot::channel();
+        let (full_release, full_release_rx) = oneshot::channel();
+        let mut full_started = Some(full_started);
+        let mut full_release_rx = Some(full_release_rx);
+        let coordinator = DirtyFlushCoordinator::spawn_actions(
+            {
+                let dirty_calls = Arc::clone(&dirty_calls);
+                move || {
+                    dirty_calls.fetch_add(1, Ordering::SeqCst);
+                    async { DirtyFlushCompletion::Complete }
+                }
+            },
+            move || {
+                let full_started = full_started.take().expect("one full checkpoint");
+                let full_release_rx = full_release_rx.take().expect("one full checkpoint");
+                async move {
+                    let _ = full_started.send(());
+                    let _ = full_release_rx.await;
+                }
+            },
+        );
+        let notifier = coordinator.notifier();
+        notifier.request_full_checkpoint();
+        let ticket = notifier
+            .request_dirty_flush_ticket()
+            .expect("dirty request accepted");
+        let completed = Arc::new(AtomicBool::new(false));
+        let waiter = tokio::spawn({
+            let completed = Arc::clone(&completed);
+            async move {
+                let result = ticket.wait().await;
+                completed.store(true, Ordering::Release);
+                result
+            }
+        });
+
+        full_started_rx.await.expect("full checkpoint starts");
+        assert!(!completed.load(Ordering::Acquire));
+        full_release.send(()).expect("release full checkpoint");
+
+        assert!(waiter.await.expect("ticket waiter joins"));
+        assert_eq!(dirty_calls.load(Ordering::SeqCst), 0);
+        assert!(matches!(
+            coordinator.drain().await,
+            DirtyFlushDrainOutcome::Complete
+        ));
+    }
+
+    #[tokio::test]
+    async fn worker_panic_wakes_ticket_as_failed() {
+        let coordinator = DirtyFlushCoordinator::spawn_actions(
+            || async {
+                panic!("test dirty worker panic");
+                #[allow(unreachable_code)]
+                DirtyFlushCompletion::Complete
+            },
+            || async {},
+        );
+        let ticket = coordinator
+            .notifier()
+            .request_dirty_flush_ticket()
+            .expect("dirty request accepted");
+
+        assert!(!ticket.wait().await);
+        assert!(matches!(
+            coordinator.drain().await,
+            DirtyFlushDrainOutcome::Failed(DirtyFlushDrainError::WorkerJoin(_))
+        ));
+    }
 
     #[tokio::test]
     async fn awaiting_producer_completion_does_not_self_rearm_and_allows_drain() {
