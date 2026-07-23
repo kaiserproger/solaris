@@ -36,14 +36,13 @@ This queue is binding across context compaction: common vanilla gameplay first,
 then production plugin API, then measured optimization, and only then rare
 hardening. An already-open lower-priority diff does not override this order.
 
-1. Run the requested 20-minute MCP survival session on the current build, with
+1. [x] Run the requested 20-minute MCP survival session on the current build, with
    one fast subagent making the decisions and no deterministic scenario runner
    or operator setup. Record concrete client-visible failures; an owner-played
-   subjective-feel gate remains separately pending. The focused precursor is
-   closed: on a fresh world the decision agent found and mined a natural jungle
-   log, crafted and placed a crafting table through ordinary client actions,
-   and opened its crafting screen at full health. The complete 20-minute run is
-   still required.
+   subjective-feel gate remains separately pending. The client advanced
+   authoritative `game_time` by 24,071 ticks, reached a stone pickaxe through
+   ordinary survival actions, and resumed after one deliberate
+   disconnect/reconnect without a crash or reproducible blocker.
 2. Treat failures from that session as the playable queue. Fix the first common
    player-visible blocker, then rerun the shortest real-client path that
    reproduces it.
@@ -75,15 +74,34 @@ hardening. An already-open lower-priority diff does not override this order.
    Close the remaining claim surfaces (containers, fluids, explosions and
    entity interaction) through a first-class zone protection policy after the
    ordinary break/place slice is client-verified.
-5. Close this owner batch with a 20-minute MCP-driven survival session whose
+5. [x] Close this owner batch with a 20-minute MCP-driven survival session whose
    decisions are made by one fast subagent. Do not use the deterministic
-   scenario runner or operator setup. Treat its visible failures as the next
-   playable queue.
+   scenario runner or operator setup. The run completed; its server profile
+   exposed and closed the ordinary break spike described below.
 6. Keep the rare multi-region save recovery `fsync`/metrics issue documented
    but deferred. Do not resume it unless it becomes ordinary save corruption or
    blocks the playable or plugin path.
 
 ## Recent Evidence
+
+- One real 26.1.2 client completed an unscripted, agent-directed survival run
+  from `game_time=1581` through `25652` without operator commands or a scenario
+  runner. It gathered wood, used the 2x2 and crafting-table interfaces, made
+  wooden and stone pickaxes, mined and explored, respawned after six natural
+  deaths, then deliberately disconnected/reconnected and continued the same
+  world. There was no crash, connection timeout, reliable-command drop, or
+  reproducible gameplay blocker. One narrow-shaft entrapment death did not
+  reproduce and remains a movement watch item; this run does not replace the
+  separate owner-played feel gate.
+
+- The run's server profile caught two normal block breaks at `117-121 ms`
+  post-admission. Every regional break was cloning an 8x8-chunk ownership
+  snapshot for a falling-block check that only reads the edited vertical
+  columns. The regional path now snapshots only chunks containing applied
+  edits, matching the established non-regional footprint. Eleven focused
+  survival-break regressions remain green, including falling sand and relight.
+  A repeated real-client grass break completed with `9.1 ms` total
+  simulation-command work and no slow-command attribution warning.
 
 - Repeated `minecraft_connect` calls no longer start competing login attempts.
   Calling it for the active address is an idempotent no-op; a different address

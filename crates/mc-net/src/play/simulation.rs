@@ -9,7 +9,8 @@ use super::explosions::{
     plan_explosion_candidates, plan_player_explosion_impact,
 };
 use super::falling_blocks::{
-    LandedFallingBlock, is_falling_block_state, plan_falling_block_starts,
+    LandedFallingBlock, falling_block_start_chunks, is_falling_block_state,
+    plan_falling_block_starts,
 };
 use super::inventory::PlayerInventory;
 use super::lighting::{

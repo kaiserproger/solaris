@@ -242,6 +242,13 @@ verification and keep ordinary survival play ahead of rare edge cases.
   p99. One explosion is admitted per world tick even if the owner calls the
   claim path repeatedly. This closes the requested explosion benchmark, while
   fluid and far-travel spikes remain.
+  The autonomous survival profile found two ordinary block breaks spending
+  `117-121 ms` after CPU admission. The regional path copied an entire 8x8-chunk
+  ownership region after every break only to inspect falling blocks above the
+  edited columns. It now snapshots only the chunks containing applied edits.
+  The same real-client break path completed in `9.1 ms` total simulation-command
+  work with no slow-command warning. A separate 49.5 ms breeding spike and the
+  existing fluid/far-travel paths remain open.
 - [ ] Bound breeding and scheduled-block work per tick and move expensive
   preparation off the tick owner. No single animal or block batch may stall
   packet processing.
@@ -267,8 +274,13 @@ verification and keep ordinary survival play ahead of rare edge cases.
   attempts and made the later disconnect look like a respawn/navigation
   failure. Same-address reconnect is now an idempotent no-op; switching servers
   requires an explicit disconnect. A clean agent rerun completed the same
-  natural wood-to-table path without operator setup. The broader unscripted
-  20-minute survival-quality gate remains open.
+  natural wood-to-table path without operator setup. The subsequent unscripted
+  run advanced authoritative `game_time` from `1581` to `25652`, crafted through
+  a stone pickaxe, explored and mined, survived one deliberate
+  disconnect/reconnect, and had no crash, timeout, reliable-command drop, or
+  reproducible gameplay blocker. Six natural deaths were respawned through the
+  ordinary client path; one narrow-shaft entrapment death was not reproduced
+  and remains a watch item rather than a closed movement claim.
 - [x] Accumulate vanilla-style per-chunk `InhabitedTime` while players keep a
   chunk active. The tick owner uses vanilla's strict 128-block chunk-center
   range around non-spectator players, counts each spawning chunk once per game

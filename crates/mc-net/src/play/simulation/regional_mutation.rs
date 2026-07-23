@@ -5,21 +5,24 @@ use super::{
     ChestTransaction, ChestTransactionRequest, CommittedBucketUse, CommittedCampfireUse,
     CommittedSurvivalBreak, CommittedSurvivalPlacement, ContainerDropPlan, ContainerPlayerPlan,
     ContainerXpPlan, FurnaceBlockEntity, FurnaceCommitOutcome, FurnaceTransaction,
-    FurnaceTransactionRequest, HashMap, IncrementalLightSources, Ordering, RegionKey,
-    ResidentBlockEdit, ResidentBlockPrecondition, ScheduledBlockTick, SessionId, SessionRegistry,
+    FurnaceTransactionRequest, HashMap, IncrementalLightSources, Ordering, ResidentBlockEdit,
+    ResidentBlockPrecondition, ScheduledBlockTick, SessionId, SessionRegistry,
     SharedContainerCommit, SimulationCommand, SimulationCommandAttribution,
     SimulationCommandEnvelope, SimulationLaneAttribution, SimulationOwner, SimulationRequestError,
     SimulationResponse, SimulationTickReport, SimulationWorldAccess, SurvivalBreakPlan,
     SurvivalBreakRequest, SurvivalBreakTransaction, SurvivalPlacementPlan,
     SurvivalPlacementTransaction, Vec3, air_state_id, append_block_edit_outcome,
     applied_edits_need_fluid_ticks, command_single_owner_region, dispatch_regional_block_outcome,
-    dispatch_visibility_commands, elapsed_us, is_campfire_block, is_falling_block_state,
-    plan_falling_block_starts, prepare_survival_block_break_plan, publish_regional_light_updates,
-    regional_light_updates, resident_block_edit_outcome, resident_block_edit_result_outcome,
-    resident_block_edits, resident_block_preconditions, schedule_resident_fluid_ticks_near_applied,
-    snapshot_region, valid_survival_break_plan, warn,
+    dispatch_visibility_commands, elapsed_us, falling_block_start_chunks, is_campfire_block,
+    is_falling_block_state, plan_falling_block_starts, prepare_survival_block_break_plan,
+    publish_regional_light_updates, regional_light_updates, resident_block_edit_outcome,
+    resident_block_edit_result_outcome, resident_block_edits, resident_block_preconditions,
+    schedule_resident_fluid_ticks_near_applied, snapshot_region, valid_survival_break_plan, warn,
 };
 use std::collections::BTreeMap;
+
+#[cfg(test)]
+use super::RegionKey;
 
 #[cfg(test)]
 #[derive(Debug, Clone)]
@@ -527,18 +530,10 @@ impl SimulationOwner {
                                     && let Some(entity_type_id) = plan.falling_block_entity_type_id
                                 {
                                     let air = air_state_id(&plan.blocks);
-                                    let root = plan
-                                        .edits
-                                        .first()
-                                        .expect("validated survival break has an edit")
-                                        .pos;
-                                    let post_commit_snapshot = snapshot_region(
-                                        &world_read,
-                                        RegionKey::from_chunk(
-                                            root.x.div_euclid(16),
-                                            root.z.div_euclid(16),
-                                        ),
-                                    );
+                                    let falling_chunks =
+                                        falling_block_start_chunks(&committed.block.applied);
+                                    let post_commit_snapshot =
+                                        world_read.snapshot_chunks(&falling_chunks);
                                     let start_plan = plan_falling_block_starts(
                                         &plan.blocks,
                                         &plan.block_facts,
