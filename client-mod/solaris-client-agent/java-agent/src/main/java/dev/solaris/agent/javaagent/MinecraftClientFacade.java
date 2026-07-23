@@ -379,6 +379,26 @@ public final class MinecraftClientFacade implements ClientFacade {
     public void connect(String host, int port) {
         Minecraft minecraft = Minecraft.getInstance();
         String address = host + ":" + port;
+        ClientPacketListener listener = minecraft.getConnection();
+        boolean activeConnection = listener != null
+            && (
+                listener.getConnection().isConnected()
+                    || listener.getConnection().isConnecting()
+            );
+        ServerData currentServer = minecraft.getCurrentServer();
+        String currentAddress = currentServer == null ? null : currentServer.ip;
+        switch (connectDecision(activeConnection, currentAddress, address)) {
+            case KEEP_CURRENT -> {
+                return;
+            }
+            case REJECT_DIFFERENT -> throw new IllegalStateException(
+                "client is already connected to "
+                    + (currentAddress == null ? "another server" : currentAddress)
+                    + "; disconnect before connecting to " + address
+            );
+            case CONNECT -> {
+            }
+        }
         ServerData serverData = new ServerData("Solaris", address, ServerData.Type.OTHER);
         TransferState transferState = new TransferState(Map.of(), Map.of(), false);
         ConnectScreen.startConnecting(
@@ -389,6 +409,29 @@ public final class MinecraftClientFacade implements ClientFacade {
             false,
             transferState
         );
+    }
+
+    static ConnectDecision connectDecision(
+        boolean activeConnection,
+        String currentAddress,
+        String requestedAddress
+    ) {
+        if (!activeConnection) {
+            return ConnectDecision.CONNECT;
+        }
+        if (
+            currentAddress != null
+                && currentAddress.equalsIgnoreCase(requestedAddress)
+        ) {
+            return ConnectDecision.KEEP_CURRENT;
+        }
+        return ConnectDecision.REJECT_DIFFERENT;
+    }
+
+    enum ConnectDecision {
+        CONNECT,
+        KEEP_CURRENT,
+        REJECT_DIFFERENT
     }
 
     @Override

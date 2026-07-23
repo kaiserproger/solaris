@@ -39,7 +39,11 @@ hardening. An already-open lower-priority diff does not override this order.
 1. Run the requested 20-minute MCP survival session on the current build, with
    one fast subagent making the decisions and no deterministic scenario runner
    or operator setup. Record concrete client-visible failures; an owner-played
-   subjective-feel gate remains separately pending.
+   subjective-feel gate remains separately pending. The focused precursor is
+   closed: on a fresh world the decision agent found and mined a natural jungle
+   log, crafted and placed a crafting table through ordinary client actions,
+   and opened its crafting screen at full health. The complete 20-minute run is
+   still required.
 2. Treat failures from that session as the playable queue. Fix the first common
    player-visible blocker, then rerun the shortest real-client path that
    reproduces it.
@@ -80,6 +84,16 @@ hardening. An already-open lower-priority diff does not override this order.
    blocks the playable or plugin path.
 
 ## Recent Evidence
+
+- Repeated `minecraft_connect` calls no longer start competing login attempts.
+  Calling it for the active address is an idempotent no-op; a different address
+  is rejected until the caller explicitly disconnects. The original autonomous
+  attempt had mistaken this duplicate-login lifecycle for respawn/navigation
+  failure. On a fresh server, three same-address calls retained one session with
+  no rejection or disconnect. A fast decision-agent rerun then found and mined
+  a natural jungle log, crafted planks and a crafting table with normal
+  container clicks, placed it on observed clear ground, and opened the crafting
+  screen with health `20.0`.
 
 - The autonomous survival run's apparent natural-zombie combat failure was in
   the MCP observation boundary, not server combat. The server log had committed

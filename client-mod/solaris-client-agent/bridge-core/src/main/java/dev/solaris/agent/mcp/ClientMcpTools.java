@@ -129,9 +129,9 @@ public final class ClientMcpTools {
             "wait_no_visible_item",
             itemVisibilityWaitSchema()
         ),
-        nonIdempotentControl(
+        control(
             "minecraft_connect",
-            "Connect the real Minecraft client to a server.",
+            "Connect the real Minecraft client to a server. Repeating the active address is a no-op; changing servers requires an explicit disconnect.",
             "connect",
             connectSchema()
         ),

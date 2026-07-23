@@ -335,6 +335,7 @@ final class ClientMcpToolsTest {
         assertFalse(find(tools, "minecraft_respawn").idempotent());
         assertTrue(find(tools, "minecraft_respawn").openWorld());
         assertFalse(find(tools, "minecraft_connect").destructive());
+        assertTrue(find(tools, "minecraft_connect").idempotent());
         assertTrue(find(tools, "minecraft_use_item_on").destructive());
         assertTrue(find(tools, "minecraft_press_inputs").destructive());
         assertTrue(find(tools, "minecraft_select_hotbar_item").destructive());

@@ -257,20 +257,18 @@ verification and keep ordinary survival play ahead of rare edge cases.
   overdue 50 ms tick before its pushed command notification, allowing sustained
   over-budget ticks to starve player transactions. Command readiness now wins
   before the ticker; the broader natural-load responsiveness gate remains.
-- [ ] Make an autonomous MCP survival pass reliably reach the first crafting
-  table without operator commands or deterministic scenarios. A real 26.1.2
-  client stayed connected for `27,490` exposed server ticks, broke and picked up
-  a jungle log, survived save/rejoin, and saw natural passive/hostile spawns,
-  but navigation timed out once, pickup confirmation initially lagged behind
-  the actual pickup, and nine deaths prevented the wood-to-crafting loop from
-  completing. The apparent combat failure was a client-MCP observation race:
-  the server had already committed zombie health `20 -> 19`, while
-  `minecraft_attack_entity_once` returned before the applied entity update.
-  The tool now sends the look rotation first and waits on pushed client-state
-  events for damage or removal. A natural, non-operator zombie returned
-  `confirmed=true` with health `19 -> 18`; an attack from the death screen now
-  fails instead of reporting a false dispatch. Navigation and survival
-  decision quality remain open.
+- [x] Make an autonomous MCP survival pass reliably reach the first crafting
+  table without operator commands or deterministic scenarios. A fresh real
+  26.1.2 client found a natural jungle log, navigated to it, mined and collected
+  it, crafted planks and a crafting table through ordinary container clicks,
+  placed the table on observed clear ground, and opened its crafting screen at
+  full health. The first attempt exposed the decision agent repeatedly calling
+  `minecraft_connect` while already in play, which created duplicate login
+  attempts and made the later disconnect look like a respawn/navigation
+  failure. Same-address reconnect is now an idempotent no-op; switching servers
+  requires an explicit disconnect. A clean agent rerun completed the same
+  natural wood-to-table path without operator setup. The broader unscripted
+  20-minute survival-quality gate remains open.
 - [x] Accumulate vanilla-style per-chunk `InhabitedTime` while players keep a
   chunk active. The tick owner uses vanilla's strict 128-block chunk-center
   range around non-spectator players, counts each spawning chunk once per game

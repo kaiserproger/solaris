@@ -16,6 +16,34 @@ import static org.junit.jupiter.api.Assertions.assertTrue;
 
 final class MinecraftClientFacadeTest {
     @Test
+    void repeatedConnectKeepsTheCurrentServerAndRejectsAnImplicitSwitch() {
+        assertEquals(
+            MinecraftClientFacade.ConnectDecision.CONNECT,
+            MinecraftClientFacade.connectDecision(false, null, "127.0.0.1:25565")
+        );
+        assertEquals(
+            MinecraftClientFacade.ConnectDecision.KEEP_CURRENT,
+            MinecraftClientFacade.connectDecision(
+                true,
+                "LOCALHOST:25565",
+                "localhost:25565"
+            )
+        );
+        assertEquals(
+            MinecraftClientFacade.ConnectDecision.REJECT_DIFFERENT,
+            MinecraftClientFacade.connectDecision(
+                true,
+                "127.0.0.1:25565",
+                "127.0.0.1:25566"
+            )
+        );
+        assertEquals(
+            MinecraftClientFacade.ConnectDecision.REJECT_DIFFERENT,
+            MinecraftClientFacade.connectDecision(true, null, "127.0.0.1:25565")
+        );
+    }
+
+    @Test
     void blockObservationIncludesClientSkyAndBlockLight() throws Exception {
         String source = Files.readString(Path.of(
             "src/main/java/dev/solaris/agent/javaagent/MinecraftClientObservation.java"
