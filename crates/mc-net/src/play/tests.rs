@@ -8505,7 +8505,7 @@ async fn scheduled_button_tick_releases_powered_button() {
     let (_simulation, owner) = simulation_channel();
     let resources = ChunkPipelineResources::with_limits(1, 1);
     let world_writer = world.lock().await;
-    let mut block_tick = Box::pin(owner.run_scheduled_block_ticks_with_budget(
+    let block_tick = owner.run_scheduled_block_ticks_with_budget(
         &config,
         &sessions,
         SimulationWorldAccess {
@@ -8516,12 +8516,10 @@ async fn scheduled_button_tick_releases_powered_button() {
         },
         120,
         1,
-    ));
-    let report = std::future::poll_fn(|cx| match Future::poll(block_tick.as_mut(), cx) {
-        Poll::Ready(report) => Poll::Ready(report),
-        Poll::Pending => panic!("resident scheduled-block commit waited for the world writer"),
-    })
-    .await;
+    );
+    let report = tokio::time::timeout(Duration::from_secs(1), block_tick)
+        .await
+        .expect("resident scheduled-block commit must not wait for the world writer");
     drop(world_writer);
 
     assert_eq!(report.drained, 1);

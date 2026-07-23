@@ -1128,8 +1128,8 @@ impl BoundServer {
                                 &entity_config.block_facts,
                                 &entity_config.blocks,
                                 entity_pathing_materials.as_deref(),
-                            )
-                            .await;
+                        )
+                        .await;
                         continue;
                     }
                     observation = tick_metrics_observations.recv(), if !tick_metrics_observations.is_closed() => {
@@ -1291,14 +1291,14 @@ impl BoundServer {
                     .append(&mut simulation_commands.lane_attribution);
                 simulation_commands.lane_attribution =
                     std::mem::take(&mut pushed_simulation_lane_attribution);
-                let simulation_commands_us = simulation_command_telemetry.elapsed_us;
+                let mut simulation_commands_us = simulation_command_telemetry.elapsed_us;
                 let simulation_command_scope = simulation_command_telemetry.scope.as_str();
-                let simulation_command_cpu_admission_wait_us = simulation_commands
+                let mut simulation_command_cpu_admission_wait_us = simulation_commands
                     .lane_attribution
                     .iter()
                     .map(|attribution| attribution.cpu_admission_wait_us)
                     .sum::<u64>();
-                let simulation_command_post_admission_us = simulation_commands
+                let mut simulation_command_post_admission_us = simulation_commands
                     .lane_attribution
                     .iter()
                     .flat_map(|lane| &lane.commands)
@@ -1500,33 +1500,101 @@ impl BoundServer {
                     .await;
                 let random_tick_us = elapsed_us(started);
 
-                let started = Instant::now();
-                let block_tick = if entity_scheduled_ticks
-                    .as_ref()
-                    .is_some_and(|scheduled_ticks| {
-                        loaded_block_tick_due(scheduled_ticks, &loaded_chunks, tick)
-                    }) {
-                    simulation_owner
-                        .run_scheduled_block_ticks_with_budget(
-                            &entity_config,
-                            &entity_sessions,
-                            play::SimulationWorldAccess {
-                                read: entity_world_read.as_ref(),
-                                mutation: entity_world_mutation.as_ref(),
-                                cpu: Some(&entity_chunk_pipeline_resources),
-                                light: entity_config.block_light.as_ref(),
-                            },
+                let (block_tick, block_tick_us) =
+                    if entity_scheduled_ticks
+                        .as_ref()
+                        .is_some_and(|scheduled_ticks| {
+                            loaded_block_tick_due(scheduled_ticks, &loaded_chunks, tick)
+                        })
+                    {
+                        let started = Instant::now();
+                        let job = spawn_scheduled_block_tick_job(
                             tick,
                             work_budgets.scheduled_ticks,
+                            Arc::clone(&entity_config),
+                            Arc::clone(&entity_sessions),
+                            entity_world_read.clone(),
+                            entity_world_mutation.clone(),
+                            entity_chunk_pipeline_resources.clone(),
+                        );
+                        let (result, mid_tick_commands) =
+                            await_scheduled_block_tick_job_with_commands(
+                                job,
+                                &mut simulation_owner,
+                                &entity_config,
+                                &entity_sessions,
+                                entity_world_read.as_ref(),
+                                entity_world_mutation.as_ref(),
+                                &entity_chunk_pipeline_resources,
+                            )
+                            .await;
+                        simulation_commands_us =
+                            simulation_commands_us.saturating_add(mid_tick_commands.elapsed_us);
+                        simulation_commands.processed = simulation_commands
+                            .processed
+                            .saturating_add(mid_tick_commands.report.processed);
+                        simulation_commands.remaining_depth =
+                            mid_tick_commands.report.remaining_depth;
+                        simulation_command_cpu_admission_wait_us =
+                            simulation_command_cpu_admission_wait_us.saturating_add(
+                                mid_tick_commands
+                                    .report
+                                    .lane_attribution
+                                    .iter()
+                                    .map(|attribution| attribution.cpu_admission_wait_us)
+                                    .sum::<u64>(),
+                            );
+                        simulation_command_post_admission_us = simulation_command_post_admission_us
+                            .saturating_add(
+                                mid_tick_commands
+                                    .report
+                                    .lane_attribution
+                                    .iter()
+                                    .flat_map(|lane| &lane.commands)
+                                    .map(|attribution| attribution.post_admission_command_us)
+                                    .sum::<u64>(),
+                            );
+                        simulation_commands
+                            .lane_attribution
+                            .extend(mid_tick_commands.report.lane_attribution);
+                        let block_tick_us =
+                            elapsed_us(started).saturating_sub(mid_tick_commands.elapsed_us);
+                        let report = match result {
+                            Ok(completed) => {
+                                debug!(
+                                    tick = completed.tick,
+                                    drained = completed.report.drained,
+                                    applied = completed.report.applied,
+                                    elapsed_us = completed.elapsed_us,
+                                    "scheduled block tick job completed"
+                                );
+                                completed.report
+                            }
+                            Err(error) if error.is_cancelled() => {
+                                debug!("scheduled block tick job cancelled");
+                                play::ScheduledBlockTickReport {
+                                    budget: work_budgets.scheduled_ticks.max(1),
+                                    ..play::ScheduledBlockTickReport::default()
+                                }
+                            }
+                            Err(error) => {
+                                warn!(%error, "scheduled block tick job failed");
+                                play::ScheduledBlockTickReport {
+                                    budget: work_budgets.scheduled_ticks.max(1),
+                                    ..play::ScheduledBlockTickReport::default()
+                                }
+                            }
+                        };
+                        (report, block_tick_us)
+                    } else {
+                        (
+                            play::ScheduledBlockTickReport {
+                                budget: work_budgets.scheduled_ticks.max(1),
+                                ..play::ScheduledBlockTickReport::default()
+                            },
+                            0,
                         )
-                        .await
-                } else {
-                    play::ScheduledBlockTickReport {
-                        budget: work_budgets.scheduled_ticks.max(1),
-                        ..play::ScheduledBlockTickReport::default()
-                    }
-                };
-                let block_tick_us = elapsed_us(started);
+                    };
 
                 let started = Instant::now();
                 let fluid_tick = if entity_scheduled_ticks
@@ -3224,6 +3292,98 @@ fn prepare_entity_physics_inputs(
         blocks: Some(Arc::clone(&config.blocks)),
     });
     entity_physics_inputs_from_snapshot(plans, snapshot)
+}
+
+struct CompletedScheduledBlockTicks {
+    tick: u64,
+    report: play::ScheduledBlockTickReport,
+    elapsed_us: u64,
+}
+
+fn spawn_scheduled_block_tick_job(
+    tick: u64,
+    budget: usize,
+    config: Arc<ServerConfig>,
+    sessions: Arc<play::SessionRegistry>,
+    world_read: Option<mc_world::WorldReadView>,
+    world_mutation: Option<mc_world::WorldMutationView>,
+    cpu_resources: ChunkPipelineResources,
+) -> tokio::task::JoinHandle<CompletedScheduledBlockTicks> {
+    let prepare_task = cpu_resources.begin_prepare_task();
+    tokio::spawn(async move {
+        let _prepare_task = prepare_task;
+        let started = Instant::now();
+        let report = play::run_scheduled_block_ticks_background(
+            &config,
+            &sessions,
+            play::SimulationWorldAccess {
+                read: world_read.as_ref(),
+                mutation: world_mutation.as_ref(),
+                cpu: Some(&cpu_resources),
+                light: config.block_light.as_ref(),
+            },
+            tick,
+            budget,
+        )
+        .await;
+        CompletedScheduledBlockTicks {
+            tick,
+            report,
+            elapsed_us: elapsed_us(started),
+        }
+    })
+}
+
+#[derive(Default)]
+struct MidTickSimulationCommands {
+    report: play::SimulationTickReport,
+    elapsed_us: u64,
+}
+
+async fn await_scheduled_block_tick_job_with_commands(
+    mut job: tokio::task::JoinHandle<CompletedScheduledBlockTicks>,
+    simulation_owner: &mut play::SimulationOwner,
+    config: &ServerConfig,
+    sessions: &play::SessionRegistry,
+    world_read: Option<&mc_world::WorldReadView>,
+    world_mutation: Option<&mc_world::WorldMutationView>,
+    cpu_resources: &ChunkPipelineResources,
+) -> (
+    Result<CompletedScheduledBlockTicks, tokio::task::JoinError>,
+    MidTickSimulationCommands,
+) {
+    let mut commands = MidTickSimulationCommands::default();
+    loop {
+        tokio::select! {
+            biased;
+            result = &mut job => return (result, commands),
+            ready = simulation_owner.wait_for_command() => {
+                if !ready {
+                    return (job.await, commands);
+                }
+                let started = Instant::now();
+                let report = simulation_owner
+                    .process_ready_commands_with_world_views(
+                        sessions,
+                        config.world.as_ref(),
+                        play::SimulationWorldAccess {
+                            read: world_read,
+                            mutation: world_mutation,
+                            cpu: Some(cpu_resources),
+                            light: config.block_light.as_ref(),
+                        },
+                        config.block_light.as_deref(),
+                        play::SIMULATION_COMMAND_BATCH_LIMIT,
+                    )
+                    .await;
+                commands.elapsed_us = commands.elapsed_us.saturating_add(elapsed_us(started));
+                commands.report.processed =
+                    commands.report.processed.saturating_add(report.processed);
+                commands.report.remaining_depth = report.remaining_depth;
+                commands.report.lane_attribution.extend(report.lane_attribution);
+            }
+        }
+    }
 }
 
 struct CompletedEntityPhysics {
@@ -5548,6 +5708,152 @@ end
         assert_eq!(completed.tick, 9);
         assert_eq!(completed.expected.len(), 257);
         assert_eq!(completed.steps.len(), 257);
+    }
+
+    #[tokio::test]
+    async fn background_scheduled_blocks_leave_simulation_owner_responsive() {
+        let reports = [
+            report("minecraft:air", &[], &[(0, true, &[])]),
+            report(
+                "minecraft:stone_button",
+                &[
+                    ("face", &["wall"]),
+                    ("facing", &["east"]),
+                    ("powered", &["false", "true"]),
+                ],
+                &[
+                    (
+                        1,
+                        true,
+                        &[("face", "wall"), ("facing", "east"), ("powered", "false")],
+                    ),
+                    (
+                        2,
+                        false,
+                        &[("face", "wall"), ("facing", "east"), ("powered", "true")],
+                    ),
+                ],
+            ),
+        ];
+        let blocks = Arc::new(BlockRegistry::from_report(&reports).unwrap());
+        let position = mc_world::BlockPos { x: 1, y: 64, z: 1 };
+        let chunk_position = mc_world::ChunkPos { x: 0, z: 0 };
+        let mut storage = WorldStorage::in_memory(Arc::clone(&blocks));
+        storage
+            .insert_generated_chunk(
+                chunk_position,
+                mc_world::Chunk::empty(
+                    chunk_position,
+                    mc_world::BlockStateId(0),
+                    Identifier::parse("minecraft:plains").unwrap(),
+                ),
+            )
+            .unwrap();
+        let mut positions = (1..=14)
+            .flat_map(|z| (1..=14).map(move |x| mc_world::BlockPos { x, y: 64, z }))
+            .collect::<Vec<_>>();
+        positions.extend(
+            (1..=6).flat_map(|z| (1..=10).map(move |x| mc_world::BlockPos { x, y: 65, z })),
+        );
+        assert_eq!(positions.len(), 256);
+        for position in positions {
+            storage
+                .set_block_at(position, mc_world::BlockStateId(2))
+                .unwrap();
+            storage
+                .schedule_block_tick(mc_world::ScheduledBlockTick::new(
+                    position,
+                    Identifier::parse("minecraft:stone_button").unwrap(),
+                    9,
+                    0,
+                ))
+                .unwrap();
+        }
+        let world_read = storage.read_view();
+        let world_mutation = storage.mutation_view();
+        let world = Arc::new(Mutex::new(storage));
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(tmp.path().join("dimensions/minecraft/overworld/region")).unwrap();
+        let mut config = save_all_test_config(
+            tmp.path(),
+            Arc::clone(&blocks),
+            Arc::new(ItemRegistry::default()),
+            canonical_entity_types(),
+        );
+        config.world = Some(Arc::clone(&world));
+        let config = Arc::new(config);
+        let sessions = Arc::new(play::SessionRegistry::new());
+        sessions.register_loaded_for_server_test("ScheduledWorker", (0, 0));
+
+        let resources = ChunkPipelineResources::with_limits(1, 1);
+        let admission = sessions
+            .try_begin_scheduled_block_ticks()
+            .expect("first scheduled block admission succeeds");
+        let duplicate = play::run_scheduled_block_ticks_background(
+            &config,
+            &sessions,
+            play::SimulationWorldAccess {
+                read: Some(&world_read),
+                mutation: Some(&world_mutation),
+                cpu: Some(&resources),
+                light: config.block_light.as_ref(),
+            },
+            9,
+            256,
+        )
+        .await;
+        assert_eq!(duplicate.drained, 0);
+        assert_eq!(duplicate.applied, 0);
+        drop(admission);
+
+        let busy_worker = resources.acquire_cpu().await.expect("reserve CPU worker");
+        let block_tick = spawn_scheduled_block_tick_job(
+            9,
+            256,
+            Arc::clone(&config),
+            Arc::clone(&sessions),
+            Some(world_read.clone()),
+            Some(world_mutation.clone()),
+            resources.clone(),
+        );
+
+        let (simulation, mut owner) = play::simulation_channel();
+        let mut barrier = tokio::spawn(async move { simulation.save_barrier(false).await });
+        let mut waiting = Box::pin(await_scheduled_block_tick_job_with_commands(
+            block_tick,
+            &mut owner,
+            &config,
+            &sessions,
+            Some(&world_read),
+            Some(&world_mutation),
+            &resources,
+        ));
+        let barrier_result = tokio::select! {
+            biased;
+            result = &mut waiting => panic!(
+                "scheduled block batch completed before CPU release: {:?}",
+                result.0.map(|completed| completed.report)
+            ),
+            result = &mut barrier => result.unwrap(),
+        };
+        assert!(barrier_result.is_ok());
+
+        drop(busy_worker);
+        let (completed, commands) = waiting.await;
+        let completed = completed.unwrap();
+        eprintln!(
+            "scheduled block background batch: drained={} applied={} elapsed_us={}",
+            completed.report.drained, completed.report.applied, completed.elapsed_us
+        );
+        assert_eq!(commands.report.processed, 1);
+        assert_eq!(commands.report.remaining_depth, 0);
+        assert_eq!(completed.tick, 9);
+        assert_eq!(completed.report.drained, 256);
+        assert_eq!(completed.report.applied, 256);
+        assert_eq!(
+            world.lock().await.get_cached_block(position),
+            Some(mc_world::BlockStateId(1))
+        );
     }
 
     #[test]

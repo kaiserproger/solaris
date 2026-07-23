@@ -167,6 +167,13 @@ and is not startup context.
   8.389 ms to 0.234 ms. The client remained in play with no disconnect,
   reliable-command loss, or runtime work-budget info spam. Representative
   interactive block/menu/combat latency remains open.
+- Scheduled-block planning uses autoscaler CPU admission and the blocking pool.
+  The phase services pushed simulation commands while the job runs, then joins
+  it before fluid or later phases. One shared admission fence covers every
+  entry point. The deterministic 256-button regression proves owner command
+  responsiveness under CPU pressure, duplicate rejection, and complete commit.
+  Its optimized run took `1,666 us`; evidence is
+  `.analysis/codex-logs/scheduled-background-owner-256-o3-final.log`.
 - `7cdd917` fixes the ordinary active-game save path exposed by the natural
   furnace loop. A resident mutation during out-of-lock whole-region encoding
   now skips that Anvil region before filesystem installation and leaves it

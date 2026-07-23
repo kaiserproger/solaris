@@ -54,6 +54,33 @@ impl SessionRegistry {
         .expect("unbounded session registration should not fail")
     }
 
+    #[cfg(test)]
+    pub(crate) fn register_loaded_for_server_test(
+        &self,
+        name: &str,
+        chunk: (i32, i32),
+    ) -> SessionId {
+        let profile = LoggedInProfile {
+            uuid: uuid::Uuid::from_u128(name.bytes().map(u128::from).sum()),
+            name: name.to_string(),
+        };
+        let (tx, _rx) = mpsc::channel(16);
+        let (id, _) = self.register(
+            &profile,
+            chunk,
+            0,
+            HashSet::from([chunk]),
+            tx,
+            PlayerPose::new(
+                f64::from(chunk.0 * mc_world::SECTION_DIM as i32) + 0.5,
+                64.0,
+                f64::from(chunk.1 * mc_world::SECTION_DIM as i32) + 0.5,
+            ),
+        );
+        let _ = self.mark_loaded(id, chunk);
+        id
+    }
+
     pub(in crate::play) fn try_register(
         &self,
         registration: SessionRegistration<'_>,

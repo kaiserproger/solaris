@@ -831,6 +831,15 @@ still uses the ordered durable coordinator transaction because partial
 installation would violate block invariants. Autoscaler scale-down to one CPU
 keeps ordinary groups inline.
 
+The scheduled-block phase starts one bounded background job. Pure snapshot
+planning and sequential regional replanning run on an autoscaler-admitted
+blocking worker, while the simulation owner continues servicing pushed
+commands. The tick does not advance into fluid or later phases until the job
+commits, so scheduled-block ordering remains explicit and its wait is attributed
+to the same tick. A shared admission fence covers both ticker and direct owner
+entry points. Commits keep the same resident/coordinator fences, and shutdown
+cannot cross the phase before the admitted job is joined.
+
 Random-tick planning now partitions the common mutation path before commit.
 Contiguous groups retain global sample order and original indexes for
 deterministic seeds. Each later group is planned from the state published by

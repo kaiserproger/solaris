@@ -3054,6 +3054,7 @@ impl SimulationOwner {
         .await
     }
 
+    #[cfg(test)]
     pub(crate) async fn run_scheduled_block_ticks_with_budget(
         &self,
         config: &crate::server::ServerConfig,
@@ -3063,7 +3064,6 @@ impl SimulationOwner {
         budget: usize,
     ) -> super::ScheduledBlockTickReport {
         super::run_scheduled_block_ticks_owned(
-            &self.authority,
             config,
             sessions,
             access,

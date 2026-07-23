@@ -312,8 +312,17 @@ verification and keep ordinary survival play ahead of rare edge cases.
   or runtime work-budget info spam. This closes the dense entity-read causes;
   scheduled block/fluid work and an interactive menu/block/attack natural-load
   gate remain open.
-- [ ] Bound scheduled-block work per tick and move expensive preparation off
-  the tick owner. No block batch may stall packet processing.
+- [x] Bound scheduled-block work per tick and move expensive preparation off
+  the tick owner. The scheduled-block phase starts one bounded background job
+  and services pushed simulation commands while its autoscaler-admitted worker
+  plans and commits. A shared admission fence rejects overlapping entry points,
+  and the tick does not advance to fluid or later phases before completion. A
+  deterministic regression reserves the only CPU permit, proves an owner
+  command completes before release, rejects duplicate admission, and then
+  commits all 256 due button ticks. The optimized `-O3` gate applied the batch
+  in `1,666 us`. This proves simulation-owner responsiveness, single authority,
+  and same-tick phase ordering; the broader interactive natural-load client
+  gate remains tracked below.
 - [ ] Make animal and hostile movement visually alive: smooth velocity/rotation,
   varied goals, sensible pauses, obstacle stepping, and no unprompted hopping,
   synchronized herds, circular running, diagonal grid motion, or stationary

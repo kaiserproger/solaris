@@ -13,7 +13,7 @@ use mc_entity::{
 use std::cell::RefCell;
 use std::collections::BTreeSet;
 use std::ops::{Deref, DerefMut};
-use std::sync::atomic::{AtomicI32, AtomicU32, AtomicU64, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI32, AtomicU32, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Mutex, MutexGuard};
 
 mod campfire_authority;
@@ -477,6 +477,7 @@ pub(crate) struct SessionRegistry {
     pressure_observation: Arc<SessionPressureObservation>,
     outbound_pressure: Arc<OutboundPressureMetrics>,
     world_time: AtomicU64,
+    scheduled_block_tick_in_flight: AtomicBool,
     players_sleeping_percentage: AtomicU32,
     entity_lifecycle_tick: AtomicU64,
     simulation_tick_sender: tokio::sync::watch::Sender<u64>,
@@ -773,6 +774,7 @@ impl SessionRegistry {
             pressure_observation,
             outbound_pressure: Arc::new(OutboundPressureMetrics::default()),
             world_time: AtomicU64::new(0),
+            scheduled_block_tick_in_flight: AtomicBool::new(false),
             players_sleeping_percentage: AtomicU32::new(DEFAULT_PLAYERS_SLEEPING_PERCENTAGE),
             entity_lifecycle_tick: AtomicU64::new(0),
             simulation_tick_sender,
@@ -1701,6 +1703,29 @@ impl SessionRegistry {
     #[cfg(test)]
     fn terrain_pathing_entity_count(&self) -> usize {
         self.simulation_inputs.terrain_pathing_entities().len()
+    }
+}
+
+pub(crate) struct ScheduledBlockTickAdmission<'a> {
+    in_flight: &'a AtomicBool,
+}
+
+impl Drop for ScheduledBlockTickAdmission<'_> {
+    fn drop(&mut self) {
+        self.in_flight.store(false, Ordering::Release);
+    }
+}
+
+impl SessionRegistry {
+    pub(crate) fn try_begin_scheduled_block_ticks(
+        &self,
+    ) -> Option<ScheduledBlockTickAdmission<'_>> {
+        self.scheduled_block_tick_in_flight
+            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+            .ok()
+            .map(|_| ScheduledBlockTickAdmission {
+                in_flight: &self.scheduled_block_tick_in_flight,
+            })
     }
 }
 

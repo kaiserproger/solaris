@@ -958,6 +958,15 @@ hardening. An already-open lower-priority diff does not override this order.
   measured `0.36` blocks of horizontal travel, and observed it remain underwater
   at `y=62.50..62.57`; the client stayed connected. The fixture also exposed a
   separate scheduled-fluid backlog, recorded in the owner performance queue.
+- Scheduled-block snapshot planning runs on an autoscaler-admitted blocking
+  worker. The scheduled-block phase services pushed simulation commands while
+  that bounded job is active, but does not advance into fluid or later phases
+  before the job commits. A shared admission fence rejects overlapping entry
+  points. A deterministic 256-button regression held the only CPU permit,
+  completed an owner command before release, rejected duplicate admission, and
+  then committed all ticks. The optimized `-O3` batch took `1,666 us`. This
+  closes scheduled-block owner starvation, not the separate full interactive
+  natural-load client gate.
 
 ## Manual And Agent Gates
 

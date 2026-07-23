@@ -249,7 +249,7 @@ pub struct PlayerAttackObservation {
 }
 pub(crate) use simulation::{
     SIMULATION_COMMAND_BATCH_LIMIT, SimulationHandle, SimulationOwner, SimulationSaveSnapshot,
-    simulation_channel_with_explosion_seed,
+    SimulationTickReport, simulation_channel_with_explosion_seed,
 };
 pub(crate) use spawn::prepare_spawn_chunk;
 
@@ -9079,6 +9079,59 @@ fn plan_scheduled_block_tick_edits(
     plan_scheduled_block_tick_edits_with_blocks(&config.blocks, snapshot, ticks)
 }
 
+async fn plan_scheduled_block_regions_off_owner(
+    blocks: Arc<BlockRegistry>,
+    snapshot: mc_world::WorldReadSnapshot,
+    region_ticks: Vec<(RegionKey, Vec<ScheduledBlockTick>)>,
+    cpu_resources: Option<&ChunkPipelineResources>,
+) -> Result<Vec<ScheduledBlockRegionPlan>, ()> {
+    let permit = match cpu_resources {
+        Some(resources) => match resources.acquire_cpu().await {
+            Ok(permit) => Some(permit),
+            Err(error) => {
+                warn!(%error, "scheduled block planning CPU admission closed");
+                return Err(());
+            }
+        },
+        None => None,
+    };
+    tokio::task::spawn_blocking(move || {
+        let _permit = permit;
+        region_ticks
+            .into_iter()
+            .map(|(region, due)| ScheduledBlockRegionPlan {
+                region,
+                plan: plan_scheduled_block_tick_edits_with_blocks(&blocks, &snapshot, &due)
+                    .expect("simple scheduled block region has a plan"),
+                due,
+            })
+            .collect()
+    })
+    .await
+    .map_err(|error| {
+        warn!(%error, "scheduled block planning worker failed");
+    })
+}
+
+async fn plan_scheduled_block_region_off_owner(
+    blocks: Arc<BlockRegistry>,
+    snapshot: mc_world::WorldReadSnapshot,
+    region: RegionKey,
+    due: Vec<ScheduledBlockTick>,
+    cpu_resources: Option<&ChunkPipelineResources>,
+) -> Result<ScheduledBlockRegionPlan, ()> {
+    let mut plans = plan_scheduled_block_regions_off_owner(
+        blocks,
+        snapshot,
+        vec![(region, due)],
+        cpu_resources,
+    )
+    .await?;
+    Ok(plans
+        .pop()
+        .expect("one scheduled block region produces one plan"))
+}
+
 fn requeue_stale_scheduled_block_ticks(
     storage: &mut mc_world::WorldStorage,
     ticks: &[ScheduledBlockTick],
@@ -9428,8 +9481,26 @@ async fn commit_scheduled_block_region_fanout(
     Ok((outcome, fallback_due))
 }
 
+pub(crate) async fn run_scheduled_block_ticks_background(
+    config: &ServerConfig,
+    sessions: &SessionRegistry,
+    access: SimulationWorldAccess<'_>,
+    world_tick: u64,
+    budget: usize,
+) -> ScheduledBlockTickReport {
+    run_scheduled_block_ticks_owned(
+        config,
+        sessions,
+        access,
+        #[cfg(test)]
+        None,
+        world_tick,
+        budget,
+    )
+    .await
+}
+
 async fn run_scheduled_block_ticks_owned(
-    _authority: &simulation::SimulationAuthority,
     config: &ServerConfig,
     sessions: &SessionRegistry,
     access: SimulationWorldAccess<'_>,
@@ -9441,6 +9512,12 @@ async fn run_scheduled_block_ticks_owned(
     let world_mutation = access.mutation;
     let cpu_resources = access.cpu;
     let budget = budget.max(1);
+    let Some(_admission) = sessions.try_begin_scheduled_block_ticks() else {
+        return ScheduledBlockTickReport {
+            budget,
+            ..ScheduledBlockTickReport::default()
+        };
+    };
     let Some(world) = config.world.as_ref() else {
         return ScheduledBlockTickReport {
             budget,
@@ -9528,17 +9605,22 @@ async fn run_scheduled_block_ticks_owned(
                 region_ticks.push((region, vec![tick]));
             }
         }
-        let mut region_plans = Some(
-            region_ticks
-                .into_iter()
-                .map(|(region, due)| ScheduledBlockRegionPlan {
-                    region,
-                    plan: plan_scheduled_block_tick_edits(config, &snapshot, &due)
-                        .expect("simple scheduled block region has a plan"),
-                    due,
-                })
-                .collect::<Vec<_>>(),
-        );
+        let mut region_plans = match plan_scheduled_block_regions_off_owner(
+            Arc::clone(&config.blocks),
+            snapshot.clone(),
+            region_ticks,
+            cpu_resources,
+        )
+        .await
+        {
+            Ok(plans) => Some(plans),
+            Err(()) => {
+                return ScheduledBlockTickReport {
+                    budget,
+                    ..ScheduledBlockTickReport::default()
+                };
+            }
+        };
         let mut journal_failed = false;
         let can_fanout = cpu_resources.is_some_and(|resources| resources.cpu_limit() > 1)
             && region_plans.as_ref().is_some_and(|plans| {
@@ -9587,8 +9669,20 @@ async fn run_scheduled_block_ticks_owned(
                 let region_due = planned.due;
                 let current_snapshot =
                     world_read.snapshot_chunks(&scheduled_block_planning_chunks(&region_due));
-                let plan = plan_scheduled_block_tick_edits(config, &current_snapshot, &region_due)
-                    .expect("simple scheduled block region has a plan");
+                let planned = match plan_scheduled_block_region_off_owner(
+                    Arc::clone(&config.blocks),
+                    current_snapshot,
+                    planned.region,
+                    region_due,
+                    cpu_resources,
+                )
+                .await
+                {
+                    Ok(planned) => planned,
+                    Err(()) => break,
+                };
+                let region_due = planned.due;
+                let plan = planned.plan;
                 if plan.edits.is_empty()
                     && scheduled_block_region_plan_fits(planned.region, &plan)
                     && let Some((edits, preconditions)) =
@@ -9811,8 +9905,14 @@ async fn run_scheduled_block_ticks_owned(
                 due.clear();
             }
         }
-        let mut storage = world.lock().await;
         for tick in &due {
+            let mut tick_outcome = BlockEditBatchOutcome::default();
+            let mut storage = crate::lock_metrics::timed_guard(
+                crate::lock_metrics::LockMetricKind::WorldStorage,
+                "scheduled special block tick apply",
+                Instant::now(),
+                world.lock().await,
+            );
             let Some(state_id) = storage.get_cached_block(tick.pos) else {
                 continue;
             };
@@ -9853,10 +9953,12 @@ async fn run_scheduled_block_ticks_owned(
                 continue;
             };
             for edit in edits {
-                apply_block_edit_to_storage(&mut storage, table, &edit, &mut outcome);
+                apply_block_edit_to_storage(&mut storage, table, &edit, &mut tick_outcome);
             }
+            schedule_leaf_ticks_near_applied(&mut storage, world_tick, &tick_outcome.applied);
+            drop(storage);
+            append_resident_block_outcome(&mut outcome, tick_outcome);
         }
-        schedule_leaf_ticks_near_applied(&mut storage, world_tick, &outcome.applied);
     }
     for update in &hopper_updates {
         let dispatches = match update {
