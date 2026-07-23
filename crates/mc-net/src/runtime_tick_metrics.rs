@@ -9,6 +9,7 @@ pub(crate) const DEFAULT_RUNTIME_TICK_METRICS_CAPACITY: usize = 1_200;
 pub(crate) struct RuntimeTickSample {
     pub(crate) tick_us: u64,
     pub(crate) world_time_us: u64,
+    pub(crate) sheep_grazing_us: u64,
     pub(crate) animal_breeding_us: u64,
     pub(crate) hostile_attacks_us: u64,
     pub(crate) entity_goals_us: u64,
@@ -38,6 +39,7 @@ pub struct RuntimeTickPercentiles {
     pub observer_skipped_windows: u64,
     pub tick: RuntimeLatencyPercentiles,
     pub world_time: RuntimeLatencyPercentiles,
+    pub sheep_grazing: RuntimeLatencyPercentiles,
     pub animal_breeding: RuntimeLatencyPercentiles,
     pub hostile_attacks: RuntimeLatencyPercentiles,
     pub entity_goals: RuntimeLatencyPercentiles,
@@ -220,6 +222,7 @@ impl RuntimeTickMetricsWindow {
             observer_skipped_windows: 0,
             tick: Self::percentiles(samples, |sample| sample.tick_us),
             world_time: Self::percentiles(samples, |sample| sample.world_time_us),
+            sheep_grazing: Self::percentiles(samples, |sample| sample.sheep_grazing_us),
             animal_breeding: Self::percentiles(samples, |sample| sample.animal_breeding_us),
             hostile_attacks: Self::percentiles(samples, |sample| sample.hostile_attacks_us),
             entity_goals: Self::percentiles(samples, |sample| sample.entity_goals_us),
@@ -269,16 +272,17 @@ mod tests {
         RuntimeTickSample {
             tick_us: base_us,
             world_time_us: base_us + 1,
-            animal_breeding_us: base_us + 2,
-            hostile_attacks_us: base_us + 3,
-            entity_goals_us: base_us + 4,
-            entity_physics_us: base_us + 5,
-            entity_dispatch_us: base_us + 6,
-            campfire_tick_us: base_us + 7,
-            entity_save_us: base_us + 8,
-            random_tick_us: base_us + 9,
-            block_tick_us: base_us + 10,
-            fluid_tick_us: base_us + 11,
+            sheep_grazing_us: base_us + 2,
+            animal_breeding_us: base_us + 3,
+            hostile_attacks_us: base_us + 4,
+            entity_goals_us: base_us + 5,
+            entity_physics_us: base_us + 6,
+            entity_dispatch_us: base_us + 7,
+            campfire_tick_us: base_us + 8,
+            entity_save_us: base_us + 9,
+            random_tick_us: base_us + 10,
+            block_tick_us: base_us + 11,
+            fluid_tick_us: base_us + 12,
         }
     }
 
@@ -320,16 +324,17 @@ mod tests {
         let snapshot = window.snapshot().expect("recorded window");
         assert_eq!(snapshot.tick.p50_us, 100);
         assert_eq!(snapshot.world_time.p50_us, 101);
-        assert_eq!(snapshot.animal_breeding.p50_us, 102);
-        assert_eq!(snapshot.hostile_attacks.p50_us, 103);
-        assert_eq!(snapshot.entity_goals.p50_us, 104);
-        assert_eq!(snapshot.entity_physics.p50_us, 105);
-        assert_eq!(snapshot.entity_dispatch.p50_us, 106);
-        assert_eq!(snapshot.campfire_tick.p50_us, 107);
-        assert_eq!(snapshot.entity_save.p50_us, 108);
-        assert_eq!(snapshot.random_tick.p50_us, 109);
-        assert_eq!(snapshot.block_tick.p50_us, 110);
-        assert_eq!(snapshot.fluid_tick.p50_us, 111);
+        assert_eq!(snapshot.sheep_grazing.p50_us, 102);
+        assert_eq!(snapshot.animal_breeding.p50_us, 103);
+        assert_eq!(snapshot.hostile_attacks.p50_us, 104);
+        assert_eq!(snapshot.entity_goals.p50_us, 105);
+        assert_eq!(snapshot.entity_physics.p50_us, 106);
+        assert_eq!(snapshot.entity_dispatch.p50_us, 107);
+        assert_eq!(snapshot.campfire_tick.p50_us, 108);
+        assert_eq!(snapshot.entity_save.p50_us, 109);
+        assert_eq!(snapshot.random_tick.p50_us, 110);
+        assert_eq!(snapshot.block_tick.p50_us, 111);
+        assert_eq!(snapshot.fluid_tick.p50_us, 112);
     }
 
     #[test]

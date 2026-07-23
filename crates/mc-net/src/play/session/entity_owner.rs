@@ -720,8 +720,10 @@ impl EntityOwnerAccess {
     pub(super) fn visit_sheep_entities_for_ids(
         &self,
         ids: &HashSet<EntityId>,
-        mut visitor: impl FnMut(mc_entity::EntityView<'_>),
+        mut visitor: impl FnMut(&EntitySnapshot),
     ) {
+        #[cfg(test)]
+        self.record_owner_request();
         for snapshot in owner_result(self.handle.snapshots_for_ids(ids))
             .into_iter()
             .filter(|snapshot| {
@@ -732,7 +734,7 @@ impl EntityOwnerAccess {
                         .is_some_and(|animal| animal.sheep_wool.is_some())
             })
         {
-            visitor(entity_snapshot_view(&snapshot));
+            visitor(&snapshot);
         }
     }
 }

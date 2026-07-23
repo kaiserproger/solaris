@@ -1305,7 +1305,8 @@ impl BoundServer {
                         tick,
                     )
                     .await;
-                let mut animal_breeding_us = elapsed_us(started);
+                let sheep_grazing_us = elapsed_us(started);
+                let mut animal_breeding_us = 0;
                 let physics_was_in_flight = entity_physics_job.is_some();
                 let started = Instant::now();
                 let queries = if physics_was_in_flight {
@@ -1336,7 +1337,7 @@ impl BoundServer {
                         &entity_sessions,
                         ANIMAL_BREEDING_TICK_INTERVAL_TICKS,
                     );
-                    animal_breeding_us = animal_breeding_us.saturating_add(elapsed_us(started));
+                    animal_breeding_us = elapsed_us(started);
                 }
                 let entity_query_count = queries.len();
                 let (steps, entity_physics_us, entity_dispatch_us) = if physics_was_in_flight {
@@ -1537,23 +1538,10 @@ impl BoundServer {
 
                 let tick_us = elapsed_us(tick_started)
                     .saturating_add(simulation_command_telemetry.off_tick_elapsed_us);
-                let attributed_tick_us = simulation_commands_us
-                    .saturating_add(world_time_us)
-                    .saturating_add(animal_breeding_us)
-                    .saturating_add(hostile_attacks_us)
-                    .saturating_add(entity_goals_us)
-                    .saturating_add(entity_physics_us)
-                    .saturating_add(entity_dispatch_us)
-                    .saturating_add(campfire_tick_us)
-                    .saturating_add(furnace_tick_us)
-                    .saturating_add(entity_save_us)
-                    .saturating_add(random_tick_us)
-                    .saturating_add(block_tick_us)
-                    .saturating_add(fluid_tick_us);
-                let unattributed_tick_us = tick_us.saturating_sub(attributed_tick_us);
                 let current_tick_sample = RuntimeTickSample {
                     tick_us,
                     world_time_us,
+                    sheep_grazing_us,
                     animal_breeding_us,
                     hostile_attacks_us,
                     entity_goals_us,
@@ -1565,6 +1553,12 @@ impl BoundServer {
                     block_tick_us,
                     fluid_tick_us,
                 };
+                let attributed_tick_us = runtime_attributed_tick_us(
+                    &current_tick_sample,
+                    simulation_commands_us,
+                    furnace_tick_us,
+                );
+                let unattributed_tick_us = tick_us.saturating_sub(attributed_tick_us);
                 tick_metrics.record(current_tick_sample);
                 scheduled_budget_exhausted_since_publish |=
                     block_tick.budget_exhausted || fluid_tick.budget_exhausted;
@@ -1608,6 +1602,10 @@ impl BoundServer {
                             world_time_p95_us = percentiles.world_time.p95_us,
                             world_time_p99_us = percentiles.world_time.p99_us,
                             world_time_max_us = percentiles.world_time.max_us,
+                            sheep_grazing_p50_us = percentiles.sheep_grazing.p50_us,
+                            sheep_grazing_p95_us = percentiles.sheep_grazing.p95_us,
+                            sheep_grazing_p99_us = percentiles.sheep_grazing.p99_us,
+                            sheep_grazing_max_us = percentiles.sheep_grazing.max_us,
                             animal_breeding_p50_us = percentiles.animal_breeding.p50_us,
                             animal_breeding_p95_us = percentiles.animal_breeding.p95_us,
                             animal_breeding_p99_us = percentiles.animal_breeding.p99_us,
@@ -1661,6 +1659,7 @@ impl BoundServer {
                             world_time,
                             tick_us,
                             world_time_us,
+                            sheep_grazing_us,
                             animal_breeding_us,
                             hostile_attacks_us,
                             entity_goals_us,
@@ -1779,6 +1778,7 @@ impl BoundServer {
                             world_time,
                             tick_us,
                             world_time_us,
+                            sheep_grazing_us,
                             animal_breeding_us,
                             hostile_attacks_us,
                             entity_goals_us,
@@ -2971,6 +2971,31 @@ async fn forward_slow_client_sheds_to_runtime_control(
 
 fn is_slow_tick(tick_us: u64, policy: RuntimeMetricsPolicy) -> bool {
     policy.slow_tick_ms > 0 && tick_us >= policy.slow_tick_ms.saturating_mul(1_000)
+}
+
+fn runtime_attributed_tick_us(
+    sample: &RuntimeTickSample,
+    simulation_commands_us: u64,
+    furnace_tick_us: u64,
+) -> u64 {
+    [
+        simulation_commands_us,
+        sample.world_time_us,
+        sample.sheep_grazing_us,
+        sample.animal_breeding_us,
+        sample.hostile_attacks_us,
+        sample.entity_goals_us,
+        sample.entity_physics_us,
+        sample.entity_dispatch_us,
+        sample.campfire_tick_us,
+        furnace_tick_us,
+        sample.entity_save_us,
+        sample.random_tick_us,
+        sample.block_tick_us,
+        sample.fluid_tick_us,
+    ]
+    .into_iter()
+    .fold(0, u64::saturating_add)
 }
 
 async fn run_console_commands(
@@ -5883,12 +5908,34 @@ end
     }
 
     #[test]
+    fn runtime_tick_attribution_includes_sheep_grazing() {
+        let sample = RuntimeTickSample {
+            tick_us: 1_000,
+            world_time_us: 0,
+            sheep_grazing_us: 123,
+            animal_breeding_us: 0,
+            hostile_attacks_us: 0,
+            entity_goals_us: 0,
+            entity_physics_us: 0,
+            entity_dispatch_us: 0,
+            campfire_tick_us: 0,
+            entity_save_us: 0,
+            random_tick_us: 0,
+            block_tick_us: 0,
+            fluid_tick_us: 0,
+        };
+
+        assert_eq!(runtime_attributed_tick_us(&sample, 7, 11), 141);
+    }
+
+    #[test]
     fn runtime_work_input_uses_the_exact_pushed_percentile_window() {
         let mut window = RuntimeTickMetricsWindow::with_capacity(4);
         for _ in 0..3 {
             window.record(RuntimeTickSample {
                 tick_us: 10_000,
                 world_time_us: 10,
+                sheep_grazing_us: 10,
                 animal_breeding_us: 10,
                 hostile_attacks_us: 10,
                 entity_goals_us: 1_000,
@@ -5904,6 +5951,7 @@ end
         let spike = RuntimeTickSample {
             tick_us: 90_000,
             world_time_us: 10,
+            sheep_grazing_us: 10,
             animal_breeding_us: 10,
             hostile_attacks_us: 10,
             entity_goals_us: 40_000,

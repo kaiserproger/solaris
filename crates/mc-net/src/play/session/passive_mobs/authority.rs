@@ -431,38 +431,42 @@ impl SessionRegistry {
     ) -> SheepGrazingPlan {
         let (_, loaded_entity_ids) = self.simulation_inputs.active_entity_candidates();
         let mut entities = self.lock_entities("snapshot sheep grazing candidates");
-        #[cfg(test)]
-        self.pause_during_sheep_grazing_plan_for_test();
         let mut sheep_ids = Vec::new();
         entities.visit_sheep_entities_for_ids(&loaded_entity_ids, |entity| {
             #[cfg(test)]
             self.sheep_grazing_entity_visits
                 .fetch_add(1, Ordering::Relaxed);
             if let Some(animal) = entity.animal {
-                sheep_ids.push((entity.id, animal.is_baby()));
+                sheep_ids.push(GrazingSheep {
+                    expected: entity.clone(),
+                    is_baby: animal.is_baby(),
+                });
             }
         });
-        let sheep = sheep_ids
+        #[cfg(test)]
+        self.pause_during_sheep_grazing_plan_for_test();
+        let mut advance = advance_sheep_grazing(tick, &sheep_ids);
+        let updates = advance
+            .timer_updates
             .into_iter()
-            .filter_map(|(entity_id, is_baby)| {
-                entities
-                    .snapshot(entity_id)
-                    .map(|expected| GrazingSheep { expected, is_baby })
+            .map(|update| {
+                let mut next = update.expected.clone();
+                next.retained.sheep_grazing_ticks = update.remaining;
+                (update.expected, next)
             })
             .collect::<Vec<_>>();
-        let mut advance = advance_sheep_grazing(tick, &sheep);
-        let mut applied_updates = HashSet::new();
-        for update in advance.timer_updates {
-            let mut next = update.expected.clone();
-            next.retained.sheep_grazing_ticks = update.remaining;
-            if entities.replace_snapshot_if_current(update.expected, next.clone()) {
-                applied_updates.insert(next.id);
-            }
+        let applied_updates = updates
+            .iter()
+            .map(|(_, next)| next.id)
+            .collect::<HashSet<_>>();
+        if !updates.is_empty() && !entities.replace_snapshots_if_current(updates) {
+            advance.plan.actions.clear();
+        } else {
+            advance
+                .plan
+                .actions
+                .retain(|candidate| applied_updates.contains(&candidate.entity_id));
         }
-        advance
-            .plan
-            .actions
-            .retain(|candidate| applied_updates.contains(&candidate.entity_id));
         advance.plan
     }
 

@@ -1535,6 +1535,112 @@ fn sheep_grazing_plan_only_visits_loaded_sheep() {
 }
 
 #[test]
+fn sheep_grazing_plan_batches_timer_updates() {
+    let registry = SessionRegistry::new();
+    let player = register_test_session(&registry, "GrazingPlanBatchAlice");
+    assert!(registry.mark_loaded(player, (0, 0)).is_empty());
+    for x in [0.5, 1.5] {
+        registry.spawn_command_entity(
+            &SimulationAuthority::for_test(),
+            4,
+            "minecraft:sheep".to_owned(),
+            Vec3::new(x, 64.0, 0.5),
+        );
+    }
+    let entity_ids = registry
+        .persisted_entity_records()
+        .into_iter()
+        .map(|record| record.snapshot.id)
+        .collect::<Vec<_>>();
+    for entity_id in &entity_ids {
+        assert!(registry.set_sheep_grazing_ticks_for_test(*entity_id, Some(10)));
+    }
+    registry.entities.reset_owner_requests_for_test();
+
+    let plan = registry.plan_sheep_grazing(&SimulationAuthority::for_test(), 1);
+
+    assert!(plan.starts.is_empty());
+    assert!(plan.actions.is_empty());
+    assert_eq!(
+        registry.entities.owner_requests_for_test(),
+        2,
+        "one selected read and one conditional batch update"
+    );
+    assert!(
+        registry
+            .persisted_entity_records()
+            .into_iter()
+            .filter(|record| entity_ids.contains(&record.snapshot.id))
+            .all(|record| record.snapshot.retained.sheep_grazing_ticks == Some(9))
+    );
+}
+
+#[test]
+fn sheep_grazing_plan_rejects_the_whole_stale_timer_batch() {
+    let registry = Arc::new(SessionRegistry::new());
+    let player = register_test_session(&registry, "GrazingPlanStaleAlice");
+    assert!(registry.mark_loaded(player, (0, 0)).is_empty());
+    for x in [0.5, 1.5] {
+        registry.spawn_command_entity(
+            &SimulationAuthority::for_test(),
+            4,
+            "minecraft:sheep".to_owned(),
+            Vec3::new(x, 64.0, 0.5),
+        );
+    }
+    let entity_ids = registry
+        .persisted_entity_records()
+        .into_iter()
+        .map(|record| record.snapshot.id)
+        .collect::<Vec<_>>();
+    for entity_id in &entity_ids {
+        assert!(registry.set_sheep_grazing_ticks_for_test(*entity_id, Some(5)));
+    }
+    let (reached_tx, reached_rx) = std::sync::mpsc::channel();
+    let (resume_tx, resume_rx) = std::sync::mpsc::channel();
+    *registry
+        .sheep_grazing_plan_probe
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(SheepGrazingPlanProbe {
+        reached: reached_tx,
+        resume: resume_rx,
+    });
+
+    let planning_registry = Arc::clone(&registry);
+    let planning = std::thread::spawn(move || {
+        planning_registry.plan_sheep_grazing(&SimulationAuthority::for_test(), 1)
+    });
+    reached_rx
+        .recv_timeout(Duration::from_secs(1))
+        .expect("grazing plan captured its selected snapshots");
+    assert!(registry.set_sheep_grazing_ticks_for_test(entity_ids[0], Some(10)));
+    resume_tx.send(()).expect("release grazing batch commit");
+    let plan = planning.join().expect("grazing planner joins");
+
+    assert!(
+        plan.actions.is_empty(),
+        "a stale all-or-nothing timer batch must not publish an eat action"
+    );
+    let timers = registry
+        .persisted_entity_records()
+        .into_iter()
+        .filter(|record| entity_ids.contains(&record.snapshot.id))
+        .map(|record| {
+            (
+                record.snapshot.id,
+                record.snapshot.retained.sheep_grazing_ticks,
+            )
+        })
+        .collect::<HashMap<_, _>>();
+    assert_eq!(timers[&entity_ids[0]], Some(10));
+    assert_eq!(
+        timers[&entity_ids[1]],
+        Some(5),
+        "the current sheep must not be partially decremented"
+    );
+}
+
+#[test]
 fn off_phase_hostile_is_not_materialized_as_attack_candidate() {
     let registry = SessionRegistry::new();
     let player = register_test_session(&registry, "OffPhaseHostileAlice");

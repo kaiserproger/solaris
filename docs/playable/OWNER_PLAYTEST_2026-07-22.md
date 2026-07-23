@@ -247,11 +247,15 @@ verification and keep ordinary survival play ahead of rare edge cases.
   ownership region after every break only to inspect falling blocks above the
   edited columns. It now snapshots only the chunks containing applied edits.
   The same real-client break path completed in `9.1 ms` total simulation-command
-  work with no slow-command warning. A separate 49.5 ms breeding spike and the
-  existing fluid/far-travel paths remain open.
-- [ ] Bound breeding and scheduled-block work per tick and move expensive
-  preparation off the tick owner. No single animal or block batch may stall
-  packet processing.
+  work with no slow-command warning. The apparent `49.5 ms` breeding spike was
+  separately traced to sheep grazing issuing one synchronous timer mutation per
+  sheep. Grazing now uses one selected read and one conditional timer-update
+  batch, while telemetry reports grazing and breeding separately. A fresh
+  1,020-tick real-client run with 11-16 visible natural entities emitted no
+  over-budget tick warning. Fluid, far-travel, and scheduled-block spikes remain
+  open.
+- [ ] Bound scheduled-block work per tick and move expensive preparation off
+  the tick owner. No block batch may stall packet processing.
 - [ ] Make animal and hostile movement visually alive: smooth velocity/rotation,
   varied goals, sensible pauses, obstacle stepping, and no unprompted hopping,
   synchronized herds, circular running, diagonal grid motion, or stationary
@@ -304,6 +308,15 @@ verification and keep ordinary survival play ahead of rare edge cases.
 
 The 2026-07-22 survival-fix checkpoint passed the full workspace test suite,
 workspace clippy with warnings denied, formatting, and `xtask code-health`.
+
+The 2026-07-23 sheep-grazing checkpoint passed all 1,707 `mc-net` tests,
+workspace clippy with warnings denied, formatting, and `xtask code-health`.
+Independent review requested stale all-or-nothing timer coverage and an exact
+tick-attribution assertion; both were added and passed. The workspace test run
+reached an unrelated existing persistence harness failure:
+`place_dirt_persists_through_flush_to_disk` consumed a block update for
+`(0,84,0)` while waiting for `(0,85,0)`. The grazing-focused and crate-wide
+gates remain green; this is not recorded as a green workspace-test gate.
 
 The 2026-07-22 tree/decorations checkpoint passed the full workspace test suite,
 workspace clippy with warnings denied, the external worldgen harness,

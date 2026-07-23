@@ -103,6 +103,16 @@ hardening. An already-open lower-priority diff does not override this order.
   A repeated real-client grass break completed with `9.1 ms` total
   simulation-command work and no slow-command attribution warning.
 
+- The profile's apparent `49.5 ms` breeding spike was sheep grazing: the
+  combined timer included both passes, and grazing performed one synchronous
+  regional-owner timer mutation per active sheep. Grazing now reuses the
+  selected sheep snapshots and applies all timer changes through one
+  conditional batch. Runtime telemetry reports `sheep_grazing_us` separately
+  from `animal_breeding_us`. Focused tests prove two sheep use one selected read
+  plus one batch mutation. A fresh real-client run kept natural passive load
+  visible for 1,020 client ticks, grew from 11 to 16 visible entities, and
+  emitted no over-budget tick warning.
+
 - Repeated `minecraft_connect` calls no longer start competing login attempts.
   Calling it for the active address is an idempotent no-op; a different address
   is rejected until the caller explicitly disconnects. The original autonomous
