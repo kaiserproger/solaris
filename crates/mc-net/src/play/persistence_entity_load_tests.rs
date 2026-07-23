@@ -230,6 +230,45 @@ fn empty_checkpoint_round_trips_its_authoritative_lifecycle_clock() {
 }
 
 #[test]
+fn retained_wander_state_loads_before_pause_fields_existed() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut entity = persisted_entity(42, uuid::Uuid::from_u128(42));
+    let mut retained_state = mc_entity::EntityRetainedState::default();
+    retained_state.spawn_tick = 77;
+    retained_state.item_pickup_ready_tick = Some(207);
+    let mut retained = serde_json::to_value(retained_state).unwrap();
+    let path = retained["path"]
+        .as_object_mut()
+        .expect("retained path is a JSON object");
+    path.remove("target_reached");
+    path.remove("resume_tick");
+    serde_json::from_value::<mc_entity::EntityRetainedState>(retained.clone())
+        .expect("legacy retained path fields use defaults");
+    set_entity_field(
+        &mut entity,
+        ENTITY_RETAINED_STATE_FIELD,
+        Tag::String(serde_json::to_string(&retained).unwrap()),
+    );
+    write_existing_gzip_file(
+        tmp.path(),
+        &versioned_entities_root(ENTITY_FORMAT_VERSION, vec![entity]),
+    );
+
+    let loaded = load_persisted_entities(tmp.path(), &items(), &entity_types()).unwrap();
+
+    assert_eq!(loaded.records.len(), 1);
+    assert_eq!(loaded.records[0].snapshot.id, EntityId(42));
+    assert_eq!(loaded.records[0].snapshot.retained.spawn_tick, 77);
+    assert_eq!(
+        loaded.records[0].snapshot.retained.item_pickup_ready_tick,
+        Some(207)
+    );
+    let retained = serde_json::to_value(&loaded.records[0].snapshot.retained).unwrap();
+    assert_eq!(retained["path"]["target_reached"], false);
+    assert_eq!(retained["path"]["resume_tick"], 0);
+}
+
+#[test]
 fn lifecycle_clock_overflow_fails_closed_before_writing() {
     let tmp = tempfile::tempdir().unwrap();
     let error = save_persisted_entity_records(

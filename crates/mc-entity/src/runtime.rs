@@ -68,6 +68,8 @@ struct ActiveEffectsState {
 
 const ENTITY_EFFECT_ACTIVE_CAPACITY: usize = 32;
 const ENTITY_EFFECT_HIDDEN_CAPACITY: usize = 128;
+const MOB_BODY_YAW_TURN_PER_TICK: f32 = 20.0;
+const MOB_HEAD_YAW_TURN_PER_TICK: f32 = 30.0;
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum EntityEffectOperation {
@@ -1972,10 +1974,7 @@ fn apply_goal_to_entity(
             };
             motion.velocity.x = direction.x * speed;
             motion.velocity.z = direction.z * speed;
-            if motion.velocity.horizontal_len() > 0.0 {
-                transform.rotation.yaw = crate::yaw_from_velocity(motion.velocity);
-                transform.rotation.head_yaw = transform.rotation.yaw;
-            }
+            face_horizontal_motion(&mut transform.rotation, motion.velocity);
         }
         GoalState::AquaticWander {
             speed,
@@ -2006,10 +2005,7 @@ fn apply_goal_to_entity(
             };
             motion.velocity.x = direction.x * speed;
             motion.velocity.z = direction.z * speed;
-            if motion.velocity.horizontal_len() > 0.0 {
-                transform.rotation.yaw = crate::yaw_from_velocity(motion.velocity);
-                transform.rotation.head_yaw = transform.rotation.yaw;
-            }
+            face_horizontal_motion(&mut transform.rotation, motion.velocity);
         }
         GoalState::FollowPosition { target, speed } => {
             let vertical_velocity = motion.velocity.y;
@@ -2040,13 +2036,30 @@ fn apply_goal_to_entity(
             } else {
                 motion.velocity
             };
-            if facing.horizontal_len() > 0.0 {
-                transform.rotation.yaw = crate::yaw_from_velocity(facing);
-                transform.rotation.head_yaw = transform.rotation.yaw;
+            if *speed == 0.0 && facing.horizontal_len() > f64::EPSILON {
+                let yaw = crate::yaw_from_velocity(facing);
+                transform.rotation.yaw = yaw;
+                transform.rotation.head_yaw = yaw;
+            } else {
+                face_horizontal_motion(&mut transform.rotation, facing);
             }
         }
     }
     stats.decisions_applied += 1;
+}
+
+fn face_horizontal_motion(rotation: &mut Rotation, velocity: Vec3) {
+    if velocity.horizontal_len() <= f64::EPSILON {
+        return;
+    }
+    let target = crate::yaw_from_velocity(velocity);
+    rotation.yaw =
+        crate::mob_control_26_1_2::rotate_towards(rotation.yaw, target, MOB_BODY_YAW_TURN_PER_TICK);
+    rotation.head_yaw = crate::mob_control_26_1_2::rotate_towards(
+        rotation.head_yaw,
+        target,
+        MOB_HEAD_YAW_TURN_PER_TICK,
+    );
 }
 
 fn integrate_positions(world: &mut World) {

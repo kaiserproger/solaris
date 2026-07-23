@@ -120,6 +120,14 @@ and is not startup context.
   Tracker admission uses one sharded get-or-insert instead of separate
   contains/owner-snapshot/insert/get operations. Visibility, arrow resolution,
   and the freshness recheck still intentionally serialize on the session lock.
+- Ground wanderers retain independent deterministic 3-7-block targets until
+  arrival, pause without drift, and turn body/head at bounded rates. Physics
+  preserves goal-owned rotation when collision clips velocity; zero-speed
+  hostile melee still faces immediately. Animals in love use a courtship
+  follow goal and return to wandering after breeding. Exhausted wander paths
+  retarget instead of retrying forever. Old persisted path JSON defaults the
+  two added pause fields. Focused client evidence covers natural sheep, pig,
+  and cow motion with non-zero yaw change and no vertical rise.
 - The exact dense 5,132-cow O3 gate is closed. The final reproduced cause was
   an unanswered keepalive challenge while valid movement packets still proved
   the client alive. Solaris now preserves one pending challenge, requires both

@@ -267,6 +267,14 @@ use typed projection; active grazing entities excluded from goal CAS always use
 the current full-state path. Owner/lane/journal errors remain errors. This is
 an incremental ECS boundary, not removal of the full-snapshot CAS input or
 direct shared access to lane worlds.
+Goal-owned rotation remains authoritative through the later physics phase:
+collision resolution may clip position and velocity but does not derive a new
+living-mob yaw from that clipped vector. Moving ground goals use bounded turns;
+zero-speed melee may face immediately for its attack fence.
+Wander targets and per-entity pauses are retained ECS state, so regional
+prepare/apply keeps them behind the same complete-snapshot CAS. Newly added
+retained fields use explicit persistence defaults so an existing saved
+checkpoint remains loadable.
 Local physics application now also mutates independent physical region stores
 concurrently inside one fenced production phase. The coordinator keeps
 boundary transfers serial, including atomic vehicle/passenger migration, while

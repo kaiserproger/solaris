@@ -501,6 +501,8 @@ fn passive_mob_breeding_plan_pairs_each_parent_once() {
     let plan = plan_breeding(17, &animals, 1);
 
     assert_eq!(plan.births.len(), 1);
+    assert_eq!(plan.courtships.len(), 1);
+    assert!(plan.courtships[0].completed);
     assert_eq!(plan.births[0].position, Vec3::new(1.0, 64.0, 0.0));
     assert_eq!(
         plan.updates[0].state.age_ticks,
@@ -512,6 +514,46 @@ fn passive_mob_breeding_plan_pairs_each_parent_once() {
     );
     assert_eq!(plan.updates[2].state.age_ticks, 0);
     assert_eq!(plan.updates[2].state.love_ticks, ready.love_ticks - 1);
+}
+
+#[test]
+fn passive_mob_breeding_plan_moves_courting_parents_together() {
+    let courting = mc_entity::AnimalBreedingState {
+        age_ticks: 0,
+        love_ticks: mc_entity::ANIMAL_LOVE_DURATION_TICKS,
+        sheep_wool: None,
+    };
+    let animals = [
+        BreedingAnimal {
+            id: EntityId(1),
+            type_id: 4,
+            type_name: "minecraft:cow".to_owned(),
+            position: Vec3::new(0.0, 64.0, 0.0),
+            state: courting,
+        },
+        BreedingAnimal {
+            id: EntityId(2),
+            type_id: 4,
+            type_name: "minecraft:cow".to_owned(),
+            position: Vec3::new(6.0, 64.0, 0.0),
+            state: courting,
+        },
+    ];
+
+    let plan = plan_breeding(20, &animals, 1);
+
+    assert!(plan.births.is_empty());
+    assert_eq!(plan.courtships.len(), 1);
+    assert_eq!(
+        plan.courtships[0],
+        passive_mobs::BreedingCourtship {
+            first_id: EntityId(1),
+            first_target: animals[1].position,
+            second_id: EntityId(2),
+            second_target: animals[0].position,
+            completed: false,
+        }
+    );
 }
 
 #[test]
@@ -1166,7 +1208,11 @@ fn breeding_commits_and_publishes_once_across_a_region_boundary() {
     let (births, dispatches) = registry.tick_animal_breeding(&SimulationAuthority::for_test(), 1);
 
     assert_eq!(births, 1);
-    assert_eq!(registry.entities.owner_requests_for_test(), 6);
+    assert_eq!(
+        registry.entities.owner_requests_for_test(),
+        7,
+        "breeding adds one batched courtship-goal owner command"
+    );
     let records = registry.persisted_entity_records();
     assert_eq!(records.len(), 3);
     let child = records
@@ -3439,6 +3485,8 @@ fn melee_hostile_faces_close_target_without_rewriting_unchanged_hold_goal() {
             entity.goal,
             GoalState::FollowPosition { speed: 0.0, .. }
         ));
+        assert_eq!(entity.rotation.yaw, -180.0);
+        assert_eq!(entity.rotation.head_yaw, -180.0);
     }
 
     registry.entities.reset_owner_requests_for_test();
@@ -3448,6 +3496,10 @@ fn melee_hostile_faces_close_target_without_rewriting_unchanged_hold_goal() {
     assert_eq!(registry.entities.owner_requests_for_test(), 3);
     assert_eq!(queries[0].velocity.x, 0.0);
     assert_eq!(queries[0].velocity.z, 0.0);
+    let entities = registry.lock_entities("test entity access");
+    let entity = entities.snapshots().next().expect("spawned hostile");
+    assert_eq!(entity.rotation.yaw, -180.0);
+    assert_eq!(entity.rotation.head_yaw, -180.0);
 }
 
 #[test]
@@ -3494,7 +3546,7 @@ fn entity_tick_checkpoints_transient_motion_without_per_tick_journal() {
 }
 
 #[test]
-fn living_physics_rotation_follows_collision_resolved_velocity() {
+fn living_physics_preserves_goal_rotation_when_collision_changes_velocity() {
     let registry = SessionRegistry::new();
     let (tx, mut rx) = mpsc::channel(8);
     let (alice, _) = registry.register(
@@ -3525,6 +3577,7 @@ fn living_physics_rotation_follows_collision_resolved_velocity() {
     let queries = registry.tick_entities_and_collect_physics_queries(1);
     assert_eq!(queries.len(), 1);
     assert!(queries[0].velocity.z > 0.0);
+    let goal_rotation = registry.persisted_entity_records()[0].snapshot.rotation;
     let resolved_velocity = Vec3::new(0.125, 0.0, 0.0);
     let steps = [EntityPhysicsStep {
         id: cow_id,
@@ -3542,13 +3595,11 @@ fn living_physics_rotation_follows_collision_resolved_velocity() {
 
     let saved = registry.persisted_entity_records();
     assert_eq!(saved[0].snapshot.velocity, resolved_velocity);
-    assert_eq!(saved[0].snapshot.rotation.yaw, -90.0);
-    assert_eq!(saved[0].snapshot.rotation.head_yaw, -90.0);
+    assert_eq!(saved[0].snapshot.rotation, goal_rotation);
     let Ok(OutboundCommand::MoveEntityRelative(movement)) = rx.try_recv() else {
         panic!("expected living movement publication");
     };
-    assert_eq!(movement.rotation.yaw, -90.0);
-    assert_eq!(movement.rotation.head_yaw, -90.0);
+    assert_eq!(movement.rotation, goal_rotation);
 }
 
 #[test]

@@ -944,7 +944,26 @@ hardening. An already-open lower-priority diff does not override this order.
   used. Focused physics already proves full-block climbing for cows, sheep, and
   chickens, and session tests prove every-tick publication for bounded natural
   passive and hostile movement. This closes basic natural spawn, publication,
-  and one-block stepping; longer visual movement quality remains open.
+  and one-block stepping.
+- Ground-mob visual movement now retains a deterministic 3-7-block wander
+  destination until arrival, pauses for a per-entity interval, and selects the
+  next destination independently. Moving goals bound body and head turning,
+  while physics commits preserve the authoritative goal rotation when
+  collision clips velocity. Courting animals follow a nearby compatible mate
+  and return to wandering after breeding. Stationary melee keeps immediate
+  facing so the existing attack fence does not gain a dead tick. Unit coverage
+  proves independent destinations, retained paths, pause without position or
+  rotation drift, bounded turning, explicit hostile facing, courtship,
+  exhausted-path retargeting, path detours, full-block livestock climbs, and
+  loading saved wander state from before the pause fields existed. The cow and
+  chicken wire breeding regressions also pass. An embedded 26.1.2 client
+  separately identified a natural sheep, pig, and cow and received pushed
+  samples travelling `0.34-0.39` blocks with non-zero yaw changes and zero
+  vertical rise. That client sample confirms the wire path; deterministic tests
+  establish independent targets, pauses, and turn limits. The server emitted
+  no tick-budget or disconnect warning during this focused gate. This closes
+  the common ground-mob visual-quality item, not specialized vanilla goal
+  parity.
 - The representative player water path is client-verified. The retained O3
   26.1.2 run proves ascent, diving, a `3.43`-block swimming pass, air depletion,
   `20 -> 18` drowning damage, and connection continuity. The missing aquatic

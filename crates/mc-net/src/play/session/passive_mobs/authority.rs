@@ -325,6 +325,36 @@ impl SessionRegistry {
             .filter(|((_, expected), update)| expected.animal != Some(update.state))
             .map(|((_, expected), update)| (expected.clone(), update.state))
             .collect::<Vec<_>>();
+        let courtship_goals = breeding_plan
+            .courtships
+            .iter()
+            .flat_map(|courtship| {
+                [
+                    (courtship.first_id, courtship.first_target),
+                    (courtship.second_id, courtship.second_target),
+                ]
+                .into_iter()
+                .filter_map(|(entity_id, target)| {
+                    let expected = expected_animals
+                        .iter()
+                        .find(|snapshot| snapshot.id == entity_id)?;
+                    let speed = expected
+                        .attributes
+                        .base(&mc_entity::AttributeKind::MovementSpeed)
+                        .unwrap_or(0.2)
+                        * 10.0;
+                    let goal = if courtship.completed {
+                        GoalState::Wander {
+                            speed,
+                            period_ticks: 80,
+                        }
+                    } else {
+                        GoalState::FollowPosition { target, speed }
+                    };
+                    (expected.goal != goal).then_some((entity_id, goal))
+                })
+            })
+            .collect::<Vec<_>>();
         let lifecycle_tick = self.simulation_tick();
         let mut committed_animals = Vec::new();
         let mut children = Vec::new();
@@ -339,6 +369,9 @@ impl SessionRegistry {
             if !states_applied {
                 return (0, Vec::new());
             }
+            let applied_goals =
+                entities.set_goals_deferred_journal(courtship_goals.iter().cloned());
+            debug_assert_eq!(applied_goals, courtship_goals.len());
             #[cfg(test)]
             self.breeding_commits.fetch_add(1, Ordering::Relaxed);
             #[cfg(test)]

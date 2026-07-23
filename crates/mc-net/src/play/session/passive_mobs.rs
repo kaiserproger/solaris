@@ -32,11 +32,21 @@ pub(super) struct BreedingStateUpdate {
     pub(super) state: AnimalBreedingState,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub(super) struct BreedingCourtship {
+    pub(super) first_id: EntityId,
+    pub(super) first_target: Vec3,
+    pub(super) second_id: EntityId,
+    pub(super) second_target: Vec3,
+    pub(super) completed: bool,
+}
+
 #[derive(Debug, Default)]
 pub(super) struct BreedingPlan {
     pub(super) updates: Vec<BreedingStateUpdate>,
     pub(super) births: Vec<BreedingBirth>,
     pub(super) became_adults: Vec<EntityId>,
+    pub(super) courtships: Vec<BreedingCourtship>,
 }
 
 pub(super) fn plan_breeding(
@@ -82,16 +92,13 @@ pub(super) fn plan_breeding(
     let courtship_complete = ANIMAL_LOVE_DURATION_TICKS - ANIMAL_BREEDING_COURTSHIP_TICKS;
     let mut paired = vec![false; animals.len()];
     let mut births = Vec::new();
+    let mut courtships = Vec::new();
     for first_index in 0..animals.len() {
         let first = &animals[first_index];
         let first_state = updates[first_index].state;
         if paired[first_index]
             || first_state.age_ticks != 0
-            || !love_window_crossed(
-                animals[first_index].state.love_ticks,
-                elapsed_love_ticks,
-                courtship_complete,
-            )
+            || animals[first_index].state.love_ticks == 0
         {
             continue;
         }
@@ -101,17 +108,34 @@ pub(super) fn plan_breeding(
             !paired[second_index]
                 && second.type_name == first.type_name
                 && second_state.age_ticks == 0
-                && love_window_crossed(
-                    animals[second_index].state.love_ticks,
-                    elapsed_love_ticks,
-                    courtship_complete,
-                )
-                && distance_sq(first.position, second.position) < 9.0
+                && second.state.love_ticks > 0
+                && distance_sq(first.position, second.position) < 64.0
         }) else {
             continue;
         };
 
         let second = &animals[second_index];
+        paired[first_index] = true;
+        paired[second_index] = true;
+        let completed = love_window_crossed(
+            animals[first_index].state.love_ticks,
+            elapsed_love_ticks,
+            courtship_complete,
+        ) && love_window_crossed(
+            animals[second_index].state.love_ticks,
+            elapsed_love_ticks,
+            courtship_complete,
+        ) && distance_sq(first.position, second.position) < 9.0;
+        courtships.push(BreedingCourtship {
+            first_id: first.id,
+            first_target: second.position,
+            second_id: second.id,
+            second_target: first.position,
+            completed,
+        });
+        if !completed {
+            continue;
+        }
         let sheep_color = if first.type_name == "minecraft:sheep" {
             updates[first_index]
                 .state
@@ -129,8 +153,6 @@ pub(super) fn plan_breeding(
         } else {
             None
         };
-        paired[first_index] = true;
-        paired[second_index] = true;
         births.push(BreedingBirth {
             type_id: first.type_id,
             type_name: first.type_name.clone(),
@@ -157,6 +179,7 @@ pub(super) fn plan_breeding(
         updates,
         births,
         became_adults,
+        courtships,
     }
 }
 

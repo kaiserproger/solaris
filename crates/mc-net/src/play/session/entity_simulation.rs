@@ -735,29 +735,12 @@ impl SessionRegistry {
                 old_motion
                     .get(&step.id)
                     .filter(|motion| !motion.is_arrow)
-                    .map(|motion| {
-                        let rotation = expected_by_id
-                            .as_ref()
-                            .and_then(|expected| expected.get(&step.id))
-                            .filter(|expected| expected.kind == EntityPhysicsKind::Living)
-                            .filter(|_| step.velocity.x.hypot(step.velocity.z) > 0.01)
-                            .map_or(motion.rotation, |_| {
-                                let yaw = step.velocity.z.atan2(step.velocity.x).to_degrees()
-                                    as f32
-                                    - 90.0;
-                                Rotation {
-                                    yaw,
-                                    pitch: motion.rotation.pitch,
-                                    head_yaw: yaw,
-                                }
-                            });
-                        EntityKinematics {
-                            id: step.id,
-                            position: step.position,
-                            rotation,
-                            velocity: step.velocity,
-                            on_ground: step.on_ground,
-                        }
+                    .map(|motion| EntityKinematics {
+                        id: step.id,
+                        position: step.position,
+                        rotation: motion.rotation,
+                        velocity: step.velocity,
+                        on_ground: step.on_ground,
                     })
             })
             .collect::<Vec<_>>();

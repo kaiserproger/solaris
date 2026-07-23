@@ -770,6 +770,8 @@ const RETAINED_PATH_NODE_DISTANCE: f64 = 1.5;
 const RETAINED_PATH_PROGRESS_EPSILON: f64 = 1.0e-4;
 const RETAINED_PATH_NO_PROGRESS_LIMIT: u8 = 6;
 const RETAINED_PATH_RECOMPUTE_LIMIT: u8 = 4;
+const WANDER_MIN_DISTANCE: f64 = 3.0;
+const WANDER_DISTANCE_SPREAD: f64 = 4.0;
 
 #[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
 struct RetainedPathState {
@@ -786,6 +788,10 @@ struct RetainedPathState {
     recomputations: u8,
     was_moving: bool,
     stopped: bool,
+    #[serde(default)]
+    target_reached: bool,
+    #[serde(default)]
+    resume_tick: u64,
 }
 
 impl Default for RetainedPathState {
@@ -804,6 +810,8 @@ impl Default for RetainedPathState {
             recomputations: 0,
             was_moving: false,
             stopped: false,
+            target_reached: false,
+            resume_tick: 0,
         }
     }
 }
@@ -930,12 +938,13 @@ impl PreparedGoalTick {
 
     #[must_use]
     pub fn resolve(self, probe: &dyn PathingProbe, budget: PathingBudget) -> ResolvedGoalTick {
+        let tick = self.tick;
         let pathing_results = self
             .pathing_requests
             .into_iter()
             .map(|request| {
                 let id = request.id;
-                let (decision, next_path) = resolve_retained_pathing(&request, probe, budget);
+                let (decision, next_path) = resolve_retained_pathing(&request, tick, probe, budget);
                 (
                     id,
                     GoalPathingResult {
@@ -1885,6 +1894,7 @@ impl EntityStore {
 
 fn resolve_retained_pathing(
     request: &GoalPathingRequest,
+    tick: u64,
     probe: &dyn PathingProbe,
     budget: PathingBudget,
 ) -> (PathingDecision, RetainedPathState) {
@@ -1905,6 +1915,8 @@ fn resolve_retained_pathing(
         path.recomputations = 0;
         path.was_moving = false;
         path.stopped = false;
+        path.target_reached = false;
+        path.resume_tick = 0;
     } else if path.has_last_position {
         let progress = (current.x - path.last_position.x).hypot(current.z - path.last_position.z);
         if progress > RETAINED_PATH_PROGRESS_EPSILON {
@@ -1928,7 +1940,6 @@ fn resolve_retained_pathing(
     path.has_last_position = true;
 
     if no_progress_budget_exhausted {
-        path.stopped = false;
         path.recomputations = 0;
         path.was_moving = false;
         return (
@@ -1958,6 +1969,16 @@ fn resolve_retained_pathing(
     {
         probes.direct_path_resolved(request.id);
         path.was_moving = false;
+        if let GoalState::Wander { period_ticks, .. } = &request.expected_goal
+            && !path.target_reached
+        {
+            path.target_reached = true;
+            path.resume_tick = tick.saturating_add(wander_pause_ticks(
+                request.id,
+                request.target_epoch.unwrap_or_default(),
+                *period_ticks,
+            ));
+        }
         return (
             PathingDecision {
                 velocity: Vec3::ZERO,
@@ -2311,22 +2332,36 @@ fn wander_pathing_target(
     position: Vec3,
     path: RetainedPathState,
     tick: u64,
-    period_ticks: u32,
+    _period_ticks: u32,
 ) -> (Vec3, u64) {
-    let period = u64::from(period_ticks.max(1));
-    let epoch = tick / period;
-    if path.has_target && path.target_epoch == Some(epoch) {
-        return (path.target, epoch);
+    if path.has_target && !path.stopped && (!path.target_reached || tick < path.resume_tick) {
+        return (path.target, path.target_epoch.unwrap_or_default());
     }
+    let epoch = path.target_epoch.map_or(0, |epoch| epoch.saturating_add(1));
     let angle = deterministic_angle(id, epoch);
+    let distance = WANDER_MIN_DISTANCE
+        + deterministic_unit(id, epoch.wrapping_add(0x2d)) * WANDER_DISTANCE_SPREAD;
     (
         Vec3 {
-            x: position.x + angle.cos(),
+            x: position.x + angle.cos() * distance,
             y: position.y,
-            z: position.z + angle.sin(),
+            z: position.z + angle.sin() * distance,
         },
         epoch,
     )
+}
+
+fn wander_pause_ticks(id: EntityId, epoch: u64, period_ticks: u32) -> u64 {
+    let period = u64::from(period_ticks.max(1));
+    let minimum = (period / 2).max(10);
+    minimum.saturating_add(
+        splitmix64((id.0 as u32 as u64) ^ epoch.wrapping_mul(0x94d0_49bb_1331_11eb)) % period,
+    )
+}
+
+fn deterministic_unit(id: EntityId, phase: u64) -> f64 {
+    let mixed = splitmix64((id.0 as u32 as u64) ^ phase.wrapping_mul(0xbf58_476d_1ce4_e5b9));
+    mixed as f64 / u64::MAX as f64
 }
 
 fn deterministic_wave(id: EntityId, phase: u64) -> f64 {
@@ -2941,6 +2976,27 @@ mod tests {
         let velocity = store.snapshot(follower).unwrap().velocity;
         assert!((velocity.x - 0.3).abs() < 0.000_001);
         assert!((velocity.z - 0.4).abs() < 0.000_001);
+    }
+
+    #[test]
+    fn ground_goal_turns_body_and_head_without_snapping() {
+        let mut store = EntityStore::new();
+        let mut entity = cow(Vec3::new(0.0, 64.0, 0.0));
+        entity.goal = GoalState::FollowPosition {
+            target: Vec3::new(10.0, 64.0, 0.0),
+            speed: 1.0,
+        };
+        let id = store.spawn(entity);
+
+        store.tick_goals(1);
+        let first = store.snapshot(id).unwrap().rotation;
+        assert_eq!(first.yaw, -20.0);
+        assert_eq!(first.head_yaw, -30.0);
+
+        store.tick_goals(2);
+        let second = store.snapshot(id).unwrap().rotation;
+        assert_eq!(second.yaw, -40.0);
+        assert_eq!(second.head_yaw, -60.0);
     }
 
     #[test]
@@ -3788,7 +3844,7 @@ mod tests {
     }
 
     #[test]
-    fn wander_retains_its_absolute_target_within_one_period() {
+    fn wander_retains_its_absolute_target_until_reached() {
         let mut store = EntityStore::new();
         let mut entity = cow(Vec3::new(0.0, 64.0, 0.0));
         entity.goal = GoalState::Wander {
@@ -3800,18 +3856,18 @@ mod tests {
 
         store.tick_goals_with_pathing(1, &probe, PathingBudget::DEFAULT);
         store.tick_positions(0.05);
-        let prepared = store.prepare_goal_tick_with_pathing_for_ids(2, &HashSet::from([id]));
+        let prepared = store.prepare_goal_tick_with_pathing_for_ids(400, &HashSet::from([id]));
         let request = &prepared.pathing_requests[0];
 
         assert_eq!(request.expected_path.target_revision, 1);
         assert_eq!(
             request.target, request.expected_path.target,
-            "moving within one Wander period must not replace the retained absolute target"
+            "elapsed time must not replace an unfinished Wander target"
         );
     }
 
     #[test]
-    fn wander_stops_after_reaching_its_retained_target() {
+    fn wander_pauses_after_reaching_its_retained_target() {
         let mut store = EntityStore::new();
         let mut entity = cow(Vec3::new(0.0, 64.0, 0.0));
         entity.goal = GoalState::Wander {
@@ -3821,54 +3877,65 @@ mod tests {
         let id = store.spawn(entity);
         let probe = TestPathingProbe::new(PathingProbeResult::Walkable);
 
-        for tick in 1..=6 {
+        let mut reached = None;
+        for tick in 1..=80 {
             store.tick_goals_with_pathing(tick, &probe, PathingBudget::DEFAULT);
+            let prepared =
+                store.prepare_goal_tick_with_pathing_for_ids(tick + 1, &HashSet::from([id]));
+            let path = prepared.pathing_requests[0].expected_path;
+            if path.target_reached {
+                reached = Some((
+                    prepared.pathing_requests[0].target,
+                    path.resume_tick,
+                    store.snapshot(id).expect("wanderer snapshot").position,
+                ));
+                break;
+            }
             store.tick_positions(PathingBudget::TICK_SECONDS);
         }
-
-        let prepared = store.prepare_goal_tick_with_pathing_for_ids(7, &HashSet::from([id]));
-        let request = &prepared.pathing_requests[0];
-        let position = store.snapshot(id).expect("wanderer snapshot").position;
-        let reach = 3.0 * PathingBudget::TICK_SECONDS * 1.25;
-        assert!(
-            (request.target.x - position.x).hypot(request.target.z - position.z) <= reach,
-            "fixture must enter the retained target radius"
-        );
-        let rotation = store.snapshot(id).unwrap().rotation;
-
-        store.apply_prepared_goal_tick(prepared.resolve(&probe, PathingBudget::DEFAULT));
+        let (target, resume_tick, position) =
+            reached.expect("wanderer reaches its retained target");
 
         assert_eq!(store.snapshot(id).unwrap().velocity, Vec3::ZERO);
-        assert_eq!(store.snapshot(id).unwrap().rotation, rotation);
+        let rotation = store.snapshot(id).unwrap().rotation;
+        let paused =
+            store.prepare_goal_tick_with_pathing_for_ids(resume_tick - 1, &HashSet::from([id]));
+        assert_eq!(paused.pathing_requests[0].target, target);
+        store.apply_prepared_goal_tick(paused.resolve(&probe, PathingBudget::DEFAULT));
         store.tick_positions(PathingBudget::TICK_SECONDS);
         assert_eq!(store.snapshot(id).unwrap().position, position);
+        assert_eq!(store.snapshot(id).unwrap().rotation, rotation);
+
+        let resumed =
+            store.prepare_goal_tick_with_pathing_for_ids(resume_tick, &HashSet::from([id]));
+        assert_ne!(resumed.pathing_requests[0].target, target);
     }
 
     #[test]
-    fn wander_replaces_its_target_at_the_period_boundary() {
+    fn wander_targets_are_multiblock_and_not_synchronized() {
         let mut store = EntityStore::new();
-        let mut entity = cow(Vec3::new(0.0, 64.0, 0.0));
-        entity.goal = GoalState::Wander {
+        let position = Vec3::new(0.0, 64.0, 0.0);
+        let mut first = cow(position);
+        first.goal = GoalState::Wander {
             speed: 4.0,
             period_ticks: 40,
         };
-        let id = store.spawn(entity);
-        let probe = TestPathingProbe::new(PathingProbeResult::Walkable);
+        let second = first.clone();
+        let first_id = store.spawn(first);
+        let second_id = store.spawn(second);
 
-        store.tick_goals_with_pathing(1, &probe, PathingBudget::DEFAULT);
-        let prepared = store.prepare_goal_tick_with_pathing_for_ids(40, &HashSet::from([id]));
-        let request = &prepared.pathing_requests[0];
-
-        assert_eq!(request.expected_path.target_revision, 1);
-        assert_ne!(request.target, request.expected_path.target);
-
-        store.apply_prepared_goal_tick(prepared.resolve(&probe, PathingBudget::DEFAULT));
-        let next = store.prepare_goal_tick_with_pathing_for_ids(41, &HashSet::from([id]));
-        assert_eq!(next.pathing_requests[0].expected_path.target_revision, 2);
-        assert_eq!(
-            next.pathing_requests[0].target,
-            next.pathing_requests[0].expected_path.target
-        );
+        let prepared =
+            store.prepare_goal_tick_with_pathing_for_ids(1, &HashSet::from([first_id, second_id]));
+        let first_target = prepared.pathing_requests[0].target;
+        let second_target = prepared.pathing_requests[1].target;
+        for target in [first_target, second_target] {
+            let distance = (target.x - position.x).hypot(target.z - position.z);
+            assert!(
+                (WANDER_MIN_DISTANCE..=WANDER_MIN_DISTANCE + WANDER_DISTANCE_SPREAD)
+                    .contains(&distance)
+            );
+        }
+        assert_ne!(first_target, second_target);
     }
 
     #[test]
@@ -4051,6 +4118,35 @@ mod tests {
 
         assert!(stopped, "no-progress recovery must have a finite bound");
         assert_eq!(store.snapshot(follower).unwrap().velocity, Vec3::ZERO);
+    }
+
+    #[test]
+    fn exhausted_wander_path_retargets_instead_of_retrying_forever() {
+        let mut store = EntityStore::new();
+        let mut entity = cow(Vec3::new(0.0, 64.0, 0.0));
+        entity.goal = GoalState::Wander {
+            speed: 1.0,
+            period_ticks: 40,
+        };
+        let id = store.spawn(entity);
+        let probe = TestPathingProbe::new(PathingProbeResult::Walkable);
+        let mut exhausted_tick = None;
+
+        for tick in 1..=64 {
+            let target = store
+                .prepare_goal_tick_with_pathing_for_ids(tick, &HashSet::from([id]))
+                .pathing_requests[0]
+                .target;
+            let stats = store.tick_goals_with_pathing(tick, &probe, PathingBudget::DEFAULT);
+            if stats.pathing_blocked == 1 {
+                exhausted_tick = Some((tick, target));
+                break;
+            }
+        }
+        let (tick, exhausted_target) = exhausted_tick.expect("wander path exhausts");
+        let next = store.prepare_goal_tick_with_pathing_for_ids(tick + 1, &HashSet::from([id]));
+
+        assert_ne!(next.pathing_requests[0].target, exhausted_target);
     }
 
     #[test]

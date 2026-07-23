@@ -323,10 +323,24 @@ verification and keep ordinary survival play ahead of rare edge cases.
   in `1,666 us`. This proves simulation-owner responsiveness, single authority,
   and same-tick phase ordering; the broader interactive natural-load client
   gate remains tracked below.
-- [ ] Make animal and hostile movement visually alive: smooth velocity/rotation,
-  varied goals, sensible pauses, obstacle stepping, and no unprompted hopping,
-  synchronized herds, circular running, diagonal grid motion, or stationary
-  jitter.
+- [x] Make animal and hostile movement visually alive. Ground wanderers now
+  retain a deterministic 3-7-block destination until arrival, pause for a
+  per-entity interval, and choose independent destinations instead of replacing
+  one-block targets on a shared period. Moving goals turn body and head at
+  bounded rates; collision resolution preserves that goal rotation instead of
+  snapping it to the clipped velocity. Animals in love follow a nearby mate
+  during courtship and return to wandering after breeding; zero-speed hostile
+  melee still faces its target immediately. Deterministic tests cover
+  independent multiblock targets, retained paths, pause without drift or
+  rotation jitter, bounded turning, explicit hostile facing, courtship,
+  obstacle pathing, full-block livestock climbs, exhausted-path retargeting,
+  and old saved wander state. The formerly failing cow and chicken wire
+  breeding tests now pass. In an embedded 26.1.2 client gate, a separately
+  identified natural sheep, pig, and cow each produced pushed motion with
+  `0.34-0.39`-block horizontal samples, non-zero yaw changes, and no vertical
+  rise. That client sample confirms publication, while the deterministic tests
+  establish independent timing, pauses, and turn limits. The server emitted no
+  tick-budget or disconnect warning during the gate.
 - [ ] Extend entity collision context beyond players: powder-snow-walkable mob
   tags and falling blocks must use their vanilla dynamic powder-snow shape
   without weakening the exact-state fingerprint fence.
