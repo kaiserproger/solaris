@@ -431,17 +431,19 @@ hardening. An already-open lower-priority diff does not override this order.
   not a per-action latency SLO or broad overload soak. Evidence is
   `.analysis/real-client-runs/responsiveness-o3/20260723T103459Z-real-client-playable-loop-4vVxYV`.
 
-- The shipped `basic-economy` plugin now provides durable virtual balances,
-  operator self-grants, and an inventory shop whose item grant and balance CAS
-  commit atomically. The shipped `land-claims` plugin stores a bounded whole-
-  chunk claim index, waits for a targeted registry result, and rolls back the
-  durable CAS when registration is rejected.
-  Unit coverage proves owner/operator/stranger lookup semantics; real Lua and
-  two-client TCP coverage proves a non-operator cannot break or place in the
-  owner's claim and obtains its test item through the real economy menu. The
-  temporary adapter covers only direct break/place in the configured
-  Overworld range; container, fluid, piston, explosion, fire, and entity
-  interaction protection remain open. No manual-client gate was run.
+- The shipped `basic-economy` plugin now uses one configured physical item as
+  currency and opens its server-owned inventory shop on zone entry or
+  `/economy`. Purchase and refund each mutate currency, product inventory, and
+  the durable refund ledger in one transaction. The old virtual wallet and
+  duplicate `currency-catalog` fixture were removed. The production TCP/Lua
+  gate customizes gold ingots and a stone axe, then proves zone opening,
+  purchase, insufficient-funds rejection, refund, and refreshed menu state.
+  Stable product ids retain the original refund terms across catalog changes;
+  changed terms block new purchases until old purchases are refunded.
+  The shipped `land-claims` plugin remains a bounded durable whole-chunk index
+  with direct break/place protection; container, fluid, piston, explosion,
+  fire, and entity interaction protection remain open. No manual-client gate
+  was run.
 
 - Mob death completion no longer scans every server entity every tick. Lethal
   melee, projectile/effect damage, test ingress, and persisted restore enqueue
@@ -581,8 +583,8 @@ hardening. An already-open lower-priority diff does not override this order.
   manual-client or vanilla-oracle gate was run for this plugin-only slice.
 - Checkpoint `d59bd57` adds optional bounded `config.toml` snapshots to Lua API
   `0.6.0`. Configuration is validated before command ownership, read once, and
-  returned as a fresh recursive Lua table. The shipped currency catalog now
-  takes currency, zone, and products from operator configuration. Its real
+  returned as a fresh recursive Lua table. The then-separate currency catalog
+  took currency, zone, and products from operator configuration. Its real
   TCP/Lua gate overrides all three and proves exact menu content, purchase,
   stale rejection without mutation, and refund. Full workspace tests, strict
   workspace Clippy, fmt, code-health `0 fail / KEEP`, and diff-check pass. A
@@ -672,8 +674,8 @@ hardening. An already-open lower-priority diff does not override this order.
   remains explicitly outside the outbox FIFO contract. No manual/client or
   vanilla-oracle gate was run for this plugin-only slice.
 - Checkpoint `e09c6ec` replaces smoke-only confidence in the shipped Lua
-  examples with production wire evidence. The exact currency catalog files now
-  pass zone activation, rendered menu contents, an atomic three-emerald/two-
+  examples with production wire evidence. The then-shipped currency catalog
+  files passed zone activation, rendered menu contents, an atomic three-emerald/two-
   apple purchase, insufficient-funds rejection with unchanged ledger, and a
   refund. The exact colony scaffold files now pass `/colony recruit worker`,
   durable activation, initial `home`, a later owner-accepted `hold`, and status

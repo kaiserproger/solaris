@@ -17,25 +17,20 @@ The configured plugin directory contains one directory per plugin:
 
 ```text
 plugins/
-`-- currency-catalog/
+`-- basic-economy/
     |-- config.toml     # optional operator configuration
     |-- plugin.toml
     `-- main.lua
 ```
 
 ```toml
-id = "currency-catalog"
-name = "Currency Catalog"
-version = "0.1.0"
+id = "basic-economy"
+name = "Basic Economy"
+version = "0.4.0"
 api = "0.6.0"
-events = ["server.started", "player.zone_entered", "player.zone_exited", "inventory.menu.clicked"]
+events = ["server.started", "player.left"]
 capabilities = ["storage", "inventory_menus", "inventory_storage_transactions", "zones"]
-player_commands = ["catalog"]
-operator_commands = ["catalogadmin"]
-console_commands = ["time"]
-spawn_entities = ["minecraft:pig"]
-dependencies = [{ id = "economy", relation = "required" }]
-permissions = ["solaris:catalog.read"]
+player_commands = ["economy"]
 ```
 
 An optional startup-only worldgen declaration is also available:
@@ -483,12 +478,16 @@ admission limits, not operator-configured worker percentages.
 
 ## Shipped Economy And Claims
 
-`examples/plugins/basic-economy` provides `/economy`, a durable virtual balance,
-an operator-only self grant, and a server-owned inventory shop. The item grant
-and balance deduction use one `inventory_storage_transaction`, so neither side
-commits alone. `config.toml` documents the starting balance, currency label,
-and every product beside the value an operator edits. Player-to-player payment,
-auctions, and multiple currencies are intentionally outside this basic plugin.
+`examples/plugins/basic-economy` uses one configurable physical item, such as
+emeralds or gold ingots, as currency. Entering its configured cuboid opens a
+server-owned inventory shop; `/economy` opens the same shop manually. A primary
+click removes currency, grants the product, and advances the durable refund
+ledger in one `inventory_storage_transaction`. A secondary click atomically
+refunds only purchases recorded by this shop. Insufficient currency, a full
+inventory, stale storage, or a concurrent purchase rejects the whole mutation.
+`config.toml` documents the currency item and labels, zone, and products beside
+the values an operator edits. Player-to-player payment, auctions, and multiple
+simultaneous currencies are intentionally outside this basic plugin.
 
 `examples/plugins/land-claims` provides `/claim status`, `/claim create`, and
 `/claim remove`. Claims cover one whole chunk in the configured dimension and
@@ -652,8 +651,8 @@ cannot construct an arbitrary targeted result. Directly matching and trusting
 the fields of `HostAttached` is not an adapter API. Lua exposes no filesystem,
 network, process, debug, paths, locks, NBT, sessions, or entity pointers.
 
-See [the contract examples](../examples/plugins/) for the basic economy,
-land claims, configurable currency catalog, `/who` inventory roster, and the
+See [the contract examples](../examples/plugins/) for the configurable
+item-currency economy, land claims, `/who` inventory roster, and the
 intentionally limited colony/villager scaffold.
 
 `crates/mc-test-harness/tests/plugin_examples.rs` copies those exact shipped
@@ -675,7 +674,7 @@ examples; they are not vanilla-oracle or broad plugin-ecosystem readiness
 evidence.
 
 The same suite routes the exact economy and claim Lua files through the real
-host. It proves the default balance and atomic economy purchase, durable claim
-CAS and zone registration, then uses two real wire clients to prove a stranger
-cannot break or place inside the owner's claimed chunk. The stranger acquires
-the placement item through the economy plugin, not a privileged debug command.
+host. It proves zone and command entry, atomic item-currency purchase and
+refund, durable claim CAS and zone registration, then uses two real wire
+clients to prove a stranger cannot break or place inside the owner's claimed
+chunk.

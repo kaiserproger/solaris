@@ -136,7 +136,7 @@ async fn shipped_land_claim_zone_blocks_strangers_but_not_owner_or_operator() {
 #[tokio::test]
 async fn ordinary_plugin_zones_never_protect_blocks() {
     let mut commands = admitted_zone_commands(
-        "currency-catalog",
+        "ordinary-shop",
         "    solaris.upsert_zone(\"claim-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa-p0-p0\", \"minecraft:overworld\", 0, -64, 0, 15, 319, 15)",
         1,
     )

@@ -2963,6 +2963,89 @@ mod tests {
             .unwrap();
     }
 
+    #[tokio::test]
+    async fn shipped_basic_economy_releases_pending_read_after_batch_rejection() {
+        let examples =
+            Path::new(env!("CARGO_MANIFEST_DIR")).join("../../examples/plugins/basic-economy");
+        let source = read_plugin_source(&examples).unwrap();
+        let (boundary, endpoint) =
+            script_boundary_pair(NonZeroUsize::new(4).unwrap(), NonZeroUsize::new(2).unwrap());
+        for message in ["existing-first", "existing-second"] {
+            endpoint
+                .try_submit_command(ScriptCommand::BroadcastChatMessage {
+                    message: message.to_owned(),
+                })
+                .unwrap();
+        }
+        let (startup_tx, startup_rx) = std::sync::mpsc::sync_channel(1);
+        let (progress_tx, progress_rx) = std::sync::mpsc::sync_channel(2);
+        let host = thread::spawn(move || {
+            let mut endpoint = endpoint;
+            run_lua_host_inner(&mut endpoint, vec![source], startup_tx, Some(progress_tx));
+        });
+        assert_eq!(startup_rx.recv().unwrap(), 1);
+
+        let player_id = ScriptPlayerId::new(7);
+        let context = player_context("Alex");
+        assert_eq!(
+            boundary
+                .try_enqueue_player_command_with_context(player_id, context.clone(), "economy",),
+            Ok(PlayerCommandAdmission::Enqueued)
+        );
+        assert_eq!(progress_rx.recv().unwrap(), "player.command");
+
+        for expected in ["existing-first", "existing-second"] {
+            let command = boundary.recv_command().await.unwrap();
+            assert!(matches!(
+                command,
+                ScriptCommand::BroadcastChatMessage { message } if message == expected
+            ));
+        }
+
+        assert_eq!(
+            boundary.try_enqueue_player_command_with_context(player_id, context, "economy"),
+            Ok(PlayerCommandAdmission::Enqueued)
+        );
+        assert_eq!(progress_rx.recv().unwrap(), "player.command");
+
+        let mut saw_rejection_notice = false;
+        let mut saw_retry_read = false;
+        for _ in 0..2 {
+            let command = boundary.recv_command().await.unwrap();
+            let ScriptCommand::HostAttached {
+                provenance,
+                request,
+            } = command
+            else {
+                panic!("economy retry command was not host attached");
+            };
+            assert_eq!(provenance.plugin_id(), "basic-economy");
+            match request.as_ref() {
+                ScriptCommand::SendChatMessage {
+                    player_id: target,
+                    message,
+                } => {
+                    assert_eq!(*target, player_id);
+                    assert_eq!(message, "Economy request rejected: queue_full.");
+                    saw_rejection_notice = true;
+                }
+                ScriptCommand::PluginStorageGet { request } => {
+                    assert_eq!(request.request_id(), "command-7");
+                    saw_retry_read = true;
+                }
+                other => panic!("unexpected economy retry command: {other:?}"),
+            }
+        }
+        assert!(saw_rejection_notice);
+        assert!(saw_retry_read);
+
+        drop(boundary);
+        tokio::task::spawn_blocking(move || host.join())
+            .await
+            .unwrap()
+            .unwrap();
+    }
+
     #[test]
     fn lua_api_rejects_oversized_chat_before_it_reaches_the_command_queue() {
         let mut runtime = LuaScriptRuntime::from_source(
@@ -3914,7 +3997,7 @@ mod tests {
         let examples = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../examples/plugins");
         let controls = RuntimeControls::unrestricted();
         for (name, expected_commands) in [
-            ("currency-catalog", 1_usize),
+            ("basic-economy", 1_usize),
             ("colony-villager-scaffold", 2_usize),
             ("geological-mines", 0_usize),
             ("online-roster", 0_usize),

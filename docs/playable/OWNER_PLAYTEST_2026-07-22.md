@@ -224,9 +224,23 @@ verification and keep ordinary survival play ahead of rare edge cases.
 
 ## Plugins
 
-- [x] Ship a reusable baseline economy plugin with durable balances and an
-  atomic inventory-menu shop. This is `examples/plugins/basic-economy`.
-- [ ] Extend economy with configurable item currency and zone activation.
+- [x] Ship a reusable baseline economy plugin with a configurable physical item
+  currency, durable refund ledger, and atomic inventory-menu shop. This is
+  `examples/plugins/basic-economy`.
+- [x] Activate the economy shop from a configured zone while retaining
+  `/economy` as a manual entry point. The old virtual-wallet implementation and
+  duplicate `currency-catalog` fixture were removed. The consolidated plugin
+  configures one currency item (emeralds, gold ingots, or another registered
+  item), inclusive zone bounds, and up to 16 products. Primary clicks atomically
+  remove currency, grant the product, and advance the refund ledger; secondary
+  clicks reverse only recorded purchases using the original product and
+  currency terms. Stable product ids make catalog reordering safe; changed
+  terms require refunding prior purchases before buying again. The production
+  TCP/Lua gate proves a configured gold-ingot purchase, insufficient-funds
+  rejection, refund, menu refresh, and zone-triggered opening. Focused tests
+  cover changed terms, the purchase-count bound, corrupt-ledger retry,
+  fractional counts, duplicate product ids, invalid zone ids, and out-of-range
+  bounds.
 - [x] Ship baseline protection/claims with durable ownership and direct player
   break/placement policy. This is `examples/plugins/land-claims`.
 - [ ] Extend claims to containers, fluids, pistons, explosions, fire, and entity

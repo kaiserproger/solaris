@@ -14,7 +14,8 @@ use mc_protocol::packets::play::{
     SynchronizePlayerPosition, pack_block_pos,
 };
 use mc_script::{
-    PlayerCommandAdmission, ScriptCommand, ScriptEvent, ScriptPlayerContext, ScriptPlayerId,
+    PlayerCommandAdmission, ScriptCommand, ScriptEvent, ScriptInventoryClick, ScriptPlayerContext,
+    ScriptPlayerId, ScriptStorageMutation,
 };
 use mc_test_harness::client::{Client, FrameWaitLimits};
 
@@ -42,26 +43,52 @@ async fn shipped_basic_economy_and_land_claims_route_real_lua_commands() {
     boundary
         .try_enqueue_event(ScriptEvent::server_started())
         .expect("enqueue server start");
-    let load = boundary
-        .recv_command()
-        .await
-        .expect("claim storage load command");
-    let admitted = boundary
-        .accept_host_command(load)
-        .expect("admit claim storage load");
-    assert_eq!(admitted.plugin_id(), "land-claims");
-    assert!(matches!(
-        admitted.request(),
-        ScriptCommand::PluginStorageGet { request }
-            if request.key() == "claims:v1"
-    ));
-    boundary
-        .try_enqueue_event(
-            admitted
-                .plugin_storage_get_result(None, None)
-                .expect("empty claim storage result"),
-        )
-        .expect("deliver empty claim storage result");
+    let mut economy_zone_registered = false;
+    let mut claims_loaded = false;
+    for _ in 0..2 {
+        let command = boundary
+            .recv_command()
+            .await
+            .expect("plugin startup command");
+        let admitted = boundary
+            .accept_host_command(command)
+            .expect("admit plugin startup command");
+        let plugin_id = admitted.plugin_id().to_owned();
+        match plugin_id.as_str() {
+            "basic-economy" => {
+                let (target, zone) = admitted
+                    .into_upsert_zone()
+                    .expect("consume economy market zone");
+                assert_eq!(zone.id(), "economy-market");
+                boundary
+                    .try_enqueue_event(
+                        target
+                            .zone_command_result(zone.id(), true)
+                            .expect("accepted economy zone result"),
+                    )
+                    .expect("deliver economy zone result");
+                economy_zone_registered = true;
+            }
+            "land-claims" => {
+                assert!(matches!(
+                    admitted.request(),
+                    ScriptCommand::PluginStorageGet { request }
+                        if request.key() == "claims:v1"
+                ));
+                boundary
+                    .try_enqueue_event(
+                        admitted
+                            .plugin_storage_get_result(None, None)
+                            .expect("empty claim storage result"),
+                    )
+                    .expect("deliver empty claim storage result");
+                claims_loaded = true;
+            }
+            other => panic!("unexpected startup plugin {other}"),
+        }
+    }
+    assert!(economy_zone_registered);
+    assert!(claims_loaded);
 
     let player_id = ScriptPlayerId::new(7);
     let context = ScriptPlayerContext::new(
@@ -129,35 +156,40 @@ async fn shipped_basic_economy_and_land_claims_route_real_lua_commands() {
 
     assert_eq!(
         boundary
-            .try_enqueue_player_command_with_context(player_id, context.clone(), "economy balance")
-            .expect("enqueue balance command"),
+            .try_enqueue_player_command_with_context(player_id, context.clone(), "economy")
+            .expect("enqueue economy command"),
         PlayerCommandAdmission::Enqueued
     );
-    let wallet = boundary.recv_command().await.expect("wallet read command");
-    let wallet = boundary
-        .accept_host_command(wallet)
-        .expect("admit wallet read");
-    assert_eq!(wallet.plugin_id(), "basic-economy");
+    let ledger = boundary.recv_command().await.expect("ledger read command");
+    let ledger = boundary
+        .accept_host_command(ledger)
+        .expect("admit ledger read");
+    assert_eq!(ledger.plugin_id(), "basic-economy");
     assert!(matches!(
-        wallet.request(),
+        ledger.request(),
         ScriptCommand::PluginStorageGet { request }
-            if request.key() == "wallet:12345678-1234-5678-1234-567812345678"
+            if request.key() == "shop:economy:12345678-1234-5678-1234-567812345678"
     ));
     boundary
         .try_enqueue_event(
-            wallet
+            ledger
                 .plugin_storage_get_result(None, None)
-                .expect("new wallet result"),
+                .expect("new economy ledger result"),
         )
-        .expect("deliver wallet result");
-    let balance = boundary.recv_command().await.expect("balance message");
-    let balance = boundary
-        .accept_host_command(balance)
-        .expect("admit balance message");
+        .expect("deliver economy ledger result");
+    let menu = boundary.recv_command().await.expect("economy menu command");
+    let menu = boundary
+        .accept_host_command(menu)
+        .expect("admit economy menu");
+    assert_eq!(menu.plugin_id(), "basic-economy");
     assert!(matches!(
-        balance.request(),
-        ScriptCommand::SendChatMessage { player_id: target, message }
-            if *target == player_id && message == "Balance: 100 Coins."
+        menu.request(),
+        ScriptCommand::OpenInventoryMenu { player_id: target, menu }
+            if *target == player_id
+                && menu.title() == "Market - Emeralds"
+                && menu.slots()[0].item().resource_id() == "minecraft:apple"
+                && menu.slots()[0].item().label()
+                    == Some("Apples | buy 3 Emeralds | refund | owned 0")
     ));
 
     assert_eq!(
@@ -234,23 +266,175 @@ async fn shipped_basic_economy_and_land_claims_route_real_lua_commands() {
 }
 
 #[tokio::test]
-async fn shipped_land_claim_blocks_stranger_break_and_placement_over_wire() {
+async fn shipped_basic_economy_retains_refund_terms_and_bounds_purchase_count() {
     let plugins = tempfile::tempdir().expect("plugin tempdir");
     copy_example_plugin("basic-economy", plugins.path());
-    copy_example_plugin("land-claims", plugins.path());
+    let config_path = plugins.path().join("basic-economy/config.toml");
+    let mut config: toml::Table =
+        toml::from_str(&std::fs::read_to_string(&config_path).expect("read economy config"))
+            .expect("parse economy config");
+    config
+        .get_mut("catalog")
+        .and_then(toml::Value::as_array_mut)
+        .and_then(|catalog| catalog.first_mut())
+        .and_then(toml::Value::as_table_mut)
+        .expect("first economy product")
+        .insert("price".to_owned(), toml::Value::Integer(4));
     std::fs::write(
-        plugins.path().join("basic-economy/config.toml"),
-        r#"starting_balance = 100
-currency_name = "Coins"
-
-[[products]]
-resource = "minecraft:dirt"
-count = 1
-price = 1
-label = "Dirt"
-"#,
+        &config_path,
+        toml::to_string_pretty(&config).expect("encode changed economy config"),
     )
-    .expect("configure dirt shop");
+    .expect("write changed economy config");
+
+    let (boundary, host) = mc_script::start_lua_host(mc_script::LuaHostConfig::new(plugins.path()))
+        .expect("start changed economy plugin");
+    let context = ScriptPlayerContext::new(
+        "12345678-1234-5678-1234-567812345678",
+        "EconomyPlayer",
+        false,
+        1.0,
+        64.0,
+        1.0,
+    );
+
+    let old_terms = "v2|apples,minecraft:apple,2,3,minecraft:emerald,1";
+    let (target, player_id, menu) =
+        open_economy_menu_from_ledger(&boundary, 7, context.clone(), old_terms, 7).await;
+    assert_eq!(
+        menu.slots()[0].item().label(),
+        Some("Apples | buy 4 Emeralds | changed terms: refund only | refund | owned 1")
+    );
+    boundary
+        .try_enqueue_event(
+            target
+                .inventory_menu_clicked(
+                    player_id,
+                    context.clone(),
+                    &menu,
+                    0,
+                    ScriptInventoryClick::Secondary,
+                )
+                .expect("build legacy refund click"),
+        )
+        .expect("enqueue legacy refund click");
+    let mut transaction = None;
+    for _ in 0..2 {
+        let command = boundary.recv_command().await.expect("refund command");
+        let admitted = boundary
+            .accept_host_command(command)
+            .expect("admit refund command");
+        if let ScriptCommand::InventoryStorageTransaction {
+            transaction: candidate,
+        } = admitted.into_request()
+        {
+            transaction = Some(candidate);
+        }
+    }
+    let transaction = transaction.expect("legacy refund transaction");
+    assert!(
+        transaction
+            .inventory()
+            .iter()
+            .any(|delta| { delta.resource_id() == "minecraft:emerald" && delta.delta() == 3 })
+    );
+    assert!(
+        transaction
+            .inventory()
+            .iter()
+            .any(|delta| { delta.resource_id() == "minecraft:apple" && delta.delta() == -2 })
+    );
+    assert!(matches!(
+        &transaction.storage()[0],
+        ScriptStorageMutation::CompareAndSwap {
+            expected_version: Some(7),
+            value,
+            ..
+        } if value == "v2|"
+    ));
+
+    let maxed = "v2|apples,minecraft:apple,2,4,minecraft:emerald,999999";
+    let (target, player_id, menu) =
+        open_economy_menu_from_ledger(&boundary, 8, context.clone(), maxed, 8).await;
+    boundary
+        .try_enqueue_event(
+            target
+                .inventory_menu_clicked(
+                    player_id,
+                    context.clone(),
+                    &menu,
+                    0,
+                    ScriptInventoryClick::Primary,
+                )
+                .expect("build maxed purchase click"),
+        )
+        .expect("enqueue maxed purchase click");
+    let limit = boundary
+        .recv_command()
+        .await
+        .expect("purchase limit message");
+    let limit = boundary
+        .accept_host_command(limit)
+        .expect("admit purchase limit message");
+    assert!(matches!(
+        limit.request(),
+        ScriptCommand::SendChatMessage { player_id: target, message }
+            if *target == player_id && message == "Purchase limit reached for this product."
+    ));
+
+    let corrupt_player = ScriptPlayerId::new(9);
+    boundary
+        .try_enqueue_player_command_with_context(corrupt_player, context.clone(), "economy")
+        .expect("enqueue corrupt-ledger economy command");
+    let read = boundary.recv_command().await.expect("corrupt ledger read");
+    let read = boundary
+        .accept_host_command(read)
+        .expect("admit corrupt ledger read");
+    boundary
+        .try_enqueue_event(
+            read.plugin_storage_get_result(Some("v1|1"), Some(9))
+                .expect("corrupt ledger result"),
+        )
+        .expect("deliver corrupt ledger result");
+    let corrupt = boundary
+        .recv_command()
+        .await
+        .expect("corrupt ledger message");
+    let corrupt = boundary
+        .accept_host_command(corrupt)
+        .expect("admit corrupt ledger message");
+    assert!(matches!(
+        corrupt.request(),
+        ScriptCommand::SendChatMessage { player_id: target, message }
+            if *target == corrupt_player
+                && message == "Economy unavailable: invalid ledger record."
+    ));
+    assert_eq!(
+        boundary
+            .try_enqueue_player_command_with_context(corrupt_player, context, "economy")
+            .expect("retry economy after corrupt ledger"),
+        PlayerCommandAdmission::Enqueued
+    );
+    let retry = boundary.recv_command().await.expect("retry ledger read");
+    let retry = boundary
+        .accept_host_command(retry)
+        .expect("admit retry ledger read");
+    assert!(matches!(
+        retry.request(),
+        ScriptCommand::PluginStorageGet { .. }
+    ));
+
+    drop(boundary);
+    tokio::task::spawn_blocking(move || host.join())
+        .await
+        .expect("Lua host join task")
+        .expect("Lua host thread");
+}
+
+#[tokio::test]
+async fn shipped_land_claim_blocks_stranger_break_and_placement_over_wire() {
+    let plugins = tempfile::tempdir().expect("plugin tempdir");
+    copy_example_plugin("land-claims", plugins.path());
+    write_dirt_fixture_plugin(plugins.path());
     let (boundary, host) = mc_script::start_lua_host(mc_script::LuaHostConfig::new(plugins.path()))
         .expect("start land claims plugin");
     assert_eq!(host.loaded_plugins(), 2);
@@ -392,18 +576,9 @@ label = "Dirt"
         })
         .await
         .expect("stranger grounded");
-    send_command(&mut stranger, "economy").await;
-    let dirt_menu = wait_for_economy_menu(
-        &mut stranger,
-        dirt_item_id,
-        1,
-        "Balance: 100 Coins",
-        "Dirt | 1 Coins",
-    )
-    .await;
-    click_catalog_product(&mut stranger, &dirt_menu, 0).await;
-    let dirt_purchase = wait_for_message_and_inventory(&mut stranger, "Purchased Dirt.").await;
-    assert_eq!(total_count(&dirt_purchase, dirt_item_id), 1);
+    send_command(&mut stranger, "fixture-dirt").await;
+    let dirt_grant = wait_for_message_and_inventory(&mut stranger, "fixture-dirt-ready").await;
+    assert_eq!(total_count(&dirt_grant, dirt_item_id), 1);
 
     stranger
         .write_packet(&ServerboundPlayerAction {
@@ -466,9 +641,8 @@ label = "Dirt"
 async fn shipped_inventory_plugins_work_over_wire() {
     let plugins = tempfile::tempdir().expect("plugin tempdir");
     copy_example_plugin("basic-economy", plugins.path());
-    copy_example_plugin("currency-catalog", plugins.path());
     copy_example_plugin("online-roster", plugins.path());
-    let config_path = plugins.path().join("currency-catalog/config.toml");
+    let config_path = plugins.path().join("basic-economy/config.toml");
     let mut config: toml::Table =
         toml::from_str(&std::fs::read_to_string(&config_path).expect("read catalog config"))
             .expect("parse catalog config");
@@ -530,8 +704,8 @@ async fn shipped_inventory_plugins_work_over_wire() {
     let product_count = 1;
     let product_price = 2;
     let (boundary, host) = mc_script::start_lua_host(mc_script::LuaHostConfig::new(plugins.path()))
-        .expect("start shipped currency catalog");
-    assert_eq!(host.loaded_plugins(), 3);
+        .expect("start shipped item economy");
+    assert_eq!(host.loaded_plugins(), 2);
 
     let world_dir = tempfile::tempdir().expect("disk-backed world tempdir");
     std::fs::create_dir_all(world_dir.path().join("region")).expect("create world region");
@@ -543,7 +717,6 @@ async fn shipped_inventory_plugins_work_over_wire() {
     let currency_id = item_id(&items, currency_resource);
     let product_id = item_id(&items, product_resource);
     let roster_item_id = item_id(&items, "minecraft:paper");
-    let economy_product_id = item_id(&items, "minecraft:bread");
     let generator = Arc::new(mc_worldgen::TerrainGenerator::new(0, Arc::clone(&blocks)));
     let world =
         mc_world::WorldStorage::open_with_capacity(world_dir.path(), Arc::clone(&blocks), 49)
@@ -553,7 +726,7 @@ async fn shipped_inventory_plugins_work_over_wire() {
     let shutdown = mc_net::ShutdownHandle::default();
     let cfg = mc_net::ServerConfig {
         bind_address: "127.0.0.1:0".parse().unwrap(),
-        motd: "Shipped currency catalog wire test".into(),
+        motd: "Shipped item economy wire test".into(),
         max_players: 1,
         view_distance: 1,
         data: Arc::new(mc_data::solaris_required_data()),
@@ -602,8 +775,6 @@ async fn shipped_inventory_plugins_work_over_wire() {
         })
         .await
         .expect("report grounded spawn pose");
-    wait_for_system_chat(&mut client, "Currency Catalog ready.").await;
-
     client
         .write_packet(&ServerboundChatCommand {
             command: format!("give {currency_resource} {product_price}"),
@@ -691,18 +862,27 @@ async fn shipped_inventory_plugins_work_over_wire() {
     .await;
     assert_eq!(final_menu.product_count, product_count);
 
+    client
+        .write_packet(&ServerboundMovePlayerPos {
+            x: 20.0,
+            y: sync.y,
+            z: 20.0,
+            flags: MovePlayerFlags::new(true, false),
+        })
+        .await
+        .expect("leave catalog zone before command entry");
     send_command(&mut client, "economy").await;
-    let economy_menu = wait_for_economy_menu(
+    let command_menu = wait_for_catalog_menu(
         &mut client,
-        economy_product_id,
-        4,
-        "Balance: 100 Coins",
-        "Bread x4 | 8 Coins",
+        product_id,
+        product_count,
+        product_label,
+        product_price,
+        currency_plural,
+        0,
     )
     .await;
-    click_catalog_product(&mut client, &economy_menu, 0).await;
-    let economy_purchase = wait_for_message_and_inventory(&mut client, "Purchased Bread x4.").await;
-    assert_eq!(total_count(&economy_purchase, economy_product_id), 4);
+    assert_eq!(command_menu.product_count, product_count);
 
     send_command(&mut client, "who").await;
     wait_for_roster_menu(&mut client, roster_item_id, "CatalogPlayer").await;
@@ -891,6 +1071,75 @@ fn copy_example_plugin(name: &str, destination_root: &Path) {
     }
 }
 
+async fn open_economy_menu_from_ledger(
+    boundary: &mc_script::ScriptBoundary,
+    player_value: u64,
+    context: ScriptPlayerContext,
+    ledger: &str,
+    version: u64,
+) -> (
+    mc_script::ScriptPluginTarget,
+    ScriptPlayerId,
+    mc_script::ScriptInventoryMenu,
+) {
+    let player_id = ScriptPlayerId::new(player_value);
+    assert_eq!(
+        boundary
+            .try_enqueue_player_command_with_context(player_id, context, "economy")
+            .expect("enqueue economy command"),
+        PlayerCommandAdmission::Enqueued
+    );
+    let read = boundary.recv_command().await.expect("economy ledger read");
+    let read = boundary
+        .accept_host_command(read)
+        .expect("admit economy ledger read");
+    boundary
+        .try_enqueue_event(
+            read.plugin_storage_get_result(Some(ledger), Some(version))
+                .expect("economy ledger result"),
+        )
+        .expect("deliver economy ledger result");
+    boundary
+        .accept_host_command(boundary.recv_command().await.expect("economy menu command"))
+        .expect("admit economy menu")
+        .into_open_inventory_menu()
+        .expect("consume economy menu")
+}
+
+fn write_dirt_fixture_plugin(destination_root: &Path) {
+    let destination = destination_root.join("dirt-fixture");
+    std::fs::create_dir(&destination).expect("create dirt fixture plugin directory");
+    std::fs::write(
+        destination.join("plugin.toml"),
+        r#"
+            id = "dirt-fixture"
+            name = "Dirt Fixture"
+            version = "0.1.0"
+            api = "0.6.0"
+            capabilities = ["player_inventory"]
+            player_commands = ["fixture-dirt"]
+        "#,
+    )
+    .expect("write dirt fixture manifest");
+    std::fs::write(
+        destination.join("main.lua"),
+        r#"
+            function on_player_command(event)
+                solaris.inventory_transaction(event.player_id, "dirt-grant", {
+                    { resource = "minecraft:dirt", delta = 1 },
+                })
+            end
+
+            function on_player_inventory_transaction_result(event)
+                if event.request_id == "dirt-grant" and event.committed then
+                    solaris.send_message(event.player_id, "fixture-dirt-ready")
+                end
+            end
+        "#,
+    )
+    .expect("write dirt fixture source");
+}
+
 fn write_villager_fixture_plugin(destination_root: &Path) {
     let destination = destination_root.join("villager-fixture");
     std::fs::create_dir(&destination).expect("create villager fixture plugin directory");
@@ -1069,51 +1318,6 @@ async fn wait_for_roster_menu(client: &mut Client, item_id: u32, username: &str)
         content.items[0].custom_name.as_deref(),
         Some(format!("{username} | minecraft:overworld").as_str())
     );
-}
-
-async fn wait_for_economy_menu(
-    client: &mut Client,
-    product_id: u32,
-    product_count: i32,
-    title: &str,
-    label: &str,
-) -> CatalogMenu {
-    let open = client
-        .wait_for_frame_id_with_timeout_and_limits(
-            ClientboundOpenScreen::ID,
-            Duration::from_secs(5),
-            FRAME_LIMITS,
-        )
-        .await
-        .expect("economy open frame");
-    let screen = ClientboundOpenScreen::decode(&mut open.frame.body.clone())
-        .expect("decode economy OpenScreen");
-    assert_eq!(screen.menu_type, 0);
-    assert_eq!(literal_text_component_text(&screen.title_nbt), title);
-    let content = loop {
-        let outcome = client
-            .wait_for_frame_id_with_timeout_and_limits(
-                ClientboundContainerSetContent::ID,
-                Duration::from_secs(5),
-                FRAME_LIMITS,
-            )
-            .await
-            .expect("economy content frame");
-        let content = ClientboundContainerSetContent::decode(&mut outcome.frame.body.clone())
-            .expect("decode economy content");
-        if content.container_id == screen.container_id {
-            break content;
-        }
-    };
-    assert_eq!(content.items[0].item_id, product_id);
-    assert_eq!(content.items[0].count, product_count);
-    assert_eq!(content.items[0].custom_name.as_deref(), Some(label));
-    CatalogMenu {
-        container_id: content.container_id,
-        state_id: content.state_id,
-        product_id,
-        product_count,
-    }
 }
 
 async fn click_catalog_product(client: &mut Client, menu: &CatalogMenu, button_num: i8) {

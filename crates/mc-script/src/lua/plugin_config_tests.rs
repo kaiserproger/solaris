@@ -399,9 +399,9 @@ fn disk_config_accepts_each_exact_structural_boundary() {
 }
 
 #[test]
-fn currency_catalog_rejects_fail_late_config_shapes_during_plugin_load() {
+fn basic_economy_rejects_fail_late_config_shapes_during_plugin_load() {
     let catalog = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-        .join("../../examples/plugins/currency-catalog");
+        .join("../../examples/plugins/basic-economy");
 
     let mut float_count = read_plugin_source(&catalog).unwrap();
     float_count
@@ -480,4 +480,25 @@ fn currency_catalog_rejects_fail_late_config_shapes_during_plugin_load() {
         Err(error) => error,
     };
     assert!(error.contains("zone y bounds are out of range"));
+
+    let mut duplicate_product_id = read_plugin_source(&catalog).unwrap();
+    let products = duplicate_product_id
+        .config
+        .get_mut("catalog")
+        .and_then(toml::Value::as_array_mut)
+        .unwrap();
+    let first_id = products[0]
+        .as_table()
+        .and_then(|item| item.get("id"))
+        .cloned()
+        .unwrap();
+    products[1]
+        .as_table_mut()
+        .unwrap()
+        .insert("id".to_owned(), first_id);
+    let error = match LuaPlugin::new(duplicate_product_id) {
+        Ok(_) => panic!("duplicate catalog id loaded"),
+        Err(error) => error,
+    };
+    assert!(error.contains("catalog ids must be unique"));
 }

@@ -60,16 +60,18 @@ and is not startup context.
   measured idle p99 11 us, sustained four-kill p99 13,668 us, and bounded
   four-removal p99 24,367 us. Focused death/effect/arrow/restart tests pass;
   this does not prove real socket throughput or manual combat feel.
-- `basic-economy` now owns durable virtual wallets and an inventory shop with
-  atomic item/balance commit. `land-claims` owns a bounded durable whole-chunk
-  index, waits for targeted zone-command results, and rolls storage back when
-  a registry change is rejected. The production block-break and placement
-  paths consult the shared zone adapter before mutation. Focused
-  Lua and two-client TCP tests prove default balance, purchase, claim commit,
-  owner/operator bypass, stranger rejection, and unchanged world blocks. The
-  adapter convention is intentionally temporary and protects direct break and
-  placement only; containers, fluids, pistons, explosions, fire, and entity
-  interaction remain open. No manual-client gate has run.
+- `basic-economy` now owns one configurable physical item currency, a
+  zone-activated inventory shop, and a durable refund ledger. Purchase and
+  refund use one inventory/storage transaction, so currency, product, and
+  ledger never commit separately. The old virtual wallet and duplicate
+  `currency-catalog` fixture were removed. Stable product ids preserve original
+  refund terms across catalog edits and reject purchases until old terms are
+  cleared. A production TCP/Lua gate proves a configured gold-ingot purchase,
+  insufficient-funds rejection, refund, and zone-triggered menu refresh.
+  `land-claims` owns a bounded durable whole-chunk
+  index and direct break/place protection. Containers, fluids, pistons,
+  explosions, fire, and entity interaction remain open. No manual-client gate
+  has run.
 - The agent-run real-client hostile-combat functional gate is closed on an
   isolated O3 server. Ordinary 26.1.2 client actions selected an iron sword,
   killed a zombie, observed and collected its rotten-flesh drop, observed a
@@ -218,8 +220,8 @@ and is not startup context.
   for this plugin-only slice.
 - `d59bd57` adds optional per-plugin `config.toml`, loaded and recursively
   bounded before plugin registration, plus a fresh-copy `solaris.config()` Lua
-  API. The shipped currency catalog now reads currency, zone, and products from
-  that file and validates its exact schema at load. A production TCP/Lua gate
+  API. The then-separate currency catalog read currency, zone, and products
+  from that file and validated its exact schema at load. A production TCP/Lua gate
   overrides the example with gold currency, a stone axe, and a moved zone, then
   proves menu content, buy, stale rejection, unchanged state, and refund. Full
   workspace tests, strict workspace Clippy, fmt, code-health `0 fail / KEEP`,
@@ -377,7 +379,7 @@ two priorities unless it becomes a common-play blocker or corruption risk.
   above `u32`, invalid pickup identities/modes, transition-tick deduplication,
   and unpublished campfire outputs; the wire gate covers exact committed event
   fields and rejected retries. Block DTOs expose player pose separately from
-  integer block coordinates. The exact shipped currency catalog now has a
+  integer block coordinates. The consolidated item-currency economy now has a
   production wire gate for zone activation, buy, insufficient-funds rejection,
   unchanged ledger, and refund. The exact shipped colony scaffold has a
   production wire gate for durable recruit, `home`, later accepted `hold`, and
