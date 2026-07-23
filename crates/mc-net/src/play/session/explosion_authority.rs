@@ -30,6 +30,8 @@ use super::{
     record_entity_dispatches_locked,
 };
 
+pub(in crate::play) const EXPLOSIONS_PER_TICK: usize = 1;
+
 pub(in crate::play) struct ExpiredPrimedTnt {
     pub(in crate::play) entity_id: EntityId,
     pub(in crate::play) position: Vec3,
@@ -269,25 +271,51 @@ impl SessionRegistry {
         current_tick: u64,
     ) -> Vec<ExpiredPrimedTnt> {
         let mut inner = self.lock_session_entities("claim due primed TNT");
-        let mut due_ids = inner
-            .entities
-            .snapshots_vec()
-            .into_iter()
-            .filter(|entity| {
-                entity.lifecycle == EntityLifecycle::Alive
-                    && entity
-                        .retained
-                        .primed_tnt
-                        .is_some_and(|fuse| fuse.expires_tick <= current_tick)
-            })
-            .map(|entity| entity.id)
-            .collect::<Vec<_>>();
-        due_ids.sort_unstable();
+        if inner.last_primed_tnt_claim_tick == Some(current_tick) {
+            return Vec::new();
+        }
+        inner.last_primed_tnt_claim_tick = Some(current_tick);
+        let mut due_ids = Vec::with_capacity(EXPLOSIONS_PER_TICK);
+        while due_ids.len() < EXPLOSIONS_PER_TICK {
+            let Some((&deadline, _)) = inner.primed_tnt_deadlines.first_key_value() else {
+                break;
+            };
+            if deadline > current_tick {
+                break;
+            }
+            let bucket = inner
+                .primed_tnt_deadlines
+                .get_mut(&deadline)
+                .expect("first TNT deadline exists");
+            let entity_id = bucket
+                .pop_first()
+                .expect("TNT deadline bucket is non-empty");
+            if bucket.is_empty() {
+                inner.primed_tnt_deadlines.remove(&deadline);
+            }
+            debug_assert_eq!(
+                inner.primed_tnt_deadline_by_id.remove(&entity_id),
+                Some(deadline)
+            );
+            due_ids.push(entity_id);
+        }
 
         let claimed = due_ids
             .into_iter()
             .filter_map(|entity_id| {
-                let retained = inner.entities.snapshot(entity_id)?.retained.primed_tnt?;
+                let entity = inner.entities.snapshot(entity_id)?;
+                if entity.lifecycle != EntityLifecycle::Alive {
+                    return None;
+                }
+                let retained = entity.retained.primed_tnt?;
+                if retained.expires_tick > current_tick {
+                    schedule_primed_tnt_deadline_locked(
+                        &mut inner,
+                        entity_id,
+                        Some(retained.expires_tick),
+                    );
+                    return None;
+                }
                 let snapshot = remove_server_entity_state_locked(&mut inner, entity_id)?;
                 let observer_ids = remove_entity_visibility_locked(&mut inner, entity_id);
                 let is_creeper = snapshot.type_name == "minecraft:creeper";
@@ -395,6 +423,8 @@ pub(super) fn spawn_primed_tnt_locked(
         air_block_state: air.0,
     });
     let entity_id = inner.entities.spawn(entity);
+    let expires_tick = inner.entity_lifecycle_tick.saturating_add(fuse_ticks);
+    schedule_primed_tnt_deadline_locked(inner, entity_id, Some(expires_tick));
     inner
         .entity_type_aabbs
         .entry(entity_type_id)
@@ -403,6 +433,39 @@ pub(super) fn spawn_primed_tnt_locked(
     initialize_entity_wire_state_locked(inner, entity_id);
     let dispatches = spawn_entity_visibility_locked(inner, entity_id);
     (entity_id, dispatches)
+}
+
+pub(super) fn schedule_primed_tnt_deadline_locked(
+    inner: &mut SessionRegistryInner,
+    entity_id: EntityId,
+    expires_tick: Option<u64>,
+) {
+    if inner.primed_tnt_deadline_by_id.get(&entity_id).copied() == expires_tick {
+        return;
+    }
+    if let Some(previous_deadline) = inner.primed_tnt_deadline_by_id.remove(&entity_id) {
+        let remove_bucket = inner
+            .primed_tnt_deadlines
+            .get_mut(&previous_deadline)
+            .is_some_and(|bucket| {
+                bucket.remove(&entity_id);
+                bucket.is_empty()
+            });
+        if remove_bucket {
+            inner.primed_tnt_deadlines.remove(&previous_deadline);
+        }
+    }
+    let Some(expires_tick) = expires_tick else {
+        return;
+    };
+    inner
+        .primed_tnt_deadline_by_id
+        .insert(entity_id, expires_tick);
+    inner
+        .primed_tnt_deadlines
+        .entry(expires_tick)
+        .or_default()
+        .insert(entity_id);
 }
 
 fn apply_explosion_knockback_locked(

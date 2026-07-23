@@ -37,6 +37,13 @@ and is not startup context.
   terminal removal, radius-3 explosion, and player damage. Exact 26.1.2
   swell/ignited wire indexes and line-of-sight cancellation are still pending;
   no manual-client gate was run.
+- Primed TNT/creeper expiry uses an exact retained-deadline index populated by
+  spawn, fuse updates, restore, and removal. Rescheduling removes the previous
+  bucket entry, and repeated owner calls cannot exceed one explosion per world
+  tick. An O3 full-path load with 4,096 background cows, 64 explosions, and a
+  fresh 27-block solid volume per explosion measured idle fuse p99 0 us and
+  explosion-tick p50/p95/p99 23,812/37,943/46,463 us. This is in-process
+  authority/world/entity evidence, not publication or socket throughput.
 - Block use/break, entity interaction, and default melee now use separate
   26.1.2 eye-to-AABB verification contracts. Block and entity interactions are
   strict at their buffered limits; attack is inclusive. Player and

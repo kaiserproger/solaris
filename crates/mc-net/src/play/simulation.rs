@@ -5995,6 +5995,10 @@ fn valid_block_edit_command(
 }
 
 #[cfg(test)]
+#[path = "simulation/explosion_load_tests.rs"]
+mod explosion_load_tests;
+
+#[cfg(test)]
 mod tests {
     use super::super::{
         EntityPhysicsStep, GameMode, HOSTILE_MELEE_PERIOD_TICKS, ITEM_PICKUP_DELAY_TICKS,
@@ -15553,6 +15557,18 @@ mod tests {
         let restored = SessionRegistry::new();
         assert_eq!(restored.restore_persisted_entities(saved), 1);
         assert_eq!(restored.persisted_entity_records().len(), 1);
+        assert!(
+            restored
+                .claim_due_primed_tnt(&SimulationAuthority::for_test(), 79)
+                .is_empty()
+        );
+        assert_eq!(
+            restored
+                .claim_due_primed_tnt(&SimulationAuthority::for_test(), 80)
+                .len(),
+            1,
+            "restored TNT must be scheduled in the deadline index"
+        );
 
         world
             .lock()
@@ -15690,19 +15706,24 @@ mod tests {
         );
         let materials = mc_physics::BlockMaterialIds::new(0, None, None);
         owner.advance_world_time(&sessions, 80);
-        assert_eq!(
-            owner
-                .tick_primed_tnt(
-                    &sessions,
-                    Some(&world),
-                    None,
-                    &block_facts,
-                    &blocks,
-                    Some(&materials),
-                )
-                .await,
-            2
-        );
+        for index in 0..2 {
+            if index != 0 {
+                owner.advance_world_time(&sessions, 1);
+            }
+            assert_eq!(
+                owner
+                    .tick_primed_tnt(
+                        &sessions,
+                        Some(&world),
+                        None,
+                        &block_facts,
+                        &blocks,
+                        Some(&materials),
+                    )
+                    .await,
+                1
+            );
+        }
         assert!(
             outbound.try_recv().is_err(),
             "all TNT world and entity publication must wait for older ordered work"

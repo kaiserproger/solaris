@@ -11,6 +11,7 @@ use mc_entity::{
     RegionalOwnerRuntime, RegionalOwnerStatus, VersionedEntitySnapshots,
 };
 use std::cell::RefCell;
+use std::collections::BTreeSet;
 use std::ops::{Deref, DerefMut};
 use std::sync::atomic::{AtomicI32, AtomicU32, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Mutex, MutexGuard};
@@ -119,7 +120,8 @@ use entity_owner::*;
 use entity_tracking::EntityMovementTrackers;
 #[allow(unused_imports)]
 pub(super) use explosion_authority::{
-    ExpiredPrimedTnt, ExplosionEntityTarget, ExplosionPlayerTarget, ServerEntityExplosionImpact,
+    EXPLOSIONS_PER_TICK, ExpiredPrimedTnt, ExplosionEntityTarget, ExplosionPlayerTarget,
+    ServerEntityExplosionImpact,
 };
 pub(super) use herd_spawn_authority::HerdSpawnOutcome;
 #[cfg(test)]
@@ -364,6 +366,9 @@ struct SessionRegistryInner {
     item_despawn_deadline_by_id: HashMap<EntityId, u64>,
     dying_entity_deadlines: BTreeMap<u64, VecDeque<EntityId>>,
     dying_entity_deadline_by_id: HashMap<EntityId, u64>,
+    primed_tnt_deadlines: BTreeMap<u64, BTreeSet<EntityId>>,
+    primed_tnt_deadline_by_id: HashMap<EntityId, u64>,
+    last_primed_tnt_claim_tick: Option<u64>,
     player_persistence: HashMap<SessionId, Arc<Mutex<PlayerPersistedState>>>,
     player_hurt_resistance: HashMap<SessionId, PlayerHurtResistance>,
     active_shields: HashMap<SessionId, ActiveShield>,

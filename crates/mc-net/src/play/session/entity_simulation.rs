@@ -2,6 +2,7 @@ use super::entity_lifecycle::{
     remove_server_entity_locked, schedule_entity_death_locked, track_entity_chunk_locked,
 };
 use super::entity_physics_class::entity_type_uses_aquatic_physics;
+use super::explosion_authority::schedule_primed_tnt_deadline_locked;
 use super::interaction_geometry::{
     distance_sq, entity_aabb, entity_geometry, entity_is_near_player_chunk,
 };
@@ -496,6 +497,11 @@ impl SessionRegistry {
                 inner.natural_ground_mobs.insert(entity_id);
             }
             schedule_entity_death_locked(&mut inner, &entity);
+            schedule_primed_tnt_deadline_locked(
+                &mut inner,
+                entity_id,
+                entity.retained.primed_tnt.map(|fuse| fuse.expires_tick),
+            );
             if entity.item_stack.is_some() {
                 schedule_item_despawn_locked(&mut inner, entity_id, entity.retained.spawn_tick);
             }

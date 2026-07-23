@@ -612,6 +612,42 @@ fn nearby_creeper_primes_once_and_explodes_after_thirty_ticks() {
 }
 
 #[test]
+fn due_tnt_is_drained_in_bounded_deadline_batches() {
+    let registry = SessionRegistry::new();
+    for index in 0..10 {
+        registry.spawn_chained_primed_tnt(
+            &SimulationAuthority::for_test(),
+            132,
+            Vec3::new(f64::from(index) + 0.5, 64.0, 0.5),
+            Vec3::ZERO,
+            5,
+            BlockStateId(0),
+        );
+    }
+
+    assert!(
+        registry
+            .claim_due_primed_tnt(&SimulationAuthority::for_test(), 4)
+            .is_empty()
+    );
+    let mut claimed = 0;
+    for tick in 5..15 {
+        let batch = registry.claim_due_primed_tnt(&SimulationAuthority::for_test(), tick);
+        assert!(!batch.is_empty());
+        assert!(batch.len() <= super::explosion_authority::EXPLOSIONS_PER_TICK);
+        claimed += batch.len();
+        assert!(
+            registry
+                .claim_due_primed_tnt(&SimulationAuthority::for_test(), tick)
+                .is_empty(),
+            "the per-tick budget must survive repeated owner calls"
+        );
+    }
+    assert_eq!(claimed, 10);
+    assert!(registry.primed_tnt_fuses_for_test().is_empty());
+}
+
+#[test]
 fn creeper_cancels_its_fuse_when_the_player_gets_clear() {
     let registry = SessionRegistry::new();
     let player = register_test_session(&registry, "CreeperEscape");
@@ -637,6 +673,17 @@ fn creeper_cancels_its_fuse_when_the_player_gets_clear() {
         0
     );
     assert!(registry.primed_tnt_fuses_for_test().is_empty());
+    {
+        let inner = registry.lock_inner("verify cancelled creeper deadline cleanup");
+        assert!(inner.primed_tnt_deadlines.is_empty());
+        assert!(inner.primed_tnt_deadline_by_id.is_empty());
+    }
+    assert!(
+        registry
+            .claim_due_primed_tnt(&SimulationAuthority::for_test(), 40)
+            .is_empty(),
+        "cancelled creeper fuse must not leave a deadline entry"
+    );
     assert_eq!(registry.persisted_entity_records().len(), 1);
 }
 

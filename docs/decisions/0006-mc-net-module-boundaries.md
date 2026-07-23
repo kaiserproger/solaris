@@ -640,6 +640,17 @@ overtaken by the next. Generic block-edit recipients remain unordered; the
 ordered loaded-chunk recipient path is intentionally limited to this TNT
 transaction boundary.
 
+Fuse expiry is indexed by exact retained deadline. TNT spawn, creeper fuse
+start/reversal/cancellation, persisted restore, and generic entity removal
+atomically move or remove the matching deadline bucket entry. The owner claims
+one due explosion per world tick, including repeated calls at the same tick,
+before running ray planning, world mutation, drops, entity impacts, and ordered
+publication. This deliberately spreads a simultaneous TNT burst across ticks
+instead of allowing one world-lock turn to exceed the server tick budget. An O3
+run with 4,096 background entities, 64 queued explosions, and a fresh 27-block
+solid volume per explosion measured 46,463 us p99. The limit is a measured
+overload fence, not a vanilla timing-parity claim.
+
 Creepers use the local decompiled 26.1.2 `Creeper`/`SwellGoal` common-path
 values: a 30-tick fuse, exclusive 3-block trigger, 7-block cancellation
 distance, and explosion power 3. Moving out of range reverses fuse progress one

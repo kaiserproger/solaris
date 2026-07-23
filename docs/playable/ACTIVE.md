@@ -71,13 +71,11 @@ hardening. An already-open lower-priority diff does not override this order.
    Close the remaining claim surfaces (containers, fluids, explosions and
    entity interaction) through a first-class zone protection policy after the
    ordinary break/place slice is client-verified.
-5. Run a bounded explosion load benchmark and record the exact envelope. The
-   terrain visual gate is closed under worldgen revision 8.
-6. Close this owner batch with a 20-minute MCP-driven survival session whose
+5. Close this owner batch with a 20-minute MCP-driven survival session whose
    decisions are made by one fast subagent. Do not use the deterministic
    scenario runner or operator setup. Treat its visible failures as the next
    playable queue.
-7. Keep the rare multi-region save recovery `fsync`/metrics issue documented
+6. Keep the rare multi-region save recovery `fsync`/metrics issue documented
    but deferred. Do not resume it unless it becomes ordinary save corruption or
    blocks the playable or plugin path.
 
@@ -341,6 +339,19 @@ hardening. An already-open lower-priority diff does not override this order.
   multi-tick backlog, lethal effects, arrows, normal death timing, and restart
   reconstruction. This is in-process owner/publication evidence, not real
   socket throughput or manual combat feel.
+
+- Primed TNT and creeper fuses now enter an exact deadline index instead of
+  scanning every server entity each tick. Spawn, cancellation, rescheduling,
+  persisted restore, and entity removal maintain that index without stale queue
+  entries. The explosion owner claims at most one due explosion per world tick,
+  including repeated owner calls, so ray planning, world edits, drops, entity
+  impacts, and ordered publication cannot combine an arbitrary simultaneous
+  batch under one world lock. The explicit O3 full-path benchmark used 4,096
+  background cows, 64 due explosions, a fresh 27-block solid dirt volume per
+  explosion, and one loaded observer. Idle fuse checks measured 0 us p50/p99;
+  the 64 bounded explosion ticks measured 23,812 us p50, 37,943 us p95, and
+  46,463 us p99/max. This is an in-process release-build authority/world/entity
+  envelope, not publication or real socket throughput.
 
 - Reach now uses the 26.1.2 server contracts instead of one shared
   center-distance rule. Block checks measure eye-to-block AABB at 5.5 survival

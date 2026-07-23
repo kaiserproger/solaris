@@ -293,6 +293,18 @@ pub(super) fn clear_removed_entity_tracking_locked(
     entity_id: EntityId,
 ) {
     inner.item_despawn_deadline_by_id.remove(&entity_id);
+    if let Some(deadline) = inner.primed_tnt_deadline_by_id.remove(&entity_id) {
+        let remove_bucket = inner
+            .primed_tnt_deadlines
+            .get_mut(&deadline)
+            .is_some_and(|bucket| {
+                bucket.remove(&entity_id);
+                bucket.is_empty()
+            });
+        if remove_bucket {
+            inner.primed_tnt_deadlines.remove(&deadline);
+        }
+    }
     clear_entity_publication_state_locked(inner, entity_id);
     inner.hostile_entities.remove(&entity_id);
     inner.natural_hostile_mobs.remove(&entity_id);

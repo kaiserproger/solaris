@@ -20,6 +20,7 @@ use crate::play::{
 use super::entity_lifecycle::nearby_entity_snapshots_locked;
 use super::entity_lifecycle::{nearby_entity_candidate_ids_locked, track_entity_chunk_locked};
 use super::entity_owner::EntityOwnerAccess;
+use super::explosion_authority::schedule_primed_tnt_deadline_locked;
 use super::interaction_geometry::{distance_sq, entity_aabb};
 #[cfg(test)]
 use super::outbound::ServerEntitySnapshot;
@@ -387,11 +388,11 @@ impl SessionRegistry {
                 .iter()
                 .map(|plan| plan.hostile_id)
                 .collect::<HashSet<_>>();
-            let mut entities = self.lock_entities("commit hostile creeper fuses");
-            entities.prefetch(&creeper_ids);
+            let mut guards = self.lock_session_entities("commit hostile creeper fuses");
+            guards.entities.prefetch(&creeper_ids);
             let mut ignitions = 0;
             for plan in creeper_fuses {
-                let Some(expected) = entities.snapshot(plan.hostile_id) else {
+                let Some(expected) = guards.entities.snapshot(plan.hostile_id) else {
                     continue;
                 };
                 let previous_fuse = expected.retained.primed_tnt;
@@ -417,8 +418,15 @@ impl SessionRegistry {
                 };
                 let mut next = expected.clone();
                 next.retained.primed_tnt = next_fuse;
-                if entities.replace_snapshot_if_current(expected, next) && previous_fuse.is_none() {
-                    ignitions += 1;
+                if guards.entities.replace_snapshot_if_current(expected, next) {
+                    schedule_primed_tnt_deadline_locked(
+                        &mut guards,
+                        plan.hostile_id,
+                        next_fuse.map(|fuse| fuse.expires_tick),
+                    );
+                    if previous_fuse.is_none() {
+                        ignitions += 1;
+                    }
                 }
             }
             ignitions

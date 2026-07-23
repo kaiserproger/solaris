@@ -108,6 +108,10 @@ verification and keep ordinary survival play ahead of rare edge cases.
   and returned `pickup_confirmed=true` when cobblestone increased from `0` to
   `1` in non-selected slot `1`; the diamond pickaxe remained selected in slot
   `0`, the block became air, and the client stayed in play.
+- [ ] Fix the persistent embedded non-operator restart pickup regression. The
+  full workspace gate and an exact isolated rerun both received break update
+  and acknowledgement for `(-1, 84, 0)` but no drop stack or inventory item;
+  this is separate from the green fresh-world MCP pickup gate above.
 - [x] `minecraft_use_item_on` exposes `main_hand` and `off_hand`, defaults to
   main hand, dispatches that exact vanilla interaction hand, and returns the
   local interaction result instead of unconditional `ok`. In the focused real
@@ -228,6 +232,14 @@ verification and keep ordinary survival play ahead of rare edge cases.
   flush and chunk fetch/light work accumulated behind it. Fix that common
   exploration stall and the observed shutdown-drain timeout before using
   far-travel results as a latency benchmark.
+  Explosion expiry no longer scans every entity and cannot process an unbounded
+  simultaneous batch under one world lock. An O3 full-path benchmark with 4,096
+  background cows, 64 due explosions, a fresh 27-block solid dirt volume for
+  every explosion, and one loaded observer measured idle fuse checks at 0 us
+  p99 and bounded explosion ticks at 23,812 us p50 / 37,943 us p95 / 46,463 us
+  p99. One explosion is admitted per world tick even if the owner calls the
+  claim path repeatedly. This closes the requested explosion benchmark, while
+  fluid and far-travel spikes remain.
 - [ ] Bound breeding and scheduled-block work per tick and move expensive
   preparation off the tick owner. No single animal or block batch may stall
   packet processing.
