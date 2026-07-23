@@ -1519,10 +1519,7 @@ impl WorldMutationView {
                     self.resident
                         .read_view
                         .update_chunk(chunk_position, chunk, move |chunk| {
-                            ticks
-                                .into_iter()
-                                .filter(|tick| chunk.schedule_fluid_tick(tick.clone()))
-                                .count()
+                            chunk.schedule_fluid_tick_batch(ticks)
                         });
                 self.resident.scheduled_tick_view.publish_chunk(
                     chunk_position,
@@ -2232,8 +2229,16 @@ impl WorldMutationView {
             );
         }
 
+        let mut scheduled_by_chunk = HashMap::<ChunkPos, Vec<ScheduledFluidTick>>::new();
         for tick in scheduled_fluid_ticks {
-            let chunk_position = chunk_pos_of(tick.pos);
+            scheduled_by_chunk
+                .entry(chunk_pos_of(tick.pos))
+                .or_default()
+                .push(tick.clone());
+        }
+        let mut scheduled_by_chunk = scheduled_by_chunk.into_iter().collect::<Vec<_>>();
+        scheduled_by_chunk.sort_unstable_by_key(|(position, _)| (position.x, position.z));
+        for (chunk_position, ticks) in scheduled_by_chunk {
             let chunk = region
                 .chunks
                 .get_mut(&chunk_position)
@@ -2241,14 +2246,16 @@ impl WorldMutationView {
             let added = self
                 .resident
                 .read_view
-                .update_chunk(chunk_position, chunk, |chunk| {
-                    let added = chunk.schedule_fluid_tick(tick.clone());
-                    if added && let Some(decision_id) = decision_id {
+                .update_chunk(chunk_position, chunk, move |chunk| {
+                    let added = chunk.schedule_fluid_tick_batch(ticks);
+                    if added != 0
+                        && let Some(decision_id) = decision_id
+                    {
                         chunk.set_world_journal_lsn(decision_id);
                     }
                     added
                 });
-            if added {
+            if added != 0 {
                 touched.insert(chunk_position);
             }
             self.resident.scheduled_tick_view.publish_chunk(

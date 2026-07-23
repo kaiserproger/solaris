@@ -3,6 +3,7 @@ use super::containers::furnace_fuel_ticks;
 use super::falling_blocks::{FallingBlockStart, LandedFallingBlock, plan_falling_block_starts};
 use super::use_item_on_adapter::cursor_y_relative_to_target;
 use super::*;
+use std::cell::Cell;
 use std::collections::{BTreeMap, HashSet};
 use std::num::NonZeroUsize;
 use std::pin::Pin;

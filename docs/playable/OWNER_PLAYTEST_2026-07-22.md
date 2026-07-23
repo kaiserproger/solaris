@@ -226,9 +226,16 @@ verification and keep ordinary survival play ahead of rare edge cases.
   in 20-tick batches and inline single-region scheduled block ticks no longer
   wait for a WAL append. The batched breeding pass preserves every eligible
   love window; an O3 profile rerun is still required.
-  A debug deep-water fixture also exposed a scheduled-fluid backlog applying
-  roughly 94-105 updates in `68-76 ms` per tick and delaying client entry for
-  more than two minutes; profile and bound that common loaded-ocean path.
+  The debug deep-water fixture's scheduled-fluid backlog is closed. Fluid
+  planning previously retained every intermediate transition for one block,
+  recursively revisited the same unsupported-flow positions, and scheduled
+  follow-up ticks one at a time. It now visits each position once, commits one
+  final edit per block, batches follow-up scheduling per chunk, and keeps the
+  ordinary resident path off synchronous journal `fsync`. The same loaded ocean
+  settled after nine O3 batches with at most 28 final edits; `fluid_tick`
+  measured `1,751 us` p50 and `3,321 us` max while the 26.1.2 client remained
+  connected for 600 client ticks. Evidence is
+  `.analysis/codex-logs/scheduled-fluid-coalesced-o3-summary-20260723.json`.
   The terrain visual run also exposed a separate far-travel path: a 289-chunk
   stream took about 31 seconds while dirty-cache pressure forced a 3.5-second
   flush and chunk fetch/light work accumulated behind it. Fix that common
@@ -240,8 +247,8 @@ verification and keep ordinary survival play ahead of rare edge cases.
   every explosion, and one loaded observer measured idle fuse checks at 0 us
   p99 and bounded explosion ticks at 23,812 us p50 / 37,943 us p95 / 46,463 us
   p99. One explosion is admitted per world tick even if the owner calls the
-  claim path repeatedly. This closes the requested explosion benchmark, while
-  fluid and far-travel spikes remain.
+  claim path repeatedly. This closes the requested explosion benchmark; the
+  separate far-travel spike remains.
   The autonomous survival profile found two ordinary block breaks spending
   `117-121 ms` after CPU admission. The regional path copied an entire 8x8-chunk
   ownership region after every break only to inspect falling blocks above the

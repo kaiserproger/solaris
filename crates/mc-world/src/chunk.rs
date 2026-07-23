@@ -12,7 +12,7 @@
 //! codec to populate (`heightmaps`, `biomes`, `block_entities`,
 //! `status`).
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use mc_data::Identifier;
@@ -918,6 +918,47 @@ impl Chunk {
         true
     }
 
+    pub(crate) fn schedule_fluid_tick_batch(
+        &mut self,
+        ticks: impl IntoIterator<Item = ScheduledFluidTick>,
+    ) -> usize {
+        let mut requests = self
+            .scheduled_fluid_ticks
+            .iter()
+            .map(|tick| {
+                (
+                    tick.pos,
+                    tick.fluid.clone(),
+                    tick.trigger_tick,
+                    tick.priority,
+                )
+            })
+            .collect::<HashSet<_>>();
+        let mut added = 0;
+        for mut tick in ticks {
+            let request = (
+                tick.pos,
+                tick.fluid.clone(),
+                tick.trigger_tick,
+                tick.priority,
+            );
+            if !self.contains_block_pos(tick.pos) || !requests.insert(request) {
+                continue;
+            }
+            tick.sequence = self.next_scheduled_fluid_tick_sequence;
+            self.next_scheduled_fluid_tick_sequence =
+                self.next_scheduled_fluid_tick_sequence.wrapping_add(1);
+            self.scheduled_fluid_ticks.push(tick);
+            added += 1;
+        }
+        if added != 0 {
+            self.scheduled_fluid_ticks
+                .sort_by_key(ScheduledFluidTick::sort_key);
+            self.mark_dirty();
+        }
+        added
+    }
+
     pub(crate) fn load_scheduled_fluid_ticks(&mut self, mut ticks: Vec<ScheduledFluidTick>) {
         ticks.sort_by_key(ScheduledFluidTick::sort_key);
         self.next_scheduled_fluid_tick_sequence = ticks
@@ -1478,6 +1519,28 @@ mod tests {
         assert!(c.drain_due_fluid_ticks(9, usize::MAX).is_empty());
         assert!(!c.dirty);
         assert!(c.drain_due_fluid_ticks(10, 0).is_empty());
+        assert!(!c.dirty);
+    }
+
+    #[test]
+    fn scheduled_fluid_tick_batch_deduplicates_and_sorts_once() {
+        let mut c = Chunk::empty(ChunkPos { x: 0, z: 0 }, air(), plains());
+        let later = ScheduledFluidTick::new(BlockPos { x: 1, y: 64, z: 1 }, water(), 10, 0);
+        let earlier = ScheduledFluidTick::new(BlockPos { x: 2, y: 64, z: 1 }, water(), 5, 0);
+
+        assert_eq!(
+            c.schedule_fluid_tick_batch([later.clone(), earlier.clone(), later.clone(),]),
+            2
+        );
+        assert_eq!(
+            c.scheduled_fluid_ticks()
+                .iter()
+                .map(|tick| tick.pos)
+                .collect::<Vec<_>>(),
+            vec![earlier.pos, later.pos]
+        );
+        c.dirty = false;
+        assert_eq!(c.schedule_fluid_tick_batch([earlier, later]), 0);
         assert!(!c.dirty);
     }
 

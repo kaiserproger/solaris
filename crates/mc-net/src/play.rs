@@ -8819,32 +8819,24 @@ async fn run_scheduled_fluid_ticks_owned(
         if let Some((edits, preconditions)) =
             resident_block_edit_inputs(&plan.edits, &plan.preconditions, table)
         {
-            match commit_resident_block_edits(
-                sessions,
-                world_read,
-                mutation,
-                world_tick,
-                ResidentBlockCommit {
-                    edits: &edits,
-                    preconditions: &preconditions,
-                    consumed_block_ticks: &[],
-                    consumed_fluid_ticks: &due,
-                    scheduled_fluid_ticks: &plan.scheduled_fluid_ticks,
-                    light_table: table,
-                    leaf_trigger_tick: Some(world_tick.saturating_add(1)),
-                },
-            )
-            .await
-            {
-                Ok(result) => result,
-                Err(()) => {
-                    return ScheduledFluidTickReport {
-                        drained,
-                        budget,
-                        budget_exhausted: drained >= budget,
-                        ..ScheduledFluidTickReport::default()
-                    };
+            match mutation.apply_fluid_tick_plan_conditionally(&mc_world::ResidentFluidTickPlan {
+                consumed_ticks: &due,
+                edits: &edits,
+                preconditions: &preconditions,
+                scheduled_ticks: &plan.scheduled_fluid_ticks,
+                light_table: table,
+                leaf_trigger_tick: Some(world_tick.saturating_add(1)),
+            }) {
+                mc_world::ResidentBlockEditBatchResult::Applied(applied) => {
+                    simulation::resident_block_edit_result_outcome(
+                        mc_world::ResidentBlockEditBatchResult::Applied(applied),
+                    )
                 }
+                mc_world::ResidentBlockEditBatchResult::Stale => {
+                    Some(BlockEditBatchOutcome::default())
+                }
+                mc_world::ResidentBlockEditBatchResult::Missing
+                | mc_world::ResidentBlockEditBatchResult::CrossRegion => None,
             }
         } else {
             None

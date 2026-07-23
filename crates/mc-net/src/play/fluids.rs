@@ -1,4 +1,4 @@
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet, VecDeque};
 
 use mc_data::block_facts::{BlockFactsTable, FluidKind, FluidStateFacts};
 use mc_protocol::codec::Identifier;
@@ -46,6 +46,7 @@ pub(super) fn plan_scheduled_fluid_tick_edits(
 ) -> ScheduledFluidTickPlan {
     let mut world = SnapshotPlanningWorld::new(snapshot);
     let mut plan = ScheduledFluidTickPlan::default();
+    let mut edit_indexes = HashMap::<BlockPos, usize>::new();
     for tick in ticks {
         let Some(state) = world.get_cached_block(tick.pos) else {
             continue;
@@ -65,10 +66,17 @@ pub(super) fn plan_scheduled_fluid_tick_edits(
         }
         for edit in edits {
             if world.apply(edit) {
-                plan.edits.push(edit);
+                if let Some(&index) = edit_indexes.get(&edit.pos) {
+                    plan.edits[index] = edit;
+                } else {
+                    edit_indexes.insert(edit.pos, plan.edits.len());
+                    plan.edits.push(edit);
+                }
             }
         }
     }
+    plan.edits
+        .retain(|edit| snapshot.get_cached_block(edit.pos) != Some(edit.new_state));
     plan.preconditions = world.preconditions();
     let edited_positions = plan.edits.iter().map(|edit| edit.pos).collect::<Vec<_>>();
     plan.scheduled_fluid_ticks =
@@ -203,48 +211,41 @@ fn fluid_has_source_path(
     fluid: FluidStateFacts,
     depth: u8,
 ) -> bool {
-    if fluid.source {
-        return true;
-    }
-    if depth > max_flow_level(fluid.kind).saturating_add(1) {
-        return false;
-    }
-
-    let above = BlockPos {
-        y: pos.y + 1,
-        ..pos
-    };
-    if world
-        .get_cached_block(above)
-        .and_then(|state| facts.fluid(state.0))
-        .is_some_and(|above_fluid| {
-            above_fluid.kind == fluid.kind
-                && fluid_has_source_path(facts, world, above, above_fluid, depth.saturating_add(1))
-        })
-    {
-        return true;
-    }
-
-    for neighbour in horizontal_fluid_neighbours(pos) {
-        let support = world
-            .get_cached_block(neighbour)
-            .and_then(|state| facts.fluid(state.0))
-            .and_then(|other| {
-                (other.kind == fluid.kind && other.level < fluid.level)
-                    .then_some((neighbour, other))
-            });
-        let Some((support_pos, support_fluid)) = support else {
-            continue;
-        };
-        if fluid_has_source_path(
-            facts,
-            world,
-            support_pos,
-            support_fluid,
-            depth.saturating_add(1),
-        ) {
+    let max_depth = max_flow_level(fluid.kind).saturating_add(1);
+    let mut pending = VecDeque::from([(pos, fluid, depth)]);
+    let mut visited = HashSet::new();
+    while let Some((pos, fluid, depth)) = pending.pop_front() {
+        if fluid.source {
             return true;
         }
+        if depth > max_depth || !visited.insert(pos) {
+            continue;
+        }
+
+        let next_depth = depth.saturating_add(1);
+        let above = BlockPos {
+            y: pos.y + 1,
+            ..pos
+        };
+        if let Some(above_fluid) = world
+            .get_cached_block(above)
+            .and_then(|state| facts.fluid(state.0))
+            .filter(|above_fluid| above_fluid.kind == fluid.kind)
+        {
+            pending.push_back((above, above_fluid, next_depth));
+        }
+
+        pending.extend(
+            horizontal_fluid_neighbours(pos)
+                .into_iter()
+                .filter_map(|neighbour| {
+                    let other = world
+                        .get_cached_block(neighbour)
+                        .and_then(|state| facts.fluid(state.0))?;
+                    (other.kind == fluid.kind && other.level < fluid.level)
+                        .then_some((neighbour, other, next_depth))
+                }),
+        );
     }
     false
 }

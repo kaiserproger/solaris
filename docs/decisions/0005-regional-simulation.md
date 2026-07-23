@@ -721,14 +721,18 @@ Scheduled fluid processing also uses region ownership for its common path.
 The coordinator no longer drains due ticks before planning. It selects an exact
 per-chunk due prefix from immutable snapshots, and the resident region verifies
 that prefix together with all block state/token preconditions. One mutation
-then consumes the prefix, applies flow edits, schedules follow-up fluid and leaf
-ticks, and stamps every touched chunk with the same journal decision. Stale
-preflight leaves the due queue unchanged. A journaled restart test proves the
-flowing block and future tick queue are recovered together while the global
-writer is held. A footprint crossing an 8 by 8 boundary keeps the old
-coordinator commit, which now exact-claims every due prefix before mutation.
-This removes both global dequeue and commit from one-region fluid work; it does
-not yet run independent regions concurrently in one tick pass.
+then consumes the prefix, applies one final flow edit per position, and
+schedules follow-up fluid and leaf ticks. Source-path planning uses one bounded
+visited set instead of recursively revisiting the same graph, and follow-up
+ticks are deduplicated, sorted, and published once per chunk. Stale preflight
+leaves the due queue unchanged. Like ordinary same-region scheduled blocks and
+active furnaces, this deterministic common path marks resident chunks dirty for
+the normal save cadence and does not wait for a world-journal append or `fsync`
+on the tick thread. An unclean process loss may therefore discard unsaved fluid
+progress. A footprint crossing an 8 by 8 boundary keeps the ordered coordinator
+commit, which exact-claims every due prefix before mutation. This removes the
+global dequeue and synchronous journal from one-region fluid work; it does not
+yet run independent regions concurrently in one tick pass.
 
 Scheduled block processing now uses the same exact resident queue-and-block
 transaction when a due batch contains only buttons, leaves, or stale entries.

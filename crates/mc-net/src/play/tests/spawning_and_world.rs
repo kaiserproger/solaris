@@ -2535,6 +2535,70 @@ async fn random_leaf_decay_spawns_deterministic_natural_drop() {
     );
 }
 
+#[test]
+fn unsupported_dense_flow_search_visits_each_position_once() {
+    struct CountingPlanningWorld<'a> {
+        inner: &'a mc_world::WorldStorage,
+        reads: Cell<usize>,
+    }
+
+    impl BlockPlanningRead for CountingPlanningWorld<'_> {
+        fn get_cached_block(&self, pos: mc_world::BlockPos) -> Option<BlockStateId> {
+            self.reads.set(self.reads.get() + 1);
+            self.inner.get_cached_block(pos)
+        }
+
+        fn block_mutation_token(
+            &self,
+            pos: mc_world::BlockPos,
+        ) -> Option<mc_world::BlockMutationToken> {
+            self.inner.block_mutation_token(pos)
+        }
+    }
+
+    let facts = fluid_test_facts();
+    let registry = Arc::new(fluid_test_registry());
+    let mut storage = mc_world::WorldStorage::in_memory(Arc::clone(&registry));
+    let chunk_pos = ChunkPos { x: 0, z: 0 };
+    storage
+        .insert_generated_chunk(
+            chunk_pos,
+            Chunk::empty(
+                chunk_pos,
+                BlockStateId(0),
+                Identifier::parse("minecraft:plains").unwrap(),
+            ),
+        )
+        .unwrap();
+    for x in 1_i32..=15 {
+        for z in 1_i32..=15 {
+            let distance = x.abs_diff(8).saturating_add(z.abs_diff(8)).clamp(1, 7);
+            storage
+                .set_block_at(
+                    mc_world::BlockPos { x, y: 64, z },
+                    BlockStateId(2 + distance),
+                )
+                .unwrap();
+        }
+    }
+    let world = CountingPlanningWorld {
+        inner: &storage,
+        reads: Cell::new(0),
+    };
+    let target = mc_world::BlockPos { x: 15, y: 64, z: 8 };
+    let fluid = facts.fluid(9).unwrap();
+
+    assert_eq!(
+        supported_flow_state(registry.as_ref(), &facts, &world, target, fluid),
+        Some(BlockStateId(0))
+    );
+    assert!(
+        world.reads.get() < 1_000,
+        "bounded source search made {} block reads",
+        world.reads.get()
+    );
+}
+
 #[tokio::test]
 async fn scheduled_fluid_ticks_ignore_ticketed_chunks_until_loaded() {
     let registry = SessionRegistry::new();
@@ -2638,7 +2702,7 @@ async fn scheduled_fluid_ticks_ignore_ticketed_chunks_until_loaded() {
 }
 
 #[tokio::test]
-async fn resident_scheduled_fluid_tick_is_durable_without_world_writer() {
+async fn resident_scheduled_fluid_tick_stays_off_the_synchronous_journal_path() {
     let reports = vec![
         simple_block(0, "minecraft:air"),
         BlockReport {
@@ -2709,7 +2773,7 @@ async fn resident_scheduled_fluid_tick_is_durable_without_world_writer() {
     )
     .unwrap();
     assert!(pending.is_empty());
-    sessions.install_world_chunk_journal(journal);
+    sessions.install_world_chunk_journal(journal.clone());
 
     let shared_world = Arc::clone(config.world.as_ref().unwrap());
     let storage = shared_world.lock().await;
@@ -2718,41 +2782,36 @@ async fn resident_scheduled_fluid_tick_is_durable_without_world_writer() {
     drop(storage);
     let (_simulation, owner) = simulation_channel();
     let world_writer = shared_world.lock().await;
-    let report = tokio::time::timeout(
-        std::time::Duration::from_secs(5),
-        owner.run_scheduled_fluid_ticks_with_budget(
+    let report = owner
+        .run_scheduled_fluid_ticks_with_budget(
             &config,
             &sessions,
             Some(&world_read),
             Some(&world_mutation),
             0,
             1,
-        ),
-    )
-    .await
-    .expect("resident fluid journal completion event");
+        )
+        .await;
     assert_eq!(report.drained, 1);
     assert_eq!(report.applied, 1);
-
-    let (reopened, pending) = super::world_journal::WorldChunkJournal::open(
-        temp.path(),
-        Arc::clone(&config.blocks),
-        Arc::clone(&config.items),
-    )
-    .unwrap();
-    let restored = reopened.decode_pending(&pending).unwrap();
-    assert_eq!(restored.len(), 1);
     assert_eq!(
-        restored[0].get_block(4, target.y, 4),
+        journal.watermark(),
+        None,
+        "deterministic fluid simulation must not fsync the crash journal inside a game tick"
+    );
+    let snapshot = world_read.snapshot_chunks(&[chunk_pos]);
+    let chunk = snapshot.chunk(chunk_pos).unwrap();
+    assert_eq!(
+        chunk.get_block(4, target.y, 4),
         Some(mc_world::BlockStateId(2))
     );
     assert!(
-        restored[0]
+        chunk
             .scheduled_fluid_ticks()
             .iter()
             .all(|tick| tick.trigger_tick > 0)
     );
-    assert!(!restored[0].scheduled_fluid_ticks().is_empty());
+    assert!(!chunk.scheduled_fluid_ticks().is_empty());
 
     drop(world_writer);
 }

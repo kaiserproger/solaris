@@ -113,6 +113,18 @@ hardening. An already-open lower-priority diff does not override this order.
   visible for 1,020 client ticks, grew from 11 to 16 visible entities, and
   emitted no over-budget tick warning.
 
+- The deep-water backlog came from fluid planning preserving every intermediate
+  transition for the same position and repeatedly traversing the same
+  unsupported-flow graph. Planning now visits each candidate position once,
+  commits only the final state per block, and schedules follow-up ticks once per
+  chunk. Ordinary resident fluid batches use the normal dirty-chunk save cadence
+  instead of waiting for a journal `fsync` on the tick thread. The same loaded
+  ocean that previously applied 94-105 edits indefinitely at 68-76 ms settled
+  after nine O3 batches with at most 28 final edits: `fluid_tick` measured
+  1,751 us p50 and 3,321 us max, and the real 26.1.2 client stayed connected
+  through 600 client ticks. Evidence is
+  `.analysis/codex-logs/scheduled-fluid-coalesced-o3-summary-20260723.json`.
+
 - Repeated `minecraft_connect` calls no longer start competing login attempts.
   Calling it for the active address is an idempotent no-op; a different address
   is rejected until the caller explicitly disconnects. The original autonomous
