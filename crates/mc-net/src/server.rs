@@ -3584,9 +3584,43 @@ struct EntityPhysicsSnapshot {
 
 struct SampledPhysicsWorld {
     snapshot: Arc<EntityPhysicsSnapshot>,
+    entity_bottom: f64,
+    fall_distance: f64,
+    powder_snow_collision: PowderSnowCollision,
+}
+
+#[derive(Clone, Copy, Default)]
+enum PowderSnowCollision {
+    #[default]
+    None,
+    WalkableMob,
+    FallingBlock,
 }
 
 impl SampledPhysicsWorld {
+    fn for_query(snapshot: Arc<EntityPhysicsSnapshot>, query: play::EntityPhysicsQuery) -> Self {
+        let powder_snow_collision = match query.kind {
+            play::EntityPhysicsKind::PowderSnowWalkableLiving => PowderSnowCollision::WalkableMob,
+            play::EntityPhysicsKind::FallingBlock => PowderSnowCollision::FallingBlock,
+            _ => PowderSnowCollision::None,
+        };
+        Self {
+            snapshot,
+            entity_bottom: query.position.y,
+            fall_distance: query.fall_distance,
+            powder_snow_collision,
+        }
+    }
+
+    fn without_entity_context(snapshot: Arc<EntityPhysicsSnapshot>) -> Self {
+        Self {
+            snapshot,
+            entity_bottom: f64::NEG_INFINITY,
+            fall_distance: 0.0,
+            powder_snow_collision: PowderSnowCollision::None,
+        }
+    }
+
     fn state_id_at(&self, x: i32, y: i32, z: i32) -> Option<u32> {
         if !(MIN_Y..MAX_Y).contains(&y) {
             return None;
@@ -3608,9 +3642,7 @@ fn arrow_physics_facts_from_steps(
     snapshot: &Arc<EntityPhysicsSnapshot>,
     steps: &[play::EntityPhysicsStep],
 ) -> Vec<play::ArrowPhysicsFact> {
-    let sampler = SampledPhysicsWorld {
-        snapshot: Arc::clone(snapshot),
-    };
+    let sampler = SampledPhysicsWorld::without_entity_context(Arc::clone(snapshot));
     let mut expected = expected.iter();
 
     steps
@@ -3804,13 +3836,37 @@ impl BlockSampler for SampledPhysicsWorld {
             .as_ref()
             .and_then(|blocks| blocks.by_id(mc_world::BlockStateId(state)))
             .and_then(|block| {
-                mc_data::collision_shapes::vanilla_collision_shapes().get_for_state(
-                    state,
-                    &block.block.id,
-                    &block.properties,
-                )
+                mc_data::collision_shapes::vanilla_collision_shapes()
+                    .get_for_state(state, &block.block.id, &block.properties)
+                    .map(|shape| (block.block.id.as_str(), shape))
             });
-        if let Some(boxes) = exact_shape {
+        if let Some(("minecraft:powder_snow", _)) = exact_shape {
+            if self.fall_distance > 2.5 {
+                emit(BlockCollisionBox::from_fixed_4096([
+                    0,
+                    0,
+                    0,
+                    4096,
+                    (0.9_f32 * 4096.0) as i16,
+                    4096,
+                ]));
+                return;
+            }
+            match self.powder_snow_collision {
+                PowderSnowCollision::FallingBlock => {
+                    emit(BlockCollisionBox::from_sixteenths(0, 0, 0, 16, 16, 16));
+                    return;
+                }
+                PowderSnowCollision::WalkableMob
+                    if self.entity_bottom > f64::from(y) + 1.0 - 1.0e-5_f32 as f64 =>
+                {
+                    emit(BlockCollisionBox::from_sixteenths(0, 0, 0, 16, 16, 16));
+                    return;
+                }
+                PowderSnowCollision::None | PowderSnowCollision::WalkableMob => {}
+            }
+        }
+        if let Some((_, boxes)) = exact_shape {
             for collision_box in boxes.iter() {
                 emit(BlockCollisionBox::from_fixed_4096(
                     collision_box.coordinates(),
@@ -3965,9 +4021,7 @@ fn step_sampled_entity(input: EntityPhysicsInput) -> play::EntityPhysicsStep {
             horizontal_collision: false,
         };
     }
-    let sampler = SampledPhysicsWorld {
-        snapshot: input.snapshot,
-    };
+    let sampler = SampledPhysicsWorld::for_query(input.snapshot, input.query);
     let result = mc_physics::step_entity(
         EntityBody {
             position: physics_vec(input.query.position),
@@ -3986,7 +4040,9 @@ fn step_sampled_entity(input: EntityPhysicsInput) -> play::EntityPhysicsStep {
         horizontal_collision: result.horizontal_collision
             && matches!(
                 input.query.kind,
-                play::EntityPhysicsKind::Living | play::EntityPhysicsKind::AquaticLiving
+                play::EntityPhysicsKind::Living
+                    | play::EntityPhysicsKind::PowderSnowWalkableLiving
+                    | play::EntityPhysicsKind::AquaticLiving
             ),
     }
 }
@@ -3994,8 +4050,11 @@ fn step_sampled_entity(input: EntityPhysicsInput) -> play::EntityPhysicsStep {
 fn physics_config_for_query(query: play::EntityPhysicsQuery) -> PhysicsConfig {
     match query.kind {
         play::EntityPhysicsKind::Default => PhysicsConfig::default(),
-        play::EntityPhysicsKind::Living => PhysicsConfig::living_entity(),
+        play::EntityPhysicsKind::Living | play::EntityPhysicsKind::PowderSnowWalkableLiving => {
+            PhysicsConfig::living_entity()
+        }
         play::EntityPhysicsKind::AquaticLiving => PhysicsConfig::aquatic_entity(),
+        play::EntityPhysicsKind::FallingBlock => PhysicsConfig::default(),
         play::EntityPhysicsKind::ArrowProjectile { .. } => {
             let mut config = PhysicsConfig::arrow_projectile();
             // Retained projectile velocity is blocks per Minecraft tick. This
@@ -5560,6 +5619,7 @@ end
                     velocity: mc_entity::Vec3::ZERO,
                     aabb: mc_physics::Aabb::COW,
                     on_ground: false,
+                    fall_distance: 0.0,
                     kind: play::EntityPhysicsKind::Default,
                 },
                 snapshot: Arc::clone(&snapshot),
@@ -5583,6 +5643,7 @@ end
             velocity: mc_entity::Vec3::ZERO,
             aabb: mc_physics::Aabb::COW,
             on_ground: false,
+            fall_distance: 0.0,
             kind: play::EntityPhysicsKind::Default,
         };
         let inputs = vec![EntityPhysicsInput {
@@ -5624,6 +5685,7 @@ end
                     velocity: mc_entity::Vec3::ZERO,
                     aabb: mc_physics::Aabb::COW,
                     on_ground: false,
+                    fall_distance: 0.0,
                     kind: play::EntityPhysicsKind::Default,
                 },
                 snapshot: Arc::clone(&snapshot),
@@ -5674,6 +5736,7 @@ end
                 velocity: mc_entity::Vec3::ZERO,
                 aabb: mc_physics::Aabb::COW,
                 on_ground: false,
+                fall_distance: 0.0,
                 kind: play::EntityPhysicsKind::Default,
             })
             .collect::<Vec<_>>();
@@ -5929,6 +5992,7 @@ end
                 height: 0.5,
             },
             on_ground: false,
+            fall_distance: 0.0,
             kind: play::EntityPhysicsKind::ArrowProjectile {
                 revision: None,
                 embedded_block: None,
@@ -5994,6 +6058,7 @@ end
                 height: 0.5,
             },
             on_ground: true,
+            fall_distance: 0.0,
             kind: play::EntityPhysicsKind::ArrowProjectile {
                 revision: None,
                 embedded_block: Some(mc_entity::projectile_26_1_2::BlockPosition::new(8, 64, 8)),
@@ -6001,9 +6066,7 @@ end
         };
         let input = sample_entity_physics_input(query, &mut world, &materials);
         let snapshot = Arc::clone(&input.snapshot);
-        let sampler = SampledPhysicsWorld {
-            snapshot: Arc::clone(&snapshot),
-        };
+        let sampler = SampledPhysicsWorld::without_entity_context(Arc::clone(&snapshot));
 
         assert_eq!(
             collision_block_touching_arrow_endpoint(
@@ -6064,6 +6127,7 @@ end
                 height: 0.5,
             },
             on_ground: false,
+            fall_distance: 0.0,
             kind: play::EntityPhysicsKind::ArrowProjectile {
                 revision: None,
                 embedded_block: Some(mc_entity::projectile_26_1_2::BlockPosition::new(8, 64, 8)),
@@ -6132,6 +6196,7 @@ end
                 height: 0.5,
             },
             on_ground: false,
+            fall_distance: 0.0,
             kind: play::EntityPhysicsKind::ArrowProjectile {
                 revision: None,
                 embedded_block: None,
@@ -6206,6 +6271,7 @@ end
             velocity: mc_entity::Vec3::ZERO,
             aabb: mc_physics::Aabb::COW,
             on_ground: false,
+            fall_distance: 0.0,
             kind: play::EntityPhysicsKind::Default,
         };
         let queries = [query];
@@ -6595,6 +6661,7 @@ end
             velocity: mc_entity::Vec3::new(1.0, 0.0, 0.0),
             aabb: mc_physics::Aabb::COW,
             on_ground: true,
+            fall_distance: 0.0,
             kind: play::EntityPhysicsKind::Default,
         };
         let step = step_sampled_entity(EntityPhysicsInput {
@@ -6642,6 +6709,7 @@ end
             velocity: mc_entity::Vec3::new(20.0, 0.0, 0.0),
             aabb: mc_physics::Aabb::COW,
             on_ground: true,
+            fall_distance: 0.0,
             kind: play::EntityPhysicsKind::Living,
         };
 
@@ -6690,6 +6758,7 @@ end
             velocity: mc_entity::Vec3::new(2.0, 0.0, 0.0),
             aabb: mc_physics::Aabb::COW,
             on_ground: true,
+            fall_distance: 0.0,
             kind: play::EntityPhysicsKind::Living,
         };
 
@@ -6714,6 +6783,7 @@ end
                 height: 0.7,
             },
             on_ground: true,
+            fall_distance: 0.0,
             kind: play::EntityPhysicsKind::Living,
         };
 
@@ -6736,6 +6806,7 @@ end
                 height: 0.3,
             },
             on_ground: false,
+            fall_distance: 0.0,
             kind: play::EntityPhysicsKind::Living,
         };
 
@@ -6789,6 +6860,7 @@ end
             velocity: mc_entity::Vec3::ZERO,
             aabb: mc_physics::Aabb::COW,
             on_ground: false,
+            fall_distance: 0.0,
             kind: play::EntityPhysicsKind::Default,
         };
 
@@ -6834,6 +6906,7 @@ end
             velocity: mc_entity::Vec3::ZERO,
             aabb: mc_physics::Aabb::COW,
             on_ground: true,
+            fall_distance: 0.0,
             kind: play::EntityPhysicsKind::Default,
         });
         let plans = entity_physics_sample_plans(&queries);
@@ -6892,6 +6965,7 @@ end
                 velocity: mc_entity::Vec3::ZERO,
                 aabb: mc_physics::Aabb::COW,
                 on_ground: false,
+                fall_distance: 0.0,
                 kind: play::EntityPhysicsKind::Default,
             })
             .collect::<Vec<_>>();

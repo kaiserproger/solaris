@@ -49,6 +49,7 @@ struct TransformState {
 struct MotionState {
     velocity: Vec3,
     on_ground: bool,
+    fall_distance: f64,
 }
 
 #[derive(Component)]
@@ -670,6 +671,7 @@ impl EntityRuntime {
             rotation: transform.rotation,
             velocity: motion.velocity,
             on_ground: motion.on_ground,
+            fall_distance: motion.fall_distance,
             is_item: entity_type.name == "minecraft:item",
             is_experience: entity_type.name == "minecraft:experience_orb",
             is_arrow: entity_type.name == "minecraft:arrow",
@@ -1249,6 +1251,7 @@ fn insert_snapshot_into_world(world: &mut World, snapshot: EntitySnapshot) -> bo
     let EntityRetainedState {
         path,
         living: retained_living,
+        fall_distance,
         active_effects,
         arrow_state,
         last_damage_tick,
@@ -1286,6 +1289,7 @@ fn insert_snapshot_into_world(world: &mut World, snapshot: EntitySnapshot) -> bo
         MotionState {
             velocity,
             on_ground,
+            fall_distance,
         },
         LifecycleState(lifecycle),
         LivingState {
@@ -1395,6 +1399,7 @@ fn restore_snapshot_in_world(world: &mut World, snapshot: EntitySnapshot) -> boo
     let EntityRetainedState {
         path,
         living: retained_living,
+        fall_distance,
         active_effects,
         arrow_state,
         last_damage_tick,
@@ -1426,6 +1431,7 @@ fn restore_snapshot_in_world(world: &mut World, snapshot: EntitySnapshot) -> boo
             MotionState {
                 velocity,
                 on_ground,
+                fall_distance,
             },
             LifecycleState(lifecycle),
             LivingState {
@@ -1534,6 +1540,7 @@ fn snapshot_from_world(world: &World, id: EntityId) -> Option<EntitySnapshot> {
                 last_hurt: living.state.last_hurt,
                 death_time: living.state.death_time,
             },
+            fall_distance: motion.fall_distance,
             active_effects: active_effects_snapshot(entity.get::<ActiveEffectsState>()),
             arrow_state: gameplay.arrow_state,
             last_damage_tick: gameplay.last_damage_tick,
@@ -1593,6 +1600,7 @@ fn entity_view_from_world(world: &World, id: EntityId) -> Option<EntityView<'_>>
                 last_hurt: living.state.last_hurt,
                 death_time: living.state.death_time,
             },
+            fall_distance: motion.fall_distance,
             active_effects: active_effects_snapshot(entity.get::<ActiveEffectsState>()),
             arrow_state: gameplay.arrow_state,
             last_damage_tick: gameplay.last_damage_tick,
@@ -2108,15 +2116,22 @@ fn apply_physics_results(world: &mut World) {
                 continue;
             };
 
-            {
+            let old_y = {
                 let Some(mut transform) = entity.get_mut::<TransformState>() else {
                     continue;
                 };
+                let old_y = transform.position.y;
                 transform.position = result.position;
                 transform.rotation = result.rotation;
-            }
+                old_y
+            };
             let Some(mut motion) = entity.get_mut::<MotionState>() else {
                 continue;
+            };
+            motion.fall_distance = if result.on_ground {
+                0.0
+            } else {
+                motion.fall_distance + (old_y - result.position.y).max(0.0)
             };
             motion.velocity = result.velocity;
             motion.on_ground = result.on_ground;
@@ -2337,6 +2352,47 @@ mod tests {
         assert_eq!(runtime.remove(original.id), Some(original));
         assert!(!runtime.contains_uuid(duplicate.uuid));
         assert!(runtime.insert_snapshot(duplicate));
+    }
+
+    #[test]
+    fn physics_tracks_fall_distance_and_resets_it_on_ground() {
+        let initial = snapshot(10, 10, "minecraft:zombie");
+        let mut runtime = EntityRuntime::new();
+        assert!(runtime.insert_snapshot(initial.clone()));
+
+        runtime.queue_physics(EntityPhysicsResult {
+            id: initial.id,
+            position: Vec3::new(
+                initial.position.x,
+                initial.position.y - 3.0,
+                initial.position.z,
+            ),
+            rotation: initial.rotation,
+            velocity: Vec3::new(0.0, -0.5, 0.0),
+            on_ground: false,
+        });
+        runtime.run_stage(EntityStage::PhysicsApply);
+        assert_eq!(
+            runtime.snapshot(initial.id).unwrap().retained.fall_distance,
+            3.0
+        );
+
+        runtime.queue_physics(EntityPhysicsResult {
+            id: initial.id,
+            position: Vec3::new(
+                initial.position.x,
+                initial.position.y - 3.5,
+                initial.position.z,
+            ),
+            rotation: initial.rotation,
+            velocity: Vec3::ZERO,
+            on_ground: true,
+        });
+        runtime.run_stage(EntityStage::PhysicsApply);
+        assert_eq!(
+            runtime.snapshot(initial.id).unwrap().retained.fall_distance,
+            0.0
+        );
     }
 
     #[test]

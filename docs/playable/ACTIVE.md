@@ -29,6 +29,12 @@ client accepts exact zero below a `0.001` threshold without changing its
 push-driven wait. Player collision now consumes the complete embedded vanilla
 shape table before custom-registry fallbacks and supplies vanilla movement
 context for leather boots, Shift descent, and long falls through powder snow.
+Entity physics now carries the matching dynamic context: the exact 26.1.2
+powder-snow-walkable mob tag stands only from above, short-falling blocks use
+the full base shape, and ordinary entities sink. ECS motion retains accumulated
+fall distance, so every entity switches to the earlier vanilla 0.9F shape after
+a fall beyond 2.5 blocks and resets on landing. Both player and entity dynamic
+branches remain behind the exact embedded state-fingerprint check.
 
 ## Current Queue
 

@@ -1287,10 +1287,12 @@ fn validate_entity_numeric_state(
         || !entity.rotation.pitch.is_finite()
         || !entity.rotation.head_yaw.is_finite()
         || !entity.health.is_finite()
+        || !entity.retained.fall_distance.is_finite()
+        || entity.retained.fall_distance < 0.0
     {
         return Err(PlayerPersistenceError::InvalidNumeric {
             path: path.to_path_buf(),
-            field: "entity Pos/Motion/Rotation/Health",
+            field: "entity Pos/Motion/Rotation/Health/FallDistance",
         });
     }
     Ok(())
@@ -1697,17 +1699,23 @@ pub(crate) fn load_persisted_entities(
                 });
             }
         };
-        let retained = string_field(fields, ENTITY_RETAINED_STATE_FIELD)
-            .ok_or_else(|| PlayerPersistenceError::InvalidValue {
-                path: path.clone(),
-                field: ENTITY_RETAINED_STATE_FIELD,
-            })
-            .and_then(|encoded| {
-                serde_json::from_str(encoded).map_err(|_| PlayerPersistenceError::InvalidValue {
+        let mut retained: mc_entity::EntityRetainedState =
+            string_field(fields, ENTITY_RETAINED_STATE_FIELD)
+                .ok_or_else(|| PlayerPersistenceError::InvalidValue {
                     path: path.clone(),
                     field: ENTITY_RETAINED_STATE_FIELD,
                 })
-            })?;
+                .and_then(|encoded| {
+                    serde_json::from_str(encoded).map_err(|_| {
+                        PlayerPersistenceError::InvalidValue {
+                            path: path.clone(),
+                            field: ENTITY_RETAINED_STATE_FIELD,
+                        }
+                    })
+                })?;
+        if let Some(fall_distance) = float_field(fields, "FallDistance") {
+            retained.fall_distance = f64::from(fall_distance);
+        }
         let head_yaw = float_field(fields, ENTITY_HEAD_YAW_FIELD).ok_or_else(|| {
             PlayerPersistenceError::InvalidValue {
                 path: path.clone(),
@@ -2066,6 +2074,10 @@ fn entity_tag(
             }),
         ),
         ("OnGround".into(), Tag::Byte(i8::from(entity.on_ground))),
+        (
+            "FallDistance".into(),
+            Tag::Float(entity.retained.fall_distance as f32),
+        ),
         ("Health".into(), Tag::Float(entity.health)),
         (ENTITY_ATTRIBUTES_FIELD.into(), Tag::String(attributes)),
         (ENTITY_LIFECYCLE_FIELD.into(), Tag::Byte(lifecycle)),

@@ -341,9 +341,20 @@ verification and keep ordinary survival play ahead of rare edge cases.
   rise. That client sample confirms publication, while the deterministic tests
   establish independent timing, pauses, and turn limits. The server emitted no
   tick-budget or disconnect warning during the gate.
-- [ ] Extend entity collision context beyond players: powder-snow-walkable mob
+- [x] Extend entity collision context beyond players: powder-snow-walkable mob
   tags and falling blocks must use their vanilla dynamic powder-snow shape
-  without weakening the exact-state fingerprint fence.
+  without weakening the exact-state fingerprint fence. Physics queries now
+  distinguish the exact 26.1.2 walkable tag (rabbit, fox, silverfish, and
+  endermite) and falling blocks. Tagged mobs receive full support only while
+  above powder snow; short-falling blocks receive the block's full base shape;
+  ordinary entities keep sinking. All entities whose accumulated fall distance
+  exceeds 2.5 blocks use the earlier vanilla 0.9F landing shape. Fall distance
+  is retained by the ECS physics state and reset on landing. The dynamic branch
+  runs only after the embedded shape table accepts the exact block-state
+  fingerprint, and a mismatched custom state retains the conservative
+  full-cube fallback. Deterministic tests cover tag routing, query projection,
+  fall accumulation/reset, above/inside behavior, both falling-block branches,
+  long-falling ordinary mobs, and the fingerprint mismatch.
 - [ ] Keep menus, inventory actions, block events, and attacks responsive under
   natural mob/chunk load. The biased entity-owner select used to check an
   overdue 50 ms tick before its pushed command notification, allowing sustained

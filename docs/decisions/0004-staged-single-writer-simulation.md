@@ -170,6 +170,17 @@ goal CAS, currently grazing sheep, always use the current full-state path and
 are merged back in stable entity-id order. Remove the narrow projection when
 ECS consumers read typed components directly across the owner boundary.
 
+The physics-kind projection also carries dynamic powder-snow collision
+capability. The exact 26.1.2 walkable-mob tag and falling-block identity are
+resolved while the entity owner state is available, then consumed by the
+snapshot sampler without another entity lookup or lock. ECS motion accumulates
+downward travel and resets it on landing; the typed query carries that retained
+distance so the sampler can apply vanilla's leading long-fall 0.9F branch
+before the falling-block and walkable-mob branches. The sampler applies these
+dynamic shapes only after the embedded collision table accepts the exact
+block-state fingerprint; unknown or altered states keep the conservative
+material fallback.
+
 The first Prompt 03B player transaction moves item-entity claim and inventory
 credit into one owner operation. The command validates the observed item
 identity, computes capacity from the registered player snapshot, and either

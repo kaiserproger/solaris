@@ -273,6 +273,7 @@ fn physics_motion_publication_preserves_non_kinematic_state() {
         },
         velocity: Vec3::new(0.1, 0.2, 0.3),
         on_ground: false,
+        fall_distance: 0.0,
         is_item: false,
         is_experience: false,
         is_arrow: false,

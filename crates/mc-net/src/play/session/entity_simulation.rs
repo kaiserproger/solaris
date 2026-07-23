@@ -2,7 +2,9 @@ use super::entity_lifecycle::{
     remove_server_entity_locked, schedule_entity_death_locked, track_entity_chunk_locked,
     update_breeding_tick_tracking_locked,
 };
-use super::entity_physics_class::entity_type_uses_aquatic_physics;
+use super::entity_physics_class::{
+    entity_type_uses_aquatic_physics, entity_type_walks_on_powder_snow,
+};
 use super::explosion_authority::schedule_primed_tnt_deadline_locked;
 use super::interaction_geometry::{
     distance_sq, entity_aabb, entity_geometry, entity_is_near_player_chunk,
@@ -30,11 +32,14 @@ fn entity_physics_query_matches(current: EntityMotionState, expected: &EntityPhy
         }
         EntityPhysicsKind::Default
         | EntityPhysicsKind::Living
+        | EntityPhysicsKind::PowderSnowWalkableLiving
+        | EntityPhysicsKind::FallingBlock
         | EntityPhysicsKind::AquaticLiving => true,
     };
     current.position == expected.position
         && current.velocity == expected.velocity
         && current.on_ground == expected.on_ground
+        && current.fall_distance == expected.fall_distance
         && arrow_state_matches
 }
 
@@ -269,29 +274,38 @@ impl SessionRegistry {
                     );
                     active_entity_kinds.insert(
                         entity.id,
-                        if entity.type_name == "minecraft:arrow" {
-                            EntityPhysicsKind::ArrowProjectile {
-                                revision: entity
-                                    .retained
-                                    .arrow_state
-                                    .map(|state| state.projectile.revision),
-                                embedded_block: entity
-                                    .retained
-                                    .arrow_state
-                                    .filter(|state| state.in_ground)
-                                    .and_then(|state| state.last_block_position),
-                            }
-                        } else if entity_type_uses_aquatic_physics(entity.type_name) {
-                            EntityPhysicsKind::AquaticLiving
-                        } else if entity.item_stack.is_none()
-                            && entity.experience_value.is_none()
-                            && entity.block_state.is_none()
-                            && entity.vehicle.is_none()
-                        {
-                            EntityPhysicsKind::Living
-                        } else {
-                            EntityPhysicsKind::Default
-                        },
+                        (
+                            if entity.type_name == "minecraft:arrow" {
+                                EntityPhysicsKind::ArrowProjectile {
+                                    revision: entity
+                                        .retained
+                                        .arrow_state
+                                        .map(|state| state.projectile.revision),
+                                    embedded_block: entity
+                                        .retained
+                                        .arrow_state
+                                        .filter(|state| state.in_ground)
+                                        .and_then(|state| state.last_block_position),
+                                }
+                            } else if entity_type_uses_aquatic_physics(entity.type_name) {
+                                EntityPhysicsKind::AquaticLiving
+                            } else if entity.type_name == "minecraft:falling_block" {
+                                EntityPhysicsKind::FallingBlock
+                            } else if entity.item_stack.is_none()
+                                && entity.experience_value.is_none()
+                                && entity.block_state.is_none()
+                                && entity.vehicle.is_none()
+                            {
+                                if entity_type_walks_on_powder_snow(entity.type_name) {
+                                    EntityPhysicsKind::PowderSnowWalkableLiving
+                                } else {
+                                    EntityPhysicsKind::Living
+                                }
+                            } else {
+                                EntityPhysicsKind::Default
+                            },
+                            entity.retained.fall_distance,
+                        ),
                     );
                 }
             }
@@ -415,29 +429,38 @@ impl SessionRegistry {
             );
             active_entity_kinds.insert(
                 entity.id,
-                if entity.type_name == "minecraft:arrow" {
-                    EntityPhysicsKind::ArrowProjectile {
-                        revision: entity
-                            .retained
-                            .arrow_state
-                            .map(|state| state.projectile.revision),
-                        embedded_block: entity
-                            .retained
-                            .arrow_state
-                            .filter(|state| state.in_ground)
-                            .and_then(|state| state.last_block_position),
-                    }
-                } else if entity_type_uses_aquatic_physics(entity.type_name) {
-                    EntityPhysicsKind::AquaticLiving
-                } else if entity.item_stack.is_none()
-                    && entity.experience_value.is_none()
-                    && entity.block_state.is_none()
-                    && entity.vehicle.is_none()
-                {
-                    EntityPhysicsKind::Living
-                } else {
-                    EntityPhysicsKind::Default
-                },
+                (
+                    if entity.type_name == "minecraft:arrow" {
+                        EntityPhysicsKind::ArrowProjectile {
+                            revision: entity
+                                .retained
+                                .arrow_state
+                                .map(|state| state.projectile.revision),
+                            embedded_block: entity
+                                .retained
+                                .arrow_state
+                                .filter(|state| state.in_ground)
+                                .and_then(|state| state.last_block_position),
+                        }
+                    } else if entity_type_uses_aquatic_physics(entity.type_name) {
+                        EntityPhysicsKind::AquaticLiving
+                    } else if entity.type_name == "minecraft:falling_block" {
+                        EntityPhysicsKind::FallingBlock
+                    } else if entity.item_stack.is_none()
+                        && entity.experience_value.is_none()
+                        && entity.block_state.is_none()
+                        && entity.vehicle.is_none()
+                    {
+                        if entity_type_walks_on_powder_snow(entity.type_name) {
+                            EntityPhysicsKind::PowderSnowWalkableLiving
+                        } else {
+                            EntityPhysicsKind::Living
+                        }
+                    } else {
+                        EntityPhysicsKind::Default
+                    },
+                    entity.retained.fall_distance,
+                ),
             );
             kinematics.push(EntityKinematics {
                 id: entity.id,
@@ -457,7 +480,8 @@ impl SessionRegistry {
                 velocity: state.velocity,
                 aabb: active_entity_aabbs[&state.id],
                 on_ground: state.on_ground,
-                kind: active_entity_kinds[&state.id],
+                fall_distance: active_entity_kinds[&state.id].1,
+                kind: active_entity_kinds[&state.id].0,
             })
             .collect();
         drop(entities);

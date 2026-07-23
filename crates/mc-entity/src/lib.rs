@@ -418,6 +418,8 @@ pub struct EntitySnapshot {
 pub struct EntityRetainedState {
     path: RetainedPathState,
     pub living: EntityLivingRetainedState,
+    #[serde(default)]
+    pub fall_distance: f64,
     pub active_effects: Option<EntityActiveEffectsState>,
     pub arrow_state: Option<projectile_26_1_2::ArrowState>,
     pub last_damage_tick: Option<u64>,
@@ -478,6 +480,7 @@ pub struct EntityMotionState {
     pub rotation: Rotation,
     pub velocity: Vec3,
     pub on_ground: bool,
+    pub fall_distance: f64,
     pub is_item: bool,
     pub is_experience: bool,
     pub is_arrow: bool,

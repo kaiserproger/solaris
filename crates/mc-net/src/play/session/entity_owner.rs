@@ -313,6 +313,7 @@ impl EntityOwnerAccess {
             rotation: snapshot.rotation,
             velocity: snapshot.velocity,
             on_ground: snapshot.on_ground,
+            fall_distance: snapshot.retained.fall_distance,
             is_item: snapshot.type_name == "minecraft:item",
             is_experience: snapshot.type_name == "minecraft:experience_orb",
             is_arrow: snapshot.type_name == "minecraft:arrow",

@@ -3415,6 +3415,61 @@ fn all_living_aquatic_and_amphibious_classes_use_aquatic_water_rules() {
 }
 
 #[test]
+fn vanilla_powder_snow_walkable_mob_tag_is_exact() {
+    for type_name in [
+        "minecraft:rabbit",
+        "minecraft:endermite",
+        "minecraft:silverfish",
+        "minecraft:fox",
+    ] {
+        assert!(
+            super::entity_physics_class::entity_type_walks_on_powder_snow(type_name),
+            "{type_name}"
+        );
+    }
+    for type_name in [
+        "minecraft:zombie",
+        "minecraft:cow",
+        "minecraft:falling_block",
+    ] {
+        assert!(
+            !super::entity_physics_class::entity_type_walks_on_powder_snow(type_name),
+            "{type_name}"
+        );
+    }
+}
+
+#[test]
+fn entity_physics_queries_carry_dynamic_powder_snow_context() {
+    let registry = SessionRegistry::new();
+    let alice = register_test_session(&registry, "PowderSnowContextAlice");
+    assert!(registry.mark_loaded(alice, (0, 0)).is_empty());
+    registry.spawn_command_entity(
+        &SimulationAuthority::for_test(),
+        1,
+        "minecraft:rabbit".to_string(),
+        Vec3::new(1.5, 64.0, 0.5),
+    );
+    registry.spawn_command_entity(
+        &SimulationAuthority::for_test(),
+        2,
+        "minecraft:falling_block".to_string(),
+        Vec3::new(2.5, 64.0, 0.5),
+    );
+
+    let queries = registry.tick_entities_and_collect_physics_queries(1);
+
+    assert!(queries.iter().any(|query| {
+        query.position.x == 1.5 && query.kind == EntityPhysicsKind::PowderSnowWalkableLiving
+    }));
+    assert!(
+        queries.iter().any(|query| {
+            query.position.x == 2.5 && query.kind == EntityPhysicsKind::FallingBlock
+        })
+    );
+}
+
+#[test]
 fn empty_entity_goal_tick_skips_regional_owner_request() {
     let registry = SessionRegistry::new();
     registry.entities.reset_owner_requests_for_test();
@@ -8105,6 +8160,7 @@ fn stale_arrow_physics_does_not_commit_or_publish_projectile_work() {
         velocity: initial_velocity,
         aabb: entity_aabb("minecraft:arrow"),
         on_ground: false,
+        fall_distance: 0.0,
         kind: EntityPhysicsKind::ArrowProjectile {
             revision: Some(99),
             embedded_block: None,
@@ -10657,6 +10713,7 @@ fn stale_entity_physics_result_does_not_overwrite_newer_kinematics() {
         velocity: initial.velocity,
         aabb: mc_physics::Aabb::COW,
         on_ground: initial.on_ground,
+        fall_distance: 0.0,
         kind: EntityPhysicsKind::Living,
     };
     let newer_position = Vec3::new(1.5, 64.0, 0.5);

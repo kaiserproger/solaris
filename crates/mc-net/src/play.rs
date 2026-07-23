@@ -908,6 +908,7 @@ pub(crate) struct EntityPhysicsQuery {
     pub velocity: Vec3,
     pub aabb: mc_physics::Aabb,
     pub on_ground: bool,
+    pub fall_distance: f64,
     pub kind: EntityPhysicsKind,
 }
 
@@ -915,7 +916,9 @@ pub(crate) struct EntityPhysicsQuery {
 pub(crate) enum EntityPhysicsKind {
     Default,
     Living,
+    PowderSnowWalkableLiving,
     AquaticLiving,
+    FallingBlock,
     ArrowProjectile {
         revision: Option<u64>,
         embedded_block: Option<mc_entity::projectile_26_1_2::BlockPosition>,
