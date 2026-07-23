@@ -506,9 +506,16 @@ targeted zone result before reporting success and rolls its storage CAS back
 when the registry rejects the zone change. This convention is a documented temporary bridge: a future
 first-class protection policy in the zone command must replace the plugin-id
 special case and migrate this shipped plugin in the same change. Protection
-currently covers direct player block breaking and item placement. Containers,
-buckets, pistons, explosions, fire, and entity interaction are not protected
-and must not be presented as covered.
+covers direct break/place, right-click block interactions including containers
+and buckets, living-entity interaction at the target position, and explosion
+block damage. Player actions use the authoritative actor check, and every
+chest/furnace click rechecks all backing block positions so a claim created
+after opening still denies mutation. Explosion planning takes one immutable
+claim snapshot after claiming due explosions and before the world lock; it does
+not copy zones on idle ticks or lock the registry per candidate block. Piston
+movement and fire spread are not implemented gameplay mutations yet; their
+future commit paths must consume the same ambient-protection snapshot before
+publication.
 
 Player teleports are same-dimension authoritative mutations:
 

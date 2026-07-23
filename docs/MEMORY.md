@@ -68,10 +68,21 @@ and is not startup context.
   refund terms across catalog edits and reject purchases until old terms are
   cleared. A production TCP/Lua gate proves a configured gold-ingot purchase,
   insufficient-funds rejection, refund, and zone-triggered menu refresh.
-  `land-claims` owns a bounded durable whole-chunk
-  index and direct break/place protection. Containers, fluids, pistons,
-  explosions, fire, and entity interaction remain open. No manual-client gate
-  has run.
+  `land-claims` owns a bounded durable whole-chunk index. Direct break/place,
+  right-click block actions, containers, buckets, living-entity interaction,
+  and explosion block damage are protected. Piston movement and fire spread
+  remain open because those mutation paths do not exist yet. No manual-client
+  gate has run.
+- Land-claim admission now covers right-click block actions, all halves of a
+  chest window, exact filled-bucket destinations, living-entity target
+  positions, and explosion block candidates in addition to direct break/place.
+  Every chest/furnace click rechecks the backing positions. Player actions keep
+  the bounded authoritative actor check. Explosion planning clones one
+  immutable claim snapshot only when an explosion is due and before the world
+  lock, so idle ticks do not copy zones and the candidate loop takes no zone
+  mutex. Fire spread and piston movement remain absent mechanics, and the
+  temporary plugin-id/zone-id convention still needs the explicit published
+  policy index described by ADR 0009.
 - The agent-run real-client hostile-combat functional gate is closed on an
   isolated O3 server. Ordinary 26.1.2 client actions selected an iron sword,
   killed a zombie, observed and collected its rotten-flesh drop, observed a

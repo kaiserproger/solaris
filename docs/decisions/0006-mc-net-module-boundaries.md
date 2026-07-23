@@ -485,16 +485,21 @@ Other accepted concrete boundaries in this staged migration are:
   events.
 - `script::zone` also owns the temporary shipped land-claim lookup. Only the
   exact `land-claims` plugin and its documented owner-UUID zone-id convention
-  have protection semantics. `play::block_break` and
-  `play::use_item_on_adapter` call that lookup immediately before authoritative
-  block mutation and resynchronize denied clients; they do not parse plugin
-  ids or claim ownership themselves. The registry lock is held only for the
-  bounded lookup, which is the linearization point for an admitted player
-  mutation; a claim command ordered afterward cannot retroactively cancel that
-  in-flight mutation. Zone commands publish a targeted accepted/rejected result
-  so durable claim storage can roll back an unapplied registry change. This
-  bridge covers direct player break/place only and must be deleted when the
-  script zone DTO gains an explicit protection policy.
+  have protection semantics. `play::block_break`,
+  `play::use_item_on_adapter`, chest opening, and entity interaction call that
+  lookup before authoritative player mutation and resynchronize denied block
+  actions; they do not parse plugin ids or claim ownership themselves. The
+  registry lock is held only for the bounded actor lookup, which is the
+  linearization point for an admitted player action; a claim command ordered
+  afterward cannot retroactively cancel that in-flight action. Open
+  chest/furnace windows repeat that admission at each click. Explosion planning
+  clones one immutable claim-only snapshot after claiming due explosions and
+  before taking the world lock, then performs candidate checks without the zone
+  mutex or idle-tick cloning. Zone commands
+  publish a targeted accepted/rejected result so durable claim storage can roll
+  back an unapplied registry change. This bridge must be deleted when the
+  script zone DTO gains an explicit protection policy and the actor path moves
+  to the versioned published policy index required by ADR 0009.
 - The `mc-script` Lua loader owns optional per-plugin `config.toml` discovery,
   bounded parsing, recursive type/shape validation, and the immutable startup
   snapshot exposed by `solaris.config()`. Each call materializes a fresh Lua

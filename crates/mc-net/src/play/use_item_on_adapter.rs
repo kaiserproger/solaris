@@ -78,6 +78,7 @@ pub(super) enum UseItemOnNoOpReason {
     TargetBlockedOrUnplaceable,
     PlacementPlanRejected,
     ConcurrentMutation,
+    ClaimProtected,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -224,6 +225,7 @@ where
     match handle_use_item_on_interactions(
         state,
         writer,
+        script_events,
         game_mode,
         xp_state,
         player_pose,
@@ -307,6 +309,7 @@ pub(super) fn classify_use_item_on_preflight(
 async fn handle_use_item_on_interactions<W>(
     state: &mut InteractionState,
     writer: &mut W,
+    script_events: Option<&ScriptGameplayEventPublisher>,
     game_mode: GameMode,
     xp_state: &XpState,
     player_pose: PlayerPose,
@@ -318,6 +321,35 @@ where
     W: AsyncWriteExt + Unpin,
 {
     let (cx, cy, cz) = target.coords;
+    let (dx, dy, dz) = action.direction.normal();
+    let adjacent_pos = mc_world::BlockPos {
+        x: cx + dx,
+        y: cy + dy,
+        z: cz + dz,
+    };
+    let held = &state.inventory.slots[hand_inventory_slot(state, action.hand)];
+    let placing_fluid = !held.is_empty()
+        && state
+            .item_to_block
+            .bucket_fluid_kind(held.item_id)
+            .is_some();
+    if script_events.is_some_and(|events| {
+        !events.block_mutation_allowed(target.clicked_pos)
+            || (placing_fluid && !events.block_mutation_allowed(adjacent_pos))
+    }) {
+        reject_use_item_on_with_resync(
+            state,
+            writer,
+            action.hand,
+            action.sequence,
+            target.clicked_pos,
+            adjacent_pos,
+            UseItemOnNoOpReason::ClaimProtected,
+            UseItemOnResyncOptions::WITH_HELD_ITEM,
+        )
+        .await?;
+        return Ok(UseItemOnOutcome::Handled);
+    }
     if !player_pose.shifting {
         if open_crafting_table_container(state, writer, player_pose, action.sequence, cx, cy, cz)
             .await?
@@ -358,7 +390,16 @@ where
         if open_furnace_container(state, writer, player_pose, action.sequence, cx, cy, cz).await? {
             return Ok(UseItemOnOutcome::Handled);
         }
-        if open_chest_container(state, writer, player_pose, action.sequence, cx, cy, cz).await? {
+        if open_chest_container(
+            state,
+            writer,
+            script_events,
+            player_pose,
+            action.sequence,
+            target.clicked_pos,
+        )
+        .await?
+        {
             return Ok(UseItemOnOutcome::Handled);
         }
         if handle_cauldron_bucket_use_on(

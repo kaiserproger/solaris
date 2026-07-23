@@ -954,6 +954,7 @@ impl BoundServer {
         let entity_tick_metrics = runtime_tick_metrics.clone();
         let entity_chunk_pipeline_resources = chunk_pipeline_resources.clone();
         let entity_scripts = scripts.clone();
+        let entity_script_zones = script_zones.clone();
         let (periodic_save_requests, periodic_save_worker) = if entity_world_root.is_some() {
             let periodic_config = Arc::clone(&entity_config);
             let periodic_sessions = Arc::clone(&entity_sessions);
@@ -1128,8 +1129,19 @@ impl BoundServer {
                                 &entity_config.block_facts,
                                 &entity_config.blocks,
                                 entity_pathing_materials.as_deref(),
-                        )
-                        .await;
+                                || {
+                                    entity_script_zones.as_ref().map(|zones| {
+                                        zones.claim_protection_snapshot().unwrap_or_else(|error| {
+                                            warn!(
+                                                ?error,
+                                                "claim snapshot unavailable; denying explosion block damage"
+                                            );
+                                            crate::script::ClaimProtectionSnapshot::unavailable()
+                                        })
+                                    })
+                                },
+                            )
+                            .await;
                         continue;
                     }
                     observation = tick_metrics_observations.recv(), if !tick_metrics_observations.is_closed() => {
@@ -1436,6 +1448,17 @@ impl BoundServer {
                             &entity_config.block_facts,
                             &entity_config.blocks,
                             entity_pathing_materials.as_deref(),
+                            || {
+                                entity_script_zones.as_ref().map(|zones| {
+                                    zones.claim_protection_snapshot().unwrap_or_else(|error| {
+                                        warn!(
+                                            ?error,
+                                            "claim snapshot unavailable; denying explosion block damage"
+                                        );
+                                        crate::script::ClaimProtectionSnapshot::unavailable()
+                                    })
+                                })
+                            },
                         )
                         .await;
                 }

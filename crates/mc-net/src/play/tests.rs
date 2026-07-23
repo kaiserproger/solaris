@@ -4232,6 +4232,21 @@ fn chest_quick_move_places_player_stack_in_first_empty_storage_slot() {
 }
 
 #[test]
+fn persistent_container_claim_check_covers_furnace_and_both_chest_halves() {
+    let first = mc_world::BlockPos { x: 1, y: 64, z: 2 };
+    let second = mc_world::BlockPos { x: 2, y: 64, z: 2 };
+    let chest = ActiveContainer::Chest(ChestWindow::new(vec![first, second], 7));
+    assert!(!persistent_container_claim_allowed(&chest, |position| {
+        position != second
+    }));
+    assert!(persistent_container_claim_allowed(&chest, |_| true));
+
+    let furnace = ActiveContainer::Furnace(FurnaceWindow::new(first, 8, FurnaceKind::Furnace));
+    assert!(!persistent_container_claim_allowed(&furnace, |_| false));
+    assert!(persistent_container_claim_allowed(&furnace, |_| true));
+}
+
+#[test]
 fn admin_dispatcher_parses_slash_commands_and_permissions() {
     let op = CommandPermissions { op: true };
     let not_op = CommandPermissions { op: false };

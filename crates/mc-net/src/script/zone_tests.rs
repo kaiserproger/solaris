@@ -131,6 +131,11 @@ async fn shipped_land_claim_zone_blocks_strangers_but_not_owner_or_operator() {
         ),
         Ok(true)
     );
+
+    let snapshot = adapter.claim_protection_snapshot().unwrap();
+    assert!(!snapshot.ambient_block_mutation_allowed("minecraft:overworld", claimed));
+    assert!(snapshot.ambient_block_mutation_allowed("minecraft:overworld", outside));
+    assert!(snapshot.ambient_block_mutation_allowed("minecraft:the_nether", claimed));
 }
 
 #[tokio::test]
@@ -154,6 +159,15 @@ async fn ordinary_plugin_zones_never_protect_blocks() {
             mc_world::BlockPos { x: 7, y: 64, z: 7 },
         ),
         Ok(true)
+    );
+    assert!(
+        adapter
+            .claim_protection_snapshot()
+            .unwrap()
+            .ambient_block_mutation_allowed(
+                "minecraft:overworld",
+                mc_world::BlockPos { x: 7, y: 64, z: 7 },
+            )
     );
 }
 
@@ -181,6 +195,15 @@ async fn malformed_shipped_claim_zone_does_not_enable_protection() {
             mc_world::BlockPos { x: 7, y: 64, z: 7 },
         ),
         Ok(true)
+    );
+    assert!(
+        adapter
+            .claim_protection_snapshot()
+            .unwrap()
+            .ambient_block_mutation_allowed(
+                "minecraft:overworld",
+                mc_world::BlockPos { x: 7, y: 64, z: 7 },
+            )
     );
 }
 

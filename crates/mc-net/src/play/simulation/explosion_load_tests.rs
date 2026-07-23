@@ -159,6 +159,7 @@ async fn explosion_authority_load_benchmark_report() {
                 &block_facts,
                 &blocks,
                 Some(&materials),
+                || None,
             )
             .await;
         burst_us.push(started.elapsed().as_micros());

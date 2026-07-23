@@ -459,6 +459,7 @@ async fn shipped_land_claim_blocks_stranger_break_and_placement_over_wire() {
         .default;
     let items = Arc::new(mc_data::items::solaris_required_items());
     let dirt_item_id = item_id(&items, "minecraft:dirt");
+    let water_bucket_item_id = item_id(&items, "minecraft:water_bucket");
     let generator = Arc::new(mc_worldgen::TerrainGenerator::new(0, Arc::clone(&blocks)));
     let fixture_y = generator.surface_height(0, 0) + 1;
     let target = mc_world::BlockPos {
@@ -620,6 +621,34 @@ async fn shipped_land_claim_blocks_stranger_break_and_placement_over_wire() {
             .await
             .get_block(placement)
             .expect("read protected air"),
+        Some(air)
+    );
+
+    send_command(&mut stranger, "fixture-water").await;
+    let water_grant = wait_for_message_and_inventory(&mut stranger, "fixture-water-ready").await;
+    assert_eq!(total_count(&water_grant, dirt_item_id), 0);
+    assert_eq!(total_count(&water_grant, water_bucket_item_id), 1);
+    stranger
+        .write_packet(&ServerboundUseItemOn {
+            hand: InteractionHand::MainHand,
+            position: pack_block_pos(base.x, base.y, base.z),
+            direction: Direction::Up,
+            cursor_x: 0.5,
+            cursor_y: 1.0,
+            cursor_z: 0.5,
+            inside: false,
+            world_border_hit: false,
+            sequence: 43,
+        })
+        .await
+        .expect("attempt protected bucket placement");
+    wait_for_block_ack(&mut stranger, 43).await;
+    assert_eq!(
+        world
+            .lock()
+            .await
+            .get_block(placement)
+            .expect("read bucket-protected air"),
         Some(air)
     );
 
@@ -1117,7 +1146,7 @@ fn write_dirt_fixture_plugin(destination_root: &Path) {
             version = "0.1.0"
             api = "0.6.0"
             capabilities = ["player_inventory"]
-            player_commands = ["fixture-dirt"]
+            player_commands = ["fixture-dirt", "fixture-water"]
         "#,
     )
     .expect("write dirt fixture manifest");
@@ -1125,14 +1154,23 @@ fn write_dirt_fixture_plugin(destination_root: &Path) {
         destination.join("main.lua"),
         r#"
             function on_player_command(event)
-                solaris.inventory_transaction(event.player_id, "dirt-grant", {
-                    { resource = "minecraft:dirt", delta = 1 },
-                })
+                if event.root == "fixture-dirt" then
+                    solaris.inventory_transaction(event.player_id, "dirt-grant", {
+                        { resource = "minecraft:dirt", delta = 1 },
+                    })
+                elseif event.root == "fixture-water" then
+                    solaris.inventory_transaction(event.player_id, "water-grant", {
+                        { resource = "minecraft:dirt", delta = -1 },
+                        { resource = "minecraft:water_bucket", delta = 1 },
+                    })
+                end
             end
 
             function on_player_inventory_transaction_result(event)
                 if event.request_id == "dirt-grant" and event.committed then
                     solaris.send_message(event.player_id, "fixture-dirt-ready")
+                elseif event.request_id == "water-grant" and event.committed then
+                    solaris.send_message(event.player_id, "fixture-water-ready")
                 end
             end
         "#,

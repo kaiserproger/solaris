@@ -3323,16 +3323,14 @@ where
 async fn open_chest_container<W>(
     state: &mut InteractionState,
     writer: &mut W,
+    script_events: Option<&ScriptGameplayEventPublisher>,
     player_pose: PlayerPose,
     sequence: i32,
-    x: i32,
-    y: i32,
-    z: i32,
+    position: mc_world::BlockPos,
 ) -> Result<bool, ConnectionError>
 where
     W: AsyncWriteExt + Unpin,
 {
-    let position = mc_world::BlockPos { x, y, z };
     let (positions, title) = {
         let clicked = state.world_read.get_cached_block(position);
         let Some(clicked) = clicked else {
@@ -3358,6 +3356,14 @@ where
         positions.sort_by_key(|pos| (pos.x, pos.y, pos.z));
         (positions, title)
     };
+    if script_events.is_some_and(|events| {
+        positions
+            .iter()
+            .any(|position| !events.block_mutation_allowed(*position))
+    }) {
+        write_block_ack(writer, state.compression, sequence).await?;
+        return Ok(true);
+    }
 
     store_active_container(state, player_pose).await?;
     let container_id = next_container_id(state);
@@ -5296,6 +5302,20 @@ struct ContainerClickContext<'a> {
     script_context: ScriptPlayerContext,
 }
 
+fn persistent_container_claim_allowed(
+    active: &ActiveContainer,
+    mut block_allowed: impl FnMut(mc_world::BlockPos) -> bool,
+) -> bool {
+    match active {
+        ActiveContainer::Furnace(window) => block_allowed(window.position),
+        ActiveContainer::Chest(window) => window
+            .positions
+            .iter()
+            .all(|position| block_allowed(*position)),
+        _ => true,
+    }
+}
+
 async fn handle_container_click<W>(
     state: &mut InteractionState,
     writer: &mut W,
@@ -5362,6 +5382,26 @@ where
             write_inventory_content_resync(state, writer).await?;
             return Ok(());
         };
+        let claim_rejected = script_events.is_some_and(|events| {
+            !persistent_container_claim_allowed(&active, |position| {
+                events.block_mutation_allowed(position)
+            })
+        });
+        if claim_rejected {
+            match &active {
+                ActiveContainer::Furnace(window) => {
+                    let (furnace, _) = load_furnace_commit_snapshot(state, window.position).await?;
+                    write_furnace_content(state, writer, window, &furnace).await?;
+                }
+                ActiveContainer::Chest(window) => {
+                    let view = load_chest_view(state, window).await?;
+                    write_chest_content(state, writer, window, &view).await?;
+                }
+                _ => unreachable!("only persistent world containers can be claim-rejected"),
+            }
+            state.active_container = Some(active);
+            return Ok(());
+        }
         match active {
             ActiveContainer::CraftingTable(crafting)
                 if crafting.container_id == packet.container_id =>
@@ -6057,8 +6097,21 @@ where
         None
     };
 
+    let Some(accepted) = accepted else {
+        return Ok(());
+    };
+    if script_events.is_some_and(|events| {
+        !events.block_mutation_allowed(mc_world::BlockPos {
+            x: accepted.entity_position.x.floor() as i32,
+            y: accepted.entity_position.y.floor() as i32,
+            z: accepted.entity_position.z.floor() as i32,
+        })
+    }) {
+        return Ok(());
+    }
+
     handle_vanilla_interact(state, writer, packet).await?;
-    if let (Some(accepted), Some(script_events)) = (accepted, script_events) {
+    if let Some(script_events) = script_events {
         let hand = match packet.hand {
             InteractionHand::MainHand => ScriptInteractionHand::MainHand,
             InteractionHand::OffHand => ScriptInteractionHand::OffHand,

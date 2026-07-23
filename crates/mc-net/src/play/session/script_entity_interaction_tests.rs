@@ -88,6 +88,7 @@ fn owner_accepts_only_reachable_live_entity_interactions() {
     assert_eq!(accepted.game_mode, GameMode::Survival);
     assert_eq!(accepted.entity_id, reachable);
     assert_eq!(accepted.entity_type, "minecraft:villager");
+    assert_eq!(accepted.entity_position, Vec3::new(1.5, 64.0, 0.5));
 
     assert!(
         registry

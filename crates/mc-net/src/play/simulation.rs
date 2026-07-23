@@ -2692,7 +2692,8 @@ impl SimulationOwner {
         sessions.world_time()
     }
 
-    pub(crate) async fn tick_primed_tnt(
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) async fn tick_primed_tnt<F>(
         &mut self,
         sessions: &SessionRegistry,
         world: Option<&WorldHandle>,
@@ -2700,7 +2701,11 @@ impl SimulationOwner {
         block_facts: &BlockFactsTable,
         blocks: &BlockRegistry,
         materials: Option<&BlockMaterialIds>,
-    ) -> usize {
+        claim_protection: F,
+    ) -> usize
+    where
+        F: FnOnce() -> Option<crate::script::ClaimProtectionSnapshot>,
+    {
         let current_tick = sessions.simulation_tick();
         let expired_tnt = sessions.claim_due_primed_tnt(&self.authority, current_tick);
         if expired_tnt.is_empty() {
@@ -2715,6 +2720,7 @@ impl SimulationOwner {
             dispatch_visibility_commands(dispatches);
             return expired;
         }
+        let claim_protection = claim_protection();
 
         let entity_targets = expired_tnt
             .iter()
@@ -2766,7 +2772,10 @@ impl SimulationOwner {
                         };
                         Some(ExplosionBlockSample {
                             resistance,
-                            explodable: true,
+                            explodable: claim_protection.as_ref().is_none_or(|protection| {
+                                protection
+                                    .ambient_block_mutation_allowed("minecraft:overworld", position)
+                            }),
                         })
                     },
                 ) else {
@@ -6015,6 +6024,7 @@ mod tests {
     use mc_data::items::ItemRegistry;
     use mc_entity::{EntityItemStack, Rotation, Vec3};
     use mc_protocol::packets::play::ItemStack;
+    use mc_script::{ScriptAxisAlignedZone, ScriptPosition};
     use mc_world::{BlockPos, BlockRegistry, BlockStateId, Chunk, ChunkPos, WorldStorage};
     use std::collections::{BTreeMap, HashSet};
     use std::sync::Mutex;
@@ -15514,7 +15524,9 @@ mod tests {
             .unwrap();
         let tnt = BlockPos { x: 1, y: 64, z: 1 };
         let chained_tnt = BlockPos { x: 2, y: 64, z: 1 };
+        let protected = BlockPos { x: 1, y: 64, z: 2 };
         storage.set_block_at(tnt, BlockStateId(5)).unwrap();
+        storage.set_block_at(protected, BlockStateId(6)).unwrap();
         let tnt_token = storage.block_mutation_token(tnt).unwrap();
         let world = Arc::new(tokio::sync::Mutex::new(storage));
 
@@ -15595,6 +15607,7 @@ mod tests {
                     &block_facts,
                     &blocks,
                     Some(&materials),
+                    || panic!("claim snapshot must stay lazy without a due explosion"),
                 )
                 .await,
             0
@@ -15604,6 +15617,25 @@ mod tests {
             Some(BlockStateId(5))
         );
         owner.advance_world_time(&sessions, 1);
+        let claim_protection = crate::script::ClaimProtectionSnapshot::from_zones(vec![
+            ScriptAxisAlignedZone::try_new(
+                "protected-test",
+                "minecraft:overworld",
+                ScriptPosition::try_new(
+                    f64::from(protected.x),
+                    f64::from(protected.y),
+                    f64::from(protected.z),
+                )
+                .unwrap(),
+                ScriptPosition::try_new(
+                    f64::from(protected.x),
+                    f64::from(protected.y),
+                    f64::from(protected.z),
+                )
+                .unwrap(),
+            )
+            .unwrap(),
+        ]);
         assert_eq!(
             owner
                 .tick_primed_tnt(
@@ -15613,6 +15645,7 @@ mod tests {
                     &block_facts,
                     &blocks,
                     Some(&materials),
+                    || Some(claim_protection),
                 )
                 .await,
             1
@@ -15620,6 +15653,11 @@ mod tests {
         assert_eq!(
             world.lock().await.get_block(chained_tnt).unwrap(),
             Some(BlockStateId(0))
+        );
+        assert_eq!(
+            world.lock().await.get_block(protected).unwrap(),
+            Some(BlockStateId(6)),
+            "claim snapshot must remove protected blocks from explosion candidates"
         );
         let chained_fuses = sessions.primed_tnt_fuses_for_test();
         assert_eq!(chained_fuses.len(), 1);
@@ -15720,6 +15758,7 @@ mod tests {
                         &block_facts,
                         &blocks,
                         Some(&materials),
+                        || None,
                     )
                     .await,
                 1
@@ -15830,6 +15869,7 @@ mod tests {
                     &BlockFactsTable::default(),
                     &blocks,
                     None,
+                    || None,
                 )
                 .await,
             1

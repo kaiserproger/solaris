@@ -440,10 +440,21 @@ hardening. An already-open lower-priority diff does not override this order.
   purchase, insufficient-funds rejection, refund, and refreshed menu state.
   Stable product ids retain the original refund terms across catalog changes;
   changed terms block new purchases until old purchases are refunded.
-  The shipped `land-claims` plugin remains a bounded durable whole-chunk index
-  with direct break/place protection; container, fluid, piston, explosion,
-  fire, and entity interaction protection remain open. No manual-client gate
-  was run.
+  The shipped `land-claims` plugin remains a bounded durable whole-chunk index.
+  Direct break/place, right-click block actions, containers, buckets,
+  living-entity interaction, and explosion block damage are protected. Piston
+  movement and fire spread remain open because those mutation paths do not
+  exist yet. No manual-client gate was run.
+
+- Land claims now deny foreign right-click block actions, cross-boundary filled
+  bucket placement, double-container access, living-entity interaction at the
+  authoritative target position, and explosion block damage. Every
+  chest/furnace click rechecks its backing positions. Explosion planning uses
+  one immutable claim snapshot only after an explosion becomes due and before
+  the world lock, not one zone lock per candidate or one clone per idle tick.
+  The production wire gate proves foreign break, placement, and filled-bucket
+  placement leave the claimed world unchanged. Fire spread and piston movement
+  are not implemented yet, so the owner item remains open.
 
 - Mob death completion no longer scans every server entity every tick. Lethal
   melee, projectile/effect damage, test ingress, and persisted restore enqueue

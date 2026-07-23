@@ -1,6 +1,6 @@
 use std::time::Instant;
 
-use mc_entity::{EntityId, EntityLifecycle};
+use mc_entity::{EntityId, EntityLifecycle, Vec3};
 use mc_protocol::packets::play::GameMode;
 
 use super::interaction_geometry::{entity_geometry, within_entity_reach};
@@ -13,6 +13,7 @@ pub(in crate::play) struct AcceptedScriptEntityInteraction {
     pub(in crate::play) game_mode: GameMode,
     pub(in crate::play) entity_id: EntityId,
     pub(in crate::play) entity_type: String,
+    pub(in crate::play) entity_position: Vec3,
 }
 
 impl SessionRegistry {
@@ -64,6 +65,7 @@ impl SessionRegistry {
             game_mode,
             entity_id,
             entity_type: entity.type_name,
+            entity_position: entity.position,
         })
     }
 }

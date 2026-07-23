@@ -79,6 +79,41 @@ struct RegisteredZone {
     zone: ScriptAxisAlignedZone,
 }
 
+#[derive(Debug, Clone, Default)]
+pub(crate) struct ClaimProtectionSnapshot {
+    zones: Vec<ScriptAxisAlignedZone>,
+    deny_all: bool,
+}
+
+impl ClaimProtectionSnapshot {
+    #[cfg(test)]
+    pub(crate) fn from_zones(zones: Vec<ScriptAxisAlignedZone>) -> Self {
+        Self {
+            zones,
+            deny_all: false,
+        }
+    }
+
+    pub(crate) fn unavailable() -> Self {
+        Self {
+            zones: Vec::new(),
+            deny_all: true,
+        }
+    }
+
+    pub(crate) fn ambient_block_mutation_allowed(
+        &self,
+        dimension: &str,
+        position: mc_world::BlockPos,
+    ) -> bool {
+        !self.deny_all
+            && self
+                .zones
+                .iter()
+                .all(|zone| !zone_contains_block(zone, dimension, position))
+    }
+}
+
 #[derive(Debug)]
 struct PlayerMembership {
     revision: u64,
@@ -206,6 +241,21 @@ impl ZoneRegistry {
             .filter(|(_, registered)| zone_contains_block(&registered.zone, dimension, position))
             .filter_map(|(key, _)| claim_owner_uuid(&key.zone_id))
             .all(|owner| owner == actor_uuid)
+    }
+
+    fn claim_protection_snapshot(&self) -> ClaimProtectionSnapshot {
+        let zones = self
+            .zones
+            .iter()
+            .filter(|(key, _)| {
+                key.plugin_id == LAND_CLAIMS_PLUGIN_ID && claim_owner_uuid(&key.zone_id).is_some()
+            })
+            .map(|(_, registered)| registered.zone.clone())
+            .collect();
+        ClaimProtectionSnapshot {
+            zones,
+            deny_all: false,
+        }
     }
 
     fn observe_player(
@@ -465,6 +515,16 @@ impl PluginZoneAdapter {
             .lock()
             .map_err(|_| ZoneAdapterError::StateUnavailable)?
             .block_mutation_allowed(actor_uuid, operator, dimension, position))
+    }
+
+    pub(crate) fn claim_protection_snapshot(
+        &self,
+    ) -> Result<ClaimProtectionSnapshot, ZoneAdapterError> {
+        Ok(self
+            .registry
+            .lock()
+            .map_err(|_| ZoneAdapterError::StateUnavailable)?
+            .claim_protection_snapshot())
     }
 
     pub(crate) fn close(&self) -> Result<(), ZoneAdapterError> {
