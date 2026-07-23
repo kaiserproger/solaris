@@ -13,6 +13,8 @@ const HILL_CROSS_SCALE: f64 = 280.0;
 const DETAIL_SCALE: f64 = 190.0;
 const MOUNTAIN_SCALE_A: f64 = 2_200.0;
 const MOUNTAIN_SCALE_B: f64 = 1_550.0;
+const MOUNTAIN_DETAIL_LONG_SCALE: f64 = 520.0;
+const MOUNTAIN_DETAIL_CROSS_SCALE: f64 = 210.0;
 const RIVER_SCALE: f64 = 1_850.0;
 const RIVER_DETAIL_SCALE: f64 = 610.0;
 const SPAWN_LAND_RADIUS: f64 = 384.0;
@@ -86,6 +88,13 @@ pub(super) fn sample(router: OverworldRouter, block_x: i32, block_z: i32) -> Ter
         2,
         0.45,
     );
+    let mountain_detail = fbm_2d(
+        (wx + wz * 0.31) / (MOUNTAIN_DETAIL_LONG_SCALE * scale),
+        (wz - wx * 0.24) / (MOUNTAIN_DETAIL_CROSS_SCALE * scale),
+        router.seed ^ 0x4D44_544C,
+        4,
+        0.52,
+    );
 
     // Two differently oriented ridge fields produce long, branching ranges
     // instead of isolated noise peaks.
@@ -123,11 +132,17 @@ pub(super) fn sample(router: OverworldRouter, block_x: i32, block_z: i32) -> Ter
     let rolling_land = sea
         + 7.0
         + continentalness.max(0.0) * 20.0 * land_scale
-        + upland * (5.0 + (1.0 - erosion) * 8.0) * land_scale
-        + hills * 3.5 * land_scale
-        + detail * land_scale;
+        + upland * (7.0 + (1.0 - erosion) * 12.0) * land_scale
+        + hills * 8.0 * land_scale
+        + detail * 1.8 * land_scale;
     let mountain_height = settings.map_or(98.0, |_| 142.0) * land_scale;
-    let mut height = lerp(ocean_floor, rolling_land + ridges * mountain_height, land);
+    let mountain_relief = ridges * (mountain_height + mountain_detail * 36.0 * land_scale);
+    let mut height = lerp(ocean_floor, rolling_land + mountain_relief, land);
+
+    // Keep the deterministic spawn region dry even when broad relief happens
+    // to dip below sea level for a particular seed.
+    let spawn_floor = sea + 7.0;
+    height = height.max(lerp(height, spawn_floor, spawn_weight));
 
     // A warped zero contour forms continuous valleys. Mountains and the safe
     // spawn plateau suppress it before it can become a local sink.

@@ -771,13 +771,14 @@ async fn spawn_position_skips_collidable_body_space_and_hazardous_support() {
     let stone = state("minecraft:stone");
     let glass = state("minecraft:glass");
     let magma = state("minecraft:magma_block");
+    let oak_leaves = state("minecraft:oak_leaves");
     let mut world = mc_world::WorldStorage::in_memory(Arc::clone(&blocks));
     let mut chunk = Chunk::empty(
         ChunkPos { x: 0, z: 0 },
         air,
         Identifier::parse("minecraft:plains").unwrap(),
     );
-    for (x, support) in [(0, stone), (1, magma), (2, stone)] {
+    for (x, support) in [(0, stone), (1, magma), (2, oak_leaves), (3, stone)] {
         chunk.set_block(x, 64, 0, support);
         chunk
             .highest_opaque
@@ -797,7 +798,7 @@ async fn spawn_position_skips_collidable_body_space_and_hazardous_support() {
         )),
     );
 
-    assert_eq!(spawn_position(&config, Some(&world_read)), (2.5, 66.0, 0.5));
+    assert_eq!(spawn_position(&config, Some(&world_read)), (3.5, 66.0, 0.5));
 }
 
 #[test]

@@ -152,15 +152,28 @@ verification and keep ordinary survival play ahead of rare edge cases.
   against the collision oracle, including every age/stage state; the runtime
   physics sampler also reproduces an exact partial pitcher-crop shape instead
   of its full-block fallback.
-- [ ] Keep vanilla-compatible world load/save while producing coherent terrain
+- [x] Keep vanilla-compatible world load/save while producing coherent terrain
   quality comparable in intent to Tectonic/Tellus. The Anvil encoder now emits
   exactly one `DataVersion`, `LastUpdate`, and `InhabitedTime` root field for
   every chunk, including old Solaris chunks that lacked them. Production
   flushes use the actual simulation tick for `LastUpdate`; imported
   `DataVersion` and `InhabitedTime` survive save/reopen. Focused disk round-trip
   coverage and all `mc-world` tests are green. Runtime now accumulates exact
-  active ticks and persists them in batches. A real-client terrain visual pass
-  remains before this item closes.
+  active ticks and persists them in batches. Worldgen revision 8 removes low
+  coastal shelves from the mountain-surface route, strengthens long rolling
+  relief, adds a 520x210-block mountain detail field, gives high peaks snow,
+  keeps low shelves in coastal/lowland biomes, and explicitly keeps the spawn
+  window dry. An agent-run MCP
+  route used a fresh 26.1.2 client, seed `918273645`, and `tellus_like` mode to
+  inspect the forest spawn, coast, ocean, and the representative
+  high-relief range around `(-78080, -28928)`: trees had raised irregular
+  crowns, terrain stayed solid, vegetation remained coherent, and the mountain
+  had a continuous elongated slope instead of the original flat gravel plateau.
+  A second agent-run MCP pass used the exact shipped `playable.toml` profile
+  (`seed=0`, `tellus_like`) and found a dry, solid, moderately decorated forest
+  spawn with the same raised tree crowns. The exact shipped-profile gate also
+  exposed the spawn selector treating a leaf canopy as ground; spawn support
+  now follows the vanilla no-leaves heightmap intent and rejects leaf blocks.
 - [x] Verify vanilla ore height/distribution when the vanilla ore pass is active.
   The default embedded pass now preserves all 18 relevant vanilla 26.1.2
   placed/configured ore facts: separate passes, height anchors, uniform versus
@@ -210,6 +223,11 @@ verification and keep ordinary survival play ahead of rare edge cases.
   A debug deep-water fixture also exposed a scheduled-fluid backlog applying
   roughly 94-105 updates in `68-76 ms` per tick and delaying client entry for
   more than two minutes; profile and bound that common loaded-ocean path.
+  The terrain visual run also exposed a separate far-travel path: a 289-chunk
+  stream took about 31 seconds while dirty-cache pressure forced a 3.5-second
+  flush and chunk fetch/light work accumulated behind it. Fix that common
+  exploration stall and the observed shutdown-drain timeout before using
+  far-travel results as a latency benchmark.
 - [ ] Bound breeding and scheduled-block work per tick and move expensive
   preparation off the tick owner. No single animal or block batch may stall
   packet processing.
@@ -248,8 +266,9 @@ workspace clippy with warnings denied, formatting, and `xtask code-health`.
 
 The 2026-07-22 tree/decorations checkpoint passed the full workspace test suite,
 workspace clippy with warnings denied, the external worldgen harness,
-formatting, and `xtask code-health`; independent review reported no findings. A
-fresh-world client visual pass remains part of the broader terrain checkpoint.
+formatting, and `xtask code-health`; independent review reported no findings.
+The revision-8 fresh-world client visual pass is recorded in the completed
+broader terrain item above.
 
 The 2026-07-22 surface/spawn checkpoint passed all `mc-worldgen` tests and the
 external worldgen server harness. The harness starts a fresh generated server,
@@ -277,4 +296,4 @@ declaration to the plugin manifest. Plugin discovery is prepared once before
 the world contract and reused by the Lua host. The geological profile empties
 the vanilla ore rules and creates deterministic elongated deposits spanning
 chunk boundaries; the default profile remains unchanged. World contract schema
-2 persists the ore profile and worldgen revision 7 fences mixed-profile worlds.
+2 persists the ore profile and worldgen revision 8 fences mixed-profile worlds.

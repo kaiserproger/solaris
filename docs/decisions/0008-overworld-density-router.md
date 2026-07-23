@@ -1,7 +1,7 @@
 # ADR 0008 - Overworld generation pipeline
 
 **Date:** 2026-07-22
-**Status:** Accepted, worldgen revision 7
+**Status:** Accepted, worldgen revision 8
 
 ## Context
 
@@ -13,7 +13,16 @@ block as support instead of the surface planned for that column.
 
 ## Decision
 
-Worldgen revision 7 retains the revision-6 density router and adds an explicit
+Worldgen revision 8 retains the revision-7 pipeline and corrects terrain that a
+real 26.1.2 client exposed as broad flat gravel plateaus. Long rolling relief
+has more vertical range, while a rotated 520x210-block detail field shapes the
+inside of the existing long mountain masks. Low coastal ridge masks no longer
+select mountain surfaces, high peaks use snow, low shelves retain their
+coastal/lowland surfaces, and a
+smooth explicit floor keeps the spawn region dry across seeds. The persisted
+revision fences these changed columns from revision-7 worlds.
+
+Worldgen revision 7 retained the revision-6 density router and added an explicit
 ore profile to the persisted world contract. The default `vanilla` profile uses
 the embedded 26.1.2 ore passes. A validated plugin manifest may instead declare
 `geological_deposits`; that disables the vanilla pass and uses large
@@ -54,7 +63,7 @@ Anvil open.
 An existing unversioned Anvil world is treated as a vanilla import and opens
 without Solaris fallback generation, so missing chunks cannot mix both terrain
 authorities. Existing worlds are never rewritten. The local playable profile
-uses `.analysis/test-world-v7`.
+uses `.analysis/test-world-v8`.
 
 Anvil root metadata belongs to the chunk serialization boundary, not a concrete
 terrain generator. The encoder emits one `DataVersion`, `LastUpdate`, and
@@ -71,7 +80,7 @@ republishing hundreds of chunks on every tick.
 
 The hot path samples each surface column once and reuses its biome result for
 vertical biome cells. Cave noise exits after its region mask or first tunnel
-field rejects the cell. No revision-7 performance claim exists until a release
+field rejects the cell. No revision-8 performance claim exists until a release
 benchmark runs on a clean host.
 
 ## Staged boundary
@@ -80,13 +89,15 @@ Landforms and caves are isolated sibling stages. Surface composition, ores,
 features, and structures still reside in the larger `terrain.rs` assembly and
 should move into focused sibling modules when each stage is changed. This ADR
 does not claim vanilla NoiseRouter parity or complete Tectonic/Tellus feature
-coverage. Real-client visual inspection remains required.
+coverage. The bounded client pass verifies representative shapes, not complete
+seed coverage or owner-approved visual parity.
 
 ## Verification
 
 - deterministic generation for repeated calls and explicit geometry;
 - bounded adjacent-column and chunk-border steps plus non-grid biome transitions;
 - no isolated four-block-scale terrain craters across sampled seeds;
+- representative high-relief windows have visible shape without vertical walls;
 - dry walkable land throughout a 193x193 spawn window across sampled seeds;
 - broad water-filled river sections;
 - sparse locally coherent tunnel caves with no chamber field, surface mouth, or
@@ -101,4 +112,8 @@ coverage. Real-client visual inspection remains required.
 - rejection of a changed persisted ore profile;
 - order-independent ore placement;
 - geological deposits crossing chunk boundaries while default generation stays vanilla;
+- agent-run 26.1.2 MCP inspection with seed `918273645` and `tellus_like` mode
+  over forest, coast, ocean, and high-relief terrain;
+- agent-run 26.1.2 MCP inspection of the exact shipped `playable.toml` seed-0
+  `tellus_like` forest spawn;
 - `cargo test -p mc-worldgen`.

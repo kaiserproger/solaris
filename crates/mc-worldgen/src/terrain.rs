@@ -543,12 +543,17 @@ impl TerrainGenerator {
                     .pick(&self.biomes.ocean, world_x, world_z, 0x544F_434E);
             }
         }
-        if land_mask.abs() < 0.08 || height_y <= sea_y + i64::from(BEACH_HEIGHT_ABOVE_SEA) {
+        let near_coast = land_mask.abs() < 0.025 && height_y <= sea_y + 6;
+        if near_coast || height_y <= sea_y + i64::from(BEACH_HEIGHT_ABOVE_SEA) {
             return self
                 .biomes
                 .pick(&self.biomes.beach, world_x, world_z, 0x5442_4541);
         }
-        if height_y > sea_y + 86 || mountain > 0.22 {
+        // A ridge field may cross its threshold on a low coastal shelf. Only
+        // route that shelf to a rocky mountain surface once the terrain has
+        // actually risen above ordinary lowland.
+        if height_y > sea_y + 86 || (mountain > 0.22 && land_mask > 0.08 && height_y >= sea_y + 18)
+        {
             return self
                 .biomes
                 .pick(&self.biomes.mountain, world_x, world_z, 0x544D_4F55);
@@ -619,16 +624,20 @@ impl TerrainGenerator {
                 self.tellus_biome_for(wx, wz, height, settings, sample)
             }
         };
-        let (mut surface, fill) = self.surface_materials(&biome);
+        let (sea_level, water_enabled) = match self.worldgen_mode {
+            WorldgenMode::VanillaLike => (SEA_LEVEL, true),
+            WorldgenMode::TellusLike(settings) => (settings.sea_level, settings.water_enabled),
+        };
+        let (mut surface, mut fill) = self.surface_materials(&biome);
+        if self.biomes.mountain.contains(&biome) && height >= sea_level + 112 {
+            surface = self.snow_block;
+            fill = self.stone;
+        }
         if self.is_spawn_iron_outcrop(wx, height, wz) {
             surface = self.iron_ore;
         } else if self.is_spawn_stone_outcrop(wx, height, wz) {
             surface = self.stone;
         }
-        let (sea_level, water_enabled) = match self.worldgen_mode {
-            WorldgenMode::VanillaLike => (SEA_LEVEL, true),
-            WorldgenMode::TellusLike(settings) => (settings.sea_level, settings.water_enabled),
-        };
         let top_non_air = if water_enabled && (height < sea_level || self.biomes.is_river(&biome)) {
             let inclusive_top = checked_y_offset(self.geometry.max_y(), -1).unwrap_or(height);
             sea_level.clamp(height, inclusive_top)

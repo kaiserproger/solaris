@@ -592,14 +592,14 @@ mod tests {
         assert_eq!(cfg.network.port, 25565);
         assert_eq!(
             cfg.data.world_dir,
-            Some(std::path::PathBuf::from(".analysis/test-world-v7"))
+            Some(std::path::PathBuf::from(".analysis/test-world-v8"))
         );
         assert_eq!(
             cfg.data.vanilla_data_dir,
             Some(std::path::PathBuf::from("data/vanilla"))
         );
         assert_eq!(cfg.data.seed, 0);
-        assert_eq!(cfg.data.worldgen_mode, WorldgenMode::VanillaLike);
+        assert_eq!(cfg.data.worldgen_mode, WorldgenMode::TellusLike);
         assert!(!cfg.auth.online_mode);
         assert!(!cfg.auth.prevent_proxy_connections);
         assert!(!cfg.auth.whitelist_enabled);

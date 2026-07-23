@@ -695,12 +695,25 @@ pub(super) fn top_non_air_y(
     z: i32,
     air: mc_world::BlockStateId,
 ) -> Option<i32> {
+    // Generated-world fixtures need the same solid, no-leaves surface used by spawn selection.
     (mc_world::MIN_Y..mc_world::MAX_Y).rev().find(|&y| {
-        world
+        let Some(state_id) = world
             .get_block(mc_world::BlockPos { x, y, z })
             .ok()
             .flatten()
-            != Some(air)
+        else {
+            return false;
+        };
+        if state_id == air {
+            return false;
+        }
+        let Some(state) = world.registry().by_id(state_id) else {
+            return false;
+        };
+        !state.block.id.path().ends_with("_leaves")
+            && mc_data::collision_shapes::vanilla_collision_shapes()
+                .get(state_id.0)
+                .is_some_and(|shape| !shape.is_empty())
     })
 }
 

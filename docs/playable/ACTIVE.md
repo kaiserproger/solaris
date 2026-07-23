@@ -71,9 +71,8 @@ hardening. An already-open lower-priority diff does not override this order.
    Close the remaining claim surfaces (containers, fluids, explosions and
    entity interaction) through a first-class zone protection policy after the
    ordinary break/place slice is client-verified.
-5. Improve terrain generation toward the concrete Tellus/Tectonic traits that
-   can be measured without breaking vanilla world persistence. Then run a
-   bounded explosion load benchmark and record the exact envelope.
+5. Run a bounded explosion load benchmark and record the exact envelope. The
+   terrain visual gate is closed under worldgen revision 8.
 6. Close this owner batch with a 20-minute MCP-driven survival session whose
    decisions are made by one fast subagent. Do not use the deterministic
    scenario runner or operator setup. Treat its visible failures as the next
@@ -84,13 +83,29 @@ hardening. An already-open lower-priority diff does not override this order.
 
 ## Recent Evidence
 
+- Worldgen revision 8 passed an agent-run MCP route with a fresh 26.1.2 client,
+  seed `918273645`, and `tellus_like` mode over forest, coast, ocean, and the
+  representative high-relief range around `(-78080, -28928)`. The first route
+  exposed low ridge masks becoming enormous
+  flat gravel shelves. The corrected router keeps low shelves out of mountain
+  biomes, strengthens the existing 720x280 rolling relief, adds anisotropic
+  520x210 mountain detail, uses elevation-aware grass/gravel/snow surfaces, and
+  explicitly keeps spawn dry. Numeric checks require visible local mountain
+  relief without a five-block adjacent wall. A second agent-run MCP pass used
+  the exact shipped `playable.toml` profile (`seed=0`, `tellus_like`) and found
+  a dry, solid, moderately decorated forest spawn with raised tree crowns. Its
+  focused harness then exposed leaf canopies being accepted as spawn support;
+  spawn selection now rejects leaves, matching vanilla's no-leaves heightmap
+  intent. The first run exposed a pending
+  31-second far-travel chunk stream under dirty-cache flush pressure; that is a
+  runtime latency item, not accepted worldgen performance evidence.
+
 - Fresh and legacy Solaris chunks now serialize the mandatory vanilla Anvil
   metadata at the codec boundary rather than in one generator. `DataVersion`
   defaults to the pinned 26.1.2 value, nonzero production ticks become
   `LastUpdate`, imported `InhabitedTime` is preserved, and each field is emitted
-  exactly once through a real region write/read. This closes the concrete format
-  gap but does not yet prove the broader terrain-quality item; visual client
-  inspection remains queued. Runtime now uses vanilla's strict 128-block
+  exactly once through a real region write/read. Runtime now uses vanilla's
+  strict 128-block
   chunk-center range around non-spectator players, counts each spawning chunk
   once per game tick, applies those counts in 20-tick mutation batches, and
   flushes chunks as they leave that range. Missing residents retain their delta
@@ -170,7 +185,7 @@ hardening. An already-open lower-priority diff does not override this order.
   before world validation and is reused to start Lua later. The profile removes
   the vanilla ore rules and generates deterministic elongated deposits larger
   than 512 connected blocks across chunk boundaries. World contract schema 2
-  persists the profile under worldgen revision 7 and rejects a later profile
+  persists the profile under worldgen revision 8 and rejects a later profile
   change; no declaration remains the vanilla default.
 
 - Default ore generation now embeds 18 separate vanilla 26.1.2 placement passes
@@ -193,8 +208,8 @@ hardening. An already-open lower-priority diff does not override this order.
   columns, with separate tree/grass/flower density per biome. The embedded
   collision oracle verifies every state of generated and growable plants is not
   a full cube, and the runtime sampler reproduces an exact partial pitcher-crop
-  shape. This is measurable coherence/collision evidence; the broader
-  Tellus/Tectonic visual gate remains open.
+  shape. This is measurable coherence/collision evidence; the bounded
+  Tellus/Tectonic visual gate is now closed by the revision-8 route above.
 
 - A normal 26.1.2 client is now fenced from combat between respawn and its
   `ServerboundPlayerLoaded` acknowledgement, matching vanilla's load gate.
@@ -218,8 +233,8 @@ hardening. An already-open lower-priority diff does not override this order.
   or 401s, moved from z=0.598 to z=9.956, and remained in play at full health.
   The current-build 20-minute autonomous survival session remains pending.
 
-- Worldgen revision 7 keeps the revision-6 landform and cave
-  stages: domain-warped continents, branching mountain ranges, and warped
+- Worldgen revision 8 keeps the revision-6 cave stage and revises landforms:
+  domain-warped continents, shaped branching mountain ranges, and warped
   river-valley contours that become river biomes only after substantial carving.
   Tests cover a dry walkable 193x193 spawn window across a seed grid, full
   sampled cave volumes, chunk-border slopes, isolated-crater rejection, surface
@@ -228,7 +243,8 @@ hardening. An already-open lower-priority diff does not override this order.
   Fresh Solaris worlds persist revision/seed/mode/ore-profile/geometry in
   `solaris/world.json`; unversioned vanilla Anvil worlds open without Solaris
   fallback generation, so terrain authorities cannot mix. `playable.toml` now
-  uses `.analysis/test-world-v7`. Real-client visual inspection is pending.
+  uses `.analysis/test-world-v8` with seed `0` and `tellus_like`; both that exact
+  profile and seed `918273645` received bounded fresh-client inspection.
 
 - Hostile melee now keeps a zero-speed target-facing goal while in reach, so a
   stationary zombie stops without freezing its body/head rotation and publishes

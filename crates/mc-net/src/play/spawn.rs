@@ -106,7 +106,8 @@ fn safe_spawn_support(config: &ServerConfig, state_id: mc_world::BlockStateId) -
     let Some(state) = config.blocks.by_id(state_id) else {
         return false;
     };
-    if hazardous_spawn_block(state.block.id.path()) {
+    let path = state.block.id.path();
+    if path.ends_with("_leaves") || hazardous_spawn_block(path) {
         return false;
     }
     !passable_block_name(state.block.id.as_str())

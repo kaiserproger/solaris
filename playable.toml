@@ -25,11 +25,11 @@ allow_local_dev_operators = false
 directory = "plugins"
 
 [data]
-# Worldgen v7 persists revision, seed, mode, ore profile, and geometry.
-world_dir = ".analysis/test-world-v7"
+# Worldgen v8 persists revision, seed, mode, ore profile, and geometry.
+world_dir = ".analysis/test-world-v8"
 vanilla_data_dir = "data/vanilla"
 seed = 0
-# worldgen_mode = "tellus_like"
+worldgen_mode = "tellus_like"
 
 [simulation]
 random_tick_speed = 5

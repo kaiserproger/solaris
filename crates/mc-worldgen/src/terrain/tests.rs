@@ -784,6 +784,117 @@ fn tellus_like_mountains_are_rare_but_giant() {
 }
 
 #[test]
+fn tellus_like_lowlands_do_not_become_flat_mountain_surfaces() {
+    let settings = TellusWorldgenSettings::default();
+    let g = TerrainGenerator::with_worldgen_mode(
+        918_273_645,
+        tiny_registry(),
+        WorldgenMode::TellusLike(settings),
+    );
+    let mut sampled_lowlands = 0usize;
+
+    for wx in (-2_048..=2_048).step_by(32) {
+        for wz in (-2_048..=2_048).step_by(32) {
+            let height = g.surface_height(wx, wz);
+            if height < settings.sea_level + 4 || height >= settings.sea_level + 18 {
+                continue;
+            }
+            sampled_lowlands += 1;
+            let biome = g.biome_for(wx, wz, height);
+            assert!(
+                !g.biomes.mountain.contains(&biome),
+                "low shelf at ({wx}, {wz}) height {height} became mountain biome {biome}"
+            );
+        }
+    }
+
+    assert!(
+        sampled_lowlands > 100,
+        "sample should contain enough Tellus lowland columns"
+    );
+}
+
+#[test]
+fn tellus_like_playtest_seed_contains_high_relief() {
+    let settings = TellusWorldgenSettings::default();
+    let g = TerrainGenerator::with_worldgen_mode(
+        918_273_645,
+        tiny_registry(),
+        WorldgenMode::TellusLike(settings),
+    );
+    let mut highest = (i32::MIN, 0, 0);
+
+    for wx in (-160_000..=160_000).step_by(4_096) {
+        for wz in (-160_000..=160_000).step_by(4_096) {
+            let height = g.surface_height(wx, wz);
+            if height > highest.0 {
+                highest = (height, wx, wz);
+            }
+        }
+    }
+
+    assert!(
+        highest.0 >= settings.sea_level + 100,
+        "playtest seed lost high relief; highest sample was {highest:?}"
+    );
+}
+
+#[test]
+fn tellus_like_high_relief_has_visible_local_shape() {
+    let g = TerrainGenerator::with_worldgen_mode(
+        918_273_645,
+        tiny_registry(),
+        WorldgenMode::TellusLike(TellusWorldgenSettings::default()),
+    );
+    let mut minimum = i32::MAX;
+    let mut maximum = i32::MIN;
+    let mut maximum_step = 0;
+
+    for wx in -78_208..=-77_952 {
+        for wz in -29_056..=-28_800 {
+            let height = g.surface_height(wx, wz);
+            minimum = minimum.min(height);
+            maximum = maximum.max(height);
+            maximum_step = maximum_step
+                .max((height - g.surface_height(wx + 1, wz)).abs())
+                .max((height - g.surface_height(wx, wz + 1)).abs());
+        }
+    }
+
+    assert!(
+        maximum - minimum >= 18,
+        "high-relief window became a flat plateau: {minimum}..={maximum}"
+    );
+    assert!(
+        maximum_step <= 5,
+        "high-relief window formed a vertical terrain wall: step {maximum_step}"
+    );
+}
+
+#[test]
+fn tellus_like_high_mountain_blocks_use_snow_over_stone() {
+    let settings = TellusWorldgenSettings::default();
+    let g = TerrainGenerator::with_worldgen_mode(
+        918_273_645,
+        tiny_registry(),
+        WorldgenMode::TellusLike(settings),
+    );
+
+    let high = g.plan_column(
+        ChunkPos {
+            x: (-78_080_i32).div_euclid(16),
+            z: (-28_928_i32).div_euclid(16),
+        },
+        (-78_080_i32).rem_euclid(16) as u8,
+        (-28_928_i32).rem_euclid(16) as u8,
+    );
+    assert!(g.biomes.mountain.contains(&high.biome));
+    assert!(high.height >= settings.sea_level + 112);
+    assert_eq!(high.surface, g.snow_block);
+    assert_eq!(high.fill, g.stone);
+}
+
+#[test]
 fn generated_column_has_bedrock_and_biome_surface() {
     let g = TerrainGenerator::new(42, tiny_registry());
     let chunk = g.generate(ChunkPos { x: 0, z: 0 });

@@ -36,6 +36,7 @@ async fn survival_bonemeal_grows_oak_sapling_into_tree() {
 
     let oak_sapling = sapling_test_state(&blocks, "minecraft:oak_sapling", &[]);
     let grown_oak_sapling = sapling_test_state(&blocks, "minecraft:oak_sapling", &[("stage", "1")]);
+    let dirt = sapling_test_state(&blocks, "minecraft:dirt", &[]);
     let oak_log = sapling_test_state(&blocks, "minecraft:oak_log", &[("axis", "y")]);
     let oak_leaves = sapling_test_state(
         &blocks,
@@ -87,6 +88,12 @@ async fn survival_bonemeal_grows_oak_sapling_into_tree() {
     let sapling_pos = (2, support_y + 1, 2);
     {
         let mut storage = world.lock().await;
+        clear_loaded_mega_sapling_volume(&mut storage, &blocks, sapling_pos);
+        sapling_test_set(
+            &mut storage,
+            (sapling_pos.0, support_y, sapling_pos.2),
+            dirt,
+        );
         sapling_test_set(&mut storage, sapling_pos, oak_sapling);
     }
 
@@ -257,6 +264,7 @@ async fn survival_bonemeal_stage_one_oak_replaces_existing_canopy_leaf() {
     let canopy_pos = (sapling_pos.0 + 1, sapling_pos.1 + 4, sapling_pos.2);
     {
         let mut storage = world.lock().await;
+        clear_loaded_mega_sapling_volume(&mut storage, &blocks, sapling_pos);
         sapling_test_set(
             &mut storage,
             (sapling_pos.0, support_y, sapling_pos.2),
