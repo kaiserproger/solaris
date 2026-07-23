@@ -108,10 +108,12 @@ verification and keep ordinary survival play ahead of rare edge cases.
   and returned `pickup_confirmed=true` when cobblestone increased from `0` to
   `1` in non-selected slot `1`; the diamond pickaxe remained selected in slot
   `0`, the block became air, and the client stayed in play.
-- [ ] Fix the persistent embedded non-operator restart pickup regression. The
-  full workspace gate and an exact isolated rerun both received break update
-  and acknowledgement for `(-1, 84, 0)` but no drop stack or inventory item;
-  this is separate from the green fresh-world MCP pickup gate above.
+- [x] The embedded non-operator restart pickup regression was a false-positive
+  fixture: an ordinary random tick changed exposed dirt to grass and advanced
+  its mutation token while the client was still mining the original dirt
+  snapshot. The persistence gate now mines stable jungle logs, then verifies
+  pickup, placement, shutdown save, and restored inventory; its
+  exact isolated run is green.
 - [x] `minecraft_use_item_on` exposes `main_hand` and `off_hand`, defaults to
   main hand, dispatches that exact vanilla interaction hand, and returns the
   local interaction result instead of unconditional `ok`. In the focused real
@@ -251,7 +253,17 @@ verification and keep ordinary survival play ahead of rare edge cases.
   tags and falling blocks must use their vanilla dynamic powder-snow shape
   without weakening the exact-state fingerprint fence.
 - [ ] Keep menus, inventory actions, block events, and attacks responsive under
-  natural mob/chunk load.
+  natural mob/chunk load. The biased entity-owner select used to check an
+  overdue 50 ms tick before its pushed command notification, allowing sustained
+  over-budget ticks to starve player transactions. Command readiness now wins
+  before the ticker; the broader natural-load responsiveness gate remains.
+- [ ] Make an autonomous MCP survival pass reliably reach the first crafting
+  table without operator commands or deterministic scenarios. A real 26.1.2
+  client stayed connected for `27,490` exposed server ticks, broke and picked up
+  a jungle log, survived save/rejoin, and saw natural passive/hostile spawns,
+  but navigation timed out once, pickup confirmation initially lagged behind
+  the actual pickup, combat attempts did not damage the selected zombie, and
+  nine deaths prevented the wood-to-crafting loop from completing.
 - [x] Accumulate vanilla-style per-chunk `InhabitedTime` while players keep a
   chunk active. The tick owner uses vanilla's strict 128-block chunk-center
   range around non-spectator players, counts each spawning chunk once per game

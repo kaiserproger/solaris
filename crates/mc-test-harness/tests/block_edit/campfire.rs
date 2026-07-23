@@ -1262,11 +1262,13 @@ async fn survival_campfire_finishes_after_restart_before_any_client_reconnects()
         .expect("start campfire cooking");
     wait_for_campfire_input_visual_and_slot(&mut client, campfire_pos, &porkchop_name).await;
 
-    {
-        let mut storage = first_world.lock().await;
-        let flushed = storage.flush_dirty().expect("flush dirty world");
-        assert!(flushed > 0, "in-flight campfire state should dirty a chunk");
-    }
+    client
+        .write_packet(&ServerboundChatCommand {
+            command: "save-all".into(),
+        })
+        .await
+        .expect("save in-flight campfire state");
+    wait_for_save_all_feedback(&mut client).await;
 
     drop(client);
     first_shutdown.request();

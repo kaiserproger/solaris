@@ -1047,6 +1047,7 @@ impl BoundServer {
             let mut session_empty_generation = entity_sessions.session_empty_generation();
             let mut player_save_generation = entity_sessions.player_save_generation();
             let mut simulation_command_window = SimulationCommandTelemetryWindow::default();
+            let mut simulation_command_gate = SimulationCommandGate::default();
             let mut pushed_simulation_lane_attribution = Vec::new();
             let mut entity_physics_job = None;
             let mut scheduled_budget_exhausted_since_publish = false;
@@ -1181,8 +1182,9 @@ impl BoundServer {
                         }
                         continue;
                     }
-                    _ = ticker.tick() => false,
-                    ready = simulation_owner.wait_for_command() => {
+                    // An overdue tick is immediately ready. Commands must win the
+                    // biased select so overloaded ticks cannot starve player actions.
+                    ready = simulation_owner.wait_for_command(), if simulation_command_gate.accepts_off_tick_batch() => {
                         if !ready {
                             if let Some(job) = entity_physics_job.take() {
                                 apply_entity_physics_job_result(
@@ -1212,6 +1214,7 @@ impl BoundServer {
                         }
                         true
                     }
+                    _ = ticker.tick() => false,
                 };
                 if command_arrived {
                     let started = Instant::now();
@@ -1231,9 +1234,11 @@ impl BoundServer {
                         .await;
                     simulation_command_window
                         .record_off_tick(elapsed_us(started), report.processed);
+                    simulation_command_gate.record_off_tick_batch();
                     pushed_simulation_lane_attribution.extend(report.lane_attribution);
                     continue;
                 }
+                simulation_command_gate.record_tick_boundary();
                 let tick_started = Instant::now();
                 tick = entity_sessions.simulation_tick().saturating_add(1);
                 if let Some(scripts) = entity_scripts.as_ref() {
@@ -2711,6 +2716,25 @@ impl SimulationCommandTelemetryScope {
             Self::Tick => "tick",
             Self::SincePreviousTickBoundary => "since_previous_tick_boundary",
         }
+    }
+}
+
+#[derive(Debug, Default)]
+struct SimulationCommandGate {
+    processed_since_tick: bool,
+}
+
+impl SimulationCommandGate {
+    fn accepts_off_tick_batch(&self) -> bool {
+        !self.processed_since_tick
+    }
+
+    fn record_off_tick_batch(&mut self) {
+        self.processed_since_tick = true;
+    }
+
+    fn record_tick_boundary(&mut self) {
+        self.processed_since_tick = false;
     }
 }
 
@@ -5020,6 +5044,17 @@ mod tests {
             SimulationCommandTelemetryScope::SincePreviousTickBoundary
         );
         assert_eq!(telemetry.scope.as_str(), "since_previous_tick_boundary");
+    }
+
+    #[test]
+    fn simulation_command_gate_bounds_off_tick_work_between_ticks() {
+        let mut gate = SimulationCommandGate::default();
+
+        assert!(gate.accepts_off_tick_batch());
+        gate.record_off_tick_batch();
+        assert!(!gate.accepts_off_tick_batch());
+        gate.record_tick_boundary();
+        assert!(gate.accepts_off_tick_batch());
     }
 
     #[test]
