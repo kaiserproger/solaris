@@ -4,8 +4,8 @@ Generated from task cards plus durable Git-common-dir state. Edit task cards, no
 
 ## Counts
 
-- `BLOCKED`: **3**
-- `DONE`: **11**
+- `BLOCKED`: **2**
+- `DONE`: **12**
 - `QUEUED`: **60**
 
 ## Cursor
@@ -66,7 +66,7 @@ Generated from task cards plus durable Git-common-dir state. Edit task cards, no
 - [ ] `T04-03` · **QUEUED** · Item despawn deadline + restart proof
 - [ ] `T04-04` · **QUEUED** · Two-client shared pickup contention real-client gate
 - [x] `T04-05` · **DONE** · Loot executor: random count ranges и multiple rolls core slice
-- [ ] `T04-06` · **BLOCKED-INTEGRATED** · Loot context vertical slice: Fortune/Silk/Looting/burning
+- [x] `T04-06` · **DONE** · Loot context vertical slice: Fortune/Silk/Looting/burning
 - [ ] `T04-07` · **QUEUED** · Renewable wheat → bread lifecycle real-client gate
 - [ ] `T04-08` · **QUEUED** · Sugar cane/cactus support cascade representative parity
 
