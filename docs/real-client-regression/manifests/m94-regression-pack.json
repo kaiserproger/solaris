@@ -169,6 +169,7 @@
       "title": "Inventory, crafting, containers, and common stations",
       "ledger_rows": ["I1", "I2", "K1", "K2", "A1"],
       "status": "manual-pending",
+      "no_debug_commands": false,
       "bounded_time_minutes": 18,
       "screenshots_required": true,
       "steps": [
@@ -188,6 +189,7 @@
       "title": "Focused inventory recipe execution from oak log to planks",
       "ledger_rows": ["I1", "I2"],
       "status": "manual-pending",
+      "no_debug_commands": false,
       "bounded_time_minutes": 8,
       "screenshots_required": true,
       "steps": [
@@ -207,6 +209,7 @@
       "title": "Focused two-client shared chest deposit and observation",
       "ledger_rows": ["I1", "K1", "S2", "Q2"],
       "status": "manual-pending",
+      "no_debug_commands": false,
       "bounded_time_minutes": 10,
       "screenshots_required": true,
       "steps": [
@@ -226,6 +229,7 @@
       "title": "Focused two-client shared chest live slot update",
       "ledger_rows": ["I1", "K1", "S2", "Q2"],
       "status": "manual-pending",
+      "no_debug_commands": false,
       "bounded_time_minutes": 10,
       "screenshots_required": true,
       "steps": [
@@ -240,6 +244,77 @@
         "The secondary client records the same chest block, container screen open, slot 0 containing dirt, quick-move withdrawal, empty slot convergence, and clean screen close.",
         "The primary client records the peer mutation arriving on the still-open container screen before it closes.",
         "The run does not claim broad container, station, malformed-click, furnace, barrel, cursor-recovery, or deliberate stale-click parity."
+      ]
+    },
+    {
+      "id": "m94-03d-crafting-table-max-craft",
+      "title": "Focused crafting-table max-craft and cursor conservation",
+      "ledger_rows": ["I1", "I2", "Q2"],
+      "status": "manual-pending",
+      "no_debug_commands": false,
+      "bounded_time_minutes": 8,
+      "screenshots_required": true,
+      "steps": [
+        "Open a crafting table through ordinary client interaction and execute one maximum-count craft.",
+        "Record input consumption, output count, cursor state, and close/reopen conservation.",
+        "Remain blocked until the dedicated table-grid and cursor client primitive exists."
+      ],
+      "expected_observations": [
+        "The phase either records exact max-craft conservation or returns a named blocked result.",
+        "Inventory recipe, chest, furnace, and malformed-click evidence are not substituted for this phase."
+      ]
+    },
+    {
+      "id": "m94-03e-furnace-family-ui",
+      "title": "Focused furnace-family input, fuel, output, and reopen UI",
+      "ledger_rows": ["I2", "K1", "A1", "Q2"],
+      "status": "manual-pending",
+      "no_debug_commands": false,
+      "bounded_time_minutes": 8,
+      "screenshots_required": true,
+      "steps": [
+        "Open a furnace-family screen and observe input, fuel, progress, output, and close/reopen state.",
+        "Remain blocked until the dedicated furnace-family client observations exist."
+      ],
+      "expected_observations": [
+        "The phase names the exact furnace family and records conservation or a named blocked result.",
+        "Chest or inventory-only evidence does not satisfy this phase."
+      ]
+    },
+    {
+      "id": "m94-03f-malformed-container-rejection",
+      "title": "Focused malformed container click rejection and resync",
+      "ledger_rows": ["I1", "K1", "Q2"],
+      "status": "manual-pending",
+      "no_debug_commands": false,
+      "bounded_time_minutes": 6,
+      "screenshots_required": true,
+      "steps": [
+        "Inject one bounded malformed or stale container click through an explicit test primitive.",
+        "Verify authoritative slots and cursor are resynchronized without mutation or duplication.",
+        "Remain blocked until the bounded raw-click primitive exists."
+      ],
+      "expected_observations": [
+        "The phase records exact rejection, slot state, cursor state, and resync evidence.",
+        "Successful ordinary clicks do not substitute for malformed rejection."
+      ]
+    },
+    {
+      "id": "m94-03g-chest-reopen-conservation",
+      "title": "Focused chest close and reopen conservation",
+      "ledger_rows": ["I1", "K1", "Q2"],
+      "status": "manual-pending",
+      "no_debug_commands": false,
+      "bounded_time_minutes": 8,
+      "screenshots_required": true,
+      "steps": [
+        "Place and open one chest through the real item-use path.",
+        "Observe the same empty storage slot, close the screen, reopen the same chest, and observe the same slot again.",
+        "Record both screen transitions and exact conservation without claiming shared-client or restart persistence."
+      ],
+      "expected_observations": [
+        "Both opens and closes complete and the observed slot remains empty across reopen.",
+        "The phase does not claim furnace, malformed-click, multiplayer, or process-restart coverage."
       ]
     },
     {

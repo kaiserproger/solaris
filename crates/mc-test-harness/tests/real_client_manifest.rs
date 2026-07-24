@@ -930,6 +930,25 @@ fn m94_real_client_manifest_covers_required_regression_rows() {
         scenario_ids.contains("m94-03c-two-client-shared-chest-live-update"),
         "M94 manifest must keep the focused two-client shared chest live-update scenario"
     );
+    for id in [
+        "m94-03-inventory-crafting-containers-stations",
+        "m94-03a-inventory-oak-log-to-planks",
+        "m94-03b-two-client-shared-chest",
+        "m94-03c-two-client-shared-chest-live-update",
+        "m94-03d-crafting-table-max-craft",
+        "m94-03e-furnace-family-ui",
+        "m94-03f-malformed-container-rejection",
+        "m94-03g-chest-reopen-conservation",
+    ] {
+        let scenario = scenarios
+            .iter()
+            .find(|scenario| scenario["id"] == id)
+            .expect("focused inventory/container scenario exists");
+        assert_eq!(
+            scenario["no_debug_commands"], false,
+            "{id} uses explicit fixture setup and must declare its debug-command policy"
+        );
+    }
     assert!(
         scenario_ids.contains("m94-08-enchanting-efficiency"),
         "M94 manifest must keep the focused enchanting scenario"

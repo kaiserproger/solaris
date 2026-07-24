@@ -79,9 +79,21 @@ final class M94InventoryCraftingScenarioTest {
             report.observations().stream().anyMatch(entry -> entry.contains("simple chest open: passed")),
             "broad scenario must record the real chest open probe"
         );
+        for (String phase : List.of(
+            M94InventoryCraftingScenario.TABLE_CRAFT_ID,
+            M94InventoryCraftingScenario.FURNACE_UI_ID,
+            M94InventoryCraftingScenario.MALFORMED_REJECTION_ID
+        )) {
+            assertTrue(
+                report.observations().stream().anyMatch(entry -> entry.contains("focused phase blocked: " + phase)),
+                "broad scenario must name blocked phase " + phase
+            );
+        }
         assertTrue(
-            report.observations().stream().anyMatch(entry -> entry.contains("blocked: cursor transfer")),
-            "broad scenario must name the unimplemented broad inventory/container subrows"
+            report.observations().stream().anyMatch(
+                entry -> entry.contains("focused phase available: " + M94InventoryCraftingScenario.REOPEN_CONSERVATION_ID)
+            ),
+            "broad scenario must name the executable reopen phase"
         );
     }
 
@@ -241,6 +253,50 @@ final class M94InventoryCraftingScenarioTest {
             report.observations().stream().anyMatch(entry -> entry.contains("shared chest live update: passed")),
             "primary observer must record the peer mutation arriving on the open screen"
         );
+    }
+
+    @Test
+    void chestReopenPhaseOpensClosesAndReopensTheSameEmptyContainer() {
+        FakeScenarioClient client = new FakeScenarioClient();
+
+        ClientScenarioReport report = new M94InventoryCraftingScenario().run(
+            M94InventoryCraftingScenario.REOPEN_CONSERVATION_ID,
+            Path.of("run/screenshots"),
+            client
+        );
+
+        assertEquals("passed", report.result());
+        assertEquals(
+            2,
+            client.operations.stream().filter(operation -> operation.startsWith("screen:")).count(),
+            "reopen phase must observe two distinct screen opens"
+        );
+        assertEquals(
+            2,
+            client.operations.stream().filter("closeScreen"::equals).count(),
+            "reopen phase must close both views"
+        );
+        assertTrue(
+            report.observations().stream().anyMatch(entry -> entry.contains("chest reopen conservation: passed"))
+        );
+    }
+
+    @Test
+    void unsupportedFocusedContainerPhasesFailClosedByExactId() {
+        for (String id : List.of(
+            M94InventoryCraftingScenario.TABLE_CRAFT_ID,
+            M94InventoryCraftingScenario.FURNACE_UI_ID,
+            M94InventoryCraftingScenario.MALFORMED_REJECTION_ID
+        )) {
+            ClientScenarioReport report = new M94InventoryCraftingScenario().run(
+                id,
+                Path.of("run/screenshots"),
+                new FakeScenarioClient()
+            );
+            assertEquals("blocked", report.result(), id);
+            assertEquals(id, report.id());
+            assertTrue(report.observations().get(0).startsWith("blocked:"), id);
+        }
     }
 
     @Test
