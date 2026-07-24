@@ -5,13 +5,13 @@ Generated from task cards plus durable Git-common-dir state. Edit task cards, no
 ## Counts
 
 - `BLOCKED`: **1**
-- `DONE`: **13**
-- `QUEUED`: **60**
+- `DONE`: **14**
+- `QUEUED`: **59**
 
 ## Cursor
 
 - Active: `none`
-- Ready: `T01-04, T01-05, T01-06, T02-01, T04-03, T05-01, T06-01, T07-02`
+- Ready: `T01-05, T01-06, T02-01, T02-06, T02-08, T04-03, T05-01, T06-01, T07-02`
 - Coordinator: `none`
 - Templates: `none`
 
@@ -33,7 +33,7 @@ Generated from task cards plus durable Git-common-dir state. Edit task cards, no
 - [x] `T01-01` · **DONE** · Добавить компактный core-gate manifest: scenario → ledger rows → evidence legs
 - [x] `T01-02` · **DONE** · Разрезать broad block/fluid real-client gate на независимые focused phases
 - [x] `T01-03` · **DONE** · Разрезать inventory/crafting/container real-client gate на focused phases
-- [ ] `T01-04` · **QUEUED** · Добавить restart invariant snapshot и строгую cross-phase валидацию
+- [x] `T01-04` · **DONE** · Добавить restart invariant snapshot и строгую cross-phase валидацию
 - [ ] `T01-05` · **QUEUED** · Добавить vanilla oracle для block transaction/rejection/resync
 - [ ] `T01-06` · **QUEUED** · Добавить vanilla oracle для inventory/crafting/container state machine
 
