@@ -9,7 +9,18 @@ import java.util.List;
 final class M94BlocksFluidsFarmingDropsScenario {
     static final String ID = "m94-02-blocks-fluids-farming-drops";
 
+    static final String SOLID_PHASE_ID = M94SolidBlockScenario.ID;
+    static final String WATER_PHASE_ID = M94WaterBucketScenario.ID;
+
     ClientScenarioReport run(String id, Path screenshotsDir, ScenarioClient client) {
+        if (SOLID_PHASE_ID.equals(id)) {
+            return new M94SolidBlockScenario().run(id, screenshotsDir, client);
+        }
+
+        if (WATER_PHASE_ID.equals(id)) {
+            return new M94WaterBucketScenario().run(id, screenshotsDir, client);
+        }
+
         if (!ID.equals(id)) {
             return new ClientScenarioReport("blocked", id, List.of("unsupported scenario id: " + id));
         }

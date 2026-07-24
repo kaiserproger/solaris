@@ -46,6 +46,48 @@ final class M94BlocksFluidsFarmingDropsScenarioTest {
     }
 
     @Test
+    void supportsIndependentSolidPhaseId() {
+        FakeScenarioClient client = new FakeScenarioClient();
+
+        ClientScenarioReport report = new M94BlocksFluidsFarmingDropsScenario().run(
+            M94BlocksFluidsFarmingDropsScenario.SOLID_PHASE_ID,
+            Path.of("run/screenshots"),
+            client
+        );
+
+        assertEquals("passed", report.result());
+        assertTrue(
+            client.operations.contains("break:solid-break-clicked:minecraft:dirt:1"),
+            "solid phase must run break/drop operations"
+        );
+        assertTrue(
+            report.observations().stream().anyMatch(entry -> entry.contains("solid placement:")),
+            "solid phase must expose placement observations"
+        );
+    }
+
+    @Test
+    void supportsIndependentWaterPhaseId() {
+        FakeScenarioClient client = new FakeScenarioClient();
+
+        ClientScenarioReport report = new M94BlocksFluidsFarmingDropsScenario().run(
+            M94BlocksFluidsFarmingDropsScenario.WATER_PHASE_ID,
+            Path.of("run/screenshots"),
+            client
+        );
+
+        assertEquals("passed", report.result());
+        assertTrue(
+            client.operations.contains("use:minecraft:water_bucket:water-clicked"),
+            "water phase must place water and update held item"
+        );
+        assertTrue(
+            report.observations().stream().anyMatch(entry -> entry.contains("water pickup:")),
+            "water phase must expose pickup observations"
+        );
+    }
+
+    @Test
     void blocksUnknownScenarioIds() {
         ClientScenarioReport report = new M94BlocksFluidsFarmingDropsScenario().run(
             "m94-unknown",
