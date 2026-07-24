@@ -4,14 +4,14 @@ Generated from task cards plus durable Git-common-dir state. Edit task cards, no
 
 ## Counts
 
-- `BLOCKED`: **7**
-- `DONE`: **7**
+- `BLOCKED`: **6**
+- `DONE`: **8**
 - `QUEUED`: **60**
 
 ## Cursor
 
 - Active: `none`
-- Ready: `none`
+- Ready: `T04-03, T05-01, T06-01`
 - Coordinator: `none`
 - Templates: `none`
 
@@ -26,7 +26,7 @@ Generated from task cards plus durable Git-common-dir state. Edit task cards, no
 - [x] `T00-03` · **DONE** · Собрать актуальную матрицу real-client сценариев и артефактов
 - [x] `T00-04` · **DONE** · Собрать актуальную матрицу vanilla oracle/replay
 - [x] `T00-05` · **DONE** · Собрать текущую performance/concurrency базу и пробелы
-- [ ] `T00-06` · **BLOCKED-INTEGRATED** · Свернуть противоречивые/stale документы в один migration report
+- [x] `T00-06` · **DONE** · Свернуть противоречивые/stale документы в один migration report
 
 ## W01
 
