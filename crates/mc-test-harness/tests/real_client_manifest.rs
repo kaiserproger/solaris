@@ -899,6 +899,21 @@ fn m94_real_client_manifest_covers_required_regression_rows() {
         scenario_ids.contains("m94-02c-water-bucket-place-pickup"),
         "M94 manifest must keep the focused accepted water-bucket real-client scenario"
     );
+    for id in [
+        "m94-02-blocks-fluids-farming-drops",
+        "m94-02a-solid-place-break-drop",
+        "m94-02b-rejected-block-resync",
+        "m94-02c-water-bucket-place-pickup",
+    ] {
+        let scenario = scenarios
+            .iter()
+            .find(|scenario| scenario["id"] == id)
+            .expect("focused block/fluid scenario exists");
+        assert_eq!(
+            scenario["no_debug_commands"], false,
+            "{id} uses explicit operator-backed setup and must not masquerade as no-debug evidence"
+        );
+    }
     assert!(
         scenario_ids.contains("m94-04a-regular-sign-place-text"),
         "M94 manifest must keep the focused regular sign real-client scenario"

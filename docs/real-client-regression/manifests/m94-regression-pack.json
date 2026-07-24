@@ -82,6 +82,7 @@
       "title": "Block edits, fluids, farming, and visible drops",
       "ledger_rows": ["B1", "B2", "B3", "F1", "F2", "F3", "F4", "L1", "L2"],
       "status": "manual-pending",
+      "no_debug_commands": false,
       "bounded_time_minutes": 18,
       "screenshots_required": true,
       "steps": [
@@ -101,6 +102,7 @@
       "title": "Focused solid block placement, break, drop, and pickup",
       "ledger_rows": ["B1", "B2", "L2"],
       "status": "manual-pending",
+      "no_debug_commands": false,
       "bounded_time_minutes": 8,
       "screenshots_required": true,
       "steps": [
@@ -120,6 +122,7 @@
       "title": "Rejected block, out-of-reach, and water-bucket fallback resync",
       "ledger_rows": ["B1", "B3", "Q2"],
       "status": "manual-pending",
+      "no_debug_commands": false,
       "bounded_time_minutes": 8,
       "screenshots_required": true,
       "steps": [
@@ -144,6 +147,7 @@
       "title": "Focused accepted water-bucket placement and pickup",
       "ledger_rows": ["B1", "B3"],
       "status": "manual-pending",
+      "no_debug_commands": false,
       "bounded_time_minutes": 8,
       "screenshots_required": true,
       "steps": [
