@@ -4,8 +4,8 @@ Generated from task cards plus durable Git-common-dir state. Edit task cards, no
 
 ## Counts
 
-- `BLOCKED`: **8**
-- `DONE`: **6**
+- `BLOCKED`: **7**
+- `DONE`: **7**
 - `QUEUED`: **60**
 
 ## Cursor
@@ -87,7 +87,7 @@ Generated from task cards plus durable Git-common-dir state. Edit task cards, no
 - [ ] `T06-02` · **QUEUED** · Fault injection: chained/simultaneous TNT world/entity outcome
 - [ ] `T06-03` · **QUEUED** · Fault injection: cross-region hopper compound commit
 - [ ] `T06-04` · **QUEUED** · Shutdown while journal/checkpoint outcome is unknown
-- [ ] `T06-05` · **BLOCKED-INTEGRATED** · Real Anvil compression corpus + unknown NBT preservation
+- [x] `T06-05` · **DONE** · Real Anvil compression corpus + unknown NBT preservation
 - [ ] `T06-06` · **QUEUED** · Disconnect during pending chunk prepare/load/generate
 - [ ] `T06-07` · **QUEUED** · Natural TCP slow-reader fairness, shedding и recovery
 - [ ] `T06-08` · **BLOCKED-INTEGRATED** · External online-mode paid-client qualification
