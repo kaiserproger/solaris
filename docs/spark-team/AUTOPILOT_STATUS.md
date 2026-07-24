@@ -4,15 +4,16 @@ Generated from task cards plus durable Git-common-dir state. Edit task cards, no
 
 ## Counts
 
-- `DONE`: **5**
-- `QUEUED`: **69**
+- `BLOCKED`: **8**
+- `DONE`: **6**
+- `QUEUED`: **60**
 
 ## Cursor
 
 - Active: `none`
-- Ready: `T00-06, T01-01, T01-02, T01-03, T07-01, T04-05, T06-05`
+- Ready: `none`
 - Coordinator: `none`
-- Templates: `T06-08`
+- Templates: `none`
 
 ## Active details
 
@@ -25,13 +26,13 @@ Generated from task cards plus durable Git-common-dir state. Edit task cards, no
 - [x] `T00-03` · **DONE** · Собрать актуальную матрицу real-client сценариев и артефактов
 - [x] `T00-04` · **DONE** · Собрать актуальную матрицу vanilla oracle/replay
 - [x] `T00-05` · **DONE** · Собрать текущую performance/concurrency базу и пробелы
-- [ ] `T00-06` · **QUEUED** · Свернуть противоречивые/stale документы в один migration report
+- [ ] `T00-06` · **BLOCKED-INTEGRATED** · Свернуть противоречивые/stale документы в один migration report
 
 ## W01
 
-- [ ] `T01-01` · **QUEUED** · Добавить компактный core-gate manifest: scenario → ledger rows → evidence legs
-- [ ] `T01-02` · **QUEUED** · Разрезать broad block/fluid real-client gate на независимые focused phases
-- [ ] `T01-03` · **QUEUED** · Разрезать inventory/crafting/container real-client gate на focused phases
+- [ ] `T01-01` · **BLOCKED-INTEGRATED** · Добавить компактный core-gate manifest: scenario → ledger rows → evidence legs
+- [ ] `T01-02` · **BLOCKED-INTEGRATED** · Разрезать broad block/fluid real-client gate на независимые focused phases
+- [ ] `T01-03` · **BLOCKED-INTEGRATED** · Разрезать inventory/crafting/container real-client gate на focused phases
 - [ ] `T01-04` · **QUEUED** · Добавить restart invariant snapshot и строгую cross-phase валидацию
 - [ ] `T01-05` · **QUEUED** · Добавить vanilla oracle для block transaction/rejection/resync
 - [ ] `T01-06` · **QUEUED** · Добавить vanilla oracle для inventory/crafting/container state machine
@@ -64,8 +65,8 @@ Generated from task cards plus durable Git-common-dir state. Edit task cards, no
 - [ ] `T04-02` · **QUEUED** · Partial pickup и overflow conservation
 - [ ] `T04-03` · **QUEUED** · Item despawn deadline + restart proof
 - [ ] `T04-04` · **QUEUED** · Two-client shared pickup contention real-client gate
-- [ ] `T04-05` · **QUEUED** · Loot executor: random count ranges и multiple rolls core slice
-- [ ] `T04-06` · **QUEUED** · Loot context vertical slice: Fortune/Silk/Looting/burning
+- [x] `T04-05` · **DONE** · Loot executor: random count ranges и multiple rolls core slice
+- [ ] `T04-06` · **BLOCKED-INTEGRATED** · Loot context vertical slice: Fortune/Silk/Looting/burning
 - [ ] `T04-07` · **QUEUED** · Renewable wheat → bread lifecycle real-client gate
 - [ ] `T04-08` · **QUEUED** · Sugar cane/cactus support cascade representative parity
 
@@ -86,14 +87,14 @@ Generated from task cards plus durable Git-common-dir state. Edit task cards, no
 - [ ] `T06-02` · **QUEUED** · Fault injection: chained/simultaneous TNT world/entity outcome
 - [ ] `T06-03` · **QUEUED** · Fault injection: cross-region hopper compound commit
 - [ ] `T06-04` · **QUEUED** · Shutdown while journal/checkpoint outcome is unknown
-- [ ] `T06-05` · **QUEUED** · Real Anvil compression corpus + unknown NBT preservation
+- [ ] `T06-05` · **BLOCKED-INTEGRATED** · Real Anvil compression corpus + unknown NBT preservation
 - [ ] `T06-06` · **QUEUED** · Disconnect during pending chunk prepare/load/generate
 - [ ] `T06-07` · **QUEUED** · Natural TCP slow-reader fairness, shedding и recovery
-- [ ] `T06-08` · **QUEUED** · External online-mode paid-client qualification
+- [ ] `T06-08` · **BLOCKED-INTEGRATED** · External online-mode paid-client qualification
 
 ## W07
 
-- [ ] `T07-01` · **QUEUED** · Заморозить low/balanced/high profile configs и budgets
+- [ ] `T07-01` · **BLOCKED-INTEGRATED** · Заморозить low/balanced/high profile configs и budgets
 - [ ] `T07-02` · **QUEUED** · Versioned performance result schema + provenance validator
 - [ ] `T07-03` · **QUEUED** · Solo generated-world VD8 clean-host profile
 - [ ] `T07-04` · **QUEUED** · Two-client ordinary survival responsiveness profile
