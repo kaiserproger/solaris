@@ -65,6 +65,23 @@ impl SessionRegistry {
         PreparedChunkClaimResult::Claimed(claim)
     }
 
+    pub(in crate::play) fn prepared_chunk_or_claim_uncached(
+        &self,
+        chunk: (i32, i32),
+    ) -> PreparedChunkClaimResult {
+        let mut cache = self.lock_prepared_cache("uncached prepared chunk claim");
+        if cache.prepared_in_flight.contains_key(&chunk) {
+            return PreparedChunkClaimResult::InFlight;
+        }
+        cache.next_prepared_claim = cache.next_prepared_claim.wrapping_add(1).max(1);
+        let claim = PreparedChunkClaim {
+            id: cache.next_prepared_claim,
+            revision: cache.prepared_revisions.get(&chunk).copied().unwrap_or(0),
+        };
+        cache.prepared_in_flight.insert(chunk, claim);
+        PreparedChunkClaimResult::Claimed(claim)
+    }
+
     pub(in crate::play) fn prepared_change_generation(&self) -> u64 {
         self.prepared_change_generation.load(Ordering::Acquire)
     }

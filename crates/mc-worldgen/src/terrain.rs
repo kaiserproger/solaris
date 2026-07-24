@@ -20,7 +20,7 @@ use mc_data::Identifier;
 use mc_world::chunk::{Chunk, ChunkGeometry, ChunkPos, Heightmap, OVERWORLD_GEOMETRY};
 use mc_world::{
     BIOME_DIM, BIOME_VOLUME, BiomeSection, BlockRegistry, BlockStateId, ChunkGenerator,
-    PackedBitArray,
+    PackedBitArray, SettlementInhabitantMarker,
 };
 
 use crate::structures::{StructureRules, StructureTemplate};
@@ -1594,6 +1594,31 @@ impl TerrainGenerator {
         };
         let origin_z = center_z - size[2] / 2;
         paste_template(chunk, template, origin_x, origin_y, origin_z, touched);
+        let mut inhabitants = chunk.settlement_inhabitants();
+        inhabitants.extend(
+            self.structures
+                .inhabitants()
+                .iter()
+                .zip(template.villager_markers())
+                .filter_map(|(inhabitant, marker)| {
+                    let x = origin_x.checked_add(marker[0])?;
+                    let y = origin_y.checked_add(marker[1])?;
+                    let z = origin_z.checked_add(marker[2])?;
+                    (x.div_euclid(16) == chunk.pos.x && z.div_euclid(16) == chunk.pos.z).then(
+                        || SettlementInhabitantMarker {
+                            claim: format!("{}@{center_x},{center_z}", inhabitant.id),
+                            entity_type: inhabitant.entity_type.clone(),
+                            position: [f64::from(x) + 0.5, f64::from(y), f64::from(z) + 0.5],
+                            villager_kind: inhabitant.villager_kind.clone(),
+                            profession: inhabitant.profession.clone(),
+                            level: inhabitant.level,
+                        },
+                    )
+                }),
+        );
+        if !inhabitants.is_empty() {
+            chunk.set_settlement_inhabitants(&inhabitants);
+        }
     }
 
     fn structure_plan(&self, grid_x: i32, grid_z: i32) -> Option<(&StructureTemplate, i32, i32)> {

@@ -1,10 +1,12 @@
 package dev.solaris.agent.mixin;
 
+import com.mojang.logging.LogUtils;
 import dev.solaris.agent.javaagent.ClientStateEvents;
 import dev.solaris.agent.javaagent.ScenarioItemDropIdentity;
 import net.minecraft.client.Minecraft;
 import net.minecraft.client.multiplayer.ClientPacketListener;
 import net.minecraft.network.protocol.game.ClientboundBlockChangedAckPacket;
+import net.minecraft.network.protocol.game.ClientboundBlockUpdatePacket;
 import net.minecraft.network.protocol.game.ClientboundContainerClosePacket;
 import net.minecraft.network.protocol.game.ClientboundContainerSetContentPacket;
 import net.minecraft.network.protocol.game.ClientboundContainerSetDataPacket;
@@ -19,15 +21,41 @@ import org.spongepowered.asm.mixin.Mixin;
 import org.spongepowered.asm.mixin.injection.At;
 import org.spongepowered.asm.mixin.injection.Inject;
 import org.spongepowered.asm.mixin.injection.callback.CallbackInfo;
+import org.slf4j.Logger;
 
 @Mixin(ClientPacketListener.class)
 abstract class ClientPacketListenerMixin {
+    private static final Logger SOLARIS_LOGGER = LogUtils.getLogger();
+    private static final boolean SOLARIS_TRACE_BLOCK_BREAK = Boolean.getBoolean(
+        "solaris.traceBlockBreak"
+    );
+
     @Inject(method = "handleBlockChangedAck", at = @At("RETURN"))
     private void solaris$publishBlockChangeAck(
         ClientboundBlockChangedAckPacket packet,
         CallbackInfo callbackInfo
     ) {
+        if (SOLARIS_TRACE_BLOCK_BREAK) {
+            SOLARIS_LOGGER.info(
+                "[solaris-block-break] receive ack sequence={}",
+                packet.sequence()
+            );
+        }
         ClientStateEvents.publishBlockChangeAck();
+    }
+
+    @Inject(method = "handleBlockUpdate", at = @At("HEAD"))
+    private void solaris$traceBlockUpdate(
+        ClientboundBlockUpdatePacket packet,
+        CallbackInfo callbackInfo
+    ) {
+        if (SOLARIS_TRACE_BLOCK_BREAK) {
+            SOLARIS_LOGGER.info(
+                "[solaris-block-break] receive block_update pos={} state={}",
+                packet.getPos(),
+                packet.getBlockState()
+            );
+        }
     }
 
     @Inject(method = "handleTakeItemEntity", at = @At("HEAD"))

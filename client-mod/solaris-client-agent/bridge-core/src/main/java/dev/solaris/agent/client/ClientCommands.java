@@ -312,6 +312,26 @@ public final class ClientCommands {
             client.closeCurrentScreen();
             return ok();
         }));
+        registry.register("click_confirmation_button", request -> {
+            JsonObject payload = request.payload();
+            String expectedTitle = boundedString(payload, "expected_title", 256);
+            String buttonLabel = boundedString(payload, "button_label", 64);
+            return executor.callOnClientThread(() -> {
+                client.clickConfirmationButton(expectedTitle, buttonLabel);
+                return ok();
+            });
+        });
+        registry.register("click_screen_button", request -> {
+            JsonObject payload = request.payload();
+            String expectedScreenClass =
+                boundedString(payload, "expected_screen_class", 256);
+            String expectedTitle = boundedString(payload, "expected_title", 256);
+            String buttonLabel = boundedString(payload, "button_label", 64);
+            return executor.callOnClientThread(() -> {
+                client.clickScreenButton(expectedScreenClass, expectedTitle, buttonLabel);
+                return ok();
+            });
+        });
         registry.register("open_inventory", request -> executor.callOnClientThread(() -> {
             client.openInventory();
             return ok();

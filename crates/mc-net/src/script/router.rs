@@ -132,6 +132,8 @@ impl ScriptRouter {
             | ScriptCommand::CloseInventoryMenu { .. }
             | ScriptCommand::InventoryStorageTransaction { .. }
             | ScriptCommand::PlayerInventoryTransaction { .. }
+            | ScriptCommand::PlaceLoaderBlock { .. }
+            | ScriptCommand::GrantLoaderBlockItem { .. }
             | ScriptCommand::UpsertZone { .. }
             | ScriptCommand::RemoveZone { .. }
             | ScriptCommand::UpsertColony { .. }
@@ -229,16 +231,92 @@ impl ScriptRouter {
                 }
                 ScriptRouterExit::Continue
             }
+            ScriptCommand::OpenClientScreen { .. } => {
+                if let Err(error) = context.sessions.route_script_client_screen_command(
+                    admitted,
+                    context.config.loader_manifest.as_deref(),
+                ) {
+                    debug!(?error, "admitted client screen command rejected");
+                }
+                ScriptRouterExit::Continue
+            }
+            ScriptCommand::PlaceLoaderBlock { block_id, x, y, z } => {
+                let Some(manifest) = context.config.loader_manifest.as_deref() else {
+                    debug!("Loader block placement rejected without an active manifest");
+                    return ScriptRouterExit::Continue;
+                };
+                let Some(state) = manifest.world_block_state(
+                    admitted.plugin_id(),
+                    block_id,
+                    &context.config.blocks,
+                ) else {
+                    debug!(
+                        plugin = admitted.plugin_id(),
+                        %block_id,
+                        "Loader block placement rejected outside plugin ownership"
+                    );
+                    return ScriptRouterExit::Continue;
+                };
+                if !(mc_world::MIN_Y..mc_world::MAX_Y).contains(y) {
+                    debug!(%block_id, y, "Loader block placement rejected outside world height");
+                    return ScriptRouterExit::Continue;
+                }
+                if let Err(error) = context
+                    .simulation
+                    .place_loader_block_server_owned(
+                        mc_world::BlockPos {
+                            x: *x,
+                            y: *y,
+                            z: *z,
+                        },
+                        state,
+                    )
+                    .await
+                {
+                    debug!(?error, %block_id, "Loader block placement rejected");
+                }
+                ScriptRouterExit::Continue
+            }
+            ScriptCommand::GrantLoaderBlockItem {
+                player_id,
+                block_id,
+                count,
+            } => {
+                let Some(manifest) = context.config.loader_manifest.as_deref() else {
+                    debug!("Loader item grant rejected without an active manifest");
+                    return ScriptRouterExit::Continue;
+                };
+                let Some(stack) = manifest.world_block_item(
+                    admitted.plugin_id(),
+                    block_id,
+                    *count,
+                    &context.config.items,
+                ) else {
+                    debug!(
+                        plugin = admitted.plugin_id(),
+                        %block_id,
+                        "Loader item grant rejected outside plugin ownership"
+                    );
+                    return ScriptRouterExit::Continue;
+                };
+                if let Err(error) = context
+                    .sessions
+                    .route_loader_item_grant(player_id.value(), block_id, stack)
+                    .await
+                {
+                    debug!(
+                        ?error,
+                        player_id = player_id.value(),
+                        %block_id,
+                        "Loader item grant rejected"
+                    );
+                }
+                ScriptRouterExit::Continue
+            }
             ScriptCommand::PlayerInventoryTransaction { .. } => {
                 match self
                     .inventories
-                    .route_admitted(
-                        admitted,
-                        context.sessions,
-                        &context.config.items,
-                        &context.config.item_facts,
-                        context.config.world.is_some(),
-                    )
+                    .route_admitted(admitted, context.sessions, context.config.world.is_some())
                     .await
                 {
                     Ok(()) => ScriptRouterExit::Continue,

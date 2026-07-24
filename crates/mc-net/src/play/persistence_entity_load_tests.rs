@@ -363,8 +363,12 @@ fn current_gzip_entity_file_restarts_with_the_existing_envelope() {
     let Tag::Compound(fields) = root else {
         panic!("entity root must be a compound");
     };
-    assert_eq!(fields.len(), 4);
+    assert_eq!(fields.len(), 5);
     assert!(matches!(field(&fields, "Entities"), Some(Tag::List(_))));
+    assert!(matches!(
+        field(&fields, "SolarisSettlementClaims"),
+        Some(Tag::List(claims)) if claims.elements.is_empty()
+    ));
     assert_eq!(
         int_field(&fields, "SolarisEntityFormatVersion"),
         Some(ENTITY_FORMAT_VERSION)

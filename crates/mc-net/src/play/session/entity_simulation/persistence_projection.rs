@@ -20,6 +20,7 @@ pub(super) fn project_owner_save(
             lifecycle_clock: lifecycle_tick,
             regional_sequence_watermark,
             records,
+            settlement_claims: Default::default(),
         },
         journal_phases,
     )

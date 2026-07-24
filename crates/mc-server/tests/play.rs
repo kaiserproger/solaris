@@ -83,6 +83,7 @@ async fn start_server_with_max(max_players: u32) -> SocketAddr {
         chunk_pipeline: mc_net::ChunkPipelinePolicy::default(),
         random_tick,
         command_permissions: mc_net::CommandPermissionConfig::new(Vec::<String>::new(), true),
+        loader_manifest: None,
         shutdown: mc_net::ShutdownHandle::default(),
     };
     let bound = mc_net::bind(cfg).await.expect("bind");
@@ -116,6 +117,7 @@ async fn start_server_with_extension() -> (SocketAddr, mc_extension::ExtensionEn
         chunk_pipeline: mc_net::ChunkPipelinePolicy::default(),
         random_tick: mc_net::RandomTickPolicy::default(),
         command_permissions: mc_net::CommandPermissionConfig::new(Vec::<String>::new(), true),
+        loader_manifest: None,
         shutdown: mc_net::ShutdownHandle::default(),
     };
     let (boundary, endpoint) =
@@ -170,6 +172,7 @@ fn script_server_config(shutdown: mc_net::ShutdownHandle) -> mc_net::ServerConfi
         chunk_pipeline: mc_net::ChunkPipelinePolicy::default(),
         random_tick: mc_net::RandomTickPolicy::default(),
         command_permissions: mc_net::CommandPermissionConfig::new(Vec::<String>::new(), true),
+        loader_manifest: None,
         shutdown,
     }
 }

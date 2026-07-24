@@ -61,13 +61,7 @@ async fn inventory_adapter_publishes_exact_unavailable_result() {
 
     assert_eq!(
         adapter
-            .route_admitted(
-                admitted,
-                &SessionRegistry::new(),
-                &mc_data::items::solaris_required_items(),
-                &mc_data::item_components::solaris_required_item_facts(),
-                true,
-            )
+            .route_admitted(admitted, &SessionRegistry::new(), true,)
             .await,
         Ok(())
     );
@@ -94,13 +88,7 @@ async fn inventory_adapter_rejects_unavailable_inventory_runtime_before_session_
 
     assert_eq!(
         adapter
-            .route_admitted(
-                admitted,
-                &SessionRegistry::new(),
-                &mc_data::items::solaris_required_items(),
-                &mc_data::item_components::solaris_required_item_facts(),
-                false,
-            )
+            .route_admitted(admitted, &SessionRegistry::new(), false,)
             .await,
         Ok(())
     );
@@ -125,13 +113,7 @@ async fn closed_result_channel_stops_inventory_adapter() {
 
     assert_eq!(
         adapter
-            .route_admitted(
-                admitted,
-                &SessionRegistry::new(),
-                &mc_data::items::solaris_required_items(),
-                &mc_data::item_components::solaris_required_item_facts(),
-                true,
-            )
+            .route_admitted(admitted, &SessionRegistry::new(), true,)
             .await,
         Err(InventoryAdapterError::PublicationClosed)
     );

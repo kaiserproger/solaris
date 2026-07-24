@@ -25,6 +25,7 @@ use super::{
     BlockEdit, BlockPlanningRead, ItemStack, SnapshotPlanningWorld, SnapshotReadPrecondition,
     adjacent_block_positions, block_state_property, sibling_state_with_bool_property,
 };
+use crate::script::ZoneProtectionSnapshot;
 
 #[derive(Debug, Default)]
 pub(super) struct ScheduledBlockTickPlan {
@@ -58,6 +59,7 @@ pub(super) fn plan_scheduled_block_tick_edits(
     blocks: &BlockRegistry,
     snapshot: &mc_world::WorldReadSnapshot,
     ticks: &[ScheduledBlockTick],
+    protection: Option<&ZoneProtectionSnapshot>,
 ) -> Option<ScheduledBlockTickPlan> {
     let mut world = SnapshotPlanningWorld::new(snapshot);
     let mut plan = ScheduledBlockTickPlan::default();
@@ -74,8 +76,9 @@ pub(super) fn plan_scheduled_block_tick_edits(
         if matches!(state.block.id.path(), "hopper" | "comparator") {
             return None;
         }
-        let Some(edits) = scheduled_simple_block_tick_edits(blocks, &world, tick.pos, state_id)
-        else {
+        let Some(edits) = scheduled_simple_block_tick_edits_with_protection(
+            blocks, &world, tick.pos, state_id, protection,
+        ) else {
             continue;
         };
         if edits
@@ -104,14 +107,15 @@ pub(super) fn scheduled_block_tick_edits(
     if state.block.id.path() == "comparator" {
         return scheduled_comparator_tick_edits(blocks, storage, pos, state);
     }
-    scheduled_simple_block_tick_edits(blocks, storage, pos, state_id)
+    scheduled_simple_block_tick_edits_with_protection(blocks, storage, pos, state_id, None)
 }
 
-pub(super) fn scheduled_simple_block_tick_edits(
+fn scheduled_simple_block_tick_edits_with_protection(
     blocks: &BlockRegistry,
     storage: &impl BlockPlanningRead,
     pos: mc_world::BlockPos,
     state_id: BlockStateId,
+    protection: Option<&ZoneProtectionSnapshot>,
 ) -> Option<Vec<BlockEdit>> {
     let state = blocks.by_id(state_id)?;
     if state.block.id.path().ends_with("_leaves") {
@@ -130,7 +134,7 @@ pub(super) fn scheduled_simple_block_tick_edits(
         pos,
         new_state: sibling_state_with_bool_property(blocks, state, "powered", false)?,
     }];
-    extend_adjacent_power_target_edits(blocks, storage, pos, false, &mut edits);
+    extend_adjacent_power_target_edits(blocks, storage, pos, false, protection, &mut edits);
     Some(edits)
 }
 
@@ -957,6 +961,7 @@ pub(super) fn insert_hopper_stack_into_campfire(
         damage: moving.damage,
         enchantments: moving.enchantments.clone(),
         custom_name: None,
+        item_model: None,
     };
     context.sessions.commit_campfire_cooking_insert(
         position,

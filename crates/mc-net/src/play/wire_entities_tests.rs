@@ -1,4 +1,5 @@
 use bytes::BytesMut;
+use mc_data::Identifier;
 use mc_entity::effects_26_1_2::{
     EffectDamageSource, EffectFlags, EffectId, EffectInstance, EffectKind, TargetEffectContext,
 };
@@ -6,15 +7,16 @@ use mc_entity::living_26_1_2::DamageContext;
 use mc_entity::runtime_26_1_2::{EffectAction, PublicationFact, TargetKind};
 use mc_entity::{
     AnimalBreedingState, AttributeKind, EntityDamageRequest, EntityEffectOperation,
-    EntityEffectRejection, EntityEffectRequest, EntityEffectResult, EntityId, EntitySnapshot,
-    EntityStore, Rotation, SheepColor, SpawnEntity, Vec3,
+    EntityEffectRejection, EntityEffectRequest, EntityEffectResult, EntityId, EntityItemStack,
+    EntitySnapshot, EntityStore, Rotation, SheepColor, SpawnEntity, Vec3, VillagerData,
+    VillagerKind, VillagerProfession,
 };
 use mc_protocol::Packet;
 use mc_protocol::frame::{Compression, try_decode_frame};
 use mc_protocol::packets::play::{
     ClientboundSetEntityData, EntityDataValue, EntityPositionSync, EntityVec3,
-    LIVING_ENTITY_DATA_HEALTH_INDEX_26_1_2, MoveEntityPos, MoveEntityPosRot, PositionMoveRotation,
-    RotateHead, SetEntityMotion,
+    ITEM_ENTITY_DATA_ITEM_INDEX, ItemStack, LIVING_ENTITY_DATA_HEALTH_INDEX_26_1_2, MoveEntityPos,
+    MoveEntityPosRot, PositionMoveRotation, RotateHead, SetEntityMotion,
 };
 use std::collections::HashSet;
 
@@ -45,7 +47,43 @@ fn entity_snapshot(type_id: i32, type_name: &str) -> ServerEntitySnapshot {
         experience_value: None,
         block_state: None,
         animal: None,
+        villager: None,
     }
+}
+
+#[tokio::test]
+async fn item_entity_pairing_preserves_loader_presentation_components() {
+    let model = Identifier::parse("solaris_loader:loader_block").unwrap();
+    let mut snapshot = entity_snapshot(71, "minecraft:item");
+    snapshot.item_stack = Some(
+        EntityItemStack::new(45, 1)
+            .with_custom_name("Ruby Block")
+            .with_item_model(model.clone()),
+    );
+    let mut writer = Vec::new();
+
+    send_entity_pairing_data(&mut writer, Compression::Disabled, &snapshot)
+        .await
+        .unwrap();
+
+    let mut bytes = BytesMut::from(writer.as_slice());
+    let mut frame = try_decode_frame(&mut bytes, Compression::Disabled)
+        .unwrap()
+        .expect("set entity data frame");
+    assert_eq!(frame.id, ClientboundSetEntityData::ID);
+    assert_eq!(
+        ClientboundSetEntityData::decode(&mut frame.body).unwrap(),
+        ClientboundSetEntityData {
+            entity_id: 42,
+            values: vec![EntityDataValue::ItemStack {
+                index: ITEM_ENTITY_DATA_ITEM_INDEX,
+                stack: ItemStack::new(45, 1)
+                    .with_custom_name("Ruby Block")
+                    .with_item_model(model),
+            }],
+        }
+    );
+    assert!(bytes.is_empty());
 }
 
 #[tokio::test]
@@ -209,6 +247,31 @@ async fn pairing_omits_vanilla_default_health_but_incremental_does_not() {
         vec![EntityDataValue::Float {
             index: LIVING_ENTITY_DATA_HEALTH_INDEX_26_1_2,
             value: 1.0,
+        }]
+    );
+}
+
+#[tokio::test]
+async fn pairing_emits_plains_toolsmith_villager_data() {
+    let mut snapshot = entity_snapshot(120, "minecraft:villager");
+    snapshot.villager = Some(VillagerData::new(
+        VillagerKind::Plains,
+        VillagerProfession::Toolsmith,
+        1,
+    ));
+    let mut writer = Vec::new();
+
+    send_entity_pairing_data(&mut writer, Compression::Disabled, &snapshot)
+        .await
+        .unwrap();
+
+    assert_eq!(
+        decode_entity_data(&writer)[0].values,
+        vec![EntityDataValue::VillagerData {
+            index: 19,
+            villager_type: 2,
+            profession: 13,
+            level: 1,
         }]
     );
 }

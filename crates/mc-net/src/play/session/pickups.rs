@@ -505,7 +505,8 @@ impl SessionRegistry {
                 count: stack.count,
                 damage: stack.damage,
                 enchantments: stack.enchantments.clone(),
-                custom_name: None,
+                custom_name: stack.custom_name.as_deref().cloned(),
+                item_model: stack.item_model.as_deref().cloned().map(Arc::new),
             };
             let (remaining, changed_slots) = inventory.merge_pickup_stack(
                 probe,
@@ -953,6 +954,8 @@ fn claim_item_pickup_locked(
         count: picked_count,
         damage: stack.damage,
         enchantments: stack.enchantments.clone(),
+        custom_name: stack.custom_name.clone(),
+        item_model: stack.item_model.clone(),
     };
     stack.count -= picked_count;
 

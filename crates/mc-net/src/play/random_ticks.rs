@@ -50,9 +50,7 @@ pub(super) fn random_tick_edit_seeded(
             .or_else(|| vertical_plant_growth_edits(blocks, world, pos, state, random_seed)),
         RandomTickFamily::Farmland => next_farmland_state(blocks, facts, world, pos, state)
             .map(|new_state| vec![BlockEdit { pos, new_state }]),
-        RandomTickFamily::Fire => {
-            next_fire_state(blocks, state).map(|new_state| vec![BlockEdit { pos, new_state }])
-        }
+        RandomTickFamily::Fire => fire_tick_edits(blocks, world, pos, state, random_seed),
         RandomTickFamily::Grass => {
             next_grass_edit(blocks, world, pos, state).map(|edit| vec![edit])
         }
@@ -264,6 +262,56 @@ pub(super) fn next_fire_state(blocks: &BlockRegistry, state: BlockStateId) -> Op
         return Some(air_state_id(blocks));
     }
     sibling_state_with_property(blocks, current, "age", &(age + 1).to_string())
+}
+
+fn fire_tick_edits(
+    blocks: &BlockRegistry,
+    world: &impl BlockPlanningRead,
+    pos: BlockPos,
+    state: BlockStateId,
+    random_seed: u64,
+) -> Option<Vec<BlockEdit>> {
+    let next_state = next_fire_state(blocks, state)?;
+    let mut edits = vec![BlockEdit {
+        pos,
+        new_state: next_state,
+    }];
+    let current = blocks.by_id(state)?;
+    if current.block.id.as_str() != "minecraft:fire"
+        || next_state == air_state_id(blocks)
+        || !random_seed.is_multiple_of(3)
+    {
+        return Some(edits);
+    }
+
+    let neighbours = fluid_neighbour_positions(pos);
+    let start = random_seed as usize % neighbours.len();
+    for offset in 0..neighbours.len() {
+        let target = neighbours[(start + offset) % neighbours.len()];
+        let Some(target_state) = world.get_cached_block(target) else {
+            continue;
+        };
+        let Some(target_block) = blocks.by_id(target_state) else {
+            continue;
+        };
+        if is_common_flammable_block(target_block.block.id.path()) {
+            edits.push(BlockEdit {
+                pos: target,
+                new_state: current.block.default,
+            });
+            break;
+        }
+    }
+    Some(edits)
+}
+
+fn is_common_flammable_block(path: &str) -> bool {
+    path.ends_with("_log")
+        || path.ends_with("_wood")
+        || path.ends_with("_planks")
+        || path.ends_with("_leaves")
+        || path.ends_with("_wool")
+        || matches!(path, "bookshelf" | "hay_block" | "tnt")
 }
 
 pub(super) fn next_grass_edit(

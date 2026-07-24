@@ -129,6 +129,7 @@ pub(in crate::play) fn furnace_slot_to_stack(slot: &FurnaceSlot) -> ItemStack {
             damage: slot.damage,
             enchantments: slot.enchantments.clone(),
             custom_name: None,
+            item_model: None,
         }
     }
 }

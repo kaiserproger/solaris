@@ -34,6 +34,8 @@ REQUIRED_TOOLS = {
     "minecraft_attack_entity_once",
     "minecraft_attack_entity_until_drop_collected",
     "minecraft_press_inputs",
+    "minecraft_click_confirmation_button",
+    "minecraft_click_screen_button",
     "minecraft_open_inventory",
     "minecraft_quick_move_container_slot",
     "minecraft_click_container_slot",

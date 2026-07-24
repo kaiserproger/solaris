@@ -19,7 +19,8 @@ use crate::play::combat::{MeleeKnockback, PlayerDamageRequest};
 use crate::play::inventory::PlayerInventory;
 use crate::play::persistence::XpState;
 use crate::play::session::{
-    ScriptMenuCloseRequest, ScriptMenuOpenRequest, ScriptPlayerTeleportCommand,
+    LoaderItemGrantCommand, ScriptMenuCloseRequest, ScriptMenuOpenRequest,
+    ScriptPlayerInventoryCommand, ScriptPlayerTeleportCommand,
 };
 use crate::play::wire_entities::ServerEntityWireMove;
 
@@ -50,6 +51,7 @@ pub(in crate::play) struct ServerEntitySnapshot {
     pub(in crate::play) experience_value: Option<i32>,
     pub(in crate::play) block_state: Option<u32>,
     pub(in crate::play) animal: Option<mc_entity::AnimalBreedingState>,
+    pub(in crate::play) villager: Option<mc_entity::VillagerData>,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -141,6 +143,8 @@ pub(in crate::play) enum OutboundCommand {
     OpenScriptMenu(ScriptMenuOpenRequest),
     CloseScriptMenu(ScriptMenuCloseRequest),
     ScriptPlayerTeleport(ScriptPlayerTeleportCommand),
+    ScriptPlayerInventoryTransaction(ScriptPlayerInventoryCommand),
+    LoaderItemGrant(LoaderItemGrantCommand),
     AuthoritativeInventory {
         inventory: Box<PlayerInventory>,
         carried_item: ItemStack,
@@ -225,6 +229,8 @@ impl OutboundCommand {
             | Self::OpenScriptMenu(_)
             | Self::CloseScriptMenu(_)
             | Self::ScriptPlayerTeleport(_)
+            | Self::ScriptPlayerInventoryTransaction(_)
+            | Self::LoaderItemGrant(_)
             | Self::AuthoritativeInventory { .. }
             | Self::Explosion(_) => OutboundLane::Reliable,
         }

@@ -24,6 +24,7 @@ mod control_plane;
 mod dirty_flush;
 pub mod encryption;
 mod error;
+mod loader;
 mod lock_metrics;
 mod login;
 mod memory_pressure;
@@ -51,6 +52,12 @@ pub use control_plane::{
     RuntimeWorkFocus, RuntimeWorkInput,
 };
 pub use error::ConnectionError;
+pub use loader::{
+    LOADER_ARTIFACT_CHUNK_BYTES, LOADER_PROTOCOL_VERSION, LoaderArtifactRequest, LoaderBundle,
+    LoaderClientAck, LoaderContentKind, LoaderHandshakeError, LoaderManifest, LoaderPermission,
+    LoaderPlatform, LoaderSession, loader_ack_channel, loader_artifact_channel,
+    loader_manifest_channel, loader_open_screen_channel, loader_request_channel,
+};
 pub use lock_metrics::{LockMetricSnapshot, LockMetricsSnapshot, lock_pressure_snapshot};
 pub use login::{LoginAccessConfig, offline_uuid};
 pub use play::{

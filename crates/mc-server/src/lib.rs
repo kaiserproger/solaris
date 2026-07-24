@@ -543,6 +543,7 @@ impl ServerConfig {
                 )
                 .with_prevent_proxy_connections(self.auth.prevent_proxy_connections),
             ),
+            loader_manifest: None,
             shutdown: mc_net::ShutdownHandle::default(),
         })
     }
@@ -734,6 +735,26 @@ mod tests {
             toml::from_str(include_str!("../../../example.toml")).expect("parse example.toml");
 
         assert!(cfg.autoscale.enabled);
+    }
+
+    #[test]
+    fn loader_live_gate_config_is_isolated_and_parseable() {
+        let cfg: ServerConfig = toml::from_str(include_str!(
+            "../../../examples/loader-live-gate/playable.toml"
+        ))
+        .expect("parse Loader live-gate config");
+
+        assert_eq!(cfg.network.port, 25567);
+        assert_eq!(
+            cfg.plugins.directory,
+            Some(PathBuf::from("examples/loader-live-gate/plugins"))
+        );
+        assert_eq!(
+            cfg.data.world_dir,
+            Some(PathBuf::from(".analysis/loader-live-gate/world"))
+        );
+        assert!(!cfg.auth.online_mode);
+        assert!(!cfg.autoscale.enabled);
     }
 
     #[test]

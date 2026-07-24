@@ -1,3 +1,4 @@
+use super::SettlementInhabitantSpawn;
 use super::block_edit_commit::{
     apply_block_edit_batch_to_storage_conditionally,
     apply_block_edit_batch_with_scheduled_ticks_to_storage_conditionally,
@@ -302,8 +303,12 @@ pub(super) enum SimulationCommand {
         chunk: (i32, i32),
         spawns: Vec<HerdSpawn>,
     },
+    EnsureSettlementInhabitants {
+        chunk: (i32, i32),
+        spawns: Vec<SettlementInhabitantSpawn>,
+    },
     ApplyBlockEdits {
-        actor_session: SessionId,
+        actor_session: Option<SessionId>,
         edits: Vec<BlockEdit>,
         preconditions: Vec<BlockEditPrecondition>,
         scheduled_block_ticks: Vec<ScheduledBlockTick>,
@@ -391,6 +396,7 @@ impl SimulationCommand {
             Self::SpawnCommandEntity { .. } => "spawn_command_entity",
             Self::SetWorldTime { .. } => "set_world_time",
             Self::EnsureChunkHerd { .. } => "ensure_chunk_herd",
+            Self::EnsureSettlementInhabitants { .. } => "ensure_settlement_inhabitants",
             Self::ApplyBlockEdits { .. } => "apply_block_edits",
             Self::CommitBlockDrops { .. } => "commit_block_drops",
             Self::ScheduleFluidTicksNearApplied { .. } => "schedule_fluid_ticks_near_applied",
@@ -496,7 +502,7 @@ impl CommittedPlayerPose {
 struct PendingOwnerRelight {
     envelope: SimulationCommandEnvelope,
     response: SimulationResponse,
-    actor_session: SessionId,
+    actor_session: Option<SessionId>,
     sources: IncrementalLightSources,
 }
 
@@ -513,13 +519,13 @@ fn response_block_edit_outcome_mut(
     }
 }
 
-fn command_relight_actor_session(command: &SimulationCommand) -> Option<SessionId> {
+fn command_relight_actor_session(command: &SimulationCommand) -> Option<Option<SessionId>> {
     match command {
         SimulationCommand::ApplyBlockEdits { actor_session, .. } => Some(*actor_session),
-        SimulationCommand::CommitSurvivalBreak(command) => Some(command.actor_session),
-        SimulationCommand::CommitSurvivalPlacement(command) => Some(command.actor_session),
-        SimulationCommand::CommitBucketUse(command) => Some(command.actor_session),
-        SimulationCommand::CommitTntIgnition { actor_session, .. } => Some(*actor_session),
+        SimulationCommand::CommitSurvivalBreak(command) => Some(Some(command.actor_session)),
+        SimulationCommand::CommitSurvivalPlacement(command) => Some(Some(command.actor_session)),
+        SimulationCommand::CommitBucketUse(command) => Some(Some(command.actor_session)),
+        SimulationCommand::CommitTntIgnition { actor_session, .. } => Some(Some(*actor_session)),
         _ => None,
     }
 }
@@ -593,7 +599,7 @@ async fn finish_pending_owner_relight(
     if !updates.is_empty() {
         dispatch_visibility_commands(
             sessions
-                .loaded_recipients_for_chunks(&light_chunks, Some(pending.actor_session))
+                .loaded_recipients_for_chunks(&light_chunks, pending.actor_session)
                 .into_iter()
                 .map(|recipient| VisibilityDispatch {
                     recipient,
@@ -640,7 +646,11 @@ fn command_requires_world(command: &SimulationCommand) -> bool {
 }
 
 fn command_is_background(command: &SimulationCommand) -> bool {
-    matches!(command, SimulationCommand::EnsureChunkHerd { .. })
+    matches!(
+        command,
+        SimulationCommand::EnsureChunkHerd { .. }
+            | SimulationCommand::EnsureSettlementInhabitants { .. }
+    )
 }
 
 fn command_orders_earlier_herds(command: &SimulationCommand) -> bool {
@@ -765,6 +775,9 @@ fn command_single_owner_region(command: &SimulationCommand) -> Option<RegionKey>
     let position = match command {
         SimulationCommand::SpawnCommandEntity { position, .. } => *position,
         SimulationCommand::EnsureChunkHerd { chunk, .. } => {
+            return Some(RegionKey::from_chunk(chunk.0, chunk.1));
+        }
+        SimulationCommand::EnsureSettlementInhabitants { chunk, .. } => {
             return Some(RegionKey::from_chunk(chunk.0, chunk.1));
         }
         _ => return None,
@@ -1170,12 +1183,12 @@ fn publish_computed_light_updates(
 
 fn dispatch_regional_block_outcome(
     sessions: &SessionRegistry,
-    actor_session: SessionId,
+    actor_session: Option<SessionId>,
     outcome: &BlockEditBatchOutcome,
 ) {
     sessions.invalidate_prepared_chunks(&outcome.edit_chunks);
     let mut dispatches = sessions
-        .loaded_recipients_for_chunks(&outcome.edit_chunks, Some(actor_session))
+        .loaded_recipients_for_chunks(&outcome.edit_chunks, actor_session)
         .into_iter()
         .map(|recipient| VisibilityDispatch {
             recipient,
@@ -1191,7 +1204,7 @@ fn dispatch_regional_block_outcome(
             .collect::<HashSet<_>>();
         dispatches.extend(
             sessions
-                .loaded_recipients_for_chunks(&light_chunks, Some(actor_session))
+                .loaded_recipients_for_chunks(&light_chunks, actor_session)
                 .into_iter()
                 .map(|recipient| VisibilityDispatch {
                     recipient,
@@ -1278,6 +1291,7 @@ pub(super) struct SurvivalBlockBreakPlan {
     pub(super) loot: Arc<mc_data::loot::LootTables>,
     pub(super) item_entity_type_id: Option<i32>,
     pub(super) falling_block_entity_type_id: Option<i32>,
+    pub(super) loader_block_drop: Option<ItemStack>,
     pub(super) held: SurvivalBreakHeldItem,
     pub(super) drop_items: bool,
 }
@@ -1294,6 +1308,7 @@ impl std::fmt::Debug for SurvivalBlockBreakPlan {
                 "falling_block_entity_type_id",
                 &self.falling_block_entity_type_id,
             )
+            .field("loader_block_drop", &self.loader_block_drop)
             .field("held", &self.held)
             .field("drop_items", &self.drop_items)
             .finish_non_exhaustive()
@@ -2052,13 +2067,42 @@ impl SimulationHandle {
     ) -> Result<Option<BlockEditBatchOutcome>, SimulationRequestError> {
         let actor_session = self.session_id()?;
         let receiver = self.enqueue_player_command(SimulationCommand::ApplyBlockEdits {
-            actor_session,
+            actor_session: Some(actor_session),
             edits,
             preconditions,
             scheduled_block_ticks,
         })?;
         match receiver.await {
             Ok(Ok(SimulationResponse::BlockEdits(Ok(outcome)))) => Ok(*outcome),
+            Ok(Ok(SimulationResponse::BlockEdits(Err(error)))) => Err(error),
+            Ok(Ok(_)) => Err(SimulationRequestError::ResponseMismatch),
+            Ok(Err(error)) => Err(error),
+            Err(_) => Err(SimulationRequestError::OwnerStopped),
+        }
+    }
+
+    pub(crate) async fn place_loader_block_server_owned(
+        &self,
+        position: BlockPos,
+        state: BlockStateId,
+    ) -> Result<bool, SimulationRequestError> {
+        if self.session_fence.is_some() {
+            return Err(SimulationRequestError::InvalidCommand);
+        }
+        let receiver = self.enqueue_with_fence(
+            None,
+            SimulationCommand::ApplyBlockEdits {
+                actor_session: None,
+                edits: vec![BlockEdit {
+                    pos: position,
+                    new_state: state,
+                }],
+                preconditions: Vec::new(),
+                scheduled_block_ticks: Vec::new(),
+            },
+        )?;
+        match receiver.await {
+            Ok(Ok(SimulationResponse::BlockEdits(Ok(outcome)))) => Ok(outcome.is_some()),
             Ok(Ok(SimulationResponse::BlockEdits(Err(error)))) => Err(error),
             Ok(Ok(_)) => Err(SimulationRequestError::ResponseMismatch),
             Ok(Err(error)) => Err(error),
@@ -3047,6 +3091,7 @@ impl SimulationOwner {
         config: &crate::server::ServerConfig,
         sessions: &SessionRegistry,
         access: SimulationWorldAccess<'_>,
+        protection: Option<&crate::script::ZoneProtectionSnapshot>,
         world_tick: u64,
         chunk_budget: usize,
     ) -> super::RandomTickReport {
@@ -3057,6 +3102,7 @@ impl SimulationOwner {
             access,
             #[cfg(test)]
             self.regional_block_edit_probe.clone(),
+            protection,
             world_tick,
             chunk_budget,
         )
@@ -3078,6 +3124,7 @@ impl SimulationOwner {
             access,
             #[cfg(test)]
             self.regional_block_edit_probe.clone(),
+            None,
             world_tick,
             budget,
         )
@@ -4785,6 +4832,16 @@ impl SimulationOwner {
                         SimulationResponse::EntitySpawn(dispatches)
                     }
                 }
+                SimulationCommand::EnsureSettlementInhabitants { spawns, .. } => {
+                    let dispatches =
+                        sessions.ensure_settlement_inhabitants(&self.authority, spawns);
+                    if detached {
+                        dispatch_visibility_commands(dispatches);
+                        SimulationResponse::EntitySpawn(Vec::new())
+                    } else {
+                        SimulationResponse::EntitySpawn(dispatches)
+                    }
+                }
                 SimulationCommand::ApplyBlockEdits {
                     actor_session,
                     edits,
@@ -4845,10 +4902,7 @@ impl SimulationOwner {
                             }
                             sessions.invalidate_prepared_chunks(&outcome.edit_chunks);
                             let mut dispatches = sessions
-                                .loaded_recipients_for_chunks(
-                                    &outcome.edit_chunks,
-                                    Some(*actor_session),
-                                )
+                                .loaded_recipients_for_chunks(&outcome.edit_chunks, *actor_session)
                                 .into_iter()
                                 .map(|recipient| VisibilityDispatch {
                                     recipient,
@@ -4864,10 +4918,7 @@ impl SimulationOwner {
                                     .collect::<HashSet<_>>();
                                 dispatches.extend(
                                     sessions
-                                        .loaded_recipients_for_chunks(
-                                            &light_chunks,
-                                            Some(*actor_session),
-                                        )
+                                        .loaded_recipients_for_chunks(&light_chunks, *actor_session)
                                         .into_iter()
                                         .map(|recipient| VisibilityDispatch {
                                             recipient,
@@ -5622,7 +5673,7 @@ impl SimulationOwner {
                 .and_then(|outcome| outcome.pending_light_sources.take());
             if let Some(sources) = pending_sources {
                 let actor_session = command_relight_actor_session(&envelope.command)
-                    .expect("pending relight command has an actor session");
+                    .expect("pending relight command supports owner relight");
                 let slot = pending_relight
                     .as_deref_mut()
                     .expect("pending relight slot exists when compute is deferred");
@@ -6228,6 +6279,10 @@ mod tests {
                 id: Identifier::parse("minecraft:cobblestone").unwrap(),
                 protocol_id: 7,
             },
+            mc_data::items::ItemReport {
+                id: Identifier::parse("minecraft:paper").unwrap(),
+                protocol_id: 45,
+            },
         ]));
         SurvivalBlockBreakPlan {
             position: pos,
@@ -6245,6 +6300,7 @@ mod tests {
             loot: Arc::new(mc_data::loot::LootTables::default()),
             item_entity_type_id: Some(1),
             falling_block_entity_type_id: Some(99),
+            loader_block_drop: None,
             held: SurvivalBreakHeldItem {
                 hotbar_slot: 0,
                 expected: ItemStack::new(42, 1),
@@ -6626,7 +6682,7 @@ mod tests {
         let (handle, mut owner) = simulation_channel_with_capacity(1);
         let response = handle
             .enqueue(SimulationCommand::ApplyBlockEdits {
-                actor_session: 0,
+                actor_session: Some(0),
                 edits: vec![BlockEdit {
                     pos: position,
                     new_state: BlockStateId(0),
@@ -6722,7 +6778,7 @@ mod tests {
         let (handle, mut owner) = simulation_channel_with_capacity(2);
         let block_response = handle
             .enqueue(SimulationCommand::ApplyBlockEdits {
-                actor_session: 0,
+                actor_session: Some(0),
                 edits: vec![BlockEdit {
                     pos: block_position,
                     new_state: BlockStateId(0),
@@ -6830,7 +6886,7 @@ mod tests {
         let (handle, mut owner) = simulation_channel_with_capacity(1);
         let response = handle
             .enqueue(SimulationCommand::ApplyBlockEdits {
-                actor_session: session,
+                actor_session: Some(session),
                 edits: vec![BlockEdit {
                     pos: position,
                     new_state: BlockStateId(0),
@@ -7000,7 +7056,7 @@ mod tests {
         let (handle, mut owner) = simulation_channel_with_capacity(1);
         let response = handle
             .enqueue(SimulationCommand::ApplyBlockEdits {
-                actor_session: 0,
+                actor_session: Some(0),
                 edits: vec![BlockEdit {
                     pos: position,
                     new_state: BlockStateId(0),
@@ -7078,7 +7134,7 @@ mod tests {
             .map(|(position, token)| {
                 handle
                     .enqueue(SimulationCommand::ApplyBlockEdits {
-                        actor_session: 0,
+                        actor_session: Some(0),
                         edits: vec![BlockEdit {
                             pos: position,
                             new_state: BlockStateId(0),
@@ -7204,7 +7260,7 @@ mod tests {
         let resources = crate::chunk_pipeline::ChunkPipelineResources::with_limits(1, 2);
         let (handle, mut owner) = simulation_channel_with_capacity(2);
         let command = || SimulationCommand::ApplyBlockEdits {
-            actor_session: 0,
+            actor_session: Some(0),
             edits: vec![BlockEdit {
                 pos: position,
                 new_state: BlockStateId(0),
@@ -7277,7 +7333,7 @@ mod tests {
         let resources = crate::chunk_pipeline::ChunkPipelineResources::with_limits(1, 2);
         let (handle, mut owner) = simulation_channel_with_capacity(3);
         let command = |position, token| SimulationCommand::ApplyBlockEdits {
-            actor_session: 0,
+            actor_session: Some(0),
             edits: vec![BlockEdit {
                 pos: position,
                 new_state: BlockStateId(0),
@@ -9174,6 +9230,8 @@ mod tests {
             count: 3,
             damage: Some(7),
             enchantments: Vec::new(),
+            custom_name: None,
+            item_model: None,
         };
         assert!(registry.replace_item_stack_after_pickup_plan_for_test(item, replacement.clone()));
         resume_tx.send(()).expect("release pickup CAS");
@@ -9829,7 +9887,7 @@ mod tests {
             version: 2,
         };
         let command = |precondition_pos, tick_pos| SimulationCommand::ApplyBlockEdits {
-            actor_session: 1,
+            actor_session: Some(1),
             edits: vec![
                 BlockEdit {
                     pos: inside,
@@ -10483,6 +10541,79 @@ mod tests {
         assert_eq!(
             drops[0].snapshot.item_stack,
             Some(EntityItemStack::new(7, 1))
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn loader_break_drop_and_pickup_preserve_exact_item_presentation() {
+        let (storage, pos, token) = test_block_storage();
+        let world = Arc::new(tokio::sync::Mutex::new(storage));
+        let registry = SessionRegistry::new();
+        let session = register_test_session(&registry, "LoaderBreakMiner");
+        let mut inventory = PlayerInventory::empty();
+        inventory.slots[PlayerInventory::HOTBAR_BASE] = ItemStack::new(42, 1);
+        let player_state = register_test_player_state(&registry, session, inventory);
+        let (handle, mut owner) = simulation_channel_with_capacity(1);
+        let session_handle = handle.for_session(session);
+        let mut plan = test_survival_block_break_plan(pos, token);
+        let model = crate::loader::loader_block_item_model(0);
+        let loader_item = ItemStack::new(45, 1)
+            .with_custom_name("Ruby Block")
+            .with_item_model(model.clone());
+        plan.loader_block_drop = Some(loader_item.clone());
+        let mut request = Box::pin(session_handle.commit_survival_block_break(plan));
+        assert_request_enqueued(request.as_mut(), &handle).await;
+
+        assert_eq!(
+            owner
+                .process_tick_with_world(&registry, Some(&world), None, 1)
+                .processed,
+            1
+        );
+        request.await.unwrap().expect("Loader break commits");
+
+        let expected_entity_stack = EntityItemStack::new(45, 1)
+            .with_custom_name("Ruby Block")
+            .with_item_model(model);
+        let drop = registry
+            .persisted_entity_records()
+            .into_iter()
+            .find(|record| record.snapshot.item_stack.is_some())
+            .expect("Loader drop persists");
+        assert_eq!(
+            drop.snapshot.item_stack.as_ref(),
+            Some(&expected_entity_stack)
+        );
+
+        registry.advance_world_time(ITEM_PICKUP_DELAY_TICKS);
+        let mut pickup = Box::pin(session_handle.pickup_item_into_inventory(
+            drop.snapshot.id,
+            45,
+            None,
+            Vec::new(),
+            64,
+        ));
+        assert_request_enqueued(pickup.as_mut(), &handle).await;
+        assert_eq!(owner.process_tick(&registry, 2).processed, 1);
+        let credited = pickup
+            .await
+            .unwrap()
+            .expect("Loader drop is credited through simulation owner");
+        assert_eq!(credited.credited, expected_entity_stack);
+        assert!(
+            player_state
+                .lock()
+                .unwrap()
+                .inventory
+                .slots
+                .iter()
+                .any(|stack| stack == &loader_item)
+        );
+        assert!(
+            registry
+                .persisted_entity_records()
+                .into_iter()
+                .all(|record| record.snapshot.id != drop.snapshot.id)
         );
     }
 
@@ -12248,6 +12379,8 @@ mod tests {
                     count: 1,
                     damage: Some(3),
                     enchantments: Vec::new(),
+                    custom_name: None,
+                    item_model: None,
                 },
                 EntityItemStack::new(43, 4),
                 EntityItemStack::new(44, 2),
@@ -12355,6 +12488,8 @@ mod tests {
                 count: 3,
                 damage: Some(7),
                 enchantments: Vec::new(),
+                custom_name: None,
+                item_model: None,
             }]
         );
     }
@@ -14092,6 +14227,59 @@ mod tests {
         );
     }
 
+    #[tokio::test(flavor = "current_thread")]
+    async fn server_owned_loader_block_edit_dispatches_to_every_loaded_session() {
+        let (mut storage, pos, _) = test_block_storage();
+        storage.set_block_at(pos, BlockStateId(0)).unwrap();
+        let world = Arc::new(tokio::sync::Mutex::new(storage));
+        let registry = SessionRegistry::new();
+        let (first, mut first_rx) =
+            register_test_session_with_outbound(&registry, "LoaderBlockFirst");
+        let (second, mut second_rx) =
+            register_test_session_with_outbound(&registry, "LoaderBlockSecond");
+        for session in [first, second] {
+            registry.replace_view(session, (0, 0), 2, HashSet::from([(0, 0)]));
+            registry.mark_loaded(session, (0, 0));
+        }
+        while first_rx.try_recv().is_ok() {}
+        while second_rx.try_recv().is_ok() {}
+        let (handle, mut owner) = simulation_channel_with_capacity(1);
+        let block_light = BlockLightTable::from_arrays(
+            "test",
+            vec![0; 5],
+            vec![0, 15, 1, 15, 15],
+            vec![true, false, false, false, false],
+        );
+        let mut request = Box::pin(handle.place_loader_block_server_owned(pos, BlockStateId(4)));
+        assert_request_enqueued(request.as_mut(), &handle).await;
+
+        owner
+            .process_commands_with_world(&registry, Some(&world), Some(&block_light), 1)
+            .await;
+
+        assert!(request.await.unwrap());
+        assert!(matches!(
+            first_rx.try_recv(),
+            Ok(OutboundCommand::BlockDeltas(_))
+        ));
+        assert!(matches!(
+            first_rx.try_recv(),
+            Ok(OutboundCommand::LightUpdates(_))
+        ));
+        assert!(matches!(
+            second_rx.try_recv(),
+            Ok(OutboundCommand::BlockDeltas(_))
+        ));
+        assert!(matches!(
+            second_rx.try_recv(),
+            Ok(OutboundCommand::LightUpdates(_))
+        ));
+        assert_eq!(
+            world.lock().await.get_cached_block(pos),
+            Some(BlockStateId(4))
+        );
+    }
+
     #[test]
     fn queued_conditional_block_edits_commit_only_first_matching_token() {
         let (storage, pos, token) = test_block_storage();
@@ -14099,7 +14287,7 @@ mod tests {
         let registry = SessionRegistry::new();
         let (handle, mut owner) = simulation_channel_with_capacity(2);
         let command = || SimulationCommand::ApplyBlockEdits {
-            actor_session: 0,
+            actor_session: Some(0),
             edits: vec![BlockEdit {
                 pos,
                 new_state: BlockStateId(0),
@@ -14143,7 +14331,7 @@ mod tests {
         let (handle, mut owner) = simulation_channel_with_capacity(1);
         let response = handle
             .enqueue(SimulationCommand::ApplyBlockEdits {
-                actor_session: 0,
+                actor_session: Some(0),
                 edits: vec![BlockEdit {
                     pos,
                     new_state: BlockStateId(0),
@@ -14275,7 +14463,7 @@ mod tests {
         let (handle, mut owner) = simulation_channel_with_capacity(2);
         let remove = handle
             .enqueue(SimulationCommand::ApplyBlockEdits {
-                actor_session: 0,
+                actor_session: Some(0),
                 edits: vec![BlockEdit {
                     pos,
                     new_state: BlockStateId(0),
@@ -14286,7 +14474,7 @@ mod tests {
             .unwrap();
         let restore = handle
             .enqueue(SimulationCommand::ApplyBlockEdits {
-                actor_session: 0,
+                actor_session: Some(0),
                 edits: vec![BlockEdit {
                     pos,
                     new_state: BlockStateId(1),

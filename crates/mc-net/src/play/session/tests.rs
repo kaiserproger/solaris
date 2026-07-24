@@ -9202,6 +9202,7 @@ fn registration<'a>(
         max_sessions,
         script_operator: false,
         dimension: "minecraft:overworld",
+        loader_session: None,
     }
 }
 
@@ -9254,6 +9255,7 @@ async fn profile_properties_reach_observer_player_info_wire_packet() {
             max_sessions: usize::MAX,
             script_operator: false,
             dimension: "minecraft:overworld",
+            loader_session: None,
         })
         .unwrap();
 

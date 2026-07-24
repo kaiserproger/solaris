@@ -1,4 +1,4 @@
-use std::sync::Arc;
+use std::sync::{Arc, Condvar, Mutex, MutexGuard};
 use std::time::Instant;
 
 use mc_data::item_components::ItemFactsTable;
@@ -14,11 +14,121 @@ use super::SessionRegistry;
 use super::outbound::{OutboundCommand, dispatch_visibility_command};
 use super::visibility::ordered_session_recipient;
 
+#[derive(Debug)]
+pub(super) struct ScriptInventoryTransactionGate {
+    state: Mutex<ScriptInventoryTransactionGateState>,
+    changed: Condvar,
+}
+
+#[derive(Debug)]
+struct ScriptInventoryTransactionGateState {
+    active: bool,
+    pending_owner_transactions: usize,
+}
+
+#[derive(Debug)]
+pub(super) struct ScriptPlayerInventoryReservation {
+    gate: Arc<ScriptInventoryTransactionGate>,
+}
+
+#[derive(Debug)]
+pub(in crate::play) struct ScriptInventoryTransactionGuard<'a> {
+    _state: MutexGuard<'a, ScriptInventoryTransactionGateState>,
+}
+
+impl ScriptInventoryTransactionGate {
+    pub(super) fn new() -> Self {
+        Self {
+            state: Mutex::new(ScriptInventoryTransactionGateState {
+                active: true,
+                pending_owner_transactions: 0,
+            }),
+            changed: Condvar::new(),
+        }
+    }
+
+    pub(super) fn reserve_owner<T>(
+        self: &Arc<Self>,
+        capture: impl FnOnce() -> Option<T>,
+    ) -> Option<(ScriptPlayerInventoryReservation, T)> {
+        let mut state = self.lock("reserve session-owner inventory transaction", None);
+        if !state.active {
+            return None;
+        }
+        let captured = capture()?;
+        state.pending_owner_transactions += 1;
+        Some((
+            ScriptPlayerInventoryReservation {
+                gate: Arc::clone(self),
+            },
+            captured,
+        ))
+    }
+
+    fn begin_compound(&self, player_id: u64) -> Option<ScriptInventoryTransactionGuard<'_>> {
+        let mut state = self.lock("begin compound inventory transaction", Some(player_id));
+        while state.active && state.pending_owner_transactions != 0 {
+            state = self.changed.wait(state).unwrap_or_else(|poisoned| {
+                warn!(
+                    player_id,
+                    "script transaction gate was poisoned while waiting; recovering state"
+                );
+                poisoned.into_inner()
+            });
+        }
+        state
+            .active
+            .then_some(ScriptInventoryTransactionGuard { _state: state })
+    }
+
+    pub(super) fn close(&self, player_id: u64) {
+        let mut state = self.lock("close inventory transaction gate", Some(player_id));
+        state.active = false;
+        self.changed.notify_all();
+    }
+
+    fn lock(
+        &self,
+        operation: &'static str,
+        player_id: Option<u64>,
+    ) -> MutexGuard<'_, ScriptInventoryTransactionGateState> {
+        self.state.lock().unwrap_or_else(|poisoned| {
+            warn!(
+                ?player_id,
+                operation, "script transaction gate was poisoned; recovering state"
+            );
+            poisoned.into_inner()
+        })
+    }
+}
+
+impl ScriptPlayerInventoryReservation {
+    pub(in crate::play) fn begin_commit(&self) -> Option<ScriptInventoryTransactionGuard<'_>> {
+        let state = self.gate.lock("begin session-owner inventory commit", None);
+        state
+            .active
+            .then_some(ScriptInventoryTransactionGuard { _state: state })
+    }
+}
+
+impl Drop for ScriptPlayerInventoryReservation {
+    fn drop(&mut self) {
+        let mut state = self
+            .gate
+            .lock("finish session-owner inventory transaction", None);
+        state.pending_owner_transactions = state
+            .pending_owner_transactions
+            .checked_sub(1)
+            .expect("owner inventory reservation count remains balanced");
+        self.gate.changed.notify_all();
+    }
+}
+
 impl SessionRegistry {
-    /// Commits the plugin ledger and the canonical player inventory while the
-    /// same player-state lock excludes every other inventory mutation. Storage
-    /// I/O is intentionally allowed under this lock: plugin purchases are a
-    /// cold path, and releasing it would make the two commits observable apart.
+    /// Commits the plugin ledger and canonical player inventory behind the same
+    /// session gate used by standalone owner-routed inventory transactions.
+    /// Storage I/O stays inside the gate because releasing it would make the
+    /// ledger and inventory commits observable apart.
     pub(crate) fn commit_script_inventory_storage_transaction<S>(
         &self,
         plugin_id: &str,
@@ -30,7 +140,7 @@ impl SessionRegistry {
     where
         S: ScriptStorageTransactionPrepare,
     {
-        let (player_state, recipient, transaction_active) = {
+        let transaction_gate = {
             let inner = self.lock_inner("prepare script inventory transaction");
             let player_id = transaction.player_id().value();
             let Some(session) = inner.sessions.get(&player_id) else {
@@ -39,29 +149,34 @@ impl SessionRegistry {
             if session.tx.is_closed() {
                 return Ok(false);
             }
-            let Some(player_state) = inner.player_persistence.get(&player_id).cloned() else {
-                return Ok(false);
-            };
-            (
-                player_state,
-                ordered_session_recipient(player_id, session),
-                Arc::clone(&session.script_transaction_active),
-            )
+            Arc::clone(&session.script_inventory_transaction_gate)
         };
 
         #[cfg(test)]
         self.pause_script_transaction_after_capture_for_test();
 
-        let transaction_active = transaction_active.lock().unwrap_or_else(|poisoned| {
-            warn!(
-                player_id = transaction.player_id().value(),
-                "script transaction gate was poisoned during commit; recovering state"
-            );
-            poisoned.into_inner()
-        });
-        if !*transaction_active {
+        let player_id = transaction.player_id().value();
+        let Some(_transaction_guard) = transaction_gate.begin_compound(player_id) else {
             return Ok(false);
-        }
+        };
+        let (player_state, recipient) = {
+            let inner = self.lock_inner("capture compound inventory transaction owner");
+            let Some(session) = inner.sessions.get(&player_id) else {
+                return Ok(false);
+            };
+            if session.tx.is_closed()
+                || !Arc::ptr_eq(
+                    &session.script_inventory_transaction_gate,
+                    &transaction_gate,
+                )
+            {
+                return Ok(false);
+            }
+            let Some(player_state) = inner.player_persistence.get(&player_id).cloned() else {
+                return Ok(false);
+            };
+            (player_state, ordered_session_recipient(player_id, session))
+        };
 
         let wait_started = Instant::now();
         let guard = player_state.lock().unwrap_or_else(|poisoned| {

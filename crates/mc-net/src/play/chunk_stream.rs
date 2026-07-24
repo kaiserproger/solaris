@@ -79,6 +79,7 @@ pub(super) struct ChunkStreamState {
     chunk_source: Option<mc_world::ChunkSourceView>,
     biomes: Arc<Registry>,
     blocks: Arc<BlockRegistry>,
+    loader_block_projection: Option<crate::loader::LoaderBlockProjection>,
     block_light: Option<Arc<BlockLightTable>>,
     items: Arc<ItemRegistry>,
     tags: Arc<TagsData>,
@@ -935,6 +936,7 @@ impl ChunkStreamState {
         policy: ChunkPipelinePolicy,
     ) -> Self {
         let vd = view_distance.max(0);
+        let loader_block_projection = sessions.loader_block_projection(session_id, &blocks);
         let (result_tx, result_rx) = mpsc::channel(policy.chunk_result_queue_size);
         let progress_notify = Arc::new(tokio::sync::Notify::new());
         let scheduler = ChunkScheduler::new(prioritized_spiral(
@@ -951,6 +953,7 @@ impl ChunkStreamState {
             chunk_source: None,
             biomes,
             blocks,
+            loader_block_projection,
             block_light,
             items,
             tags,
@@ -1523,10 +1526,26 @@ impl ChunkStreamState {
                 self.set_stop_reason(stop_reason);
                 break;
             };
-            let prepare_claim = match self.sessions.prepared_chunk_or_wait_for_earlier_session(
-                (request.chunk_x, request.chunk_z),
-                self.session_id,
-            ) {
+            let prepared = if self.loader_block_projection.is_some() {
+                match self
+                    .sessions
+                    .prepared_chunk_or_claim_uncached((request.chunk_x, request.chunk_z))
+                {
+                    PreparedChunkClaimResult::Claimed(claim) => {
+                        SessionPreparedChunkClaimResult::Claimed(claim)
+                    }
+                    PreparedChunkClaimResult::InFlight => SessionPreparedChunkClaimResult::InFlight,
+                    PreparedChunkClaimResult::Cached => {
+                        unreachable!("uncached Loader projection claims never return cached frames")
+                    }
+                }
+            } else {
+                self.sessions.prepared_chunk_or_wait_for_earlier_session(
+                    (request.chunk_x, request.chunk_z),
+                    self.session_id,
+                )
+            };
+            let prepare_claim = match prepared {
                 SessionPreparedChunkClaimResult::Cached(prepared, revision) => {
                     self.accept_result(ChunkPrepareResult {
                         request,
@@ -1670,7 +1689,8 @@ impl ChunkStreamState {
     }
 
     fn dispatch_forward_prewarm(&mut self) {
-        if self.view_distance <= 0
+        if self.loader_block_projection.is_some()
+            || self.view_distance <= 0
             || self.memory_pressure_active
             || self
                 .runtime_control
@@ -1747,6 +1767,7 @@ impl ChunkStreamState {
         let active_generation = Arc::clone(&self.active_generation);
         let generation_changed = Arc::clone(&self.generation_changed);
         let compression = self.compression;
+        let loader_block_projection = self.loader_block_projection.clone();
         let current_tick = self.sessions.simulation_tick();
         let sessions = Arc::clone(&self.sessions);
         let tx = self.result_tx.clone();
@@ -1799,6 +1820,7 @@ impl ChunkStreamState {
                     active_generation,
                     generation_changed,
                     current_tick,
+                    loader_block_projection,
                 )
                 .await
             });
@@ -1942,6 +1964,7 @@ impl ChunkStreamState {
                             Arc::new(AtomicU64::new(request.generation.0)),
                             Arc::new(tokio::sync::Notify::new()),
                             current_tick,
+                            None,
                         )
                         .await;
                         if let ChunkPrepareOutcome::Ready(prepared) = result.outcome {
@@ -2093,7 +2116,60 @@ impl ChunkStreamState {
                 let mut visibility = visibility;
                 let herd_spawns =
                     natural_spawns_for_policy(&prepared.herd_spawns, self.spawn_monsters);
+                let settlement_spawns = self
+                    .world_read
+                    .as_ref()
+                    .and_then(|world_read| {
+                        world_read
+                            .snapshot_chunks(&[ChunkPos { x: cx, z: cz }])
+                            .chunk(ChunkPos { x: cx, z: cz })
+                    })
+                    .map_or_else(Vec::new, |chunk| {
+                        chunk
+                            .settlement_inhabitants()
+                            .into_iter()
+                            .filter_map(|marker| {
+                                let entity_type =
+                                    Identifier::parse(marker.entity_type.clone()).ok()?;
+                                let entity_type_id =
+                                    i32::try_from(self.entity_types.id_of(&entity_type)?).ok()?;
+                                let villager_kind = match marker.villager_kind.as_str() {
+                                    "plains" => mc_entity::VillagerKind::Plains,
+                                    _ => return None,
+                                };
+                                let profession = match marker.profession.as_str() {
+                                    "none" => mc_entity::VillagerProfession::None,
+                                    "toolsmith" => mc_entity::VillagerProfession::Toolsmith,
+                                    _ => return None,
+                                };
+                                Some(SettlementInhabitantSpawn {
+                                    claim: marker.claim,
+                                    entity_type_id,
+                                    entity_type_name: entity_type.to_string(),
+                                    position: Vec3::new(
+                                        marker.position[0],
+                                        marker.position[1],
+                                        marker.position[2],
+                                    ),
+                                    villager: mc_entity::VillagerData::new(
+                                        villager_kind,
+                                        profession,
+                                        marker.level,
+                                    ),
+                                })
+                            })
+                            .collect()
+                    });
                 if let Some(simulation) = self.simulation.as_ref() {
+                    if !settlement_spawns.is_empty()
+                        && let Err(error) =
+                            simulation.ensure_settlement_inhabitants((cx, cz), settlement_spawns)
+                    {
+                        warn!(
+                            ?error,
+                            cx, cz, "simulation settlement inhabitant request rejected"
+                        );
+                    }
                     if let Err(error) = simulation.ensure_chunk_herd((cx, cz), herd_spawns.clone())
                     {
                         warn!(?error, cx, cz, "simulation chunk herd request rejected");
@@ -2112,7 +2188,9 @@ impl ChunkStreamState {
                     }
                 }
                 dispatch_visibility_commands(visibility);
-                if let Some(revision) = prepared_revision {
+                if self.loader_block_projection.is_none()
+                    && let Some(revision) = prepared_revision
+                {
                     self.sessions.cache_prepared_chunk_if_current(
                         (cx, cz),
                         revision,
@@ -2734,6 +2812,7 @@ async fn prepare_chunk_request(
     active_generation: Arc<AtomicU64>,
     generation_changed: Arc<tokio::sync::Notify>,
     current_tick: u64,
+    loader_block_projection: Option<crate::loader::LoaderBlockProjection>,
 ) -> ChunkPrepareResult {
     if !is_active_request(request, &active_generation) {
         return stale_chunk_result(request, &resources);
@@ -2873,6 +2952,7 @@ async fn prepare_chunk_request(
                     Some(workspace),
                     request.chunk_x,
                     request.chunk_z,
+                    loader_block_projection.as_ref(),
                 )
             })
         } else {
@@ -2895,6 +2975,7 @@ async fn prepare_chunk_request(
                 None,
                 request.chunk_x,
                 request.chunk_z,
+                loader_block_projection.as_ref(),
             )
         }
         .map_err(|err| err.to_string())?;
@@ -3730,11 +3811,20 @@ fn build_chunk_packet(
     workspace: Option<&mut LightWorkspace>,
     cx: i32,
     cz: i32,
+    loader_block_projection: Option<&crate::loader::LoaderBlockProjection>,
 ) -> Result<BuiltChunkPacket, mc_world::wire::WireError> {
     let mut timing = ChunkBuildTiming::default();
 
     let chunk_data_started = Instant::now();
-    let data = encode_chunk_data(centre, biomes, blocks)?;
+    let data = match loader_block_projection {
+        Some(projection) => mc_world::wire::encode_chunk_data_with_block_projection(
+            centre,
+            biomes,
+            blocks,
+            &|state| projection.project(state),
+        )?,
+        None => encode_chunk_data(centre, biomes, blocks)?,
+    };
     timing.chunk_data_ms = chunk_data_started.elapsed().as_millis() as u64;
 
     let heightmap_started = Instant::now();
@@ -4943,6 +5033,7 @@ mod tests {
             Arc::new(AtomicU64::new(2)),
             Arc::new(tokio::sync::Notify::new()),
             0,
+            None,
         )
         .await;
 
@@ -4993,6 +5084,7 @@ mod tests {
             Some(&mut workspace),
             0,
             0,
+            None,
         )
         .expect("chunk packet builds from baked light");
 
@@ -5002,6 +5094,47 @@ mod tests {
         assert_eq!(built.timing.light_compute_ms, 0);
         assert_eq!(light.sky.section(0).unwrap()[0], 0x21);
         assert_eq!(light.block.section(0).unwrap()[0], 0x43);
+    }
+
+    #[test]
+    fn build_chunk_packet_projects_loader_state_into_chunk_palette() {
+        let plains = Identifier::parse("minecraft:plains").unwrap();
+        let mut centre = Chunk::empty_with_geometry(
+            ChunkPos { x: 0, z: 0 },
+            BlockStateId(0),
+            plains,
+            mc_world::ChunkGeometry::new(0, 16).unwrap(),
+        );
+        centre.sections[0] = mc_world::ChunkSection::filled(BlockStateId(1), BlockStateId(0));
+        let projection = crate::loader::LoaderBlockProjection::for_test(1, 42);
+        let neighbourhood: [[Option<Arc<Chunk>>; 3]; 3] =
+            std::array::from_fn(|_| std::array::from_fn(|_| None));
+
+        let built = build_chunk_packet(
+            &centre,
+            &neighbourhood,
+            &test_biome_registry(),
+            &air_block_registry(),
+            &ItemRegistry::from_report(&[]),
+            &TagsData::default(),
+            &[],
+            &mc_data::block_entity_types::BlockEntityTypeRegistry::default(),
+            None,
+            None,
+            &[],
+            &[],
+            &[],
+            &mc_data::biomes::BiomeSpawnRules::default(),
+            &mc_data::entity_types::solaris_required_entity_types(),
+            None,
+            0,
+            0,
+            Some(&projection),
+        )
+        .unwrap();
+
+        assert_eq!(built.packet.data[4], 0, "single-value block palette");
+        assert_eq!(built.packet.data[5], 42, "session carrier state");
     }
 
     #[tokio::test]
@@ -5059,6 +5192,7 @@ mod tests {
             Arc::new(AtomicU64::new(1)),
             Arc::new(tokio::sync::Notify::new()),
             0,
+            None,
         )
         .await;
 
@@ -5605,6 +5739,7 @@ mod tests {
             Arc::clone(&stream.active_generation),
             Arc::clone(&stream.generation_changed),
             0,
+            None,
         )
         .await;
         assert!(matches!(result.outcome, ChunkPrepareOutcome::Backpressured));
@@ -8467,6 +8602,7 @@ mod tests {
             Arc::clone(&stream.active_generation),
             Arc::clone(&stream.generation_changed),
             0,
+            None,
         )
         .await;
         assert!(matches!(result.outcome, ChunkPrepareOutcome::Backpressured));

@@ -117,6 +117,18 @@ pub struct BlockPos {
     pub z: i32,
 }
 
+const SETTLEMENT_INHABITANTS_KEY: &str = "SolarisSettlementInhabitants";
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct SettlementInhabitantMarker {
+    pub claim: String,
+    pub entity_type: String,
+    pub position: [f64; 3],
+    pub villager_kind: String,
+    pub profession: String,
+    pub level: u8,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct BlockMutationToken {
     pub chunk_instance_id: u64,
@@ -568,6 +580,99 @@ impl Chunk {
             light_source_generation: 0,
             block_mutation_versions: HashMap::new(),
         }
+    }
+
+    pub fn set_settlement_inhabitants(&mut self, inhabitants: &[SettlementInhabitantMarker]) {
+        self.extras
+            .retain(|(key, _)| key != SETTLEMENT_INHABITANTS_KEY);
+        if inhabitants.is_empty() {
+            return;
+        }
+        let elements = inhabitants
+            .iter()
+            .map(|inhabitant| {
+                Tag::Compound(vec![
+                    ("Claim".into(), Tag::String(inhabitant.claim.clone())),
+                    ("Entity".into(), Tag::String(inhabitant.entity_type.clone())),
+                    ("X".into(), Tag::Double(inhabitant.position[0])),
+                    ("Y".into(), Tag::Double(inhabitant.position[1])),
+                    ("Z".into(), Tag::Double(inhabitant.position[2])),
+                    (
+                        "VillagerKind".into(),
+                        Tag::String(inhabitant.villager_kind.clone()),
+                    ),
+                    (
+                        "Profession".into(),
+                        Tag::String(inhabitant.profession.clone()),
+                    ),
+                    ("Level".into(), Tag::Int(i32::from(inhabitant.level))),
+                ])
+            })
+            .collect();
+        self.extras.push((
+            SETTLEMENT_INHABITANTS_KEY.into(),
+            Tag::List(mc_nbt::ListTag {
+                element_type: mc_nbt::tag_type::COMPOUND,
+                elements,
+            }),
+        ));
+    }
+
+    #[must_use]
+    pub fn settlement_inhabitants(&self) -> Vec<SettlementInhabitantMarker> {
+        let Some(Tag::List(list)) = self
+            .extras
+            .iter()
+            .find(|(key, _)| key == SETTLEMENT_INHABITANTS_KEY)
+            .map(|(_, value)| value)
+        else {
+            return Vec::new();
+        };
+        list.elements
+            .iter()
+            .filter_map(|entry| {
+                let Tag::Compound(fields) = entry else {
+                    return None;
+                };
+                let string = |name: &str| {
+                    fields.iter().find_map(|(key, value)| {
+                        (key == name)
+                            .then_some(value)
+                            .and_then(|value| match value {
+                                Tag::String(value) => Some(value.clone()),
+                                _ => None,
+                            })
+                    })
+                };
+                let double = |name: &str| {
+                    fields.iter().find_map(|(key, value)| {
+                        (key == name)
+                            .then_some(value)
+                            .and_then(|value| match value {
+                                Tag::Double(value) if value.is_finite() => Some(*value),
+                                _ => None,
+                            })
+                    })
+                };
+                let level = fields.iter().find_map(|(key, value)| {
+                    (key == "Level")
+                        .then_some(value)
+                        .and_then(|value| match value {
+                            Tag::Int(value) => u8::try_from(*value).ok(),
+                            _ => None,
+                        })
+                        .filter(|value| (1..=5).contains(value))
+                });
+                Some(SettlementInhabitantMarker {
+                    claim: string("Claim")?,
+                    entity_type: string("Entity")?,
+                    position: [double("X")?, double("Y")?, double("Z")?],
+                    villager_kind: string("VillagerKind")?,
+                    profession: string("Profession")?,
+                    level: level?,
+                })
+            })
+            .collect()
     }
 
     #[must_use]
@@ -1135,6 +1240,23 @@ mod tests {
         assert_eq!(c.get_block(15, MAX_Y - 1, 15), Some(air()));
         assert_eq!(c.get_block(0, MIN_Y - 1, 0), None);
         assert_eq!(c.get_block(0, MAX_Y, 0), None);
+    }
+
+    #[test]
+    fn settlement_inhabitant_markers_round_trip_through_chunk_extras() {
+        let mut chunk = Chunk::empty(ChunkPos { x: 4, z: 0 }, air(), plains());
+        let marker = SettlementInhabitantMarker {
+            claim: "settlement-prototype:smith@72,8".to_owned(),
+            entity_type: "minecraft:villager".to_owned(),
+            position: [72.5, 66.0, 8.5],
+            villager_kind: "plains".to_owned(),
+            profession: "toolsmith".to_owned(),
+            level: 1,
+        };
+
+        chunk.set_settlement_inhabitants(std::slice::from_ref(&marker));
+
+        assert_eq!(chunk.settlement_inhabitants(), vec![marker]);
     }
 
     #[test]

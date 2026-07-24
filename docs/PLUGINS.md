@@ -33,23 +33,222 @@ capabilities = ["storage", "inventory_menus", "inventory_storage_transactions", 
 player_commands = ["economy"]
 ```
 
-An optional startup-only worldgen declaration is also available:
+Optional startup-only worldgen declarations are also available:
 
 ```toml
 [worldgen]
 ore_profile = "geological_deposits"
+settlement_profile = "plains_village_prototype"
+
+[[worldgen.settlement_buildings]]
+id = "smithy"
+template = "plains_toolsmith"
+role = "workplace"
+
+[[worldgen.settlement_inhabitants]]
+id = "smith"
+kind = "villager"
+building = "smithy"
+job = "toolsmith"
+
+[[worldgen.settlement_extensions]]
+id = "work-orders"
+building = "smithy"
 ```
 
 Installing `examples/plugins/geological-mines` selects large deterministic
 cross-chunk deposits and disables the vanilla ore pass for that world. Without
-a declaration the profile remains `vanilla`. The selected profile is persisted
-in `solaris/world.json`; changing it requires a fresh world directory so old
-and new chunks cannot mix authorities. Two plugins declaring a profile fail
-startup instead of relying on directory order. This declaration is resolved
-before pre-generation and gives Lua no chunk, generator, lock, or worker handle.
-An invalid worldgen declaration or missing Lua source fails startup instead of
-silently selecting vanilla. Unversioned vanilla Anvil imports reject a plugin
-worldgen profile because Solaris does not generate missing chunks in imports.
+a declaration the ore profile remains `vanilla`.
+
+Installing `examples/plugins/settlement-prototype` selects one bounded plains
+village prototype. Solaris loads the vanilla fountain, small-house, and
+toolsmith NBT templates from `data.vanilla_data_dir`, combines the declared
+building templates at stable offsets, and uses the extracted vanilla village
+spacing/separation/salt. Omitting `settlement_buildings` selects all three
+prototype parts. Seed zero fixes the prototype near spawn; other seeds use
+deterministic grassland placement. Missing template data fails startup instead
+of substituting a Solaris-authored building.
+
+Settlement descriptors are startup-only, immutable, and owned by the plugin
+that declares the settlement profile. A plan has at most three uniquely
+selected building templates, 16 named inhabitants, and 16 extension records;
+all ids are lowercase bounded literals. Inhabitants and extensions must
+reference a declared building. Extension ids are materialized as
+`plugin-id:local-id`, so one plugin cannot claim another plugin's extension
+namespace. The closed prototype vocabulary currently supports fountain,
+small-house, and toolsmith templates; meeting-point, home, and workplace
+building roles; villagers; and unemployed/toolsmith jobs.
+
+Ore and settlement profiles may have different plugin owners. Two plugins
+declaring the same profile kind fail startup instead of relying on directory
+order. The ore profile and canonical settlement plan (owner plus every ordered
+descriptor) are persisted in `solaris/world.json`; changing either requires a
+fresh world directory so old and new chunks cannot mix authorities.
+Declarations are resolved before pre-generation and give Lua no chunk,
+generator, lock, or worker handle. An invalid/empty declaration or missing Lua
+source fails startup. Unversioned vanilla Anvil imports reject plugin worldgen
+profiles because Solaris does not generate missing chunks in imports.
+
+The deterministic startup plan now covers per-building selection and roles,
+inhabitant selection, job assignment, and bounded plugin-owned extension
+records without giving Lua mutable worldgen callbacks. The plan is validated
+before generation and its selected building parts directly determine the
+composite template. Solaris extracts the templates' vanilla villager jigsaw
+slots and persists the planned inhabitants as typed chunk markers. When such a
+chunk is installed, a dedicated system-owned simulation command materializes
+the villagers with plains type, declared profession, and level-one metadata.
+The per-inhabitant claim is durable and independent of ambient-herd admission,
+so a reload or later chunk installation cannot duplicate the planned resident.
+
+### Client Content Manifest
+
+A plugin may declare startup-only Solaris Loader bundles in `plugin.toml`:
+
+```toml
+[client]
+schema = 1
+
+[[client.bundles]]
+id = "rich-content"
+version = "1.2.3"
+artifact = "client/rich-content.zip"
+sha256 = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+size_bytes = 4096
+loaders = ["fabric", "neoforge", "forge"]
+content = ["blocks", "items", "screens", "assets", "interactions"]
+permissions = [
+  "register_blocks",
+  "register_items",
+  "open_screens",
+  "load_assets",
+  "send_interactions",
+]
+```
+
+Schema 1 is closed and shared by all three loaders. Each content kind requires
+its matching permission. A plugin may declare at most eight bundles; each
+artifact is capped at 64 MiB, uses a relative canonical path, and carries a
+lowercase 64-character SHA-256. The cache identity is
+`plugin-id:bundle-id/version/sha256`, so changing bytes requires a new identity
+even if an operator reuses a display version.
+
+When at least one bundle is declared, Solaris sends the combined manifest
+during Configuration. The client must acknowledge protocol 1, its exact
+platform and loader version, all required permissions, and every cache identity
+before the server accepts `AcknowledgeFinishConfiguration`. A server with no
+client bundles sends no Solaris Loader payload and preserves the vanilla
+configuration path.
+
+The Fabric, NeoForge, and Forge clients register these Configuration payloads
+through their native 26.1.2 networking APIs and delegate the received bytes to
+the same Java validator. On first contact with an exact normalized server
+address and permission set, each adapter opens the native Minecraft confirmation
+screen. The shared core stores the allow or deny decision in
+`permissions.properties` under the Loader cache. Decisions are not shared
+between server addresses, and a changed permission set prompts again. The cache
+defaults to `~/.solaris/loader-cache`; `solaris.loader.cacheDir` overrides it.
+The server gives this Loader-only Configuration exchange two minutes; unrelated
+pre-Play phases retain their ten-second read timeout.
+
+If an exact cache identity is absent or its file fails the declared size/hash,
+the client requests that identity on `solaris:loader/request`. The server
+streams only the matching plugin artifact in bounded
+`solaris:loader/artifact` chunks. The client requires contiguous offsets,
+stages in the final cache filesystem, verifies exact size and SHA-256, and uses
+an atomic move before including the identity in `solaris:loader/ack`. Plugin
+startup also rejects a missing, escaping, wrong-size, or wrong-hash source
+artifact.
+
+A denial emits no artifact request, creates no staging file, and disconnects
+without acknowledgement. Once every cache file is verified, the client reads a
+closed `solaris-client.json` index from the first ZIP entry. The implemented
+index schema accepts owned `screens` (`id`, `title`, `body`, optional
+`item_id`/`block_id`), one owned `blocks` entry (`id`, `model`, `name`), up to 128
+owned `items` (`id`, `base_item`, `name`), and `assets`
+(`id`, canonical `assets/...` path, exact SHA-256, and exact byte size), rejects
+all undeclared archive entries, and bounds the activated registry to 64 screens,
+one block, 128 items, 128 assets, and 64 MiB of asset bytes. A block requires
+`register_blocks` and its exact verified owner model under
+`assets/<namespace>/models/<path>.json`. Every item requires
+`register_items`, a known `minecraft:*` base item, and its exact verified
+`assets/<namespace>/items/<path>.json` definition. It also accepts up to 64 owned
+`interactions` (`id`, `screen_id`, `label`, `payload`). An interaction must
+reference a screen declared by the same bundle; one screen has at most eight
+actions, labels are at most 64 bytes, and the UTF-8 payload is at most 4 KiB.
+Fabric, NeoForge, and Forge publish the same immutable registry before
+acknowledgement and retain it into Play. Denied, malformed, or unverified
+bundles never publish content. A plugin
+whose bundle declares
+`screens` plus `open_screens` may call
+`solaris.open_client_screen(player_id, "plugin-id:screen-id")`. Solaris routes
+that Play payload only to the exact player session that completed the Loader
+acknowledgement; vanilla, disconnected, closed, and unknown sessions are
+rejected. Fabric, NeoForge, and Forge resolve the id only from the activated
+registry belonging to the packet's exact originating connection and open the
+bounded title/body screen on the client thread. All three clients clear the
+registry on logout before another server connection can reuse the process.
+Every verified asset path under `assets/<namespace>/...` is also published as
+that exact Minecraft resource id through one transient required pack. The
+client sends the Loader acknowledgement only after the pack reload exposes the
+exact verified bytes. A close event from that same Configuration connection
+removes the pack and reloads resources; a stale close cannot remove a newer
+connection's pack.
+
+An activated screen renders its declared interactions as buttons. Pressing one
+sends `solaris:loader/interaction` only if the screen definition and originating
+connection are still current. Solaris accepts the bounded action only from that
+player's exact Loader-acknowledged Play session, requires an owner bundle with
+`interactions` plus `send_interactions`, and targets only that owner plugin's
+Lua `on_loader_interaction(event)` handler. The event fields are `player_id`,
+`interaction_id`, and `payload`. Client payloads remain untrusted plugin input;
+the namespace fence prevents one bundle from addressing another plugin.
+
+When a screen references an activated item, Fabric, NeoForge, and Forge build
+the same local vanilla stack after the verified resource pack reload, assign
+the item's owner-namespaced Minecraft 26.1.2 `ITEM_MODEL` plus declared name,
+and render it with the standard item widget. This presentation path does not
+mutate the frozen item registry. The block-specific server grant is described
+below; player-driven item use is not part of the current slice.
+
+The block prototype pre-registers one `solaris_loader:loader_block` block/item
+carrier before registry freeze on Fabric, NeoForge, and Forge. Once the verified
+pack is visible, deterministic carrier blockstate/item definitions point to the
+declared owner model. A screen referencing `block_id` renders that block through
+the standard block item. For a block bundle, `solaris:loader/ack` also carries
+the exact non-negative 26.1.2 runtime id of that pre-registered carrier state.
+At startup Solaris reads the one owned block id from the first index entry of
+the already size/SHA-verified plugin artifact. ACK validation binds that owner
+id to the reported carrier state only for the exact acknowledged Play session;
+a missing, unexpected, or non-VarInt state is rejected. This is not a
+vanilla-block substitution. Solaris keeps one full, opaque, non-emitting
+canonical server-owned state after the frozen vanilla state range in the
+server block and light tables and projects it through the exact session's
+mapping in both block updates and chunk palettes. Projected chunk frames are
+not shared across sessions. The owning
+host-attested plugin can place that exact canonical state with
+`solaris.place_loader_block("plugin-id:block-id", x, y, z)`. Solaris rejects a
+foreign or unknown block id and commits accepted coordinates through the
+server-owned block-edit transaction, so world storage never contains a client
+runtime id. The same exact owner can call
+`solaris.grant_loader_block_item(player_id, "plugin-id:block-id", count)` with
+`count` in `1..=64`. The target must be the exact live session that
+acknowledged that block carrier. Solaris merges a canonical
+`minecraft:paper` stack carrying the verified block name and
+`solaris_loader:loader_block` `ITEM_MODEL` into the player's normal inventory,
+persists it before publication, and leaves a full inventory unchanged.
+When that exact stack is used on a block, only the live session that
+acknowledged the carrier may resolve it to the canonical owner block. Solaris
+then reuses normal survival placement validation and atomically commits the
+world edit plus one-item debit through the canonical player persistence path.
+Wrong-model, wrong-base, unacknowledged, stale-hand, and rejected placements
+leave both world and inventory unchanged. Survival breaking that canonical
+Loader state now replaces ordinary loot planning with the same named
+`minecraft:paper` plus `solaris_loader:loader_block` presentation. The
+authoritative item entity carries `CUSTOM_NAME` and `ITEM_MODEL` through wire
+publication, entity persistence, partial claims, and the existing simulation
+owner pickup/inventory commit; no Loader-specific direct inventory credit is
+used. A missing ACK or a different canonical state cannot select this drop.
+Multiple simultaneous block carriers remain a later slice.
 
 Plugin ids use lowercase ASCII letters, digits, `_`, `-`, or `.`. Command roots
 remain lowercase ASCII literals of at most 64 bytes. Plugin command roots are
@@ -291,6 +490,8 @@ solaris.broadcast(text)
 solaris.disconnect(player_id, reason)
 solaris.run_console(command)
 solaris.spawn_entity(player_id, entity_type, x, y, z)
+solaris.place_loader_block(block_id, x, y, z)
+solaris.grant_loader_block_item(player_id, block_id, count)
 ```
 
 Plugins with `player_queries` may request one bounded point-in-time snapshot:
@@ -476,6 +677,29 @@ players, and 262,144 memberships. A request beyond a bound is rejected without
 partial mutation and logged by the production router. These bounds are server
 admission limits, not operator-configured worker percentages.
 
+## Ownership Routing
+
+Lua commands never contain region keys, leases, epochs, locks, sockets, or
+worker handles. The server resolves ownership after admitting the bounded DTO:
+
+- entity spawn enters the simulation owner;
+- villager binding and orders enter the current regional entity owner;
+- menus, teleports, and standalone player-inventory transactions enter the
+  target player's ordered session lane;
+- plugin storage enters its serial durable actor.
+
+A standalone `player_inventory_transaction` completes only after the exact
+session owner plans against its live inventory and updates the durable player
+mirror. A missing or dropped owner command returns `player_unavailable` without
+mutation; an unavailable world runtime returns `runtime_unavailable`. Standalone
+owner commands and compound inventory/storage transactions share one internal
+session gate, so compound planning cannot overtake an earlier owner command. The
+compound `inventory_storage_transaction` remains a separate typed coordinator
+with an internal player-lifetime fence because its durable storage mutation and
+inventory mutation must never publish separately. Neither path exposes its
+coordination mechanism to Lua. There is no generic mutable-world transaction or
+coroutine suspension API.
+
 ## Shipped Economy And Claims
 
 `examples/plugins/basic-economy` uses one configurable physical item, such as
@@ -521,9 +745,16 @@ every chest/furnace click rechecks all backing block positions so a policy
 created after opening still denies mutation. Explosion planning takes one
 immutable generic zone-protection snapshot after claiming due explosions and
 before the world lock; it does not copy zones on idle ticks or lock the registry
-per candidate block. Piston movement and fire spread are not implemented
-gameplay mutations yet; their future commit paths must consume the same ambient
-protection snapshot before publication.
+per candidate block. Random fire ticks use the same immutable snapshot before
+planning one bounded adjacent burn into common fuel; protected targets are not
+mutated and no zone lock enters the random-tick candidate loop. This is the
+baseline mutation/protection path, not the complete vanilla fire material and
+odds table. Direct lever/button power can extend or retract one normal piston
+and move one common propertyless full block. Its base/head/destination edits are
+one atomic group and consume the ambient protection snapshot in both direct
+interaction and scheduled button-release planning; one protected position
+rejects the whole group. Sticky pistons, multi-block chains, slime/honey, and
+moving-block animation are not part of this baseline.
 
 Player teleports are same-dimension authoritative mutations:
 

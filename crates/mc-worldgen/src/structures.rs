@@ -5,7 +5,9 @@ use bytes::Bytes;
 use flate2::read::GzDecoder;
 use mc_data::Identifier;
 use mc_data::items::ItemRegistry;
-use mc_data::worldgen_structures::StructureSetFacts;
+use mc_data::worldgen_structures::{
+    StructureDataError, StructureSetFacts, load_structure_set_facts,
+};
 use mc_nbt::{ListTag, Tag};
 use mc_world::{BlockRegistry, BlockStateId, ChestBlockEntity, FurnaceSlot};
 use thiserror::Error;
@@ -34,6 +36,12 @@ pub enum StructureError {
     UnknownState { path: String, block: Identifier },
     #[error("Solaris playable ruin references missing item {item}")]
     MissingPlayableRuinItem { item: Identifier },
+    #[error(
+        "plains village templates expose {available} villager slots for {requested} planned inhabitants"
+    )]
+    MissingVillagerSlots { requested: usize, available: usize },
+    #[error(transparent)]
+    StructureData(#[from] StructureDataError),
 }
 
 #[derive(Debug, Clone)]
@@ -41,6 +49,7 @@ pub struct StructureTemplate {
     size: [i32; 3],
     blocks: Vec<TemplateBlock>,
     chests: Vec<TemplateChest>,
+    villager_markers: Vec<[i32; 3]>,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -62,6 +71,7 @@ impl StructureTemplate {
             size,
             blocks,
             chests: Vec::new(),
+            villager_markers: Vec::new(),
         }
     }
 
@@ -117,13 +127,66 @@ impl StructureTemplate {
         &self.chests
     }
 
+    #[must_use]
+    pub fn villager_markers(&self) -> &[[i32; 3]] {
+        &self.villager_markers
+    }
+
     fn from_tag(path: &str, root: &Tag, registry: &BlockRegistry) -> Result<Self, StructureError> {
         let compound = expect_compound(path, root, "root")?;
         let size = expect_int_triplet(path, require(compound, path, "size")?, "size")?;
         let palette = parse_palette(path, require(compound, path, "palette")?, registry)?;
-        let blocks = parse_blocks(path, require(compound, path, "blocks")?, &palette)?;
-        Ok(Self::new(size, blocks))
+        let (blocks, villager_markers) =
+            parse_blocks(path, require(compound, path, "blocks")?, &palette)?;
+        let mut template = Self::new(size, blocks);
+        template.villager_markers = villager_markers;
+        Ok(template)
     }
+
+    fn combine(parts: Vec<(Self, [i32; 3])>) -> Self {
+        let mut size = [0; 3];
+        let mut blocks = Vec::new();
+        let mut chests = Vec::new();
+        let mut villager_markers = Vec::new();
+        for (part, offset) in parts {
+            for axis in 0..3 {
+                size[axis] = size[axis].max(offset[axis] + part.size[axis]);
+            }
+            blocks.extend(part.blocks.into_iter().map(|mut block| {
+                for (coordinate, delta) in block.pos.iter_mut().zip(offset.iter()) {
+                    *coordinate += delta;
+                }
+                block
+            }));
+            chests.extend(part.chests.into_iter().map(|mut chest| {
+                for (coordinate, delta) in chest.pos.iter_mut().zip(offset.iter()) {
+                    *coordinate += delta;
+                }
+                chest
+            }));
+            villager_markers.extend(part.villager_markers.into_iter().map(|mut marker| {
+                for (coordinate, delta) in marker.iter_mut().zip(offset.iter()) {
+                    *coordinate += delta;
+                }
+                marker
+            }));
+        }
+        Self {
+            size,
+            blocks,
+            chests,
+            villager_markers,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StructureInhabitant {
+    pub id: String,
+    pub entity_type: String,
+    pub villager_kind: String,
+    pub profession: String,
+    pub level: u8,
 }
 
 #[derive(Debug, Clone)]
@@ -133,6 +196,27 @@ pub struct StructureRules {
     separation_chunks: i32,
     salt: u64,
     fixed_center: Option<(i32, i32)>,
+    inhabitants: Vec<StructureInhabitant>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PlainsVillagePrototypePart {
+    Fountain,
+    SmallHouse,
+    Toolsmith,
+}
+
+impl PlainsVillagePrototypePart {
+    const fn source(self) -> (&'static str, [i32; 3]) {
+        match self {
+            Self::Fountain => (
+                "village/plains/town_centers/plains_fountain_01.nbt",
+                [0, 0, 0],
+            ),
+            Self::SmallHouse => ("village/plains/houses/plains_small_house_1.nbt", [12, 0, 0]),
+            Self::Toolsmith => ("village/plains/houses/plains_tool_smith_1.nbt", [0, 0, 12]),
+        }
+    }
 }
 
 impl StructureRules {
@@ -144,6 +228,7 @@ impl StructureRules {
             separation_chunks: 8,
             salt: 0x9E37_8731_2B17,
             fixed_center: None,
+            inhabitants: Vec::new(),
         }
     }
 
@@ -157,7 +242,75 @@ impl StructureRules {
             separation_chunks: 8,
             salt: 10_387_312,
             fixed_center: None,
+            inhabitants: Vec::new(),
         }
+    }
+
+    /// One bounded village prototype assembled from unmodified vanilla NBT
+    /// templates and vanilla village spacing data.
+    pub fn plains_village_prototype(
+        vanilla_data_dir: impl AsRef<Path>,
+        blocks: &BlockRegistry,
+    ) -> Result<Self, StructureError> {
+        Self::plains_village_prototype_with_parts(
+            vanilla_data_dir,
+            blocks,
+            &[
+                PlainsVillagePrototypePart::Fountain,
+                PlainsVillagePrototypePart::SmallHouse,
+                PlainsVillagePrototypePart::Toolsmith,
+            ],
+        )
+    }
+
+    pub fn plains_village_prototype_with_parts(
+        vanilla_data_dir: impl AsRef<Path>,
+        blocks: &BlockRegistry,
+        parts: &[PlainsVillagePrototypePart],
+    ) -> Result<Self, StructureError> {
+        let vanilla_data_dir = vanilla_data_dir.as_ref();
+        let structure_root = vanilla_data_dir.join("data/minecraft/structure");
+        let parts = parts
+            .iter()
+            .copied()
+            .map(PlainsVillagePrototypePart::source)
+            .map(|(path, offset)| {
+                StructureTemplate::from_nbt_file(structure_root.join(path), blocks)
+                    .map(|template| (template, offset))
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        let facts = load_structure_set_facts(vanilla_data_dir.join("data/minecraft/worldgen"))?;
+        Ok(
+            Self::plains_village_markers(vec![StructureTemplate::combine(parts)])
+                .with_structure_set_facts(&facts),
+        )
+    }
+
+    pub fn plains_village_prototype_with_plan(
+        vanilla_data_dir: impl AsRef<Path>,
+        blocks: &BlockRegistry,
+        parts: &[PlainsVillagePrototypePart],
+        inhabitants: Vec<StructureInhabitant>,
+    ) -> Result<Self, StructureError> {
+        let mut rules = Self::plains_village_prototype_with_parts(vanilla_data_dir, blocks, parts)?;
+        let available = rules
+            .templates
+            .first()
+            .map_or(0, |template| template.villager_markers.len());
+        if inhabitants.len() > available {
+            return Err(StructureError::MissingVillagerSlots {
+                requested: inhabitants.len(),
+                available,
+            });
+        }
+        rules.inhabitants = inhabitants;
+        Ok(rules)
+    }
+
+    #[must_use]
+    pub fn with_fixed_center(mut self, center: (i32, i32)) -> Self {
+        self.fixed_center = Some(center);
+        self
     }
 
     /// A Solaris-owned reward ruin for the seed-zero playable loop.
@@ -211,6 +364,7 @@ impl StructureRules {
             salt: 0x0053_4F4C_4152_4953,
             // Chunk (4, 0): 4.5 chunks east of spawn, inside one generated chunk.
             fixed_center: Some((72, 8)),
+            inhabitants: Vec::new(),
         })
     }
 
@@ -264,6 +418,11 @@ impl StructureRules {
         self.fixed_center
     }
 
+    #[must_use]
+    pub fn inhabitants(&self) -> &[StructureInhabitant] {
+        &self.inhabitants
+    }
+
     #[cfg(test)]
     pub(crate) fn fixed_for_test(template: StructureTemplate, center: (i32, i32)) -> Self {
         Self {
@@ -272,6 +431,7 @@ impl StructureRules {
             separation_chunks: 8,
             salt: 0,
             fixed_center: Some(center),
+            inhabitants: Vec::new(),
         }
     }
 }
@@ -310,11 +470,18 @@ impl Default for StructureRules {
     }
 }
 
+#[derive(Debug, Clone, Copy)]
+enum TemplatePaletteEntry {
+    Block(BlockStateId),
+    Jigsaw,
+    Ignored,
+}
+
 fn parse_palette(
     path: &str,
     tag: &Tag,
     registry: &BlockRegistry,
-) -> Result<Vec<Option<BlockStateId>>, StructureError> {
+) -> Result<Vec<TemplatePaletteEntry>, StructureError> {
     let list = expect_list(path, tag, "palette")?;
     list.elements
         .iter()
@@ -326,18 +493,18 @@ fn parse_palette_entry(
     path: &str,
     entry: &Tag,
     registry: &BlockRegistry,
-) -> Result<Option<BlockStateId>, StructureError> {
+) -> Result<TemplatePaletteEntry, StructureError> {
     let compound = expect_compound(path, entry, "palette[]")?;
     let name = expect_string(path, require(compound, path, "Name")?, "Name")?;
     let id = Identifier::parse(name.clone()).map_err(|_| StructureError::InvalidField {
         path: path.to_string(),
         field: "palette[].Name",
     })?;
-    if matches!(
-        id.as_str(),
-        "minecraft:air" | "minecraft:jigsaw" | "minecraft:structure_void"
-    ) {
-        return Ok(None);
+    if id.as_str() == "minecraft:jigsaw" {
+        return Ok(TemplatePaletteEntry::Jigsaw);
+    }
+    if matches!(id.as_str(), "minecraft:air" | "minecraft:structure_void") {
+        return Ok(TemplatePaletteEntry::Ignored);
     }
     let props = match compound.iter().find(|(key, _)| key == "Properties") {
         Some((_, tag)) => parse_properties(path, tag)?,
@@ -351,7 +518,7 @@ fn parse_palette_entry(
     }
     registry
         .by_name_and_props(&id, &props)
-        .map(Some)
+        .map(TemplatePaletteEntry::Block)
         .ok_or_else(|| StructureError::UnknownState {
             path: path.to_string(),
             block: id,
@@ -374,10 +541,11 @@ fn parse_properties(path: &str, tag: &Tag) -> Result<Vec<(String, String)>, Stru
 fn parse_blocks(
     path: &str,
     tag: &Tag,
-    palette: &[Option<BlockStateId>],
-) -> Result<Vec<TemplateBlock>, StructureError> {
+    palette: &[TemplatePaletteEntry],
+) -> Result<(Vec<TemplateBlock>, Vec<[i32; 3]>), StructureError> {
     let list = expect_list(path, tag, "blocks")?;
     let mut blocks = Vec::new();
+    let mut villager_markers = Vec::new();
     for entry in &list.elements {
         let compound = expect_compound(path, entry, "blocks[]")?;
         let pos = expect_int_triplet(path, require(compound, path, "pos")?, "blocks[].pos")?;
@@ -389,11 +557,36 @@ fn parse_blocks(
                     path: path.to_string(),
                     field: "blocks[].state",
                 })?;
-        if let Some(state) = state {
-            blocks.push(TemplateBlock { pos, state: *state });
+        match state {
+            TemplatePaletteEntry::Block(state) => {
+                blocks.push(TemplateBlock { pos, state: *state });
+            }
+            TemplatePaletteEntry::Jigsaw if is_plains_villager_jigsaw(compound) => {
+                villager_markers.push(pos);
+            }
+            TemplatePaletteEntry::Jigsaw | TemplatePaletteEntry::Ignored => {}
         }
     }
-    Ok(blocks)
+    Ok((blocks, villager_markers))
+}
+
+fn is_plains_villager_jigsaw(compound: &[(String, Tag)]) -> bool {
+    compound
+        .iter()
+        .find(|(key, _)| key == "nbt")
+        .and_then(|(_, tag)| match tag {
+            Tag::Compound(fields) => Some(fields),
+            _ => None,
+        })
+        .is_some_and(|fields| {
+            fields.iter().any(|(key, value)| {
+                key == "pool"
+                    && matches!(
+                        value,
+                        Tag::String(pool) if pool == "minecraft:village/plains/villagers"
+                    )
+            })
+        })
 }
 
 fn require<'a>(
@@ -516,6 +709,84 @@ mod tests {
                 .iter()
                 .all(|block| registry.by_id(block.state).is_some())
         );
+    }
+
+    #[test]
+    fn loads_real_plains_village_prototype_when_present() {
+        let vanilla = workspace_path("data/vanilla");
+        let blocks_path = vanilla.join("reports/blocks.json");
+        let fountain = vanilla
+            .join("data/minecraft/structure/village/plains/town_centers/plains_fountain_01.nbt");
+        if !blocks_path.exists() || !fountain.exists() {
+            return;
+        }
+        let report = mc_data::blocks::load_blocks_report(&blocks_path).unwrap();
+        let registry = BlockRegistry::from_report(&report).unwrap();
+
+        let rules = StructureRules::plains_village_prototype(&vanilla, &registry).unwrap();
+
+        assert_eq!(rules.templates().len(), 1);
+        assert!(rules.templates()[0].size()[0] > 16);
+        assert!(rules.templates()[0].size()[2] > 16);
+        assert!(rules.templates()[0].blocks().len() > 200);
+        assert!(!rules.templates()[0].villager_markers().is_empty());
+        assert_eq!(rules.grid_chunks(), 34);
+        assert_eq!(rules.separation_chunks(), 8);
+        assert_eq!(rules.salt(), 10_387_312);
+    }
+
+    #[test]
+    fn plains_village_plan_selects_only_declared_building_parts_when_present() {
+        let vanilla = workspace_path("data/vanilla");
+        let blocks_path = vanilla.join("reports/blocks.json");
+        let fountain = vanilla
+            .join("data/minecraft/structure/village/plains/town_centers/plains_fountain_01.nbt");
+        if !blocks_path.exists() || !fountain.exists() {
+            return;
+        }
+        let report = mc_data::blocks::load_blocks_report(&blocks_path).unwrap();
+        let registry = BlockRegistry::from_report(&report).unwrap();
+
+        let rules = StructureRules::plains_village_prototype_with_parts(
+            &vanilla,
+            &registry,
+            &[PlainsVillagePrototypePart::Fountain],
+        )
+        .unwrap();
+
+        assert_eq!(rules.templates().len(), 1);
+        assert_eq!(rules.templates()[0].size(), [9, 4, 9]);
+        assert!(rules.templates()[0].blocks().len() > 100);
+    }
+
+    #[test]
+    fn combined_templates_keep_stable_offsets() {
+        let combined = StructureTemplate::combine(vec![
+            (
+                StructureTemplate::new(
+                    [2, 1, 1],
+                    vec![TemplateBlock {
+                        pos: [1, 0, 0],
+                        state: BlockStateId(1),
+                    }],
+                ),
+                [0, 0, 0],
+            ),
+            (
+                StructureTemplate::new(
+                    [1, 2, 1],
+                    vec![TemplateBlock {
+                        pos: [0, 1, 0],
+                        state: BlockStateId(2),
+                    }],
+                ),
+                [4, 0, 3],
+            ),
+        ]);
+
+        assert_eq!(combined.size(), [5, 2, 4]);
+        assert_eq!(combined.blocks()[0].pos, [1, 0, 0]);
+        assert_eq!(combined.blocks()[1].pos, [4, 1, 3]);
     }
 
     #[test]

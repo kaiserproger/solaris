@@ -54,7 +54,8 @@ What is now **permitted**:
 - The JSON contents of `data/minecraft/**` inside the vanilla server
   jar (registries, tags, loot tables, recipes, worldgen JSON).
 - Binary NBT structures (`data/minecraft/structure/**/*.nbt`) used as
-  worldgen building blocks, when we eventually need them in M4+.
+  worldgen building blocks. The first production consumer combines three
+  extracted plains-village templates behind a bounded plugin startup profile.
 - Pack metadata files (`pack.mcmeta`).
 
 ## Consequences

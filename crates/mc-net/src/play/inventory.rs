@@ -322,6 +322,7 @@ pub(crate) fn can_stack(left: &ItemStack, right: &ItemStack) -> bool {
         && left.item_id == right.item_id
         && left.damage == right.damage
         && left.custom_name == right.custom_name
+        && left.item_model == right.item_model
         && enchantments_equal_in_canonical_order(&left.enchantments, &right.enchantments)
 }
 

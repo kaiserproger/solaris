@@ -2,6 +2,7 @@ use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
+use mc_test_harness::replay::ReplayScenarioManifest;
 use serde_json::{Value, json};
 
 const M94_MANIFEST: &str =
@@ -361,6 +362,35 @@ fn core_replay_real_client_prepare_copies_canonical_manifest() {
         .expect("read prepared automation metadata");
     assert!(automation.contains("core_replay_manifest=core-replay-manifest.json"));
     assert!(automation.contains("client_adapter_task=:fabric-agent:runClientAgent"));
+}
+
+#[test]
+fn core_replay_core_gate_manifest_supports_compact_ledger_rows_and_evidence_legs() {
+    let repo_root = repo_root();
+    let core_manifest = repo_root.join("tools/core-replay-scenarios/core-actions-seed-81.json");
+    let mut scenario: Value = serde_json::from_slice(
+        &std::fs::read(&core_manifest).expect("read core replay scenario manifest"),
+    )
+    .expect("core replay scenario manifest parses");
+
+    let mut compact = scenario.clone();
+    compact["ledger_rows"] = json!(["Q1", "Q2", "Q3"]);
+    compact["evidence_legs"] = json!([
+        "protocol-session",
+        "oracle-comparison",
+        "real-client-observation"
+    ]);
+    ReplayScenarioManifest::from_json(&compact.to_string())
+        .expect("core replay scenario supports compact evidence contract");
+
+    let mut bad = scenario.clone();
+    bad["ledger_rows"] = json!(["Q1", "Q2"]);
+    bad["evidence_legs"] = json!(["protocol-session"]);
+    assert!(
+        ReplayScenarioManifest::from_json(&bad.to_string()).is_err(),
+        "compact rows and evidence legs mismatch must fail"
+    );
+    assert!(compact["id"].as_str().is_some_and(|id| id == "core-actions-seed-81"));
 }
 
 #[test]

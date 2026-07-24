@@ -522,6 +522,7 @@ impl SessionRegistry {
             lifecycle_clock,
             regional_sequence_watermark,
             records,
+            settlement_claims,
         } = checkpoint;
         self.entities
             .restore_checkpoint_boundary(lifecycle_clock, regional_sequence_watermark);
@@ -532,6 +533,7 @@ impl SessionRegistry {
             return 0;
         }
         inner.entity_lifecycle_tick = lifecycle_clock;
+        inner.settlement_spawn_claims = settlement_claims;
         if current_clock != lifecycle_clock {
             self.entity_lifecycle_tick
                 .store(lifecycle_clock, Ordering::Release);
@@ -599,7 +601,12 @@ impl SessionRegistry {
         #[cfg(test)]
         self.pause_before_entity_save_owner_barrier_for_test();
         let saved = owner_result(self.entities.handle.save_barrier());
-        project_owner_save(saved, &metadata)
+        let (mut checkpoint, phases) = project_owner_save(saved, &metadata);
+        checkpoint.settlement_claims = self
+            .lock_inner("snapshot settlement spawn claims")
+            .settlement_spawn_claims
+            .clone();
+        (checkpoint, phases)
     }
 
     #[cfg(test)]

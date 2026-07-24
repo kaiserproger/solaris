@@ -15,6 +15,7 @@ notes record progress; they do not silently change an ADR.
 | [0007](0007-connection-liveness-under-outbound-pressure.md) | Accepted | Keepalive liveness and bounded entity movement publication under pressure |
 | [0008](0008-overworld-density-router.md) | Accepted, staged extraction | Single worldgen shape authority and deterministic chunk pipeline |
 | [0009](0009-regional-plugin-boundary.md) | Accepted, staged implementation | Regional simulation stays behind serial plugin semantics and transactional commands |
+| [0010](0010-solaris-loader-contract.md) | Accepted, staged implementation | Shared untrusted client-bundle manifest, Configuration handshake, permissions, and cache identity |
 
 ## Routing
 
@@ -27,6 +28,8 @@ notes record progress; they do not silently change an ADR.
 - Connection liveness, keepalive timeout, or client movement pressure: 0007.
 - Worldgen topology, climate, rivers, caves, or feature-pipeline ownership: 0008.
 - Lua execution, plugin event ordering, consistency, or regional API exposure: 0009.
+- Client bundle manifests, loader negotiation, artifact trust, permissions, or
+  cache identity: 0010.
 
 Update the owning ADR in the same slice when authority, threading, waiting,
 persistence ordering, or module policy changes. State non-goals and staged

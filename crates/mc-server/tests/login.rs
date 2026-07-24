@@ -70,6 +70,7 @@ async fn start_server_with_policy_and_permissions(
         chunk_pipeline,
         random_tick: mc_net::RandomTickPolicy::default(),
         command_permissions,
+        loader_manifest: None,
         shutdown: mc_net::ShutdownHandle::default(),
     };
     let bound = mc_net::bind(cfg).await.expect("bind");

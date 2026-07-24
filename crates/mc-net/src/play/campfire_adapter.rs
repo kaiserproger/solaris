@@ -139,6 +139,7 @@ where
         damage: held.damage,
         enchantments: held.enchantments.clone(),
         custom_name: None,
+        item_model: None,
     };
     let expected = state.sessions.campfire_cooking_state(position);
     let mut cooking = expected.clone();

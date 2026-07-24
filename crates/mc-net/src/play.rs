@@ -91,6 +91,7 @@ use crate::chunk_pipeline::ChunkPipelineResources;
 use crate::configuration::ConfigurationCustomPayload;
 use crate::connection::{read_frame, write_packet};
 use crate::error::ConnectionError;
+use crate::loader::loader_interaction_channel;
 use crate::login::LoggedInProfile;
 use crate::script::PluginZoneAdapter;
 use crate::server::{ExtensionEventSink, ScriptEventSink, ServerConfig, WorldHandle};
@@ -425,7 +426,8 @@ use session::{
     EntityAttackOutcome, OutboundCommand, OutboundLightUpdate, PlayerAttackResult,
     PlayerEntitySnapshot, ScriptMenuCloseRequest, ScriptMenuOpenRequest, ServerEntityMove,
     ServerEntitySnapshot, SessionAdmissionError, SessionId, SessionRegistration, SleepOutcome,
-    VisibilityDispatch, dispatch_visibility_commands, publish_script_menu_click,
+    VisibilityDispatch, apply_loader_item_grant, apply_script_player_inventory_transaction,
+    dispatch_visibility_commands, publish_script_menu_click,
 };
 #[cfg(test)]
 use session::{PlayerDamagePublication, PlayerInventorySlotDelta, within_block_reach};
@@ -450,8 +452,10 @@ use survival::{
     food_rule_for_item, is_durability_tool_path, max_tool_damage_for_path,
 };
 #[cfg(test)]
+use toggles::plan_toggle_block_interaction;
+#[cfg(test)]
 use toggles::toggled_bool_state;
-use toggles::{ToggleBlockPlan, plan_toggle_block_interaction};
+use toggles::{ToggleBlockPlan, plan_toggle_block_interaction_with_protection};
 #[cfg(test)]
 use use_item_on_adapter::{
     UseItemOnNoOpReason, UseItemOnOutcome, UseItemOnResyncOptions, classify_use_item_on_preflight,
@@ -899,6 +903,15 @@ pub(super) struct HerdSpawn {
     position: Vec3,
     hostile: bool,
     sheep_color: Option<mc_entity::SheepColor>,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub(super) struct SettlementInhabitantSpawn {
+    claim: String,
+    entity_type_id: i32,
+    entity_type_name: String,
+    position: Vec3,
+    villager: mc_entity::VillagerData,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -1494,6 +1507,7 @@ pub(crate) async fn handle<R, W>(
     runtime_control: Option<RuntimeControlHandle>,
     simulation: SimulationHandle,
     configuration_custom_payloads: Vec<ConfigurationCustomPayload>,
+    loader_session: Option<crate::LoaderSession>,
     extension: Option<ExtensionEventSink>,
     scripts: Option<ScriptEventSink>,
     script_zones: Option<PluginZoneAdapter>,
@@ -1502,6 +1516,7 @@ where
     R: AsyncReadExt + Unpin,
     W: AsyncWriteExt + Unpin,
 {
+    let loader_eligible = loader_session.is_some();
     // `blocks` rides along on the config — currently unused by the
     // Play handler because the chunk encoder reads palette IDs straight
     // from the chunk; it'll matter once we synthesise placeholder
@@ -1565,6 +1580,7 @@ where
         max_sessions: config.max_players as usize,
         script_operator: permissions.op,
         dimension: dim_name.as_str(),
+        loader_session,
     }) {
         Ok(registered) => registered,
         Err(err) => {
@@ -1921,6 +1937,7 @@ where
             selected_hotbar_slot: player_state.selected_hotbar_slot,
             inventory: initial_inventory,
             carried_item: player_state.carried_item.clone(),
+            player_persistence: Arc::clone(&player_save_state),
             inventory_state_id: 1,
             inventory_quickcraft: QuickCraftState::default(),
             items: Arc::clone(&config.items),
@@ -1930,6 +1947,7 @@ where
             tags: Arc::clone(&config.tags),
             recipes,
             loot: Arc::clone(&config.loot),
+            script_zones: script_zones.clone(),
             next_container_id: FURNACE_CONTAINER_ID_MIN,
             active_container: None,
             pending_break: None,
@@ -1980,6 +1998,7 @@ where
             player_simulation,
             config,
             session_id,
+            loader_eligible,
             initial_pose,
             respawn_pose,
             respawn,
@@ -2046,6 +2065,8 @@ struct InteractionState {
     inventory: PlayerInventory,
     /// Server-authoritative cursor stack for vanilla container clicks.
     carried_item: ItemStack,
+    /// Durable mirror committed only by this exact session owner.
+    player_persistence: Arc<Mutex<PlayerPersistedState>>,
     /// M6.e: per-vanilla, the server bumps this counter on every
     /// inventory mutation it ships to the client; the client uses
     /// it to detect desyncs. Starts at 1 (after the seed
@@ -2061,6 +2082,7 @@ struct InteractionState {
     tags: Arc<TagsData>,
     recipes: Vec<mc_data::recipes::Recipe>,
     loot: Arc<mc_data::loot::LootTables>,
+    script_zones: Option<PluginZoneAdapter>,
     next_container_id: i32,
     active_container: Option<ActiveContainer>,
     pending_break: Option<PendingBreak>,
@@ -2122,6 +2144,7 @@ impl ClientPreferences {
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum PlayCustomPayloadAction {
     Brand(String),
+    LoaderInteraction(Bytes),
     Unknown { channel: String, payload: Bytes },
     Oversized { len: usize },
 }
@@ -2140,6 +2163,9 @@ fn classify_play_custom_payload(
     }
 
     let payload = body.copy_to_bytes(body.remaining());
+    if channel == *loader_interaction_channel() {
+        return Ok(PlayCustomPayloadAction::LoaderInteraction(payload));
+    }
     Ok(PlayCustomPayloadAction::Unknown {
         channel: channel.as_str().to_string(),
         payload,
@@ -2208,7 +2234,7 @@ where
     };
     let update = state_id.map(|state_id| BlockUpdate {
         position,
-        state_id: state_id.0 as i32,
+        state_id: outbound_block_state_id(state, state_id),
     });
     if let Some(update) = update {
         write_packet(writer, &update, state.compression).await?;
@@ -2231,12 +2257,20 @@ where
         .get_cached_block(mc_world::BlockPos { x, y, z })
         .map(|state_id| BlockUpdate {
             position,
-            state_id: state_id.0 as i32,
+            state_id: outbound_block_state_id(state, state_id),
         });
     if let Some(update) = update {
         write_packet(writer, &update, state.compression).await?;
     }
     write_block_ack(writer, state.compression, sequence).await
+}
+
+fn outbound_block_state_id(state: &InteractionState, block_state: mc_world::BlockStateId) -> i32 {
+    state
+        .sessions
+        .loader_block_projection(state.session_id, &state.blocks)
+        .map_or(block_state, |projection| projection.project(block_state))
+        .0 as i32
 }
 
 async fn write_crafting_content<W>(
@@ -3629,6 +3663,50 @@ where
 {
     state.inventory_state_id = state.inventory_state_id.wrapping_add(1);
     write_inventory_content_with_state_id(state, writer, state.inventory_state_id).await
+}
+
+fn commit_session_owner_script_player_inventory(
+    state: &mut InteractionState,
+    transaction: &mc_script::ScriptPlayerInventoryTransaction,
+) -> Result<(), mc_script::ScriptPlayerInventoryFailure> {
+    let items = Arc::clone(&state.items);
+    let item_facts = Arc::clone(&state.item_facts);
+    let player_persistence = Arc::clone(&state.player_persistence);
+    let mut persisted = player_persistence
+        .lock()
+        .unwrap_or_else(|poisoned| {
+            warn!(
+                "player persistence mutex was poisoned during session-owner script inventory commit; recovering state"
+            );
+            poisoned.into_inner()
+        });
+    apply_script_player_inventory_transaction(
+        transaction,
+        &mut state.inventory,
+        &mut persisted,
+        &items,
+        &item_facts,
+    )
+}
+
+fn commit_session_owner_loader_item_grant(
+    state: &mut InteractionState,
+    stack: &ItemStack,
+) -> Result<(), mc_script::ScriptPlayerInventoryFailure> {
+    let items = Arc::clone(&state.items);
+    let item_facts = Arc::clone(&state.item_facts);
+    let player_persistence = Arc::clone(&state.player_persistence);
+    let mut persisted = player_persistence.lock().unwrap_or_else(|poisoned| {
+        warn!("player persistence mutex was poisoned during Loader item grant; recovering state");
+        poisoned.into_inner()
+    });
+    apply_loader_item_grant(
+        stack,
+        &mut state.inventory,
+        &mut persisted,
+        &items,
+        &item_facts,
+    )
 }
 
 async fn write_inventory_content_resync<W>(
@@ -5849,7 +5927,8 @@ where
             count: stack.count,
             damage: stack.damage,
             enchantments: stack.enchantments.clone(),
-            custom_name: None,
+            custom_name: stack.custom_name.as_deref().cloned(),
+            item_model: stack.item_model.as_deref().cloned().map(Arc::new),
         };
         let max_stack = item_max_stack(&state.item_facts, &state.items, &probe);
         let credited = match state
@@ -7474,12 +7553,14 @@ async fn commit_random_tick_region_fanout(
     Ok((outcome, eligible, leaf_drops, fallback))
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn run_random_ticks_owned(
     authority: &simulation::SimulationAuthority,
     config: &ServerConfig,
     sessions: &SessionRegistry,
     access: SimulationWorldAccess<'_>,
     #[cfg(test)] probe: Option<simulation::RegionalBlockEditProbe>,
+    protection: Option<&crate::script::ZoneProtectionSnapshot>,
     world_tick: u64,
     chunk_budget: usize,
 ) -> RandomTickReport {
@@ -7537,8 +7618,9 @@ async fn run_random_ticks_owned(
                     .collect::<Vec<_>>();
                 let snapshot =
                     world_read.snapshot_chunks(&random_tick_planning_chunks(&planning_candidates));
-                let plan =
-                    plan_indexed_random_tick_edits(config, policy, world_tick, &snapshot, &group);
+                let plan = plan_indexed_random_tick_edits(
+                    config, policy, world_tick, &snapshot, &group, protection,
+                );
                 let first = group
                     .first()
                     .expect("random-tick candidate groups are non-empty")
@@ -7611,7 +7693,9 @@ async fn run_random_ticks_owned(
                 candidate.state = state;
             }
         }
-        let plan = plan_indexed_random_tick_edits(config, policy, world_tick, &snapshot, &group);
+        let plan = plan_indexed_random_tick_edits(
+            config, policy, world_tick, &snapshot, &group, protection,
+        );
         // The plan owns every edit and precondition needed below. Releasing the
         // snapshot here lets the resident mutation update its chunk in place.
         drop(snapshot);
@@ -8651,7 +8735,7 @@ fn plan_random_tick_edits(
     candidates: &[RandomTickCandidate],
 ) -> RandomTickPlan {
     let indexed = candidates.iter().copied().enumerate().collect::<Vec<_>>();
-    plan_indexed_random_tick_edits(config, policy, world_tick, snapshot, &indexed)
+    plan_indexed_random_tick_edits(config, policy, world_tick, snapshot, &indexed, None)
 }
 
 #[cfg(test)]
@@ -8665,7 +8749,7 @@ fn plan_random_tick_region_edits(
     random_tick_candidate_groups(candidates)
         .into_iter()
         .map(|candidates| {
-            plan_indexed_random_tick_edits(config, policy, world_tick, snapshot, &candidates)
+            plan_indexed_random_tick_edits(config, policy, world_tick, snapshot, &candidates, None)
         })
         .collect()
 }
@@ -8716,6 +8800,7 @@ fn plan_indexed_random_tick_edits(
     world_tick: u64,
     snapshot: &mc_world::WorldReadSnapshot,
     candidates: &[(usize, RandomTickCandidate)],
+    protection: Option<&crate::script::ZoneProtectionSnapshot>,
 ) -> RandomTickPlan {
     let mut world = SnapshotPlanningWorld::new(snapshot);
     let mut edited_positions = HashSet::new();
@@ -8755,6 +8840,10 @@ fn plan_indexed_random_tick_edits(
         }
         let applied_before = plan.edits.len();
         for edit in edits {
+            if !ambient_random_tick_edit_allowed(family, candidate.sample.pos, edit.pos, protection)
+            {
+                continue;
+            }
             if world.apply(edit) {
                 edited_positions.insert(edit.pos);
                 plan.edits.push(edit);
@@ -8781,6 +8870,19 @@ fn plan_indexed_random_tick_edits(
     }
     plan.preconditions = world.preconditions();
     plan
+}
+
+fn ambient_random_tick_edit_allowed(
+    family: mc_data::block_facts::RandomTickFamily,
+    source: mc_world::BlockPos,
+    target: mc_world::BlockPos,
+    protection: Option<&crate::script::ZoneProtectionSnapshot>,
+) -> bool {
+    family != mc_data::block_facts::RandomTickFamily::Fire
+        || target == source
+        || protection.is_none_or(|protection| {
+            protection.ambient_block_mutation_allowed("minecraft:overworld", target)
+        })
 }
 
 fn snapshot_read_preconditions_are_current(
@@ -9131,14 +9233,16 @@ fn plan_scheduled_block_tick_edits(
     config: &ServerConfig,
     snapshot: &mc_world::WorldReadSnapshot,
     ticks: &[ScheduledBlockTick],
+    protection: Option<&crate::script::ZoneProtectionSnapshot>,
 ) -> Option<ScheduledBlockTickPlan> {
-    plan_scheduled_block_tick_edits_with_blocks(&config.blocks, snapshot, ticks)
+    plan_scheduled_block_tick_edits_with_blocks(&config.blocks, snapshot, ticks, protection)
 }
 
 async fn plan_scheduled_block_regions_off_owner(
     blocks: Arc<BlockRegistry>,
     snapshot: mc_world::WorldReadSnapshot,
     region_ticks: Vec<(RegionKey, Vec<ScheduledBlockTick>)>,
+    protection: Option<Arc<crate::script::ZoneProtectionSnapshot>>,
     cpu_resources: Option<&ChunkPipelineResources>,
 ) -> Result<Vec<ScheduledBlockRegionPlan>, ()> {
     let permit = match cpu_resources {
@@ -9157,8 +9261,13 @@ async fn plan_scheduled_block_regions_off_owner(
             .into_iter()
             .map(|(region, due)| ScheduledBlockRegionPlan {
                 region,
-                plan: plan_scheduled_block_tick_edits_with_blocks(&blocks, &snapshot, &due)
-                    .expect("simple scheduled block region has a plan"),
+                plan: plan_scheduled_block_tick_edits_with_blocks(
+                    &blocks,
+                    &snapshot,
+                    &due,
+                    protection.as_deref(),
+                )
+                .expect("simple scheduled block region has a plan"),
                 due,
             })
             .collect()
@@ -9174,12 +9283,14 @@ async fn plan_scheduled_block_region_off_owner(
     snapshot: mc_world::WorldReadSnapshot,
     region: RegionKey,
     due: Vec<ScheduledBlockTick>,
+    protection: Option<Arc<crate::script::ZoneProtectionSnapshot>>,
     cpu_resources: Option<&ChunkPipelineResources>,
 ) -> Result<ScheduledBlockRegionPlan, ()> {
     let mut plans = plan_scheduled_block_regions_off_owner(
         blocks,
         snapshot,
         vec![(region, due)],
+        protection,
         cpu_resources,
     )
     .await?;
@@ -9541,6 +9652,7 @@ pub(crate) async fn run_scheduled_block_ticks_background(
     config: &ServerConfig,
     sessions: &SessionRegistry,
     access: SimulationWorldAccess<'_>,
+    protection: Option<Arc<crate::script::ZoneProtectionSnapshot>>,
     world_tick: u64,
     budget: usize,
 ) -> ScheduledBlockTickReport {
@@ -9550,6 +9662,7 @@ pub(crate) async fn run_scheduled_block_ticks_background(
         access,
         #[cfg(test)]
         None,
+        protection,
         world_tick,
         budget,
     )
@@ -9561,6 +9674,7 @@ async fn run_scheduled_block_ticks_owned(
     sessions: &SessionRegistry,
     access: SimulationWorldAccess<'_>,
     #[cfg(test)] probe: Option<simulation::RegionalBlockEditProbe>,
+    protection: Option<Arc<crate::script::ZoneProtectionSnapshot>>,
     world_tick: u64,
     budget: usize,
 ) -> ScheduledBlockTickReport {
@@ -9665,6 +9779,7 @@ async fn run_scheduled_block_ticks_owned(
             Arc::clone(&config.blocks),
             snapshot.clone(),
             region_ticks,
+            protection.clone(),
             cpu_resources,
         )
         .await
@@ -9730,6 +9845,7 @@ async fn run_scheduled_block_ticks_owned(
                     current_snapshot,
                     planned.region,
                     region_due,
+                    protection.clone(),
                     cpu_resources,
                 )
                 .await
@@ -9914,7 +10030,7 @@ async fn run_scheduled_block_ticks_owned(
             }
         }
     }
-    let plan = plan_scheduled_block_tick_edits(config, &snapshot, &due);
+    let plan = plan_scheduled_block_tick_edits(config, &snapshot, &due, protection.as_deref());
     #[cfg(test)]
     if !due.is_empty() && plan.is_some() && world.try_lock().is_ok() {
         SCHEDULED_BLOCK_PLANNING_WITHOUT_WRITER_COUNT.with(|count| count.set(count.get() + 1));
@@ -10961,6 +11077,15 @@ fn plan_loaded_toggle_block_interaction(
     pos: mc_world::BlockPos,
     world_tick: u64,
 ) -> Option<ToggleBlockPlan> {
+    let protection = state.script_zones.as_ref().map(|zones| {
+        zones.protection_snapshot().unwrap_or_else(|error| {
+            warn!(
+                ?error,
+                "zone protection snapshot unavailable; denying piston movement"
+            );
+            crate::script::ZoneProtectionSnapshot::unavailable()
+        })
+    });
     let centre = ChunkPos {
         x: pos.x.div_euclid(SECTION_DIM as i32),
         z: pos.z.div_euclid(SECTION_DIM as i32),
@@ -10976,7 +11101,14 @@ fn plan_loaded_toggle_block_interaction(
     }
     let snapshot = state.world_read.snapshot_chunks(&chunks);
     let clicked = snapshot.get_cached_block(pos)?;
-    plan_toggle_block_interaction(&state.blocks, &snapshot, pos, clicked, world_tick)
+    plan_toggle_block_interaction_with_protection(
+        &state.blocks,
+        &snapshot,
+        pos,
+        clicked,
+        world_tick,
+        protection.as_ref(),
+    )
 }
 
 fn adjacent_block_positions(pos: mc_world::BlockPos) -> [mc_world::BlockPos; 6] {
@@ -11821,6 +11953,7 @@ async fn play_loop<R, W>(
     simulation: SimulationHandle,
     config: &ServerConfig,
     session_id: SessionId,
+    loader_eligible: bool,
     player_pose: PlayerPose,
     respawn_pose: PlayerPose,
     respawn: ClientboundRespawn,
@@ -11854,6 +11987,7 @@ where
         simulation,
         config,
         session_id,
+        loader_eligible,
         player_pose,
         respawn_pose,
         respawn,
@@ -11899,6 +12033,7 @@ async fn play_loop_inner<R, W>(
     simulation: SimulationHandle,
     config: &ServerConfig,
     session_id: SessionId,
+    loader_eligible: bool,
     mut player_pose: PlayerPose,
     mut respawn_pose: PlayerPose,
     respawn: ClientboundRespawn,
@@ -12036,7 +12171,9 @@ where
                     match command {
                     Some(OutboundCommand::BlockDeltas(deltas)) => {
                         let deltas = collect_block_delta_batch(deltas, &mut outbound_rx, &mut pending_outbound);
-                        send_block_deltas(writer, compression, &deltas).await?;
+                        let projection = sessions
+                            .loader_block_projection(session_id, &config.blocks);
+                        send_block_deltas(writer, compression, &deltas, projection.as_ref()).await?;
                     }
                     Some(OutboundCommand::LightUpdates(updates)) => {
                         if let Some(state) = interaction.as_deref_mut() {
@@ -12364,6 +12501,51 @@ where
                             &mut pending_teleport,
                         )
                         .await?;
+                    }
+                    Some(OutboundCommand::ScriptPlayerInventoryTransaction(command)) => {
+                        let result = match command.begin_commit() {
+                            Some(_transaction_guard) => match interaction.as_deref_mut() {
+                                Some(state) => commit_session_owner_script_player_inventory(
+                                    state,
+                                    command.transaction(),
+                                ),
+                                None => Err(
+                                    mc_script::ScriptPlayerInventoryFailure::RuntimeUnavailable,
+                                ),
+                            },
+                            None => {
+                                Err(mc_script::ScriptPlayerInventoryFailure::PlayerUnavailable)
+                            }
+                        };
+                        let committed = result.is_ok();
+                        command.complete(result);
+                        if committed
+                            && let Some(state) = interaction.as_deref_mut()
+                        {
+                            write_inventory_content(state, writer).await?;
+                        }
+                    }
+                    Some(OutboundCommand::LoaderItemGrant(command)) => {
+                        let result = match command.begin_commit() {
+                            Some(_transaction_guard) => match interaction.as_deref_mut() {
+                                Some(state) => {
+                                    commit_session_owner_loader_item_grant(state, command.stack())
+                                }
+                                None => Err(
+                                    mc_script::ScriptPlayerInventoryFailure::RuntimeUnavailable,
+                                ),
+                            },
+                            None => {
+                                Err(mc_script::ScriptPlayerInventoryFailure::PlayerUnavailable)
+                            }
+                        };
+                        let committed = result.is_ok();
+                        command.complete(result);
+                        if committed
+                            && let Some(state) = interaction.as_deref_mut()
+                        {
+                            write_inventory_content(state, writer).await?;
+                        }
                     }
                     Some(OutboundCommand::AuthoritativeInventory {
                         inventory,
@@ -13077,6 +13259,23 @@ where
                                 });
                             }
                         }
+                        PlayCustomPayloadAction::LoaderInteraction(payload) => {
+                            if let Err(error) = session::route_client_loader_interaction(
+                                scripts.as_ref(),
+                                session_id,
+                                loader_eligible,
+                                config.loader_manifest.as_deref(),
+                                payload.as_ref(),
+                            )
+                            .await
+                            {
+                                debug!(
+                                    ?error,
+                                    player_id = session_id,
+                                    "Loader interaction rejected"
+                                );
+                            }
+                        }
                         PlayCustomPayloadAction::Unknown { channel, payload } => {
                             if let Some(extension) = extension.as_ref() {
                                 extension.enqueue_custom_payload(
@@ -13373,6 +13572,7 @@ mod campfire_output_recovery_tests {
                 Vec::<String>::new(),
                 true,
             ),
+            loader_manifest: None,
             shutdown: crate::server::ShutdownHandle::default(),
         })
     }

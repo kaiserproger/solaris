@@ -123,6 +123,14 @@ public interface ClientFacade {
 
     void closeCurrentScreen() throws Exception;
 
+    void clickConfirmationButton(String expectedTitle, String buttonLabel) throws Exception;
+
+    void clickScreenButton(
+        String expectedScreenClass,
+        String expectedTitle,
+        String buttonLabel
+    ) throws Exception;
+
     void openInventory() throws Exception;
 
     void respawn(Duration timeout) throws Exception;

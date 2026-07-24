@@ -15,6 +15,8 @@ pub(crate) struct PersistedWorldContract {
     pub(crate) seed: i64,
     pub(crate) mode: String,
     pub(crate) ore_profile: String,
+    #[serde(default = "vanilla_profile")]
+    pub(crate) settlement_profile: String,
     pub(crate) min_y: i32,
     pub(crate) height: i32,
 }
@@ -99,6 +101,7 @@ pub(crate) fn ensure_world_contract(
     seed: i64,
     mode: &str,
     ore_profile: &str,
+    settlement_profile: &str,
 ) -> Result<WorldSource> {
     let path = world_contract_path(world_dir);
     match std::fs::read(&path) {
@@ -117,18 +120,21 @@ pub(crate) fn ensure_world_contract(
                 || persisted.seed != seed
                 || persisted.mode != mode
                 || persisted.ore_profile != ore_profile
+                || persisted.settlement_profile != settlement_profile
             {
                 bail!(
-                    "persisted worldgen revision={} seed={} mode={} ore_profile={} in {} does not match configured revision={} seed={} mode={} ore_profile={}; use a fresh world_dir",
+                    "persisted worldgen revision={} seed={} mode={} ore_profile={} settlement_profile={} in {} does not match configured revision={} seed={} mode={} ore_profile={} settlement_profile={}; use a fresh world_dir",
                     persisted.worldgen_revision,
                     persisted.seed,
                     persisted.mode,
                     persisted.ore_profile,
+                    persisted.settlement_profile,
                     path.display(),
                     mc_worldgen::WORLDGEN_REVISION,
                     seed,
                     mode,
                     ore_profile,
+                    settlement_profile,
                 );
             }
             let stored = mc_world::ChunkGeometry::new(persisted.min_y, persisted.height)
@@ -154,14 +160,21 @@ pub(crate) fn ensure_world_contract(
         }
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
             if world_contains_anvil_data(world_dir)? {
-                if ore_profile != "vanilla" {
+                if ore_profile != "vanilla" || settlement_profile != "vanilla" {
                     bail!(
-                        "worldgen ore profile {ore_profile} cannot be applied to an unversioned Anvil import; use a fresh world_dir"
+                        "worldgen profiles ore={ore_profile} settlement={settlement_profile} cannot be applied to an unversioned Anvil import; use a fresh world_dir"
                     );
                 }
                 return Ok(WorldSource::ExistingVanilla);
             }
-            write_world_contract(&path, configured, seed, mode, ore_profile)?;
+            write_world_contract(
+                &path,
+                configured,
+                seed,
+                mode,
+                ore_profile,
+                settlement_profile,
+            )?;
             Ok(WorldSource::SolarisGenerated)
         }
         Err(error) => Err(error)
@@ -209,6 +222,7 @@ fn write_world_contract(
     seed: i64,
     mode: &str,
     ore_profile: &str,
+    settlement_profile: &str,
 ) -> Result<()> {
     let parent = path
         .parent()
@@ -221,6 +235,7 @@ fn write_world_contract(
         seed,
         mode: mode.to_owned(),
         ore_profile: ore_profile.to_owned(),
+        settlement_profile: settlement_profile.to_owned(),
         min_y: geometry.min_y(),
         height: geometry.height(),
     };
@@ -254,6 +269,10 @@ fn write_world_contract(
         )
     })?;
     sync_metadata_directory(parent)
+}
+
+fn vanilla_profile() -> String {
+    "vanilla".to_owned()
 }
 
 #[cfg(unix)]

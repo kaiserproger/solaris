@@ -66,6 +66,13 @@ mod projectiles;
 #[cfg(test)]
 #[path = "session/projectiles_tests.rs"]
 mod projectiles_tests;
+mod script_client_screen_endpoint;
+#[cfg(test)]
+mod script_client_screen_endpoint_tests;
+mod script_loader_interaction_endpoint;
+#[cfg(test)]
+mod script_loader_interaction_endpoint_tests;
+pub(super) use script_loader_interaction_endpoint::route_client_loader_interaction;
 mod script_colony_endpoint;
 mod script_commit_events;
 mod script_entity_interaction;
@@ -74,6 +81,9 @@ mod script_entity_interaction_tests;
 mod script_inventory_transaction_endpoint;
 #[cfg(test)]
 mod script_inventory_transaction_endpoint_tests;
+mod script_loader_item_endpoint;
+#[cfg(test)]
+mod script_loader_item_endpoint_tests;
 mod script_menu_endpoint;
 #[cfg(test)]
 mod script_menu_endpoint_tests;
@@ -87,6 +97,7 @@ mod script_teleport_endpoint;
 #[cfg(test)]
 mod script_teleport_endpoint_tests;
 mod session_lifecycle;
+mod settlement_authority;
 mod simulation_input_publication;
 #[cfg(test)]
 mod simulation_input_publication_tests;
@@ -186,8 +197,14 @@ use projectiles::resolve_arrow_entity_hits_locked;
 use projectiles::{
     arrow_entity_candidate_snapshots_locked, segment_aabb_intersection_t, spawn_arrow_locked,
 };
+pub(in crate::play) use script_loader_item_endpoint::{
+    LoaderItemGrantCommand, apply_loader_item_grant,
+};
 pub(in crate::play) use script_menu_endpoint::{
     ScriptMenuCloseRequest, ScriptMenuOpenRequest, publish_script_menu_click,
+};
+pub(in crate::play) use script_player_inventory_endpoint::{
+    ScriptPlayerInventoryCommand, apply_script_player_inventory_transaction,
 };
 pub(in crate::play) use script_teleport_endpoint::{
     ScriptPlayerTeleportCommand, ScriptPlayerTeleportCompletion,
@@ -314,6 +331,7 @@ pub(super) struct SessionRegistration<'a> {
     pub(super) max_sessions: usize,
     pub(super) script_operator: bool,
     pub(super) dimension: &'a str,
+    pub(super) loader_session: Option<crate::LoaderSession>,
 }
 
 #[derive(Debug)]
@@ -333,9 +351,11 @@ struct PlaySession {
     tx: mpsc::Sender<OutboundCommand>,
     pressure: Arc<OutboundPressureMetrics>,
     ordered_dispatch: Arc<OrderedDispatchState>,
-    script_transaction_active: Arc<Mutex<bool>>,
+    script_inventory_transaction_gate:
+        Arc<script_inventory_transaction_endpoint::ScriptInventoryTransactionGate>,
     script_operator: bool,
     dimension: String,
+    loader_session: Option<crate::LoaderSession>,
 }
 
 #[derive(Debug, Clone)]
@@ -361,6 +381,7 @@ struct SessionRegistryInner {
     entity_movement_trackers: Arc<EntityMovementTrackers>,
     arrow_tick_scratch: projectiles::ArrowTickScratch,
     spawned_entity_chunks: HashSet<(i32, i32)>,
+    settlement_spawn_claims: BTreeSet<String>,
     pending_hostile_spawns: BTreeMap<(i32, i32), Vec<HerdSpawn>>,
     item_pickup_ready: BTreeMap<u64, Vec<EntityId>>,
     item_despawn_deadlines: BTreeMap<u64, VecDeque<EntityId>>,
@@ -874,6 +895,60 @@ impl SessionRegistry {
             #[cfg(test)]
             hostile_entity_scan_visits: AtomicU64::new(0),
         }
+    }
+
+    pub(in crate::play) fn loader_block_projection(
+        &self,
+        session_id: SessionId,
+        blocks: &mc_world::BlockRegistry,
+    ) -> Option<crate::loader::LoaderBlockProjection> {
+        let inner = self.lock_inner("Loader block projection");
+        inner
+            .sessions
+            .get(&session_id)?
+            .loader_session
+            .as_ref()?
+            .block_projection(blocks)
+    }
+
+    pub(in crate::play) fn loader_item_placement_state(
+        &self,
+        session_id: SessionId,
+        held: &ItemStack,
+        items: &ItemRegistry,
+        blocks: &mc_world::BlockRegistry,
+    ) -> Option<mc_world::BlockStateId> {
+        let paper = Identifier::parse("minecraft:paper").expect("static paper item id");
+        if held.is_empty() || items.id_of(&paper) != Some(held.item_id) {
+            return None;
+        }
+        let item_model = held.item_model.as_deref()?;
+        let inner = self.lock_inner("Loader item placement state");
+        let session = inner.sessions.get(&session_id)?;
+        if session.tx.is_closed() {
+            return None;
+        }
+        session
+            .loader_session
+            .as_ref()?
+            .block_projection(blocks)
+            .and_then(|projection| projection.canonical_state_for_item_model(item_model))
+    }
+
+    pub(in crate::play) fn loader_block_drop_stack(
+        &self,
+        session_id: SessionId,
+        block_state: mc_world::BlockStateId,
+        items: &ItemRegistry,
+        blocks: &mc_world::BlockRegistry,
+    ) -> Option<ItemStack> {
+        let inner = self.lock_inner("Loader block drop stack");
+        let session = inner.sessions.get(&session_id)?;
+        if session.tx.is_closed() {
+            return None;
+        }
+        let projection = session.loader_session.as_ref()?.block_projection(blocks)?;
+        projection.item_stack_for_state(items, block_state, 1)
     }
 
     pub(crate) fn install_world_chunk_journal(

@@ -277,6 +277,8 @@ impl SessionRegistry {
             count: plan.drop_count,
             damage: held.damage,
             enchantments: held.enchantments.clone(),
+            custom_name: held.custom_name.clone().map(Box::new),
+            item_model: held.item_model.as_deref().cloned().map(Box::new),
         };
         held.count -= plan.drop_count;
         if held.count <= 0 {

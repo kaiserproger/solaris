@@ -53,6 +53,16 @@ actor-or-operator zone policy carries an opaque plugin-scoped zone id, bounds,
 and one normalized allowed actor UUID. Core routing never matches a plugin id or parses an
 id convention; the plugin owns claim meaning and persistence.
 
+Startup world generation follows the same boundary in declarative form. A
+settlement-profile owner may publish one bounded immutable plan of known
+building templates and roles, inhabitants, jobs, and plugin-scoped extension
+ids. Startup validates and materializes that plan before generation; Lua never
+receives a generator, chunk, region, or mutable-world handle. Entity
+materialization enters a dedicated system-owned simulation command with
+persisted villager type, profession, and level state. Its durable
+per-inhabitant claim does not reuse ambient-herd admission, whose chunk-level
+claim and payload have different semantics.
+
 If an uncommon custom decision later needs synchronous-looking admission, its
 adapter may suspend only the initiating action while the host processes it.
 The region must continue ticking and may resume the action only from an exact
@@ -94,9 +104,20 @@ default and cannot weaken per-plugin FIFO ordering.
 thread, bounded immutable DTOs, capability-gated command batches, targeted
 result events, instruction and memory limits, and generic typed protected
 zones. `mc-net` already has production adapters for storage, zones, menus,
-player inventory transactions, teleports, colonies, and villager bindings. The
-actor protection path still reads the bounded registry mutex; explosion
-planning uses an immutable snapshot. There is no general coroutine wait API,
-custom-action suspension adapter, or published versioned actor-policy index.
-This ADR fixes the architectural direction; it does not claim that every
-gameplay transaction or publication stage is complete.
+player inventory transactions, teleports, colonies, and villager bindings.
+Entity spawn and villager work enter simulation/regional owners; menu,
+teleport, and standalone player-inventory commands enter the exact ordered
+session lane. Standalone inventory transactions now plan against live
+session-owner state and update its durable mirror before publishing a result,
+instead of mutating persistence from the script router. The compound
+inventory/storage transaction remains an explicit typed coordinator with an
+internal session gate shared with standalone inventory owner commands; this
+keeps their plan, durable mutation, and ordered owner application serialized.
+The actor protection path still reads the bounded
+registry mutex; explosion planning, bounded random-fire planning, and baseline
+normal-piston planning use an immutable snapshot. Piston edits are one atomic
+base/head/destination group in both direct and scheduled-button paths. There is
+no general coroutine wait API, custom-action suspension adapter, or published
+versioned actor-policy index. This ADR fixes the architectural direction; it
+does not claim that every gameplay transaction or publication stage is
+complete.

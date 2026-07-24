@@ -19,6 +19,33 @@ and is not startup context.
   Delivery-order checkpoint `5e2908a` remains binding.
 - The worktree may contain unrelated owner files and local artifacts. Inspect
   exact ownership before editing; never clean or stage them by accident.
+- The current uncommitted Solaris Loader checkpoint defines one protocol-1
+  plugin manifest and Configuration acknowledgement for Fabric, NeoForge, and
+  Forge. It validates explicit content permissions and exact SHA-256-derived
+  cache identities while leaving servers without client bundles on the vanilla
+  path. Native 26.1.2 Configuration payload registration now exists on all
+  three platforms. Missing exact cache identities now use a bounded
+  request/artifact flow; plugin startup verifies source bytes and the shared
+  Java core stages, size/SHA-verifies, and atomically publishes cache entries
+  before acknowledgement. Fabric, NeoForge, and Forge now prompt in Minecraft
+  for unknown server-address plus permission-set decisions and persist exact
+  allow/deny choices under the Loader cache; denial happens before request or
+  staging. Verified allowed ZIPs now activate one closed archive index for
+  immutable owned screen definitions and exact asset bytes across all three
+  adapters before acknowledgement, with logout clearing the active registry.
+  Host-attested plugins can now open those immutable title/body screens through
+  an ordered Play payload only on the exact connection that completed the
+  Loader acknowledgement; all three adapters fence queued UI work to that
+  origin. Verified asset paths now mount through one transient required
+  Minecraft client pack; acknowledgement waits for exact-byte resource
+  visibility, and the exact connection close removes the pack without letting
+  stale work clear a newer mount. Closed owner-namespaced interaction
+  declarations now render as bounded screen buttons on all three adapters.
+  Their Play action is emitted only for the current definition and connection,
+  accepted only from the exact Loader-acknowledged session, and delivered as a
+  targeted `loader.interaction` event solely to the owner Lua plugin. Blocks and
+  items remain later slices. The interaction slice has automated coverage but
+  no PrismLauncher 26.1.2 visual run.
 - Fresh-player spawn now chooses the nearest non-hazardous collidable support
   with collision-free, non-fluid body space in the resident 11x11 spawn window.
   Focused tests cover water, transparent collision, and magma support. A new
@@ -70,8 +97,10 @@ and is not startup context.
   insufficient-funds rejection, refund, and zone-triggered menu refresh.
   `land-claims` owns a bounded durable whole-chunk index. Direct break/place,
   right-click block actions, containers, buckets, living-entity interaction,
-  and explosion block damage are protected. Piston movement and fire spread
-  remain open because those mutation paths do not exist yet. No manual-client
+  explosion block damage, and the bounded common-fuel fire path are protected.
+  A direct lever/button can extend or retract one normal piston with one common
+  full block; its atomic base/head/destination edits consume the ambient
+  protection snapshot in direct and scheduled-button planning. No manual-client
   gate has run.
 - Land-claim admission now covers right-click block actions, all halves of a
   chest window, exact filled-bucket destinations, living-entity target
@@ -80,11 +109,26 @@ and is not startup context.
   the bounded authoritative actor check. Explosion planning clones one
   immutable generic protection snapshot only when an explosion is due and before the world
   lock, so idle ticks do not copy zones and the candidate loop takes no zone
-  mutex. Fire spread and piston movement remain absent mechanics, and the
+  mutex. Random fire planning now consumes the same immutable snapshot and
+  skips protected burn targets while allowing the source fire to age. The
+  baseline normal-piston mutation is atomic and rejects the whole group if any
+  affected position is protected; sticky pistons, multi-block chains,
+  slime/honey, and moving animation remain outside this slice. The fire slice
+  does not yet reproduce the complete vanilla material/odds table, and the
   bounded actor lookup still needs the published policy index described by ADR
   0009. Rust contains no `land-claims` plugin-id or zone-id convention:
   `solaris.upsert_protected_zone` carries a typed actor-or-operator policy, and
   the Lua plugin owns claim identity, persistence, and lifecycle.
+- Current production Lua mutations hide regional/session ownership completely:
+  entity spawn and villager commands enter simulation/regional owners, while
+  menus, teleports, and standalone player-inventory transactions enter the
+  exact ordered session lane. Standalone inventory routing now waits for the
+  session owner to plan from live inventory and update the durable mirror;
+  dropped commands reject without mutation. The compound inventory/storage
+  transaction shares the same internal session gate, so it cannot plan past an
+  earlier owner command and its ledger and inventory cannot commit separately.
+  No lock, region key,
+  lease, epoch, or worker handle enters a Lua DTO.
 - The agent-run real-client hostile-combat functional gate is closed on an
   isolated O3 server. Ordinary 26.1.2 client actions selected an iron sword,
   killed a zombie, observed and collected its rotten-flesh drop, observed a
@@ -356,13 +400,23 @@ two priorities unless it becomes a common-play blocker or corruption risk.
   domain-warped continents, branching mountain ranges, substantially carved
   river-valley contours, and bounded tunnel caves behind a 32-block surface shell.
   Trees require exact planned support and a stable 5x5 footprint.
-  Solaris worlds persist revision/seed/mode/ore-profile/geometry; unversioned
+  Solaris worlds persist revision/seed/mode/ore-profile/settlement-profile/geometry; unversioned
   Anvil worlds open without fallback generation and reject plugin worldgen
   profiles. The playable profile uses `.analysis/test-world-v9`. Revision 8
   adds visible anisotropic mountain detail, stronger long relief, elevation-
   aware mountain surfaces, and an explicit dry-spawn floor; the fresh-client
   forest/coast/ocean/high-relief route is complete. Revision 9 removes filled
   3x3 upper leaf boxes in favor of connected irregular oak/jungle crowns.
+- The optional startup-only `plains_village_prototype` Lua manifest profile
+  combines an extracted vanilla plains fountain, small house, and toolsmith at
+  stable offsets and consumes extracted village placement facts. Seed zero
+  fixes it near spawn; other seeds use deterministic grassland placement. The
+  selection shares the persisted plugin worldgen profile fence and requires the
+  vanilla sidecar. The bounded plan selects buildings, roles, named inhabitants,
+  jobs, and owner-scoped extensions. Extracted vanilla villager jigsaw slots
+  become persisted chunk markers; a dedicated simulation-owner command
+  materializes each villager once with durable profession metadata and a claim
+  separate from ambient herd spawning.
 - Lua API 0.6 has bounded DTO/files/batches, optional bounded startup-only TOML
   configuration with fresh Lua copies, push-driven bounded simulation timers,
   one-shot host admission, an attested `mc-net` router, and durable plugin

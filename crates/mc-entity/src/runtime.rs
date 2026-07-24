@@ -149,6 +149,7 @@ struct GameplayDecisionState {
     item_pickup_ready_tick: Option<u64>,
     item_pickup_owner_block: Option<crate::EntityItemPickupOwnerBlock>,
     primed_tnt: Option<crate::EntityPrimedTntState>,
+    villager: Option<crate::VillagerData>,
 }
 
 #[derive(Component)]
@@ -1261,6 +1262,7 @@ fn insert_snapshot_into_world(world: &mut World, snapshot: EntitySnapshot) -> bo
         item_pickup_ready_tick,
         item_pickup_owner_block,
         primed_tnt,
+        villager,
     } = retained;
     let living_state = living_state_from_snapshot(health, lifecycle, retained_living);
     if living_state.validate().is_err() {
@@ -1307,6 +1309,7 @@ fn insert_snapshot_into_world(world: &mut World, snapshot: EntitySnapshot) -> bo
             item_pickup_ready_tick,
             item_pickup_owner_block,
             primed_tnt,
+            villager,
         },
         PersistentState,
         VisibilityState,
@@ -1409,6 +1412,7 @@ fn restore_snapshot_in_world(world: &mut World, snapshot: EntitySnapshot) -> boo
         item_pickup_ready_tick,
         item_pickup_owner_block,
         primed_tnt,
+        villager,
     } = retained;
     let living_state = living_state_from_snapshot(health, lifecycle, retained_living);
     if living_state.validate().is_err() {
@@ -1449,6 +1453,7 @@ fn restore_snapshot_in_world(world: &mut World, snapshot: EntitySnapshot) -> boo
                 item_pickup_ready_tick,
                 item_pickup_owner_block,
                 primed_tnt,
+                villager,
             },
         ));
         replace_optional_component(&mut entity, active_effects);
@@ -1550,6 +1555,7 @@ fn snapshot_from_world(world: &World, id: EntityId) -> Option<EntitySnapshot> {
             item_pickup_ready_tick: gameplay.item_pickup_ready_tick,
             item_pickup_owner_block: gameplay.item_pickup_owner_block,
             primed_tnt: gameplay.primed_tnt,
+            villager: gameplay.villager,
         },
     })
 }
@@ -1610,6 +1616,7 @@ fn entity_view_from_world(world: &World, id: EntityId) -> Option<EntityView<'_>>
             item_pickup_ready_tick: gameplay.item_pickup_ready_tick,
             item_pickup_owner_block: gameplay.item_pickup_owner_block,
             primed_tnt: gameplay.primed_tnt,
+            villager: gameplay.villager,
         },
     })
 }

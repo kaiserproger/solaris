@@ -8,8 +8,12 @@ import dev.solaris.agent.client.ClientSnapshot;
 import net.minecraft.client.KeyMapping;
 import net.minecraft.client.Minecraft;
 import net.minecraft.client.Screenshot;
+import net.minecraft.client.gui.components.Button;
 import net.minecraft.client.gui.screens.ConnectScreen;
+import net.minecraft.client.gui.screens.ConfirmScreen;
+import net.minecraft.client.gui.screens.Screen;
 import net.minecraft.client.gui.screens.inventory.InventoryScreen;
+import net.minecraft.client.input.InputWithModifiers;
 import net.minecraft.client.multiplayer.ClientPacketListener;
 import net.minecraft.client.multiplayer.ServerData;
 import net.minecraft.client.multiplayer.TransferState;
@@ -38,6 +42,17 @@ import java.util.concurrent.TimeoutException;
 
 public final class MinecraftClientFacade implements ClientFacade {
     private static final long MAX_TICK_WAIT_NANOS = 30_000_000_000L;
+    private static final InputWithModifiers BUTTON_INPUT = new InputWithModifiers() {
+        @Override
+        public int input() {
+            return 257;
+        }
+
+        @Override
+        public int modifiers() {
+            return 0;
+        }
+    };
 
     @Override
     public ClientSnapshot snapshot() {
@@ -1004,6 +1019,67 @@ public final class MinecraftClientFacade implements ClientFacade {
     public void closeCurrentScreen() {
         Minecraft minecraft = requireInPlay();
         MinecraftScenarioClient.closeCurrentScreenOnClientThread(minecraft);
+    }
+
+    @Override
+    public void clickConfirmationButton(String expectedTitle, String buttonLabel) {
+        Minecraft minecraft = Minecraft.getInstance();
+        if (!(minecraft.screen instanceof ConfirmScreen screen)) {
+            throw new IllegalStateException("current screen is not a confirmation screen");
+        }
+        String actualTitle = screen.getTitle().getString();
+        if (!actualTitle.equals(expectedTitle)) {
+            throw new IllegalStateException(
+                "confirmation title mismatch: " + actualTitle
+            );
+        }
+        pressExactButton(screen, buttonLabel, "confirmation");
+    }
+
+    @Override
+    public void clickScreenButton(
+        String expectedScreenClass,
+        String expectedTitle,
+        String buttonLabel
+    ) {
+        Minecraft minecraft = requireInPlay();
+        Screen screen = minecraft.screen;
+        if (screen == null) {
+            throw new IllegalStateException("no client screen is open");
+        }
+        String actualScreenClass = screen.getClass().getName();
+        if (!actualScreenClass.equals(expectedScreenClass)) {
+            throw new IllegalStateException(
+                "screen class mismatch: " + actualScreenClass
+            );
+        }
+        String actualTitle = screen.getTitle().getString();
+        if (!actualTitle.equals(expectedTitle)) {
+            throw new IllegalStateException("screen title mismatch: " + actualTitle);
+        }
+        pressExactButton(screen, buttonLabel, "screen");
+    }
+
+    private static void pressExactButton(
+        Screen screen,
+        String buttonLabel,
+        String screenKind
+    ) {
+        List<Button> matches = screen.children().stream()
+            .filter(Button.class::isInstance)
+            .map(Button.class::cast)
+            .filter(button -> button.getMessage().getString().equals(buttonLabel))
+            .toList();
+        if (matches.size() != 1) {
+            throw new IllegalStateException(
+                screenKind + " button match count: " + matches.size()
+            );
+        }
+        Button button = matches.getFirst();
+        if (!button.active || !button.visible) {
+            throw new IllegalStateException(screenKind + " button is not enabled");
+        }
+        button.onPress(BUTTON_INPUT);
     }
 
     @Override

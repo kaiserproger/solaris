@@ -10,8 +10,11 @@ use std::thread;
 
 use mlua::{Function, HookTriggers, Lua, LuaOptions, LuaString, StdLib, Table, Value, VmState};
 use serde::Deserialize;
+use sha2::{Digest, Sha256};
 use tracing::{info, warn};
 
+#[cfg(test)]
+mod loader_tests;
 #[cfg(test)]
 mod worldgen_tests;
 
@@ -47,6 +50,16 @@ const MAX_PLUGIN_CONFIG_STRING_BYTES: usize = 4 * 1024;
 const MAX_PLUGIN_SOURCE_BYTES: usize = 1024 * 1024;
 const MAX_PLUGIN_DIRECTORIES: usize = 128;
 const MAX_API_VERSION_BYTES: usize = 16;
+const MAX_SETTLEMENT_BUILDINGS: usize = 3;
+const MAX_SETTLEMENT_INHABITANTS: usize = 16;
+const MAX_SETTLEMENT_EXTENSIONS: usize = 16;
+const MAX_SETTLEMENT_DESCRIPTOR_ID_BYTES: usize = 48;
+const CLIENT_MANIFEST_SCHEMA: u16 = 1;
+const MAX_CLIENT_BUNDLES_PER_PLUGIN: usize = 8;
+const MAX_CLIENT_BUNDLE_ID_BYTES: usize = 48;
+const MAX_CLIENT_BUNDLE_VERSION_BYTES: usize = 32;
+const MAX_CLIENT_ARTIFACT_PATH_BYTES: usize = 160;
+const MAX_CLIENT_BUNDLE_BYTES: u64 = 64 * 1024 * 1024;
 const MAX_PENDING_PLUGIN_TIMERS: usize = 256;
 const MAX_PLUGIN_TIMER_CALLBACKS_PER_TICK: usize = 8;
 const MAX_PLUGIN_TIMER_DELAY_TICKS: u64 = 630_720_000;
@@ -73,11 +86,23 @@ impl LuaHostConfig {
 #[derive(Debug)]
 #[non_exhaustive]
 pub enum LuaHostError {
-    Io { path: PathBuf, message: String },
-    ThreadSpawn { message: String },
+    Io {
+        path: PathBuf,
+        message: String,
+    },
+    ThreadSpawn {
+        message: String,
+    },
     StartupChannelClosed,
-    WorldgenConflict { first: String, second: String },
-    InvalidWorldgenPlugin { path: PathBuf, message: String },
+    WorldgenConflict {
+        kind: &'static str,
+        first: String,
+        second: String,
+    },
+    InvalidStartupPlugin {
+        path: PathBuf,
+        message: String,
+    },
 }
 
 impl fmt::Display for LuaHostError {
@@ -88,13 +113,17 @@ impl fmt::Display for LuaHostError {
                 write!(formatter, "starting Lua host thread: {message}")
             }
             Self::StartupChannelClosed => formatter.write_str("Lua host startup channel closed"),
-            Self::WorldgenConflict { first, second } => write!(
+            Self::WorldgenConflict {
+                kind,
+                first,
+                second,
+            } => write!(
                 formatter,
-                "plugins {first} and {second} both declare a worldgen ore profile"
+                "plugins {first} and {second} both declare a worldgen {kind} profile"
             ),
-            Self::InvalidWorldgenPlugin { path, message } => write!(
+            Self::InvalidStartupPlugin { path, message } => write!(
                 formatter,
-                "worldgen plugin {} is invalid: {message}",
+                "startup-declarative plugin {} is invalid: {message}",
                 path.display()
             ),
         }
@@ -125,16 +154,421 @@ impl LuaWorldgenOreProfile {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum LuaWorldgenSettlementProfile {
+    PlainsVillagePrototype,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[non_exhaustive]
+pub enum LuaClientLoader {
+    Fabric,
+    NeoForge,
+    Forge,
+}
+
+impl LuaClientLoader {
+    #[must_use]
+    pub const fn contract_name(self) -> &'static str {
+        match self {
+            Self::Fabric => "fabric",
+            Self::NeoForge => "neoforge",
+            Self::Forge => "forge",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[non_exhaustive]
+pub enum LuaClientContentKind {
+    Blocks,
+    Items,
+    Screens,
+    Assets,
+    Interactions,
+}
+
+impl LuaClientContentKind {
+    #[must_use]
+    pub const fn contract_name(self) -> &'static str {
+        match self {
+            Self::Blocks => "blocks",
+            Self::Items => "items",
+            Self::Screens => "screens",
+            Self::Assets => "assets",
+            Self::Interactions => "interactions",
+        }
+    }
+
+    const fn required_permission(self) -> LuaClientPermission {
+        match self {
+            Self::Blocks => LuaClientPermission::RegisterBlocks,
+            Self::Items => LuaClientPermission::RegisterItems,
+            Self::Screens => LuaClientPermission::OpenScreens,
+            Self::Assets => LuaClientPermission::LoadAssets,
+            Self::Interactions => LuaClientPermission::SendInteractions,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[non_exhaustive]
+pub enum LuaClientPermission {
+    RegisterBlocks,
+    RegisterItems,
+    OpenScreens,
+    LoadAssets,
+    SendInteractions,
+}
+
+impl LuaClientPermission {
+    #[must_use]
+    pub const fn contract_name(self) -> &'static str {
+        match self {
+            Self::RegisterBlocks => "register_blocks",
+            Self::RegisterItems => "register_items",
+            Self::OpenScreens => "open_screens",
+            Self::LoadAssets => "load_assets",
+            Self::SendInteractions => "send_interactions",
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LuaClientBundle {
+    owner_plugin_id: String,
+    id: String,
+    version: String,
+    artifact: String,
+    sha256: String,
+    size_bytes: u64,
+    artifact_path: PathBuf,
+    loaders: Vec<LuaClientLoader>,
+    content: Vec<LuaClientContentKind>,
+    permissions: Vec<LuaClientPermission>,
+}
+
+impl LuaClientBundle {
+    #[must_use]
+    pub fn owner_plugin_id(&self) -> &str {
+        &self.owner_plugin_id
+    }
+
+    #[must_use]
+    pub fn id(&self) -> &str {
+        &self.id
+    }
+
+    #[must_use]
+    pub fn version(&self) -> &str {
+        &self.version
+    }
+
+    #[must_use]
+    pub fn artifact(&self) -> &str {
+        &self.artifact
+    }
+
+    #[must_use]
+    pub fn sha256(&self) -> &str {
+        &self.sha256
+    }
+
+    #[must_use]
+    pub const fn size_bytes(&self) -> u64 {
+        self.size_bytes
+    }
+
+    #[must_use]
+    pub fn artifact_path(&self) -> &Path {
+        &self.artifact_path
+    }
+
+    #[must_use]
+    pub fn loaders(&self) -> &[LuaClientLoader] {
+        &self.loaders
+    }
+
+    #[must_use]
+    pub fn content(&self) -> &[LuaClientContentKind] {
+        &self.content
+    }
+
+    #[must_use]
+    pub fn permissions(&self) -> &[LuaClientPermission] {
+        &self.permissions
+    }
+
+    #[must_use]
+    pub fn cache_key(&self) -> String {
+        format!(
+            "{}:{}/{}/{}",
+            self.owner_plugin_id, self.id, self.version, self.sha256
+        )
+    }
+}
+
+impl LuaWorldgenSettlementProfile {
+    #[must_use]
+    pub const fn contract_name(self) -> &'static str {
+        match self {
+            Self::PlainsVillagePrototype => "plains_village_prototype",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[non_exhaustive]
+pub enum LuaSettlementBuildingTemplate {
+    PlainsFountain,
+    PlainsSmallHouse,
+    PlainsToolsmith,
+}
+
+impl LuaSettlementBuildingTemplate {
+    #[must_use]
+    pub const fn contract_name(self) -> &'static str {
+        match self {
+            Self::PlainsFountain => "plains_fountain",
+            Self::PlainsSmallHouse => "plains_small_house",
+            Self::PlainsToolsmith => "plains_toolsmith",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum LuaSettlementBuildingRole {
+    MeetingPoint,
+    Home,
+    Workplace,
+}
+
+impl LuaSettlementBuildingRole {
+    #[must_use]
+    pub const fn contract_name(self) -> &'static str {
+        match self {
+            Self::MeetingPoint => "meeting_point",
+            Self::Home => "home",
+            Self::Workplace => "workplace",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum LuaSettlementInhabitantKind {
+    Villager,
+}
+
+impl LuaSettlementInhabitantKind {
+    #[must_use]
+    pub const fn entity_type(self) -> &'static str {
+        match self {
+            Self::Villager => "minecraft:villager",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum LuaSettlementJob {
+    Unemployed,
+    Toolsmith,
+}
+
+impl LuaSettlementJob {
+    #[must_use]
+    pub const fn contract_name(self) -> &'static str {
+        match self {
+            Self::Unemployed => "unemployed",
+            Self::Toolsmith => "toolsmith",
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LuaSettlementBuilding {
+    id: String,
+    template: LuaSettlementBuildingTemplate,
+    role: LuaSettlementBuildingRole,
+}
+
+impl LuaSettlementBuilding {
+    #[must_use]
+    pub fn id(&self) -> &str {
+        &self.id
+    }
+
+    #[must_use]
+    pub const fn template(&self) -> LuaSettlementBuildingTemplate {
+        self.template
+    }
+
+    #[must_use]
+    pub const fn role(&self) -> LuaSettlementBuildingRole {
+        self.role
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LuaSettlementInhabitant {
+    id: String,
+    kind: LuaSettlementInhabitantKind,
+    building_id: String,
+    job: LuaSettlementJob,
+}
+
+impl LuaSettlementInhabitant {
+    #[must_use]
+    pub fn id(&self) -> &str {
+        &self.id
+    }
+
+    #[must_use]
+    pub const fn kind(&self) -> LuaSettlementInhabitantKind {
+        self.kind
+    }
+
+    #[must_use]
+    pub fn building_id(&self) -> &str {
+        &self.building_id
+    }
+
+    #[must_use]
+    pub const fn job(&self) -> LuaSettlementJob {
+        self.job
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LuaSettlementExtension {
+    id: String,
+    building_id: String,
+}
+
+impl LuaSettlementExtension {
+    #[must_use]
+    pub fn id(&self) -> &str {
+        &self.id
+    }
+
+    #[must_use]
+    pub fn building_id(&self) -> &str {
+        &self.building_id
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LuaSettlementPlan {
+    owner_plugin_id: String,
+    profile: LuaWorldgenSettlementProfile,
+    buildings: Vec<LuaSettlementBuilding>,
+    inhabitants: Vec<LuaSettlementInhabitant>,
+    extensions: Vec<LuaSettlementExtension>,
+}
+
+impl LuaSettlementPlan {
+    #[must_use]
+    pub fn plains_village_prototype(owner_plugin_id: impl Into<String>) -> Self {
+        Self {
+            owner_plugin_id: owner_plugin_id.into(),
+            profile: LuaWorldgenSettlementProfile::PlainsVillagePrototype,
+            buildings: default_plains_village_buildings(),
+            inhabitants: Vec::new(),
+            extensions: Vec::new(),
+        }
+    }
+
+    #[must_use]
+    pub fn owner_plugin_id(&self) -> &str {
+        &self.owner_plugin_id
+    }
+
+    #[must_use]
+    pub const fn profile(&self) -> LuaWorldgenSettlementProfile {
+        self.profile
+    }
+
+    #[must_use]
+    pub fn buildings(&self) -> &[LuaSettlementBuilding] {
+        &self.buildings
+    }
+
+    #[must_use]
+    pub fn inhabitants(&self) -> &[LuaSettlementInhabitant] {
+        &self.inhabitants
+    }
+
+    #[must_use]
+    pub fn extensions(&self) -> &[LuaSettlementExtension] {
+        &self.extensions
+    }
+
+    #[must_use]
+    pub fn contract_name(&self) -> String {
+        let mut contract = format!(
+            "{}|owner={}|buildings=",
+            self.profile.contract_name(),
+            self.owner_plugin_id
+        );
+        for building in &self.buildings {
+            contract.push_str(&format!(
+                "{},{},{};",
+                building.id,
+                building.template.contract_name(),
+                building.role.contract_name()
+            ));
+        }
+        contract.push_str("|inhabitants=");
+        for inhabitant in &self.inhabitants {
+            contract.push_str(&format!(
+                "{},{},{},{};",
+                inhabitant.id,
+                inhabitant.kind.entity_type(),
+                inhabitant.building_id,
+                inhabitant.job.contract_name()
+            ));
+        }
+        contract.push_str("|extensions=");
+        for extension in &self.extensions {
+            contract.push_str(&format!("{},{};", extension.id, extension.building_id));
+        }
+        contract
+    }
+}
+
 #[derive(Debug)]
 pub struct PreparedLuaPlugins {
     sources: Vec<PluginSource>,
     worldgen_ore_profile: Option<LuaWorldgenOreProfile>,
+    worldgen_settlement_plan: Option<LuaSettlementPlan>,
+    client_bundles: Vec<LuaClientBundle>,
 }
 
 impl PreparedLuaPlugins {
     #[must_use]
     pub const fn worldgen_ore_profile(&self) -> Option<LuaWorldgenOreProfile> {
         self.worldgen_ore_profile
+    }
+
+    #[must_use]
+    pub const fn worldgen_settlement_profile(&self) -> Option<LuaWorldgenSettlementProfile> {
+        match &self.worldgen_settlement_plan {
+            Some(plan) => Some(plan.profile()),
+            None => None,
+        }
+    }
+
+    #[must_use]
+    pub fn worldgen_settlement_plan(&self) -> Option<&LuaSettlementPlan> {
+        self.worldgen_settlement_plan.as_ref()
+    }
+
+    #[must_use]
+    pub fn client_bundles(&self) -> &[LuaClientBundle] {
+        &self.client_bundles
     }
 }
 
@@ -159,24 +593,41 @@ pub fn prepare_lua_plugins(config: LuaHostConfig) -> Result<PreparedLuaPlugins, 
         message: error.to_string(),
     })?;
     let sources = discover_plugins(config.plugins_dir())?;
-    let mut selected = None;
-    let mut owner = None;
+    let mut selected_ore = None;
+    let mut ore_owner = None;
+    let mut selected_settlement = None;
+    let mut settlement_owner = None;
+    let mut client_bundles = Vec::new();
     for source in &sources {
-        let Some(profile) = source.worldgen_ore_profile else {
-            continue;
-        };
-        if let Some(first) = owner {
-            return Err(LuaHostError::WorldgenConflict {
-                first,
-                second: source.manifest.plugin_id().to_owned(),
-            });
+        if let Some(profile) = source.worldgen_ore_profile {
+            if let Some(first) = ore_owner {
+                return Err(LuaHostError::WorldgenConflict {
+                    kind: "ore",
+                    first,
+                    second: source.manifest.plugin_id().to_owned(),
+                });
+            }
+            selected_ore = Some(profile);
+            ore_owner = Some(source.manifest.plugin_id().to_owned());
         }
-        selected = Some(profile);
-        owner = Some(source.manifest.plugin_id().to_owned());
+        if let Some(plan) = &source.worldgen_settlement_plan {
+            if let Some(first) = settlement_owner {
+                return Err(LuaHostError::WorldgenConflict {
+                    kind: "settlement",
+                    first,
+                    second: source.manifest.plugin_id().to_owned(),
+                });
+            }
+            selected_settlement = Some(plan.clone());
+            settlement_owner = Some(source.manifest.plugin_id().to_owned());
+        }
+        client_bundles.extend(source.client_bundles.iter().cloned());
     }
     Ok(PreparedLuaPlugins {
         sources,
-        worldgen_ore_profile: selected,
+        worldgen_ore_profile: selected_ore,
+        worldgen_settlement_plan: selected_settlement,
+        client_bundles,
     })
 }
 
@@ -217,19 +668,21 @@ struct PluginSource {
     source: String,
     source_path: PathBuf,
     worldgen_ore_profile: Option<LuaWorldgenOreProfile>,
+    worldgen_settlement_plan: Option<LuaSettlementPlan>,
+    client_bundles: Vec<LuaClientBundle>,
 }
 
 #[derive(Debug)]
 struct PluginSourceError {
     message: String,
-    worldgen_declared: bool,
+    startup_contract_declared: bool,
 }
 
 impl PluginSourceError {
-    fn new(message: impl Into<String>, worldgen_declared: bool) -> Self {
+    fn new(message: impl Into<String>, startup_contract_declared: bool) -> Self {
         Self {
             message: message.into(),
-            worldgen_declared,
+            startup_contract_declared,
         }
     }
 
@@ -269,18 +722,139 @@ struct DiskManifest {
     #[serde(default)]
     permissions: Vec<String>,
     worldgen: Option<DiskWorldgen>,
+    client: Option<DiskClient>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct DiskClient {
+    schema: u16,
+    #[serde(default)]
+    bundles: Vec<DiskClientBundle>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct DiskClientBundle {
+    id: String,
+    version: String,
+    artifact: String,
+    sha256: String,
+    size_bytes: u64,
+    loaders: Vec<DiskClientLoader>,
+    content: Vec<DiskClientContentKind>,
+    permissions: Vec<DiskClientPermission>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "snake_case")]
+enum DiskClientLoader {
+    Fabric,
+    #[serde(rename = "neoforge")]
+    NeoForge,
+    Forge,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "snake_case")]
+enum DiskClientContentKind {
+    Blocks,
+    Items,
+    Screens,
+    Assets,
+    Interactions,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "snake_case")]
+enum DiskClientPermission {
+    RegisterBlocks,
+    RegisterItems,
+    OpenScreens,
+    LoadAssets,
+    SendInteractions,
 }
 
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct DiskWorldgen {
-    ore_profile: DiskWorldgenOreProfile,
+    #[serde(default)]
+    ore_profile: Option<DiskWorldgenOreProfile>,
+    #[serde(default)]
+    settlement_profile: Option<DiskWorldgenSettlementProfile>,
+    #[serde(default)]
+    settlement_buildings: Vec<DiskSettlementBuilding>,
+    #[serde(default)]
+    settlement_inhabitants: Vec<DiskSettlementInhabitant>,
+    #[serde(default)]
+    settlement_extensions: Vec<DiskSettlementExtension>,
 }
 
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "snake_case")]
 enum DiskWorldgenOreProfile {
     GeologicalDeposits,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "snake_case")]
+enum DiskWorldgenSettlementProfile {
+    PlainsVillagePrototype,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct DiskSettlementBuilding {
+    id: String,
+    template: DiskSettlementBuildingTemplate,
+    role: DiskSettlementBuildingRole,
+}
+
+#[derive(Debug, Deserialize)]
+enum DiskSettlementBuildingTemplate {
+    #[serde(rename = "plains_fountain")]
+    Fountain,
+    #[serde(rename = "plains_small_house")]
+    SmallHouse,
+    #[serde(rename = "plains_toolsmith")]
+    Toolsmith,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "snake_case")]
+enum DiskSettlementBuildingRole {
+    MeetingPoint,
+    Home,
+    Workplace,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct DiskSettlementInhabitant {
+    id: String,
+    kind: DiskSettlementInhabitantKind,
+    building: String,
+    job: DiskSettlementJob,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "snake_case")]
+enum DiskSettlementInhabitantKind {
+    Villager,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "snake_case")]
+enum DiskSettlementJob {
+    Unemployed,
+    Toolsmith,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct DiskSettlementExtension {
+    id: String,
+    building: String,
 }
 
 #[derive(Debug, Deserialize)]
@@ -327,8 +901,8 @@ fn discover_plugins(plugins_dir: &Path) -> Result<Vec<PluginSource>, LuaHostErro
     for directory in directories {
         match read_plugin_source(&directory) {
             Ok(source) => sources.push(source),
-            Err(error) if error.worldgen_declared => {
-                return Err(LuaHostError::InvalidWorldgenPlugin {
+            Err(error) if error.startup_contract_declared => {
+                return Err(LuaHostError::InvalidStartupPlugin {
                     path: directory,
                     message: error.message,
                 });
@@ -349,15 +923,56 @@ fn read_plugin_source(directory: &Path) -> Result<PluginSource, PluginSourceErro
         .map_err(|error| PluginSourceError::new(error, false))?;
     let raw_manifest: toml::Value = toml::from_str(&raw_manifest)
         .map_err(|error| PluginSourceError::new(format!("parsing manifest: {error}"), false))?;
-    let worldgen_declared = raw_manifest.get("worldgen").is_some();
+    let startup_contract_declared =
+        raw_manifest.get("worldgen").is_some() || raw_manifest.get("client").is_some();
     let disk: DiskManifest = raw_manifest.try_into().map_err(|error| {
-        PluginSourceError::new(format!("parsing manifest: {error}"), worldgen_declared)
+        PluginSourceError::new(
+            format!("parsing manifest: {error}"),
+            startup_contract_declared,
+        )
     })?;
     let requested_api_version = parse_api_version(&disk.api)
-        .map_err(|error| PluginSourceError::new(error, worldgen_declared))?;
-    let worldgen_ore_profile = disk.worldgen.map(|worldgen| match worldgen.ore_profile {
-        DiskWorldgenOreProfile::GeologicalDeposits => LuaWorldgenOreProfile::GeologicalDeposits,
-    });
+        .map_err(|error| PluginSourceError::new(error, startup_contract_declared))?;
+    let (
+        worldgen_ore_profile,
+        worldgen_settlement_profile,
+        settlement_buildings,
+        settlement_inhabitants,
+        settlement_extensions,
+    ) = match disk.worldgen {
+        Some(worldgen)
+            if worldgen.ore_profile.is_none()
+                && worldgen.settlement_profile.is_none()
+                && worldgen.settlement_buildings.is_empty()
+                && worldgen.settlement_inhabitants.is_empty()
+                && worldgen.settlement_extensions.is_empty() =>
+        {
+            return Err(PluginSourceError::new(
+                "worldgen must declare ore_profile or settlement_profile",
+                true,
+            ));
+        }
+        Some(worldgen) => {
+            let ore_profile = worldgen.ore_profile.map(|profile| match profile {
+                DiskWorldgenOreProfile::GeologicalDeposits => {
+                    LuaWorldgenOreProfile::GeologicalDeposits
+                }
+            });
+            let settlement_profile = worldgen.settlement_profile.map(|profile| match profile {
+                DiskWorldgenSettlementProfile::PlainsVillagePrototype => {
+                    LuaWorldgenSettlementProfile::PlainsVillagePrototype
+                }
+            });
+            (
+                ore_profile,
+                settlement_profile,
+                worldgen.settlement_buildings,
+                worldgen.settlement_inhabitants,
+                worldgen.settlement_extensions,
+            )
+        }
+        None => (None, None, Vec::new(), Vec::new(), Vec::new()),
+    };
     let mut manifest =
         ScriptPluginManifest::new(disk.id, disk.name, disk.version, requested_api_version);
     for event in disk.events {
@@ -388,23 +1003,473 @@ fn read_plugin_source(directory: &Path) -> Result<PluginSource, PluginSourceErro
     }
     for capability in disk.capabilities {
         manifest = declare_disk_capability(manifest, &capability)
-            .map_err(|error| PluginSourceError::new(error, worldgen_declared))?;
+            .map_err(|error| PluginSourceError::new(error, startup_contract_declared))?;
     }
     let manifest = manifest.validate().map_err(|error| {
-        PluginSourceError::new(format!("invalid manifest: {error:?}"), worldgen_declared)
+        PluginSourceError::new(
+            format!("invalid manifest: {error:?}"),
+            startup_contract_declared,
+        )
     })?;
+    let worldgen_settlement_plan = materialize_settlement_plan(
+        manifest.plugin_id(),
+        worldgen_settlement_profile,
+        settlement_buildings,
+        settlement_inhabitants,
+        settlement_extensions,
+    )
+    .map_err(|error| PluginSourceError::new(error, startup_contract_declared))?;
+    let client_bundles =
+        materialize_client_bundles(directory, manifest.plugin_id(), disk.client)
+            .map_err(|error| PluginSourceError::new(error, startup_contract_declared))?;
     let config = read_plugin_config(directory)
-        .map_err(|error| PluginSourceError::new(error, worldgen_declared))?;
+        .map_err(|error| PluginSourceError::new(error, startup_contract_declared))?;
     let source_path = directory.join("main.lua");
     let source = read_utf8_file_limited(&source_path, MAX_PLUGIN_SOURCE_BYTES)
-        .map_err(|error| PluginSourceError::new(error, worldgen_declared))?;
+        .map_err(|error| PluginSourceError::new(error, startup_contract_declared))?;
     Ok(PluginSource {
         manifest,
         config,
         source,
         source_path,
         worldgen_ore_profile,
+        worldgen_settlement_plan,
+        client_bundles,
     })
+}
+
+fn materialize_client_bundles(
+    plugin_directory: &Path,
+    owner_plugin_id: &str,
+    client: Option<DiskClient>,
+) -> Result<Vec<LuaClientBundle>, String> {
+    let Some(client) = client else {
+        return Ok(Vec::new());
+    };
+    if client.schema != CLIENT_MANIFEST_SCHEMA {
+        return Err(format!(
+            "client manifest schema must be {CLIENT_MANIFEST_SCHEMA}, got {}",
+            client.schema
+        ));
+    }
+    if client.bundles.is_empty() {
+        return Err("client manifest must declare at least one bundle".to_owned());
+    }
+    if client.bundles.len() > MAX_CLIENT_BUNDLES_PER_PLUGIN {
+        return Err(format!(
+            "client bundles exceed {MAX_CLIENT_BUNDLES_PER_PLUGIN} entries"
+        ));
+    }
+
+    let mut bundle_ids = HashSet::new();
+    let mut bundles = Vec::with_capacity(client.bundles.len());
+    for bundle in client.bundles {
+        validate_client_literal(&bundle.id, "client bundle id", MAX_CLIENT_BUNDLE_ID_BYTES)?;
+        if !bundle_ids.insert(bundle.id.clone()) {
+            return Err(format!("duplicate client bundle id {:?}", bundle.id));
+        }
+        validate_client_literal(
+            &bundle.version,
+            "client bundle version",
+            MAX_CLIENT_BUNDLE_VERSION_BYTES,
+        )?;
+        validate_client_artifact_path(&bundle.artifact)?;
+        if bundle.sha256.len() != 64
+            || !bundle
+                .sha256
+                .bytes()
+                .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+        {
+            return Err(format!(
+                "client bundle {:?} sha256 must be 64 lowercase hexadecimal characters",
+                bundle.id
+            ));
+        }
+        if bundle.size_bytes == 0 || bundle.size_bytes > MAX_CLIENT_BUNDLE_BYTES {
+            return Err(format!(
+                "client bundle {:?} size_bytes must be 1..={MAX_CLIENT_BUNDLE_BYTES}",
+                bundle.id
+            ));
+        }
+
+        let loaders = unique_client_values(
+            bundle.loaders.into_iter().map(|loader| match loader {
+                DiskClientLoader::Fabric => LuaClientLoader::Fabric,
+                DiskClientLoader::NeoForge => LuaClientLoader::NeoForge,
+                DiskClientLoader::Forge => LuaClientLoader::Forge,
+            }),
+            "loaders",
+            &bundle.id,
+        )?;
+        let content = unique_client_values(
+            bundle.content.into_iter().map(|content| match content {
+                DiskClientContentKind::Blocks => LuaClientContentKind::Blocks,
+                DiskClientContentKind::Items => LuaClientContentKind::Items,
+                DiskClientContentKind::Screens => LuaClientContentKind::Screens,
+                DiskClientContentKind::Assets => LuaClientContentKind::Assets,
+                DiskClientContentKind::Interactions => LuaClientContentKind::Interactions,
+            }),
+            "content",
+            &bundle.id,
+        )?;
+        let permissions = unique_client_values(
+            bundle
+                .permissions
+                .into_iter()
+                .map(|permission| match permission {
+                    DiskClientPermission::RegisterBlocks => LuaClientPermission::RegisterBlocks,
+                    DiskClientPermission::RegisterItems => LuaClientPermission::RegisterItems,
+                    DiskClientPermission::OpenScreens => LuaClientPermission::OpenScreens,
+                    DiskClientPermission::LoadAssets => LuaClientPermission::LoadAssets,
+                    DiskClientPermission::SendInteractions => LuaClientPermission::SendInteractions,
+                }),
+            "permissions",
+            &bundle.id,
+        )?;
+        for content_kind in &content {
+            let required = content_kind.required_permission();
+            if !permissions.contains(&required) {
+                return Err(format!(
+                    "client bundle {:?} content {:?} requires permission {:?}",
+                    bundle.id,
+                    content_kind.contract_name(),
+                    required.contract_name()
+                ));
+            }
+        }
+        let artifact_path = validate_client_artifact(
+            plugin_directory,
+            &bundle.artifact,
+            bundle.size_bytes,
+            &bundle.sha256,
+        )?;
+
+        bundles.push(LuaClientBundle {
+            owner_plugin_id: owner_plugin_id.to_owned(),
+            id: bundle.id,
+            version: bundle.version,
+            artifact: bundle.artifact,
+            sha256: bundle.sha256,
+            size_bytes: bundle.size_bytes,
+            artifact_path,
+            loaders,
+            content,
+            permissions,
+        });
+    }
+    Ok(bundles)
+}
+
+fn validate_client_artifact(
+    plugin_directory: &Path,
+    relative_path: &str,
+    declared_size: u64,
+    declared_sha256: &str,
+) -> Result<PathBuf, String> {
+    let plugin_root = fs::canonicalize(plugin_directory).map_err(|error| {
+        format!(
+            "canonicalizing plugin directory {}: {error}",
+            plugin_directory.display()
+        )
+    })?;
+    let artifact_path = plugin_directory.join(relative_path);
+    let canonical = fs::canonicalize(&artifact_path).map_err(|error| {
+        format!(
+            "opening client artifact {}: {error}",
+            artifact_path.display()
+        )
+    })?;
+    if !canonical.starts_with(&plugin_root) {
+        return Err(format!(
+            "client artifact {} escapes the plugin directory",
+            artifact_path.display()
+        ));
+    }
+    let metadata = fs::metadata(&canonical)
+        .map_err(|error| format!("reading client artifact metadata: {error}"))?;
+    if !metadata.is_file() {
+        return Err(format!(
+            "client artifact {} is not a regular file",
+            artifact_path.display()
+        ));
+    }
+    if metadata.len() != declared_size {
+        return Err(format!(
+            "client artifact {} has {} bytes, manifest declares {declared_size}",
+            artifact_path.display(),
+            metadata.len()
+        ));
+    }
+    let mut file = fs::File::open(&canonical).map_err(|error| {
+        format!(
+            "opening client artifact {}: {error}",
+            artifact_path.display()
+        )
+    })?;
+    let mut digest = Sha256::new();
+    let copied = std::io::copy(&mut file, &mut digest).map_err(|error| {
+        format!(
+            "hashing client artifact {}: {error}",
+            artifact_path.display()
+        )
+    })?;
+    if copied != declared_size {
+        return Err(format!(
+            "client artifact {} changed while hashing",
+            artifact_path.display()
+        ));
+    }
+    let actual_sha256 = format!("{:x}", digest.finalize());
+    if actual_sha256 != declared_sha256 {
+        return Err(format!(
+            "client artifact {} SHA-256 does not match the manifest",
+            artifact_path.display()
+        ));
+    }
+    Ok(canonical)
+}
+
+fn unique_client_values<T>(
+    values: impl IntoIterator<Item = T>,
+    field: &str,
+    bundle_id: &str,
+) -> Result<Vec<T>, String>
+where
+    T: Copy + Eq + std::hash::Hash,
+{
+    let mut unique = HashSet::new();
+    let mut result = Vec::new();
+    for value in values {
+        if !unique.insert(value) {
+            return Err(format!(
+                "client bundle {bundle_id:?} contains duplicate {field}"
+            ));
+        }
+        result.push(value);
+    }
+    if result.is_empty() {
+        return Err(format!(
+            "client bundle {bundle_id:?} must declare at least one {field}"
+        ));
+    }
+    Ok(result)
+}
+
+fn validate_client_literal(value: &str, field: &str, max_bytes: usize) -> Result<(), String> {
+    if value.is_empty() || value.len() > max_bytes {
+        return Err(format!("{field} must contain 1..={max_bytes} bytes"));
+    }
+    if matches!(value, "." | "..") {
+        return Err(format!("{field} cannot be a relative path segment"));
+    }
+    if !value
+        .bytes()
+        .all(|byte| byte.is_ascii_alphanumeric() || b"_.-".contains(&byte))
+    {
+        return Err(format!("{field} {value:?} contains invalid characters"));
+    }
+    Ok(())
+}
+
+fn validate_client_artifact_path(path: &str) -> Result<(), String> {
+    if path.is_empty()
+        || path.len() > MAX_CLIENT_ARTIFACT_PATH_BYTES
+        || path.starts_with('/')
+        || path.contains('\\')
+        || path
+            .split('/')
+            .any(|component| component.is_empty() || matches!(component, "." | ".."))
+        || !path
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || b"_./-".contains(&byte))
+    {
+        return Err(format!(
+            "client artifact path {path:?} must be a bounded relative ASCII path"
+        ));
+    }
+    Ok(())
+}
+
+fn materialize_settlement_plan(
+    owner_plugin_id: &str,
+    profile: Option<LuaWorldgenSettlementProfile>,
+    buildings: Vec<DiskSettlementBuilding>,
+    inhabitants: Vec<DiskSettlementInhabitant>,
+    extensions: Vec<DiskSettlementExtension>,
+) -> Result<Option<LuaSettlementPlan>, String> {
+    let Some(profile) = profile else {
+        if buildings.is_empty() && inhabitants.is_empty() && extensions.is_empty() {
+            return Ok(None);
+        }
+        return Err("settlement descriptors require settlement_profile".to_owned());
+    };
+    if buildings.len() > MAX_SETTLEMENT_BUILDINGS {
+        return Err(format!(
+            "settlement_buildings exceeds {MAX_SETTLEMENT_BUILDINGS} entries"
+        ));
+    }
+    if inhabitants.len() > MAX_SETTLEMENT_INHABITANTS {
+        return Err(format!(
+            "settlement_inhabitants exceeds {MAX_SETTLEMENT_INHABITANTS} entries"
+        ));
+    }
+    if extensions.len() > MAX_SETTLEMENT_EXTENSIONS {
+        return Err(format!(
+            "settlement_extensions exceeds {MAX_SETTLEMENT_EXTENSIONS} entries"
+        ));
+    }
+
+    let buildings = if buildings.is_empty() {
+        default_plains_village_buildings()
+    } else {
+        let mut ids = HashSet::new();
+        let mut templates = HashSet::new();
+        let mut materialized = Vec::with_capacity(buildings.len());
+        for building in buildings {
+            validate_settlement_descriptor_id(&building.id, "settlement building id")?;
+            if !ids.insert(building.id.clone()) {
+                return Err(format!(
+                    "duplicate settlement building id {:?}",
+                    building.id
+                ));
+            }
+            let template = match building.template {
+                DiskSettlementBuildingTemplate::Fountain => {
+                    LuaSettlementBuildingTemplate::PlainsFountain
+                }
+                DiskSettlementBuildingTemplate::SmallHouse => {
+                    LuaSettlementBuildingTemplate::PlainsSmallHouse
+                }
+                DiskSettlementBuildingTemplate::Toolsmith => {
+                    LuaSettlementBuildingTemplate::PlainsToolsmith
+                }
+            };
+            if !templates.insert(template) {
+                return Err(format!(
+                    "duplicate settlement building template {:?}",
+                    template.contract_name()
+                ));
+            }
+            let role = match building.role {
+                DiskSettlementBuildingRole::MeetingPoint => LuaSettlementBuildingRole::MeetingPoint,
+                DiskSettlementBuildingRole::Home => LuaSettlementBuildingRole::Home,
+                DiskSettlementBuildingRole::Workplace => LuaSettlementBuildingRole::Workplace,
+            };
+            materialized.push(LuaSettlementBuilding {
+                id: building.id,
+                template,
+                role,
+            });
+        }
+        materialized
+    };
+    let building_ids = buildings
+        .iter()
+        .map(|building| building.id.as_str())
+        .collect::<HashSet<_>>();
+
+    let mut inhabitant_ids = HashSet::new();
+    let mut materialized_inhabitants = Vec::with_capacity(inhabitants.len());
+    for inhabitant in inhabitants {
+        validate_settlement_descriptor_id(&inhabitant.id, "settlement inhabitant id")?;
+        if !inhabitant_ids.insert(inhabitant.id.clone()) {
+            return Err(format!(
+                "duplicate settlement inhabitant id {:?}",
+                inhabitant.id
+            ));
+        }
+        if !building_ids.contains(inhabitant.building.as_str()) {
+            return Err(format!(
+                "settlement inhabitant {:?} references unknown building {:?}",
+                inhabitant.id, inhabitant.building
+            ));
+        }
+        let kind = match inhabitant.kind {
+            DiskSettlementInhabitantKind::Villager => LuaSettlementInhabitantKind::Villager,
+        };
+        let job = match inhabitant.job {
+            DiskSettlementJob::Unemployed => LuaSettlementJob::Unemployed,
+            DiskSettlementJob::Toolsmith => LuaSettlementJob::Toolsmith,
+        };
+        materialized_inhabitants.push(LuaSettlementInhabitant {
+            id: inhabitant.id,
+            kind,
+            building_id: inhabitant.building,
+            job,
+        });
+    }
+
+    let mut extension_ids = HashSet::new();
+    let mut materialized_extensions = Vec::with_capacity(extensions.len());
+    for extension in extensions {
+        validate_settlement_descriptor_id(&extension.id, "settlement extension id")?;
+        if !extension_ids.insert(extension.id.clone()) {
+            return Err(format!(
+                "duplicate settlement extension id {:?}",
+                extension.id
+            ));
+        }
+        if !building_ids.contains(extension.building.as_str()) {
+            return Err(format!(
+                "settlement extension {:?} references unknown building {:?}",
+                extension.id, extension.building
+            ));
+        }
+        materialized_extensions.push(LuaSettlementExtension {
+            id: format!("{owner_plugin_id}:{}", extension.id),
+            building_id: extension.building,
+        });
+    }
+
+    Ok(Some(LuaSettlementPlan {
+        owner_plugin_id: owner_plugin_id.to_owned(),
+        profile,
+        buildings,
+        inhabitants: materialized_inhabitants,
+        extensions: materialized_extensions,
+    }))
+}
+
+fn default_plains_village_buildings() -> Vec<LuaSettlementBuilding> {
+    [
+        (
+            "meeting-point",
+            LuaSettlementBuildingTemplate::PlainsFountain,
+            LuaSettlementBuildingRole::MeetingPoint,
+        ),
+        (
+            "home",
+            LuaSettlementBuildingTemplate::PlainsSmallHouse,
+            LuaSettlementBuildingRole::Home,
+        ),
+        (
+            "toolsmith",
+            LuaSettlementBuildingTemplate::PlainsToolsmith,
+            LuaSettlementBuildingRole::Workplace,
+        ),
+    ]
+    .into_iter()
+    .map(|(id, template, role)| LuaSettlementBuilding {
+        id: id.to_owned(),
+        template,
+        role,
+    })
+    .collect()
+}
+
+fn validate_settlement_descriptor_id(value: &str, field: &str) -> Result<(), String> {
+    if value.is_empty() || value.len() > MAX_SETTLEMENT_DESCRIPTOR_ID_BYTES {
+        return Err(format!(
+            "{field} must contain 1..={MAX_SETTLEMENT_DESCRIPTOR_ID_BYTES} bytes"
+        ));
+    }
+    if !value
+        .bytes()
+        .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit() || b"_.-".contains(&byte))
+    {
+        return Err(format!("{field} {value:?} contains invalid characters"));
+    }
+    Ok(())
 }
 
 fn read_plugin_config(directory: &Path) -> Result<toml::Table, String> {
@@ -1195,6 +2260,73 @@ fn install_solaris_api(
         )?,
     )?;
     let open_menu_invocation = Arc::clone(&invocation);
+    let open_client_screen_invocation = Arc::clone(&invocation);
+    api.set(
+        "open_client_screen",
+        lua.create_function(move |_, (player_id, screen_id): (u64, LuaString)| {
+            let screen_id = bounded_lua_string(
+                screen_id,
+                "screen_id",
+                crate::MAX_SCRIPT_RESOURCE_ID_BYTES,
+                false,
+            )?;
+            crate::validate_script_resource_id(&screen_id)
+                .map_err(|_| lua_input_error("screen_id", "invalid"))?;
+            push_command(
+                &open_client_screen_invocation,
+                ScriptCommand::OpenClientScreen {
+                    player_id: ScriptPlayerId::new(player_id),
+                    screen_id,
+                },
+            )
+        })?,
+    )?;
+    let place_loader_block_invocation = Arc::clone(&invocation);
+    api.set(
+        "place_loader_block",
+        lua.create_function(move |_, (block_id, x, y, z): (LuaString, i32, i32, i32)| {
+            let block_id = bounded_lua_string(
+                block_id,
+                "block_id",
+                crate::MAX_SCRIPT_RESOURCE_ID_BYTES,
+                false,
+            )?;
+            crate::validate_script_resource_id(&block_id)
+                .map_err(|_| lua_input_error("block_id", "invalid"))?;
+            push_command(
+                &place_loader_block_invocation,
+                ScriptCommand::PlaceLoaderBlock { block_id, x, y, z },
+            )
+        })?,
+    )?;
+    let grant_loader_block_item_invocation = Arc::clone(&invocation);
+    api.set(
+        "grant_loader_block_item",
+        lua.create_function(
+            move |_, (player_id, block_id, count): (u64, LuaString, i64)| {
+                let block_id = bounded_lua_string(
+                    block_id,
+                    "block_id",
+                    crate::MAX_SCRIPT_RESOURCE_ID_BYTES,
+                    false,
+                )?;
+                crate::validate_script_resource_id(&block_id)
+                    .map_err(|_| lua_input_error("block_id", "invalid"))?;
+                let count = u8::try_from(count)
+                    .ok()
+                    .filter(|count| (1..=64).contains(count))
+                    .ok_or_else(|| lua_input_error("count", "must be in 1..=64"))?;
+                push_command(
+                    &grant_loader_block_item_invocation,
+                    ScriptCommand::GrantLoaderBlockItem {
+                        player_id: ScriptPlayerId::new(player_id),
+                        block_id,
+                        count,
+                    },
+                )
+            },
+        )?,
+    )?;
     api.set(
         "open_inventory_menu",
         lua.create_function(
@@ -2210,6 +3342,15 @@ fn event_table(lua: &Lua, event: &ScriptEvent) -> mlua::Result<Table> {
             table.set("order", order.as_str())?;
             table.set("accepted", *accepted)?;
         }
+        ScriptEventKind::LoaderInteraction {
+            player_id,
+            interaction_id,
+            payload,
+        } => {
+            table.set("player_id", player_id.value())?;
+            table.set("interaction_id", interaction_id.as_str())?;
+            table.set("payload", payload.as_str())?;
+        }
     }
     Ok(table)
 }
@@ -2259,6 +3400,7 @@ fn handler_name(event: &ScriptEvent) -> &'static str {
         ScriptEventKind::ColonyRecordResult { .. } => "on_colony_record_result",
         ScriptEventKind::ColonyVillagerBindingResult { .. } => "on_colony_villager_binding_result",
         ScriptEventKind::ColonyVillagerOrderResult { .. } => "on_colony_villager_order_result",
+        ScriptEventKind::LoaderInteraction { .. } => "on_loader_interaction",
     }
 }
 
@@ -2350,6 +3492,45 @@ mod tests {
             &[ScriptCommand::SendChatMessage {
                 player_id: ScriptPlayerId::new(7),
                 message: "Welcome Alex".to_owned(),
+            }]
+        );
+    }
+
+    #[test]
+    fn targeted_loader_interaction_reaches_only_its_owner_handler() {
+        let mut runtime = LuaScriptRuntime::from_source(
+            manifest(&[]),
+            r#"
+                function on_loader_interaction(event)
+                    solaris.send_message(
+                        event.player_id,
+                        event.interaction_id .. "=" .. event.payload)
+                end
+            "#,
+            LuaRuntimeLimits::default(),
+        )
+        .unwrap();
+        let controls = RuntimeControls::unrestricted();
+        let event = ScriptEvent::loader_interaction(
+            "test-plugin",
+            ScriptPlayerId::new(7),
+            "test-plugin:continue",
+            "accepted",
+        )
+        .unwrap();
+
+        let batch = runtime
+            .handle_event(
+                &event,
+                RuntimeContext::new(&controls, NonZeroUsize::new(8).unwrap()),
+            )
+            .unwrap();
+
+        assert_eq!(
+            batch.commands(),
+            &[ScriptCommand::SendChatMessage {
+                player_id: ScriptPlayerId::new(7),
+                message: "test-plugin:continue=accepted".to_owned(),
             }]
         );
     }
@@ -2546,6 +3727,93 @@ mod tests {
                     RuntimeContext::new(&controls, NonZeroUsize::new(8).unwrap()),
                 )
                 .is_err()
+        );
+    }
+
+    #[test]
+    fn lua_place_loader_block_emits_bounded_integer_command() {
+        let manifest =
+            ScriptPluginManifest::new("loader-test", "Loader Test", "0.1.0", SCRIPT_API_VERSION)
+                .declare_player_command_root("place")
+                .validate()
+                .unwrap();
+        let controls = RuntimeControls::unrestricted();
+        let event = ScriptEvent::try_player_command_with_context(
+            "loader-test",
+            ScriptPlayerId::new(7),
+            player_context("Alex"),
+            "place",
+            "",
+        )
+        .unwrap();
+        let mut runtime = LuaScriptRuntime::from_source(
+            manifest,
+            r#"
+                function on_player_command(event)
+                    solaris.place_loader_block("loader-test:ruby_block", 3, 64, -5)
+                end
+            "#,
+            LuaRuntimeLimits::default(),
+        )
+        .unwrap();
+
+        let batch = runtime
+            .handle_event(
+                &event,
+                RuntimeContext::new(&controls, NonZeroUsize::new(8).unwrap()),
+            )
+            .unwrap();
+        assert_eq!(
+            batch.commands(),
+            &[ScriptCommand::PlaceLoaderBlock {
+                block_id: "loader-test:ruby_block".to_owned(),
+                x: 3,
+                y: 64,
+                z: -5,
+            }]
+        );
+    }
+
+    #[test]
+    fn lua_grant_loader_block_item_emits_bounded_command() {
+        let manifest =
+            ScriptPluginManifest::new("loader-test", "Loader Test", "0.1.0", SCRIPT_API_VERSION)
+                .declare_player_command_root("grant")
+                .validate()
+                .unwrap();
+        let controls = RuntimeControls::unrestricted();
+        let event = ScriptEvent::try_player_command_with_context(
+            "loader-test",
+            ScriptPlayerId::new(7),
+            player_context("Alex"),
+            "grant",
+            "",
+        )
+        .unwrap();
+        let mut runtime = LuaScriptRuntime::from_source(
+            manifest,
+            r#"
+                function on_player_command(event)
+                    solaris.grant_loader_block_item(event.player_id, "loader-test:ruby_block", 3)
+                end
+            "#,
+            LuaRuntimeLimits::default(),
+        )
+        .unwrap();
+
+        let batch = runtime
+            .handle_event(
+                &event,
+                RuntimeContext::new(&controls, NonZeroUsize::new(8).unwrap()),
+            )
+            .unwrap();
+        assert_eq!(
+            batch.commands(),
+            &[ScriptCommand::GrantLoaderBlockItem {
+                player_id: ScriptPlayerId::new(7),
+                block_id: "loader-test:ruby_block".to_owned(),
+                count: 3,
+            }]
         );
     }
 
@@ -2967,6 +4235,8 @@ mod tests {
             .to_owned(),
             source_path: PathBuf::from("atomic/main.lua"),
             worldgen_ore_profile: None,
+            worldgen_settlement_plan: None,
+            client_bundles: Vec::new(),
         };
         let (boundary, endpoint) =
             script_boundary_pair(NonZeroUsize::new(2).unwrap(), NonZeroUsize::new(1).unwrap());
@@ -3473,6 +4743,8 @@ mod tests {
             .to_owned(),
             source_path: PathBuf::from("bad/main.lua"),
             worldgen_ore_profile: None,
+            worldgen_settlement_plan: None,
+            client_bundles: Vec::new(),
         };
         let good_manifest =
             ScriptPluginManifest::new("good-plugin", "Good Plugin", "0.1.0", SCRIPT_API_VERSION)
@@ -3490,6 +4762,8 @@ mod tests {
             .to_owned(),
             source_path: PathBuf::from("good/main.lua"),
             worldgen_ore_profile: None,
+            worldgen_settlement_plan: None,
+            client_bundles: Vec::new(),
         };
         let (boundary, endpoint) =
             script_boundary_pair(NonZeroUsize::new(4).unwrap(), NonZeroUsize::new(4).unwrap());
@@ -3540,6 +4814,8 @@ mod tests {
             source: "function on_server_tick(_event) end".to_owned(),
             source_path: PathBuf::from(path),
             worldgen_ore_profile: None,
+            worldgen_settlement_plan: None,
+            client_bundles: Vec::new(),
         };
         let (boundary, endpoint) =
             script_boundary_pair(NonZeroUsize::new(4).unwrap(), NonZeroUsize::new(4).unwrap());
@@ -3589,6 +4865,8 @@ mod tests {
             source: "function on_player_command(_event) end".to_owned(),
             source_path: PathBuf::from(path),
             worldgen_ore_profile: None,
+            worldgen_settlement_plan: None,
+            client_bundles: Vec::new(),
         };
         let (boundary, endpoint) =
             script_boundary_pair(NonZeroUsize::new(4).unwrap(), NonZeroUsize::new(4).unwrap());
@@ -3625,6 +4903,8 @@ mod tests {
             ),
             source_path: PathBuf::from(format!("{id}/main.lua")),
             worldgen_ore_profile: None,
+            worldgen_settlement_plan: None,
+            client_bundles: Vec::new(),
         };
         let (boundary, endpoint) =
             script_boundary_pair(NonZeroUsize::new(4).unwrap(), NonZeroUsize::new(4).unwrap());
@@ -3677,6 +4957,8 @@ mod tests {
             .to_owned(),
             source_path: PathBuf::from("bad/main.lua"),
             worldgen_ore_profile: None,
+            worldgen_settlement_plan: None,
+            client_bundles: Vec::new(),
         };
         let good = PluginSource {
             manifest: ScriptPluginManifest::new("good", "good", "0.1.0", SCRIPT_API_VERSION)
@@ -3692,6 +4974,8 @@ mod tests {
             .to_owned(),
             source_path: PathBuf::from("good/main.lua"),
             worldgen_ore_profile: None,
+            worldgen_settlement_plan: None,
+            client_bundles: Vec::new(),
         };
         let (boundary, endpoint) =
             script_boundary_pair(NonZeroUsize::new(4).unwrap(), NonZeroUsize::new(4).unwrap());
@@ -4017,6 +5301,8 @@ mod tests {
             ),
             source_path: PathBuf::from(format!("{id}/main.lua")),
             worldgen_ore_profile: None,
+            worldgen_settlement_plan: None,
+            client_bundles: Vec::new(),
         };
         let (boundary, endpoint) =
             script_boundary_pair(NonZeroUsize::new(2).unwrap(), NonZeroUsize::new(2).unwrap());

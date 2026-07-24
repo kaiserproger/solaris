@@ -15,26 +15,54 @@ use mc_world::{BlockPos, BlockRegistry, BlockStateId};
 use tokio::sync::mpsc;
 
 use super::*;
+use crate::loader::{
+    LOADER_PROTOCOL_VERSION, LoaderBundle, LoaderClientAck, LoaderContentKind, LoaderManifest,
+    LoaderPermission, LoaderPlatform, loader_block_item_model,
+};
 use crate::login::LoggedInProfile;
 use crate::play::item_blocks::ItemToBlockTable;
 use crate::play::persistence::PlayerPersistedState;
 use crate::play::tests::{insert_fluid_test_chunk, interaction_state_for_blocks};
-use crate::play::{CommandPermissions, SimulationOwner, simulation_channel};
+use crate::play::{
+    CommandPermissions, OutboundCommand, SessionRegistration, SimulationOwner, simulation_channel,
+};
 use crate::server::ScriptEventSink;
 
 const SLAB_ITEM_ID: u32 = 42;
 const STAIR_ITEM_ID: u32 = 43;
 const STONE_ITEM_ID: u32 = 44;
+const PAPER_ITEM_ID: u32 = 45;
 
 struct PlacementHarness {
     state: InteractionState,
     owner: SimulationOwner,
     persisted: Arc<Mutex<PlayerPersistedState>>,
     pose: PlayerPose,
+    _outbound: mpsc::Receiver<OutboundCommand>,
 }
 
 async fn placement_harness(held_item: u32) -> PlacementHarness {
-    let reports = placement_reports();
+    placement_harness_with(ItemStack::new(held_item, 2), None).await
+}
+
+async fn placement_harness_with(
+    held: ItemStack,
+    loader_session: Option<crate::LoaderSession>,
+) -> PlacementHarness {
+    let mut reports = placement_reports();
+    let loader_state_id = reports
+        .iter()
+        .map(|report| report.states.len() as u32)
+        .sum();
+    reports.push(BlockReport {
+        id: Identifier::parse("example:ruby_block").unwrap(),
+        properties: BTreeMap::new(),
+        states: vec![BlockStateReport {
+            id: loader_state_id,
+            default: true,
+            properties: BTreeMap::new(),
+        }],
+    });
     let blocks = Arc::new(BlockRegistry::from_report(&reports).unwrap());
     let items = Arc::new(ItemRegistry::from_report(&[
         ItemReport {
@@ -49,6 +77,10 @@ async fn placement_harness(held_item: u32) -> PlacementHarness {
             id: Identifier::parse("minecraft:stone").unwrap(),
             protocol_id: STONE_ITEM_ID,
         },
+        ItemReport {
+            id: Identifier::parse("minecraft:paper").unwrap(),
+            protocol_id: PAPER_ITEM_ID,
+        },
     ]));
     let mut state = interaction_state_for_blocks(Arc::clone(&blocks));
     state.items = Arc::clone(&items);
@@ -56,7 +88,7 @@ async fn placement_harness(held_item: u32) -> PlacementHarness {
     state.block_facts = Arc::new(mc_data::block_facts::BlockFactsTable::from_blocks_report(
         &reports,
     ));
-    *state.inventory.held_mut(0).unwrap() = ItemStack::new(held_item, 2);
+    *state.inventory.held_mut(0).unwrap() = held;
     insert_fluid_test_chunk(&state).await;
 
     let pose = PlayerPose::new(4.5, 64.0, 4.5);
@@ -64,10 +96,23 @@ async fn placement_harness(held_item: u32) -> PlacementHarness {
         uuid: crate::login::offline_uuid("PlacementAdapter"),
         name: "PlacementAdapter".to_owned(),
     };
-    let (tx, _rx) = mpsc::channel(8);
+    let (tx, outbound) = mpsc::channel(8);
     let (session_id, _) = state
         .sessions
-        .register(&profile, (0, 0), 0, HashSet::new(), tx, pose);
+        .try_register(SessionRegistration {
+            profile: &profile,
+            properties: &[],
+            center: (0, 0),
+            view_distance: 0,
+            desired: HashSet::new(),
+            tx,
+            pose,
+            max_sessions: usize::MAX,
+            script_operator: false,
+            dimension: "minecraft:overworld",
+            loader_session,
+        })
+        .unwrap();
     let mut saved = PlayerPersistedState::new_default(pose);
     saved.inventory = state.inventory.clone();
     let persisted = Arc::new(Mutex::new(saved));
@@ -83,7 +128,91 @@ async fn placement_harness(held_item: u32) -> PlacementHarness {
         owner,
         persisted,
         pose,
+        _outbound: outbound,
     }
+}
+
+fn loader_manifest() -> LoaderManifest {
+    LoaderManifest {
+        protocol: LOADER_PROTOCOL_VERSION,
+        bundles: vec![LoaderBundle {
+            owner: "example".to_owned(),
+            id: "block".to_owned(),
+            version: "1".to_owned(),
+            artifact: "client/block.zip".to_owned(),
+            sha256: "a".repeat(64),
+            size_bytes: 1,
+            loaders: vec![LoaderPlatform::Fabric],
+            content: vec![LoaderContentKind::Blocks],
+            permissions: vec![LoaderPermission::RegisterBlocks],
+            cache_key: format!("example:block/1/{}", "a".repeat(64)),
+            source_path: None,
+            block_id: Some("example:ruby_block".to_owned()),
+            block_name: Some("Ruby Block".to_owned()),
+        }],
+    }
+}
+
+fn loader_session(manifest: &LoaderManifest) -> crate::LoaderSession {
+    manifest
+        .bind_ack(&LoaderClientAck {
+            protocol: LOADER_PROTOCOL_VERSION,
+            platform: LoaderPlatform::Fabric,
+            loader_version: "test".to_owned(),
+            accepted_permissions: manifest.bundles[0].permissions.clone(),
+            cached_bundles: vec![manifest.bundles[0].cache_key.clone()],
+            carrier_block_state_ids: BTreeMap::from([("example:ruby_block".to_owned(), 321)]),
+        })
+        .unwrap()
+}
+
+fn loader_stack(count: i32) -> ItemStack {
+    ItemStack::new(PAPER_ITEM_ID, count)
+        .with_custom_name("Ruby Block")
+        .with_item_model(loader_block_item_model(0))
+}
+
+#[tokio::test]
+async fn loader_block_drop_requires_ack_and_exact_canonical_state() {
+    let manifest = loader_manifest();
+    let acknowledged =
+        placement_harness_with(loader_stack(1), Some(loader_session(&manifest))).await;
+    let canonical = acknowledged
+        .state
+        .blocks
+        .block(&Identifier::parse("example:ruby_block").unwrap())
+        .unwrap()
+        .default;
+
+    assert_eq!(
+        acknowledged.state.sessions.loader_block_drop_stack(
+            acknowledged.state.session_id,
+            canonical,
+            &acknowledged.state.items,
+            &acknowledged.state.blocks,
+        ),
+        Some(loader_stack(1))
+    );
+    assert_eq!(
+        acknowledged.state.sessions.loader_block_drop_stack(
+            acknowledged.state.session_id,
+            BlockStateId(1),
+            &acknowledged.state.items,
+            &acknowledged.state.blocks,
+        ),
+        None
+    );
+
+    let unacknowledged = placement_harness_with(loader_stack(1), None).await;
+    assert_eq!(
+        unacknowledged.state.sessions.loader_block_drop_stack(
+            unacknowledged.state.session_id,
+            canonical,
+            &unacknowledged.state.items,
+            &unacknowledged.state.blocks,
+        ),
+        None
+    );
 }
 
 async fn poll_placement_pending<F>(mut request: Pin<&mut F>)
@@ -195,6 +324,95 @@ async fn ordinary_block_placement_routes_all_six_clicked_faces() {
             "placement did not route {direction:?} to {target:?}"
         );
         assert_held_count(&harness, 1);
+    }
+}
+
+#[tokio::test]
+async fn acknowledged_loader_item_places_canonical_state_and_debits_once() {
+    let manifest = loader_manifest();
+    let mut harness =
+        placement_harness_with(loader_stack(2), Some(loader_session(&manifest))).await;
+    let clicked = BlockPos { x: 4, y: 64, z: 4 };
+    let target = BlockPos { x: 5, ..clicked };
+    set_block(&harness.state, clicked, BlockStateId(1)).await;
+    let action = use_item_on(clicked, Direction::East, 0.5);
+
+    run_accepted_placement(&mut harness, clicked, &action).await;
+
+    let canonical = harness
+        .state
+        .blocks
+        .block(&Identifier::parse("example:ruby_block").unwrap())
+        .unwrap()
+        .default;
+    assert_eq!(
+        harness.state.world.lock().await.get_cached_block(target),
+        Some(canonical)
+    );
+    assert_eq!(harness.state.inventory.held(0), Some(&loader_stack(1)));
+    assert_eq!(
+        harness.persisted.lock().unwrap().inventory.held(0),
+        Some(&loader_stack(1))
+    );
+}
+
+#[tokio::test]
+async fn loader_item_placement_requires_exact_model_and_acknowledged_session() {
+    let manifest = loader_manifest();
+    let wrong_model = ItemStack::new(PAPER_ITEM_ID, 2)
+        .with_custom_name("Ruby Block")
+        .with_item_model(Identifier::parse("example:not_loader").unwrap());
+    for (held, loader_session) in [
+        (wrong_model, Some(loader_session(&manifest))),
+        (loader_stack(2), None),
+        (
+            ItemStack::new(STONE_ITEM_ID, 2)
+                .with_custom_name("Ruby Block")
+                .with_item_model(loader_block_item_model(0)),
+            Some(loader_session(&manifest)),
+        ),
+    ] {
+        let mut harness = placement_harness_with(held.clone(), loader_session).await;
+        let clicked = BlockPos { x: 4, y: 64, z: 4 };
+        let target = BlockPos { x: 5, ..clicked };
+        set_block(&harness.state, clicked, BlockStateId(1)).await;
+        let action = use_item_on(clicked, Direction::East, 0.5);
+        let mut writer = Vec::new();
+
+        handle_block_item_placement(
+            &mut harness.state,
+            &mut writer,
+            None,
+            GameMode::Survival,
+            harness.pose,
+            clicked,
+            &action,
+            (clicked.x, clicked.y, clicked.z),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(
+            harness.state.world.lock().await.get_cached_block(target),
+            Some(BlockStateId(0))
+        );
+        assert_eq!(harness.state.inventory.held(0), Some(&held));
+        assert_eq!(
+            harness.persisted.lock().unwrap().inventory.held(0),
+            Some(&held)
+        );
+        assert_eq!(
+            harness
+                .owner
+                .process_tick_with_world(
+                    &harness.state.sessions,
+                    Some(&harness.state.world),
+                    None,
+                    1,
+                )
+                .processed,
+            0
+        );
     }
 }
 

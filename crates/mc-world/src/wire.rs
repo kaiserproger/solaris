@@ -325,6 +325,17 @@ pub fn encode_chunk_data(
     biomes: &Registry,
     blocks: &BlockRegistry,
 ) -> Result<Vec<u8>, WireError> {
+    encode_chunk_data_with_block_projection(chunk, biomes, blocks, &|state| state)
+}
+
+/// Encode chunk data after projecting server-owned block states into the state
+/// ids understood by one client.
+pub fn encode_chunk_data_with_block_projection(
+    chunk: &Chunk,
+    biomes: &Registry,
+    blocks: &BlockRegistry,
+    project: &dyn Fn(crate::block::BlockStateId) -> crate::block::BlockStateId,
+) -> Result<Vec<u8>, WireError> {
     debug_assert_eq!(chunk.sections.len(), chunk.geometry().section_count());
     debug_assert_eq!(chunk.biomes.len(), chunk.geometry().section_count());
     let mut buf = Vec::with_capacity(chunk.geometry().section_count() * 16);
@@ -333,7 +344,7 @@ pub fn encode_chunk_data(
         // fluid_count as a fast gate before scanning entity/fluid overlap.
         buf.extend_from_slice(&(sec.non_air_count() as i16).to_be_bytes());
         buf.extend_from_slice(&(section_fluid_count(sec, blocks) as i16).to_be_bytes());
-        encode_block_palette(&mut buf, sec);
+        encode_block_palette(&mut buf, sec, project);
         encode_biome_palette(&mut buf, bsec, biomes)?;
     }
     Ok(buf)
@@ -367,7 +378,11 @@ fn section_fluid_count(section: &ChunkSection, blocks: &BlockRegistry) -> u16 {
         .count() as u16
 }
 
-fn encode_block_palette(buf: &mut Vec<u8>, section: &ChunkSection) {
+fn encode_block_palette(
+    buf: &mut Vec<u8>,
+    section: &ChunkSection,
+    project: &dyn Fn(crate::block::BlockStateId) -> crate::block::BlockStateId,
+) {
     match (section.palette(), section.indices()) {
         (None, _) => {
             // Section is in Single mode — vanilla's
@@ -380,13 +395,13 @@ fn encode_block_palette(buf: &mut Vec<u8>, section: &ChunkSection) {
             buf.push(0);
             write_varint(
                 buf,
-                i32::try_from(section.get(0, 0, 0).0).expect("state id < i32::MAX"),
+                i32::try_from(project(section.get(0, 0, 0)).0).expect("state id < i32::MAX"),
             );
             // No bit-storage longs.
         }
         (Some(palette), Some(indices)) => {
             if indices.bits_per_entry() >= DIRECT_BITS_THRESHOLD {
-                encode_block_direct(buf, palette, indices);
+                encode_block_direct(buf, palette, indices, project);
             } else {
                 buf.push(indices.bits_per_entry());
                 write_varint(
@@ -394,7 +409,10 @@ fn encode_block_palette(buf: &mut Vec<u8>, section: &ChunkSection) {
                     i32::try_from(palette.len()).expect("palette len < i32::MAX"),
                 );
                 for state in palette {
-                    write_varint(buf, i32::try_from(state.0).expect("state id < i32::MAX"));
+                    write_varint(
+                        buf,
+                        i32::try_from(project(*state).0).expect("state id < i32::MAX"),
+                    );
                 }
                 for word in pack_fixed_longs(indices.bits_per_entry(), indices.len(), |idx| {
                     indices.get(idx)
@@ -417,11 +435,12 @@ fn encode_block_direct(
     buf: &mut Vec<u8>,
     palette: &[crate::block::BlockStateId],
     indices: &PackedBitArray,
+    project: &dyn Fn(crate::block::BlockStateId) -> crate::block::BlockStateId,
 ) {
     let bits = DIRECT_BITS.max(indices.bits_per_entry());
     let direct = pack_fixed_longs(bits, SECTION_VOLUME, |cell| {
         let p = indices.get(cell) as usize;
-        palette[p].0
+        project(palette[p]).0
     });
     buf.push(bits);
     // GlobalPalette: no palette VarInts.
@@ -760,6 +779,35 @@ mod tests {
                 "section {sec} mismatches expected all-air/all-plains layout"
             );
         }
+    }
+
+    #[test]
+    fn chunk_palette_projects_one_server_owned_state_to_the_client_carrier() {
+        let geometry = ChunkGeometry::new(0, 16).unwrap();
+        let mut chunk = Chunk::empty_with_geometry(
+            ChunkPos { x: 0, z: 0 },
+            AIR,
+            Identifier::parse("minecraft:plains").unwrap(),
+            geometry,
+        );
+        chunk.sections[0] = ChunkSection::filled(BlockStateId(11), AIR);
+
+        let bytes = encode_chunk_data_with_block_projection(
+            &chunk,
+            &biome_registry(),
+            &air_chest_registry(),
+            &|state| {
+                if state == BlockStateId(11) {
+                    BlockStateId(42)
+                } else {
+                    state
+                }
+            },
+        )
+        .unwrap();
+
+        assert_eq!(bytes[4], 0, "single-value block palette");
+        assert_eq!(bytes[5], 42, "projected carrier state VarInt");
     }
 
     #[test]
@@ -1209,7 +1257,7 @@ mod tests {
         }
 
         let mut buf = Vec::new();
-        super::encode_block_palette(&mut buf, &section);
+        super::encode_block_palette(&mut buf, &section, &|state| state);
 
         assert_eq!(buf[0], super::DIRECT_BITS, "first byte = direct bits");
         // No VarInt palette length: the next bytes are the packed
@@ -1238,7 +1286,7 @@ mod tests {
         }
 
         let mut buf = Vec::new();
-        super::encode_block_palette(&mut buf, &section);
+        super::encode_block_palette(&mut buf, &section, &|state| state);
 
         assert_eq!(buf[0], 5, "17 states require five bits");
         let mut offset = 1;
@@ -1315,7 +1363,7 @@ mod tests {
         section.set(1, 0, 0, BlockStateId(2));
 
         let mut buf = Vec::new();
-        super::encode_block_palette(&mut buf, &section);
+        super::encode_block_palette(&mut buf, &section, &|state| state);
 
         assert!(
             buf[0] < super::DIRECT_BITS_THRESHOLD,

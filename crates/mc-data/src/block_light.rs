@@ -165,6 +165,15 @@ impl BlockLightTable {
         }
     }
 
+    /// Append one full, opaque, non-emitting block state after a validated
+    /// frozen registry.
+    pub fn append_opaque_state(&mut self) {
+        self.emission.push(0);
+        self.opacity.push(15);
+        self.propagates_sky.push(false);
+        self.suffocating.push(true);
+    }
+
     /// Build a runtime table from `blocks.json` when the exact vanilla
     /// light oracle is absent. Unknown blocks are treated as opaque and
     /// non-emissive, which keeps caves and terrain sane; known air,
@@ -460,7 +469,7 @@ mod tests {
 
     #[test]
     fn from_arrays_pins_lookups() {
-        let table = BlockLightTable::from_arrays(
+        let mut table = BlockLightTable::from_arrays(
             "test",
             vec![0, 14, 15],
             vec![0, 0, 15],
@@ -473,6 +482,11 @@ mod tests {
         assert_eq!(table.propagates_sky(1), Some(true));
         assert_eq!(table.suffocating(2), Some(true));
         assert_eq!(table.emission(99), None);
+        table.append_opaque_state();
+        assert_eq!(table.emission(3), Some(0));
+        assert_eq!(table.opacity(3), Some(15));
+        assert_eq!(table.propagates_sky(3), Some(false));
+        assert_eq!(table.suffocating(3), Some(true));
     }
 
     #[test]

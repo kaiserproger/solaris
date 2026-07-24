@@ -17,15 +17,16 @@ use mc_protocol::TARGET_RELEASE;
 use mc_protocol::codec::{Identifier, WriteMc};
 use mc_protocol::frame::{Compression, encode_frame, try_decode_frame};
 use mc_protocol::packets::configuration::{
-    AcknowledgeFinishConfiguration, ClientboundKnownPacks, FinishConfiguration, KnownPackEntry,
-    RegistryData, ServerboundClientInformation, ServerboundCustomPayload, ServerboundKnownPacks,
-    UpdateEnabledFeatures, UpdateTags,
+    AcknowledgeFinishConfiguration, ClientboundCustomPayload, ClientboundKnownPacks,
+    FinishConfiguration, KnownPackEntry, RegistryData, ServerboundClientInformation,
+    ServerboundCustomPayload, ServerboundKnownPacks, UpdateEnabledFeatures, UpdateTags,
 };
 use mc_protocol::packets::handshake::{Handshake, NextState};
 use mc_protocol::packets::login::{LoginAcknowledged, LoginStart, LoginSuccess, SetCompression};
 use mc_protocol::packets::play::LoginPlay;
 use mc_protocol::packets::{ChatVisibility, ClientInformation, MainHand, ParticleStatus};
 use mc_protocol::packets::{CustomPayload, Packet};
+use sha2::{Digest, Sha256};
 use tempfile::TempDir;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
@@ -39,6 +40,13 @@ async fn start_server() -> SocketAddr {
 }
 
 async fn start_server_with_data(data: std::sync::Arc<mc_data::VanillaData>) -> SocketAddr {
+    start_server_with_data_and_loader(data, None).await
+}
+
+async fn start_server_with_data_and_loader(
+    data: std::sync::Arc<mc_data::VanillaData>,
+    loader_manifest: Option<std::sync::Arc<mc_net::LoaderManifest>>,
+) -> SocketAddr {
     let cfg = mc_net::ServerConfig {
         bind_address: "127.0.0.1:0".parse().unwrap(),
         motd: "M1.e config".into(),
@@ -61,6 +69,7 @@ async fn start_server_with_data(data: std::sync::Arc<mc_data::VanillaData>) -> S
         chunk_pipeline: mc_net::ChunkPipelinePolicy::default(),
         random_tick: mc_net::RandomTickPolicy::default(),
         command_permissions: mc_net::CommandPermissionConfig::new(Vec::<String>::new(), true),
+        loader_manifest,
         shutdown: mc_net::ShutdownHandle::default(),
     };
     let bound = mc_net::bind(cfg).await.expect("bind");
@@ -69,6 +78,31 @@ async fn start_server_with_data(data: std::sync::Arc<mc_data::VanillaData>) -> S
         let _ = bound.serve().await;
     });
     addr
+}
+
+fn loader_manifest() -> mc_net::LoaderManifest {
+    mc_net::LoaderManifest {
+        protocol: mc_net::LOADER_PROTOCOL_VERSION,
+        bundles: vec![mc_net::LoaderBundle {
+            owner: "example".to_owned(),
+            id: "screen".to_owned(),
+            version: "1".to_owned(),
+            artifact: "client/screen.zip".to_owned(),
+            sha256: "a".repeat(64),
+            size_bytes: 128,
+            loaders: vec![
+                mc_net::LoaderPlatform::Fabric,
+                mc_net::LoaderPlatform::NeoForge,
+                mc_net::LoaderPlatform::Forge,
+            ],
+            content: vec![mc_net::LoaderContentKind::Screens],
+            permissions: vec![mc_net::LoaderPermission::OpenScreens],
+            cache_key: format!("example:screen/1/{}", "a".repeat(64)),
+            source_path: None,
+            block_id: None,
+            block_name: None,
+        }],
+    }
 }
 
 fn full_registry_sidecar() -> TempDir {
@@ -125,6 +159,7 @@ async fn start_server_with_extension() -> (SocketAddr, mc_extension::ExtensionEn
         chunk_pipeline: mc_net::ChunkPipelinePolicy::default(),
         random_tick: mc_net::RandomTickPolicy::default(),
         command_permissions: mc_net::CommandPermissionConfig::new(Vec::<String>::new(), true),
+        loader_manifest: None,
         shutdown: mc_net::ShutdownHandle::default(),
     };
     let (boundary, endpoint) =
@@ -395,6 +430,269 @@ async fn configuration_known_packs_and_finish_complete() {
         LoginPlay::ID,
         "after AcknowledgeFinishConfiguration the server should emit \
          Login (Play) as the first Play-state packet"
+    );
+}
+
+#[tokio::test]
+async fn configuration_empty_loader_manifest_preserves_vanilla_path() {
+    let addr = start_server_with_data_and_loader(
+        std::sync::Arc::new(mc_data::testing::stub()),
+        Some(std::sync::Arc::new(mc_net::LoaderManifest {
+            protocol: mc_net::LOADER_PROTOCOL_VERSION,
+            bundles: Vec::new(),
+        })),
+    )
+    .await;
+    let mut stream = TcpStream::connect(addr).await.unwrap();
+    let mut rbuf = BytesMut::with_capacity(4096);
+    let compression = run_through_login_ack(&mut stream, &mut rbuf, addr, "EmptyLoader").await;
+
+    let known = read_configuration_preamble(&mut stream, &mut rbuf, compression).await;
+    write_frame(
+        &mut stream,
+        &ServerboundKnownPacks { packs: known.packs },
+        compression,
+    )
+    .await;
+    read_to_finish_configuration(&mut stream, &mut rbuf, compression).await;
+    write_frame(&mut stream, &AcknowledgeFinishConfiguration, compression).await;
+
+    let frame = read_one_frame(&mut stream, &mut rbuf, compression).await;
+    assert_eq!(frame.id, LoginPlay::ID);
+}
+
+#[tokio::test]
+async fn configuration_loader_manifest_requires_valid_ack_before_play() {
+    let manifest = loader_manifest();
+    let addr = start_server_with_data_and_loader(
+        std::sync::Arc::new(mc_data::testing::stub()),
+        Some(std::sync::Arc::new(manifest.clone())),
+    )
+    .await;
+    let mut stream = TcpStream::connect(addr).await.unwrap();
+    let mut rbuf = BytesMut::with_capacity(4096);
+    let compression = run_through_login_ack(&mut stream, &mut rbuf, addr, "LoaderClient").await;
+
+    let known = read_configuration_preamble(&mut stream, &mut rbuf, compression).await;
+    write_frame(
+        &mut stream,
+        &ServerboundKnownPacks { packs: known.packs },
+        compression,
+    )
+    .await;
+    for _ in 0..mc_data::KNOWN_REGISTRIES.len() {
+        let mut frame = read_one_frame(&mut stream, &mut rbuf, compression).await;
+        assert_eq!(frame.id, RegistryData::ID);
+        let _ = RegistryData::decode(&mut frame.body).unwrap();
+    }
+    let mut frame = read_one_frame(&mut stream, &mut rbuf, compression).await;
+    assert_eq!(frame.id, UpdateTags::ID);
+    let _ = UpdateTags::decode(&mut frame.body).unwrap();
+
+    let mut frame = read_one_frame(&mut stream, &mut rbuf, compression).await;
+    assert_eq!(frame.id, ClientboundCustomPayload::ID);
+    let payload = ClientboundCustomPayload::decode(&mut frame.body)
+        .unwrap()
+        .payload;
+    let CustomPayload::Unknown { channel, payload } = payload else {
+        panic!("expected Solaris Loader custom payload");
+    };
+    assert_eq!(channel, *mc_net::loader_manifest_channel());
+    assert_eq!(
+        serde_json::from_slice::<mc_net::LoaderManifest>(&payload).unwrap(),
+        manifest
+    );
+
+    let ack = mc_net::LoaderClientAck {
+        protocol: mc_net::LOADER_PROTOCOL_VERSION,
+        platform: mc_net::LoaderPlatform::NeoForge,
+        loader_version: "0.1.0".to_owned(),
+        accepted_permissions: vec![mc_net::LoaderPermission::OpenScreens],
+        cached_bundles: vec![manifest.bundles[0].cache_key.clone()],
+        carrier_block_state_ids: std::collections::BTreeMap::new(),
+    };
+    write_frame(
+        &mut stream,
+        &ServerboundCustomPayload {
+            payload: CustomPayload::Unknown {
+                channel: mc_net::loader_ack_channel().clone(),
+                payload: serde_json::to_vec(&ack).unwrap(),
+            },
+        },
+        compression,
+    )
+    .await;
+    let mut frame = read_one_frame(&mut stream, &mut rbuf, compression).await;
+    assert_eq!(frame.id, FinishConfiguration::ID);
+    let _ = FinishConfiguration::decode(&mut frame.body).unwrap();
+    let late_request = mc_net::LoaderArtifactRequest {
+        protocol: mc_net::LOADER_PROTOCOL_VERSION,
+        cache_key: manifest.bundles[0].cache_key.clone(),
+    };
+    write_frame(
+        &mut stream,
+        &ServerboundCustomPayload {
+            payload: CustomPayload::Unknown {
+                channel: mc_net::loader_request_channel().clone(),
+                payload: serde_json::to_vec(&late_request).unwrap(),
+            },
+        },
+        compression,
+    )
+    .await;
+    write_frame(&mut stream, &AcknowledgeFinishConfiguration, compression).await;
+
+    let frame = read_one_frame(&mut stream, &mut rbuf, compression).await;
+    assert_eq!(frame.id, LoginPlay::ID);
+}
+
+#[tokio::test]
+async fn configuration_loader_streams_only_the_exact_requested_artifact() {
+    let artifact_dir = TempDir::new().unwrap();
+    let artifact_path = artifact_dir.path().join("screen.bundle");
+    let artifact = vec![0x5a; mc_net::LOADER_ARTIFACT_CHUNK_BYTES + 7];
+    fs::write(&artifact_path, &artifact).unwrap();
+    let sha256 = format!("{:x}", Sha256::digest(&artifact));
+    let mut manifest = loader_manifest();
+    manifest.bundles[0].sha256 = sha256.clone();
+    manifest.bundles[0].size_bytes = artifact.len() as u64;
+    manifest.bundles[0].cache_key = format!("example:screen/1/{sha256}");
+    manifest.bundles[0].source_path = Some(artifact_path);
+    let addr = start_server_with_data_and_loader(
+        std::sync::Arc::new(mc_data::testing::stub()),
+        Some(std::sync::Arc::new(manifest.clone())),
+    )
+    .await;
+    let mut stream = TcpStream::connect(addr).await.unwrap();
+    let mut rbuf = BytesMut::with_capacity(4096);
+    let compression = run_through_login_ack(&mut stream, &mut rbuf, addr, "LoaderTransfer").await;
+
+    let known = read_configuration_preamble(&mut stream, &mut rbuf, compression).await;
+    write_frame(
+        &mut stream,
+        &ServerboundKnownPacks { packs: known.packs },
+        compression,
+    )
+    .await;
+    for _ in 0..mc_data::KNOWN_REGISTRIES.len() {
+        let _ = read_one_frame(&mut stream, &mut rbuf, compression).await;
+    }
+    let _ = read_one_frame(&mut stream, &mut rbuf, compression).await;
+    let mut frame = read_one_frame(&mut stream, &mut rbuf, compression).await;
+    assert_eq!(frame.id, ClientboundCustomPayload::ID);
+    let manifest_payload = ClientboundCustomPayload::decode(&mut frame.body)
+        .unwrap()
+        .payload;
+    assert!(matches!(
+        manifest_payload,
+        CustomPayload::Unknown { channel, .. }
+            if channel == *mc_net::loader_manifest_channel()
+    ));
+    let request = mc_net::LoaderArtifactRequest {
+        protocol: mc_net::LOADER_PROTOCOL_VERSION,
+        cache_key: manifest.bundles[0].cache_key.clone(),
+    };
+    write_frame(
+        &mut stream,
+        &ServerboundCustomPayload {
+            payload: CustomPayload::Unknown {
+                channel: mc_net::loader_request_channel().clone(),
+                payload: serde_json::to_vec(&request).unwrap(),
+            },
+        },
+        compression,
+    )
+    .await;
+
+    let mut received = Vec::new();
+    for expected_last in [false, true] {
+        let mut frame = read_one_frame(&mut stream, &mut rbuf, compression).await;
+        assert_eq!(frame.id, ClientboundCustomPayload::ID);
+        let CustomPayload::Unknown { channel, payload } =
+            ClientboundCustomPayload::decode(&mut frame.body)
+                .unwrap()
+                .payload
+        else {
+            panic!("expected raw Loader artifact payload");
+        };
+        assert_eq!(channel, *mc_net::loader_artifact_channel());
+        let mut chunk = payload.as_slice();
+        assert_eq!(chunk.get_u16(), mc_net::LOADER_PROTOCOL_VERSION);
+        let cache_key_len = usize::from(chunk.get_u16());
+        assert_eq!(
+            chunk.copy_to_bytes(cache_key_len),
+            manifest.bundles[0].cache_key.as_bytes()
+        );
+        assert_eq!(chunk.get_u64(), received.len() as u64);
+        assert_eq!(chunk.get_u8() != 0, expected_last);
+        received.extend_from_slice(chunk);
+    }
+    assert_eq!(received, artifact);
+
+    let ack = mc_net::LoaderClientAck {
+        protocol: mc_net::LOADER_PROTOCOL_VERSION,
+        platform: mc_net::LoaderPlatform::Fabric,
+        loader_version: "0.1.0".to_owned(),
+        accepted_permissions: vec![mc_net::LoaderPermission::OpenScreens],
+        cached_bundles: vec![manifest.bundles[0].cache_key.clone()],
+        carrier_block_state_ids: std::collections::BTreeMap::new(),
+    };
+    write_frame(
+        &mut stream,
+        &ServerboundCustomPayload {
+            payload: CustomPayload::Unknown {
+                channel: mc_net::loader_ack_channel().clone(),
+                payload: serde_json::to_vec(&ack).unwrap(),
+            },
+        },
+        compression,
+    )
+    .await;
+    let mut frame = read_one_frame(&mut stream, &mut rbuf, compression).await;
+    assert_eq!(frame.id, FinishConfiguration::ID);
+    FinishConfiguration::decode(&mut frame.body).unwrap();
+    write_frame(&mut stream, &AcknowledgeFinishConfiguration, compression).await;
+
+    let frame = read_one_frame(&mut stream, &mut rbuf, compression).await;
+    assert_eq!(frame.id, LoginPlay::ID);
+}
+
+#[tokio::test]
+async fn configuration_loader_manifest_rejects_missing_ack() {
+    let addr = start_server_with_data_and_loader(
+        std::sync::Arc::new(mc_data::testing::stub()),
+        Some(std::sync::Arc::new(loader_manifest())),
+    )
+    .await;
+    let mut stream = TcpStream::connect(addr).await.unwrap();
+    let mut rbuf = BytesMut::with_capacity(4096);
+    let compression = run_through_login_ack(&mut stream, &mut rbuf, addr, "VanillaClient").await;
+
+    let known = read_configuration_preamble(&mut stream, &mut rbuf, compression).await;
+    write_frame(
+        &mut stream,
+        &ServerboundKnownPacks { packs: known.packs },
+        compression,
+    )
+    .await;
+    for _ in 0..mc_data::KNOWN_REGISTRIES.len() {
+        let _ = read_one_frame(&mut stream, &mut rbuf, compression).await;
+    }
+    let _ = read_one_frame(&mut stream, &mut rbuf, compression).await;
+    let _ = read_one_frame(&mut stream, &mut rbuf, compression).await;
+
+    for _ in 0..33 {
+        write_frame(&mut stream, &AcknowledgeFinishConfiguration, compression).await;
+    }
+    let next = tokio::time::timeout(
+        Duration::from_secs(2),
+        read_optional_frame(&mut stream, &mut rbuf, compression),
+    )
+    .await
+    .expect("server did not reject a missing Solaris Loader ack within 2s");
+    assert!(
+        next.is_none(),
+        "server advanced to Play without a loader ack"
     );
 }
 

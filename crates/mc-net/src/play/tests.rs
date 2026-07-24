@@ -29,6 +29,44 @@ fn no_script_player_context(session_id: SessionId) -> ScriptPlayerContext {
     )
 }
 
+#[test]
+fn session_owner_script_inventory_commit_updates_live_and_durable_state_together() {
+    let items = Arc::new(mc_data::items::solaris_required_items());
+    let mut state = interaction_state_for_items(Arc::clone(&items));
+    state.item_facts = Arc::new(mc_data::item_components::solaris_required_item_facts());
+    let apple = items
+        .id_of(&Identifier::parse("minecraft:apple").unwrap())
+        .unwrap();
+    let emerald = items
+        .id_of(&Identifier::parse("minecraft:emerald").unwrap())
+        .unwrap();
+    state.inventory.slots[9] = ItemStack::new(apple, 3);
+    let transaction = mc_script::ScriptPlayerInventoryTransaction::try_new(
+        "owner-exchange",
+        mc_script::ScriptPlayerId::new(state.session_id),
+        vec![
+            mc_script::ScriptInventoryResourceDelta::try_new("minecraft:apple", -2).unwrap(),
+            mc_script::ScriptInventoryResourceDelta::try_new("minecraft:emerald", 4).unwrap(),
+        ],
+    )
+    .unwrap();
+
+    assert_eq!(
+        commit_session_owner_script_player_inventory(&mut state, &transaction),
+        Ok(())
+    );
+    assert_eq!(state.inventory.slots[9], ItemStack::new(apple, 1));
+    assert!(
+        state.inventory.slots[9..=44]
+            .iter()
+            .any(|stack| *stack == ItemStack::new(emerald, 4))
+    );
+    assert_eq!(
+        state.player_persistence.lock().unwrap().inventory.slots,
+        state.inventory.slots
+    );
+}
+
 async fn run_scheduled_block_ticks(
     config: &ServerConfig,
     sessions: &SessionRegistry,
@@ -53,6 +91,33 @@ async fn run_scheduled_block_ticks(
             config.random_tick.normalized().fluid_tick_budget,
         )
         .await
+}
+
+async fn run_scheduled_block_ticks_with_protection(
+    config: &ServerConfig,
+    sessions: &SessionRegistry,
+    protection: Arc<crate::script::ZoneProtectionSnapshot>,
+    world_tick: u64,
+) -> ScheduledBlockTickReport {
+    let shared_world = config.world.as_ref().unwrap();
+    let storage = shared_world.lock().await;
+    let world_read = storage.read_view();
+    let world_mutation = storage.mutation_view();
+    drop(storage);
+    run_scheduled_block_ticks_owned(
+        config,
+        sessions,
+        SimulationWorldAccess {
+            read: Some(&world_read),
+            mutation: Some(&world_mutation),
+            ..SimulationWorldAccess::default()
+        },
+        None,
+        Some(protection),
+        world_tick,
+        config.random_tick.normalized().fluid_tick_budget,
+    )
+    .await
 }
 
 async fn run_scheduled_fluid_ticks(
@@ -360,6 +425,7 @@ fn play_loop_slow_client_test_config() -> crate::server::ServerConfig {
             Vec::<String>::new(),
             true,
         ),
+        loader_manifest: None,
         shutdown: crate::server::ShutdownHandle::default(),
     }
 }
@@ -395,6 +461,7 @@ async fn initial_play_sync_sends_recipe_update_once_before_recipe_book_packets()
         None,
         simulation,
         Vec::new(),
+        None,
         None,
         None,
         None,
@@ -1434,6 +1501,7 @@ async fn play_loop_closes_session_when_outbound_write_stalls() {
             simulation.for_session(1),
             &config,
             1,
+            false,
             pose,
             pose,
             respawn,
@@ -1515,6 +1583,7 @@ async fn play_loop_closes_session_when_direct_response_write_stalls() {
             simulation.for_session(1),
             &config,
             1,
+            false,
             pose,
             pose,
             respawn,
@@ -1582,6 +1651,7 @@ async fn play_loop_exits_when_outbound_channel_closes() {
             simulation.for_session(1),
             &config,
             1,
+            false,
             pose,
             pose,
             respawn,
@@ -1658,6 +1728,7 @@ async fn play_loop_drains_bounded_outbound_pressure_without_shedding() {
             simulation.for_session(1),
             &config,
             1,
+            false,
             pose,
             pose,
             respawn,
@@ -2942,6 +3013,9 @@ pub(super) fn interaction_state_for_blocks(
         selected_hotbar_slot: 0,
         inventory: PlayerInventory::empty(),
         carried_item: ItemStack::EMPTY,
+        player_persistence: Arc::new(Mutex::new(PlayerPersistedState::new_default(
+            PlayerPose::new(0.5, 64.0, 0.5),
+        ))),
         inventory_state_id: 1,
         inventory_quickcraft: QuickCraftState::default(),
         items,
@@ -2951,6 +3025,7 @@ pub(super) fn interaction_state_for_blocks(
         tags: Arc::new(TagsData::default()),
         recipes: Vec::new(),
         loot: Arc::new(mc_data::loot::LootTables::default()),
+        script_zones: None,
         next_container_id: FURNACE_CONTAINER_ID_MIN,
         active_container: None,
         pending_break: None,
@@ -3992,6 +4067,21 @@ fn oversized_play_custom_payload_is_rejected_before_decode() {
     );
 }
 
+#[test]
+fn loader_interaction_channel_is_claimed_before_extension_forwarding() {
+    let channel = b"solaris:loader/interaction";
+    let payload = b"action";
+    let mut body = Vec::with_capacity(1 + channel.len() + payload.len());
+    body.push(channel.len() as u8);
+    body.extend_from_slice(channel);
+    body.extend_from_slice(payload);
+
+    assert_eq!(
+        classify_play_custom_payload(Bytes::from(body)).unwrap(),
+        PlayCustomPayloadAction::LoaderInteraction(Bytes::from_static(payload))
+    );
+}
+
 fn test_use_item_on(position: i64) -> ServerboundUseItemOn {
     ServerboundUseItemOn {
         hand: mc_protocol::packets::play::InteractionHand::MainHand,
@@ -4728,6 +4818,7 @@ fn bucket_replacement_updates_single_held_stack_only() {
                 damage: None,
                 enchantments: Vec::new(),
                 custom_name: None,
+                item_model: None,
             },
         )
         .unwrap();
@@ -4751,6 +4842,7 @@ fn bucket_replacement_updates_single_held_stack_only() {
                 damage: None,
                 enchantments: Vec::new(),
                 custom_name: None,
+                item_model: None,
             },
         )
         .unwrap();
@@ -4784,6 +4876,7 @@ fn bucket_replacement_updates_single_held_stack_only() {
         damage: None,
         enchantments: Vec::new(),
         custom_name: None,
+        item_model: None,
     };
     let (next, changed) = plan_bucket_replacement(&inventory, 45, 61, 1).unwrap();
     assert_eq!(next.slots[45].item_id, 61);
@@ -7193,6 +7286,7 @@ fn sapling_bonemeal_advances_stage_before_growing_a_varied_oak_tree() {
                 damage: None,
                 enchantments: Vec::new(),
                 custom_name: None,
+                item_model: None,
             },
         )
         .unwrap();
@@ -7633,6 +7727,7 @@ fn stage_zero_sapling_advances_even_when_tree_space_is_blocked() {
                 damage: None,
                 enchantments: Vec::new(),
                 custom_name: None,
+                item_model: None,
             },
         )
         .unwrap();
@@ -7678,6 +7773,7 @@ fn bonemeal_consumes_exactly_one_item_only_after_successful_growth() {
                 damage: None,
                 enchantments: Vec::new(),
                 custom_name: None,
+                item_model: None,
             },
         )
         .unwrap();
@@ -7701,6 +7797,7 @@ fn bonemeal_consumes_exactly_one_item_only_after_successful_growth() {
                 damage: None,
                 enchantments: Vec::new(),
                 custom_name: None,
+                item_model: None,
             },
         )
         .unwrap();
@@ -8020,6 +8117,104 @@ fn natural_random_tick_helpers_cover_leaves_grass_and_fire() {
 }
 
 #[test]
+fn fire_random_tick_spreads_to_common_fuel() {
+    let reports = vec![
+        simple_block(0, "minecraft:air"),
+        BlockReport {
+            id: Identifier::parse("minecraft:fire").unwrap(),
+            properties: prop_schema(&[("age", &["0", "1"])]),
+            states: vec![
+                state(1, true, &[("age", "0")]),
+                state(2, false, &[("age", "1")]),
+            ],
+        },
+        simple_block(3, "minecraft:oak_log"),
+    ];
+    let blocks = Arc::new(mc_world::BlockRegistry::from_report(&reports).unwrap());
+    let facts = mc_data::block_facts::BlockFactsTable::from_blocks_report(&reports);
+    let mut world = mc_world::WorldStorage::in_memory(Arc::clone(&blocks));
+    let chunk = ChunkPos { x: 0, z: 0 };
+    world
+        .insert_generated_chunk(
+            chunk,
+            Chunk::empty(
+                chunk,
+                BlockStateId(0),
+                Identifier::parse("minecraft:plains").unwrap(),
+            ),
+        )
+        .unwrap();
+    let fire = mc_world::BlockPos { x: 4, y: 64, z: 4 };
+    let fuel = mc_world::BlockPos { x: 5, y: 64, z: 4 };
+    world.set_block_at(fire, BlockStateId(1)).unwrap();
+    world.set_block_at(fuel, BlockStateId(3)).unwrap();
+
+    let edits = random_tick_edit_seeded(
+        blocks.as_ref(),
+        &facts,
+        &world,
+        fire,
+        BlockStateId(1),
+        mc_data::block_facts::RandomTickFamily::Fire,
+        0,
+    )
+    .unwrap();
+
+    assert_eq!(
+        edits,
+        vec![
+            BlockEdit {
+                pos: fire,
+                new_state: BlockStateId(2),
+            },
+            BlockEdit {
+                pos: fuel,
+                new_state: BlockStateId(1),
+            },
+        ]
+    );
+}
+
+#[test]
+fn protected_zone_rejects_only_ambient_fire_target() {
+    let source = mc_world::BlockPos { x: -1, y: 64, z: 0 };
+    let protected = mc_world::BlockPos { x: 0, y: 64, z: 0 };
+    let zone = mc_script::ScriptAxisAlignedZone::try_new_with_protection(
+        "claim",
+        "minecraft:overworld",
+        mc_script::ScriptPosition::try_new(0.0, 0.0, 0.0).unwrap(),
+        mc_script::ScriptPosition::try_new(15.0, 319.0, 15.0).unwrap(),
+        Some(
+            mc_script::ScriptZoneProtection::try_actor_or_operator(
+                "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa",
+            )
+            .unwrap(),
+        ),
+    )
+    .unwrap();
+    let protection = crate::script::ZoneProtectionSnapshot::from_zones(vec![zone]);
+
+    assert!(ambient_random_tick_edit_allowed(
+        mc_data::block_facts::RandomTickFamily::Fire,
+        source,
+        source,
+        Some(&protection),
+    ));
+    assert!(!ambient_random_tick_edit_allowed(
+        mc_data::block_facts::RandomTickFamily::Fire,
+        source,
+        protected,
+        Some(&protection),
+    ));
+    assert!(ambient_random_tick_edit_allowed(
+        mc_data::block_facts::RandomTickFamily::Crop,
+        source,
+        protected,
+        Some(&protection),
+    ));
+}
+
+#[test]
 fn natural_leaf_decay_uses_vanilla_base_drop_pools() {
     let blocks = mc_world::BlockRegistry::from_report(&[
         simple_block(0, "minecraft:air"),
@@ -8326,6 +8521,204 @@ fn lever_toggle_powers_adjacent_iron_door() {
         ]
     );
     assert!(plan.scheduled_block_ticks.is_empty());
+}
+
+#[test]
+fn lever_extends_one_block_piston_and_retracts_the_head() {
+    let blocks = Arc::new(piston_test_registry());
+    let mut world = in_memory_button_world(Arc::clone(&blocks));
+    let lever = mc_world::BlockPos { x: 1, y: 64, z: 1 };
+    let piston = mc_world::BlockPos { x: 2, y: 64, z: 1 };
+    let arm = mc_world::BlockPos { x: 3, y: 64, z: 1 };
+    let destination = mc_world::BlockPos { x: 4, y: 64, z: 1 };
+    for (pos, state_id) in [(lever, 3), (piston, 5), (arm, 8)] {
+        world
+            .set_block_at(pos, mc_world::BlockStateId(state_id))
+            .expect("place piston test block");
+    }
+
+    let extend =
+        plan_toggle_block_interaction(&blocks, &world, lever, mc_world::BlockStateId(3), 0)
+            .expect("lever should extend adjacent piston");
+    assert_eq!(
+        extend.edits,
+        vec![
+            BlockEdit {
+                pos: lever,
+                new_state: mc_world::BlockStateId(4),
+            },
+            BlockEdit {
+                pos: piston,
+                new_state: mc_world::BlockStateId(6),
+            },
+            BlockEdit {
+                pos: destination,
+                new_state: mc_world::BlockStateId(8),
+            },
+            BlockEdit {
+                pos: arm,
+                new_state: mc_world::BlockStateId(7),
+            },
+        ]
+    );
+    apply_block_edit_batch_to_storage_conditionally(
+        &mut world,
+        None,
+        &extend.edits,
+        &extend.preconditions,
+    )
+    .expect("extension plan remains current");
+
+    let other_lever = mc_world::BlockPos { x: 2, y: 65, z: 1 };
+    world
+        .set_block_at(other_lever, mc_world::BlockStateId(3))
+        .expect("place alternate piston control");
+    let stale_retract =
+        plan_toggle_block_interaction(&blocks, &world, lever, mc_world::BlockStateId(4), 1)
+            .expect("lever should retract adjacent piston");
+    assert_eq!(
+        stale_retract.edits,
+        vec![
+            BlockEdit {
+                pos: lever,
+                new_state: mc_world::BlockStateId(3),
+            },
+            BlockEdit {
+                pos: piston,
+                new_state: mc_world::BlockStateId(5),
+            },
+            BlockEdit {
+                pos: arm,
+                new_state: mc_world::BlockStateId(0),
+            },
+        ]
+    );
+    world
+        .set_block_at(other_lever, mc_world::BlockStateId(4))
+        .expect("power alternate piston control");
+    assert!(
+        apply_block_edit_batch_to_storage_conditionally(
+            &mut world,
+            None,
+            &stale_retract.edits,
+            &stale_retract.preconditions,
+        )
+        .is_none(),
+        "alternate power change must stale the retraction"
+    );
+    assert_eq!(
+        world.get_cached_block(piston),
+        Some(mc_world::BlockStateId(6))
+    );
+    world
+        .set_block_at(other_lever, mc_world::BlockStateId(3))
+        .expect("release alternate piston control");
+    let retract =
+        plan_toggle_block_interaction(&blocks, &world, lever, mc_world::BlockStateId(4), 2)
+            .expect("released alternate control permits retraction");
+    apply_block_edit_batch_to_storage_conditionally(
+        &mut world,
+        None,
+        &retract.edits,
+        &retract.preconditions,
+    )
+    .expect("retraction plan remains current");
+    assert_eq!(
+        world.get_cached_block(destination),
+        Some(mc_world::BlockStateId(8))
+    );
+}
+
+#[test]
+fn empty_piston_extends_with_an_occupied_block_two_spaces_ahead() {
+    let blocks = Arc::new(piston_test_registry());
+    let mut world = in_memory_button_world(Arc::clone(&blocks));
+    let lever = mc_world::BlockPos { x: 1, y: 64, z: 1 };
+    let piston = mc_world::BlockPos { x: 2, y: 64, z: 1 };
+    let arm = mc_world::BlockPos { x: 3, y: 64, z: 1 };
+    let destination = mc_world::BlockPos { x: 4, y: 64, z: 1 };
+    for (pos, state_id) in [(lever, 3), (piston, 5), (destination, 8)] {
+        world
+            .set_block_at(pos, mc_world::BlockStateId(state_id))
+            .expect("place empty piston test block");
+    }
+
+    let plan = plan_toggle_block_interaction(&blocks, &world, lever, mc_world::BlockStateId(3), 0)
+        .expect("empty piston should extend");
+
+    assert_eq!(
+        plan.edits,
+        vec![
+            BlockEdit {
+                pos: lever,
+                new_state: mc_world::BlockStateId(4),
+            },
+            BlockEdit {
+                pos: piston,
+                new_state: mc_world::BlockStateId(6),
+            },
+            BlockEdit {
+                pos: arm,
+                new_state: mc_world::BlockStateId(7),
+            },
+        ]
+    );
+}
+
+#[test]
+fn protected_piston_destination_rejects_the_atomic_piston_group() {
+    let blocks = Arc::new(piston_test_registry());
+    let mut world = in_memory_button_world(Arc::clone(&blocks));
+    let lever = mc_world::BlockPos { x: 1, y: 64, z: 1 };
+    let piston = mc_world::BlockPos { x: 2, y: 64, z: 1 };
+    let arm = mc_world::BlockPos { x: 3, y: 64, z: 1 };
+    let destination = mc_world::BlockPos { x: 4, y: 64, z: 1 };
+    for (pos, state_id) in [(lever, 3), (piston, 5), (arm, 8)] {
+        world
+            .set_block_at(pos, mc_world::BlockStateId(state_id))
+            .expect("place protected piston test block");
+    }
+    let zone = mc_script::ScriptAxisAlignedZone::try_new_with_protection(
+        "piston-destination",
+        "minecraft:overworld",
+        mc_script::ScriptPosition::try_new(4.0, 64.0, 1.0).unwrap(),
+        mc_script::ScriptPosition::try_new(4.0, 64.0, 1.0).unwrap(),
+        Some(
+            mc_script::ScriptZoneProtection::try_actor_or_operator(
+                "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa",
+            )
+            .unwrap(),
+        ),
+    )
+    .unwrap();
+    let protection = crate::script::ZoneProtectionSnapshot::from_zones(vec![zone]);
+
+    let plan = plan_toggle_block_interaction_with_protection(
+        &blocks,
+        &world,
+        lever,
+        mc_world::BlockStateId(3),
+        0,
+        Some(&protection),
+    )
+    .expect("direct lever edit remains valid");
+
+    assert_eq!(
+        plan.edits,
+        vec![BlockEdit {
+            pos: lever,
+            new_state: mc_world::BlockStateId(4),
+        }]
+    );
+    assert_eq!(
+        world.get_cached_block(piston),
+        Some(mc_world::BlockStateId(5))
+    );
+    assert_eq!(world.get_cached_block(arm), Some(mc_world::BlockStateId(8)));
+    assert_eq!(
+        world.get_cached_block(destination),
+        Some(mc_world::BlockStateId(0))
+    );
 }
 
 #[test]
@@ -10250,6 +10643,9 @@ async fn placing_hopper_schedules_initial_transfer_tick() {
         selected_hotbar_slot: 0,
         inventory: PlayerInventory::empty(),
         carried_item: ItemStack::EMPTY,
+        player_persistence: Arc::new(Mutex::new(PlayerPersistedState::new_default(
+            PlayerPose::new(0.5, 64.0, 0.5),
+        ))),
         inventory_state_id: 1,
         inventory_quickcraft: QuickCraftState::default(),
         items,
@@ -10259,6 +10655,7 @@ async fn placing_hopper_schedules_initial_transfer_tick() {
         tags: Arc::new(TagsData::default()),
         recipes: Vec::new(),
         loot: Arc::new(mc_data::loot::LootTables::default()),
+        script_zones: None,
         next_container_id: FURNACE_CONTAINER_ID_MIN,
         active_container: None,
         pending_break: None,
@@ -12389,7 +12786,7 @@ async fn stale_scheduled_button_plan_keeps_due_tick_after_aba() {
     assert_eq!(due.len(), 1);
     let planning_chunks = scheduled_block_planning_chunks(&due);
     let snapshot = world_read.snapshot_chunks(&planning_chunks);
-    let plan = plan_scheduled_block_tick_edits(&config, &snapshot, &due)
+    let plan = plan_scheduled_block_tick_edits(&config, &snapshot, &due, None)
         .expect("button-only batch uses snapshot planning");
     assert_eq!(
         plan.edits,
@@ -12555,6 +12952,88 @@ async fn button_press_powers_adjacent_iron_door_until_scheduled_release() {
     assert_eq!(
         storage.get_cached_block(upper_door_pos),
         Some(mc_world::BlockStateId(4))
+    );
+}
+
+#[tokio::test]
+async fn scheduled_button_release_keeps_piston_extended_when_head_is_protected() {
+    let blocks = Arc::new(piston_test_registry());
+    let world = Arc::new(tokio::sync::Mutex::new(in_memory_button_world(Arc::clone(
+        &blocks,
+    ))));
+    let button = mc_world::BlockPos { x: 1, y: 64, z: 1 };
+    let piston = mc_world::BlockPos { x: 2, y: 64, z: 1 };
+    let arm = mc_world::BlockPos { x: 3, y: 64, z: 1 };
+    let destination = mc_world::BlockPos { x: 4, y: 64, z: 1 };
+    {
+        let mut storage = world.lock().await;
+        for (pos, state_id) in [(button, 1), (piston, 5), (arm, 8)] {
+            storage
+                .set_block_at(pos, mc_world::BlockStateId(state_id))
+                .expect("place scheduled piston test block");
+        }
+        let plan = plan_toggle_block_interaction(
+            &blocks,
+            &*storage,
+            button,
+            mc_world::BlockStateId(1),
+            100,
+        )
+        .expect("button should extend adjacent piston");
+        apply_block_edit_batch_with_scheduled_ticks_to_storage_conditionally(
+            &mut storage,
+            None,
+            &plan.edits,
+            &plan.preconditions,
+            &plan.scheduled_block_ticks,
+        )
+        .expect("button extension plan remains current");
+    }
+    let zone = mc_script::ScriptAxisAlignedZone::try_new_with_protection(
+        "piston-head",
+        "minecraft:overworld",
+        mc_script::ScriptPosition::try_new(3.0, 64.0, 1.0).unwrap(),
+        mc_script::ScriptPosition::try_new(3.0, 64.0, 1.0).unwrap(),
+        Some(
+            mc_script::ScriptZoneProtection::try_actor_or_operator(
+                "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa",
+            )
+            .unwrap(),
+        ),
+    )
+    .unwrap();
+    let protection = Arc::new(crate::script::ZoneProtectionSnapshot::from_zones(vec![
+        zone,
+    ]));
+    let config = ServerConfig {
+        world: Some(Arc::clone(&world)),
+        blocks,
+        ..play_loop_slow_client_test_config()
+    };
+    let sessions = SessionRegistry::new();
+    register_loaded_button_session(&sessions, "ProtectedPiston");
+
+    let report =
+        run_scheduled_block_ticks_with_protection(&config, &sessions, protection, 120).await;
+
+    assert_eq!(report.drained, 1);
+    assert_eq!(report.applied, 1);
+    let storage = world.lock().await;
+    assert_eq!(
+        storage.get_cached_block(button),
+        Some(mc_world::BlockStateId(1))
+    );
+    assert_eq!(
+        storage.get_cached_block(piston),
+        Some(mc_world::BlockStateId(6))
+    );
+    assert_eq!(
+        storage.get_cached_block(arm),
+        Some(mc_world::BlockStateId(7))
+    );
+    assert_eq!(
+        storage.get_cached_block(destination),
+        Some(mc_world::BlockStateId(8))
     );
 }
 
@@ -12797,6 +13276,63 @@ fn register_ticketed_button_session(
         PlayerPose::new(0.5, 64.0, 0.5),
     );
     id
+}
+
+fn piston_test_registry() -> mc_world::BlockRegistry {
+    mc_world::BlockRegistry::from_report(&[
+        simple_block(0, "minecraft:air"),
+        BlockReport {
+            id: Identifier::parse("minecraft:stone_button").unwrap(),
+            properties: prop_schema(&[
+                ("face", &["wall"]),
+                ("facing", &["east"]),
+                ("powered", &["false", "true"]),
+            ]),
+            states: vec![
+                state(
+                    1,
+                    true,
+                    &[("face", "wall"), ("facing", "east"), ("powered", "false")],
+                ),
+                state(
+                    2,
+                    false,
+                    &[("face", "wall"), ("facing", "east"), ("powered", "true")],
+                ),
+            ],
+        },
+        BlockReport {
+            id: Identifier::parse("minecraft:lever").unwrap(),
+            properties: prop_schema(&[("powered", &["false", "true"])]),
+            states: vec![
+                state(3, true, &[("powered", "false")]),
+                state(4, false, &[("powered", "true")]),
+            ],
+        },
+        BlockReport {
+            id: Identifier::parse("minecraft:piston").unwrap(),
+            properties: prop_schema(&[("extended", &["false", "true"]), ("facing", &["east"])]),
+            states: vec![
+                state(5, true, &[("extended", "false"), ("facing", "east")]),
+                state(6, false, &[("extended", "true"), ("facing", "east")]),
+            ],
+        },
+        BlockReport {
+            id: Identifier::parse("minecraft:piston_head").unwrap(),
+            properties: prop_schema(&[
+                ("facing", &["east"]),
+                ("short", &["false"]),
+                ("type", &["normal"]),
+            ]),
+            states: vec![state(
+                7,
+                true,
+                &[("facing", "east"), ("short", "false"), ("type", "normal")],
+            )],
+        },
+        simple_block(8, "minecraft:stone"),
+    ])
+    .unwrap()
 }
 
 fn button_and_door_test_registry() -> mc_world::BlockRegistry {
@@ -14009,6 +14545,9 @@ fn interaction_state_for_items(items: Arc<ItemRegistry>) -> InteractionState {
         selected_hotbar_slot: 0,
         inventory: PlayerInventory::empty(),
         carried_item: ItemStack::EMPTY,
+        player_persistence: Arc::new(Mutex::new(PlayerPersistedState::new_default(
+            PlayerPose::new(0.5, 64.0, 0.5),
+        ))),
         inventory_state_id: 1,
         inventory_quickcraft: QuickCraftState::default(),
         items,
@@ -14018,6 +14557,7 @@ fn interaction_state_for_items(items: Arc<ItemRegistry>) -> InteractionState {
         tags,
         recipes: Vec::new(),
         loot: Arc::new(mc_data::loot::LootTables::default()),
+        script_zones: None,
         next_container_id: FURNACE_CONTAINER_ID_MIN,
         active_container: None,
         pending_break: None,
@@ -20167,6 +20707,9 @@ async fn campfire_test_interaction_state(pos: mc_world::BlockPos) -> Interaction
         selected_hotbar_slot: 0,
         inventory: PlayerInventory::empty(),
         carried_item: ItemStack::EMPTY,
+        player_persistence: Arc::new(Mutex::new(PlayerPersistedState::new_default(
+            PlayerPose::new(0.5, 64.0, 0.5),
+        ))),
         inventory_state_id: 1,
         inventory_quickcraft: QuickCraftState::default(),
         items,
@@ -20176,6 +20719,7 @@ async fn campfire_test_interaction_state(pos: mc_world::BlockPos) -> Interaction
         tags: Arc::new(TagsData::default()),
         recipes: Vec::new(),
         loot: Arc::new(mc_data::loot::LootTables::default()),
+        script_zones: None,
         next_container_id: FURNACE_CONTAINER_ID_MIN,
         active_container: None,
         pending_break: Some(PendingBreak {

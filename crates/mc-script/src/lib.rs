@@ -39,8 +39,12 @@ mod tick_delivery_tests;
 
 #[cfg(feature = "lua-runtime")]
 pub use lua::{
-    LuaHost, LuaHostConfig, LuaHostError, LuaWorldgenOreProfile, PreparedLuaPlugins,
-    prepare_lua_plugins, start_lua_host, start_prepared_lua_host,
+    LuaClientBundle, LuaClientContentKind, LuaClientLoader, LuaClientPermission, LuaHost,
+    LuaHostConfig, LuaHostError, LuaSettlementBuilding, LuaSettlementBuildingRole,
+    LuaSettlementBuildingTemplate, LuaSettlementExtension, LuaSettlementInhabitant,
+    LuaSettlementInhabitantKind, LuaSettlementJob, LuaSettlementPlan, LuaWorldgenOreProfile,
+    LuaWorldgenSettlementProfile, PreparedLuaPlugins, prepare_lua_plugins, start_lua_host,
+    start_prepared_lua_host,
 };
 
 /// Crate version, exposed so other crates and the binary can report it.
@@ -54,6 +58,7 @@ pub const MAX_SPAWN_ENTITY_TYPES: usize = 32;
 
 /// Maximum byte length of a script-visible namespaced resource identifier.
 pub const MAX_SCRIPT_RESOURCE_ID_BYTES: usize = 128;
+pub const MAX_SCRIPT_LOADER_INTERACTION_PAYLOAD_BYTES: usize = 4_096;
 
 /// Maximum byte length of a plugin-scoped identifier or request correlation id.
 pub const MAX_SCRIPT_ID_BYTES: usize = 64;
@@ -2002,6 +2007,40 @@ impl ScriptEvent {
         })
     }
 
+    /// Build one client-originated Loader interaction targeted to its bundle owner.
+    pub fn loader_interaction(
+        target_plugin_id: impl AsRef<str>,
+        player_id: ScriptPlayerId,
+        interaction_id: impl AsRef<str>,
+        payload: impl AsRef<str>,
+    ) -> Result<Self, ScriptDtoError> {
+        let target_plugin_id = validate_target_plugin_id(target_plugin_id.as_ref())?;
+        let interaction_id = validate_contract_resource_id(interaction_id.as_ref())?;
+        if !interaction_id
+            .strip_prefix(&target_plugin_id)
+            .is_some_and(|suffix| suffix.starts_with(':') && suffix.len() > 1)
+        {
+            return Err(ScriptDtoError::InvalidResourceId {
+                field: "Loader interaction id",
+                actual_bytes: interaction_id.len(),
+            });
+        }
+        let payload = payload.as_ref();
+        validate_bounded_value(
+            "Loader interaction payload",
+            payload,
+            MAX_SCRIPT_LOADER_INTERACTION_PAYLOAD_BYTES,
+        )?;
+        Ok(Self {
+            target_plugin_id: Some(target_plugin_id),
+            kind: ScriptEventKind::LoaderInteraction {
+                player_id,
+                interaction_id: interaction_id.to_owned(),
+                payload: payload.to_owned(),
+            },
+        })
+    }
+
     /// Return the plugin id for an event that must not be broadcast to other runtimes.
     pub fn target_plugin_id(&self) -> Option<&str> {
         self.target_plugin_id.as_deref()
@@ -2047,6 +2086,7 @@ impl ScriptEvent {
             ScriptEventKind::ColonyRecordResult { .. } => "colony.record_result",
             ScriptEventKind::ColonyVillagerBindingResult { .. } => "colony.villager_binding_result",
             ScriptEventKind::ColonyVillagerOrderResult { .. } => "colony.villager_order_result",
+            ScriptEventKind::LoaderInteraction { .. } => "loader.interaction",
         }
     }
 
@@ -2295,6 +2335,18 @@ impl ScriptEvent {
                 validate_script_id(request_id)?;
                 validate_script_id(colony_id).map(drop)
             }
+            ScriptEventKind::LoaderInteraction {
+                interaction_id,
+                payload,
+                ..
+            } => {
+                validate_contract_resource_id(interaction_id)?;
+                validate_bounded_value(
+                    "Loader interaction payload",
+                    payload,
+                    MAX_SCRIPT_LOADER_INTERACTION_PAYLOAD_BYTES,
+                )
+            }
         }
     }
 }
@@ -2473,6 +2525,11 @@ pub enum ScriptEventKind {
         order: ScriptVillagerOrder,
         accepted: bool,
     },
+    LoaderInteraction {
+        player_id: ScriptPlayerId,
+        interaction_id: String,
+        payload: String,
+    },
 }
 
 /// Outbound command requests emitted by script code.
@@ -2516,6 +2573,21 @@ pub enum ScriptCommand {
     OpenInventoryMenu {
         player_id: ScriptPlayerId,
         menu: ScriptInventoryMenu,
+    },
+    OpenClientScreen {
+        player_id: ScriptPlayerId,
+        screen_id: String,
+    },
+    PlaceLoaderBlock {
+        block_id: String,
+        x: i32,
+        y: i32,
+        z: i32,
+    },
+    GrantLoaderBlockItem {
+        player_id: ScriptPlayerId,
+        block_id: String,
+        count: u8,
     },
     CloseInventoryMenu {
         player_id: ScriptPlayerId,
@@ -2698,6 +2770,27 @@ impl AdmittedScriptCommand {
             },
             *player_id,
             menu.clone(),
+        ))
+    }
+
+    pub fn into_open_client_screen(
+        self,
+    ) -> Result<(ScriptPluginTarget, ScriptPlayerId, String), ScriptDtoError> {
+        let ScriptCommand::OpenClientScreen {
+            player_id,
+            screen_id,
+        } = self.request.as_ref()
+        else {
+            return Err(ScriptDtoError::InconsistentResult {
+                field: "client screen admission",
+            });
+        };
+        Ok((
+            ScriptPluginTarget {
+                plugin_id: self.plugin_id,
+            },
+            *player_id,
+            screen_id.clone(),
         ))
     }
 
@@ -2979,7 +3072,10 @@ impl ScriptCommand {
             Self::HostAttached { request, .. } => request.required_capability(),
             Self::SendChatMessage { .. }
             | Self::BroadcastChatMessage { .. }
-            | Self::DisconnectPlayer { .. } => None,
+            | Self::DisconnectPlayer { .. }
+            | Self::OpenClientScreen { .. }
+            | Self::PlaceLoaderBlock { .. }
+            | Self::GrantLoaderBlockItem { .. } => None,
             Self::RunConsoleCommand { command } => {
                 Some(RequiredCommandCapability::RunConsoleCommandRoot {
                     root: console_command_root(command),
@@ -3052,6 +3148,21 @@ impl ScriptCommand {
             Self::OpenInventoryMenu { menu, .. } => {
                 ScriptInventoryMenu::try_new(menu.id(), menu.title(), menu.slots().to_vec())
                     .map(drop)
+            }
+            Self::OpenClientScreen { screen_id, .. } => {
+                validate_contract_resource_id(screen_id).map(drop)
+            }
+            Self::PlaceLoaderBlock { block_id, .. } => {
+                validate_contract_resource_id(block_id).map(drop)
+            }
+            Self::GrantLoaderBlockItem {
+                block_id, count, ..
+            } => {
+                validate_contract_resource_id(block_id)?;
+                if !(1..=64).contains(count) {
+                    return Err(ScriptDtoError::InvalidBounds);
+                }
+                Ok(())
             }
             Self::UpsertZone { zone } => ScriptAxisAlignedZone::try_new_with_protection(
                 zone.id(),

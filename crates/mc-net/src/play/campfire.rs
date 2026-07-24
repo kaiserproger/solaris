@@ -142,6 +142,8 @@ fn entity_item_stack(stack: ItemStack) -> EntityItemStack {
         count: stack.count,
         damage: stack.damage,
         enchantments: stack.enchantments,
+        custom_name: stack.custom_name.map(Box::new),
+        item_model: stack.item_model.as_deref().cloned().map(Box::new),
     }
 }
 

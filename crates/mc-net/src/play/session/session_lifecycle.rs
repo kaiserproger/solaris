@@ -18,11 +18,11 @@ use crate::login::LoggedInProfile;
 #[cfg(test)]
 use crate::play::PlayerPose;
 use std::collections::HashSet;
+use std::sync::Arc;
 use std::sync::atomic::Ordering;
-use std::sync::{Arc, Mutex};
 #[cfg(test)]
 use tokio::sync::mpsc;
-use tracing::{debug, warn};
+use tracing::debug;
 
 impl SessionRegistry {
     pub(crate) fn subscribe_active_sessions(&self) -> tokio::sync::watch::Receiver<usize> {
@@ -50,6 +50,7 @@ impl SessionRegistry {
             max_sessions: usize::MAX,
             script_operator: false,
             dimension: "minecraft:overworld",
+            loader_session: None,
         })
         .expect("unbounded session registration should not fail")
     }
@@ -127,9 +128,13 @@ impl SessionRegistry {
                 tx: registration.tx,
                 pressure,
                 ordered_dispatch,
-                script_transaction_active: Arc::new(Mutex::new(true)),
+                script_inventory_transaction_gate: Arc::new(
+                    super::script_inventory_transaction_endpoint::ScriptInventoryTransactionGate::new(
+                    ),
+                ),
                 script_operator: registration.script_operator,
                 dimension: registration.dimension.to_owned(),
+                loader_session: registration.loader_session,
             },
         );
         {
@@ -255,21 +260,14 @@ impl SessionRegistry {
         id: SessionId,
         preserve_player_state: bool,
     ) -> Vec<VisibilityDispatch> {
-        let script_transaction_active = {
+        let script_inventory_transaction_gate = {
             let inner = self.lock_inner("capture unregister script transaction gate");
             let Some(session) = inner.sessions.get(&id) else {
                 return Vec::new();
             };
-            Arc::clone(&session.script_transaction_active)
+            Arc::clone(&session.script_inventory_transaction_gate)
         };
-        let mut script_transaction_active =
-            script_transaction_active.lock().unwrap_or_else(|poisoned| {
-                warn!(
-                    session_id = id,
-                    "script transaction gate was poisoned during unregister; recovering state"
-                );
-                poisoned.into_inner()
-            });
+        script_inventory_transaction_gate.close(id);
         let (
             snapshot,
             recipients,
@@ -285,8 +283,6 @@ impl SessionRegistry {
             session.combat_target.close(session.pose);
             let dropped = session.ordered_dispatch.close();
             session.pressure.record_reliable_command_drops(dropped);
-            *script_transaction_active = false;
-            drop(script_transaction_active);
             inner.sleeping_sessions.remove(&id);
             inner.spectator_sessions.remove(&id);
             inner.dead_sessions.remove(&id);

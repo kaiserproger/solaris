@@ -150,6 +150,7 @@ mod tests {
             chunk_pipeline: crate::ChunkPipelinePolicy::default(),
             random_tick: crate::RandomTickPolicy::default(),
             command_permissions: crate::CommandPermissionConfig::new(Vec::<String>::new(), true),
+            loader_manifest: None,
             shutdown: crate::ShutdownHandle::default(),
         }
     }

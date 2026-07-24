@@ -1,4 +1,4 @@
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
 use std::fs::{File, OpenOptions};
 use std::io::{Read, Write};
@@ -25,6 +25,7 @@ const ENTITY_FORMAT_VERSION_FIELD: &str = "SolarisEntityFormatVersion";
 const ENTITY_FORMAT_VERSION: i32 = 3;
 const ENTITY_LIFECYCLE_TICK_FIELD: &str = "SolarisEntityLifecycleTick";
 const ENTITY_REGIONAL_SEQUENCE_FIELD: &str = "SolarisRegionalSequenceWatermark";
+const ENTITY_SETTLEMENT_CLAIMS_FIELD: &str = "SolarisSettlementClaims";
 const ENTITY_LIFECYCLE_FIELD: &str = "SolarisLifecycle";
 const ENTITY_ATTRIBUTES_FIELD: &str = "SolarisAttributes";
 const ENTITY_RETAINED_STATE_FIELD: &str = "SolarisRetainedState";
@@ -47,6 +48,7 @@ const MAX_REGIONAL_DECISIONS_PER_FRAME: usize = 30_000;
 const MAX_REGIONAL_ENTITY_MUTATIONS_PER_FRAME: usize = 30_000;
 const DAMAGE_COMPONENT: &str = "minecraft:damage";
 const CUSTOM_NAME_COMPONENT: &str = "minecraft:custom_name";
+const ITEM_MODEL_COMPONENT: &str = "minecraft:item_model";
 const ENCHANTMENTS_COMPONENT: &str = "minecraft:enchantments";
 const CARRIED_ITEM_FIELD: &str = "SolarisCarriedItem";
 const CRAFTING_TABLE_INPUT_FIELD: &str = "SolarisCraftingTableInput";
@@ -716,6 +718,7 @@ pub(crate) fn replay_regional_commit_decisions(
         lifecycle_clock,
         regional_sequence_watermark,
         records,
+        settlement_claims,
     } = checkpoint;
     let mut entities = records
         .into_iter()
@@ -766,6 +769,7 @@ pub(crate) fn replay_regional_commit_decisions(
         lifecycle_clock: replay_boundary.0,
         regional_sequence_watermark: replay_boundary.1,
         records: restored,
+        settlement_claims,
     })
 }
 
@@ -927,6 +931,7 @@ pub(crate) struct PersistedEntityCheckpoint {
     pub(crate) lifecycle_clock: u64,
     pub(crate) regional_sequence_watermark: u64,
     pub(crate) records: Vec<PersistedEntityRecord>,
+    pub(crate) settlement_claims: BTreeSet<String>,
 }
 
 impl PersistedEntityCheckpoint {
@@ -939,6 +944,7 @@ impl PersistedEntityCheckpoint {
             lifecycle_clock,
             regional_sequence_watermark: 0,
             records: records.into_iter().map(Into::into).collect(),
+            settlement_claims: BTreeSet::new(),
         }
     }
 
@@ -952,6 +958,7 @@ impl PersistedEntityCheckpoint {
             lifecycle_clock,
             regional_sequence_watermark,
             records: records.into_iter().map(Into::into).collect(),
+            settlement_claims: BTreeSet::new(),
         }
     }
 
@@ -1150,6 +1157,7 @@ pub(super) struct InventorySlotExtras {
     damage: Option<i32>,
     enchantments: Vec<mc_data::ItemEnchantment>,
     custom_name: Option<String>,
+    item_model: Option<Arc<Identifier>>,
     fields: Vec<(String, Tag)>,
 }
 
@@ -1423,6 +1431,7 @@ pub(super) fn load_player_state(
                     damage: stack.damage,
                     enchantments: stack.enchantments,
                     custom_name: stack.custom_name,
+                    item_model: stack.item_model,
                     fields: extras,
                 });
             }
@@ -1525,6 +1534,7 @@ pub(crate) fn load_persisted_entities(
             lifecycle_clock: 0,
             regional_sequence_watermark: 0,
             records: Vec::new(),
+            settlement_claims: BTreeSet::new(),
         });
     }
     let (_, root) = read_player_root(&path)?;
@@ -1593,6 +1603,26 @@ pub(crate) fn load_persisted_entities(
             path,
             field: "Entities",
         });
+    };
+    let settlement_claims = match field(&fields, ENTITY_SETTLEMENT_CLAIMS_FIELD) {
+        None => BTreeSet::new(),
+        Some(Tag::List(list)) => list
+            .elements
+            .iter()
+            .map(|value| match value {
+                Tag::String(claim) if !claim.is_empty() => Ok(claim.clone()),
+                _ => Err(PlayerPersistenceError::InvalidValue {
+                    path: path.clone(),
+                    field: ENTITY_SETTLEMENT_CLAIMS_FIELD,
+                }),
+            })
+            .collect::<Result<BTreeSet<_>, _>>()?,
+        Some(_) => {
+            return Err(PlayerPersistenceError::InvalidValue {
+                path,
+                field: ENTITY_SETTLEMENT_CLAIMS_FIELD,
+            });
+        }
     };
     let mut entities = Vec::new();
     let mut entity_uuids = std::collections::BTreeSet::new();
@@ -1792,6 +1822,7 @@ pub(crate) fn load_persisted_entities(
         lifecycle_clock: lifecycle_tick,
         regional_sequence_watermark,
         records: entities,
+        settlement_claims,
     };
     if !checkpoint.has_valid_temporal_state() {
         return Err(PlayerPersistenceError::InvalidValue {
@@ -1886,6 +1917,7 @@ pub(crate) fn save_persisted_entities(
             lifecycle_clock: 0,
             regional_sequence_watermark: 0,
             records,
+            settlement_claims: BTreeSet::new(),
         },
     )
 }
@@ -1949,6 +1981,22 @@ pub(crate) fn save_persisted_entity_records(
                     tag_type::COMPOUND
                 },
                 elements,
+            }),
+        ),
+        (
+            ENTITY_SETTLEMENT_CLAIMS_FIELD.into(),
+            Tag::List(ListTag {
+                element_type: if checkpoint.settlement_claims.is_empty() {
+                    tag_type::END
+                } else {
+                    tag_type::STRING
+                },
+                elements: checkpoint
+                    .settlement_claims
+                    .iter()
+                    .cloned()
+                    .map(Tag::String)
+                    .collect(),
             }),
         ),
     ]);
@@ -2131,6 +2179,12 @@ pub(super) fn entity_item_stack_tag(
     if let Some(damage) = stack.damage {
         set_damage_component(&mut fields, damage);
     }
+    if let Some(custom_name) = &stack.custom_name {
+        set_custom_name_component(&mut fields, custom_name);
+    }
+    if let Some(item_model) = &stack.item_model {
+        set_item_model_component(&mut fields, item_model);
+    }
     if !stack.enchantments.is_empty() {
         set_enchantments_component(&mut fields, &stack.enchantments);
     }
@@ -2155,6 +2209,11 @@ pub(super) fn read_entity_item_stack(
         count,
         damage: damage_component(fields),
         enchantments: enchantments_component(fields)?,
+        custom_name: custom_name_component(fields).map(Box::new),
+        item_model: item_model_component(fields)?
+            .as_deref()
+            .cloned()
+            .map(Box::new),
     }))
 }
 
@@ -2356,6 +2415,7 @@ fn inventory_tag(
                     && extras.damage == stack.damage
                     && extras.enchantments == stack.enchantments
                     && extras.custom_name == stack.custom_name
+                    && extras.item_model == stack.item_model
             })
             .map(|extras| extras.fields.clone())
             .unwrap_or_default();
@@ -2391,6 +2451,7 @@ fn item_stack_from_fields(
         damage: damage_component(fields),
         enchantments: enchantments_component(fields)?,
         custom_name: custom_name_component(fields),
+        item_model: item_model_component(fields)?,
     }))
 }
 
@@ -2470,6 +2531,9 @@ fn set_item_stack_fields(fields: &mut Vec<(String, Tag)>, name: &Identifier, sta
     if let Some(custom_name) = &stack.custom_name {
         set_custom_name_component(fields, custom_name);
     }
+    if let Some(item_model) = &stack.item_model {
+        set_item_model_component(fields, item_model);
+    }
     if !stack.enchantments.is_empty() {
         set_enchantments_component(fields, &stack.enchantments);
     }
@@ -2527,6 +2591,38 @@ fn set_custom_name_component(fields: &mut Vec<(String, Tag)>, custom_name: &str)
             fields,
             "components",
             Tag::Compound(vec![(CUSTOM_NAME_COMPONENT.into(), value)]),
+        );
+    }
+}
+
+fn item_model_component(
+    fields: &[(String, Tag)],
+) -> Result<Option<Arc<Identifier>>, PlayerPersistenceError> {
+    let Some(Tag::Compound(components)) = field(fields, "components") else {
+        return Ok(None);
+    };
+    let Some(Tag::String(item_model)) = field(components, ITEM_MODEL_COMPONENT) else {
+        return Ok(None);
+    };
+    Identifier::parse(item_model.clone())
+        .map(Arc::new)
+        .map(Some)
+        .map_err(|_| PlayerPersistenceError::InvalidItemId(item_model.clone()))
+}
+
+fn set_item_model_component(fields: &mut Vec<(String, Tag)>, item_model: &Identifier) {
+    let value = Tag::String(item_model.as_str().to_owned());
+    let components = field_mut(fields, "components").and_then(|tag| match tag {
+        Tag::Compound(fields) => Some(fields),
+        _ => None,
+    });
+    if let Some(components) = components {
+        set_field(components, ITEM_MODEL_COMPONENT, value);
+    } else {
+        set_field(
+            fields,
+            "components",
+            Tag::Compound(vec![(ITEM_MODEL_COMPONENT.into(), value)]),
         );
     }
 }
@@ -2748,6 +2844,45 @@ mod tests {
 
     fn entity_types() -> EntityTypeRegistry {
         mc_data::entity_types::solaris_required_entity_types()
+    }
+
+    #[test]
+    fn settlement_claim_and_villager_job_round_trip_through_entity_storage() {
+        let tmp = tempfile::tempdir().unwrap();
+        let items = items();
+        let entity_types = entity_types();
+        let villager_name = mc_data::Identifier::parse("minecraft:villager").unwrap();
+        let villager_type = i32::try_from(entity_types.id_of(&villager_name).unwrap()).unwrap();
+        let mut spawn = SpawnEntity::new(
+            villager_type,
+            villager_name.to_string(),
+            Vec3::new(72.5, 66.0, 8.5),
+        );
+        spawn.retained.villager = Some(mc_entity::VillagerData::new(
+            mc_entity::VillagerKind::Plains,
+            mc_entity::VillagerProfession::Toolsmith,
+            1,
+        ));
+        let mut store = EntityStore::new();
+        let id = store.spawn(spawn);
+        let snapshot = store.snapshot(id).unwrap();
+        let mut checkpoint = PersistedEntityCheckpoint::new(0, [snapshot]);
+        checkpoint
+            .settlement_claims
+            .insert("settlement-prototype:smith@72,8".to_owned());
+
+        save_persisted_entity_records(tmp.path(), &items, &checkpoint).unwrap();
+        let loaded = load_persisted_entities(tmp.path(), &items, &entity_types).unwrap();
+
+        assert_eq!(loaded.settlement_claims, checkpoint.settlement_claims);
+        assert_eq!(
+            loaded.records[0].snapshot.retained.villager,
+            Some(mc_entity::VillagerData::new(
+                mc_entity::VillagerKind::Plains,
+                mc_entity::VillagerProfession::Toolsmith,
+                1,
+            ))
+        );
     }
 
     fn replay_entity(type_name: &str, spawn_tick: u64) -> EntitySnapshot {
@@ -3234,7 +3369,8 @@ mod tests {
         state.inventory.slots[9] = ItemStack::new(2, 1)
             .with_damage(11)
             .with_enchantment(efficiency.clone(), 1)
-            .with_custom_name("Named Pickaxe");
+            .with_custom_name("Named Pickaxe")
+            .with_item_model(Identifier::parse("solaris_loader:loader_block").unwrap());
 
         save_player_state(tmp.path(), uuid, &items, &state).unwrap();
 
@@ -3270,6 +3406,7 @@ mod tests {
                 .with_damage(11)
                 .with_enchantment(efficiency, 1)
                 .with_custom_name("Named Pickaxe")
+                .with_item_model(Identifier::parse("solaris_loader:loader_block").unwrap())
         );
     }
 
@@ -3598,9 +3735,12 @@ mod tests {
     fn entity_item_stack_persistence_preserves_modelled_components() {
         let items = items();
         let efficiency = Identifier::parse("minecraft:efficiency").unwrap();
+        let item_model = Identifier::parse("solaris_loader:loader_block").unwrap();
         let stack = EntityItemStack::new(2, 1)
             .with_damage(17)
-            .with_enchantment(efficiency.clone(), 1);
+            .with_enchantment(efficiency.clone(), 1)
+            .with_custom_name("Ruby Block")
+            .with_item_model(item_model.clone());
 
         let tag = entity_item_stack_tag(&items, &stack).unwrap();
         let Tag::Compound(fields) = tag else {
@@ -3614,6 +3754,17 @@ mod tests {
             panic!("enchantments compound");
         };
         assert_eq!(int_field(enchantments, efficiency.as_str()), Some(1));
+        assert_eq!(
+            custom_name_component(&fields).as_deref(),
+            Some("Ruby Block")
+        );
+        assert_eq!(
+            item_model_component(&fields)
+                .unwrap()
+                .as_deref()
+                .map(Identifier::as_str),
+            Some(item_model.as_str())
+        );
 
         let loaded = read_entity_item_stack(&fields, &items).unwrap().unwrap();
         assert_eq!(loaded, stack);

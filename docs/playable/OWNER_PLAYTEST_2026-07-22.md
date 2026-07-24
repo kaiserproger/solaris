@@ -243,7 +243,7 @@ verification and keep ordinary survival play ahead of rare edge cases.
   bounds.
 - [x] Ship baseline protection/claims with durable ownership and direct player
   break/placement policy. This is `examples/plugins/land-claims`.
-- [ ] Extend claims to containers, fluids, pistons, explosions, fire, and entity
+- [x] Extend claims to containers, fluids, pistons, explosions, fire, and entity
   interaction. Direct right-click block actions now cover containers, buckets,
   cauldrons, toggles, beds, campfires, tilling, planting, and TNT ignition;
   living-entity interaction is checked at the authoritative target position.
@@ -251,21 +251,136 @@ verification and keep ordinary survival play ahead of rare edge cases.
   opened before a claim was created. Explosion block planning consumes one
   immutable generic protection snapshot only after due explosions are claimed and before
   taking the world lock, so idle ticks do not copy zones, protected blocks are
-  not candidates, and no per-block zone mutex is added. Piston movement and
-  fire spread have no implemented mutation path yet; keep this item open until
-  those mechanics exist and consume the ambient protection snapshot.
+  not candidates, and no per-block zone mutex is added. Random fire ticks now
+  perform one bounded adjacent burn into common fuel and consume the same
+  immutable ambient snapshot before planning, so a protected target is skipped
+  without taking the zone mutex or freezing the source fire's lifecycle.
+  A directly adjacent lever or button can now extend/retract one normal piston
+  and move one common propertyless full block. The base/head/destination edits
+  form one atomic group and consume the same immutable ambient snapshot in both
+  direct interaction and scheduled button-release planning; if any group
+  position is protected, none of the piston edits publish. Focused direct,
+  scheduled-owner, and protected-group regressions are green. This closes the
+  claims surface, not full piston parity: sticky pistons, multi-block chains,
+  slime/honey, and moving-block animation remain outside this baseline. The
+  fire slice likewise does not claim the complete vanilla material/odds table.
   Protection is plugin-authored through `solaris.upsert_protected_zone`; Rust
   does not match `land-claims` or parse its zone ids.
-- [ ] Keep plugin APIs region-aware without exposing locks or requiring plugin
-  authors to reason about worker ownership.
-- [ ] Prototype villages from extracted vanilla structure/template data, with
+- [x] Keep plugin APIs region-aware without exposing locks or requiring plugin
+  authors to reason about worker ownership. Production Lua commands contain
+  only bounded DTOs and opaque player/entity ids: entity spawn enters the
+  simulation owner, villager binding/order enters the current regional owner,
+  and menus, teleports, and player-inventory transactions enter the target
+  player's ordered session lane. A standalone player-inventory transaction no
+  longer mutates the persistence mutex from the script router; the router waits
+  for the exact session owner to plan against its live inventory, update the
+  durable mirror, and return the committed/rejected result. Dropped or closed
+  owner commands publish `player_unavailable` without mutation. The compound
+  inventory/storage purchase shares one internal session gate with standalone
+  owner commands, so its planning cannot overtake an earlier owner mutation and
+  the durable ledger and inventory cannot publish separately. Focused
+  owner-routing, cross-path serialization, rejection, and durable-mirror regressions
+  are green. This does not add a generic mutable-world or coroutine API.
+- [x] Prototype villages from extracted vanilla structure/template data, with
   stable Lua hooks for settlement generation, inhabitants, buildings, jobs, and
-  plugin-owned extensions.
+  plugin-owned extensions. First slice: the startup-only
+  `plains_village_prototype` manifest profile now combines an extracted vanilla
+  plains fountain, small house, and toolsmith with stable offsets and extracted
+  village placement facts. Seed zero fixes the deterministic composite near
+  spawn and the profile is included in the persisted worldgen fence. The
+  profile owner can now publish a bounded immutable startup plan selecting
+  building templates and roles, named villagers and jobs, and building-scoped
+  extension ids; selected parts directly materialize the deterministic
+  composite, extension ids are prefixed with the validated plugin id, and the
+  canonical plan is part of the persisted worldgen fence. Vanilla villager
+  jigsaw slots now become persisted chunk markers; chunk installation submits a
+  dedicated system-owned simulation command that idempotently spawns the named
+  villagers with durable plains/profession/level state. Its persistent
+  per-inhabitant claim is separate from ambient-herd admission and prevents
+  death or restart from duplicating a planned inhabitant.
 - [ ] Design and prototype Solaris Loader for Fabric, NeoForge, and Forge. A
   server/plugin manifest must be able to supply client-side blocks, items,
   screens, assets, and interactions so rich plugins are not limited to inventory
   GUI or vanilla-block substitutions. Treat downloaded content as untrusted,
-  versioned, permissioned, and cacheable.
+  versioned, permissioned, and cacheable. First slice: plugin discovery validates
+  one closed schema for all five content kinds and all three loader platforms,
+  including a relative artifact path, exact SHA-256/size, declared permissions,
+  and a versioned cache identity. During Configuration the server sends that
+  manifest on `solaris:loader/manifest` and enters Play only after a compatible
+  client acknowledges platform, loader version, permissions, and every exact
+  cache key on `solaris:loader/ack`; servers without client bundles retain the
+  vanilla path. A shared Java codec/validator and thin Fabric, NeoForge, and
+  Forge adapters consume the same JSON contract. All three adapters now
+  register manifest, request, artifact, and acknowledgement Configuration
+  payloads through their native 26.1.2 APIs. Missing identities are transferred
+  in bounded chunks, staged in the cache filesystem, verified against exact
+  size and SHA-256, and atomically published before acknowledgement. Permission
+  decisions are now keyed by exact server address and requested permission set,
+  persisted in the Loader cache, and collected through a Minecraft confirmation
+  screen on all three platforms before any download. Denial creates no request
+  or staging file. Verified, allowed archives now use one closed
+  `solaris-client.json` index to activate immutable owned screen and item
+  definitions, exact asset bytes, and screen-bound interactions across all
+  three adapters before acknowledgement. Unknown index fields or archive
+  entries and wrong asset bytes fail before activation, and logout clears the
+  active registry before another connection. Each item
+  is owner-namespaced, uses a verified `assets/<namespace>/items/<path>.json`
+  definition plus a known vanilla base item, and can be attached to a Loader
+  screen. Fabric, NeoForge, and Forge then render the same local `ItemStack`
+  through Minecraft's 26.1.2 `ITEM_MODEL` component without mutating the frozen
+  item registry. The block slice accepts up to eight owner-namespaced
+  declarations backed by exact verified owner models. Fabric registers the
+  bounded Solaris carrier block/item set in its pre-freeze main entrypoint;
+  NeoForge and Forge use their deferred registry events. After Configuration,
+  the verified pack maps sorted owner ids to deterministic carrier
+  blockstate/item definitions, so all three platforms can render each declared
+  block without replacing a vanilla block state or mutating a frozen registry.
+  The client resolves every carrier's exact runtime state id after pre-freeze
+  registration and reports the explicit owner-to-state map as
+  `carrier_block_state_ids` in the ACK. Solaris reads all owned block identities
+  from the exact hash-verified plugin artifacts, rejects a missing, extra,
+  invalid, or duplicate carrier state, and retains the resulting mapping only
+  for that acknowledged Play session. Every canonical server-owned Loader
+  block state projects to that session's exact carrier in block updates and
+  chunk palettes;
+  projected chunk frames are never reused by another session. Solaris now
+  registers that full opaque state in the server block and light tables before
+  opening the world, persists it by owner name, and lets only the exact
+  host-attested owner place it through
+  `solaris.place_loader_block`; the existing server-owned block transaction
+  publishes per-session projections to loaded clients. The exact owner can now
+  grant that verified block presentation into one exact
+  Loader-acknowledged player's canonical inventory with
+  `solaris.grant_loader_block_item`. Solaris persists the named
+  `minecraft:paper` plus that owner's deterministic carrier `ITEM_MODEL` stack
+  before publication and does not mutate a full inventory. `UseItemOn` accepts
+  only that exact model in the live session that acknowledged the owner block,
+  resolves the canonical owner state, and runs the ordinary survival placement
+  transaction so the conditional world edit and one-item persisted debit
+  commit together before publication. Wrong-model and unacknowledged stacks
+  leave world and inventory unchanged. Survival breaking the acknowledged
+  canonical Loader state now creates that same named paper/`ITEM_MODEL` stack
+  as an authoritative world item. Its presentation components survive entity
+  wire publication, persistence, partial claims, and the existing
+  simulation-owner pickup/inventory commit; missing ACK and other states cannot
+  select the Loader drop.
+  Host-attested
+  plugins can
+  now call
+  `solaris.open_client_screen` for an activated owner-namespaced title/body
+  screen. The server routes the ordered Play payload only to the exact player
+  session that acknowledged the Loader manifest, and Fabric, NeoForge, and
+  Forge discard queued UI work if its originating connection is no longer
+  current. Verified `assets/<namespace>/...` entries now mount through one
+  transient required Minecraft resource pack on all three platforms. Loader
+  acknowledgement waits for the resource reload to expose the exact verified
+  bytes, and close of that exact Configuration connection removes the pack;
+  stale close work cannot remove a newer mount. Declared interactions now
+  render as bounded screen buttons on all three platforms, send only while the
+  exact definition and originating connection remain active, and reach only
+  the owner Lua plugin through the exact Loader-acknowledged session. Automated
+  all-platform coverage is green; the PrismLauncher 26.1.2 visual gate was not
+  run.
 
 ## Runtime And Distribution
 

@@ -48,6 +48,8 @@ final class ClientMcpToolsTest {
             "minecraft_press_inputs",
             "minecraft_wait_ticks",
             "minecraft_close_screen",
+            "minecraft_click_confirmation_button",
+            "minecraft_click_screen_button",
             "minecraft_open_inventory",
             "minecraft_respawn",
             "minecraft_quick_move_container_slot",
@@ -104,6 +106,14 @@ final class ClientMcpToolsTest {
             "minecraft_wait_for_health_below"
         ));
         JsonObject inputs = properties(find(ClientMcpTools.definitions(), "minecraft_press_inputs"));
+        JsonObject confirmation = properties(find(
+            ClientMcpTools.definitions(),
+            "minecraft_click_confirmation_button"
+        ));
+        JsonObject screenButton = properties(find(
+            ClientMcpTools.definitions(),
+            "minecraft_click_screen_button"
+        ));
         JsonObject inventory = properties(find(ClientMcpTools.definitions(), "minecraft_wait_for_inventory"));
         JsonObject visible = properties(find(ClientMcpTools.definitions(), "minecraft_wait_for_visible_item"));
         JsonObject select = properties(find(ClientMcpTools.definitions(), "minecraft_select_hotbar_item"));
@@ -193,6 +203,35 @@ final class ClientMcpToolsTest {
         assertEquals(2048.0, health.get("health").getAsJsonObject().get("maximum").getAsDouble());
         assertEquals(255, inputs.get("ticks").getAsJsonObject().get("maximum").getAsInt());
         assertEquals(8, inputs.get("keys").getAsJsonObject().get("maxItems").getAsInt());
+        assertEquals(
+            256,
+            confirmation.get("expected_title").getAsJsonObject().get("maxLength").getAsInt()
+        );
+        assertEquals(
+            List.of("expected_title", "button_label"),
+            find(ClientMcpTools.definitions(), "minecraft_click_confirmation_button")
+                .inputSchema()
+                .getAsJsonArray("required")
+                .asList()
+                .stream()
+                .map(value -> value.getAsString())
+                .toList()
+        );
+        assertEquals(
+            256,
+            screenButton.get("expected_screen_class").getAsJsonObject()
+                .get("maxLength").getAsInt()
+        );
+        assertEquals(
+            List.of("expected_screen_class", "expected_title", "button_label"),
+            find(ClientMcpTools.definitions(), "minecraft_click_screen_button")
+                .inputSchema()
+                .getAsJsonArray("required")
+                .asList()
+                .stream()
+                .map(value -> value.getAsString())
+                .toList()
+        );
         assertTrue(
             inputs.get("keys").getAsJsonObject().getAsJsonObject("items").getAsJsonArray("enum")
                 .asList()
@@ -336,6 +375,10 @@ final class ClientMcpToolsTest {
         assertTrue(find(tools, "minecraft_respawn").openWorld());
         assertFalse(find(tools, "minecraft_connect").destructive());
         assertTrue(find(tools, "minecraft_connect").idempotent());
+        assertTrue(find(tools, "minecraft_click_confirmation_button").destructive());
+        assertFalse(find(tools, "minecraft_click_confirmation_button").idempotent());
+        assertTrue(find(tools, "minecraft_click_screen_button").destructive());
+        assertFalse(find(tools, "minecraft_click_screen_button").idempotent());
         assertTrue(find(tools, "minecraft_use_item_on").destructive());
         assertTrue(find(tools, "minecraft_press_inputs").destructive());
         assertTrue(find(tools, "minecraft_select_hotbar_item").destructive());

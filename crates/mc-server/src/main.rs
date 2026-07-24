@@ -476,15 +476,24 @@ async fn serve(path: &Path) -> Result<()> {
     let plugin_ore_profile = prepared_plugins
         .as_ref()
         .and_then(mc_script::PreparedLuaPlugins::worldgen_ore_profile);
+    let plugin_settlement_plan = prepared_plugins
+        .as_ref()
+        .and_then(mc_script::PreparedLuaPlugins::worldgen_settlement_plan)
+        .cloned();
     let ore_profile_name = plugin_ore_profile
         .map(mc_script::LuaWorldgenOreProfile::contract_name)
         .unwrap_or("vanilla");
+    let settlement_contract = plugin_settlement_plan
+        .as_ref()
+        .map(mc_script::LuaSettlementPlan::contract_name)
+        .unwrap_or_else(|| "vanilla".to_owned());
     let world_source = ensure_world_contract(
         world_dir,
         configured_geometry,
         cfg.data.seed,
         worldgen_mode.contract_name(),
         ore_profile_name,
+        &settlement_contract,
     )?;
 
     let protocol_data = load_effective_protocol_data(cfg.data.vanilla_data_dir.as_deref())?;
@@ -496,20 +505,23 @@ async fn serve(path: &Path) -> Result<()> {
         "registry index loaded",
     );
 
-    let blocks_report = mc_data::blocks::solaris_required_blocks_report();
-    let block_states: usize = blocks_report.iter().map(|b| b.states.len()).sum();
-    let blocks = Arc::new(
-        mc_world::BlockRegistry::from_report(&blocks_report)
-            .context("building block-state registry from embedded JSON")?,
-    );
-    tracing::info!(
-        blocks = blocks_report.len(),
-        states = block_states,
-        "embedded block registry loaded",
-    );
+    let loader_manifest = prepared_plugins
+        .as_ref()
+        .map(|plugins| mc_net::LoaderManifest::from_script_bundles(plugins.client_bundles()))
+        .transpose()
+        .context("reading Solaris Loader artifact identities")?
+        .filter(|manifest| !manifest.is_empty())
+        .map(|manifest| {
+            manifest
+                .encode()
+                .context("encoding aggregated Solaris Loader manifest")?;
+            Ok::<_, anyhow::Error>(Arc::new(manifest))
+        })
+        .transpose()?;
+    let mut blocks_report = mc_data::blocks::solaris_required_blocks_report();
     let block_light_source =
         load_effective_block_light(cfg.data.vanilla_data_dir.as_deref(), &blocks_report)?;
-    let block_light = Arc::new(block_light_source.table);
+    let mut block_light = block_light_source.table;
     tracing::info!(
         version = %block_light.version,
         states = block_light.len(),
@@ -526,6 +538,29 @@ async fn serve(path: &Path) -> Result<()> {
         source = block_mining_source.source,
         "block-mining table loaded",
     );
+    if let Some(manifest) = loader_manifest.as_deref() {
+        for state_id in manifest
+            .append_world_block_report(&mut blocks_report)
+            .context("registering Solaris Loader world blocks")?
+        {
+            anyhow::ensure!(
+                usize::try_from(state_id).ok() == Some(block_light.len()),
+                "Solaris Loader block state must follow the validated light table"
+            );
+            block_light.append_opaque_state();
+        }
+    }
+    let block_light = Arc::new(block_light);
+    let block_states: usize = blocks_report.iter().map(|b| b.states.len()).sum();
+    let blocks = Arc::new(
+        mc_world::BlockRegistry::from_report(&blocks_report)
+            .context("building block-state registry from embedded JSON")?,
+    );
+    tracing::info!(
+        blocks = blocks_report.len(),
+        states = block_states,
+        "server block registry loaded",
+    );
     let block_explosion_source =
         load_effective_block_explosion(cfg.data.vanilla_data_dir.as_deref())?;
     tracing::info!(
@@ -538,8 +573,14 @@ async fn serve(path: &Path) -> Result<()> {
     );
     let items = Arc::new(mc_data::items::solaris_required_items());
     tracing::info!(entries = items.len(), "embedded item registry loaded");
-    let structure_rules =
-        structure_rules_for_startup(cfg.data.seed, cfg.data.worldgen_mode, &blocks, &items)?;
+    let structure_rules = structure_rules_for_startup(
+        cfg.data.seed,
+        cfg.data.worldgen_mode,
+        cfg.data.vanilla_data_dir.as_deref(),
+        &blocks,
+        &items,
+        plugin_settlement_plan.as_ref(),
+    )?;
     let chunk_pipeline = cfg.chunk_pipeline.to_network();
     let terrain_generator = build_terrain_generator(
         cfg.data.seed,
@@ -694,7 +735,7 @@ async fn serve(path: &Path) -> Result<()> {
         "embedded biome spawn rules loaded"
     );
 
-    let net = cfg
+    let mut net = cfg
         .to_network(
             data,
             blocks,
@@ -710,6 +751,14 @@ async fn serve(path: &Path) -> Result<()> {
             biome_spawns,
         )
         .with_context(|| format!("translating bind_address from {}", path.display()))?;
+    net.loader_manifest = loader_manifest;
+    if let Some(manifest) = net.loader_manifest.as_deref() {
+        tracing::info!(
+            protocol = manifest.protocol,
+            bundles = manifest.bundles.len(),
+            "Solaris Loader manifest prepared"
+        );
+    }
     tracing::info!(
         version = mc_server::VERSION,
         protocol = mc_protocol::PROTOCOL_VERSION,
@@ -814,9 +863,73 @@ fn build_terrain_generator(
 fn structure_rules_for_startup(
     seed: i64,
     worldgen_mode: mc_server::WorldgenMode,
+    vanilla_data_dir: Option<&Path>,
     blocks: &mc_world::BlockRegistry,
     items: &mc_data::items::ItemRegistry,
+    settlement_plan: Option<&mc_script::LuaSettlementPlan>,
 ) -> Result<mc_worldgen::StructureRules> {
+    if let Some(settlement_plan) = settlement_plan {
+        let vanilla_data_dir = vanilla_data_dir.context(
+            "worldgen settlement profile plains_village_prototype requires data.vanilla_data_dir",
+        )?;
+        let parts = settlement_plan
+            .buildings()
+            .iter()
+            .map(|building| match building.template() {
+                mc_script::LuaSettlementBuildingTemplate::PlainsFountain => {
+                    Ok(mc_worldgen::PlainsVillagePrototypePart::Fountain)
+                }
+                mc_script::LuaSettlementBuildingTemplate::PlainsSmallHouse => {
+                    Ok(mc_worldgen::PlainsVillagePrototypePart::SmallHouse)
+                }
+                mc_script::LuaSettlementBuildingTemplate::PlainsToolsmith => {
+                    Ok(mc_worldgen::PlainsVillagePrototypePart::Toolsmith)
+                }
+                _ => anyhow::bail!("unsupported settlement building template"),
+            })
+            .collect::<Result<Vec<_>>>()?;
+        let inhabitants = settlement_plan
+            .inhabitants()
+            .iter()
+            .map(|inhabitant| {
+                let entity_type = match inhabitant.kind() {
+                    mc_script::LuaSettlementInhabitantKind::Villager => "minecraft:villager",
+                    _ => anyhow::bail!("unsupported settlement inhabitant kind"),
+                };
+                let profession = match inhabitant.job() {
+                    mc_script::LuaSettlementJob::Unemployed => "none",
+                    mc_script::LuaSettlementJob::Toolsmith => "toolsmith",
+                    _ => anyhow::bail!("unsupported settlement inhabitant job"),
+                };
+                Ok(mc_worldgen::StructureInhabitant {
+                    id: format!("{}:{}", settlement_plan.owner_plugin_id(), inhabitant.id()),
+                    entity_type: entity_type.to_owned(),
+                    villager_kind: "plains".to_owned(),
+                    profession: profession.to_owned(),
+                    level: 1,
+                })
+            })
+            .collect::<Result<Vec<_>>>()?;
+        let rules = mc_worldgen::StructureRules::plains_village_prototype_with_plan(
+            vanilla_data_dir,
+            blocks,
+            &parts,
+            inhabitants,
+        )
+        .context("loading plains village prototype from vanilla structure data")?;
+        tracing::info!(
+            owner = settlement_plan.owner_plugin_id(),
+            buildings = settlement_plan.buildings().len(),
+            inhabitants = settlement_plan.inhabitants().len(),
+            extensions = settlement_plan.extensions().len(),
+            "materialized plugin settlement plan",
+        );
+        return Ok(if seed == 0 {
+            rules.with_fixed_center((72, 8))
+        } else {
+            rules
+        });
+    }
     if seed == 0 && worldgen_mode == mc_server::WorldgenMode::VanillaLike {
         return mc_worldgen::StructureRules::solaris_playable_ruin(blocks, items)
             .context("resolving Solaris playable ruin");
@@ -1698,7 +1811,15 @@ mod tests {
         let changed = mc_world::ChunkGeometry::new(-64, 384).unwrap();
 
         assert_eq!(
-            ensure_world_contract(world.path(), original, 7, "vanilla_like", "vanilla").unwrap(),
+            ensure_world_contract(
+                world.path(),
+                original,
+                7,
+                "vanilla_like",
+                "vanilla",
+                "vanilla",
+            )
+            .unwrap(),
             WorldSource::SolarisGenerated,
         );
         let bytes = std::fs::read(world_contract_path(world.path())).unwrap();
@@ -1708,11 +1829,19 @@ mod tests {
         assert_eq!(persisted.seed, 7);
         assert_eq!(persisted.mode, "vanilla_like");
         assert_eq!(persisted.ore_profile, "vanilla");
+        assert_eq!(persisted.settlement_profile, "vanilla");
         assert_eq!(persisted.min_y, 0);
         assert_eq!(persisted.height, 256);
 
-        let error =
-            ensure_world_contract(world.path(), changed, 7, "vanilla_like", "vanilla").unwrap_err();
+        let error = ensure_world_contract(
+            world.path(),
+            changed,
+            7,
+            "vanilla_like",
+            "vanilla",
+            "vanilla",
+        )
+        .unwrap_err();
 
         let message = error.to_string();
         assert!(message.contains("world contract geometry"), "{message}");
@@ -1724,7 +1853,15 @@ mod tests {
     fn world_contract_rejects_mismatched_worldgen_revision_before_world_open() {
         let world = tempfile::tempdir().unwrap();
         let geometry = mc_world::ChunkGeometry::new(-64, 384).unwrap();
-        ensure_world_contract(world.path(), geometry, 7, "vanilla_like", "vanilla").unwrap();
+        ensure_world_contract(
+            world.path(),
+            geometry,
+            7,
+            "vanilla_like",
+            "vanilla",
+            "vanilla",
+        )
+        .unwrap();
 
         let path = world_contract_path(world.path());
         let bytes = std::fs::read(&path).unwrap();
@@ -1732,8 +1869,15 @@ mod tests {
         persisted.worldgen_revision = persisted.worldgen_revision.saturating_sub(1);
         std::fs::write(&path, serde_json::to_vec_pretty(&persisted).unwrap()).unwrap();
 
-        let error = ensure_world_contract(world.path(), geometry, 7, "vanilla_like", "vanilla")
-            .unwrap_err();
+        let error = ensure_world_contract(
+            world.path(),
+            geometry,
+            7,
+            "vanilla_like",
+            "vanilla",
+            "vanilla",
+        )
+        .unwrap_err();
         assert!(error.to_string().contains("persisted worldgen revision="));
     }
 
@@ -1750,7 +1894,15 @@ mod tests {
 
         let geometry = mc_world::ChunkGeometry::new(0, 256).unwrap();
         assert_eq!(
-            ensure_world_contract(world.path(), geometry, 0, "vanilla_like", "vanilla").unwrap(),
+            ensure_world_contract(
+                world.path(),
+                geometry,
+                0,
+                "vanilla_like",
+                "vanilla",
+                "vanilla",
+            )
+            .unwrap(),
             WorldSource::ExistingVanilla,
         );
         assert!(!world_contract_path(world.path()).exists());
@@ -1769,10 +1921,27 @@ mod tests {
             0,
             "vanilla_like",
             "geological_deposits",
+            "vanilla",
         )
         .unwrap_err();
 
         assert!(error.to_string().contains("unversioned Anvil import"));
+        assert!(!world_contract_path(world.path()).exists());
+
+        let settlement_error = ensure_world_contract(
+            world.path(),
+            mc_world::OVERWORLD_GEOMETRY,
+            0,
+            "vanilla_like",
+            "vanilla",
+            "plains_village_prototype",
+        )
+        .unwrap_err();
+        assert!(
+            settlement_error
+                .to_string()
+                .contains("unversioned Anvil import")
+        );
         assert!(!world_contract_path(world.path()).exists());
     }
 
@@ -1782,23 +1951,51 @@ mod tests {
         let geometry = mc_world::OVERWORLD_GEOMETRY;
 
         assert_eq!(
-            ensure_world_contract(world.path(), geometry, 11, "vanilla_like", "vanilla").unwrap(),
+            ensure_world_contract(
+                world.path(),
+                geometry,
+                11,
+                "vanilla_like",
+                "vanilla",
+                "vanilla",
+            )
+            .unwrap(),
             WorldSource::SolarisGenerated,
         );
         assert_eq!(
-            ensure_world_contract(world.path(), geometry, 11, "vanilla_like", "vanilla").unwrap(),
+            ensure_world_contract(
+                world.path(),
+                geometry,
+                11,
+                "vanilla_like",
+                "vanilla",
+                "vanilla",
+            )
+            .unwrap(),
             WorldSource::SolarisGenerated,
         );
 
-        let seed_error =
-            ensure_world_contract(world.path(), geometry, 12, "vanilla_like", "vanilla")
-                .unwrap_err();
+        let seed_error = ensure_world_contract(
+            world.path(),
+            geometry,
+            12,
+            "vanilla_like",
+            "vanilla",
+            "vanilla",
+        )
+        .unwrap_err();
         assert!(seed_error.to_string().contains("seed=11"));
         assert!(seed_error.to_string().contains("seed=12"));
 
-        let mode_error =
-            ensure_world_contract(world.path(), geometry, 11, "tellus_like", "vanilla")
-                .unwrap_err();
+        let mode_error = ensure_world_contract(
+            world.path(),
+            geometry,
+            11,
+            "tellus_like",
+            "vanilla",
+            "vanilla",
+        )
+        .unwrap_err();
         assert!(mode_error.to_string().contains("mode=vanilla_like"));
         assert!(mode_error.to_string().contains("mode=tellus_like"));
 
@@ -1808,6 +2005,7 @@ mod tests {
             11,
             "vanilla_like",
             "geological_deposits",
+            "vanilla",
         )
         .unwrap_err();
         assert!(profile_error.to_string().contains("ore_profile=vanilla"));
@@ -1815,6 +2013,26 @@ mod tests {
             profile_error
                 .to_string()
                 .contains("ore_profile=geological_deposits")
+        );
+
+        let settlement_error = ensure_world_contract(
+            world.path(),
+            geometry,
+            11,
+            "vanilla_like",
+            "vanilla",
+            "plains_village_prototype",
+        )
+        .unwrap_err();
+        assert!(
+            settlement_error
+                .to_string()
+                .contains("settlement_profile=vanilla")
+        );
+        assert!(
+            settlement_error
+                .to_string()
+                .contains("settlement_profile=plains_village_prototype")
         );
 
         assert!(world_contract_path(world.path()).is_file());
@@ -1928,19 +2146,175 @@ mod tests {
             );
         let items = mc_data::items::solaris_required_items();
 
-        let playable =
-            structure_rules_for_startup(0, mc_server::WorldgenMode::VanillaLike, &blocks, &items)
-                .unwrap();
-        let unrelated_seed =
-            structure_rules_for_startup(7, mc_server::WorldgenMode::VanillaLike, &blocks, &items)
-                .unwrap();
-        let unrelated_mode =
-            structure_rules_for_startup(0, mc_server::WorldgenMode::TellusLike, &blocks, &items)
-                .unwrap();
+        let playable = structure_rules_for_startup(
+            0,
+            mc_server::WorldgenMode::VanillaLike,
+            None,
+            &blocks,
+            &items,
+            None,
+        )
+        .unwrap();
+        let unrelated_seed = structure_rules_for_startup(
+            7,
+            mc_server::WorldgenMode::VanillaLike,
+            None,
+            &blocks,
+            &items,
+            None,
+        )
+        .unwrap();
+        let unrelated_mode = structure_rules_for_startup(
+            0,
+            mc_server::WorldgenMode::TellusLike,
+            None,
+            &blocks,
+            &items,
+            None,
+        )
+        .unwrap();
 
         assert!(!playable.is_empty());
         assert!(unrelated_seed.is_empty());
         assert!(unrelated_mode.is_empty());
+    }
+
+    #[test]
+    fn settlement_profile_requires_the_vanilla_sidecar() {
+        let blocks = mc_world::BlockRegistry::from_report(
+            &mc_data::blocks::solaris_required_blocks_report(),
+        )
+        .unwrap();
+        let items = mc_data::items::solaris_required_items();
+
+        let error = structure_rules_for_startup(
+            0,
+            mc_server::WorldgenMode::TellusLike,
+            None,
+            &blocks,
+            &items,
+            Some(&mc_script::LuaSettlementPlan::plains_village_prototype(
+                "test-settlement",
+            )),
+        )
+        .unwrap_err();
+
+        assert!(error.to_string().contains("requires data.vanilla_data_dir"));
+    }
+
+    #[test]
+    fn settlement_profile_loads_the_extracted_prototype_when_present() {
+        let vanilla_data_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../data/vanilla");
+        let fountain = vanilla_data_dir
+            .join("data/minecraft/structure/village/plains/town_centers/plains_fountain_01.nbt");
+        if !fountain.exists() {
+            return;
+        }
+        let blocks = mc_world::BlockRegistry::from_report(
+            &mc_data::blocks::solaris_required_blocks_report(),
+        )
+        .unwrap();
+        let items = mc_data::items::solaris_required_items();
+
+        let rules = structure_rules_for_startup(
+            0,
+            mc_server::WorldgenMode::TellusLike,
+            Some(&vanilla_data_dir),
+            &blocks,
+            &items,
+            Some(&mc_script::LuaSettlementPlan::plains_village_prototype(
+                "test-settlement",
+            )),
+        )
+        .unwrap();
+
+        assert_eq!(rules.templates().len(), 1);
+        assert!(rules.templates()[0].blocks().len() > 200);
+    }
+
+    #[test]
+    fn extracted_village_prototype_generates_deterministically_when_present() {
+        let vanilla_data_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../data/vanilla");
+        let fountain = vanilla_data_dir
+            .join("data/minecraft/structure/village/plains/town_centers/plains_fountain_01.nbt");
+        if !fountain.exists() {
+            return;
+        }
+        let blocks =
+            Arc::new(
+                mc_world::BlockRegistry::from_report(
+                    &mc_data::blocks::solaris_required_blocks_report(),
+                )
+                .unwrap(),
+            );
+        let items = mc_data::items::solaris_required_items();
+        let rules = structure_rules_for_startup(
+            0,
+            mc_server::WorldgenMode::TellusLike,
+            Some(&vanilla_data_dir),
+            &blocks,
+            &items,
+            Some(&mc_script::LuaSettlementPlan::plains_village_prototype(
+                "test-settlement",
+            )),
+        )
+        .unwrap();
+        let first = build_terrain_generator(
+            0,
+            mc_server::WorldgenMode::TellusLike.to_worldgen(),
+            mc_world::OVERWORLD_GEOMETRY,
+            Arc::clone(&blocks),
+            rules.clone(),
+            None,
+        )
+        .unwrap();
+        let second = build_terrain_generator(
+            0,
+            mc_server::WorldgenMode::TellusLike.to_worldgen(),
+            mc_world::OVERWORLD_GEOMETRY,
+            Arc::clone(&blocks),
+            rules,
+            None,
+        )
+        .unwrap();
+        let baseline = build_terrain_generator(
+            0,
+            mc_server::WorldgenMode::TellusLike.to_worldgen(),
+            mc_world::OVERWORLD_GEOMETRY,
+            blocks,
+            mc_worldgen::StructureRules::none(),
+            None,
+        )
+        .unwrap();
+        let mut changed = 0;
+        for chunk_x in 3..=5 {
+            for chunk_z in -1..=1 {
+                let pos = mc_world::ChunkPos {
+                    x: chunk_x,
+                    z: chunk_z,
+                };
+                let first_chunk = mc_world::ChunkGenerator::generate(first.as_ref(), pos);
+                let second_chunk = mc_world::ChunkGenerator::generate(second.as_ref(), pos);
+                let baseline_chunk = mc_world::ChunkGenerator::generate(baseline.as_ref(), pos);
+                for y in mc_world::OVERWORLD_GEOMETRY.min_y()..mc_world::OVERWORLD_GEOMETRY.max_y()
+                {
+                    for local_z in 0..16 {
+                        for local_x in 0..16 {
+                            let generated = first_chunk.get_block(local_x, y, local_z);
+                            assert_eq!(
+                                generated,
+                                second_chunk.get_block(local_x, y, local_z),
+                                "same profile and seed must reproduce every village block"
+                            );
+                            changed += usize::from(
+                                generated != baseline_chunk.get_block(local_x, y, local_z),
+                            );
+                        }
+                    }
+                }
+            }
+        }
+        assert!(changed > 200, "prototype changed only {changed} blocks");
     }
 
     #[test]
@@ -2638,6 +3012,7 @@ mod tests {
             chunk_pipeline: mc_net::ChunkPipelinePolicy::default(),
             random_tick: mc_net::RandomTickPolicy::default(),
             command_permissions: mc_net::CommandPermissionConfig::new(Vec::<String>::new(), false),
+            loader_manifest: None,
             shutdown: shutdown.clone(),
         };
         let bound = mc_net::bind(config).await.expect("bind");

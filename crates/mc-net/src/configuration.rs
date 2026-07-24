@@ -9,6 +9,10 @@
 //! S → C  Registry Data × N         (one per built-in registry; entries use
 //!                                   the matched client pack or full sidecar
 //!                                   Network-NBT payloads)
+//! S → C  Loader Manifest           (only when plugins declare client bundles)
+//! C → S  Loader Request × N        (one per missing exact cache identity)
+//! S → C  Loader Artifact × N       (bounded contiguous chunks)
+//! C → S  Loader Ack                (only after verified cache publication)
 //! S → C  Finish Configuration
 //! C → S  Acknowledge Finish Configuration
 //!        → state transitions to Play
@@ -19,7 +23,11 @@
 //! blocking the handshake — robust to optional `Client Information` and
 //! `Plugin Message` traffic the client may emit at any point.
 
+#[cfg(test)]
+use std::collections::BTreeMap;
+use std::collections::BTreeSet;
 use std::sync::Arc;
+use std::time::Duration;
 
 use bytes::{Buf, Bytes, BytesMut};
 use mc_data::VanillaData;
@@ -31,10 +39,10 @@ use mc_protocol::frame::Compression;
 use mc_protocol::packets::CustomPayload;
 use mc_protocol::packets::Packet;
 use mc_protocol::packets::configuration::{
-    AcknowledgeFinishConfiguration, ClientboundKnownPacks, FinishConfiguration, KnownPackEntry,
-    RegistryData, RegistryEntry, ServerboundClientInformation, ServerboundCustomPayload,
-    ServerboundKnownPacks, ServerboundResourcePack, UpdateEnabledFeatures, UpdateTags,
-    UpdateTagsEntry, UpdateTagsRegistry,
+    AcknowledgeFinishConfiguration, ClientboundCustomPayload, ClientboundKnownPacks,
+    FinishConfiguration, KnownPackEntry, RegistryData, RegistryEntry, ServerboundClientInformation,
+    ServerboundCustomPayload, ServerboundKnownPacks, ServerboundResourcePack,
+    UpdateEnabledFeatures, UpdateTags, UpdateTagsEntry, UpdateTagsRegistry,
 };
 use mc_protocol::{CodecError, State, TARGET_RELEASE};
 use mc_world::{ChunkGeometry, OVERWORLD_GEOMETRY};
@@ -43,9 +51,15 @@ use tracing::{debug, info, warn};
 
 use crate::connection::{PRE_PLAY_READ_TIMEOUT, read_frame_with_timeout, write_packet};
 use crate::error::ConnectionError;
+use crate::loader::{
+    LOADER_ARTIFACT_CHUNK_BYTES, LoaderArtifactRequest, LoaderClientAck, LoaderManifest,
+    LoaderSession, encode_artifact_chunk, loader_ack_channel, loader_artifact_channel,
+    loader_manifest_channel, loader_request_channel,
+};
 use crate::login::LoggedInProfile;
 
 const MAX_IGNORED_CONFIGURATION_PACKETS: usize = 32;
+const LOADER_HANDSHAKE_READ_TIMEOUT: Duration = Duration::from_secs(120);
 
 fn override_overworld_dimension_geometry(
     payload: Arc<[u8]>,
@@ -130,6 +144,12 @@ pub(crate) struct ConfigurationContext<'a> {
     pub(crate) tags: &'a TagsData,
     pub(crate) chunk_geometry: ChunkGeometry,
     pub(crate) custom_payload_policy: Option<&'a CustomPayloadPolicy>,
+    pub(crate) loader_manifest: Option<&'a LoaderManifest>,
+}
+
+pub(crate) struct ConfigurationOutcome {
+    pub(crate) custom_payloads: Vec<ConfigurationCustomPayload>,
+    pub(crate) loader_session: Option<LoaderSession>,
 }
 
 /// The Known Packs entry we advertise as the data pack the running
@@ -150,7 +170,7 @@ pub(crate) async fn handle<R, W>(
     compression: Compression,
     profile: &LoggedInProfile,
     context: ConfigurationContext<'_>,
-) -> Result<Vec<ConfigurationCustomPayload>, ConnectionError>
+) -> Result<ConfigurationOutcome, ConnectionError>
 where
     R: AsyncReadExt + Unpin,
     W: AsyncWriteExt + Unpin,
@@ -181,6 +201,9 @@ where
     .await?;
 
     let mut custom_payloads = Vec::new();
+    let mut loader_acknowledged = context.loader_manifest.is_none();
+    let mut loader_session = None;
+    let mut loader_requests = BTreeSet::new();
 
     // Step 2: read frames until we see the client's KnownPacks response.
     let mut ignored_packets = 0usize;
@@ -223,11 +246,15 @@ where
             continue;
         }
         if frame.id == ServerboundCustomPayload::ID {
-            handle_configuration_custom_payload(
+            let _ = handle_configuration_custom_payload(
                 frame.body,
                 "before_known_packs",
                 context.custom_payload_policy,
                 &mut custom_payloads,
+                None,
+                &mut loader_acknowledged,
+                &mut loader_session,
+                &mut loader_requests,
             )?;
             continue;
         }
@@ -347,6 +374,43 @@ where
         "sent Update Tags",
     );
 
+    if let Some(manifest) = context.loader_manifest {
+        let payload = manifest
+            .encode()
+            .map_err(|error| ConnectionError::LoaderHandshake {
+                reason: error.to_string(),
+            })?;
+        write_packet(
+            writer,
+            &ClientboundCustomPayload {
+                payload: CustomPayload::Unknown {
+                    channel: loader_manifest_channel().clone(),
+                    payload,
+                },
+            },
+            compression,
+        )
+        .await?;
+        debug!(
+            bundles = manifest.bundles.len(),
+            protocol = manifest.protocol,
+            "sent Solaris Loader manifest"
+        );
+        complete_loader_handshake(
+            reader,
+            writer,
+            buf,
+            compression,
+            context.custom_payload_policy,
+            &mut custom_payloads,
+            manifest,
+            &mut loader_acknowledged,
+            &mut loader_session,
+            &mut loader_requests,
+        )
+        .await?;
+    }
+
     // Step 4: tell the client we are done configuring.
     write_packet(writer, &FinishConfiguration, compression).await?;
 
@@ -363,14 +427,13 @@ where
         )
         .await?;
         if frame.id == AcknowledgeFinishConfiguration::ID {
+            if !loader_acknowledged {
+                return Err(ConnectionError::LoaderHandshake {
+                    reason: "client finished Configuration without acknowledging the Solaris Loader manifest"
+                        .to_owned(),
+                });
+            }
             break;
-        }
-        ignored_packets += 1;
-        if ignored_packets > MAX_IGNORED_CONFIGURATION_PACKETS {
-            return Err(ConnectionError::IgnoredPacketBudgetExceeded {
-                state: State::Configuration,
-                max: MAX_IGNORED_CONFIGURATION_PACKETS,
-            });
         }
         if frame.id == ServerboundClientInformation::ID {
             let mut body = frame.body;
@@ -380,15 +443,33 @@ where
                 requested_view_distance = information.view_distance,
                 "client information noted while waiting for Configuration ack"
             );
+            note_ignored_configuration_packet(&mut ignored_packets)?;
             continue;
         }
         if frame.id == ServerboundCustomPayload::ID {
-            handle_configuration_custom_payload(
+            let request = handle_configuration_custom_payload(
                 frame.body,
                 "before_finish_ack",
                 context.custom_payload_policy,
                 &mut custom_payloads,
+                None,
+                &mut loader_acknowledged,
+                &mut loader_session,
+                &mut loader_requests,
             )?;
+            if let Some(request) = request {
+                send_loader_artifact(
+                    writer,
+                    compression,
+                    context
+                        .loader_manifest
+                        .expect("artifact request requires a loader manifest"),
+                    &request,
+                )
+                .await?;
+            } else {
+                note_ignored_configuration_packet(&mut ignored_packets)?;
+            }
             continue;
         }
         if frame.id == ServerboundResourcePack::ID {
@@ -400,8 +481,10 @@ where
                 terminal = status.action.is_terminal(),
                 "resource-pack status noted while waiting for Configuration ack"
             );
+            note_ignored_configuration_packet(&mut ignored_packets)?;
             continue;
         }
+        note_ignored_configuration_packet(&mut ignored_packets)?;
         debug!(
             id = format!("{:#04x}", frame.id),
             "ignored Configuration packet while waiting for ack"
@@ -414,15 +497,111 @@ where
         "configuration complete; entering Play state"
     );
 
-    Ok(custom_payloads)
+    Ok(ConfigurationOutcome {
+        custom_payloads,
+        loader_session,
+    })
 }
 
+#[allow(clippy::too_many_arguments)]
+async fn complete_loader_handshake<R, W>(
+    reader: &mut R,
+    writer: &mut W,
+    buf: &mut BytesMut,
+    compression: Compression,
+    custom_payload_policy: Option<&CustomPayloadPolicy>,
+    custom_payloads: &mut Vec<ConfigurationCustomPayload>,
+    manifest: &LoaderManifest,
+    loader_acknowledged: &mut bool,
+    loader_session: &mut Option<LoaderSession>,
+    loader_requests: &mut BTreeSet<String>,
+) -> Result<(), ConnectionError>
+where
+    R: AsyncReadExt + Unpin,
+    W: AsyncWriteExt + Unpin,
+{
+    let mut ignored_packets = 0usize;
+    while !*loader_acknowledged {
+        let frame = read_frame_with_timeout(
+            reader,
+            buf,
+            compression,
+            State::Configuration,
+            LOADER_HANDSHAKE_READ_TIMEOUT,
+        )
+        .await?;
+        if frame.id == ServerboundClientInformation::ID {
+            let mut body = frame.body;
+            let information = ServerboundClientInformation::decode(&mut body)?.information;
+            debug!(
+                language = %information.language,
+                requested_view_distance = information.view_distance,
+                "client information noted while waiting for Solaris Loader"
+            );
+            note_ignored_configuration_packet(&mut ignored_packets)?;
+            continue;
+        }
+        if frame.id == ServerboundCustomPayload::ID {
+            let request = handle_configuration_custom_payload(
+                frame.body,
+                "before_loader_ack",
+                custom_payload_policy,
+                custom_payloads,
+                Some(manifest),
+                loader_acknowledged,
+                loader_session,
+                loader_requests,
+            )?;
+            if let Some(request) = request {
+                send_loader_artifact(writer, compression, manifest, &request).await?;
+            } else if !*loader_acknowledged {
+                note_ignored_configuration_packet(&mut ignored_packets)?;
+            }
+            continue;
+        }
+        if frame.id == ServerboundResourcePack::ID {
+            let mut body = frame.body;
+            let status = ServerboundResourcePack::decode(&mut body)?.status;
+            debug!(
+                id = %status.id,
+                action = ?status.action,
+                terminal = status.action.is_terminal(),
+                "resource-pack status noted while waiting for Solaris Loader"
+            );
+            note_ignored_configuration_packet(&mut ignored_packets)?;
+            continue;
+        }
+        note_ignored_configuration_packet(&mut ignored_packets)?;
+        debug!(
+            id = format!("{:#04x}", frame.id),
+            "ignored Configuration packet while waiting for Solaris Loader"
+        );
+    }
+    Ok(())
+}
+
+fn note_ignored_configuration_packet(count: &mut usize) -> Result<(), ConnectionError> {
+    *count += 1;
+    if *count > MAX_IGNORED_CONFIGURATION_PACKETS {
+        return Err(ConnectionError::IgnoredPacketBudgetExceeded {
+            state: State::Configuration,
+            max: MAX_IGNORED_CONFIGURATION_PACKETS,
+        });
+    }
+    Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
 fn handle_configuration_custom_payload(
     mut body: Bytes,
     context: &'static str,
     custom_payload_policy: Option<&CustomPayloadPolicy>,
     custom_payloads: &mut Vec<ConfigurationCustomPayload>,
-) -> Result<(), ConnectionError> {
+    loader_manifest: Option<&LoaderManifest>,
+    loader_acknowledged: &mut bool,
+    loader_session: &mut Option<LoaderSession>,
+    loader_requests: &mut BTreeSet<String>,
+) -> Result<Option<LoaderArtifactRequest>, ConnectionError> {
     if body.len() > DEFAULT_MAX_CUSTOM_PAYLOAD_BYTES {
         warn!(
             len = body.len(),
@@ -430,14 +609,69 @@ fn handle_configuration_custom_payload(
             context,
             "oversized Configuration custom payload rejected before decode"
         );
-        return Ok(());
+        return Ok(None);
     }
 
     let channel = body.read_identifier()?;
     if channel == *CustomPayload::brand_channel() {
         let brand = body.read_string(DEFAULT_MAX_STRING_LEN)?;
         debug!(brand = %brand, context, "client brand noted during Configuration");
-        return Ok(());
+        return Ok(None);
+    }
+    if channel == *loader_request_channel() {
+        let Some(manifest) = loader_manifest else {
+            debug!(
+                context,
+                "ignored unsolicited Solaris Loader artifact request"
+            );
+            return Ok(None);
+        };
+        let request = LoaderArtifactRequest::decode(&body).map_err(|error| {
+            ConnectionError::LoaderHandshake {
+                reason: error.to_string(),
+            }
+        })?;
+        manifest.requested_artifact(&request).map_err(|error| {
+            ConnectionError::LoaderHandshake {
+                reason: error.to_string(),
+            }
+        })?;
+        if !loader_requests.insert(request.cache_key.clone()) {
+            return Err(ConnectionError::LoaderHandshake {
+                reason: format!(
+                    "client requested loader cache identity {} more than once",
+                    request.cache_key
+                ),
+            });
+        }
+        return Ok(Some(request));
+    }
+    if channel == *loader_ack_channel() {
+        let Some(manifest) = loader_manifest else {
+            debug!(
+                context,
+                "ignored unsolicited Solaris Loader acknowledgement"
+            );
+            return Ok(None);
+        };
+        let ack =
+            LoaderClientAck::decode(&body).map_err(|error| ConnectionError::LoaderHandshake {
+                reason: error.to_string(),
+            })?;
+        let session =
+            manifest
+                .bind_ack(&ack)
+                .map_err(|error| ConnectionError::LoaderHandshake {
+                    reason: error.to_string(),
+                })?;
+        *loader_session = Some(session);
+        *loader_acknowledged = true;
+        debug!(
+            platform = ?ack.platform,
+            loader_version = %ack.loader_version,
+            "Solaris Loader manifest acknowledged"
+        );
+        return Ok(None);
     }
 
     let payload_len = body.remaining();
@@ -449,7 +683,7 @@ fn handle_configuration_custom_payload(
                 context,
                 "Configuration custom payload denied by extension policy"
             );
-            return Ok(());
+            return Ok(None);
         }
         if payload_len > policy.max_payload_bytes() {
             warn!(
@@ -459,7 +693,7 @@ fn handle_configuration_custom_payload(
                 context,
                 "Configuration custom payload denied by extension size policy"
             );
-            return Ok(());
+            return Ok(None);
         }
         custom_payloads.push(ConfigurationCustomPayload {
             channel: channel.as_str().to_string(),
@@ -471,7 +705,7 @@ fn handle_configuration_custom_payload(
             context,
             "Configuration custom payload retained for extension"
         );
-        return Ok(());
+        return Ok(None);
     }
 
     debug!(
@@ -481,12 +715,85 @@ fn handle_configuration_custom_payload(
         "Configuration custom payload ignored"
     );
 
+    Ok(None)
+}
+
+async fn send_loader_artifact<W>(
+    writer: &mut W,
+    compression: Compression,
+    manifest: &LoaderManifest,
+    request: &LoaderArtifactRequest,
+) -> Result<(), ConnectionError>
+where
+    W: AsyncWriteExt + Unpin,
+{
+    let (bundle, path) =
+        manifest
+            .requested_artifact(request)
+            .map_err(|error| ConnectionError::LoaderHandshake {
+                reason: error.to_string(),
+            })?;
+    let metadata = tokio::fs::metadata(path).await?;
+    if !metadata.is_file() || metadata.len() != bundle.size_bytes {
+        return Err(ConnectionError::LoaderHandshake {
+            reason: format!(
+                "server artifact {} no longer matches declared size {}",
+                path.display(),
+                bundle.size_bytes
+            ),
+        });
+    }
+    let mut file = tokio::fs::File::open(path).await?;
+    let mut offset = 0_u64;
+    while offset < bundle.size_bytes {
+        let remaining = bundle.size_bytes - offset;
+        let chunk_len = usize::try_from(remaining.min(LOADER_ARTIFACT_CHUNK_BYTES as u64))
+            .expect("loader chunk length fits usize");
+        let mut chunk = vec![0_u8; chunk_len];
+        file.read_exact(&mut chunk).await?;
+        let last = offset + chunk_len as u64 == bundle.size_bytes;
+        let payload =
+            encode_artifact_chunk(&bundle.cache_key, offset, last, &chunk).map_err(|error| {
+                ConnectionError::LoaderHandshake {
+                    reason: error.to_string(),
+                }
+            })?;
+        write_packet(
+            writer,
+            &ClientboundCustomPayload {
+                payload: CustomPayload::Unknown {
+                    channel: loader_artifact_channel().clone(),
+                    payload,
+                },
+            },
+            compression,
+        )
+        .await?;
+        offset += chunk_len as u64;
+    }
+    let mut trailing = [0_u8; 1];
+    if file.read(&mut trailing).await? != 0 {
+        return Err(ConnectionError::LoaderHandshake {
+            reason: format!(
+                "server artifact {} grew while it was transferred",
+                path.display()
+            ),
+        });
+    }
+    debug!(
+        cache_key = %bundle.cache_key,
+        bytes = offset,
+        "sent Solaris Loader artifact"
+    );
     Ok(())
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::{
+        LOADER_PROTOCOL_VERSION, LoaderBundle, LoaderContentKind, LoaderPermission, LoaderPlatform,
+    };
 
     fn dimension_payload(min_y: i32, height: i32, logical_height: i32) -> Arc<[u8]> {
         let root = Tag::Compound(vec![
@@ -563,6 +870,156 @@ mod tests {
             error,
             ConnectionError::MissingRegistryPayload { registry, entry }
                 if registry == "minecraft:dimension_type" && entry == "minecraft:overworld"
+        ));
+    }
+
+    fn loader_manifest() -> LoaderManifest {
+        LoaderManifest {
+            protocol: LOADER_PROTOCOL_VERSION,
+            bundles: vec![LoaderBundle {
+                owner: "example".to_owned(),
+                id: "screen".to_owned(),
+                version: "1".to_owned(),
+                artifact: "client/screen.zip".to_owned(),
+                sha256: "a".repeat(64),
+                size_bytes: 128,
+                loaders: vec![
+                    LoaderPlatform::Fabric,
+                    LoaderPlatform::NeoForge,
+                    LoaderPlatform::Forge,
+                ],
+                content: vec![LoaderContentKind::Screens],
+                permissions: vec![LoaderPermission::OpenScreens],
+                cache_key: format!("example:screen/1/{}", "a".repeat(64)),
+                source_path: None,
+                block_id: None,
+                block_name: None,
+            }],
+        }
+    }
+
+    fn loader_ack_body(ack: &LoaderClientAck) -> Bytes {
+        let mut body = Vec::new();
+        CustomPayload::Unknown {
+            channel: loader_ack_channel().clone(),
+            payload: serde_json::to_vec(ack).unwrap(),
+        }
+        .encode_serverbound(&mut body)
+        .unwrap();
+        Bytes::from(body)
+    }
+
+    fn loader_request_body(request: &LoaderArtifactRequest) -> Bytes {
+        let mut body = Vec::new();
+        CustomPayload::Unknown {
+            channel: loader_request_channel().clone(),
+            payload: serde_json::to_vec(request).unwrap(),
+        }
+        .encode_serverbound(&mut body)
+        .unwrap();
+        Bytes::from(body)
+    }
+
+    #[test]
+    fn configuration_loader_ack_validates_before_extension_routing() {
+        let manifest = loader_manifest();
+        let ack = LoaderClientAck {
+            protocol: LOADER_PROTOCOL_VERSION,
+            platform: LoaderPlatform::Fabric,
+            loader_version: "0.1.0".to_owned(),
+            accepted_permissions: vec![LoaderPermission::OpenScreens],
+            cached_bundles: vec![manifest.bundles[0].cache_key.clone()],
+            carrier_block_state_ids: BTreeMap::new(),
+        };
+        let mut acknowledged = false;
+        let mut loader_session = None;
+        let mut retained = Vec::new();
+
+        handle_configuration_custom_payload(
+            loader_ack_body(&ack),
+            "test",
+            None,
+            &mut retained,
+            Some(&manifest),
+            &mut acknowledged,
+            &mut loader_session,
+            &mut BTreeSet::new(),
+        )
+        .unwrap();
+
+        assert!(acknowledged);
+        assert_eq!(
+            loader_session.as_ref().map(LoaderSession::platform),
+            Some(LoaderPlatform::Fabric)
+        );
+        assert!(retained.is_empty());
+    }
+
+    #[test]
+    fn configuration_loader_ack_rejects_missing_cache_identity() {
+        let manifest = loader_manifest();
+        let ack = LoaderClientAck {
+            protocol: LOADER_PROTOCOL_VERSION,
+            platform: LoaderPlatform::Forge,
+            loader_version: "0.1.0".to_owned(),
+            accepted_permissions: vec![LoaderPermission::OpenScreens],
+            cached_bundles: Vec::new(),
+            carrier_block_state_ids: BTreeMap::new(),
+        };
+        let mut acknowledged = false;
+
+        let error = handle_configuration_custom_payload(
+            loader_ack_body(&ack),
+            "test",
+            None,
+            &mut Vec::new(),
+            Some(&manifest),
+            &mut acknowledged,
+            &mut None,
+            &mut BTreeSet::new(),
+        )
+        .unwrap_err();
+
+        assert!(matches!(error, ConnectionError::LoaderHandshake { .. }));
+        assert!(!acknowledged);
+    }
+
+    #[test]
+    fn configuration_loader_request_resolves_exact_manifest_artifact() {
+        let mut manifest = loader_manifest();
+        manifest.bundles[0].source_path = Some("/plugin/client/screen.zip".into());
+        let request = LoaderArtifactRequest {
+            protocol: LOADER_PROTOCOL_VERSION,
+            cache_key: manifest.bundles[0].cache_key.clone(),
+        };
+        let mut requests = BTreeSet::new();
+
+        let decoded = handle_configuration_custom_payload(
+            loader_request_body(&request),
+            "test",
+            None,
+            &mut Vec::new(),
+            Some(&manifest),
+            &mut false,
+            &mut None,
+            &mut requests,
+        )
+        .unwrap()
+        .unwrap();
+
+        assert_eq!(decoded, request);
+        assert!(matches!(
+            handle_configuration_custom_payload(
+                loader_request_body(&request),
+                "test",
+                None,
+                &mut Vec::new(),
+                Some(&manifest),
+                &mut false,
+                &mut None,
+                &mut requests,
+            ),
+            Err(ConnectionError::LoaderHandshake { .. })
         ));
     }
 }

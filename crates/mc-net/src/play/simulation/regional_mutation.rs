@@ -54,7 +54,7 @@ struct RegionalBlockEditJob {
 
 enum RegionalMutationJob {
     BlockEdits {
-        actor_session: SessionId,
+        actor_session: Option<SessionId>,
         edits: Vec<ResidentBlockEdit>,
         preconditions: Vec<ResidentBlockPrecondition>,
         scheduled_block_ticks: Vec<ScheduledBlockTick>,
@@ -108,7 +108,7 @@ enum RegionalMutationJob {
 enum RegionalBlockEditJobResult {
     BlockEdits {
         sequence: u64,
-        actor_session: SessionId,
+        actor_session: Option<SessionId>,
         outcome: Box<Option<BlockEditBatchOutcome>>,
         journal_snapshots: Option<Vec<mc_world::ChunkSnapshot>>,
         journal_snapshot_complete: bool,
@@ -967,7 +967,11 @@ impl SimulationOwner {
                             light_updates,
                             &mut committed.block,
                         );
-                        dispatch_regional_block_outcome(sessions, actor_session, &committed.block);
+                        dispatch_regional_block_outcome(
+                            sessions,
+                            Some(actor_session),
+                            &committed.block,
+                        );
                     }
                     envelope.respond(Ok(SimulationResponse::SurvivalPlacement(
                         (*committed).map(|committed| committed.map(Box::new)),
@@ -1011,7 +1015,11 @@ impl SimulationOwner {
                             light_updates,
                             &mut committed.block,
                         );
-                        dispatch_regional_block_outcome(sessions, actor_session, &committed.block);
+                        dispatch_regional_block_outcome(
+                            sessions,
+                            Some(actor_session),
+                            &committed.block,
+                        );
 
                         let mut dispatches = std::mem::take(&mut committed.dispatches);
                         for drop in &plan.drops {
@@ -1063,7 +1071,11 @@ impl SimulationOwner {
                             light_updates,
                             &mut committed.block,
                         );
-                        dispatch_regional_block_outcome(sessions, actor_session, &committed.block);
+                        dispatch_regional_block_outcome(
+                            sessions,
+                            Some(actor_session),
+                            &committed.block,
+                        );
                     }
                     envelope.respond(Ok(SimulationResponse::BucketUse(
                         (*committed).map(|committed| committed.map(Box::new)),

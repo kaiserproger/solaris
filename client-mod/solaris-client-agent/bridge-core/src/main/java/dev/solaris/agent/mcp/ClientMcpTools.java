@@ -259,6 +259,31 @@ public final class ClientMcpTools {
             "close_screen",
             objectSchema(properties(), List.of())
         ),
+        mutating(
+            "minecraft_click_confirmation_button",
+            "Press one exact enabled button on the current confirmation screen after matching its exact title.",
+            "click_confirmation_button",
+            objectSchema(
+                properties(
+                    "expected_title", string(256),
+                    "button_label", string(64)
+                ),
+                List.of("expected_title", "button_label")
+            )
+        ),
+        mutating(
+            "minecraft_click_screen_button",
+            "Press one exact enabled button after matching the current screen's exact class and title.",
+            "click_screen_button",
+            objectSchema(
+                properties(
+                    "expected_screen_class", string(256),
+                    "expected_title", string(256),
+                    "button_label", string(64)
+                ),
+                List.of("expected_screen_class", "expected_title", "button_label")
+            )
+        ),
         control(
             "minecraft_open_inventory",
             "Open the vanilla survival inventory and 2x2 crafting screen.",

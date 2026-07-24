@@ -788,6 +788,7 @@ fn storage_bind_config(root: &std::path::Path) -> ServerConfig {
         chunk_pipeline: crate::ChunkPipelinePolicy::default(),
         random_tick: crate::play::RandomTickPolicy::default(),
         command_permissions: CommandPermissionConfig::new(Vec::<String>::new(), true),
+        loader_manifest: None,
         shutdown: ShutdownHandle::default(),
     }
 }

@@ -141,6 +141,10 @@ pub struct ReplayScenarioManifest {
     pub state_expectations: Vec<ReplayStateExpectation>,
     pub lanes: Vec<ReplayLane>,
     pub expected_invariants: Vec<ReplayExpectedInvariant>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub ledger_rows: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub evidence_legs: Vec<String>,
 }
 
 impl ReplayScenarioManifest {
@@ -193,6 +197,8 @@ impl ReplayScenarioManifest {
             state_expectations,
             lanes: self.lanes.clone(),
             expected_invariants,
+            ledger_rows: Vec::new(),
+            evidence_legs: Vec::new(),
         };
         failure.validate()?;
         Ok(failure)
@@ -226,6 +232,7 @@ impl ReplayScenarioManifest {
         let group_ids = validate_concurrent_groups(&self.concurrent_groups)?;
 
         ensure!(!self.lanes.is_empty(), "replay scenario lanes are empty");
+        let mut required_gate_ids = BTreeSet::new();
         let mut drivers = BTreeSet::new();
         for lane in &self.lanes {
             ensure!(
@@ -252,6 +259,7 @@ impl ReplayScenarioManifest {
                     lane.driver,
                     gate.id
                 );
+                required_gate_ids.insert(gate.id.as_str());
             }
             let primary_evidence = match lane.driver {
                 ReplayDriver::SolarisProtocol => ReplayEvidenceKind::Harness,
@@ -265,6 +273,44 @@ impl ReplayScenarioManifest {
                 "replay lane {:?} does not require {:?} evidence",
                 lane.driver,
                 primary_evidence
+            );
+        }
+
+        let mut rows = BTreeSet::new();
+        for row in &self.ledger_rows {
+            validate_ledger_row(row)?;
+            ensure!(rows.insert(row.as_str()), "duplicate ledger row {row}");
+        }
+        ensure!(
+            rows.len() <= MAX_REPLAY_CHECKS,
+            "replay scenario has too many ledger rows"
+        );
+
+        let mut evidence_legs = BTreeSet::new();
+        for evidence in &self.evidence_legs {
+            validate_identifier("evidence leg", evidence)?;
+            ensure!(
+                required_gate_ids.contains(evidence.as_str()),
+                "scenario evidence leg {evidence} is not declared by a replay lane"
+            );
+            ensure!(
+                evidence_legs.insert(evidence.as_str()),
+                "duplicate evidence leg {evidence}"
+            );
+        }
+        if self.ledger_rows.is_empty() {
+            ensure!(
+                self.evidence_legs.is_empty(),
+                "scenario evidence legs provided without ledger rows"
+            );
+        } else {
+            ensure!(
+                !self.evidence_legs.is_empty(),
+                "scenario ledger rows provided without evidence legs"
+            );
+            ensure!(
+                self.ledger_rows.len() == self.evidence_legs.len(),
+                "scenario evidence legs count does not match ledger rows"
             );
         }
 
@@ -962,6 +1008,24 @@ fn validate_identifier(label: &str, value: &str) -> Result<()> {
     Ok(())
 }
 
+fn validate_ledger_row(value: &str) -> Result<()> {
+    ensure!(!value.is_empty(), "ledger row is empty");
+    ensure!(value.len() <= 32, "ledger row is longer than 32 bytes: {value}");
+    let mut bytes = value.bytes();
+    let first = bytes.next().expect("non-empty ledger row");
+    ensure!(
+        first.is_ascii_uppercase(),
+        "ledger row must start with uppercase ASCII: {value}"
+    );
+    ensure!(
+        bytes.all(|byte| {
+            byte.is_ascii_uppercase() || byte.is_ascii_digit() || byte == b'-' || byte == b'_'
+        }),
+        "ledger row contains unsupported characters: {value}"
+    );
+    Ok(())
+}
+
 fn validate_non_empty(label: &str, value: &str) -> Result<()> {
     ensure!(!value.trim().is_empty(), "{label} is empty");
     ensure!(value.len() <= 1024, "{label} is longer than 1024 bytes");
@@ -1445,6 +1509,49 @@ mod tests {
             ReplayScenarioManifest::from_json(&wrong_primary_evidence.to_string()).is_err(),
             "oracle and real-client lanes must require their own evidence kind"
         );
+    }
+
+    #[test]
+    fn scenario_rejects_compact_manifest_with_rows_but_no_evidence_legs() {
+        let mut value = scenario_json();
+        value["ledger_rows"] = json!(["Q1", "Q2", "Q3"]);
+        assert!(
+            ReplayScenarioManifest::from_json(&value.to_string()).is_err(),
+            "scenario with ledger rows but no evidence legs must fail"
+        );
+    }
+
+    #[test]
+    fn scenario_rejects_compact_manifest_with_unknown_evidence_leg() {
+        let mut value = scenario_json();
+        value["ledger_rows"] = json!(["Q1"]);
+        value["evidence_legs"] = json!(["protocol-session", "unknown-leg"]);
+        assert!(
+            ReplayScenarioManifest::from_json(&value.to_string()).is_err(),
+            "scenario evidence legs must reference declared required gates"
+        );
+    }
+
+    #[test]
+    fn scenario_rejects_compact_manifest_with_row_leg_count_mismatch() {
+        let mut value = scenario_json();
+        value["ledger_rows"] = json!(["Q1", "Q2"]);
+        value["evidence_legs"] = json!(["protocol-session", "oracle-comparison", "real-client-observation"]);
+        assert!(
+            ReplayScenarioManifest::from_json(&value.to_string()).is_err(),
+            "scenario row and evidence leg counts must match"
+        );
+    }
+
+    #[test]
+    fn scenario_accepts_compact_manifest_with_rows_and_legs() {
+        let mut value = scenario_json();
+        value["ledger_rows"] = json!(["Q1", "Q2", "Q3"]);
+        value["evidence_legs"] =
+            json!(["protocol-session", "oracle-comparison", "real-client-observation"]);
+
+        ReplayScenarioManifest::from_json(&value.to_string())
+            .expect("compact scenario with compact ledger/evidence manifest");
     }
 
     #[test]

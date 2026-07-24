@@ -4,6 +4,7 @@ use mc_protocol::CodecError;
 use mc_protocol::codec::{ReadMc, WriteMc};
 use mc_protocol::packets::play::{
     LIVING_ENTITY_DATA_HEALTH_INDEX_26_1_2, MoveEntityPos, SetEntityMotion,
+    VILLAGER_ENTITY_DATA_INDEX,
 };
 
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -12,6 +13,23 @@ pub(in crate::play) enum ServerEntityWireMove {
     Rotation,
     PositionRotation { delta: Vec3 },
     Absolute { position: Vec3 },
+}
+
+fn villager_entity_data(data: mc_entity::VillagerData) -> EntityDataValue {
+    // Protocol ids come from the bundled 26.1.2 registries report.
+    let villager_type = match data.kind {
+        mc_entity::VillagerKind::Plains => 2,
+    };
+    let profession = match data.profession {
+        mc_entity::VillagerProfession::None => 0,
+        mc_entity::VillagerProfession::Toolsmith => 13,
+    };
+    EntityDataValue::VillagerData {
+        index: VILLAGER_ENTITY_DATA_INDEX,
+        villager_type,
+        profession,
+        level: i32::from(data.level),
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -279,7 +297,8 @@ where
                 count: stack.count,
                 damage: stack.damage,
                 enchantments: stack.enchantments.clone(),
-                custom_name: None,
+                custom_name: stack.custom_name.as_deref().cloned(),
+                item_model: stack.item_model.as_deref().cloned().map(Arc::new),
             },
         });
     }
@@ -307,6 +326,9 @@ where
                 value: wool.packed_metadata(),
             });
         }
+    }
+    if let Some(villager) = entity.villager {
+        values.push(villager_entity_data(villager));
     }
     if values.is_empty() {
         return Ok(());
@@ -339,7 +361,8 @@ where
                 count: stack.count,
                 damage: stack.damage,
                 enchantments: stack.enchantments.clone(),
-                custom_name: None,
+                custom_name: stack.custom_name.as_deref().cloned(),
+                item_model: stack.item_model.as_deref().cloned().map(Arc::new),
             },
         });
     }
@@ -354,6 +377,9 @@ where
                 value: wool.packed_metadata(),
             });
         }
+    }
+    if let Some(villager) = entity.villager {
+        values.push(villager_entity_data(villager));
     }
     if values.is_empty() {
         return Ok(());
@@ -637,6 +663,7 @@ mod tests {
             animal: Some(mc_entity::AnimalBreedingState::adult_sheep(
                 mc_entity::SheepColor::Brown,
             )),
+            villager: None,
         };
         let mut writer = Vec::new();
 

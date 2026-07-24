@@ -35,6 +35,18 @@ the embedded 26.1.2 ore passes. A validated plugin manifest may instead declare
 deterministic cross-chunk deposits. Conflicting declarations fail startup, and
 Lua receives no generator state or locks.
 
+The optional `plains_village_prototype` settlement profile is an independent
+startup-only plugin declaration. It loads one fountain, one small house, and
+one toolsmith directly from the local vanilla NBT sidecar, combines them with
+stable offsets, and consumes the extracted village spacing, separation, and
+salt. Seed zero uses a fixed near-spawn center; other seeds keep deterministic
+grassland placement. The settlement selection joins the persisted plugin
+worldgen profile fence. Lua receives no generator, chunk, lock, or worker
+handle. The bounded plan selects building parts and roles, inhabitants, jobs,
+and plugin-owned extension records. Vanilla villager jigsaw positions become
+persisted chunk markers; runtime installation routes them to the dedicated
+system-owned simulation command rather than ambient-herd admission.
+
 The revision-6 router replaced the revision-5 router instead of tuning it.
 `terrain::overworld::landforms` owns a new coordinate field: domain-warped
 continents establish shelves and land, erosion and uplands shape broad relief,
@@ -64,8 +76,8 @@ support.
 Generation remains stateless and coordinate-derived. Parallel generation of the
 same chunk or neighbouring chunks in any order produces identical output. Every
 new Solaris world persists `solaris/world.json` with schema, worldgen revision,
-seed, mode, ore profile, and geometry. A mismatched contract is rejected before
-Anvil open.
+seed, mode, ore profile, settlement profile, and geometry. A mismatched contract
+is rejected before Anvil open.
 An existing unversioned Anvil world is treated as a vanilla import and opens
 without Solaris fallback generation, so missing chunks cannot mix both terrain
 authorities. Existing worlds are never rewritten. The local playable profile
@@ -117,6 +129,8 @@ seed coverage or owner-approved visual parity.
 - exact active-tick `InhabitedTime` accumulation through an actual Anvil
   flush/reopen, including a chunk active for only part of a batch;
 - rejection of a changed persisted ore profile;
+- manifest admission, conflicts, sidecar requirement, exact extracted-template
+  loading, and deterministic block-for-block village regeneration;
 - order-independent ore placement;
 - geological deposits crossing chunk boundaries while default generation stays vanilla;
 - agent-run 26.1.2 MCP inspection with seed `918273645` and `tellus_like` mode

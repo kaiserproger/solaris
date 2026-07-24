@@ -101,7 +101,7 @@ pub(crate) async fn handle_connection(
                 .config
                 .command_permissions
                 .permissions_for(&profile, peer);
-            let configuration_custom_payloads = configuration::handle(
+            let configuration_outcome = configuration::handle(
                 &mut reader,
                 &mut writer,
                 &mut buf,
@@ -115,6 +115,11 @@ pub(crate) async fn handle_connection(
                         .extension
                         .as_ref()
                         .map(ExtensionEventSink::custom_payload_policy),
+                    loader_manifest: services
+                        .config
+                        .loader_manifest
+                        .as_deref()
+                        .filter(|manifest| !manifest.is_empty()),
                 },
             )
             .await?;
@@ -133,7 +138,8 @@ pub(crate) async fn handle_connection(
                 services.dirty_flush,
                 services.runtime_control,
                 services.simulation,
-                configuration_custom_payloads,
+                configuration_outcome.custom_payloads,
+                configuration_outcome.loader_session,
                 services.extension,
                 services.scripts,
                 services.script_zones,

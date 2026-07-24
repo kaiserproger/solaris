@@ -19,7 +19,7 @@ pub use chunk::{
     ChunkGenerator, ChunkGeometry, ChunkLightSourceToken, ChunkPos, FurnaceBlockEntity,
     FurnaceSlot, HEIGHTMAP_BITS, HEIGHTMAP_LEN, Heightmap, HopperBlockEntity, LIGHT_LAYER_BYTES,
     MAX_Y, MIN_SECTION_Y, MIN_Y, OVERWORLD_GEOMETRY, SECTION_COUNT, ScheduledBlockTick,
-    ScheduledFluidTick, SectionLight,
+    ScheduledFluidTick, SectionLight, SettlementInhabitantMarker,
 };
 pub use resident::{
     JournalStampResult, ResidentAppliedBlockEdit, ResidentBlockEdit, ResidentBlockEditBatchResult,

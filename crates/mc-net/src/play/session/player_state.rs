@@ -399,6 +399,8 @@ pub(super) fn apply_player_survival_plan_locked(
                     count: stack.count,
                     damage: stack.damage,
                     enchantments: stack.enchantments,
+                    custom_name: stack.custom_name.map(Box::new),
+                    item_model: stack.item_model.as_deref().cloned().map(Box::new),
                 });
             }
         }
@@ -408,6 +410,8 @@ pub(super) fn apply_player_survival_plan_locked(
                 count: carried_item.count,
                 damage: carried_item.damage,
                 enchantments: carried_item.enchantments.clone(),
+                custom_name: carried_item.custom_name.clone().map(Box::new),
+                item_model: carried_item.item_model.as_deref().cloned().map(Box::new),
             });
             carried_item = ItemStack::EMPTY;
         }

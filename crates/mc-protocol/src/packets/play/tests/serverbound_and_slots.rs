@@ -528,6 +528,26 @@ fn item_stack_custom_name_component_matches_26_1_2_component_stream_codec() {
 }
 
 #[test]
+fn item_stack_item_model_component_matches_26_1_2_registry_codec() {
+    let model = Identifier::parse("solaris_loader:loader_block").unwrap();
+    let stack = ItemStack::new(5, 1).with_item_model(model);
+    let mut buf = Vec::new();
+    stack.encode(&mut buf).unwrap();
+
+    assert_eq!(
+        buf,
+        vec![
+            0x01, 0x05, 0x01, 0x00, 0x0A, 0x1b, b's', b'o', b'l', b'a', b'r', b'i', b's', b'_',
+            b'l', b'o', b'a', b'd', b'e', b'r', b':', b'l', b'o', b'a', b'd', b'e', b'r', b'_',
+            b'b', b'l', b'o', b'c', b'k',
+        ]
+    );
+    let mut cur: &[u8] = &buf;
+    assert_eq!(ItemStack::decode(&mut cur).unwrap(), stack);
+    assert!(cur.is_empty());
+}
+
+#[test]
 fn item_stack_decoder_refuses_unsupported_component_patches() {
     // count=1, item_id=1, n_add=1, n_remove=0, unsupported component id=4.
     let bytes: Vec<u8> = vec![0x01, 0x01, 0x01, 0x00, 0x04];

@@ -86,6 +86,7 @@ const ENTITY_DATA_DIRECTION_SERIALIZER_ID: i32 = 12;
 const ENTITY_DATA_OPTIONAL_LIVING_ENTITY_REFERENCE_SERIALIZER_ID: i32 = 13;
 const ENTITY_DATA_BLOCK_STATE_SERIALIZER_ID: i32 = 14;
 const ENTITY_DATA_OPTIONAL_BLOCK_STATE_SERIALIZER_ID: i32 = 15;
+const ENTITY_DATA_VILLAGER_DATA_SERIALIZER_ID: i32 = 18;
 const ENTITY_DATA_OPTIONAL_UNSIGNED_INT_SERIALIZER_ID: i32 = 19;
 const ENTITY_DATA_HUMANOID_ARM_SERIALIZER_ID: i32 = 42;
 pub const ENTITY_DATA_SHARED_FLAGS_INDEX: u8 = 0;
@@ -96,6 +97,9 @@ pub const LIVING_ENTITY_DATA_FLAGS_INDEX: u8 = 8;
 pub const AGEABLE_ENTITY_DATA_BABY_INDEX: u8 = 16;
 /// `Sheep.DATA_WOOL_ID` on the bundled vanilla 26.1.2 server.
 pub const SHEEP_ENTITY_DATA_WOOL_INDEX: u8 = 18;
+/// `Villager.DATA_VILLAGER_DATA` after the 19 inherited accessors on the
+/// bundled vanilla 26.1.2 server.
+pub const VILLAGER_ENTITY_DATA_INDEX: u8 = 19;
 pub const LIVING_ENTITY_FLAG_USING_ITEM: i8 = 0x01;
 pub const LIVING_ENTITY_FLAG_OFF_HAND: i8 = 0x02;
 pub const ITEM_ENTITY_DATA_ITEM_INDEX: u8 = 8;
@@ -105,6 +109,9 @@ pub const DATA_COMPONENT_DAMAGE_ID: i32 = 3;
 /// uses the `Component` stream codec, which is network NBT for the supported
 /// literal text component shape.
 pub const DATA_COMPONENT_CUSTOM_NAME_ID: i32 = 6;
+/// `minecraft:item_model` in the local vanilla 26.1.2
+/// `minecraft:data_component_type` registry report.
+pub const DATA_COMPONENT_ITEM_MODEL_ID: i32 = 10;
 pub const DATA_COMPONENT_ENCHANTMENTS_ID: i32 = 13;
 
 fn write_long_array<B: BufMut>(buf: &mut B, longs: &[i64]) -> Result<(), CodecError> {
@@ -1779,8 +1786,8 @@ impl EntityDirection {
 
 /// Entity-data serializers implemented for 26.1.2.
 ///
-/// Supported serializer ids are 0-4, 7-15, 19, 20, and 42. Component,
-/// particle, villager/variant, global-position, vector, quaternion, and
+/// Supported serializer ids are 0-4, 7-15, 18-20, and 42. Component,
+/// particle, variant, global-position, vector, quaternion, and
 /// resolvable-profile serializers are rejected explicitly because this crate
 /// does not yet have faithful local value types for their payloads.
 #[derive(Debug, Clone)]
@@ -1842,6 +1849,12 @@ pub enum EntityDataValue {
         index: u8,
         value: Option<BlockStateId>,
     },
+    VillagerData {
+        index: u8,
+        villager_type: i32,
+        profession: i32,
+        level: i32,
+    },
     OptionalUnsignedInt {
         index: u8,
         value: Option<u32>,
@@ -1901,6 +1914,24 @@ impl PartialEq for EntityDataValue {
                 Self::OptionalBlockState { value: right, .. },
             ) => left == right,
             (
+                Self::VillagerData {
+                    villager_type: left_type,
+                    profession: left_profession,
+                    level: left_level,
+                    ..
+                },
+                Self::VillagerData {
+                    villager_type: right_type,
+                    profession: right_profession,
+                    level: right_level,
+                    ..
+                },
+            ) => {
+                left_type == right_type
+                    && left_profession == right_profession
+                    && left_level == right_level
+            }
+            (
                 Self::OptionalUnsignedInt { value: left, .. },
                 Self::OptionalUnsignedInt { value: right, .. },
             ) => left == right,
@@ -1945,6 +1976,7 @@ impl EntityDataValue {
             | Self::OptionalLivingEntityReference { index, .. }
             | Self::BlockState { index, .. }
             | Self::OptionalBlockState { index, .. }
+            | Self::VillagerData { index, .. }
             | Self::OptionalUnsignedInt { index, .. }
             | Self::Pose { index, .. }
             | Self::HumanoidArm { index, .. } => *index,
@@ -1970,6 +2002,7 @@ impl EntityDataValue {
             }
             Self::BlockState { .. } => ENTITY_DATA_BLOCK_STATE_SERIALIZER_ID,
             Self::OptionalBlockState { .. } => ENTITY_DATA_OPTIONAL_BLOCK_STATE_SERIALIZER_ID,
+            Self::VillagerData { .. } => ENTITY_DATA_VILLAGER_DATA_SERIALIZER_ID,
             Self::OptionalUnsignedInt { .. } => ENTITY_DATA_OPTIONAL_UNSIGNED_INT_SERIALIZER_ID,
             Self::Pose { .. } => ENTITY_DATA_POSE_SERIALIZER_ID,
             Self::HumanoidArm { .. } => ENTITY_DATA_HUMANOID_ARM_SERIALIZER_ID,
@@ -2018,6 +2051,16 @@ impl EntityDataValue {
                 }
                 Some(value) => buf.write_varint(value.0),
             },
+            Self::VillagerData {
+                villager_type,
+                profession,
+                level,
+                ..
+            } => {
+                buf.write_varint(*villager_type);
+                buf.write_varint(*profession);
+                buf.write_varint(*level);
+            }
             Self::OptionalUnsignedInt { value, .. } => match value {
                 None => buf.write_varint(0),
                 Some(value) => {
@@ -2117,6 +2160,12 @@ impl EntityDataValue {
                     value: (raw != 0).then_some(BlockStateId(raw)),
                 }
             }
+            ENTITY_DATA_VILLAGER_DATA_SERIALIZER_ID => Self::VillagerData {
+                index,
+                villager_type: buf.read_varint()?,
+                profession: buf.read_varint()?,
+                level: buf.read_varint()?,
+            },
             ENTITY_DATA_OPTIONAL_UNSIGNED_INT_SERIALIZER_ID => {
                 let raw = buf.read_varint()?;
                 if raw < 0 {
@@ -4394,6 +4443,8 @@ pub struct ItemStack {
     /// `minecraft:custom_name`, limited to the literal text-component shape
     /// used by Solaris script menus.
     pub custom_name: Option<String>,
+    /// `minecraft:item_model`, encoded as one namespaced resource identifier.
+    pub item_model: Option<std::sync::Arc<Identifier>>,
 }
 
 impl ItemStack {
@@ -4404,6 +4455,7 @@ impl ItemStack {
         damage: None,
         enchantments: Vec::new(),
         custom_name: None,
+        item_model: None,
     };
 
     #[must_use]
@@ -4419,6 +4471,7 @@ impl ItemStack {
             damage: None,
             enchantments: Vec::new(),
             custom_name: None,
+            item_model: None,
         }
     }
 
@@ -4444,6 +4497,12 @@ impl ItemStack {
         self
     }
 
+    #[must_use]
+    pub fn with_item_model(mut self, model: Identifier) -> Self {
+        self.item_model = Some(std::sync::Arc::new(model));
+        self
+    }
+
     pub fn encode<B: BufMut>(&self, buf: &mut B) -> Result<(), CodecError> {
         if self.is_empty() {
             buf.write_varint(0);
@@ -4453,6 +4512,7 @@ impl ItemStack {
         buf.write_varint(self.item_id as i32);
         let component_count = i32::from(self.damage.is_some())
             + i32::from(self.custom_name.is_some())
+            + i32::from(self.item_model.is_some())
             + i32::from(!self.enchantments.is_empty());
         buf.write_varint(component_count);
         buf.write_varint(0);
@@ -4463,6 +4523,10 @@ impl ItemStack {
         if let Some(custom_name) = &self.custom_name {
             buf.write_varint(DATA_COMPONENT_CUSTOM_NAME_ID);
             write_literal_text_component(buf, custom_name)?;
+        }
+        if let Some(item_model) = &self.item_model {
+            buf.write_varint(DATA_COMPONENT_ITEM_MODEL_ID);
+            buf.write_identifier(item_model)?;
         }
         if !self.enchantments.is_empty() {
             buf.write_varint(DATA_COMPONENT_ENCHANTMENTS_ID);
@@ -4493,13 +4557,14 @@ impl ItemStack {
         if n_add < 0 || n_remove < 0 {
             return Err(CodecError::NegativeLength(n_add.min(n_remove)));
         }
-        if n_add > 3 || n_remove != 0 {
+        if n_add > 4 || n_remove != 0 {
             return Err(CodecError::NotSupported(
                 "ItemStack with unsupported DataComponentPatch shape",
             ));
         }
         let mut damage = None;
         let mut custom_name = None;
+        let mut item_model = None;
         let mut enchantments = Vec::new();
         for _ in 0..n_add {
             let component_id = buf.read_varint()?;
@@ -4509,6 +4574,9 @@ impl ItemStack {
                 }
                 DATA_COMPONENT_CUSTOM_NAME_ID if custom_name.is_none() => {
                     custom_name = Some(read_literal_text_component(buf)?);
+                }
+                DATA_COMPONENT_ITEM_MODEL_ID if item_model.is_none() => {
+                    item_model = Some(std::sync::Arc::new(buf.read_identifier()?));
                 }
                 DATA_COMPONENT_ENCHANTMENTS_ID if enchantments.is_empty() => {
                     let count = read_count(buf, 256)?;
@@ -4549,6 +4617,7 @@ impl ItemStack {
             damage,
             enchantments,
             custom_name,
+            item_model,
         })
     }
 }

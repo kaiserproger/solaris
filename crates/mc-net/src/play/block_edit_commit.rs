@@ -227,7 +227,10 @@ where
                 })
         })
         .collect::<Vec<_>>();
-    send_block_deltas(writer, state.compression, &deltas).await
+    let projection = state
+        .sessions
+        .loader_block_projection(state.session_id, &state.blocks);
+    send_block_deltas(writer, state.compression, &deltas, projection.as_ref()).await
 }
 
 pub(super) async fn apply_visible_block_edit_batch_conditionally<W>(
@@ -310,7 +313,16 @@ where
     state
         .sessions
         .invalidate_prepared_chunks(&outcome.edit_chunks);
-    send_block_deltas(writer, state.compression, &outcome.deltas).await?;
+    let projection = state
+        .sessions
+        .loader_block_projection(state.session_id, &state.blocks);
+    send_block_deltas(
+        writer,
+        state.compression,
+        &outcome.deltas,
+        projection.as_ref(),
+    )
+    .await?;
     if broadcast_peer_blocks {
         broadcast_block_deltas(
             state,

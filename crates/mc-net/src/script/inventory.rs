@@ -1,5 +1,3 @@
-use mc_data::item_components::ItemFactsTable;
-use mc_data::items::ItemRegistry;
 use mc_script::{
     AdmittedScriptCommand, ScriptCommand, ScriptDtoError, ScriptPlayerInventoryFailure,
 };
@@ -28,8 +26,6 @@ impl PluginInventoryAdapter {
         &self,
         admitted: AdmittedScriptCommand,
         sessions: &SessionRegistry,
-        items: &ItemRegistry,
-        item_facts: &ItemFactsTable,
         runtime_available: bool,
     ) -> Result<(), InventoryAdapterError> {
         let ScriptCommand::PlayerInventoryTransaction { transaction } = admitted.request() else {
@@ -37,7 +33,8 @@ impl PluginInventoryAdapter {
         };
         let failure = if runtime_available {
             sessions
-                .commit_script_player_inventory_transaction(transaction, items, item_facts)
+                .route_script_player_inventory_transaction(transaction.clone())
+                .await
                 .err()
         } else {
             Some(ScriptPlayerInventoryFailure::RuntimeUnavailable)

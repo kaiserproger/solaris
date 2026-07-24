@@ -40,6 +40,7 @@ tempfile = "3"
 predicates = "3"
 bytes = { workspace = true }
 rsa = { workspace = true }
+sha2 = { workspace = true }
 tokio = { workspace = true }
 uuid = { workspace = true }
 mc-data = { path = "../mc-data" }

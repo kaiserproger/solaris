@@ -74,6 +74,25 @@ fn living_health_metadata_matches_the_local_26_1_2_decompile() {
 }
 
 #[test]
+fn villager_data_metadata_matches_the_local_26_1_2_javap_layout() {
+    let packet = ClientboundSetEntityData {
+        entity_id: 42,
+        values: vec![EntityDataValue::VillagerData {
+            index: 19,
+            villager_type: 2,
+            profession: 13,
+            level: 1,
+        }],
+    };
+
+    assert_eq!(encode(&packet), [0x2a, 0x13, 0x12, 0x02, 0x0d, 0x01, 0xff]);
+    assert_eq!(
+        decode_exact::<ClientboundSetEntityData>(&encode(&packet)),
+        packet
+    );
+}
+
+#[test]
 fn entity_data_supported_serializers_match_javap_layouts_and_round_trip() {
     let entity_reference = uuid::Uuid::from_bytes([
         0x00, 0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08, 0x09, 0x0A, 0x0B, 0x0C, 0x0D, 0x0E,
@@ -324,7 +343,7 @@ fn entity_data_rejects_reserved_indices_and_over_cap_collections() {
 
 #[test]
 fn entity_data_explicitly_rejects_unsupported_serializers() {
-    let unsupported = [5, 6, 16, 17, 18, 21, 34, 39, 40, 41, 43];
+    let unsupported = [5, 6, 16, 17, 21, 34, 39, 40, 41, 43];
     for serializer_id in unsupported {
         let mut encoded = vec![1, 0];
         encoded.write_varint(serializer_id);

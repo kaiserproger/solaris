@@ -13,11 +13,12 @@ workspace = true
 
 [features]
 default = []
-lua-runtime = ["dep:mlua", "dep:serde", "dep:toml", "dep:tracing"]
+lua-runtime = ["dep:mlua", "dep:serde", "dep:sha2", "dep:toml", "dep:tracing"]
 
 [dependencies]
 mlua = { workspace = true, optional = true }
 serde = { workspace = true, optional = true }
+sha2 = { workspace = true, optional = true }
 tokio = { workspace = true }
 toml = { workspace = true, optional = true }
 tracing = { workspace = true, optional = true }

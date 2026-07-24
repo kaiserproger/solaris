@@ -35,8 +35,10 @@ aes = { workspace = true }
 cfb8 = { workspace = true }
 rsa = { workspace = true }
 sha1 = { workspace = true }
+sha2 = { workspace = true }
 num-bigint = { workspace = true }
 reqwest = { workspace = true }
+zip = { workspace = true }
 
 [dev-dependencies]
 mc-entity = { path = "../mc-entity" }

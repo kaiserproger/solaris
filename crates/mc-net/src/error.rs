@@ -75,4 +75,7 @@ pub enum ConnectionError {
 
     #[error("full RegistryData payload index is missing {entry} from {registry}")]
     MissingRegistryPayload { registry: String, entry: String },
+
+    #[error("Solaris Loader handshake failed: {reason}")]
+    LoaderHandshake { reason: String },
 }

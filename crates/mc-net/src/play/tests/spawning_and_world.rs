@@ -1585,6 +1585,7 @@ fn simulation_tick_test_config(
             Vec::<String>::new(),
             true,
         ),
+        loader_manifest: None,
         shutdown: crate::server::ShutdownHandle::default(),
     }
 }
@@ -1823,6 +1824,7 @@ async fn random_ticks_ignore_ticketed_chunks_until_loaded() {
                 cpu: None,
                 light: config.block_light.as_ref(),
             },
+            None,
             0,
             1,
         )
@@ -1841,6 +1843,7 @@ async fn random_ticks_ignore_ticketed_chunks_until_loaded() {
                 cpu: None,
                 light: config.block_light.as_ref(),
             },
+            None,
             0,
             1,
         )
@@ -1857,11 +1860,146 @@ async fn random_ticks_ignore_ticketed_chunks_until_loaded() {
                 cpu: None,
                 light: config.block_light.as_ref(),
             },
+            None,
             0,
             2,
         )
         .await;
     assert_eq!(expanded.sampled, 2);
+}
+
+#[tokio::test]
+async fn random_tick_owner_keeps_protected_fuel_while_source_fire_ages() {
+    let reports = vec![
+        simple_block(0, "minecraft:air"),
+        BlockReport {
+            id: Identifier::parse("minecraft:fire").unwrap(),
+            properties: prop_schema(&[("age", &["0", "1"])]),
+            states: vec![
+                state(1, true, &[("age", "0")]),
+                state(2, false, &[("age", "1")]),
+            ],
+        },
+        simple_block(3, "minecraft:oak_log"),
+    ];
+    let blocks = Arc::new(BlockRegistry::from_report(&reports).unwrap());
+    let (policy, source) = (0..10_000)
+        .find_map(|seed| {
+            let policy = RandomTickPolicy {
+                simulation_distance: DEFAULT_VIEW_DISTANCE,
+                random_tick_speed: 1,
+                chunk_budget: 1,
+                fluid_tick_budget: 1,
+                save_interval_ticks: 20,
+                spawn_monsters: true,
+                seed,
+            };
+            let source = sample_random_tick_positions(policy, 0, &[(0, 0)])
+                .into_iter()
+                .find(|sample| {
+                    (64..80).contains(&sample.pos.y)
+                        && (1..15).contains(&sample.pos.x)
+                        && (1..15).contains(&sample.pos.z)
+                })?
+                .pos;
+            random_tick_candidate_seed(seed, 0, source, 0)
+                .is_multiple_of(3)
+                .then_some((policy, source))
+        })
+        .expect("bounded seed search finds an interior fire sample");
+    let fuel = mc_world::BlockPos {
+        x: source.x + 1,
+        ..source
+    };
+
+    let mut world = mc_world::WorldStorage::in_memory(Arc::clone(&blocks));
+    let chunk_pos = ChunkPos { x: 0, z: 0 };
+    world
+        .commit_chunk_snapshot(
+            chunk_pos,
+            Chunk::empty(
+                chunk_pos,
+                BlockStateId(0),
+                Identifier::parse("minecraft:plains").unwrap(),
+            ),
+        )
+        .unwrap();
+    world.set_block_at(source, BlockStateId(1)).unwrap();
+    world.set_block_at(fuel, BlockStateId(3)).unwrap();
+    let config = simulation_tick_test_config(
+        blocks,
+        world,
+        policy,
+        Arc::new(mc_data::block_facts::BlockFactsTable::from_blocks_report(
+            &reports,
+        )),
+    );
+
+    let sessions = SessionRegistry::new();
+    let (tx, _rx) = mpsc::channel(8);
+    let (session_id, _) = sessions.register(
+        &LoggedInProfile {
+            uuid: uuid::Uuid::nil(),
+            name: "tester".to_string(),
+        },
+        (0, 0),
+        0,
+        HashSet::from([(0, 0)]),
+        tx,
+        PlayerPose::new(0.5, DEFAULT_SPAWN_Y, 0.5),
+    );
+    let _ = sessions.mark_loaded(session_id, (0, 0));
+
+    let zone = mc_script::ScriptAxisAlignedZone::try_new_with_protection(
+        "claim",
+        "minecraft:overworld",
+        mc_script::ScriptPosition::try_new(
+            f64::from(fuel.x),
+            f64::from(fuel.y),
+            f64::from(fuel.z),
+        )
+        .unwrap(),
+        mc_script::ScriptPosition::try_new(
+            f64::from(fuel.x),
+            f64::from(fuel.y),
+            f64::from(fuel.z),
+        )
+        .unwrap(),
+        Some(
+            mc_script::ScriptZoneProtection::try_actor_or_operator(
+                "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa",
+            )
+            .unwrap(),
+        ),
+    )
+    .unwrap();
+    let protection = crate::script::ZoneProtectionSnapshot::from_zones(vec![zone]);
+    let shared_world = Arc::clone(config.world.as_ref().unwrap());
+    let world_read = shared_world.lock().await.read_view();
+    let world_mutation = shared_world.lock().await.mutation_view();
+    let (_simulation, owner) = simulation_channel();
+
+    let report = owner
+        .run_random_ticks_with_budget(
+            &config,
+            &sessions,
+            SimulationWorldAccess {
+                read: Some(&world_read),
+                mutation: Some(&world_mutation),
+                cpu: None,
+                light: config.block_light.as_ref(),
+            },
+            Some(&protection),
+            0,
+            1,
+        )
+        .await;
+
+    assert_eq!(report.eligible, 1);
+    assert_eq!(report.applied, 1);
+    let storage = shared_world.lock().await;
+    assert_eq!(storage.get_cached_block(source), Some(BlockStateId(2)));
+    assert_eq!(storage.get_cached_block(fuel), Some(BlockStateId(3)));
 }
 
 #[tokio::test]
@@ -1914,6 +2052,7 @@ async fn inert_random_tick_pass_does_not_wait_for_world_writer() {
             cpu: None,
             light: config.block_light.as_ref(),
         },
+        None,
         0,
         1,
     ));
@@ -2003,6 +2142,7 @@ async fn mutating_random_tick_planning_does_not_wait_for_world_writer() {
             cpu: Some(&resources),
             light: config.block_light.as_ref(),
         },
+        None,
         0,
         1,
     ));
@@ -2113,6 +2253,7 @@ async fn checkpoint_only_random_ticks_in_distinct_regions_do_not_wait_for_world_
             cpu: Some(&resources),
             light: config.block_light.as_ref(),
         },
+        None,
         0,
         2,
     ));
@@ -2186,6 +2327,7 @@ async fn resident_random_tick_uses_periodic_checkpoint_instead_of_per_tick_wal()
                 cpu: None,
                 light: config.block_light.as_ref(),
             },
+            None,
             0,
             1,
         )
@@ -2277,6 +2419,7 @@ async fn boundary_random_tick_coordinator_fallback_uses_periodic_checkpoint() {
                 cpu: None,
                 light: config.block_light.as_ref(),
             },
+            None,
             0,
             1,
         )
@@ -2512,6 +2655,7 @@ async fn random_leaf_decay_spawns_deterministic_natural_drop() {
                 cpu: None,
                 light: config.block_light.as_ref(),
             },
+            None,
             0,
             1,
         )

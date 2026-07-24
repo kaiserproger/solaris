@@ -3,6 +3,7 @@ use super::{
     SimulationCommand, SimulationHandle, SimulationOutcome, SimulationOwner,
     SimulationRequestError, command_is_background, command_orders_earlier_herds,
 };
+use crate::play::SettlementInhabitantSpawn;
 use crate::play::session::ScriptPlayerTeleportCompletion;
 use mc_script::ScriptPlayerTeleportFailure;
 use std::collections::{HashMap, VecDeque};
@@ -475,6 +476,14 @@ impl SimulationHandle {
             .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(result);
         claim.completed.notify_all();
         result
+    }
+
+    pub(in super::super) fn ensure_settlement_inhabitants(
+        &self,
+        chunk: (i32, i32),
+        spawns: Vec<SettlementInhabitantSpawn>,
+    ) -> Result<(), SimulationRequestError> {
+        self.enqueue_detached(SimulationCommand::EnsureSettlementInhabitants { chunk, spawns })
     }
 
     pub(crate) fn snapshot(&self) -> super::SimulationQueueSnapshot {

@@ -287,6 +287,7 @@ pub(in crate::play) fn server_entity_snapshot_from(entity: EntitySnapshot) -> Se
         experience_value: entity.experience_value,
         block_state: entity.block_state,
         animal: entity.animal,
+        villager: entity.retained.villager,
     }
 }
 

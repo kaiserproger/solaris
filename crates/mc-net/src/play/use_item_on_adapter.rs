@@ -50,10 +50,10 @@ use super::{
     SIGN_BLOCK_ENTITY_TYPE_ID, ScriptGameplayEventPublisher, air_state_id, block_break_loot_seed,
     clear_shield_use, hand_inventory_slot, interact_with_bed, interact_with_toggle_block,
     open_chest_container, open_crafting_table_container, open_enchanting_table_container,
-    open_furnace_container, open_stonecutter_container, published_block_precondition,
-    reject_unsupported_survival_station_use, schedule_fluid_ticks_for_interaction, splitmix64,
-    start_falling_blocks_after_edits, write_block_ack, write_block_resync_then_ack,
-    write_inventory_slot_updates,
+    open_furnace_container, open_stonecutter_container, outbound_block_state_id,
+    published_block_precondition, reject_unsupported_survival_station_use,
+    schedule_fluid_ticks_for_interaction, splitmix64, start_falling_blocks_after_edits,
+    write_block_ack, write_block_resync_then_ack, write_inventory_slot_updates,
 };
 
 #[cfg(test)]
@@ -1014,13 +1014,27 @@ where
         let Some(clicked_token) = snapshot.block_mutation_token(clicked_pos) else {
             break 'placement Err(UseItemOnNoOpReason::ClickedCellUnavailable);
         };
-        let Some(placed_state) = state.item_to_block.resolve_for_use_on(
-            &state.items,
-            held.item_id,
-            clicked,
-            action.direction,
-            &state.blocks,
-        ) else {
+        let is_loader_item = held
+            .item_model
+            .as_deref()
+            .is_some_and(crate::loader::is_loader_block_item_model);
+        let placed_state = if is_loader_item {
+            state.sessions.loader_item_placement_state(
+                state.session_id,
+                &held,
+                &state.items,
+                &state.blocks,
+            )
+        } else {
+            state.item_to_block.resolve_for_use_on(
+                &state.items,
+                held.item_id,
+                clicked,
+                action.direction,
+                &state.blocks,
+            )
+        };
+        let Some(placed_state) = placed_state else {
             break 'placement Ok(None);
         };
         let target_pos = if same_slab_can_replace(
@@ -1293,7 +1307,7 @@ where
                 .get_cached_block(pos)
                 .map(|state_id| BlockUpdate {
                     position: pack_block_pos(pos.x, pos.y, pos.z),
-                    state_id: state_id.0 as i32,
+                    state_id: outbound_block_state_id(state, state_id),
                 })
         })
         .collect::<Vec<_>>();

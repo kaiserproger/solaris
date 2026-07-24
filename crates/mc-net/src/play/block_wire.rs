@@ -23,6 +23,7 @@ pub(super) async fn send_block_deltas<W>(
     writer: &mut W,
     compression: Compression,
     deltas: &[BlockDelta],
+    projection: Option<&crate::loader::LoaderBlockProjection>,
 ) -> Result<(), ConnectionError>
 where
     W: AsyncWriteExt + Unpin,
@@ -30,13 +31,14 @@ where
     for packet in plan_block_delta_packets(deltas) {
         match packet {
             BlockDeltaPacket::Single(delta) => {
+                let state_id = projection.map_or(delta.state_id, |p| p.project(delta.state_id));
                 write_packet(
                     writer,
                     &BlockUpdate {
                         position: mc_protocol::packets::play::pack_block_pos(
                             delta.x, delta.y, delta.z,
                         ),
-                        state_id: delta.state_id.0 as i32,
+                        state_id: state_id.0 as i32,
                     },
                     compression,
                 )
@@ -56,7 +58,9 @@ where
                             .into_iter()
                             .map(|delta| SectionBlockChange {
                                 relative_pos: pack_section_relative_pos(delta.x, delta.y, delta.z),
-                                state_id: delta.state_id.0 as i32,
+                                state_id: projection
+                                    .map_or(delta.state_id, |p| p.project(delta.state_id))
+                                    .0 as i32,
                             })
                             .collect(),
                     },
@@ -218,4 +222,39 @@ pub(super) fn plan_block_delta_packets(deltas: &[BlockDelta]) -> Vec<BlockDeltaP
         }
     }
     packets
+}
+
+#[cfg(test)]
+mod loader_projection_tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn block_update_projects_server_owned_state_to_session_carrier() {
+        let projection = crate::loader::LoaderBlockProjection::for_test(900, 321);
+        let (mut client, mut server) = tokio::io::duplex(256);
+
+        send_block_deltas(
+            &mut server,
+            Compression::Disabled,
+            &[BlockDelta {
+                x: 1,
+                y: 64,
+                z: 2,
+                state_id: mc_world::BlockStateId(900),
+            }],
+            Some(&projection),
+        )
+        .await
+        .unwrap();
+        drop(server);
+
+        let mut bytes = BytesMut::new();
+        client.read_buf(&mut bytes).await.unwrap();
+        let frame = mc_protocol::frame::try_decode_frame(&mut bytes, Compression::Disabled)
+            .unwrap()
+            .unwrap();
+        assert_eq!(frame.id, BlockUpdate::ID);
+        let packet = BlockUpdate::decode(&mut frame.body.clone()).unwrap();
+        assert_eq!(packet.state_id, 321);
+    }
 }

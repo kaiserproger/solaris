@@ -137,6 +137,10 @@ pub struct EntityItemStack {
     pub count: i32,
     pub damage: Option<i32>,
     pub enchantments: Vec<mc_data::ItemEnchantment>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub custom_name: Option<Box<String>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub item_model: Option<Box<mc_data::Identifier>>,
 }
 
 impl EntityItemStack {
@@ -147,6 +151,8 @@ impl EntityItemStack {
             count,
             damage: None,
             enchantments: Vec::new(),
+            custom_name: None,
+            item_model: None,
         }
     }
 
@@ -163,6 +169,18 @@ impl EntityItemStack {
             .push(mc_data::ItemEnchantment { id, level });
         self.enchantments
             .sort_unstable_by(|left, right| left.id.cmp(&right.id));
+        self
+    }
+
+    #[must_use]
+    pub fn with_custom_name(mut self, name: impl Into<String>) -> Self {
+        self.custom_name = Some(Box::new(name.into()));
+        self
+    }
+
+    #[must_use]
+    pub fn with_item_model(mut self, model: mc_data::Identifier) -> Self {
+        self.item_model = Some(Box::new(model));
         self
     }
 
@@ -429,6 +447,37 @@ pub struct EntityRetainedState {
     pub item_pickup_ready_tick: Option<u64>,
     pub item_pickup_owner_block: Option<EntityItemPickupOwnerBlock>,
     pub primed_tnt: Option<EntityPrimedTntState>,
+    #[serde(default)]
+    pub villager: Option<VillagerData>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct VillagerData {
+    pub kind: VillagerKind,
+    pub profession: VillagerProfession,
+    pub level: u8,
+}
+
+impl VillagerData {
+    #[must_use]
+    pub fn new(kind: VillagerKind, profession: VillagerProfession, level: u8) -> Self {
+        Self {
+            kind,
+            profession,
+            level: level.clamp(1, 5),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum VillagerKind {
+    Plains,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum VillagerProfession {
+    None,
+    Toolsmith,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Default, Serialize, Deserialize)]

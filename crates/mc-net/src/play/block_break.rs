@@ -219,6 +219,12 @@ where
                 .name_of(held.item_id)
                 .and_then(|item| max_tool_damage_for_path(item.path()))
         };
+        let loader_block_drop = state.sessions.loader_block_drop_stack(
+            state.session_id,
+            expected_target.state,
+            &state.items,
+            &state.blocks,
+        );
         let committed = match state
             .simulation
             .commit_survival_block_break(SurvivalBlockBreakPlan {
@@ -232,6 +238,7 @@ where
                 loot: Arc::clone(&state.loot),
                 item_entity_type_id: item_entity_type_id(&state.entity_types),
                 falling_block_entity_type_id: falling_block_entity_type_id(&state.entity_types),
+                loader_block_drop,
                 held: SurvivalBreakHeldItem {
                     hotbar_slot: state.selected_hotbar_slot,
                     expected: held,
@@ -485,17 +492,34 @@ pub(super) fn plan_survival_break_drops(
                 precondition.expected_state,
                 precondition.expected_token,
             );
-            survival::block_drop_stacks_with_tool_and_facts_from_seeded(
-                &request.loot,
-                &request.items,
-                &request.item_facts,
-                &request.blocks,
-                precondition.expected_state,
-                held_item,
-                loot_seed,
-            )
-            .into_iter()
-            .map(move |drop| SurvivalBreakDrop {
+            let drops = if edit.pos == request.position {
+                request
+                    .loader_block_drop
+                    .clone()
+                    .map(|drop| vec![drop])
+                    .unwrap_or_else(|| {
+                        survival::block_drop_stacks_with_tool_and_facts_from_seeded(
+                            &request.loot,
+                            &request.items,
+                            &request.item_facts,
+                            &request.blocks,
+                            precondition.expected_state,
+                            held_item,
+                            loot_seed,
+                        )
+                    })
+            } else {
+                survival::block_drop_stacks_with_tool_and_facts_from_seeded(
+                    &request.loot,
+                    &request.items,
+                    &request.item_facts,
+                    &request.blocks,
+                    precondition.expected_state,
+                    held_item,
+                    loot_seed,
+                )
+            };
+            drops.into_iter().map(move |drop| SurvivalBreakDrop {
                 entity_type_id,
                 position: Vec3::new(
                     f64::from(edit.pos.x) + 0.5,

@@ -11,7 +11,8 @@ pub mod structures;
 pub mod terrain;
 
 pub use structures::{
-    StructureError, StructureRules, StructureTemplate, TemplateBlock, TemplateChest,
+    PlainsVillagePrototypePart, StructureError, StructureInhabitant, StructureRules,
+    StructureTemplate, TemplateBlock, TemplateChest,
 };
 pub use terrain::{
     BiomeRules, BiomeScope, OreRule, OreRules, OreRulesError, OreSpacing, TellusWorldgenSettings,

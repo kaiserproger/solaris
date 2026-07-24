@@ -344,6 +344,9 @@ pub struct ServerConfig {
     pub chunk_pipeline: ChunkPipelinePolicy,
     pub random_tick: play::RandomTickPolicy,
     pub command_permissions: CommandPermissionConfig,
+    /// Required Solaris Loader bundles negotiated during Configuration.
+    /// `None` leaves vanilla clients on the existing handshake.
+    pub loader_manifest: Option<Arc<crate::LoaderManifest>>,
     pub shutdown: ShutdownHandle,
 }
 
@@ -1507,6 +1510,15 @@ impl BoundServer {
                 }
 
                 let started = Instant::now();
+                let ambient_protection = entity_script_zones.as_ref().map(|zones| {
+                    zones.protection_snapshot().unwrap_or_else(|error| {
+                        warn!(
+                            ?error,
+                            "zone protection snapshot unavailable; denying ambient block mutation"
+                        );
+                        crate::script::ZoneProtectionSnapshot::unavailable()
+                    })
+                });
                 let random_tick = simulation_owner
                     .run_random_ticks_with_budget(
                         &entity_config,
@@ -1517,6 +1529,7 @@ impl BoundServer {
                             cpu: Some(&entity_chunk_pipeline_resources),
                             light: entity_config.block_light.as_ref(),
                         },
+                        ambient_protection.as_ref(),
                         tick,
                         work_budgets.random_tick_chunks,
                     )
@@ -1538,6 +1551,7 @@ impl BoundServer {
                             Arc::clone(&entity_sessions),
                             entity_world_read.clone(),
                             entity_world_mutation.clone(),
+                            ambient_protection.map(Arc::new),
                             entity_chunk_pipeline_resources.clone(),
                         );
                         let (result, mid_tick_commands) =
@@ -3323,6 +3337,7 @@ struct CompletedScheduledBlockTicks {
     elapsed_us: u64,
 }
 
+#[allow(clippy::too_many_arguments)]
 fn spawn_scheduled_block_tick_job(
     tick: u64,
     budget: usize,
@@ -3330,6 +3345,7 @@ fn spawn_scheduled_block_tick_job(
     sessions: Arc<play::SessionRegistry>,
     world_read: Option<mc_world::WorldReadView>,
     world_mutation: Option<mc_world::WorldMutationView>,
+    protection: Option<Arc<crate::script::ZoneProtectionSnapshot>>,
     cpu_resources: ChunkPipelineResources,
 ) -> tokio::task::JoinHandle<CompletedScheduledBlockTicks> {
     let prepare_task = cpu_resources.begin_prepare_task();
@@ -3345,6 +3361,7 @@ fn spawn_scheduled_block_tick_job(
                 cpu: Some(&cpu_resources),
                 light: config.block_light.as_ref(),
             },
+            protection,
             tick,
             budget,
         )
@@ -5226,6 +5243,7 @@ mod tests {
             chunk_pipeline: ChunkPipelinePolicy::default(),
             random_tick: play::RandomTickPolicy::default(),
             command_permissions: CommandPermissionConfig::new(Vec::<String>::new(), false),
+            loader_manifest: None,
             shutdown: ShutdownHandle::default(),
         };
         let (simulation, _owner) = play::simulation_channel();
@@ -5258,6 +5276,7 @@ mod tests {
             chunk_pipeline: ChunkPipelinePolicy::default(),
             random_tick: play::RandomTickPolicy::default(),
             command_permissions: CommandPermissionConfig::new(Vec::<String>::new(), false),
+            loader_manifest: None,
             shutdown: ShutdownHandle::default(),
         };
         let sessions = play::SessionRegistry::new();
@@ -5884,6 +5903,7 @@ end
                 cpu: Some(&resources),
                 light: config.block_light.as_ref(),
             },
+            None,
             9,
             256,
         )
@@ -5900,6 +5920,7 @@ end
             Arc::clone(&sessions),
             Some(world_read.clone()),
             Some(world_mutation.clone()),
+            None,
             resources.clone(),
         );
 
@@ -7040,6 +7061,7 @@ end
             chunk_pipeline: ChunkPipelinePolicy::default(),
             random_tick: play::RandomTickPolicy::default(),
             command_permissions: CommandPermissionConfig::new(Vec::<String>::new(), false),
+            loader_manifest: None,
             shutdown: ShutdownHandle::default(),
         };
 
@@ -7086,6 +7108,7 @@ end
             },
             random_tick: play::RandomTickPolicy::default(),
             command_permissions: CommandPermissionConfig::new(Vec::<String>::new(), false),
+            loader_manifest: None,
             shutdown: shutdown.clone(),
         };
 
@@ -7325,6 +7348,7 @@ end
             },
             random_tick: play::RandomTickPolicy::default(),
             command_permissions: CommandPermissionConfig::new(Vec::<String>::new(), false),
+            loader_manifest: None,
             shutdown: shutdown.clone(),
         };
 
@@ -7964,6 +7988,7 @@ end
             chunk_pipeline: ChunkPipelinePolicy::default(),
             random_tick: play::RandomTickPolicy::default(),
             command_permissions: CommandPermissionConfig::new(Vec::<String>::new(), true),
+            loader_manifest: None,
             shutdown: ShutdownHandle::default(),
         }
     }

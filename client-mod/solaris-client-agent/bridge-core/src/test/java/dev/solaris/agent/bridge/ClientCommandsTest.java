@@ -930,6 +930,82 @@ final class ClientCommandsTest {
     }
 
     @Test
+    void confirmationButtonRequiresExactBoundedIdentityAndRunsOnClientThread() throws Exception {
+        ImmediateExecutor executor = new ImmediateExecutor();
+        FakeClient client = new FakeClient();
+        BridgeCommand command = ClientCommands.create(executor, client)
+            .find("click_confirmation_button")
+            .orElseThrow();
+
+        assertEquals(
+            "ok",
+            command.execute(request(
+                "click_confirmation_button",
+                """
+                {
+                  "expected_title": "Allow Solaris content from 127.0.0.1:25567?",
+                  "button_label": "Allow"
+                }
+                """
+            )).get("status").getAsString()
+        );
+        assertEquals(
+            "Allow Solaris content from 127.0.0.1:25567?",
+            client.confirmationTitle
+        );
+        assertEquals("Allow", client.confirmationButtonLabel);
+        assertEquals(1, executor.calls);
+
+        assertThrows(
+            IllegalArgumentException.class,
+            () -> command.execute(request(
+                "click_confirmation_button",
+                "{\"expected_title\":\"title\"}"
+            ))
+        );
+        assertEquals(1, executor.calls);
+    }
+
+    @Test
+    void screenButtonRequiresExactBoundedIdentityAndRunsOnClientThread() throws Exception {
+        ImmediateExecutor executor = new ImmediateExecutor();
+        FakeClient client = new FakeClient();
+        BridgeCommand command = ClientCommands.create(executor, client)
+            .find("click_screen_button")
+            .orElseThrow();
+
+        assertEquals(
+            "ok",
+            command.execute(request(
+                "click_screen_button",
+                """
+                {
+                  "expected_screen_class": "dev.solaris.loader.fabric.LoaderTextScreen",
+                  "expected_title": "Ruby Loader Fixture",
+                  "button_label": "Confirm Ruby"
+                }
+                """
+            )).get("status").getAsString()
+        );
+        assertEquals(
+            "dev.solaris.loader.fabric.LoaderTextScreen",
+            client.expectedScreenClass
+        );
+        assertEquals("Ruby Loader Fixture", client.expectedScreenTitle);
+        assertEquals("Confirm Ruby", client.screenButtonLabel);
+        assertEquals(1, executor.calls);
+
+        assertThrows(
+            IllegalArgumentException.class,
+            () -> command.execute(request(
+                "click_screen_button",
+                "{\"expected_screen_class\":\"screen\",\"expected_title\":\"title\"}"
+            ))
+        );
+        assertEquals(1, executor.calls);
+    }
+
+    @Test
     void openInventoryRunsOnClientThread() throws Exception {
         ImmediateExecutor executor = new ImmediateExecutor();
         FakeClient client = new FakeClient();
@@ -993,27 +1069,27 @@ final class ClientCommandsTest {
             "click_container_button",
             "{\"button_id\":2,\"timeout_seconds\":9.0}"
         ));
-
         JsonObject waited = registry.find("wait_for_container_slot").orElseThrow().execute(request(
             "wait_for_container_slot",
             "{\"slot\":2,\"item_id\":\"minecraft:cooked_porkchop\",\"count\":1,\"timeout_seconds\":12.0}"
         ));
+
         assertTrue(quickMove.get("confirmed").getAsBoolean());
         assertTrue(click.get("confirmed").getAsBoolean());
         assertTrue(button.get("confirmed").getAsBoolean());
-        assertEquals(37, client.quickMovedContainerSlot);
         assertTrue(waited.get("matched").getAsBoolean());
+        assertEquals(37, client.quickMovedContainerSlot);
         assertEquals(Duration.ofSeconds(8), client.quickMoveContainerTimeout);
         assertEquals(3, client.clickedContainerSlot);
         assertEquals("secondary", client.containerSlotButton);
         assertEquals(Duration.ofSeconds(7), client.containerSlotTimeout);
         assertEquals(2, client.clickedContainerButton);
         assertEquals(Duration.ofSeconds(9), client.containerButtonTimeout);
-        assertEquals(0, executor.calls, "facade owns the packet-event wait");
         assertEquals(2, client.waitedContainerSlot);
         assertEquals("minecraft:cooked_porkchop", client.waitedContainerItemId);
         assertEquals(1, client.waitedContainerCount);
         assertEquals(Duration.ofSeconds(12), client.waitedContainerTimeout);
+        assertEquals(0, executor.calls, "facade owns the packet-event wait");
 
         assertThrows(IllegalArgumentException.class, () ->
             registry.find("quick_move_container_slot").orElseThrow().execute(request(
@@ -1045,13 +1121,13 @@ final class ClientCommandsTest {
                 "{\"button_id\":-1}"
             ))
         );
-    }
         assertThrows(IllegalArgumentException.class, () ->
             registry.find("wait_for_container_slot").orElseThrow().execute(request(
                 "wait_for_container_slot",
                 "{\"slot\":0,\"item_id\":\"minecraft:stone\",\"count\":0}"
             ))
         );
+    }
 
     private static BridgeRequest request(String command, String payload) {
         return BridgeCodec.decodeRequest(
@@ -1096,6 +1172,11 @@ final class ClientCommandsTest {
         int lookYawDeg;
         int lookPitchDeg;
         int closeScreenCalls;
+        String confirmationTitle;
+        String confirmationButtonLabel;
+        String expectedScreenClass;
+        String expectedScreenTitle;
+        String screenButtonLabel;
         int openInventoryCalls;
         List<Integer> readBlockPosition;
         List<Integer> scanArguments;
@@ -1124,11 +1205,11 @@ final class ClientCommandsTest {
         int droppedCount;
         Duration dropTimeout;
         int quickMovedContainerSlot = -1;
-        Duration quickMoveContainerTimeout;
         int waitedContainerSlot = -1;
         String waitedContainerItemId;
         int waitedContainerCount;
         Duration waitedContainerTimeout;
+        Duration quickMoveContainerTimeout;
         int clickedContainerSlot = -1;
         String containerSlotButton;
         Duration containerSlotTimeout;
@@ -1437,16 +1518,6 @@ final class ClientCommandsTest {
         }
 
         @Override
-        public JsonObject clickContainerSlot(int slot, String button, Duration timeout) {
-            clickedContainerSlot = slot;
-            containerSlotButton = button;
-            containerSlotTimeout = timeout;
-            JsonObject result = new JsonObject();
-            result.addProperty("confirmed", true);
-            return result;
-        }
-
-        @Override
         public JsonObject waitForContainerSlot(
             int slot,
             String itemId,
@@ -1459,6 +1530,16 @@ final class ClientCommandsTest {
             waitedContainerTimeout = timeout;
             JsonObject result = new JsonObject();
             result.addProperty("matched", true);
+            return result;
+        }
+
+        @Override
+        public JsonObject clickContainerSlot(int slot, String button, Duration timeout) {
+            clickedContainerSlot = slot;
+            containerSlotButton = button;
+            containerSlotTimeout = timeout;
+            JsonObject result = new JsonObject();
+            result.addProperty("confirmed", true);
             return result;
         }
 
@@ -1563,6 +1644,23 @@ final class ClientCommandsTest {
         @Override
         public void closeCurrentScreen() {
             closeScreenCalls += 1;
+        }
+
+        @Override
+        public void clickConfirmationButton(String expectedTitle, String buttonLabel) {
+            confirmationTitle = expectedTitle;
+            confirmationButtonLabel = buttonLabel;
+        }
+
+        @Override
+        public void clickScreenButton(
+            String expectedScreenClass,
+            String expectedTitle,
+            String buttonLabel
+        ) {
+            this.expectedScreenClass = expectedScreenClass;
+            expectedScreenTitle = expectedTitle;
+            screenButtonLabel = buttonLabel;
         }
 
         @Override
