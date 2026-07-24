@@ -80,7 +80,7 @@ Snapshot basis: **2026-07-24 Repomix snapshot**. Coordinator owns this file; wor
 - [x] [`T00-02` — Снять честный Cargo/Gradle baseline и список реально красных гейтов](tasks/T00-02.md) — **P0**, rows `—`, deps `T00-01`, locks `VALIDATION`
 - [x] [`T00-03` — Собрать актуальную матрицу real-client сценариев и артефактов](tasks/T00-03.md) — **P0**, rows `Q2`, deps `T00-01`, locks `CLIENT-JAVA,RUNNER`
 - [x] [`T00-04` — Собрать актуальную матрицу vanilla oracle/replay](tasks/T00-04.md) — **P0**, rows `Q1,Q3`, deps `T00-01`, locks `ORACLE,RUST-HARNESS`
-- [ ] [`T00-05` — Собрать текущую performance/concurrency базу и пробелы](tasks/T00-05.md) — **P0**, rows `O1,O2,O3`, deps `T00-01`, locks `PERF`
+- [x] [`T00-05` — Собрать текущую performance/concurrency базу и пробелы](tasks/T00-05.md) — **P0**, rows `O1,O2,O3`, deps `T00-01`, locks `PERF`
 - [ ] [`T00-06` — Свернуть противоречивые/stale документы в один migration report](tasks/T00-06.md) — **P0**, rows `—`, deps `T00-01,T00-03,T00-04,T00-05`, locks `COORD-DOCS`
 
 ### W01 — Evidence laboratory: real-client/oracle/replay
