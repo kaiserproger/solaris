@@ -2079,6 +2079,13 @@ fn agent_driver_reports_structured_bridge_error_body() {
 fn agent_driver_coordinates_two_client_shared_chest_across_restart_phases() {
     let repo_root = repo_root();
     let run_dir = tempfile::tempdir().expect("create run dir");
+    std::fs::write(
+        run_dir
+            .path()
+            .join("playable-31-shared-chest-marker.properties"),
+        "x=1\ny=65\nz=1\nface=up\nitem=minecraft:oak_planks\ncount=1\n",
+    )
+    .expect("write P45 shared chest marker");
     let primary = FakeBridge::start_with_options(
         14,
         vec![wait_play_payload(true), wait_play_payload(false)],
@@ -2211,6 +2218,196 @@ fn agent_driver_coordinates_two_client_shared_chest_across_restart_phases() {
     assert_eq!(
         observations["scenarios"][1]["id"],
         "playable-45-two-client-shared-chest-save-restart-after"
+    );
+    assert_eq!(
+        observations["scenarios"][1]["agent_report"]["restart_invariant_validation"]["status"],
+        "passed"
+    );
+    assert_eq!(
+        observations["scenarios"][1]["agent_report"]["restart_invariant_validation"]["checks"]
+            .as_array()
+            .expect("restart invariant checks array")
+            .len(),
+        6
+    );
+
+    let snapshot: Value = serde_json::from_slice(
+        &std::fs::read(run_dir.path().join("restart-invariants.json"))
+            .expect("restart invariant snapshot exists"),
+    )
+    .expect("restart invariant snapshot is valid JSON");
+    assert_eq!(snapshot["schema"], "solaris.restart_invariants.v1");
+    assert_eq!(
+        snapshot["producer_scenario"],
+        "playable-45-two-client-shared-chest-save-restart-before"
+    );
+    let invariants = snapshot["invariants"]
+        .as_array()
+        .expect("restart invariants array");
+    assert_eq!(invariants.len(), 6);
+    let categories: std::collections::BTreeSet<_> = invariants
+        .iter()
+        .map(|invariant| invariant["category"].as_str().expect("invariant category"))
+        .collect();
+    assert_eq!(
+        categories,
+        std::collections::BTreeSet::from(["container", "entity", "inventory", "player", "world",])
+    );
+}
+
+#[test]
+fn agent_driver_rejects_restart_snapshot_missing_typed_field_before_bridge_calls() {
+    let repo_root = repo_root();
+    let run_dir = tempfile::tempdir().expect("create run dir");
+    std::fs::write(
+        run_dir
+            .path()
+            .join("playable-31-shared-chest-marker.properties"),
+        "x=1\ny=65\nz=1\nface=up\nitem=minecraft:oak_planks\ncount=1\n",
+    )
+    .expect("write P45 marker");
+    std::fs::write(
+        run_dir.path().join("restart-invariants.json"),
+        serde_json::to_vec_pretty(&json!({
+            "schema": "solaris.restart_invariants.v1",
+            "producer_scenario": "playable-45-two-client-shared-chest-save-restart-before",
+            "created_at": "2026-07-24T00:00:00Z",
+            "invariants": [{
+                "id": "player.primary.dimension",
+                "type": "string",
+                "mode": "stable",
+                "before": "minecraft:overworld",
+                "expected_after": "minecraft:overworld"
+            }]
+        }))
+        .expect("serialize malformed restart snapshot"),
+    )
+    .expect("write malformed restart snapshot");
+    let primary_port = reserve_then_release_port();
+    let secondary_port = reserve_then_release_port();
+
+    let output = Command::new("python3")
+        .arg(repo_root.join("tools/real-client-agent-driver.py"))
+        .arg("--bridge-url")
+        .arg(format!("http://127.0.0.1:{primary_port}/rpc"))
+        .arg("--secret")
+        .arg("primary-secret")
+        .arg("--secondary-bridge-url")
+        .arg(format!("http://127.0.0.1:{secondary_port}/rpc"))
+        .arg("--secondary-secret")
+        .arg("secondary-secret")
+        .arg("--run-dir")
+        .arg(run_dir.path())
+        .arg("--scenario")
+        .arg("playable-45-two-client-shared-chest-save-restart-after")
+        .arg("--server-addr")
+        .arg("127.0.0.1:25565")
+        .arg("--timeout-seconds")
+        .arg("1")
+        .arg("--append-observations")
+        .output()
+        .expect("run malformed restart snapshot phase");
+
+    assert!(!output.status.success());
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("invalid restart invariant snapshot") && stderr.contains("category"),
+        "missing typed field must fail before bridge calls: {stderr}"
+    );
+    let observations: Value = serde_json::from_slice(
+        &std::fs::read(run_dir.path().join("observations.json"))
+            .expect("failed observations exist"),
+    )
+    .expect("failed observations parse");
+    assert_eq!(observations["result"], "failed");
+}
+
+#[test]
+fn agent_driver_rejects_restart_marker_drift_across_phases() {
+    let repo_root = repo_root();
+    let run_dir = tempfile::tempdir().expect("create run dir");
+    let marker_path = run_dir
+        .path()
+        .join("playable-31-shared-chest-marker.properties");
+    std::fs::write(
+        &marker_path,
+        "x=1\ny=65\nz=1\nface=up\nitem=minecraft:oak_planks\ncount=1\n",
+    )
+    .expect("write original P45 marker");
+    let primary = FakeBridge::start_with_options(
+        6,
+        vec![wait_play_payload(true)],
+        false,
+        None,
+        "passed",
+        VALID_PNG_1X1,
+    );
+    let secondary = FakeBridge::start_with_options(
+        5,
+        vec![wait_play_payload(true)],
+        false,
+        None,
+        "passed",
+        VALID_PNG_1X1,
+    );
+
+    let before = Command::new("python3")
+        .arg(repo_root.join("tools/real-client-agent-driver.py"))
+        .arg("--bridge-url")
+        .arg(format!("http://127.0.0.1:{}/rpc", primary.port))
+        .arg("--secret")
+        .arg("primary-secret")
+        .arg("--secondary-bridge-url")
+        .arg(format!("http://127.0.0.1:{}/rpc", secondary.port))
+        .arg("--secondary-secret")
+        .arg("secondary-secret")
+        .arg("--run-dir")
+        .arg(run_dir.path())
+        .arg("--scenario")
+        .arg("playable-45-two-client-shared-chest-save-restart-before")
+        .arg("--server-addr")
+        .arg("127.0.0.1:25565")
+        .arg("--timeout-seconds")
+        .arg("3")
+        .output()
+        .expect("run P45 before phase");
+    assert!(before.status.success(), "before phase must pass");
+    primary.join();
+    secondary.join();
+
+    std::fs::write(
+        &marker_path,
+        "x=2\ny=65\nz=1\nface=up\nitem=minecraft:oak_planks\ncount=1\n",
+    )
+    .expect("drift P45 marker");
+    let primary_port = reserve_then_release_port();
+    let secondary_port = reserve_then_release_port();
+    let after = Command::new("python3")
+        .arg(repo_root.join("tools/real-client-agent-driver.py"))
+        .arg("--bridge-url")
+        .arg(format!("http://127.0.0.1:{primary_port}/rpc"))
+        .arg("--secret")
+        .arg("primary-secret")
+        .arg("--secondary-bridge-url")
+        .arg(format!("http://127.0.0.1:{secondary_port}/rpc"))
+        .arg("--secondary-secret")
+        .arg("secondary-secret")
+        .arg("--run-dir")
+        .arg(run_dir.path())
+        .arg("--scenario")
+        .arg("playable-45-two-client-shared-chest-save-restart-after")
+        .arg("--server-addr")
+        .arg("127.0.0.1:25565")
+        .arg("--timeout-seconds")
+        .arg("1")
+        .arg("--append-observations")
+        .output()
+        .expect("run P45 drifted after phase");
+
+    assert!(!after.status.success());
+    assert!(
+        String::from_utf8_lossy(&after.stderr).contains("world.shared_chest_marker"),
+        "marker drift must be reported as a typed invariant mismatch"
     );
 }
 
