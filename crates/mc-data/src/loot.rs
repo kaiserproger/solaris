@@ -127,6 +127,8 @@ pub struct BlockLootDrop {
     random_chance: Option<f32>,
     survives_explosion: bool,
     explosion_decay: bool,
+    rolls: LootCount,
+    bonus_rolls: LootCount,
 }
 
 impl BlockLootDrop {
@@ -138,6 +140,8 @@ impl BlockLootDrop {
             random_chance: None,
             survives_explosion: false,
             explosion_decay: false,
+            rolls: LootCount::Fixed(1),
+            bonus_rolls: LootCount::Fixed(0),
         }
     }
 
@@ -186,6 +190,7 @@ pub enum FortuneBonus {
 }
 
 pub const MAX_BLOCK_BONUS_ROLLS: u32 = 4_096;
+pub const MAX_BLOCK_POOL_ROLLS: u32 = 4_096;
 pub const MAX_BLOCK_OUTPUT_ITEMS: u64 = 65_536;
 
 #[derive(Debug, Clone, PartialEq, Eq, Error)]
@@ -510,59 +515,66 @@ impl LootTables {
         let mut sampled = Vec::new();
         let mut output_items = 0_u64;
         for drop in drops {
-            if let Some(chance) = drop.random_chance {
-                if !chance.is_finite() || !(0.0..=1.0).contains(&chance) {
-                    return Err(BlockLootEvaluationError::InvalidProbability);
+            let roll_count = sample_block_pool_roll_count(
+                &mut random,
+                drop.rolls,
+                drop.bonus_rolls,
+            )?;
+            for _ in 0..roll_count {
+                if let Some(chance) = drop.random_chance {
+                    if !chance.is_finite() || !(0.0..=1.0).contains(&chance) {
+                        return Err(BlockLootEvaluationError::InvalidProbability);
+                    }
+                    if chance == 0.0 || (chance < 1.0 && random.next_float() >= chance) {
+                        continue;
+                    }
                 }
-                if chance == 0.0 || (chance < 1.0 && random.next_float() >= chance) {
+                if let Some(explosion) = context.explosion()
+                    && drop.survives_explosion
+                    && !survives_explosion(explosion, &mut random)
+                {
                     continue;
                 }
-            }
-            if let Some(explosion) = context.explosion()
-                && drop.survives_explosion
-                && !survives_explosion(explosion, &mut random)
-            {
-                continue;
-            }
 
-            let baseline = sample_loot_count(drop.drop.count, &mut random)?;
-            let mut count = match drop.fortune_bonus {
-                Some(bonus) => {
-                    bonus.try_apply(baseline, context.tool().fortune_level(), &mut random)?
-                }
-                None => baseline,
-            };
-            if let Some(explosion) = context.explosion()
-                && drop.explosion_decay
-            {
-                if u64::from(count) > MAX_BLOCK_OUTPUT_ITEMS {
-                    return Err(BlockLootEvaluationError::ExplosionDecayInputLimitExceeded {
-                        actual: u64::from(count),
-                        maximum: MAX_BLOCK_OUTPUT_ITEMS,
-                    });
-                }
-                let survivors = (0..count)
-                    .filter(|_| survives_explosion(explosion, &mut random))
-                    .count();
-                count = u32::try_from(survivors).map_err(|_| {
-                    BlockLootEvaluationError::ArithmeticOverflow {
-                        operation: "converting explosion-decay survivors",
+                let baseline = sample_loot_count(drop.drop.count, &mut random)?;
+                let mut count = match drop.fortune_bonus {
+                    Some(bonus) => {
+                        bonus.try_apply(baseline, context.tool().fortune_level(), &mut random)?
                     }
-                })?;
-            }
-            if count > 0 {
-                output_items = output_items.checked_add(u64::from(count)).ok_or(
-                    BlockLootEvaluationError::ArithmeticOverflow {
-                        operation: "adding block output items",
-                    },
-                )?;
-                if output_items > MAX_BLOCK_OUTPUT_ITEMS {
-                    return Err(BlockLootEvaluationError::OutputItemLimitExceeded {
-                        actual: output_items,
-                        maximum: MAX_BLOCK_OUTPUT_ITEMS,
-                    });
+                    None => baseline,
+                };
+                if let Some(explosion) = context.explosion()
+                    && drop.explosion_decay
+                {
+                    if u64::from(count) > MAX_BLOCK_OUTPUT_ITEMS {
+                        return Err(BlockLootEvaluationError::ExplosionDecayInputLimitExceeded {
+                            actual: u64::from(count),
+                            maximum: MAX_BLOCK_OUTPUT_ITEMS,
+                        });
+                    }
+                    let survivors = (0..count)
+                        .filter(|_| survives_explosion(explosion, &mut random))
+                        .count();
+                    count = u32::try_from(survivors).map_err(|_| {
+                        BlockLootEvaluationError::ArithmeticOverflow {
+                            operation: "converting explosion-decay survivors",
+                        }
+                    })?;
                 }
-                sampled.push(LootDrop::fixed(drop.drop.item.clone(), count));
+                if count > 0 {
+                    output_items = output_items.checked_add(u64::from(count)).ok_or(
+                        BlockLootEvaluationError::ArithmeticOverflow {
+                            operation: "adding block output items",
+                        },
+                    )?;
+                    if output_items > MAX_BLOCK_OUTPUT_ITEMS {
+                        return Err(BlockLootEvaluationError::OutputItemLimitExceeded {
+                            actual: output_items,
+                            maximum: MAX_BLOCK_OUTPUT_ITEMS,
+                        });
+                    }
+                    sampled.push(LootDrop::fixed(drop.drop.item.clone(), count));
+                }
             }
         }
         Ok(Some(sampled))
@@ -611,6 +623,8 @@ impl LootTables {
                     random_chance: None,
                     survives_explosion: true,
                     explosion_decay: false,
+                    rolls: LootCount::Fixed(1),
+                    bonus_rolls: LootCount::Fixed(0),
                 })
                 .collect::<Vec<_>>();
             common_fallbacks.iter().collect()
@@ -941,7 +955,15 @@ fn block_loot_from_table(
     let mut conditional_pools = Vec::new();
     for pool in pools {
         if contains_block_state_condition(pool) {
-            if let Some(pool) = block_state_loot_pool(path, pool)? {
+            let Some((pool_rolls, pool_bonus_rolls)) = parse_pool_rolls(pool) else {
+                return Ok(None);
+            };
+            if let Some(pool) = block_state_loot_pool(
+                path,
+                pool,
+                pool_rolls,
+                pool_bonus_rolls,
+            )? {
                 conditional_pools.push(pool);
             }
             continue;
@@ -949,6 +971,9 @@ fn block_loot_from_table(
         if has_unsupported_conditions(pool) {
             continue;
         }
+        let Some((pool_rolls, pool_bonus_rolls)) = parse_pool_rolls(pool) else {
+            return Ok(None);
+        };
         let Some(pool_count) = supported_count_from_functions(pool, true) else {
             continue;
         };
@@ -958,7 +983,12 @@ fn block_loot_from_table(
             continue;
         };
         for entry in entries {
-            let Some((mut silk, mut regular)) = block_loot_from_entry(path, entry)? else {
+            let Some((mut silk, mut regular)) = block_loot_from_entry(
+                path,
+                entry,
+                pool_rolls,
+                pool_bonus_rolls,
+            )? else {
                 continue;
             };
             if let Some(count) = pool_count {
@@ -1014,6 +1044,8 @@ fn contains_block_state_condition(value: &serde_json::Value) -> bool {
 fn block_state_loot_pool(
     path: &Path,
     pool: &serde_json::Value,
+    pool_rolls: LootCount,
+    pool_bonus_rolls: LootCount,
 ) -> Result<Option<BlockStateLootPool>, LootError> {
     let Some(predicate) = block_state_predicate(path, pool, false)? else {
         return Ok(None);
@@ -1030,7 +1062,13 @@ fn block_state_loot_pool(
     let mut parsed = Vec::new();
     match entry.get("type").and_then(serde_json::Value::as_str) {
         Some("minecraft:item") => {
-            if let Some(entry) = block_state_loot_entry(path, entry, pool_count)? {
+            if let Some(entry) = block_state_loot_entry(
+                path,
+                entry,
+                pool_count,
+                pool_rolls,
+                pool_bonus_rolls,
+            )? {
                 parsed.push(entry);
             }
         }
@@ -1039,7 +1077,13 @@ fn block_state_loot_pool(
                 return Ok(None);
             };
             for child in children {
-                let Some(entry) = block_state_loot_entry(path, child, pool_count)? else {
+                let Ok(Some(entry)) = block_state_loot_entry(
+                    path,
+                    child,
+                    pool_count,
+                    pool_rolls,
+                    pool_bonus_rolls,
+                ) else {
                     return Ok(None);
                 };
                 parsed.push(entry);
@@ -1061,6 +1105,8 @@ fn block_state_loot_entry(
     path: &Path,
     entry: &serde_json::Value,
     pool_count: Option<LootCount>,
+    pool_rolls: LootCount,
+    pool_bonus_rolls: LootCount,
 ) -> Result<Option<BlockStateLootEntry>, LootError> {
     if entry.get("type").and_then(serde_json::Value::as_str) != Some("minecraft:item") {
         return Ok(None);
@@ -1076,7 +1122,12 @@ fn block_state_loot_entry(
         .as_object_mut()
         .expect("loot entry is an object")
         .remove("conditions");
-    let Some(mut drop) = contextual_regular_drop(path, &unconditional)? else {
+    let Some(mut drop) = contextual_regular_drop(
+        path,
+        &unconditional,
+        pool_rolls,
+        pool_bonus_rolls,
+    )? else {
         return Ok(None);
     };
     if let Some(count) = pool_count {
@@ -1181,10 +1232,13 @@ fn block_state_predicate(
 fn block_loot_from_entry(
     path: &Path,
     entry: &serde_json::Value,
+    pool_rolls: LootCount,
+    pool_bonus_rolls: LootCount,
 ) -> Result<Option<(Option<BlockLootDrop>, BlockLootDrop)>, LootError> {
     match entry.get("type").and_then(serde_json::Value::as_str) {
         Some("minecraft:item") => {
-            Ok(contextual_regular_drop(path, entry)?.map(|drop| (None, drop)))
+            Ok(contextual_regular_drop(path, entry, pool_rolls, pool_bonus_rolls)?
+                .map(|drop| (None, drop)))
         }
         Some("minecraft:alternatives") => {
             if has_unsupported_conditions(entry) || entry.get("features").is_some() {
@@ -1197,13 +1251,23 @@ fn block_loot_from_entry(
             let mut regular_drop = None;
             for child in children {
                 if silk_touch_drop.is_none() {
-                    silk_touch_drop = silk_touch_drop_from_entry(path, child)?;
+                    silk_touch_drop = silk_touch_drop_from_entry(
+                        path,
+                        child,
+                        pool_rolls,
+                        pool_bonus_rolls,
+                    )?;
                     if silk_touch_drop.is_some() {
                         continue;
                     }
                 }
                 if regular_drop.is_none() {
-                    regular_drop = contextual_regular_drop(path, child)?;
+                    regular_drop = contextual_regular_drop(
+                        path,
+                        child,
+                        pool_rolls,
+                        pool_bonus_rolls,
+                    )?;
                 }
             }
             Ok(regular_drop.map(|regular| (silk_touch_drop, regular)))
@@ -1215,6 +1279,8 @@ fn block_loot_from_entry(
 fn silk_touch_drop_from_entry(
     path: &Path,
     entry: &serde_json::Value,
+    pool_rolls: LootCount,
+    pool_bonus_rolls: LootCount,
 ) -> Result<Option<BlockLootDrop>, LootError> {
     if !has_silk_touch_condition(entry) {
         return Ok(None);
@@ -1224,12 +1290,14 @@ fn silk_touch_drop_from_entry(
         .as_object_mut()
         .expect("loot entry with conditions is an object")
         .remove("conditions");
-    contextual_regular_drop(path, &unconditional)
+    contextual_regular_drop(path, &unconditional, pool_rolls, pool_bonus_rolls)
 }
 
 fn contextual_regular_drop(
     path: &Path,
     entry: &serde_json::Value,
+    rolls: LootCount,
+    bonus_rolls: LootCount,
 ) -> Result<Option<BlockLootDrop>, LootError> {
     if entry
         .get("conditions")
@@ -1267,6 +1335,8 @@ fn contextual_regular_drop(
         random_chance,
         survives_explosion: has_survives_explosion_condition(entry),
         explosion_decay: has_explosion_decay_function(entry),
+        rolls,
+        bonus_rolls,
     }))
 }
 
@@ -1387,20 +1457,57 @@ fn fortune_bonus_from_functions(value: &serde_json::Value) -> Option<Option<Fort
 }
 
 fn has_unsupported_pool_rolls(pool: &serde_json::Value) -> bool {
-    !is_supported_constant_roll(pool.get("rolls"), 1)
-        || !is_supported_constant_roll(pool.get("bonus_rolls"), 0)
+    parse_pool_rolls(pool).is_none()
 }
 
-fn is_supported_constant_roll(value: Option<&serde_json::Value>, supported: u32) -> bool {
-    let Some(value) = value else {
-        return true;
-    };
-    if let Some(value) = value.as_u64() {
-        return value == u64::from(supported);
+fn parse_pool_rolls(
+    pool: &serde_json::Value,
+) -> Option<(LootCount, LootCount)> {
+    let rolls = pool
+        .get("rolls")
+        .map_or(Some(LootCount::Fixed(1)), parse_supported_count_bound)?;
+    let bonus_rolls = pool
+        .get("bonus_rolls")
+        .map_or(Some(LootCount::Fixed(0)), parse_supported_count_bound)?;
+    Some((rolls, bonus_rolls))
+}
+
+fn parse_supported_count_bound(value: &serde_json::Value) -> Option<LootCount> {
+    if let Some(value) = supported_count_bound(value) {
+        (value <= MAX_BLOCK_POOL_ROLLS).then_some(LootCount::Fixed(value))
+    } else {
+        let fields = value.as_object()?;
+        if fields.keys().any(|key| !matches!(key.as_str(), "type" | "min" | "max")) {
+            return None;
+        }
+        if value.get("type").and_then(serde_json::Value::as_str) != Some("minecraft:uniform") {
+            return None;
+        }
+        let min = supported_count_bound(value.get("min")?)?;
+        let max = supported_count_bound(value.get("max")?)?;
+        (min <= max && max <= MAX_BLOCK_POOL_ROLLS).then_some(LootCount::UniformInclusive { min, max })
     }
-    value
-        .as_f64()
-        .is_some_and(|value| value == f64::from(supported))
+}
+
+fn sample_block_pool_roll_count(
+    random: &mut context::LootRandom,
+    rolls: LootCount,
+    bonus_rolls: LootCount,
+) -> Result<u64, BlockLootEvaluationError> {
+    let rolls = rolls.try_sample(random.next_u64())?;
+    let bonus_rolls = bonus_rolls.try_sample(random.next_u64())?;
+    let total = u64::from(rolls).checked_add(u64::from(bonus_rolls)).ok_or(
+        BlockLootEvaluationError::ArithmeticOverflow {
+            operation: "adding block pool rolls",
+        },
+    )?;
+    if total > u64::from(MAX_BLOCK_POOL_ROLLS) {
+        return Err(BlockLootEvaluationError::BonusRollLimitExceeded {
+            actual: total,
+            maximum: u64::from(MAX_BLOCK_POOL_ROLLS),
+        });
+    }
+    Ok(total)
 }
 
 fn has_unsupported_conditions(value: &serde_json::Value) -> bool {
@@ -2059,7 +2166,7 @@ mod tests {
             r#"{
               "pools": [
                 {
-                  "rolls": 2,
+                  "rolls": { "type": "minecraft:uniform", "min": 4097, "max": 4097 },
                   "entries": [{ "type": "minecraft:item", "name": "minecraft:diamond" }]
                 },
                 {
@@ -2074,7 +2181,7 @@ mod tests {
             r#"{
               "pools": [
                 {
-                  "bonus_rolls": { "type": "minecraft:uniform", "min": 0, "max": 1 },
+                  "bonus_rolls": { "type": "minecraft:uniform", "min": 1, "max": 0 },
                   "entries": [{ "type": "minecraft:item", "name": "minecraft:diamond" }]
                 },
                 {
@@ -2656,6 +2763,8 @@ mod tests {
             random_chance: None,
             survives_explosion: false,
             explosion_decay: false,
+            rolls: LootCount::Fixed(1),
+            bonus_rolls: LootCount::Fixed(0),
         };
 
         for roll in 0..12 {

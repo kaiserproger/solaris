@@ -120,7 +120,7 @@ Snapshot basis: **2026-07-24 Repomix snapshot**. Coordinator owns this file; wor
 - [ ] [`T04-02` — Partial pickup и overflow conservation](tasks/T04-02.md) — **P0**, rows `L2,I1`, deps `T04-01,T03-05`, locks `RUST-NET-SESSION`
 - [ ] [`T04-03` — Item despawn deadline + restart proof](tasks/T04-03.md) — **P0**, rows `L2,S1`, deps `T00-06`, locks `RUST-NET-SESSION,RUST-HARNESS`
 - [ ] [`T04-04` — Two-client shared pickup contention real-client gate](tasks/T04-04.md) — **P0**, rows `L2,S2,Q2`, deps `T04-02`, locks `CLIENT-JAVA`
-- [ ] [`T04-05` — Loot executor: random count ranges и multiple rolls core slice](tasks/T04-05.md) — **P1**, rows `L1`, deps `T00-04`, locks `RUST-DATA`
+- [x] [`T04-05` — Loot executor: random count ranges и multiple rolls core slice](tasks/T04-05.md) — **P1**, rows `L1`, deps `T00-04`, locks `RUST-DATA`
 - [ ] [`T04-06` — Loot context vertical slice: Fortune/Silk/Looting/burning](tasks/T04-06.md) — **P1**, rows `L1,G1`, deps `T04-05`, locks `RUST-DATA,RUST-ENTITY`
 - [ ] [`T04-07` — Renewable wheat → bread lifecycle real-client gate](tasks/T04-07.md) — **P0**, rows `F1,I2,Q2`, deps `T03-03`, locks `CLIENT-JAVA,RUST-NET-BLOCKS`
 - [ ] [`T04-08` — Sugar cane/cactus support cascade representative parity](tasks/T04-08.md) — **P1**, rows `F3`, deps `T01-05`, locks `RUST-NET-BLOCKS,RUST-HARNESS`
