@@ -515,11 +515,8 @@ impl LootTables {
         let mut sampled = Vec::new();
         let mut output_items = 0_u64;
         for drop in drops {
-            let roll_count = sample_block_pool_roll_count(
-                &mut random,
-                drop.rolls,
-                drop.bonus_rolls,
-            )?;
+            let roll_count =
+                sample_block_pool_roll_count(&mut random, drop.rolls, drop.bonus_rolls)?;
             for _ in 0..roll_count {
                 if let Some(chance) = drop.random_chance {
                     if !chance.is_finite() || !(0.0..=1.0).contains(&chance) {
@@ -958,12 +955,7 @@ fn block_loot_from_table(
             let Some((pool_rolls, pool_bonus_rolls)) = parse_pool_rolls(pool) else {
                 return Ok(None);
             };
-            if let Some(pool) = block_state_loot_pool(
-                path,
-                pool,
-                pool_rolls,
-                pool_bonus_rolls,
-            )? {
+            if let Some(pool) = block_state_loot_pool(path, pool, pool_rolls, pool_bonus_rolls)? {
                 conditional_pools.push(pool);
             }
             continue;
@@ -983,12 +975,9 @@ fn block_loot_from_table(
             continue;
         };
         for entry in entries {
-            let Some((mut silk, mut regular)) = block_loot_from_entry(
-                path,
-                entry,
-                pool_rolls,
-                pool_bonus_rolls,
-            )? else {
+            let Some((mut silk, mut regular)) =
+                block_loot_from_entry(path, entry, pool_rolls, pool_bonus_rolls)?
+            else {
                 continue;
             };
             if let Some(count) = pool_count {
@@ -1062,13 +1051,9 @@ fn block_state_loot_pool(
     let mut parsed = Vec::new();
     match entry.get("type").and_then(serde_json::Value::as_str) {
         Some("minecraft:item") => {
-            if let Some(entry) = block_state_loot_entry(
-                path,
-                entry,
-                pool_count,
-                pool_rolls,
-                pool_bonus_rolls,
-            )? {
+            if let Some(entry) =
+                block_state_loot_entry(path, entry, pool_count, pool_rolls, pool_bonus_rolls)?
+            {
                 parsed.push(entry);
             }
         }
@@ -1077,13 +1062,9 @@ fn block_state_loot_pool(
                 return Ok(None);
             };
             for child in children {
-                let Ok(Some(entry)) = block_state_loot_entry(
-                    path,
-                    child,
-                    pool_count,
-                    pool_rolls,
-                    pool_bonus_rolls,
-                ) else {
+                let Ok(Some(entry)) =
+                    block_state_loot_entry(path, child, pool_count, pool_rolls, pool_bonus_rolls)
+                else {
                     return Ok(None);
                 };
                 parsed.push(entry);
@@ -1122,12 +1103,9 @@ fn block_state_loot_entry(
         .as_object_mut()
         .expect("loot entry is an object")
         .remove("conditions");
-    let Some(mut drop) = contextual_regular_drop(
-        path,
-        &unconditional,
-        pool_rolls,
-        pool_bonus_rolls,
-    )? else {
+    let Some(mut drop) =
+        contextual_regular_drop(path, &unconditional, pool_rolls, pool_bonus_rolls)?
+    else {
         return Ok(None);
     };
     if let Some(count) = pool_count {
@@ -1237,8 +1215,10 @@ fn block_loot_from_entry(
 ) -> Result<Option<(Option<BlockLootDrop>, BlockLootDrop)>, LootError> {
     match entry.get("type").and_then(serde_json::Value::as_str) {
         Some("minecraft:item") => {
-            Ok(contextual_regular_drop(path, entry, pool_rolls, pool_bonus_rolls)?
-                .map(|drop| (None, drop)))
+            Ok(
+                contextual_regular_drop(path, entry, pool_rolls, pool_bonus_rolls)?
+                    .map(|drop| (None, drop)),
+            )
         }
         Some("minecraft:alternatives") => {
             if has_unsupported_conditions(entry) || entry.get("features").is_some() {
@@ -1251,23 +1231,15 @@ fn block_loot_from_entry(
             let mut regular_drop = None;
             for child in children {
                 if silk_touch_drop.is_none() {
-                    silk_touch_drop = silk_touch_drop_from_entry(
-                        path,
-                        child,
-                        pool_rolls,
-                        pool_bonus_rolls,
-                    )?;
+                    silk_touch_drop =
+                        silk_touch_drop_from_entry(path, child, pool_rolls, pool_bonus_rolls)?;
                     if silk_touch_drop.is_some() {
                         continue;
                     }
                 }
                 if regular_drop.is_none() {
-                    regular_drop = contextual_regular_drop(
-                        path,
-                        child,
-                        pool_rolls,
-                        pool_bonus_rolls,
-                    )?;
+                    regular_drop =
+                        contextual_regular_drop(path, child, pool_rolls, pool_bonus_rolls)?;
                 }
             }
             Ok(regular_drop.map(|regular| (silk_touch_drop, regular)))
@@ -1460,9 +1432,7 @@ fn has_unsupported_pool_rolls(pool: &serde_json::Value) -> bool {
     parse_pool_rolls(pool).is_none()
 }
 
-fn parse_pool_rolls(
-    pool: &serde_json::Value,
-) -> Option<(LootCount, LootCount)> {
+fn parse_pool_rolls(pool: &serde_json::Value) -> Option<(LootCount, LootCount)> {
     let rolls = pool
         .get("rolls")
         .map_or(Some(LootCount::Fixed(1)), parse_supported_count_bound)?;
@@ -1477,7 +1447,10 @@ fn parse_supported_count_bound(value: &serde_json::Value) -> Option<LootCount> {
         (value <= MAX_BLOCK_POOL_ROLLS).then_some(LootCount::Fixed(value))
     } else {
         let fields = value.as_object()?;
-        if fields.keys().any(|key| !matches!(key.as_str(), "type" | "min" | "max")) {
+        if fields
+            .keys()
+            .any(|key| !matches!(key.as_str(), "type" | "min" | "max"))
+        {
             return None;
         }
         if value.get("type").and_then(serde_json::Value::as_str) != Some("minecraft:uniform") {
@@ -1485,7 +1458,8 @@ fn parse_supported_count_bound(value: &serde_json::Value) -> Option<LootCount> {
         }
         let min = supported_count_bound(value.get("min")?)?;
         let max = supported_count_bound(value.get("max")?)?;
-        (min <= max && max <= MAX_BLOCK_POOL_ROLLS).then_some(LootCount::UniformInclusive { min, max })
+        (min <= max && max <= MAX_BLOCK_POOL_ROLLS)
+            .then_some(LootCount::UniformInclusive { min, max })
     }
 }
 
