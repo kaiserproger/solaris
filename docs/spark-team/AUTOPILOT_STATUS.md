@@ -4,13 +4,13 @@ Generated from task cards plus durable Git-common-dir state. Edit task cards, no
 
 ## Counts
 
-- `DONE`: **4**
-- `QUEUED`: **70**
+- `DONE`: **5**
+- `QUEUED`: **69**
 
 ## Cursor
 
 - Active: `none`
-- Ready: `T00-05, T01-01, T01-02, T01-03, T04-05, T06-05`
+- Ready: `T00-06, T01-01, T01-02, T01-03, T07-01, T04-05, T06-05`
 - Coordinator: `none`
 - Templates: `T06-08`
 
@@ -24,7 +24,7 @@ Generated from task cards plus durable Git-common-dir state. Edit task cards, no
 - [x] `T00-02` · **DONE** · Снять честный Cargo/Gradle baseline и список реально красных гейтов
 - [x] `T00-03` · **DONE** · Собрать актуальную матрицу real-client сценариев и артефактов
 - [x] `T00-04` · **DONE** · Собрать актуальную матрицу vanilla oracle/replay
-- [ ] `T00-05` · **QUEUED** · Собрать текущую performance/concurrency базу и пробелы
+- [x] `T00-05` · **DONE** · Собрать текущую performance/concurrency базу и пробелы
 - [ ] `T00-06` · **QUEUED** · Свернуть противоречивые/stale документы в один migration report
 
 ## W01
