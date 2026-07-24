@@ -2518,21 +2518,19 @@
         "crates/mc-net/src/login.rs",
         "crates/mc-net/src/session_auth.rs",
         "crates/mc-server/tests/login.rs",
-        "<owner active online-mode config path — fill before claim>"
+        "example.toml"
       ],
       "write": [
         ".analysis/spark/online-mode-qualification.md"
       ],
       "outcome": "Paid 26.1.2 client completes RSA/AES/session auth, signed properties, compression transition, reconnect and bounded load against public-bind-safe config; exact failures recorded.",
       "discovery": [
-        "Preflight paid account, network and active config without exposing credentials",
-        "Use the real session endpoint; redact access tokens, profile properties and server hash inputs",
-        "Allocate a unique world/run directory and port range"
+        "SOLARIS_REAL_CLIENT_SERVER_CONFIG=example.toml SOLARIS_REAL_CLIENT_AGENT_SCENARIO=m94-01-join-rejoin-chunks-movement bash tools/run-real-client-regression.sh --run",
+        "Latest primary run artifact directory is the newest entry under .analysis/real-client-runs after the command finishes."
       ],
       "validation": [
-        "Owner/agent real-client run",
-        "Server logs checked for disconnect/error mapping",
-        "No source edit unless reproducible bug"
+        "bash -lc 'RUN_DIR=$(ls -1dt .analysis/real-client-runs/* | head -n 1); bash tools/run-real-client-regression.sh --validate-run $RUN_DIR'",
+        "bash -lc 'RUN_DIR=$(ls -1dt .analysis/real-client-runs/* | head -n 1); rg -n online_mode|auth|session|compression|reconnect $RUN_DIR/server.log'"
       ],
       "depends": [
         "T00-02"
@@ -2542,7 +2540,7 @@
         "Не считать offline-mode эквивалентом"
       ],
       "notes": [],
-      "dispatch": "template",
+      "dispatch": "ready",
       "materialize_after": [
         "T00-01",
         "T00-02"
