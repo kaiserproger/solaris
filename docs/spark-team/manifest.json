@@ -1,0 +1,4010 @@
+{
+  "schema": "solaris.spark_team_plan.v2",
+  "snapshot": "2026-07-24 Repomix snapshot",
+  "task_count": 74,
+  "tasks": [
+    {
+      "id": "T00-01",
+      "wave": "W00",
+      "title": "Зафиксировать фактический HEAD, dirty tree и владельцев изменений",
+      "priority": "P0",
+      "route": "architecture",
+      "rows": [],
+      "kind": "audit",
+      "locks": [
+        "COORD"
+      ],
+      "read": [
+        "AGENTS.md",
+        ".memory/MEMORY.md",
+        "docs/MEMORY.md"
+      ],
+      "write": [
+        ".analysis/spark/current-tree.md"
+      ],
+      "outcome": "Один компактный снимок фактического дерева: branch/HEAD, tracked/untracked changes, активные процессы, артефакты и предполагаемый владелец каждого изменённого пути.",
+      "discovery": [
+        "git status --short --branch",
+        "git rev-parse HEAD",
+        "git diff --name-status; git diff --stat",
+        "проверить только процессы/порты, относящиеся к Solaris"
+      ],
+      "validation": [
+        "Проверить, что отчёт не содержит секретов и не предлагает reset/clean",
+        "Ни одного исходника не менять"
+      ],
+      "depends": [],
+      "non_goals": [
+        "Не читать весь репозиторий",
+        "Не исправлять найденные изменения",
+        "Не обновлять канонические docs"
+      ],
+      "notes": [],
+      "dispatch": "ready",
+      "materialize_after": [],
+      "leases": [],
+      "evidence_legs": [
+        "audit/control"
+      ]
+    },
+    {
+      "id": "T00-02",
+      "wave": "W00",
+      "title": "Снять честный Cargo/Gradle baseline и список реально красных гейтов",
+      "priority": "P0",
+      "route": "architecture",
+      "rows": [],
+      "kind": "validation",
+      "locks": [
+        "VALIDATION"
+      ],
+      "read": [
+        "AGENTS.md",
+        "README.md"
+      ],
+      "write": [
+        ".analysis/spark/baseline.md",
+        ".analysis/codex-logs/"
+      ],
+      "outcome": "Список команд с точным статусом pass/fail/degraded/skipped на неизменном дереве; один раз на fingerprint.",
+      "discovery": [
+        "cargo fmt --all -- --check",
+        "cargo run -p xtask -- code-health",
+        "cargo test --workspace",
+        "cargo clippy --workspace --all-targets -- -D warnings",
+        "client-mod/solaris-client-agent: ./gradlew test"
+      ],
+      "validation": [
+        "Полный stdout сохранить в .analysis/codex-logs",
+        "В отчёт вынести только код возврата, failures, короткий tail и log path"
+      ],
+      "depends": [
+        "T00-01"
+      ],
+      "non_goals": [
+        "Не чинить падения в этой карточке",
+        "Не повторять успешную команду на том же tree fingerprint"
+      ],
+      "notes": [],
+      "dispatch": "ready",
+      "materialize_after": [],
+      "leases": [
+        "TREE-FROZEN"
+      ],
+      "evidence_legs": [
+        "audit/control"
+      ]
+    },
+    {
+      "id": "T00-03",
+      "wave": "W00",
+      "title": "Собрать актуальную матрицу real-client сценариев и артефактов",
+      "priority": "P0",
+      "route": "playable",
+      "rows": [
+        "Q2"
+      ],
+      "kind": "audit",
+      "locks": [
+        "CLIENT-JAVA",
+        "RUNNER"
+      ],
+      "read": [
+        "docs/playable/ACTIVE.md",
+        "crates/mc-test-harness/tests/real_client_manifest.rs",
+        "client-mod/solaris-client-agent/java-agent/src/main/java/dev/solaris/agent/javaagent/PlayableRealClientLoopScenario.java"
+      ],
+      "write": [
+        ".analysis/spark/real-client-matrix.md"
+      ],
+      "outcome": "Для каждого playable/M94 scenario: implemented, declared, focused/broad, last completed artifact, pass/blocked/not-run, required manual/agent evidence.",
+      "discovery": [
+        "Извлечь scenario IDs программно",
+        "Сверить только последние артефакты по каждому ID",
+        "Отдельно пометить interrupted/late-output runs"
+      ],
+      "validation": [
+        "cargo test -p mc-test-harness --test real_client_manifest",
+        "cd client-mod/solaris-client-agent && ./gradlew :java-agent:test --tests \"*PlayableRealClientLoopScenarioTest*\""
+      ],
+      "depends": [
+        "T00-01"
+      ],
+      "non_goals": [
+        "Не запускать Minecraft",
+        "Не менять сценарии"
+      ],
+      "notes": [],
+      "dispatch": "ready",
+      "materialize_after": [],
+      "leases": [],
+      "evidence_legs": [
+        "real-client-agent"
+      ]
+    },
+    {
+      "id": "T00-04",
+      "wave": "W00",
+      "title": "Собрать актуальную матрицу vanilla oracle/replay",
+      "priority": "P0",
+      "route": "parity",
+      "rows": [
+        "Q1",
+        "Q3"
+      ],
+      "kind": "audit",
+      "locks": [
+        "ORACLE",
+        "RUST-HARNESS"
+      ],
+      "read": [
+        "docs/DEFINITION_OF_DONE.md",
+        "crates/mc-test-harness/tests/parity_oracle.rs",
+        "crates/mc-test-harness/src/replay.rs"
+      ],
+      "write": [
+        ".analysis/spark/oracle-replay-matrix.md"
+      ],
+      "outcome": "Таблица: ledger row → существующий oracle/replay manifest → prerequisites → фактический статус → минимально недостающая нога.",
+      "discovery": [
+        "rg по schema/scenario IDs, не печатать большие JSON",
+        "Выделить local-artifact-dependent и silent skip"
+      ],
+      "validation": [
+        "cargo test -p mc-test-harness --test parity_oracle --no-run",
+        "cargo test -p mc-test-harness --test parity_oracle -- --list"
+      ],
+      "depends": [
+        "T00-01"
+      ],
+      "non_goals": [
+        "Не запускать долгий oracle suite",
+        "Не редактировать ledger"
+      ],
+      "notes": [],
+      "dispatch": "ready",
+      "materialize_after": [],
+      "leases": [],
+      "evidence_legs": [
+        "oracle",
+        "replay/negative"
+      ]
+    },
+    {
+      "id": "T00-05",
+      "wave": "W00",
+      "title": "Собрать текущую performance/concurrency базу и пробелы",
+      "priority": "P0",
+      "route": "scaling",
+      "rows": [
+        "O1",
+        "O2",
+        "O3"
+      ],
+      "kind": "audit",
+      "locks": [
+        "PERF"
+      ],
+      "read": [
+        "docs/M52_OPERATOR_PERFORMANCE_NOTES.md",
+        "docs/milestones/M91.md",
+        "crates/mc-test-harness/tests/load_scenarios.rs",
+        "docs/MEMORY.md"
+      ],
+      "write": [
+        ".analysis/spark/performance-baseline.md"
+      ],
+      "outcome": "Единый список воспроизводимых workload, метрик, последних чисел, hardware/build provenance и непокрытых профилей.",
+      "discovery": [
+        "Извлечь имена non-ignored/ignored load tests",
+        "Сверить metric names с текущим кодом",
+        "Разделить functional evidence и performance evidence"
+      ],
+      "validation": [
+        "cargo test -p mc-test-harness --test load_scenarios -- --list",
+        "Статическая сверка названий метрик"
+      ],
+      "depends": [
+        "T00-01"
+      ],
+      "non_goals": [
+        "Не оптимизировать",
+        "Не смешивать загрязнённые и чистые host runs"
+      ],
+      "notes": [],
+      "dispatch": "ready",
+      "materialize_after": [],
+      "leases": [],
+      "evidence_legs": [
+        "performance"
+      ]
+    },
+    {
+      "id": "T00-06",
+      "wave": "W00",
+      "title": "Свернуть противоречивые/stale документы в один migration report",
+      "priority": "P0",
+      "route": "architecture",
+      "rows": [],
+      "kind": "docs",
+      "locks": [
+        "COORD-DOCS"
+      ],
+      "read": [
+        "docs/MEMORY.md",
+        "docs/playable/ACTIVE.md",
+        "REVIEW_FEEDBACK.md",
+        ".analysis/restart-checkpoint.md",
+        "docs/VALIDATION_LEDGER.md"
+      ],
+      "write": [
+        ".analysis/spark/status-reconciliation.md"
+      ],
+      "outcome": "Отчёт с приоритетом источников: current code/tests/runtime > docs/MEMORY > ACTIVE > review/WAL > old restart/ledger; список устаревших открытых пунктов, которые нельзя раздавать агентам без проверки.",
+      "discovery": [
+        "Сравнить даты и конкретные anchors",
+        "Пометить P46/Lua restart checkpoint как условный, пока git diff не подтвердит"
+      ],
+      "validation": [
+        "Проверить ссылки/пути",
+        "Ни один канонический документ не переписывать в этой карточке"
+      ],
+      "depends": [
+        "T00-01",
+        "T00-03",
+        "T00-04",
+        "T00-05"
+      ],
+      "non_goals": [],
+      "notes": [],
+      "dispatch": "ready",
+      "materialize_after": [],
+      "leases": [],
+      "evidence_legs": [
+        "audit/control"
+      ]
+    },
+    {
+      "id": "T01-01",
+      "wave": "W01",
+      "title": "Добавить компактный core-gate manifest: scenario → ledger rows → evidence legs",
+      "priority": "P0",
+      "route": "parity",
+      "rows": [
+        "Q1",
+        "Q2",
+        "Q3"
+      ],
+      "kind": "implementation",
+      "locks": [
+        "RUST-HARNESS"
+      ],
+      "read": [
+        "crates/mc-test-harness/src/replay.rs",
+        "crates/mc-test-harness/tests/real_client_manifest.rs",
+        "docs/DEFINITION_OF_DONE.md"
+      ],
+      "write": [
+        "crates/mc-test-harness/src/replay.rs",
+        "crates/mc-test-harness/tests/real_client_manifest.rs"
+      ],
+      "outcome": "Машиночитаемая проверка запрещает broad-row pass без перечисленных focused phases и явно фиксирует runtime/oracle/client/perf/persistence legs.",
+      "discovery": [
+        "Найти текущие DTO schema anchors",
+        "Добавить один минимальный manifest/validator, не новый framework"
+      ],
+      "validation": [
+        "cargo test -p mc-test-harness --test real_client_manifest",
+        "cargo test -p mc-test-harness replay"
+      ],
+      "depends": [
+        "T00-03",
+        "T00-04"
+      ],
+      "non_goals": [
+        "Не менять ledger statuses",
+        "Не добавлять универсальный workflow engine"
+      ],
+      "notes": [],
+      "dispatch": "ready",
+      "materialize_after": [],
+      "leases": [],
+      "evidence_legs": [
+        "unit",
+        "wire",
+        "oracle",
+        "real-client-agent",
+        "replay/negative"
+      ]
+    },
+    {
+      "id": "T01-02",
+      "wave": "W01",
+      "title": "Разрезать broad block/fluid real-client gate на независимые focused phases",
+      "priority": "P0",
+      "route": "playable",
+      "rows": [
+        "B1",
+        "B2",
+        "B3",
+        "B4",
+        "Q2"
+      ],
+      "kind": "implementation",
+      "locks": [
+        "CLIENT-JAVA"
+      ],
+      "read": [
+        "client-mod/solaris-client-agent/java-agent/src/main/java/dev/solaris/agent/javaagent/M94BlocksFluidsFarmingDropsScenario.java",
+        "client-mod/solaris-client-agent/java-agent/src/test/java/dev/solaris/agent/javaagent/M94BlocksFluidsFarmingDropsScenarioTest.java"
+      ],
+      "write": [
+        "client-mod/solaris-client-agent/java-agent/src/main/java/dev/solaris/agent/javaagent/M94BlocksFluidsFarmingDropsScenario.java",
+        "client-mod/solaris-client-agent/java-agent/src/test/java/dev/solaris/agent/javaagent/M94BlocksFluidsFarmingDropsScenarioTest.java"
+      ],
+      "outcome": "Каждая фаза имеет отдельный ID, exact observations и fail-closed result; umbrella ID только агрегирует уже зелёные фазы.",
+      "discovery": [
+        "Сначала перечислить текущие broad blockers",
+        "Не добавлять серверные debug команды как success path"
+      ],
+      "validation": [
+        "cd client-mod/solaris-client-agent && ./gradlew :java-agent:test --tests \"*M94BlocksFluidsFarmingDropsScenarioTest*\"",
+        "cargo test -p mc-test-harness --test real_client_manifest"
+      ],
+      "depends": [
+        "T00-03"
+      ],
+      "non_goals": [
+        "Не чинить серверное поведение",
+        "Не запускать длинный client gate"
+      ],
+      "notes": [],
+      "dispatch": "ready",
+      "materialize_after": [],
+      "leases": [],
+      "evidence_legs": [
+        "unit",
+        "wire",
+        "real-client-agent"
+      ]
+    },
+    {
+      "id": "T01-03",
+      "wave": "W01",
+      "title": "Разрезать inventory/crafting/container real-client gate на focused phases",
+      "priority": "P0",
+      "route": "playable",
+      "rows": [
+        "I1",
+        "I2",
+        "K1",
+        "Q2"
+      ],
+      "kind": "implementation",
+      "locks": [
+        "CLIENT-JAVA"
+      ],
+      "read": [
+        "client-mod/solaris-client-agent/java-agent/src/main/java/dev/solaris/agent/javaagent/M94InventoryCraftingScenario.java",
+        "client-mod/solaris-client-agent/java-agent/src/test/java/dev/solaris/agent/javaagent/M94InventoryCraftingScenarioTest.java"
+      ],
+      "write": [
+        "client-mod/solaris-client-agent/java-agent/src/main/java/dev/solaris/agent/javaagent/M94InventoryCraftingScenario.java",
+        "client-mod/solaris-client-agent/java-agent/src/test/java/dev/solaris/agent/javaagent/M94InventoryCraftingScenarioTest.java"
+      ],
+      "outcome": "Отдельные фазы для recipe-book/inventory craft, table craft, chest transfer, furnace-family UI, malformed rejection и reopen conservation.",
+      "discovery": [
+        "Использовать существующие push-driven container waits",
+        "Каждая success фаза должна иметь dominant rejection boundary"
+      ],
+      "validation": [
+        "cd client-mod/solaris-client-agent && ./gradlew :java-agent:test --tests \"*M94InventoryCraftingScenarioTest*\"",
+        "cargo test -p mc-test-harness --test real_client_manifest"
+      ],
+      "depends": [
+        "T00-03"
+      ],
+      "non_goals": [],
+      "notes": [],
+      "dispatch": "ready",
+      "materialize_after": [],
+      "leases": [],
+      "evidence_legs": [
+        "unit",
+        "wire",
+        "real-client-agent"
+      ]
+    },
+    {
+      "id": "T01-04",
+      "wave": "W01",
+      "title": "Добавить restart invariant snapshot и строгую cross-phase валидацию",
+      "priority": "P0",
+      "route": "parity",
+      "rows": [
+        "S1",
+        "Q2",
+        "Q3"
+      ],
+      "kind": "implementation",
+      "locks": [
+        "RUNNER",
+        "RUST-HARNESS"
+      ],
+      "read": [
+        "tools/real-client-agent-driver.py",
+        "crates/mc-test-harness/tests/real_client_agent_driver.rs",
+        "crates/mc-test-harness/tests/real_client_manifest.rs"
+      ],
+      "write": [
+        "tools/real-client-agent-driver.py",
+        "crates/mc-test-harness/tests/real_client_agent_driver.rs"
+      ],
+      "outcome": "Before/after фазы сравнивают typed invariant snapshot: player/inventory/world markers/container/entity/time as declared by scenario; missing field fails, timeout only fails.",
+      "discovery": [
+        "Переиспользовать существующий marker/provenance contract",
+        "Схема должна быть bounded и versioned"
+      ],
+      "validation": [
+        "python -m py_compile tools/real-client-agent-driver.py",
+        "cargo test -p mc-test-harness --test real_client_agent_driver",
+        "cargo test -p mc-test-harness --test real_client_manifest"
+      ],
+      "depends": [
+        "T01-01"
+      ],
+      "non_goals": [
+        "Не создавать общий database артефактов"
+      ],
+      "notes": [],
+      "dispatch": "ready",
+      "materialize_after": [],
+      "leases": [],
+      "evidence_legs": [
+        "unit",
+        "wire",
+        "real-client-agent",
+        "replay/negative",
+        "persistence"
+      ]
+    },
+    {
+      "id": "T01-05",
+      "wave": "W01",
+      "title": "Добавить vanilla oracle для block transaction/rejection/resync",
+      "priority": "P0",
+      "route": "parity",
+      "rows": [
+        "B1",
+        "B2",
+        "B3",
+        "Q1"
+      ],
+      "kind": "implementation",
+      "locks": [
+        "ORACLE",
+        "RUST-HARNESS"
+      ],
+      "read": [
+        "crates/mc-test-harness/tests/parity_oracle.rs",
+        "crates/mc-test-harness/src/replay.rs",
+        "crates/mc-test-harness/src/bin/wire_probe.rs"
+      ],
+      "write": [
+        "crates/mc-test-harness/tests/parity_oracle.rs",
+        "crates/mc-test-harness/src/replay.rs"
+      ],
+      "outcome": "Checked manifest сравнивает vanilla и Solaris для break/place/use, occupied target, out-of-reach/early-stop rejection и authoritative resync order.",
+      "discovery": [
+        "Сначала зафиксировать packet/layout facts локальным oracle",
+        "Нормализовать только шум, не результат"
+      ],
+      "validation": [
+        "cargo test -p mc-test-harness --test parity_oracle <new_filter> -- --ignored --nocapture",
+        "cargo test -p mc-test-harness replay"
+      ],
+      "depends": [
+        "T00-04",
+        "T01-01"
+      ],
+      "non_goals": [
+        "Не копировать ожидаемые константы из Solaris implementation"
+      ],
+      "notes": [],
+      "dispatch": "ready",
+      "materialize_after": [],
+      "leases": [
+        "ORACLE-RIG"
+      ],
+      "evidence_legs": [
+        "unit",
+        "wire",
+        "oracle"
+      ]
+    },
+    {
+      "id": "T01-06",
+      "wave": "W01",
+      "title": "Добавить vanilla oracle для inventory/crafting/container state machine",
+      "priority": "P0",
+      "route": "parity",
+      "rows": [
+        "I1",
+        "I2",
+        "K1",
+        "Q1"
+      ],
+      "kind": "implementation",
+      "locks": [
+        "ORACLE",
+        "RUST-HARNESS"
+      ],
+      "read": [
+        "crates/mc-test-harness/tests/parity_oracle.rs",
+        "crates/mc-test-harness/src/replay.rs",
+        "crates/mc-protocol/src/packets/play.rs"
+      ],
+      "write": [
+        "crates/mc-test-harness/tests/parity_oracle.rs",
+        "crates/mc-test-harness/src/replay.rs"
+      ],
+      "outcome": "Checked manifest сравнивает state_id/cursor/slots для craft, quick-move, stale click и close/reopen conservation.",
+      "discovery": [
+        "Ограничить первый slice chest + crafting table",
+        "Furnace расширить отдельной follow-up карточкой при необходимости"
+      ],
+      "validation": [
+        "cargo test -p mc-test-harness --test parity_oracle <new_filter> -- --ignored --nocapture",
+        "cargo test -p mc-test-harness replay"
+      ],
+      "depends": [
+        "T00-04",
+        "T01-01"
+      ],
+      "non_goals": [],
+      "notes": [],
+      "dispatch": "ready",
+      "materialize_after": [],
+      "leases": [
+        "ORACLE-RIG"
+      ],
+      "evidence_legs": [
+        "unit",
+        "wire",
+        "oracle"
+      ]
+    },
+    {
+      "id": "T02-01",
+      "wave": "W02",
+      "title": "Закрыть B4: воспроизводимый real-client water/swim feel gate",
+      "priority": "P0",
+      "route": "playable",
+      "rows": [
+        "B4",
+        "Q2"
+      ],
+      "kind": "evidence-or-fix",
+      "locks": [
+        "CLIENT-JAVA",
+        "RUNNER"
+      ],
+      "read": [
+        "docs/playable/ACTIVE.md",
+        "client-mod/solaris-client-agent/java-agent/src/main/java/dev/solaris/agent/javaagent/M94M40M41RouteScenario.java",
+        "crates/mc-net/src/play/movement.rs",
+        "crates/mc-net/src/play/player_breathing.rs"
+      ],
+      "write": [
+        "client-mod/solaris-client-agent/java-agent/src/main/java/dev/solaris/agent/javaagent/M94M40M41RouteScenario.java",
+        "client-mod/solaris-client-agent/java-agent/src/test/java/dev/solaris/agent/javaagent/M94M40M41RouteScenarioTest.java"
+      ],
+      "outcome": "Fresh client proves source-water entry, ascent, dive, swim pose, fluid height, camera/eye transition, air loss/recovery and no correction/disconnect. Server edit only after reproducible red.",
+      "discovery": [
+        "Reuse deep-water MCP observations",
+        "Record any remaining subjective-only item separately"
+      ],
+      "validation": [
+        "cd client-mod/solaris-client-agent && ./gradlew :java-agent:test --tests \"*M94M40M41RouteScenarioTest*\"",
+        "shortest exact real-client scenario"
+      ],
+      "depends": [
+        "T01-02"
+      ],
+      "non_goals": [],
+      "notes": [],
+      "dispatch": "ready",
+      "materialize_after": [],
+      "leases": [
+        "CLIENT-RIG"
+      ],
+      "evidence_legs": [
+        "unit",
+        "wire",
+        "real-client-agent"
+      ]
+    },
+    {
+      "id": "T02-02",
+      "wave": "W02",
+      "title": "Закрыть P4: полный respawn bundle + restart/rejoin evidence",
+      "priority": "P0",
+      "route": "playable",
+      "rows": [
+        "P4",
+        "G4",
+        "S1",
+        "Q2"
+      ],
+      "kind": "evidence-or-fix",
+      "locks": [
+        "CLIENT-JAVA",
+        "RUST-NET-SESSION"
+      ],
+      "read": [
+        "client-mod/solaris-client-agent/java-agent/src/main/java/dev/solaris/agent/javaagent/M94EntitiesCombatDeathRespawnScenario.java",
+        "crates/mc-net/src/play/session/session_lifecycle.rs",
+        "crates/mc-net/src/play/spawn.rs",
+        "crates/mc-test-harness/tests/block_edit/survival_lifecycle.rs"
+      ],
+      "write": [
+        "client-mod/solaris-client-agent/java-agent/src/main/java/dev/solaris/agent/javaagent/M94EntitiesCombatDeathRespawnScenario.java",
+        "crates/mc-net/src/play/session/session_lifecycle.rs",
+        "crates/mc-test-harness/tests/block_edit/survival_lifecycle.rs"
+      ],
+      "outcome": "Death screen → respawn → health/abilities/default spawn/chunk view/inventory according to mode → save/restart/rejoin without stale dead state.",
+      "discovery": [
+        "Сначала rerun existing death/respawn scenario",
+        "Изменять только точный missing packet/state"
+      ],
+      "validation": [
+        "cargo test -p mc-net respawn",
+        "cargo test -p mc-test-harness --test block_edit survival_lifecycle",
+        "cd client-mod/solaris-client-agent && ./gradlew :java-agent:test --tests \"*M94EntitiesCombatDeathRespawnScenarioTest*\""
+      ],
+      "depends": [
+        "T01-04"
+      ],
+      "non_goals": [],
+      "notes": [],
+      "dispatch": "ready",
+      "materialize_after": [],
+      "leases": [
+        "CLIENT-RIG"
+      ],
+      "evidence_legs": [
+        "unit",
+        "wire",
+        "real-client-agent",
+        "persistence"
+      ]
+    },
+    {
+      "id": "T02-03",
+      "wave": "W02",
+      "title": "Заменить small full-cube fallback на точный common sturdy-face contract",
+      "priority": "P0",
+      "route": "playable",
+      "rows": [
+        "B1",
+        "B2"
+      ],
+      "kind": "implementation",
+      "locks": [
+        "RUST-DATA",
+        "RUST-NET-BLOCKS"
+      ],
+      "read": [
+        "crates/mc-data/src/block_facts.rs",
+        "crates/mc-net/src/play/block_placement.rs",
+        "crates/mc-net/src/play/block_placement_support_tests.rs"
+      ],
+      "write": [
+        "crates/mc-data/src/block_facts.rs",
+        "crates/mc-net/src/play/block_placement.rs",
+        "crates/mc-net/src/play/block_placement_support_tests.rs"
+      ],
+      "outcome": "Common vanilla supports (full blocks plus representative irregular faces) place torches/attachments correctly; known partial/unsturdy faces reject and resync.",
+      "discovery": [
+        "Derive table from local 26.1.2 data/decompile, not wiki memory",
+        "Start with torch/sign/door supports used in survival"
+      ],
+      "validation": [
+        "cargo test -p mc-data block_facts",
+        "cargo test -p mc-net block_placement_support"
+      ],
+      "depends": [
+        "T01-05"
+      ],
+      "non_goals": [
+        "Не реализовывать весь block behavior registry за один slice"
+      ],
+      "notes": [],
+      "dispatch": "ready",
+      "materialize_after": [],
+      "leases": [],
+      "evidence_legs": [
+        "unit",
+        "wire"
+      ]
+    },
+    {
+      "id": "T02-04",
+      "wave": "W02",
+      "title": "Закрыть stair neighbour-shape recomputation real-path proof",
+      "priority": "P0",
+      "route": "playable",
+      "rows": [
+        "B1"
+      ],
+      "kind": "implementation",
+      "locks": [
+        "RUST-NET-BLOCKS",
+        "RUST-HARNESS"
+      ],
+      "read": [
+        "crates/mc-net/src/play/block_placement.rs",
+        "crates/mc-net/src/play/block_placement_support_tests.rs",
+        "crates/mc-test-harness/tests/block_edit/stations_and_placement.rs"
+      ],
+      "write": [
+        "crates/mc-net/src/play/block_placement.rs",
+        "crates/mc-net/src/play/block_placement_support_tests.rs",
+        "crates/mc-test-harness/tests/block_edit/stations_and_placement.rs"
+      ],
+      "outcome": "Placing/removing adjacent stairs updates both authoritative states, wire updates and restart state; stale dependency rejects atomically.",
+      "discovery": [
+        "Use existing corner-shape unit table",
+        "Add one raw-TCP vertical path"
+      ],
+      "validation": [
+        "cargo test -p mc-net stair",
+        "cargo test -p mc-test-harness --test block_edit stair"
+      ],
+      "depends": [
+        "T02-03"
+      ],
+      "non_goals": [],
+      "notes": [],
+      "dispatch": "ready",
+      "materialize_after": [],
+      "leases": [],
+      "evidence_legs": [
+        "unit",
+        "wire"
+      ]
+    },
+    {
+      "id": "T02-05",
+      "wave": "W02",
+      "title": "Доказать door/trapdoor state convergence для двух клиентов",
+      "priority": "P0",
+      "route": "playable",
+      "rows": [
+        "B2",
+        "S2"
+      ],
+      "kind": "evidence-or-fix",
+      "locks": [
+        "RUST-NET-BLOCKS",
+        "CLIENT-JAVA"
+      ],
+      "read": [
+        "crates/mc-net/src/play/toggles.rs",
+        "crates/mc-net/src/play/block_wire.rs",
+        "client-mod/solaris-client-agent/java-agent/src/main/java/dev/solaris/agent/javaagent/PlayableRealClientLoopScenario.java"
+      ],
+      "write": [
+        "crates/mc-net/src/play/toggles.rs",
+        "crates/mc-net/src/play/tests.rs",
+        "client-mod/solaris-client-agent/java-agent/src/main/java/dev/solaris/agent/javaagent/PlayableRealClientLoopScenario.java"
+      ],
+      "outcome": "Actor toggles earned door/trapdoor; observer sees exact open/facing/half state; rapid stale retry cannot diverge halves or consume item.",
+      "discovery": [
+        "Reuse two-client block marker pattern",
+        "Separate door and trapdoor if production edits exceed budget"
+      ],
+      "validation": [
+        "cargo test -p mc-net toggle",
+        "cd client-mod/solaris-client-agent && ./gradlew :java-agent:test --tests \"*PlayableRealClientLoopScenarioTest*\"",
+        "focused two-client client gate"
+      ],
+      "depends": [
+        "T01-02"
+      ],
+      "non_goals": [],
+      "notes": [],
+      "dispatch": "ready",
+      "materialize_after": [],
+      "leases": [
+        "CLIENT-RIG"
+      ],
+      "evidence_legs": [
+        "unit",
+        "wire",
+        "concurrency"
+      ]
+    },
+    {
+      "id": "T02-06",
+      "wave": "W02",
+      "title": "Закрыть scheduled fluid spread + save/restart real-client path",
+      "priority": "P0",
+      "route": "playable",
+      "rows": [
+        "B3",
+        "S1",
+        "Q2"
+      ],
+      "kind": "evidence-or-fix",
+      "locks": [
+        "RUST-NET-BLOCKS",
+        "CLIENT-JAVA"
+      ],
+      "read": [
+        "crates/mc-net/src/play/fluids.rs",
+        "crates/mc-net/src/play/scheduled_blocks.rs",
+        "crates/mc-test-harness/tests/block_edit/fluid_scheduling.rs",
+        "client-mod/solaris-client-agent/java-agent/src/main/java/dev/solaris/agent/javaagent/M94WaterBucketScenario.java"
+      ],
+      "write": [
+        "crates/mc-test-harness/tests/block_edit/fluid_scheduling.rs",
+        "client-mod/solaris-client-agent/java-agent/src/main/java/dev/solaris/agent/javaagent/M94WaterBucketScenario.java",
+        "client-mod/solaris-client-agent/java-agent/src/test/java/dev/solaris/agent/javaagent/M94WaterBucketScenarioTest.java"
+      ],
+      "outcome": "Client places source, observes delayed spread, clean restart, observes persisted source/scheduled continuation or settled exact state; no duplicate tick.",
+      "discovery": [
+        "Prefer evidence-only if runtime already correct",
+        "Include lava-water representative as separate phase only if cheap"
+      ],
+      "validation": [
+        "cargo test -p mc-test-harness --test block_edit fluid_scheduling",
+        "cd client-mod/solaris-client-agent && ./gradlew :java-agent:test --tests \"*M94WaterBucketScenarioTest*\"",
+        "focused restart gate"
+      ],
+      "depends": [
+        "T01-02",
+        "T01-04"
+      ],
+      "non_goals": [],
+      "notes": [],
+      "dispatch": "ready",
+      "materialize_after": [],
+      "leases": [
+        "CLIENT-RIG"
+      ],
+      "evidence_legs": [
+        "unit",
+        "wire",
+        "real-client-agent",
+        "persistence"
+      ]
+    },
+    {
+      "id": "T02-07",
+      "wave": "W02",
+      "title": "Зафиксировать representative movement boundary matrix",
+      "priority": "P0",
+      "route": "playable",
+      "rows": [
+        "B5"
+      ],
+      "kind": "implementation",
+      "locks": [
+        "RUST-NET-SESSION"
+      ],
+      "read": [
+        "crates/mc-net/src/play/movement.rs",
+        "crates/mc-net/src/play/movement_tests.rs",
+        "crates/mc-net/src/play/session/player_pose_authority.rs",
+        "crates/mc-physics/src/lib.rs"
+      ],
+      "write": [
+        "crates/mc-net/src/play/movement_tests.rs",
+        "crates/mc-physics/src/lib.rs"
+      ],
+      "outcome": "Table-driven proof for step-up, long fall, crouch edge, swim/crouch body, powder snow/leather boots and non-finite rejection, using one authoritative geometry contract.",
+      "discovery": [
+        "Audit for duplicated height/shape constants",
+        "Add tests before changing behavior"
+      ],
+      "validation": [
+        "cargo test -p mc-physics",
+        "cargo test -p mc-net movement"
+      ],
+      "depends": [
+        "T02-01"
+      ],
+      "non_goals": [
+        "Не строить общий anti-cheat subsystem"
+      ],
+      "notes": [],
+      "dispatch": "ready",
+      "materialize_after": [],
+      "leases": [],
+      "evidence_legs": [
+        "unit",
+        "wire"
+      ]
+    },
+    {
+      "id": "T02-08",
+      "wave": "W02",
+      "title": "Закрыть chunk visibility/rejoin без ghost chunks",
+      "priority": "P0",
+      "route": "playable",
+      "rows": [
+        "C1",
+        "Q2"
+      ],
+      "kind": "evidence-or-fix",
+      "locks": [
+        "RUST-NET-CHUNK",
+        "CLIENT-JAVA"
+      ],
+      "read": [
+        "crates/mc-net/src/play/chunk_stream.rs",
+        "crates/mc-net/src/play/session/chunk_view_authority.rs",
+        "crates/mc-test-harness/tests/chunk_stream.rs",
+        "client-mod/solaris-client-agent/java-agent/src/main/java/dev/solaris/agent/javaagent/M94SaveRestartVisibilityScenario.java"
+      ],
+      "write": [
+        "crates/mc-test-harness/tests/chunk_stream.rs",
+        "client-mod/solaris-client-agent/java-agent/src/main/java/dev/solaris/agent/javaagent/M94SaveRestartVisibilityScenario.java"
+      ],
+      "outcome": "Move across view boundary, disconnect during/after prepare, reconnect: exact loaded set, no stale entity/block view, all required chunks eventually visible.",
+      "discovery": [
+        "First run existing join/rejoin path",
+        "Only edit server if exact ghost/missing chunk reproduces"
+      ],
+      "validation": [
+        "cargo test -p mc-test-harness --test chunk_stream",
+        "cd client-mod/solaris-client-agent && ./gradlew :java-agent:test --tests \"*M94SaveRestartVisibilityScenarioTest*\"",
+        "focused real-client gate"
+      ],
+      "depends": [
+        "T01-04"
+      ],
+      "non_goals": [],
+      "notes": [],
+      "dispatch": "ready",
+      "materialize_after": [],
+      "leases": [
+        "CLIENT-RIG"
+      ],
+      "evidence_legs": [
+        "unit",
+        "wire",
+        "real-client-agent"
+      ]
+    },
+    {
+      "id": "T03-01",
+      "wave": "W03",
+      "title": "Window-0 cursor rejection/resync conservation",
+      "priority": "P0",
+      "route": "playable",
+      "rows": [
+        "I1",
+        "Q3"
+      ],
+      "kind": "implementation",
+      "locks": [
+        "RUST-NET-CONTAINERS"
+      ],
+      "read": [
+        "crates/mc-net/src/play/inventory.rs",
+        "crates/mc-net/src/play/tests/inventory_and_survival.rs",
+        "crates/mc-test-harness/tests/block_edit/inventory_clicks.rs"
+      ],
+      "write": [
+        "crates/mc-net/src/play/inventory.rs",
+        "crates/mc-test-harness/tests/block_edit/inventory_clicks.rs"
+      ],
+      "outcome": "Malformed/stale click cannot move slot/cursor; exact state id and authoritative cursor/slots are resent; next valid click succeeds.",
+      "discovery": [
+        "Reuse existing malformed carried-item regression",
+        "Add recovery action after rejection"
+      ],
+      "validation": [
+        "cargo test -p mc-net inventory",
+        "cargo test -p mc-test-harness --test block_edit inventory_clicks"
+      ],
+      "depends": [
+        "T01-03",
+        "T01-06"
+      ],
+      "non_goals": [],
+      "notes": [],
+      "dispatch": "ready",
+      "materialize_after": [],
+      "leases": [],
+      "evidence_legs": [
+        "unit",
+        "wire",
+        "replay/negative"
+      ]
+    },
+    {
+      "id": "T03-02",
+      "wave": "W03",
+      "title": "Crafting-table max-craft и cursor conservation",
+      "priority": "P0",
+      "route": "playable",
+      "rows": [
+        "I1",
+        "I2"
+      ],
+      "kind": "implementation",
+      "locks": [
+        "RUST-NET-CONTAINERS"
+      ],
+      "read": [
+        "crates/mc-net/src/play/containers/crafting.rs",
+        "crates/mc-net/src/play/containers/crafting_tests.rs",
+        "crates/mc-test-harness/tests/block_edit/crafting_table.rs"
+      ],
+      "write": [
+        "crates/mc-net/src/play/containers/crafting.rs",
+        "crates/mc-net/src/play/containers/crafting_tests.rs",
+        "crates/mc-test-harness/tests/block_edit/crafting_table.rs"
+      ],
+      "outcome": "Normal take, shift-click/max craft, full inventory and stale state conserve inputs/output/cursor exactly; no partial craft.",
+      "discovery": [
+        "Keep recipe authority in mc-data",
+        "One recipe family first"
+      ],
+      "validation": [
+        "cargo test -p mc-net crafting",
+        "cargo test -p mc-test-harness --test block_edit crafting_table"
+      ],
+      "depends": [
+        "T03-01"
+      ],
+      "non_goals": [],
+      "notes": [],
+      "dispatch": "ready",
+      "materialize_after": [],
+      "leases": [],
+      "evidence_legs": [
+        "unit",
+        "wire"
+      ]
+    },
+    {
+      "id": "T03-03",
+      "wave": "W03",
+      "title": "Recipe-book discovery/window sync real-client gate",
+      "priority": "P0",
+      "route": "playable",
+      "rows": [
+        "I2",
+        "Q2"
+      ],
+      "kind": "evidence-or-fix",
+      "locks": [
+        "CLIENT-JAVA",
+        "RUST-NET-CONTAINERS"
+      ],
+      "read": [
+        "crates/mc-net/src/play/recipes.rs",
+        "crates/mc-protocol/src/packets/play.rs",
+        "client-mod/solaris-client-agent/java-agent/src/main/java/dev/solaris/agent/javaagent/M94InventoryCraftingScenario.java"
+      ],
+      "write": [
+        "client-mod/solaris-client-agent/java-agent/src/main/java/dev/solaris/agent/javaagent/M94InventoryCraftingScenario.java",
+        "client-mod/solaris-client-agent/java-agent/src/test/java/dev/solaris/agent/javaagent/M94InventoryCraftingScenarioTest.java"
+      ],
+      "outcome": "Fresh client sees expected recipe display IDs, uses inventory and table recipe placement, state remains coherent after close/reopen.",
+      "discovery": [
+        "Read recipe book through existing MCP tool",
+        "Server edit only after exact missing/incorrect packet is observed"
+      ],
+      "validation": [
+        "cargo test -p mc-net recipes",
+        "cd client-mod/solaris-client-agent && ./gradlew :java-agent:test --tests \"*M94InventoryCraftingScenarioTest*\"",
+        "focused client phase"
+      ],
+      "depends": [
+        "T01-03",
+        "T03-02"
+      ],
+      "non_goals": [],
+      "notes": [],
+      "dispatch": "ready",
+      "materialize_after": [],
+      "leases": [
+        "CLIENT-RIG"
+      ],
+      "evidence_legs": [
+        "unit",
+        "wire",
+        "real-client-agent"
+      ]
+    },
+    {
+      "id": "T03-04",
+      "wave": "W03",
+      "title": "Furnace/smoker/blast/campfire recipe execution representative client path",
+      "priority": "P1",
+      "route": "playable",
+      "rows": [
+        "I2",
+        "K1",
+        "E2"
+      ],
+      "kind": "evidence-or-fix",
+      "locks": [
+        "RUST-NET-CONTAINERS",
+        "CLIENT-JAVA"
+      ],
+      "read": [
+        "crates/mc-net/src/play/containers/furnace.rs",
+        "crates/mc-net/src/play/recipes.rs",
+        "crates/mc-test-harness/tests/block_edit/furnaces.rs",
+        "client-mod/solaris-client-agent/java-agent/src/main/java/dev/solaris/agent/javaagent/PlayableRealClientLoopScenario.java"
+      ],
+      "write": [
+        "crates/mc-test-harness/tests/block_edit/furnaces.rs",
+        "client-mod/solaris-client-agent/java-agent/src/main/java/dev/solaris/agent/javaagent/PlayableRealClientLoopScenario.java"
+      ],
+      "outcome": "At least one recipe per furnace family plus campfire uses sidecar facts, correct duration/output/fuel, close/reopen conservation and client-visible progress.",
+      "discovery": [
+        "Split campfire if write set collides",
+        "Do not duplicate recipes in Rust"
+      ],
+      "validation": [
+        "cargo test -p mc-test-harness --test block_edit furnaces",
+        "focused client phases"
+      ],
+      "depends": [
+        "T03-03"
+      ],
+      "non_goals": [],
+      "notes": [],
+      "dispatch": "ready",
+      "materialize_after": [],
+      "leases": [
+        "CLIENT-RIG"
+      ],
+      "evidence_legs": [
+        "unit",
+        "wire"
+      ]
+    },
+    {
+      "id": "T03-05",
+      "wave": "W03",
+      "title": "Chest max-stack metadata + malformed edge matrix",
+      "priority": "P0",
+      "route": "playable",
+      "rows": [
+        "K1",
+        "Q3"
+      ],
+      "kind": "implementation",
+      "locks": [
+        "RUST-NET-CONTAINERS"
+      ],
+      "read": [
+        "crates/mc-net/src/play/containers/chest.rs",
+        "crates/mc-net/src/play/containers/quickcraft.rs",
+        "crates/mc-test-harness/tests/block_edit/chests_and_hoppers.rs"
+      ],
+      "write": [
+        "crates/mc-net/src/play/containers/chest.rs",
+        "crates/mc-test-harness/tests/block_edit/chests_and_hoppers.rs"
+      ],
+      "outcome": "Pickup/quick-move/drag obey item max stack; impossible prediction/stale state fails closed and authoritative storage/cursor remains unchanged.",
+      "discovery": [
+        "Use mc-data item facts, no local max=64 copy",
+        "Cover one stack-1 and one stack-16 item"
+      ],
+      "validation": [
+        "cargo test -p mc-net chest",
+        "cargo test -p mc-test-harness --test block_edit chests_and_hoppers"
+      ],
+      "depends": [
+        "T03-01"
+      ],
+      "non_goals": [],
+      "notes": [],
+      "dispatch": "ready",
+      "materialize_after": [],
+      "leases": [],
+      "evidence_legs": [
+        "unit",
+        "wire",
+        "replay/negative"
+      ]
+    },
+    {
+      "id": "T03-06",
+      "wave": "W03",
+      "title": "Two-client shared chest concurrent-click real-client gate",
+      "priority": "P0",
+      "route": "playable",
+      "rows": [
+        "K1",
+        "S2",
+        "Q2"
+      ],
+      "kind": "evidence-or-fix",
+      "locks": [
+        "CLIENT-JAVA"
+      ],
+      "read": [
+        "client-mod/solaris-client-agent/java-agent/src/main/java/dev/solaris/agent/javaagent/PlayableRealClientLoopScenario.java",
+        "client-mod/solaris-client-agent/java-agent/src/test/java/dev/solaris/agent/javaagent/PlayableRealClientLoopScenarioTest.java"
+      ],
+      "write": [
+        "client-mod/solaris-client-agent/java-agent/src/main/java/dev/solaris/agent/javaagent/PlayableRealClientLoopScenario.java",
+        "client-mod/solaris-client-agent/java-agent/src/test/java/dev/solaris/agent/javaagent/PlayableRealClientLoopScenarioTest.java"
+      ],
+      "outcome": "Two clients race deposit/withdraw; exactly one authoritative outcome per item, both state IDs converge, close/reopen shows same contents.",
+      "discovery": [
+        "Reuse playable-31 marker and extend with an actual race",
+        "No operator item grants in final evidence"
+      ],
+      "validation": [
+        "cd client-mod/solaris-client-agent && ./gradlew :java-agent:test --tests \"*PlayableRealClientLoopScenarioTest*\"",
+        "focused two-client client gate"
+      ],
+      "depends": [
+        "T03-05"
+      ],
+      "non_goals": [],
+      "notes": [],
+      "dispatch": "ready",
+      "materialize_after": [],
+      "leases": [
+        "CLIENT-RIG"
+      ],
+      "evidence_legs": [
+        "unit",
+        "wire",
+        "real-client-agent",
+        "concurrency"
+      ]
+    },
+    {
+      "id": "T03-07",
+      "wave": "W03",
+      "title": "Two-client shared furnace concurrent-click real-client gate",
+      "priority": "P1",
+      "route": "playable",
+      "rows": [
+        "K1",
+        "S2",
+        "Q2"
+      ],
+      "kind": "evidence-or-fix",
+      "locks": [
+        "CLIENT-JAVA"
+      ],
+      "read": [
+        "client-mod/solaris-client-agent/java-agent/src/main/java/dev/solaris/agent/javaagent/M94InventoryCraftingScenario.java",
+        "client-mod/solaris-client-agent/java-agent/src/test/java/dev/solaris/agent/javaagent/M94InventoryCraftingScenarioTest.java"
+      ],
+      "write": [
+        "client-mod/solaris-client-agent/java-agent/src/main/java/dev/solaris/agent/javaagent/M94InventoryCraftingScenario.java",
+        "client-mod/solaris-client-agent/java-agent/src/test/java/dev/solaris/agent/javaagent/M94InventoryCraftingScenarioTest.java"
+      ],
+      "outcome": "Live peer updates, stale click rejection and output contention converge for both clients without duplication/loss.",
+      "discovery": [
+        "Use existing two-protocol-client stale-click fixtures as server baseline",
+        "Client scenario only adds observations/actions"
+      ],
+      "validation": [
+        "cd client-mod/solaris-client-agent && ./gradlew :java-agent:test --tests \"*M94InventoryCraftingScenarioTest*\"",
+        "focused two-client client gate"
+      ],
+      "depends": [
+        "T03-04"
+      ],
+      "non_goals": [],
+      "notes": [],
+      "dispatch": "ready",
+      "materialize_after": [],
+      "leases": [
+        "CLIENT-RIG"
+      ],
+      "evidence_legs": [
+        "unit",
+        "wire",
+        "real-client-agent",
+        "concurrency"
+      ]
+    },
+    {
+      "id": "T03-08",
+      "wave": "W03",
+      "title": "Two-client container save/restart convergence",
+      "priority": "P0",
+      "route": "playable",
+      "rows": [
+        "K1",
+        "S1",
+        "S2"
+      ],
+      "kind": "evidence-or-fix",
+      "locks": [
+        "CLIENT-JAVA",
+        "RUNNER"
+      ],
+      "read": [
+        "client-mod/solaris-client-agent/java-agent/src/main/java/dev/solaris/agent/javaagent/M94SaveRestartVisibilityScenario.java",
+        "tools/real-client-agent-driver.py",
+        "crates/mc-test-harness/tests/block_edit/persistence.rs"
+      ],
+      "write": [
+        "client-mod/solaris-client-agent/java-agent/src/main/java/dev/solaris/agent/javaagent/M94SaveRestartVisibilityScenario.java",
+        "tools/real-client-agent-driver.py"
+      ],
+      "outcome": "After concurrent chest/furnace activity, save/restart/rejoin yields exact backing storage and both clients see it; cursor/open-window transient state is explicitly classified.",
+      "discovery": [
+        "Reuse restart invariant snapshot from T01-04",
+        "One container family may close this task; second becomes follow-up"
+      ],
+      "validation": [
+        "python -m py_compile tools/real-client-agent-driver.py",
+        "cargo test -p mc-test-harness --test block_edit persistence",
+        "focused restart client gate"
+      ],
+      "depends": [
+        "T01-04",
+        "T03-06"
+      ],
+      "non_goals": [],
+      "notes": [],
+      "dispatch": "ready",
+      "materialize_after": [],
+      "leases": [
+        "CLIENT-RIG"
+      ],
+      "evidence_legs": [
+        "unit",
+        "wire",
+        "persistence",
+        "concurrency"
+      ]
+    },
+    {
+      "id": "T04-01",
+      "wave": "W04",
+      "title": "Dropped item merge: exact identity/count/age/version conservation",
+      "priority": "P0",
+      "route": "playable",
+      "rows": [
+        "L2"
+      ],
+      "kind": "implementation",
+      "locks": [
+        "RUST-ENTITY",
+        "RUST-NET-SESSION"
+      ],
+      "read": [
+        "crates/mc-net/src/play/session/pickups.rs",
+        "crates/mc-entity/src/runtime_26_1_2/transaction.rs",
+        "crates/mc-test-harness/tests/block_edit/survival_lifecycle.rs"
+      ],
+      "write": [
+        "crates/mc-net/src/play/session/pickups.rs",
+        "crates/mc-entity/src/runtime_26_1_2/transaction.rs",
+        "crates/mc-test-harness/tests/block_edit/survival_lifecycle.rs"
+      ],
+      "outcome": "Compatible nearby stacks merge once under owner CAS; incompatible/full stacks do not; tracker/publication removes old identity and publishes survivor.",
+      "discovery": [
+        "Verify whether merge is absent or only unproved",
+        "No full-store scans"
+      ],
+      "validation": [
+        "cargo test -p mc-entity runtime_26_1_2",
+        "cargo test -p mc-net pickup",
+        "cargo test -p mc-test-harness --test block_edit survival_lifecycle"
+      ],
+      "depends": [
+        "T00-06"
+      ],
+      "non_goals": [],
+      "notes": [],
+      "dispatch": "ready",
+      "materialize_after": [],
+      "leases": [],
+      "evidence_legs": [
+        "unit",
+        "wire"
+      ]
+    },
+    {
+      "id": "T04-02",
+      "wave": "W04",
+      "title": "Partial pickup и overflow conservation",
+      "priority": "P0",
+      "route": "playable",
+      "rows": [
+        "L2",
+        "I1"
+      ],
+      "kind": "implementation",
+      "locks": [
+        "RUST-NET-SESSION"
+      ],
+      "read": [
+        "crates/mc-net/src/play/session/pickups.rs",
+        "crates/mc-net/src/play/session/player_state.rs",
+        "crates/mc-test-harness/tests/block_edit/survival_inventory.rs"
+      ],
+      "write": [
+        "crates/mc-net/src/play/session/pickups.rs",
+        "crates/mc-test-harness/tests/block_edit/survival_inventory.rs"
+      ],
+      "outcome": "Full/near-full inventory picks only admissible count; remainder keeps identity/count; disconnect/stale owner cannot partially commit.",
+      "discovery": [
+        "Use exact inventory transaction path",
+        "Include stack-limit metadata"
+      ],
+      "validation": [
+        "cargo test -p mc-net pickup",
+        "cargo test -p mc-test-harness --test block_edit survival_inventory"
+      ],
+      "depends": [
+        "T04-01",
+        "T03-05"
+      ],
+      "non_goals": [],
+      "notes": [],
+      "dispatch": "ready",
+      "materialize_after": [],
+      "leases": [],
+      "evidence_legs": [
+        "unit",
+        "wire"
+      ]
+    },
+    {
+      "id": "T04-03",
+      "wave": "W04",
+      "title": "Item despawn deadline + restart proof",
+      "priority": "P0",
+      "route": "architecture",
+      "rows": [
+        "L2",
+        "S1"
+      ],
+      "kind": "evidence-or-fix",
+      "locks": [
+        "RUST-NET-SESSION",
+        "RUST-HARNESS"
+      ],
+      "read": [
+        "crates/mc-net/src/play/simulation.rs",
+        "crates/mc-net/src/play/persistence.rs",
+        "crates/mc-test-harness/tests/persistence_inventory.rs"
+      ],
+      "write": [
+        "crates/mc-test-harness/tests/persistence_inventory.rs"
+      ],
+      "outcome": "Persisted spawn_tick reconstructs exact deadline; before/after restart item neither despawns early nor lives forever; stale index IDs are bounded.",
+      "discovery": [
+        "Current architecture memory says index exists: prefer verification-only",
+        "Edit production only on red"
+      ],
+      "validation": [
+        "cargo test -p mc-net item_despawn",
+        "cargo test -p mc-test-harness --test persistence_inventory"
+      ],
+      "depends": [
+        "T00-06"
+      ],
+      "non_goals": [],
+      "notes": [],
+      "dispatch": "ready",
+      "materialize_after": [],
+      "leases": [],
+      "evidence_legs": [
+        "unit",
+        "wire",
+        "persistence"
+      ]
+    },
+    {
+      "id": "T04-04",
+      "wave": "W04",
+      "title": "Two-client shared pickup contention real-client gate",
+      "priority": "P0",
+      "route": "playable",
+      "rows": [
+        "L2",
+        "S2",
+        "Q2"
+      ],
+      "kind": "evidence-or-fix",
+      "locks": [
+        "CLIENT-JAVA"
+      ],
+      "read": [
+        "client-mod/solaris-client-agent/java-agent/src/main/java/dev/solaris/agent/javaagent/PlayableRealClientLoopScenario.java",
+        "client-mod/solaris-client-agent/java-agent/src/test/java/dev/solaris/agent/javaagent/PlayableRealClientLoopScenarioTest.java"
+      ],
+      "write": [
+        "client-mod/solaris-client-agent/java-agent/src/main/java/dev/solaris/agent/javaagent/PlayableRealClientLoopScenario.java",
+        "client-mod/solaris-client-agent/java-agent/src/test/java/dev/solaris/agent/javaagent/PlayableRealClientLoopScenarioTest.java"
+      ],
+      "outcome": "Both clients race one visible item/XP reward; exactly one credit, both see removal, reconnect/reopen inventory confirms conservation.",
+      "discovery": [
+        "Extend playable-30/38 rather than create duplicate framework",
+        "Separate XP if item path is already large"
+      ],
+      "validation": [
+        "cd client-mod/solaris-client-agent && ./gradlew :java-agent:test --tests \"*PlayableRealClientLoopScenarioTest*\"",
+        "focused two-client gate"
+      ],
+      "depends": [
+        "T04-02"
+      ],
+      "non_goals": [],
+      "notes": [],
+      "dispatch": "ready",
+      "materialize_after": [],
+      "leases": [
+        "CLIENT-RIG"
+      ],
+      "evidence_legs": [
+        "unit",
+        "wire",
+        "real-client-agent",
+        "concurrency"
+      ]
+    },
+    {
+      "id": "T04-05",
+      "wave": "W04",
+      "title": "Loot executor: random count ranges и multiple rolls core slice",
+      "priority": "P1",
+      "route": "parity",
+      "rows": [
+        "L1"
+      ],
+      "kind": "implementation",
+      "locks": [
+        "RUST-DATA"
+      ],
+      "read": [
+        "crates/mc-data/src/loot.rs",
+        "crates/mc-data/src/loot/entity_26_1_2/evaluate.rs",
+        "crates/mc-data/tests/loot_context.rs"
+      ],
+      "write": [
+        "crates/mc-data/src/loot.rs",
+        "crates/mc-data/src/loot/entity_26_1_2/evaluate.rs",
+        "crates/mc-data/tests/loot_context.rs"
+      ],
+      "outcome": "One representative block and entity table execute bounded deterministic seeded ranges/rolls matching local vanilla oracle; unsupported shapes remain explicit.",
+      "discovery": [
+        "Start from current compile/evaluate model",
+        "Seed is test input, not production deterministic cheat"
+      ],
+      "validation": [
+        "cargo test -p mc-data loot"
+      ],
+      "depends": [
+        "T00-04"
+      ],
+      "non_goals": [],
+      "notes": [],
+      "dispatch": "ready",
+      "materialize_after": [],
+      "leases": [],
+      "evidence_legs": [
+        "unit",
+        "wire"
+      ]
+    },
+    {
+      "id": "T04-06",
+      "wave": "W04",
+      "title": "Loot context vertical slice: Fortune/Silk/Looting/burning",
+      "priority": "P1",
+      "route": "parity",
+      "rows": [
+        "L1",
+        "G1"
+      ],
+      "kind": "implementation",
+      "locks": [
+        "RUST-DATA",
+        "RUST-ENTITY"
+      ],
+      "read": [
+        "crates/mc-data/src/loot/context.rs",
+        "crates/mc-data/src/loot/entity_26_1_2/evaluate.rs",
+        "crates/mc-entity/src/equipment_26_1_2/drops.rs"
+      ],
+      "write": [
+        "crates/mc-data/src/loot/context.rs",
+        "crates/mc-data/src/loot/entity_26_1_2/evaluate.rs",
+        "crates/mc-data/tests/loot_context.rs"
+      ],
+      "outcome": "Exactly one block tool context and one entity killer context use authoritative equipment/effect facts and match oracle output; unsupported combinations fail explicitly.",
+      "discovery": [
+        "Do not expose live ECS handles to mc-data",
+        "Pass immutable bounded context DTO"
+      ],
+      "validation": [
+        "cargo test -p mc-data loot_context",
+        "cargo test -p mc-entity equipment"
+      ],
+      "depends": [
+        "T04-05"
+      ],
+      "non_goals": [],
+      "notes": [],
+      "dispatch": "ready",
+      "materialize_after": [],
+      "leases": [],
+      "evidence_legs": [
+        "unit",
+        "wire"
+      ]
+    },
+    {
+      "id": "T04-07",
+      "wave": "W04",
+      "title": "Renewable wheat → bread lifecycle real-client gate",
+      "priority": "P0",
+      "route": "playable",
+      "rows": [
+        "F1",
+        "I2",
+        "Q2"
+      ],
+      "kind": "evidence-or-fix",
+      "locks": [
+        "CLIENT-JAVA",
+        "RUST-NET-BLOCKS"
+      ],
+      "read": [
+        "crates/mc-test-harness/tests/block_edit/wheat_seed_source.rs",
+        "crates/mc-test-harness/tests/block_edit/wheat_harvest.rs",
+        "client-mod/solaris-client-agent/java-agent/src/main/java/dev/solaris/agent/javaagent/PlayableRealClientLoopScenario.java"
+      ],
+      "write": [
+        "client-mod/solaris-client-agent/java-agent/src/main/java/dev/solaris/agent/javaagent/PlayableRealClientLoopScenario.java",
+        "client-mod/solaris-client-agent/java-agent/src/test/java/dev/solaris/agent/javaagent/PlayableRealClientLoopScenarioTest.java"
+      ],
+      "outcome": "No-debug client obtains seeds, plants, grows/bonemeals or waits on exact tick event, harvests mature crop, replants and crafts/eats bread.",
+      "discovery": [
+        "Reuse playable-43",
+        "No elapsed-time success; wait for state changes"
+      ],
+      "validation": [
+        "cargo test -p mc-test-harness --test block_edit wheat",
+        "cd client-mod/solaris-client-agent && ./gradlew :java-agent:test --tests \"*PlayableRealClientLoopScenarioTest*\"",
+        "focused client gate"
+      ],
+      "depends": [
+        "T03-03"
+      ],
+      "non_goals": [],
+      "notes": [],
+      "dispatch": "ready",
+      "materialize_after": [],
+      "leases": [
+        "CLIENT-RIG"
+      ],
+      "evidence_legs": [
+        "unit",
+        "wire",
+        "real-client-agent"
+      ]
+    },
+    {
+      "id": "T04-08",
+      "wave": "W04",
+      "title": "Sugar cane/cactus support cascade representative parity",
+      "priority": "P1",
+      "route": "parity",
+      "rows": [
+        "F3"
+      ],
+      "kind": "implementation",
+      "locks": [
+        "RUST-NET-BLOCKS",
+        "RUST-HARNESS"
+      ],
+      "read": [
+        "crates/mc-net/src/play/plants.rs",
+        "crates/mc-test-harness/tests/block_edit/vertical_plant_growth.rs",
+        "crates/mc-test-harness/tests/block_edit/plant_lifecycle.rs"
+      ],
+      "write": [
+        "crates/mc-net/src/play/plants.rs",
+        "crates/mc-test-harness/tests/block_edit/vertical_plant_growth.rs"
+      ],
+      "outcome": "Place/grow/remove support and side-neighbor paths cascade correct states/drops; special/bucket mutation revalidates support; one oracle-backed family table.",
+      "discovery": [
+        "Cactus damage/collision is a separate task if not already local",
+        "No full plant rewrite"
+      ],
+      "validation": [
+        "cargo test -p mc-net plant",
+        "cargo test -p mc-test-harness --test block_edit vertical_plant_growth"
+      ],
+      "depends": [
+        "T01-05"
+      ],
+      "non_goals": [],
+      "notes": [],
+      "dispatch": "ready",
+      "materialize_after": [],
+      "leases": [
+        "ORACLE-RIG"
+      ],
+      "evidence_legs": [
+        "unit",
+        "wire"
+      ]
+    },
+    {
+      "id": "T05-01",
+      "wave": "W05",
+      "title": "Common damage-source matrix + exact rejection boundaries",
+      "priority": "P0",
+      "route": "parity",
+      "rows": [
+        "G1"
+      ],
+      "kind": "implementation",
+      "locks": [
+        "RUST-ENTITY",
+        "RUST-NET-SESSION"
+      ],
+      "read": [
+        "crates/mc-entity/src/living_26_1_2/damage.rs",
+        "crates/mc-entity/src/living_26_1_2/tests.rs",
+        "crates/mc-net/src/play/player_damage_adapter.rs"
+      ],
+      "write": [
+        "crates/mc-entity/src/living_26_1_2/tests.rs",
+        "crates/mc-net/src/play/player_damage_adapter.rs"
+      ],
+      "outcome": "Melee, projectile, fall, fire/lava, drowning, suffocation and starvation share authoritative reductions/immunities; non-finite/unsupported paths fail closed.",
+      "discovery": [
+        "First audit current supported matrix",
+        "Implement only missing common source"
+      ],
+      "validation": [
+        "cargo test -p mc-entity living_26_1_2",
+        "cargo test -p mc-net player_damage"
+      ],
+      "depends": [
+        "T00-06"
+      ],
+      "non_goals": [],
+      "notes": [],
+      "dispatch": "ready",
+      "materialize_after": [],
+      "leases": [],
+      "evidence_legs": [
+        "unit",
+        "wire"
+      ]
+    },
+    {
+      "id": "T05-02",
+      "wave": "W05",
+      "title": "Arrow lifecycle: spawn/flight/hit/stick/pickup representative oracle",
+      "priority": "P1",
+      "route": "parity",
+      "rows": [
+        "G2"
+      ],
+      "kind": "implementation",
+      "locks": [
+        "RUST-ENTITY",
+        "RUST-NET-SESSION"
+      ],
+      "read": [
+        "crates/mc-entity/src/projectile_26_1_2/arrow.rs",
+        "crates/mc-entity/src/projectile_26_1_2/arrow_tests.rs",
+        "crates/mc-net/src/play/session/projectiles.rs"
+      ],
+      "write": [
+        "crates/mc-entity/src/projectile_26_1_2/arrow.rs",
+        "crates/mc-entity/src/projectile_26_1_2/arrow_tests.rs",
+        "crates/mc-net/src/play/session/projectiles_tests.rs"
+      ],
+      "outcome": "Ordinary bow arrow matches local 26.1.2 gravity/drag/hit order and visible metadata; stale target/removal/pickup cannot duplicate.",
+      "discovery": [
+        "Ordinary arrow only",
+        "Tipped/spectral/crossbow deferred"
+      ],
+      "validation": [
+        "cargo test -p mc-entity projectile_26_1_2",
+        "cargo test -p mc-net projectiles"
+      ],
+      "depends": [
+        "T05-01"
+      ],
+      "non_goals": [],
+      "notes": [],
+      "dispatch": "ready",
+      "materialize_after": [],
+      "leases": [
+        "ORACLE-RIG"
+      ],
+      "evidence_legs": [
+        "unit",
+        "wire"
+      ]
+    },
+    {
+      "id": "T05-03",
+      "wave": "W05",
+      "title": "Shield angle/timing + axe-disable representative path",
+      "priority": "P1",
+      "route": "parity",
+      "rows": [
+        "G3"
+      ],
+      "kind": "implementation",
+      "locks": [
+        "RUST-NET-SESSION",
+        "RUST-ENTITY"
+      ],
+      "read": [
+        "crates/mc-net/src/play/combat/player_actions.rs",
+        "crates/mc-net/src/play/combat/player_damage.rs",
+        "crates/mc-entity/src/equipment_26_1_2/durability.rs"
+      ],
+      "write": [
+        "crates/mc-net/src/play/combat/player_actions.rs",
+        "crates/mc-net/src/play/tests.rs"
+      ],
+      "outcome": "Front-angle timely block prevents damage and consumes durability; back/late hit does not; axe disable duration comes from oracle facts and publishes correct state.",
+      "discovery": [
+        "Keep exact source/item scope bounded",
+        "No enchantment breadth"
+      ],
+      "validation": [
+        "cargo test -p mc-net shield",
+        "cargo test -p mc-entity equipment"
+      ],
+      "depends": [
+        "T05-01"
+      ],
+      "non_goals": [],
+      "notes": [],
+      "dispatch": "ready",
+      "materialize_after": [],
+      "leases": [],
+      "evidence_legs": [
+        "unit",
+        "wire"
+      ]
+    },
+    {
+      "id": "T05-04",
+      "wave": "W05",
+      "title": "Player death inventory/XP drop conservation",
+      "priority": "P0",
+      "route": "playable",
+      "rows": [
+        "G4",
+        "L2",
+        "S1"
+      ],
+      "kind": "implementation",
+      "locks": [
+        "RUST-NET-SESSION",
+        "RUST-ENTITY"
+      ],
+      "read": [
+        "crates/mc-net/src/play/session/player_state.rs",
+        "crates/mc-net/src/play/session/entity_lifecycle.rs",
+        "crates/mc-test-harness/tests/block_edit/survival_lifecycle.rs"
+      ],
+      "write": [
+        "crates/mc-net/src/play/session/player_state.rs",
+        "crates/mc-test-harness/tests/block_edit/survival_lifecycle.rs"
+      ],
+      "outcome": "One authoritative death commit produces exact item/XP consequences once; keepInventory/mode rules explicit; respawn cannot reclaim stale inventory.",
+      "discovery": [
+        "Use one compound transaction/outbox boundary",
+        "Do not infer killer attribution if facts absent"
+      ],
+      "validation": [
+        "cargo test -p mc-net death",
+        "cargo test -p mc-test-harness --test block_edit survival_lifecycle"
+      ],
+      "depends": [
+        "T02-02",
+        "T04-02"
+      ],
+      "non_goals": [],
+      "notes": [],
+      "dispatch": "ready",
+      "materialize_after": [],
+      "leases": [],
+      "evidence_legs": [
+        "unit",
+        "wire",
+        "persistence"
+      ]
+    },
+    {
+      "id": "T05-05",
+      "wave": "W05",
+      "title": "Two-client contested death drops + restart",
+      "priority": "P0",
+      "route": "playable",
+      "rows": [
+        "G4",
+        "S1",
+        "S2",
+        "Q2"
+      ],
+      "kind": "evidence-or-fix",
+      "locks": [
+        "CLIENT-JAVA",
+        "RUNNER"
+      ],
+      "read": [
+        "client-mod/solaris-client-agent/java-agent/src/main/java/dev/solaris/agent/javaagent/PlayableRealClientLoopScenario.java",
+        "tools/real-client-agent-driver.py"
+      ],
+      "write": [
+        "client-mod/solaris-client-agent/java-agent/src/main/java/dev/solaris/agent/javaagent/PlayableRealClientLoopScenario.java",
+        "tools/real-client-agent-driver.py"
+      ],
+      "outcome": "Observer sees death/drops, both race pickup, exactly one credit, victim respawns, save/restart preserves final inventories and no dropped duplicate.",
+      "discovery": [
+        "Reuse playable-37/38 and restart snapshot",
+        "Separate item and XP phases if needed"
+      ],
+      "validation": [
+        "cd client-mod/solaris-client-agent && ./gradlew :java-agent:test --tests \"*PlayableRealClientLoopScenarioTest*\"",
+        "python -m py_compile tools/real-client-agent-driver.py",
+        "focused restart gate"
+      ],
+      "depends": [
+        "T05-04",
+        "T04-04",
+        "T01-04"
+      ],
+      "non_goals": [],
+      "notes": [],
+      "dispatch": "ready",
+      "materialize_after": [],
+      "leases": [
+        "CLIENT-RIG"
+      ],
+      "evidence_legs": [
+        "unit",
+        "wire",
+        "real-client-agent",
+        "persistence",
+        "concurrency"
+      ]
+    },
+    {
+      "id": "T05-06",
+      "wave": "W05",
+      "title": "Entity snapshot version fence across owner/wire/persistence",
+      "priority": "P0",
+      "route": "architecture",
+      "rows": [
+        "N1",
+        "O2"
+      ],
+      "kind": "implementation",
+      "locks": [
+        "RUST-ENTITY",
+        "RUST-NET-SESSION"
+      ],
+      "read": [
+        "crates/mc-entity/src/runtime_26_1_2/state.rs",
+        "crates/mc-entity/src/regional.rs",
+        "crates/mc-net/src/play/session/entity_owner.rs",
+        "crates/mc-net/src/play/wire_entities.rs"
+      ],
+      "write": [
+        "crates/mc-entity/src/runtime_26_1_2/tests.rs",
+        "crates/mc-net/src/play/wire_entities_tests.rs"
+      ],
+      "outcome": "One version-fenced snapshot is used by wire/persistence/collision/damage/equipment; stale publication/CAS/death/restart tests prove no side-map authority wins.",
+      "discovery": [
+        "Inventory current side maps first",
+        "Delete duplicate only after callers move"
+      ],
+      "validation": [
+        "cargo test -p mc-entity runtime_26_1_2",
+        "cargo test -p mc-net wire_entities"
+      ],
+      "depends": [
+        "T00-06"
+      ],
+      "non_goals": [],
+      "notes": [],
+      "dispatch": "ready",
+      "materialize_after": [],
+      "leases": [],
+      "evidence_legs": [
+        "unit",
+        "wire",
+        "performance"
+      ]
+    },
+    {
+      "id": "T05-07",
+      "wave": "W05",
+      "title": "Entity spawn/despawn cap + restart invariants",
+      "priority": "P1",
+      "route": "playable",
+      "rows": [
+        "N1",
+        "S1"
+      ],
+      "kind": "implementation",
+      "locks": [
+        "RUST-NET-SESSION",
+        "RUST-ENTITY"
+      ],
+      "read": [
+        "crates/mc-net/src/play/session/entity_lifecycle.rs",
+        "crates/mc-net/src/play/session/herd_spawn_authority.rs",
+        "crates/mc-net/src/play/persistence.rs"
+      ],
+      "write": [
+        "crates/mc-net/src/play/session/entity_lifecycle.rs",
+        "crates/mc-net/src/play/session/tests.rs"
+      ],
+      "outcome": "Natural spawn respects active chunks/caps; unload/despawn/restart restores exactly allowed entities without duplicate materialization.",
+      "discovery": [
+        "Representative passive + hostile class",
+        "No species-wide AI expansion"
+      ],
+      "validation": [
+        "cargo test -p mc-net spawn",
+        "cargo test -p mc-entity regional"
+      ],
+      "depends": [
+        "T05-06"
+      ],
+      "non_goals": [],
+      "notes": [],
+      "dispatch": "ready",
+      "materialize_after": [],
+      "leases": [],
+      "evidence_legs": [
+        "unit",
+        "wire",
+        "persistence"
+      ]
+    },
+    {
+      "id": "T05-08",
+      "wave": "W05",
+      "title": "Representative species AI/pathing parity table + client proof",
+      "priority": "P1",
+      "route": "parity",
+      "rows": [
+        "N1"
+      ],
+      "kind": "implementation",
+      "locks": [
+        "RUST-ENTITY",
+        "CLIENT-JAVA"
+      ],
+      "read": [
+        "crates/mc-entity/src/ai_core_26_1_2/goal_policy.rs",
+        "crates/mc-entity/src/navigation_26_1_2/",
+        "crates/mc-net/src/play/session/entity_goal_defaults.rs",
+        "client-mod/solaris-client-agent/java-agent/src/main/java/dev/solaris/agent/javaagent/PlayableRealClientLoopScenario.java"
+      ],
+      "write": [
+        "crates/mc-entity/src/ai_core_26_1_2/goal_policy_tests.rs",
+        "crates/mc-net/src/play/session/pathing_tests.rs",
+        "client-mod/solaris-client-agent/java-agent/src/main/java/dev/solaris/agent/javaagent/PlayableRealClientLoopScenario.java"
+      ],
+      "outcome": "Zombie, sheep/cow and fish each have oracle-backed default goal/material predicates and one bounded client motion/interaction proof under budget.",
+      "discovery": [
+        "Do not chase every vanilla goal",
+        "No full species tree"
+      ],
+      "validation": [
+        "cargo test -p mc-entity ai_core_26_1_2",
+        "cargo test -p mc-net pathing",
+        "focused client gate"
+      ],
+      "depends": [
+        "T05-07"
+      ],
+      "non_goals": [],
+      "notes": [],
+      "dispatch": "ready",
+      "materialize_after": [],
+      "leases": [
+        "CLIENT-RIG"
+      ],
+      "evidence_legs": [
+        "unit",
+        "wire"
+      ]
+    },
+    {
+      "id": "T06-01",
+      "wave": "W06",
+      "title": "Fault injection: campfire world + entity/drop journal outcome",
+      "priority": "P0",
+      "route": "architecture",
+      "rows": [
+        "E2",
+        "S1",
+        "O2"
+      ],
+      "kind": "implementation",
+      "locks": [
+        "RUST-NET-ROOT",
+        "RUST-WORLD"
+      ],
+      "read": [
+        "crates/mc-net/src/play/campfire.rs",
+        "crates/mc-net/src/play/world_journal.rs",
+        "crates/mc-net/src/play/persistence.rs",
+        "crates/mc-test-harness/tests/block_edit/campfire.rs"
+      ],
+      "write": [
+        "crates/mc-test-harness/tests/block_edit/campfire.rs",
+        "crates/mc-net/src/play/world_journal.rs"
+      ],
+      "outcome": "Crashes/failpoints before/after append, durable watermark, publication and compaction recover exactly one cooked output/state, never zero+lost or duplicate.",
+      "discovery": [
+        "Prefer test failpoint hooks scoped to harness",
+        "No sleeps/polling"
+      ],
+      "validation": [
+        "cargo test -p mc-test-harness --test block_edit campfire",
+        "cargo test -p mc-net world_journal"
+      ],
+      "depends": [
+        "T00-06"
+      ],
+      "non_goals": [],
+      "notes": [],
+      "dispatch": "ready",
+      "materialize_after": [],
+      "leases": [],
+      "evidence_legs": [
+        "unit",
+        "wire",
+        "persistence",
+        "performance"
+      ]
+    },
+    {
+      "id": "T06-02",
+      "wave": "W06",
+      "title": "Fault injection: chained/simultaneous TNT world/entity outcome",
+      "priority": "P0",
+      "route": "architecture",
+      "rows": [
+        "G1",
+        "S1",
+        "O2"
+      ],
+      "kind": "implementation",
+      "locks": [
+        "RUST-NET-ROOT",
+        "RUST-WORLD",
+        "RUST-ENTITY"
+      ],
+      "read": [
+        "crates/mc-net/src/play/explosions.rs",
+        "crates/mc-net/src/play/session/explosion_authority.rs",
+        "crates/mc-net/src/play/world_journal.rs",
+        "crates/mc-test-harness/tests/block_edit/explosions.rs"
+      ],
+      "write": [
+        "crates/mc-test-harness/tests/block_edit/explosions.rs",
+        "crates/mc-net/src/play/session/explosion_authority.rs"
+      ],
+      "outcome": "Restart at each durable boundary yields at-most-once explosion/removal and exact block/entity damage result; chained TNT cannot replay twice.",
+      "discovery": [
+        "One deterministic small fixture",
+        "No broad blast parity"
+      ],
+      "validation": [
+        "cargo test -p mc-test-harness --test block_edit explosions",
+        "cargo test -p mc-net explosion"
+      ],
+      "depends": [
+        "T06-01"
+      ],
+      "non_goals": [],
+      "notes": [],
+      "dispatch": "ready",
+      "materialize_after": [],
+      "leases": [],
+      "evidence_legs": [
+        "unit",
+        "wire",
+        "persistence",
+        "performance"
+      ]
+    },
+    {
+      "id": "T06-03",
+      "wave": "W06",
+      "title": "Fault injection: cross-region hopper compound commit",
+      "priority": "P0",
+      "route": "architecture",
+      "rows": [
+        "A1",
+        "K1",
+        "S1",
+        "O2"
+      ],
+      "kind": "implementation",
+      "locks": [
+        "RUST-NET-ROOT",
+        "RUST-WORLD"
+      ],
+      "read": [
+        "crates/mc-net/src/play/simulation/regional_mutation.rs",
+        "crates/mc-net/src/play/containers.rs",
+        "crates/mc-test-harness/tests/block_edit/chests_and_hoppers.rs"
+      ],
+      "write": [
+        "crates/mc-test-harness/tests/block_edit/chests_and_hoppers.rs",
+        "crates/mc-net/src/play/simulation/regional_mutation.rs"
+      ],
+      "outcome": "Source/destination/cooldown commit atomically across region boundary; crash/retry cannot duplicate or lose item; stale version rejects whole mutation.",
+      "discovery": [
+        "Single-item transfer first",
+        "No hopper minecart"
+      ],
+      "validation": [
+        "cargo test -p mc-test-harness --test block_edit chests_and_hoppers",
+        "cargo test -p mc-net regional_mutation"
+      ],
+      "depends": [
+        "T06-01"
+      ],
+      "non_goals": [],
+      "notes": [],
+      "dispatch": "ready",
+      "materialize_after": [],
+      "leases": [],
+      "evidence_legs": [
+        "unit",
+        "wire",
+        "persistence",
+        "performance"
+      ]
+    },
+    {
+      "id": "T06-04",
+      "wave": "W06",
+      "title": "Shutdown while journal/checkpoint outcome is unknown",
+      "priority": "P0",
+      "route": "architecture",
+      "rows": [
+        "S1",
+        "O2"
+      ],
+      "kind": "implementation",
+      "locks": [
+        "RUST-NET-ROOT",
+        "RUST-WORLD"
+      ],
+      "read": [
+        "crates/mc-net/src/server.rs",
+        "crates/mc-net/src/play/world_journal.rs",
+        "crates/mc-net/src/play/persistence.rs",
+        "crates/mc-server/tests/play.rs"
+      ],
+      "write": [
+        "crates/mc-server/tests/play.rs",
+        "crates/mc-net/src/server.rs"
+      ],
+      "outcome": "Graceful stop drains admitted owner work, resolves/records unknown journal outcome, performs final save in correct order and restart replays exactly once.",
+      "discovery": [
+        "Use exact notifications/failpoints",
+        "Timeout only fails"
+      ],
+      "validation": [
+        "cargo test -p mc-server --test play shutdown",
+        "cargo test -p mc-net persistence"
+      ],
+      "depends": [
+        "T06-01",
+        "T06-03"
+      ],
+      "non_goals": [],
+      "notes": [],
+      "dispatch": "ready",
+      "materialize_after": [],
+      "leases": [],
+      "evidence_legs": [
+        "unit",
+        "wire",
+        "persistence",
+        "performance"
+      ]
+    },
+    {
+      "id": "T06-05",
+      "wave": "W06",
+      "title": "Real Anvil compression corpus + unknown NBT preservation",
+      "priority": "P1",
+      "route": "parity",
+      "rows": [
+        "W2",
+        "S1"
+      ],
+      "kind": "implementation",
+      "locks": [
+        "RUST-WORLD"
+      ],
+      "read": [
+        "crates/mc-world/src/anvil/region.rs",
+        "crates/mc-world/src/anvil/chunk_nbt.rs",
+        "crates/mc-world/src/storage.rs"
+      ],
+      "write": [
+        "crates/mc-world/src/anvil/region.rs",
+        "crates/mc-world/src/anvil/chunk_nbt.rs",
+        "crates/mc-world/src/storage/dirty_flush_tests.rs"
+      ],
+      "outcome": "Repo-safe synthetic metadata plus owner-local real-region corpus covers zlib/gzip/uncompressed/LZ4, unknown compression fail-closed and unknown root extras through edit/flush/reopen.",
+      "discovery": [
+        "Mojang bytes stay ignored",
+        "No Windows atomic replace in this task"
+      ],
+      "validation": [
+        "cargo test -p mc-world anvil",
+        "cargo test -p mc-world dirty_flush"
+      ],
+      "depends": [
+        "T00-04"
+      ],
+      "non_goals": [],
+      "notes": [],
+      "dispatch": "ready",
+      "materialize_after": [],
+      "leases": [],
+      "evidence_legs": [
+        "unit",
+        "wire",
+        "persistence"
+      ]
+    },
+    {
+      "id": "T06-06",
+      "wave": "W06",
+      "title": "Disconnect during pending chunk prepare/load/generate",
+      "priority": "P0",
+      "route": "architecture",
+      "rows": [
+        "C1",
+        "S2",
+        "O2"
+      ],
+      "kind": "implementation",
+      "locks": [
+        "RUST-NET-CHUNK",
+        "RUST-HARNESS"
+      ],
+      "read": [
+        "crates/mc-net/src/play/chunk_stream.rs",
+        "crates/mc-net/src/chunk_pipeline.rs",
+        "crates/mc-test-harness/tests/load_scenarios.rs"
+      ],
+      "write": [
+        "crates/mc-net/src/play/chunk_stream_world_handle_tests.rs",
+        "crates/mc-test-harness/tests/load_scenarios.rs"
+      ],
+      "outcome": "Disconnect cancels/publication-fences pending work; permits/retries/cache entries drain; reconnect cannot receive stale chunks from old generation.",
+      "discovery": [
+        "Cover already-running and queued jobs separately",
+        "No arbitrary wait"
+      ],
+      "validation": [
+        "cargo test -p mc-net chunk_stream",
+        "cargo test -p mc-test-harness --test load_scenarios <filter> -- --nocapture"
+      ],
+      "depends": [
+        "T02-08"
+      ],
+      "non_goals": [],
+      "notes": [],
+      "dispatch": "ready",
+      "materialize_after": [],
+      "leases": [],
+      "evidence_legs": [
+        "unit",
+        "wire",
+        "concurrency",
+        "performance"
+      ]
+    },
+    {
+      "id": "T06-07",
+      "wave": "W06",
+      "title": "Natural TCP slow-reader fairness, shedding и recovery",
+      "priority": "P0",
+      "route": "scaling",
+      "rows": [
+        "S2",
+        "O2",
+        "O3"
+      ],
+      "kind": "implementation",
+      "locks": [
+        "RUST-NET-SESSION",
+        "RUST-HARNESS"
+      ],
+      "read": [
+        "crates/mc-net/src/play/session/outbound.rs",
+        "crates/mc-net/src/play/session/outbound_backpressure_tests.rs",
+        "crates/mc-test-harness/tests/load_scenarios.rs"
+      ],
+      "write": [
+        "crates/mc-test-harness/tests/load_scenarios.rs",
+        "crates/mc-net/src/play/session/outbound_backpressure_tests.rs"
+      ],
+      "outcome": "Paused/slow real socket raises bounded pressure, healthy client keeps state-bearing progress, reliable drops remain zero or session closes by explicit policy, retry tasks drain.",
+      "discovery": [
+        "Use natural socket behavior, not only synthetic counters",
+        "Separate cosmetic drops"
+      ],
+      "validation": [
+        "cargo test -p mc-net outbound_backpressure",
+        "cargo test -p mc-test-harness --test load_scenarios paused_reader -- --nocapture"
+      ],
+      "depends": [
+        "T06-06"
+      ],
+      "non_goals": [],
+      "notes": [],
+      "dispatch": "ready",
+      "materialize_after": [],
+      "leases": [],
+      "evidence_legs": [
+        "unit",
+        "wire",
+        "concurrency",
+        "performance"
+      ]
+    },
+    {
+      "id": "T06-08",
+      "wave": "W06",
+      "title": "External online-mode paid-client qualification",
+      "priority": "P0",
+      "route": "parity",
+      "rows": [
+        "P2",
+        "P3",
+        "O4"
+      ],
+      "kind": "external-gate",
+      "locks": [
+        "EXTERNAL"
+      ],
+      "read": [
+        "crates/mc-net/src/login.rs",
+        "crates/mc-net/src/session_auth.rs",
+        "crates/mc-server/tests/login.rs",
+        "<owner active online-mode config path — fill before claim>"
+      ],
+      "write": [
+        ".analysis/spark/online-mode-qualification.md"
+      ],
+      "outcome": "Paid 26.1.2 client completes RSA/AES/session auth, signed properties, compression transition, reconnect and bounded load against public-bind-safe config; exact failures recorded.",
+      "discovery": [
+        "Preflight paid account, network and active config without exposing credentials",
+        "Use the real session endpoint; redact access tokens, profile properties and server hash inputs",
+        "Allocate a unique world/run directory and port range"
+      ],
+      "validation": [
+        "Owner/agent real-client run",
+        "Server logs checked for disconnect/error mapping",
+        "No source edit unless reproducible bug"
+      ],
+      "depends": [
+        "T00-02"
+      ],
+      "non_goals": [
+        "Не хранить токены/профильные данные в Git",
+        "Не считать offline-mode эквивалентом"
+      ],
+      "notes": [],
+      "dispatch": "template",
+      "materialize_after": [
+        "T00-01",
+        "T00-02"
+      ],
+      "leases": [
+        "CLIENT-RIG",
+        "PAID-AUTH"
+      ],
+      "evidence_legs": [
+        "real-client-agent",
+        "security/auth"
+      ]
+    },
+    {
+      "id": "T07-01",
+      "wave": "W07",
+      "title": "Заморозить low/balanced/high profile configs и budgets",
+      "priority": "P0",
+      "route": "scaling",
+      "rows": [
+        "O1",
+        "O3"
+      ],
+      "kind": "docs-and-config",
+      "locks": [
+        "PERF",
+        "COORD-DOCS"
+      ],
+      "read": [
+        "docs/milestones/M91.md",
+        "docs/M52_OPERATOR_PERFORMANCE_NOTES.md",
+        "crates/mc-net/src/control_plane.rs"
+      ],
+      "write": [
+        "docs/performance/CORE_PROFILE_MATRIX.md"
+      ],
+      "outcome": "Три воспроизводимых профиля с CPU/memory/VD/client/entity/workload limits, required metrics, build mode and pass/degraded rules; без подгонки после результата.",
+      "discovery": [
+        "Use existing >18 TPS/VD8 target and current metric names",
+        "Freeze exact p95/p99/latency budgets from clean baseline"
+      ],
+      "validation": [
+        "Статическая проверка config keys against code",
+        "Markdown links/path check"
+      ],
+      "depends": [
+        "T00-05"
+      ],
+      "non_goals": [],
+      "notes": [],
+      "dispatch": "ready",
+      "materialize_after": [],
+      "leases": [],
+      "evidence_legs": [
+        "performance"
+      ]
+    },
+    {
+      "id": "T07-02",
+      "wave": "W07",
+      "title": "Versioned performance result schema + provenance validator",
+      "priority": "P0",
+      "route": "scaling",
+      "rows": [
+        "O1",
+        "O2",
+        "O3"
+      ],
+      "kind": "implementation",
+      "locks": [
+        "RUST-HARNESS"
+      ],
+      "read": [
+        "crates/mc-test-harness/tests/load_scenarios.rs",
+        "crates/mc-test-harness/src/replay.rs"
+      ],
+      "write": [
+        "crates/mc-test-harness/src/replay.rs",
+        "crates/mc-test-harness/tests/load_scenarios.rs"
+      ],
+      "outcome": "Every run records git/tree dirty, hardware/cgroup, build, profile, samples, percentiles, lock/queue/memory/chunk/save/outbound metrics and skipped evidence; malformed result fails closed.",
+      "discovery": [
+        "Extend existing core replay/result DTO if suitable",
+        "No telemetry database"
+      ],
+      "validation": [
+        "cargo test -p mc-test-harness replay",
+        "cargo test -p mc-test-harness --test load_scenarios --no-run"
+      ],
+      "depends": [
+        "T07-01"
+      ],
+      "non_goals": [],
+      "notes": [],
+      "dispatch": "ready",
+      "materialize_after": [],
+      "leases": [],
+      "evidence_legs": [
+        "unit",
+        "wire",
+        "performance"
+      ]
+    },
+    {
+      "id": "T07-03",
+      "wave": "W07",
+      "title": "Solo generated-world VD8 clean-host profile",
+      "priority": "P0",
+      "route": "scaling",
+      "rows": [
+        "W3",
+        "C1",
+        "C2",
+        "O1",
+        "O2"
+      ],
+      "kind": "performance-run",
+      "locks": [
+        "PERF"
+      ],
+      "read": [
+        "docs/performance/CORE_PROFILE_MATRIX.md",
+        "crates/mc-test-harness/tests/load_scenarios.rs",
+        "crates/mc-test-harness/tests/chunk_stream.rs"
+      ],
+      "write": [
+        ".analysis/spark/perf/solo-generated-vd8/"
+      ],
+      "outcome": "Fresh generate → first join → all 289 chunks → save → restart → warm join, with tick/chunk/light/fetch/lock/dirty/memory metrics and exact chunk coverage.",
+      "discovery": [
+        "Run once clean host and preserve full logs",
+        "Do not edit during measurement"
+      ],
+      "validation": [
+        "Profile validator from T07-02",
+        "Artifact completeness check"
+      ],
+      "depends": [
+        "T07-02",
+        "T06-05"
+      ],
+      "non_goals": [],
+      "notes": [],
+      "dispatch": "ready",
+      "materialize_after": [],
+      "leases": [
+        "CLEAN-HOST",
+        "TREE-FROZEN"
+      ],
+      "evidence_legs": [
+        "performance"
+      ]
+    },
+    {
+      "id": "T07-04",
+      "wave": "W07",
+      "title": "Two-client ordinary survival responsiveness profile",
+      "priority": "P0",
+      "route": "scaling",
+      "rows": [
+        "S2",
+        "O1",
+        "O2"
+      ],
+      "kind": "performance-run",
+      "locks": [
+        "PERF",
+        "CLIENT-JAVA"
+      ],
+      "read": [
+        "docs/performance/CORE_PROFILE_MATRIX.md",
+        "client-mod/solaris-client-agent/java-agent/src/main/java/dev/solaris/agent/javaagent/PlayableRealClientLoopScenario.java"
+      ],
+      "write": [
+        ".analysis/spark/perf/two-client-survival/"
+      ],
+      "outcome": "Two real clients gather/craft/container/combat while chunks stream and autosave; record action latency, tick/lock/queue/outbound and visible correctness.",
+      "discovery": [
+        "Use existing focused playable phases",
+        "No debug grants in measured segment"
+      ],
+      "validation": [
+        "Profile validator",
+        "Both clients remain in_play",
+        "No reliable command drops"
+      ],
+      "depends": [
+        "T07-02",
+        "T03-06",
+        "T04-04"
+      ],
+      "non_goals": [],
+      "notes": [],
+      "dispatch": "ready",
+      "materialize_after": [],
+      "leases": [
+        "CLIENT-RIG",
+        "CLEAN-HOST",
+        "TREE-FROZEN"
+      ],
+      "evidence_legs": [
+        "concurrency",
+        "performance"
+      ]
+    },
+    {
+      "id": "T07-05",
+      "wave": "W07",
+      "title": "20-client VD8 balanced profile",
+      "priority": "P0",
+      "route": "scaling",
+      "rows": [
+        "O1",
+        "O2",
+        "O3",
+        "S2"
+      ],
+      "kind": "performance-run",
+      "locks": [
+        "PERF",
+        "RUST-HARNESS"
+      ],
+      "read": [
+        "docs/performance/CORE_PROFILE_MATRIX.md",
+        "crates/mc-test-harness/tests/load_scenarios.rs"
+      ],
+      "write": [
+        ".analysis/spark/perf/balanced-20-vd8/"
+      ],
+      "outcome": "20 active clients at VD8 execute mixed deterministic workload; >18 TPS target or exact blockers, with p50/p95/p99/max, first/full chunk, lock, queues, memory, saves and outbound.",
+      "discovery": [
+        "Clean host",
+        "At least one real client may observe if resources allow; protocol clients do load"
+      ],
+      "validation": [
+        "Profile validator",
+        "Final save/restart state check",
+        "No unbounded growth"
+      ],
+      "depends": [
+        "T07-02",
+        "T06-07"
+      ],
+      "non_goals": [],
+      "notes": [],
+      "dispatch": "ready",
+      "materialize_after": [],
+      "leases": [
+        "CLEAN-HOST",
+        "TREE-FROZEN"
+      ],
+      "evidence_legs": [
+        "concurrency",
+        "performance"
+      ]
+    },
+    {
+      "id": "T07-06",
+      "wave": "W07",
+      "title": "Dense entity/AI/physics profile",
+      "priority": "P0",
+      "route": "scaling",
+      "rows": [
+        "N1",
+        "O1",
+        "O2"
+      ],
+      "kind": "performance-run",
+      "locks": [
+        "PERF"
+      ],
+      "read": [
+        "crates/mc-net/src/play/session/combat_load_tests.rs",
+        "crates/mc-net/src/play/simulation/explosion_load_tests.rs",
+        "crates/mc-test-harness/tests/load_scenarios.rs"
+      ],
+      "write": [
+        ".analysis/spark/perf/dense-entities/"
+      ],
+      "outcome": "Representative ordinary and overload populations quantify goal/physics/publication/death/explosion stages and client liveness; workload size and cohort budgets explicit.",
+      "discovery": [
+        "Reuse 5,132-cow and death/explosion gates as baselines",
+        "Do not infer ordinary performance from synthetic overload only"
+      ],
+      "validation": [
+        "Profile validator",
+        "Client liveness and reliable delivery"
+      ],
+      "depends": [
+        "T07-02",
+        "T05-08"
+      ],
+      "non_goals": [],
+      "notes": [],
+      "dispatch": "ready",
+      "materialize_after": [],
+      "leases": [
+        "CLEAN-HOST",
+        "TREE-FROZEN"
+      ],
+      "evidence_legs": [
+        "performance"
+      ]
+    },
+    {
+      "id": "T07-07",
+      "wave": "W07",
+      "title": "Fluid/random/scheduled-block profile",
+      "priority": "P0",
+      "route": "scaling",
+      "rows": [
+        "B3",
+        "F1",
+        "A1",
+        "O1",
+        "O2"
+      ],
+      "kind": "performance-run",
+      "locks": [
+        "PERF"
+      ],
+      "read": [
+        "crates/mc-net/src/play/fluids.rs",
+        "crates/mc-net/src/play/random_ticks.rs",
+        "crates/mc-net/src/play/scheduled_blocks.rs",
+        "crates/mc-test-harness/tests/load_scenarios.rs"
+      ],
+      "write": [
+        ".analysis/spark/perf/fluid-random-scheduled/"
+      ],
+      "outcome": "Ocean/fluid settle, crops/random ticks and 256-button scheduled workload report planning/apply/follow-up, owner responsiveness and no indefinite backlog.",
+      "discovery": [
+        "Use exact existing deterministic fixtures",
+        "Separate contaminated host run"
+      ],
+      "validation": [
+        "Profile validator",
+        "Backlog drains by observed completion"
+      ],
+      "depends": [
+        "T07-02",
+        "T02-06"
+      ],
+      "non_goals": [],
+      "notes": [],
+      "dispatch": "ready",
+      "materialize_after": [],
+      "leases": [
+        "CLEAN-HOST",
+        "TREE-FROZEN"
+      ],
+      "evidence_legs": [
+        "performance"
+      ]
+    },
+    {
+      "id": "T07-08",
+      "wave": "W07",
+      "title": "Save/autosave/dirty-flush profile under live mutation",
+      "priority": "P0",
+      "route": "scaling",
+      "rows": [
+        "S1",
+        "O1",
+        "O2"
+      ],
+      "kind": "performance-run",
+      "locks": [
+        "PERF"
+      ],
+      "read": [
+        "crates/mc-world/src/storage/dirty_flush.rs",
+        "crates/mc-net/src/server.rs",
+        "crates/mc-test-harness/tests/load_scenarios.rs"
+      ],
+      "write": [
+        ".analysis/spark/perf/save-dirty-flush/"
+      ],
+      "outcome": "Live mutations during periodic/full save quantify encode/install/fsync/lock waits, stable-region progress, dirty backlog and client responsiveness; restart validates state.",
+      "discovery": [
+        "Include one stable and one continuously-mutated region",
+        "No wall-clock success"
+      ],
+      "validation": [
+        "Profile validator",
+        "Disk reopen invariant"
+      ],
+      "depends": [
+        "T07-02",
+        "T06-04"
+      ],
+      "non_goals": [],
+      "notes": [],
+      "dispatch": "ready",
+      "materialize_after": [],
+      "leases": [
+        "CLEAN-HOST",
+        "TREE-FROZEN"
+      ],
+      "evidence_legs": [
+        "persistence",
+        "performance"
+      ]
+    },
+    {
+      "id": "T08-01",
+      "wave": "W08",
+      "title": "Ранжировать remaining WorldHandle locksites по measured impact",
+      "priority": "P0",
+      "route": "architecture",
+      "rows": [
+        "O2"
+      ],
+      "kind": "audit",
+      "locks": [
+        "RUST-NET-ROOT",
+        "PERF"
+      ],
+      "read": [
+        "crates/mc-net/src/server.rs",
+        "crates/mc-net/src/play.rs",
+        "crates/mc-net/src/play/simulation.rs",
+        "crates/mc-net/src/play/chunk_stream.rs",
+        "crates/mc-world/src/resident.rs"
+      ],
+      "write": [
+        ".analysis/spark/world-handle-locksites.md"
+      ],
+      "outcome": "Таблица production locksite → resident/disk role → call frequency → measured wait/hold → safe owner target; выбрать ровно один следующий cutover.",
+      "discovery": [
+        "Use CodeGraph or bounded rg, not both broadly",
+        "Correlate with T07 logs"
+      ],
+      "validation": [
+        "Independent read-only review of ranking"
+      ],
+      "depends": [
+        "T07-03",
+        "T07-05",
+        "T07-08"
+      ],
+      "non_goals": [],
+      "notes": [],
+      "dispatch": "ready",
+      "materialize_after": [],
+      "leases": [
+        "CLEAN-HOST",
+        "TREE-FROZEN"
+      ],
+      "evidence_legs": [
+        "performance"
+      ]
+    },
+    {
+      "id": "T08-02",
+      "wave": "W08",
+      "title": "Перевести один dominant resident mutation с global WorldHandle",
+      "priority": "P0",
+      "route": "architecture",
+      "rows": [
+        "O2"
+      ],
+      "kind": "implementation",
+      "locks": [
+        "RUST-NET-ROOT",
+        "RUST-WORLD"
+      ],
+      "read": [
+        "crates/mc-world/src/resident.rs",
+        "<exact top locksite from T08-01>",
+        "docs/decisions/0004-staged-single-writer-simulation.md"
+      ],
+      "write": [
+        "<exact top locksite>",
+        "crates/mc-world/src/resident.rs",
+        "focused sibling tests",
+        "docs/decisions/0004-staged-single-writer-simulation.md"
+      ],
+      "outcome": "Already-resident mutation takes only sorted affected regional owners; global storage coordinates disk/LRU only; CAS/publication/persistence behavior unchanged.",
+      "discovery": [
+        "Task must be reissued with exact paths after T08-01",
+        "RED lock-pressure/correctness test first"
+      ],
+      "validation": [
+        "Focused domain tests",
+        "cargo test -p mc-world",
+        "cargo test -p mc-net <domain>",
+        "rerun exact workload"
+      ],
+      "depends": [
+        "T08-01"
+      ],
+      "non_goals": [
+        "Не удалять WorldHandle целиком",
+        "Не делать unrelated extraction"
+      ],
+      "notes": [],
+      "dispatch": "template",
+      "materialize_after": [
+        "T08-01"
+      ],
+      "leases": [],
+      "evidence_legs": [
+        "unit",
+        "wire",
+        "performance"
+      ]
+    },
+    {
+      "id": "T08-03",
+      "wave": "W08",
+      "title": "Убрать measured chunk-stream global-lock bottleneck",
+      "priority": "P0",
+      "route": "architecture",
+      "rows": [
+        "C1",
+        "O2"
+      ],
+      "kind": "implementation",
+      "locks": [
+        "RUST-NET-CHUNK",
+        "RUST-WORLD"
+      ],
+      "read": [
+        "crates/mc-net/src/play/chunk_stream.rs",
+        "crates/mc-net/src/chunk_pipeline.rs",
+        "crates/mc-world/src/storage/read_view.rs"
+      ],
+      "write": [
+        "crates/mc-net/src/play/chunk_stream.rs",
+        "crates/mc-world/src/storage/read_view.rs",
+        "crates/mc-net/src/play/chunk_stream_world_handle_tests.rs"
+      ],
+      "outcome": "Prepared/read-only resident view avoids holding global world lock during encode/compress/socket; stale version rechecks and cache ownership remain explicit.",
+      "discovery": [
+        "Only if T07/T08 ranks this as blocker",
+        "One stage at a time"
+      ],
+      "validation": [
+        "cargo test -p mc-net chunk_stream",
+        "cargo test -p mc-world read_view",
+        "rerun T07-03"
+      ],
+      "depends": [
+        "T08-01"
+      ],
+      "non_goals": [],
+      "notes": [],
+      "dispatch": "template",
+      "materialize_after": [
+        "T08-01"
+      ],
+      "leases": [],
+      "evidence_legs": [
+        "unit",
+        "wire",
+        "performance"
+      ]
+    },
+    {
+      "id": "T08-04",
+      "wave": "W08",
+      "title": "Исправить главный measured save/install/flush stall",
+      "priority": "P0",
+      "route": "architecture",
+      "rows": [
+        "S1",
+        "O2"
+      ],
+      "kind": "implementation",
+      "locks": [
+        "RUST-WORLD",
+        "RUST-NET-ROOT"
+      ],
+      "read": [
+        "crates/mc-world/src/storage/dirty_flush.rs",
+        "crates/mc-net/src/server.rs",
+        "crates/mc-net/src/play/persistence.rs"
+      ],
+      "write": [
+        "exact files from profile",
+        "focused fault/dirty-flush tests"
+      ],
+      "outcome": "Один измеренный stall устранён без ослабления fsync/version fences; stable regions progress, mutated region stays dirty/replans, client remains responsive.",
+      "discovery": [
+        "Choose exact hotspot from T07-08",
+        "Record baseline/new numbers"
+      ],
+      "validation": [
+        "cargo test -p mc-world dirty_flush",
+        "cargo test -p mc-net persistence",
+        "rerun T07-08"
+      ],
+      "depends": [
+        "T07-08",
+        "T08-01"
+      ],
+      "non_goals": [],
+      "notes": [],
+      "dispatch": "template",
+      "materialize_after": [
+        "T07-08",
+        "T08-01"
+      ],
+      "leases": [],
+      "evidence_legs": [
+        "unit",
+        "wire",
+        "persistence",
+        "performance"
+      ]
+    },
+    {
+      "id": "T08-05",
+      "wave": "W08",
+      "title": "Исправить главный measured entity goal/physics/publication hotspot",
+      "priority": "P0",
+      "route": "architecture",
+      "rows": [
+        "N1",
+        "O2"
+      ],
+      "kind": "implementation",
+      "locks": [
+        "RUST-ENTITY",
+        "RUST-NET-SESSION"
+      ],
+      "read": [
+        "crates/mc-entity/src/regional.rs",
+        "crates/mc-net/src/play/session/entity_simulation.rs",
+        "crates/mc-net/src/play/session/movement_publication.rs"
+      ],
+      "write": [
+        "exact hotspot files",
+        "focused load/correctness tests"
+      ],
+      "outcome": "Ускорение только выбранного stage с version/CAS/client-liveness fence; ordinary populations retain full cadence, overload stays bounded.",
+      "discovery": [
+        "Choose from T07-06",
+        "No operator worker percentages"
+      ],
+      "validation": [
+        "cargo test -p mc-entity",
+        "cargo test -p mc-net entity",
+        "rerun T07-06"
+      ],
+      "depends": [
+        "T07-06",
+        "T05-06"
+      ],
+      "non_goals": [],
+      "notes": [],
+      "dispatch": "template",
+      "materialize_after": [
+        "T07-06"
+      ],
+      "leases": [],
+      "evidence_legs": [
+        "unit",
+        "wire",
+        "performance"
+      ]
+    },
+    {
+      "id": "T08-06",
+      "wave": "W08",
+      "title": "Autoscale recovery + slow-client shedding profile/fix",
+      "priority": "P0",
+      "route": "scaling",
+      "rows": [
+        "O3",
+        "S2"
+      ],
+      "kind": "implementation",
+      "locks": [
+        "RUST-NET-SESSION",
+        "PERF"
+      ],
+      "read": [
+        "crates/mc-net/src/control_plane.rs",
+        "crates/mc-net/src/play/chunk_stream_autoscale_tests.rs",
+        "crates/mc-net/src/play/session/outbound.rs"
+      ],
+      "write": [
+        "crates/mc-net/src/control_plane.rs",
+        "focused autoscale/backpressure tests"
+      ],
+      "outcome": "Under CPU/memory/queue/slow-reader pressure controller degrades bounded budgets, keeps healthy clients alive, then recovers with hysteresis/headroom; drain/restart exact.",
+      "discovery": [
+        "Use existing metrics and capacity-derived limits",
+        "No full cluster autoscaling"
+      ],
+      "validation": [
+        "cargo test -p mc-net control_plane",
+        "cargo test -p mc-net autoscale",
+        "profile recovery workload"
+      ],
+      "depends": [
+        "T07-05",
+        "T06-07"
+      ],
+      "non_goals": [],
+      "notes": [],
+      "dispatch": "template",
+      "materialize_after": [
+        "T07-05",
+        "T06-07"
+      ],
+      "leases": [
+        "CLEAN-HOST",
+        "TREE-FROZEN"
+      ],
+      "evidence_legs": [
+        "unit",
+        "wire",
+        "concurrency",
+        "performance"
+      ]
+    },
+    {
+      "id": "T09-01",
+      "wave": "W09",
+      "title": "Двухчасовой no-debug single-client active survival arc",
+      "priority": "P0",
+      "route": "playable",
+      "rows": [
+        "Q2",
+        "S1",
+        "O1"
+      ],
+      "kind": "integration-gate",
+      "locks": [
+        "CLIENT-JAVA",
+        "RUNNER",
+        "PERF"
+      ],
+      "read": [
+        "docs/playable/ACTIVE.md",
+        "client-mod/solaris-client-agent/java-agent/src/main/java/dev/solaris/agent/javaagent/PlayableRealClientLoopScenario.java",
+        "docs/performance/CORE_PROFILE_MATRIX.md"
+      ],
+      "write": [
+        ".analysis/spark/gates/two-hour-survival/"
+      ],
+      "outcome": "Fresh world: join/orient → wood/food/shelter/night → stone/furnace/light → iron/tools/shield/armor → renewable food → combat/death/recovery → explore → save/restart/rejoin, active actions only.",
+      "discovery": [
+        "Subagent decisions allowed; deterministic scenario may orchestrate but no debug grants",
+        "Record first common blocker as new microtask"
+      ],
+      "validation": [
+        "All phase observations",
+        "No crash/disconnect/catastrophic stall",
+        "Profile result valid",
+        "Final state after restart"
+      ],
+      "depends": [
+        "T02-01",
+        "T02-02",
+        "T03-08",
+        "T04-07",
+        "T05-05",
+        "T08-04",
+        "T08-05"
+      ],
+      "non_goals": [],
+      "notes": [],
+      "dispatch": "ready",
+      "materialize_after": [],
+      "leases": [
+        "CLIENT-RIG",
+        "CLEAN-HOST",
+        "TREE-FROZEN"
+      ],
+      "evidence_legs": [
+        "real-client-agent",
+        "persistence",
+        "performance"
+      ]
+    },
+    {
+      "id": "T09-02",
+      "wave": "W09",
+      "title": "30-minute two-client cooperative survival arc",
+      "priority": "P0",
+      "route": "playable",
+      "rows": [
+        "S2",
+        "Q2",
+        "O1"
+      ],
+      "kind": "integration-gate",
+      "locks": [
+        "CLIENT-JAVA",
+        "RUNNER",
+        "PERF"
+      ],
+      "read": [
+        "client-mod/solaris-client-agent/java-agent/src/main/java/dev/solaris/agent/javaagent/PlayableRealClientLoopScenario.java",
+        "docs/performance/CORE_PROFILE_MATRIX.md"
+      ],
+      "write": [
+        ".analysis/spark/gates/two-client-coop/"
+      ],
+      "outcome": "Two fresh clients cooperate through gather/craft/shared storage/build/combat/death/drop handoff/reconnect/save/restart; all shared state converges.",
+      "discovery": [
+        "No operator setup in measured segment",
+        "Slow reader is separate gate"
+      ],
+      "validation": [
+        "No duplication/loss",
+        "Both remain in_play except deliberate reconnect",
+        "Final restart invariant"
+      ],
+      "depends": [
+        "T03-06",
+        "T03-08",
+        "T04-04",
+        "T05-05",
+        "T06-07",
+        "T08-06"
+      ],
+      "non_goals": [],
+      "notes": [],
+      "dispatch": "ready",
+      "materialize_after": [],
+      "leases": [
+        "CLIENT-RIG",
+        "CLEAN-HOST",
+        "TREE-FROZEN"
+      ],
+      "evidence_legs": [
+        "real-client-agent",
+        "concurrency",
+        "performance"
+      ]
+    },
+    {
+      "id": "T09-03",
+      "wave": "W09",
+      "title": "36,000-tick / 20-client mixed soak с failing-seed manifests",
+      "priority": "P0",
+      "route": "scaling",
+      "rows": [
+        "S2",
+        "O1",
+        "O2",
+        "O3",
+        "Q3"
+      ],
+      "kind": "integration-gate",
+      "locks": [
+        "PERF",
+        "RUST-HARNESS"
+      ],
+      "read": [
+        "crates/mc-test-harness/tests/load_scenarios.rs",
+        "crates/mc-test-harness/src/replay.rs",
+        "docs/performance/CORE_PROFILE_MATRIX.md"
+      ],
+      "write": [
+        ".analysis/spark/gates/20-client-soak/"
+      ],
+      "outcome": "20 clients execute exploration/edits/crafting/containers/mobs/drops/fluids/save/reconnect/slow reader for exact simulation ticks; failures emit replay manifest and state hash.",
+      "discovery": [
+        "Timeout only fails",
+        "Do not hide degraded sidecars/artifacts"
+      ],
+      "validation": [
+        ">18 TPS target or exact blockers",
+        "No deadlock/corruption/unbounded growth/reliable loss",
+        "Final save/restart"
+      ],
+      "depends": [
+        "T07-05",
+        "T07-07",
+        "T07-08",
+        "T08-06"
+      ],
+      "non_goals": [],
+      "notes": [],
+      "dispatch": "ready",
+      "materialize_after": [],
+      "leases": [
+        "CLEAN-HOST",
+        "TREE-FROZEN"
+      ],
+      "evidence_legs": [
+        "replay/negative",
+        "concurrency",
+        "performance"
+      ]
+    },
+    {
+      "id": "T09-04",
+      "wave": "W09",
+      "title": "Единый authoritative pre-stop/post-restart state diff",
+      "priority": "P0",
+      "route": "parity",
+      "rows": [
+        "S1",
+        "S2",
+        "Q3"
+      ],
+      "kind": "implementation",
+      "locks": [
+        "RUST-HARNESS",
+        "RUNNER"
+      ],
+      "read": [
+        "crates/mc-test-harness/src/replay.rs",
+        "crates/mc-test-harness/tests/load_scenarios.rs",
+        "tools/real-client-agent-driver.py"
+      ],
+      "write": [
+        "crates/mc-test-harness/src/replay.rs",
+        "crates/mc-test-harness/tests/load_scenarios.rs",
+        "tools/real-client-agent-driver.py"
+      ],
+      "outcome": "Versioned normalized state snapshot compares players/inventories/chunks/block entities/entities/drops/scheduled work/time-weather in declared scope across stop/restart.",
+      "discovery": [
+        "Extend T01-04, do not create competing schema",
+        "Unknown/unobserved fields explicit"
+      ],
+      "validation": [
+        "cargo test -p mc-test-harness replay",
+        "cargo test -p mc-test-harness --test load_scenarios",
+        "python -m py_compile tools/real-client-agent-driver.py"
+      ],
+      "depends": [
+        "T01-04",
+        "T09-01",
+        "T09-02"
+      ],
+      "non_goals": [],
+      "notes": [],
+      "dispatch": "ready",
+      "materialize_after": [],
+      "leases": [
+        "CLIENT-RIG"
+      ],
+      "evidence_legs": [
+        "unit",
+        "wire",
+        "replay/negative",
+        "persistence",
+        "concurrency"
+      ]
+    },
+    {
+      "id": "T10-01",
+      "wave": "W10",
+      "title": "Пересчитать все 46 frozen rows по текущему коду и evidence",
+      "priority": "P1",
+      "route": "parity",
+      "rows": [
+        "Q1",
+        "Q2"
+      ],
+      "kind": "audit",
+      "locks": [
+        "COORD-DOCS"
+      ],
+      "read": [
+        "docs/VALIDATION_LEDGER.md",
+        "docs/DEFINITION_OF_DONE.md",
+        ".analysis/spark/real-client-matrix.md",
+        ".analysis/spark/oracle-replay-matrix.md",
+        ".analysis/spark/performance-baseline.md"
+      ],
+      "write": [
+        ".analysis/spark/m100-row-audit.md"
+      ],
+      "outcome": "Для каждой строки ровно одна минимально недостающая нога: runtime/oracle/client/perf/concurrency/persistence/scope decision; никаких status edits до аудита.",
+      "discovery": [
+        "Use current artifacts from W09",
+        "Separate accepted divergence from missing evidence"
+      ],
+      "validation": [
+        "cargo run -p mc-test-harness --bin coverage-audit -- docs/VALIDATION_LEDGER.md (baseline only)",
+        "Independent review of row mapping"
+      ],
+      "depends": [
+        "T09-03",
+        "T09-04"
+      ],
+      "non_goals": [],
+      "notes": [],
+      "dispatch": "coordinator-only",
+      "materialize_after": [],
+      "leases": [],
+      "evidence_legs": [
+        "oracle",
+        "real-client-agent"
+      ]
+    },
+    {
+      "id": "T10-02",
+      "wave": "W10",
+      "title": "Закрыть hard required-green Q1/Q2/O1/O2/O3 blockers",
+      "priority": "P1",
+      "route": "parity",
+      "rows": [
+        "Q1",
+        "Q2",
+        "O1",
+        "O2",
+        "O3"
+      ],
+      "kind": "campaign",
+      "locks": [
+        "COORD"
+      ],
+      "read": [
+        ".analysis/spark/m100-row-audit.md"
+      ],
+      "write": [
+        "task cards generated from exact missing legs"
+      ],
+      "outcome": "Каждый blocker раздаётся отдельной карточкой размером ≤3 source files; закрытие только с required evidence, без umbrella pass.",
+      "discovery": [
+        "Coordinator creates one child task per missing leg",
+        "Max two disjoint agents"
+      ],
+      "validation": [
+        "Per-child L1",
+        "Wave-boundary L2 once"
+      ],
+      "depends": [
+        "T10-01"
+      ],
+      "non_goals": [
+        "Не выполнять несколько missing legs в одном Spark контексте"
+      ],
+      "notes": [],
+      "dispatch": "coordinator-only",
+      "materialize_after": [],
+      "leases": [],
+      "evidence_legs": [
+        "oracle",
+        "real-client-agent",
+        "performance"
+      ]
+    },
+    {
+      "id": "T10-03",
+      "wave": "W10",
+      "title": "Итеративно закрывать smallest missing legs до ≥37/46 ready",
+      "priority": "P1",
+      "route": "parity",
+      "rows": [],
+      "kind": "campaign",
+      "locks": [
+        "COORD"
+      ],
+      "read": [
+        ".analysis/spark/m100-row-audit.md",
+        "docs/VALIDATION_LEDGER.md"
+      ],
+      "write": [
+        "task cards + evidence artifacts"
+      ],
+      "outcome": "Coverage достигает ≥80% только через реальные legs; remaining rows owner-accepted non-goal/divergence или точный deferred debt.",
+      "discovery": [
+        "Sort by effort/value: evidence-only first, then small behavior fixes, then broad systems",
+        "Re-run coverage audit after each wave, not each microtask"
+      ],
+      "validation": [
+        "cargo run -p mc-test-harness --bin coverage-audit -- docs/VALIDATION_LEDGER.md"
+      ],
+      "depends": [
+        "T10-02"
+      ],
+      "non_goals": [],
+      "notes": [],
+      "dispatch": "coordinator-only",
+      "materialize_after": [],
+      "leases": [],
+      "evidence_legs": [
+        "audit/control"
+      ]
+    },
+    {
+      "id": "T10-04",
+      "wave": "W10",
+      "title": "Финальный L2, M100 decision и честный closeout",
+      "priority": "P1",
+      "route": "parity",
+      "rows": [],
+      "kind": "release-gate",
+      "locks": [
+        "VALIDATION",
+        "COORD-DOCS"
+      ],
+      "read": [
+        "docs/DEFINITION_OF_DONE.md",
+        "docs/milestones/M100.md",
+        "docs/VALIDATION_LEDGER.md"
+      ],
+      "write": [
+        "docs/milestones/M100.md",
+        "docs/VALIDATION_LEDGER.md",
+        "docs/REPLACEMENT_READINESS.md",
+        "docs/MEMORY.md"
+      ],
+      "outcome": "Один exact-tree L2, coverage report, client/oracle/perf/soak/persistence/security matrix; release-ready только если каждый hard gate зелёный, иначе stabilization с точным next cursor.",
+      "discovery": [
+        "Freeze tree before L2",
+        "No status inflation"
+      ],
+      "validation": [
+        "cargo run -p xtask -- code-health",
+        "cargo test --workspace",
+        "cargo clippy --workspace --all-targets -- -D warnings",
+        "cargo fmt --all -- --check",
+        "coverage audit",
+        "validate client/perf artifacts"
+      ],
+      "depends": [
+        "T10-03"
+      ],
+      "non_goals": [],
+      "notes": [],
+      "dispatch": "coordinator-only",
+      "materialize_after": [],
+      "leases": [
+        "TREE-FROZEN"
+      ],
+      "evidence_legs": [
+        "audit/control"
+      ]
+    }
+  ],
+  "batches": [
+    {
+      "id": "B01",
+      "tasks": [
+        "T00-01"
+      ]
+    },
+    {
+      "id": "B02",
+      "tasks": [
+        "T00-02"
+      ]
+    },
+    {
+      "id": "B03",
+      "tasks": [
+        "T00-03",
+        "T00-04"
+      ]
+    },
+    {
+      "id": "B04",
+      "tasks": [
+        "T00-05"
+      ]
+    },
+    {
+      "id": "B05",
+      "tasks": [
+        "T00-06",
+        "T01-01"
+      ]
+    },
+    {
+      "id": "B06",
+      "tasks": [
+        "T01-02",
+        "T01-04"
+      ]
+    },
+    {
+      "id": "B07",
+      "tasks": [
+        "T01-03",
+        "T01-05"
+      ]
+    },
+    {
+      "id": "B08",
+      "tasks": [
+        "T01-06",
+        "T02-01"
+      ]
+    },
+    {
+      "id": "B09",
+      "tasks": [
+        "T02-02",
+        "T02-03"
+      ]
+    },
+    {
+      "id": "B10",
+      "tasks": [
+        "T02-04",
+        "T02-07"
+      ]
+    },
+    {
+      "id": "B11",
+      "tasks": [
+        "T02-05",
+        "T03-01"
+      ]
+    },
+    {
+      "id": "B12",
+      "tasks": [
+        "T02-06",
+        "T03-02"
+      ]
+    },
+    {
+      "id": "B13",
+      "tasks": [
+        "T02-08",
+        "T03-05"
+      ]
+    },
+    {
+      "id": "B14",
+      "tasks": [
+        "T03-03",
+        "T04-01"
+      ]
+    },
+    {
+      "id": "B15",
+      "tasks": [
+        "T03-06",
+        "T04-02"
+      ]
+    },
+    {
+      "id": "B16",
+      "tasks": [
+        "T03-08",
+        "T04-03"
+      ]
+    },
+    {
+      "id": "B17",
+      "tasks": [
+        "T03-04",
+        "T04-05"
+      ]
+    },
+    {
+      "id": "B18",
+      "tasks": [
+        "T03-07",
+        "T04-06"
+      ]
+    },
+    {
+      "id": "B19",
+      "tasks": [
+        "T04-04",
+        "T04-08"
+      ]
+    },
+    {
+      "id": "B20",
+      "tasks": [
+        "T04-07",
+        "T05-01"
+      ]
+    },
+    {
+      "id": "B21",
+      "tasks": [
+        "T05-04",
+        "T06-06"
+      ]
+    },
+    {
+      "id": "B22",
+      "tasks": [
+        "T05-05",
+        "T05-06"
+      ]
+    },
+    {
+      "id": "B23",
+      "tasks": [
+        "T05-02",
+        "T06-08"
+      ]
+    },
+    {
+      "id": "B24",
+      "tasks": [
+        "T05-03",
+        "T06-05"
+      ]
+    },
+    {
+      "id": "B25",
+      "tasks": [
+        "T05-07"
+      ]
+    },
+    {
+      "id": "B26",
+      "tasks": [
+        "T05-08",
+        "T06-07"
+      ]
+    },
+    {
+      "id": "B27",
+      "tasks": [
+        "T06-01"
+      ]
+    },
+    {
+      "id": "B28",
+      "tasks": [
+        "T06-02"
+      ]
+    },
+    {
+      "id": "B29",
+      "tasks": [
+        "T06-03"
+      ]
+    },
+    {
+      "id": "B30",
+      "tasks": [
+        "T06-04"
+      ]
+    },
+    {
+      "id": "B31",
+      "tasks": [
+        "T07-01"
+      ]
+    },
+    {
+      "id": "B32",
+      "tasks": [
+        "T07-02"
+      ]
+    },
+    {
+      "id": "B33",
+      "tasks": [
+        "T07-03"
+      ]
+    },
+    {
+      "id": "B34",
+      "tasks": [
+        "T07-04"
+      ]
+    },
+    {
+      "id": "B35",
+      "tasks": [
+        "T07-05"
+      ]
+    },
+    {
+      "id": "B36",
+      "tasks": [
+        "T07-06"
+      ]
+    },
+    {
+      "id": "B37",
+      "tasks": [
+        "T07-07"
+      ]
+    },
+    {
+      "id": "B38",
+      "tasks": [
+        "T07-08"
+      ]
+    },
+    {
+      "id": "B39",
+      "tasks": [
+        "T08-01"
+      ]
+    },
+    {
+      "id": "B40",
+      "tasks": [
+        "T08-02"
+      ]
+    },
+    {
+      "id": "B41",
+      "tasks": [
+        "T08-03",
+        "T08-05"
+      ]
+    },
+    {
+      "id": "B42",
+      "tasks": [
+        "T08-04"
+      ]
+    },
+    {
+      "id": "B43",
+      "tasks": [
+        "T08-06"
+      ]
+    },
+    {
+      "id": "B44",
+      "tasks": [
+        "T09-01"
+      ]
+    },
+    {
+      "id": "B45",
+      "tasks": [
+        "T09-02"
+      ]
+    },
+    {
+      "id": "B46",
+      "tasks": [
+        "T09-03"
+      ]
+    },
+    {
+      "id": "B47",
+      "tasks": [
+        "T09-04"
+      ]
+    },
+    {
+      "id": "B48",
+      "tasks": [
+        "T10-01"
+      ]
+    },
+    {
+      "id": "B49",
+      "tasks": [
+        "T10-02"
+      ]
+    },
+    {
+      "id": "B50",
+      "tasks": [
+        "T10-03"
+      ]
+    },
+    {
+      "id": "B51",
+      "tasks": [
+        "T10-04"
+      ]
+    }
+  ],
+  "batch_count": 51
+}
