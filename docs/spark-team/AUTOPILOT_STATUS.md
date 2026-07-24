@@ -4,8 +4,8 @@ Generated from task cards plus durable Git-common-dir state. Edit task cards, no
 
 ## Counts
 
-- `BLOCKED`: **4**
-- `DONE`: **10**
+- `BLOCKED`: **3**
+- `DONE`: **11**
 - `QUEUED`: **60**
 
 ## Cursor
@@ -32,7 +32,7 @@ Generated from task cards plus durable Git-common-dir state. Edit task cards, no
 
 - [x] `T01-01` · **DONE** · Добавить компактный core-gate manifest: scenario → ledger rows → evidence legs
 - [x] `T01-02` · **DONE** · Разрезать broad block/fluid real-client gate на независимые focused phases
-- [ ] `T01-03` · **BLOCKED-INTEGRATED** · Разрезать inventory/crafting/container real-client gate на focused phases
+- [x] `T01-03` · **DONE** · Разрезать inventory/crafting/container real-client gate на focused phases
 - [ ] `T01-04` · **QUEUED** · Добавить restart invariant snapshot и строгую cross-phase валидацию
 - [ ] `T01-05` · **QUEUED** · Добавить vanilla oracle для block transaction/rejection/resync
 - [ ] `T01-06` · **QUEUED** · Добавить vanilla oracle для inventory/crafting/container state machine
