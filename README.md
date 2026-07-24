@@ -6,15 +6,13 @@ Solaris is an authoritative server implementing the vanilla 26.1 Java protocol
 plus a custom protocol extension consumed by a Fabric/NeoForge client mod. See
 [`docs/PROJECT_SPEC.md`](docs/PROJECT_SPEC.md) for the full design document.
 
-**Status:** stabilization-alpha/private vanilla-near base, not a release-ready
-vanilla replacement. The M100 frozen denominator currently has 46 in-scope rows,
-0 countable `ready` rows, and 0.00% conservative coverage under the runtime-test
-plus separate vanilla oracle/real-client evidence rule. A 2026-06-13 static
-review found no cargo, client, or profiler run evidence; see
-[`docs/REPLACEMENT_READINESS.md`](docs/REPLACEMENT_READINESS.md),
-[`docs/VALIDATION_LEDGER.md`](docs/VALIDATION_LEDGER.md), and
-[`docs/VALIDATION_COVERAGE_AUDIT.md`](docs/VALIDATION_COVERAGE_AUDIT.md) before
-making compatibility or readiness claims.
+**Status:** stabilization-alpha/private vanilla-near baseline in active
+development. Solaris is not release-ready. Validate compatibility and readiness
+against:
+[docs/REPLACEMENT_READINESS.md](docs/REPLACEMENT_READINESS.md),
+[docs/VALIDATION_LEDGER.md](docs/VALIDATION_LEDGER.md),
+[docs/VALIDATION_COVERAGE_AUDIT.md](docs/VALIDATION_COVERAGE_AUDIT.md)
+before making compatibility or readiness claims.
 
 ## Build
 
