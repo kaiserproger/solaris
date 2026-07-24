@@ -4,14 +4,14 @@ Generated from task cards plus durable Git-common-dir state. Edit task cards, no
 
 ## Counts
 
-- `BLOCKED`: **2**
-- `DONE`: **12**
+- `BLOCKED`: **1**
+- `DONE`: **13**
 - `QUEUED`: **60**
 
 ## Cursor
 
 - Active: `none`
-- Ready: `T01-04, T01-05, T01-06, T02-01, T04-03, T05-01, T06-01`
+- Ready: `T01-04, T01-05, T01-06, T02-01, T04-03, T05-01, T06-01, T07-02`
 - Coordinator: `none`
 - Templates: `none`
 
@@ -94,7 +94,7 @@ Generated from task cards plus durable Git-common-dir state. Edit task cards, no
 
 ## W07
 
-- [ ] `T07-01` · **BLOCKED-INTEGRATED** · Заморозить low/balanced/high profile configs и budgets
+- [x] `T07-01` · **DONE** · Заморозить low/balanced/high profile configs и budgets
 - [ ] `T07-02` · **QUEUED** · Versioned performance result schema + provenance validator
 - [ ] `T07-03` · **QUEUED** · Solo generated-world VD8 clean-host profile
 - [ ] `T07-04` · **QUEUED** · Two-client ordinary survival responsiveness profile
