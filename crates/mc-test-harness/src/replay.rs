@@ -11,10 +11,179 @@ use crate::parity::{
 pub const REPLAY_SCENARIO_SCHEMA: &str = "solaris.core_replay.scenario.v1";
 pub const REPLAY_RESULT_SCHEMA: &str = "solaris.core_replay.result.v1";
 pub const CORE_GATE_MANIFEST_SCHEMA: &str = "solaris.core_gate.manifest.v1";
+pub const BLOCK_TRANSACTION_ORACLE_SCHEMA: &str = "solaris.block_transaction.oracle.v1";
 
 const MAX_REPLAY_ACTIONS: usize = 10_000;
 const MAX_REPLAY_CHECKS: usize = 128;
 const MAX_CONCURRENT_GROUP_REPETITIONS: u16 = 1_000;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum BlockTransactionOracleCase {
+    AcceptedBreak,
+    AcceptedPlace,
+    OccupiedPlaceRejection,
+    OutOfReachBreakRejection,
+    EarlyStopBreakRejection,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct BlockTransactionOraclePhase {
+    pub id: String,
+    pub case: BlockTransactionOracleCase,
+    pub sequence: i32,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct BlockTransactionOracleManifest {
+    pub schema: String,
+    pub id: String,
+    pub phases: Vec<BlockTransactionOraclePhase>,
+}
+
+impl BlockTransactionOracleManifest {
+    pub fn from_json(input: &str) -> Result<Self> {
+        let manifest: Self =
+            serde_json::from_str(input).context("parse block transaction oracle manifest JSON")?;
+        manifest.validate()?;
+        Ok(manifest)
+    }
+
+    pub fn to_pretty_json(&self) -> Result<String> {
+        self.validate()?;
+        serde_json::to_string_pretty(self)
+            .context("serialize block transaction oracle manifest JSON")
+    }
+
+    pub fn validate(&self) -> Result<()> {
+        ensure!(
+            self.schema == BLOCK_TRANSACTION_ORACLE_SCHEMA,
+            "unsupported block transaction oracle schema: {}",
+            self.schema
+        );
+        validate_identifier("block transaction oracle id", &self.id)?;
+        ensure!(
+            self.phases.len() == 5,
+            "block transaction oracle must declare exactly five focused phases"
+        );
+        let mut ids = BTreeSet::new();
+        let mut sequences = BTreeSet::new();
+        let mut cases = BTreeSet::new();
+        for phase in &self.phases {
+            validate_identifier("block transaction phase id", &phase.id)?;
+            ensure!(
+                ids.insert(phase.id.as_str()),
+                "duplicate block transaction phase id: {}",
+                phase.id
+            );
+            ensure!(
+                phase.sequence > 0,
+                "block transaction phase {} has non-positive sequence",
+                phase.id
+            );
+            ensure!(
+                sequences.insert(phase.sequence),
+                "duplicate block transaction sequence: {}",
+                phase.sequence
+            );
+            ensure!(
+                cases.insert(phase.case),
+                "duplicate block transaction oracle case: {:?}",
+                phase.case
+            );
+        }
+        let required = BTreeSet::from([
+            BlockTransactionOracleCase::AcceptedBreak,
+            BlockTransactionOracleCase::AcceptedPlace,
+            BlockTransactionOracleCase::OccupiedPlaceRejection,
+            BlockTransactionOracleCase::OutOfReachBreakRejection,
+            BlockTransactionOracleCase::EarlyStopBreakRejection,
+        ]);
+        ensure!(
+            cases == required,
+            "block transaction oracle phases do not cover the required case matrix"
+        );
+        Ok(())
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case", deny_unknown_fields)]
+pub enum BlockTransactionOracleEvent {
+    TargetUpdate { state_id: i32 },
+    Ack { sequence: i32 },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct BlockTransactionOracleTrace {
+    pub manifest_id: String,
+    pub phases: Vec<BlockTransactionOraclePhaseTrace>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct BlockTransactionOraclePhaseTrace {
+    pub id: String,
+    pub events: Vec<BlockTransactionOracleEvent>,
+}
+
+impl BlockTransactionOracleTrace {
+    pub fn validate_against(&self, manifest: &BlockTransactionOracleManifest) -> Result<()> {
+        manifest.validate()?;
+        ensure!(
+            self.manifest_id == manifest.id,
+            "block transaction trace manifest id {} does not match {}",
+            self.manifest_id,
+            manifest.id
+        );
+        ensure!(
+            self.phases.len() == manifest.phases.len(),
+            "block transaction trace phase count does not match manifest"
+        );
+        for (expected, actual) in manifest.phases.iter().zip(&self.phases) {
+            ensure!(
+                actual.id == expected.id,
+                "block transaction trace phase order/id mismatch: expected {}, got {}",
+                expected.id,
+                actual.id
+            );
+            ensure!(
+                !actual.events.is_empty(),
+                "block transaction trace phase {} has no events",
+                actual.id
+            );
+            let ack_index = actual
+                .events
+                .iter()
+                .position(|event| matches!(event, BlockTransactionOracleEvent::Ack { sequence } if *sequence == expected.sequence))
+                .with_context(|| format!("block transaction phase {} has no matching ack", actual.id))?;
+            if matches!(
+                expected.case,
+                BlockTransactionOracleCase::OccupiedPlaceRejection
+            ) {
+                ensure!(
+                    actual.events[..ack_index].iter().any(|event| matches!(
+                        event,
+                        BlockTransactionOracleEvent::TargetUpdate { .. }
+                    )),
+                    "rejected block transaction phase {} has no authoritative resync before ack",
+                    actual.id
+                );
+            }
+            ensure!(
+                actual.events[ack_index + 1..]
+                    .iter()
+                    .all(|event| !matches!(event, BlockTransactionOracleEvent::Ack { sequence } if *sequence == expected.sequence)),
+                "block transaction phase {} repeats its ack",
+                actual.id
+            );
+        }
+        Ok(())
+    }
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -1229,6 +1398,86 @@ fn validate_relative_artifact_path(value: &str) -> Result<()> {
 mod tests {
     use super::*;
     use serde_json::{Value, json};
+
+    fn block_transaction_oracle_json() -> Value {
+        json!({
+            "schema": "solaris.block_transaction.oracle.v1",
+            "id": "block-transaction-26-1-2",
+            "phases": [
+                {"id":"accepted-break","case":"accepted_break","sequence":1},
+                {"id":"accepted-place","case":"accepted_place","sequence":2},
+                {"id":"occupied-place-rejection","case":"occupied_place_rejection","sequence":3},
+                {"id":"out-of-reach-break-rejection","case":"out_of_reach_break_rejection","sequence":4},
+                {"id":"early-stop-break-rejection","case":"early_stop_break_rejection","sequence":5}
+            ]
+        })
+    }
+
+    #[test]
+    fn block_transaction_oracle_manifest_requires_complete_unique_case_matrix() {
+        let manifest =
+            BlockTransactionOracleManifest::from_json(&block_transaction_oracle_json().to_string())
+                .expect("valid block transaction oracle manifest");
+        assert_eq!(manifest.phases.len(), 5);
+        assert_eq!(
+            BlockTransactionOracleManifest::from_json(
+                &manifest.to_pretty_json().expect("encode manifest")
+            )
+            .expect("decode manifest"),
+            manifest
+        );
+
+        let mut duplicate_case = block_transaction_oracle_json();
+        duplicate_case["phases"][4]["case"] = json!("accepted_break");
+        assert!(BlockTransactionOracleManifest::from_json(&duplicate_case.to_string()).is_err());
+
+        let mut duplicate_sequence = block_transaction_oracle_json();
+        duplicate_sequence["phases"][4]["sequence"] = json!(4);
+        assert!(
+            BlockTransactionOracleManifest::from_json(&duplicate_sequence.to_string()).is_err()
+        );
+
+        let mut unknown_field = block_transaction_oracle_json();
+        unknown_field["phases"][0]["expected_state"] = json!(0);
+        assert!(BlockTransactionOracleManifest::from_json(&unknown_field.to_string()).is_err());
+    }
+
+    #[test]
+    fn block_transaction_trace_requires_authoritative_update_before_matching_ack() {
+        let manifest =
+            BlockTransactionOracleManifest::from_json(&block_transaction_oracle_json().to_string())
+                .expect("valid manifest");
+        let phases = manifest
+            .phases
+            .iter()
+            .map(|phase| BlockTransactionOraclePhaseTrace {
+                id: phase.id.clone(),
+                events: vec![
+                    BlockTransactionOracleEvent::TargetUpdate { state_id: 1 },
+                    BlockTransactionOracleEvent::Ack {
+                        sequence: phase.sequence,
+                    },
+                ],
+            })
+            .collect();
+        let mut trace = BlockTransactionOracleTrace {
+            manifest_id: manifest.id.clone(),
+            phases,
+        };
+        trace.phases[0].events = vec![BlockTransactionOracleEvent::Ack { sequence: 1 }];
+        trace.phases[1].events = vec![BlockTransactionOracleEvent::Ack { sequence: 2 }];
+        trace
+            .validate_against(&manifest)
+            .expect("accepted phases may rely on prediction while rejections resync before ack");
+
+        let mut ack_first = trace.clone();
+        ack_first.phases[2].events.swap(0, 1);
+        assert!(ack_first.validate_against(&manifest).is_err());
+
+        let mut wrong_ack = trace;
+        wrong_ack.phases[3].events[1] = BlockTransactionOracleEvent::Ack { sequence: 99 };
+        assert!(wrong_ack.validate_against(&manifest).is_err());
+    }
 
     fn core_gate_manifest_json() -> Value {
         json!({

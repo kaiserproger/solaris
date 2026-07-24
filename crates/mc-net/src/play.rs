@@ -2216,29 +2216,6 @@ where
     Ok(())
 }
 
-async fn write_loaded_block_resync_then_ack<W>(
-    state: &InteractionState,
-    writer: &mut W,
-    position: i64,
-    sequence: i32,
-) -> Result<(), ConnectionError>
-where
-    W: AsyncWriteExt + Unpin,
-{
-    let (x, y, z) = unpack_block_pos(position);
-    let update = state
-        .world_read
-        .get_cached_block(mc_world::BlockPos { x, y, z })
-        .map(|state_id| BlockUpdate {
-            position,
-            state_id: state_id.0 as i32,
-        });
-    if let Some(update) = update {
-        write_packet(writer, &update, state.compression).await?;
-    }
-    write_block_ack(writer, state.compression, sequence).await
-}
-
 async fn write_crafting_content<W>(
     state: &mut InteractionState,
     writer: &mut W,

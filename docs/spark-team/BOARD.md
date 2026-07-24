@@ -89,7 +89,7 @@ Snapshot basis: **2026-07-24 Repomix snapshot**. Coordinator owns this file; wor
 - [x] [`T01-02` — Разрезать broad block/fluid real-client gate на независимые focused phases](tasks/T01-02.md) — **P0**, rows `B1,B2,B3,B4,Q2`, deps `T00-03`, locks `CLIENT-JAVA`
 - [x] [`T01-03` — Разрезать inventory/crafting/container real-client gate на focused phases](tasks/T01-03.md) — **P0**, rows `I1,I2,K1,Q2`, deps `T00-03`, locks `CLIENT-JAVA`
 - [x] [`T01-04` — Добавить restart invariant snapshot и строгую cross-phase валидацию](tasks/T01-04.md) — **P0**, rows `S1,Q2,Q3`, deps `T01-01`, locks `RUNNER,RUST-HARNESS`
-- [ ] [`T01-05` — Добавить vanilla oracle для block transaction/rejection/resync](tasks/T01-05.md) — **P0**, rows `B1,B2,B3,Q1`, deps `T00-04,T01-01`, locks `ORACLE,RUST-HARNESS`
+- [x] [`T01-05` — Добавить vanilla oracle для block transaction/rejection/resync](tasks/T01-05.md) — **P0**, rows `B1,B2,B3,Q1`, deps `T00-04,T01-01`, locks `ORACLE,RUST-HARNESS`
 - [ ] [`T01-06` — Добавить vanilla oracle для inventory/crafting/container state machine](tasks/T01-06.md) — **P0**, rows `I1,I2,K1,Q1`, deps `T00-04,T01-01`, locks `ORACLE,RUST-HARNESS`
 
 ### W02 — Обычная играбельность и client-visible блокеры

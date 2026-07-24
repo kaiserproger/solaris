@@ -11,13 +11,15 @@ use mc_protocol::packets::configuration::{
     ServerboundKnownPacks, UpdateTags,
 };
 use mc_protocol::packets::play::{
-    AddEntity, ClientboundChangeDifficulty, ClientboundCommands, ClientboundContainerSetContent,
-    ClientboundContainerSetSlot, ClientboundInitializeBorder, ClientboundKeepAlive,
-    ClientboundPlayerAbilities, ClientboundSetHealth, ClientboundSetHeldSlot, ClientboundSetTime,
-    ClientboundSystemChat, ConfirmTeleportation, EntityEvent, GameEvent, LoginPlay,
-    MovePlayerFlags, RemoveEntities, ServerboundChatCommand, ServerboundKeepAlive,
-    ServerboundMovePlayerPos, ServerboundMovePlayerStatusOnly, ServerboundPlayerLoaded,
-    ServerboundSetCarriedItem, SetCenterChunk, SetDefaultSpawnPosition, SynchronizePlayerPosition,
+    AddEntity, BlockChangedAck, BlockUpdate, ClientboundChangeDifficulty, ClientboundCommands,
+    ClientboundContainerSetContent, ClientboundContainerSetSlot, ClientboundInitializeBorder,
+    ClientboundKeepAlive, ClientboundPlayerAbilities, ClientboundSetHealth, ClientboundSetHeldSlot,
+    ClientboundSetTime, ClientboundSystemChat, ConfirmTeleportation, Direction, EntityEvent,
+    GameEvent, InteractionHand, LevelChunkWithLight, LoginPlay, MovePlayerFlags, PlayerActionKind,
+    RemoveEntities, SectionBlocksUpdate, ServerboundChatCommand, ServerboundKeepAlive,
+    ServerboundMovePlayerPos, ServerboundMovePlayerStatusOnly, ServerboundPlayerAction,
+    ServerboundPlayerLoaded, ServerboundSetCarriedItem, ServerboundUseItemOn, SetCenterChunk,
+    SetDefaultSpawnPosition, SynchronizePlayerPosition, pack_block_pos, unpack_block_pos,
 };
 use mc_test_harness::client::Client;
 use mc_test_harness::parity::{
@@ -27,9 +29,11 @@ use mc_test_harness::parity::{
     read_typed_skipping_startup_noise, vanilla_oracle_availability,
 };
 use mc_test_harness::replay::{
-    REPLAY_RESULT_SCHEMA, ReplayCheckStatus, ReplayDriver, ReplayEvidenceKind, ReplayGateResult,
-    ReplayHardwareProvenance, ReplayInvariantResult, ReplayOutcome, ReplayProvenance,
-    ReplayRunResult, ReplayScenarioManifest, run_protocol_replay,
+    BLOCK_TRANSACTION_ORACLE_SCHEMA, BlockTransactionOracleCase, BlockTransactionOracleEvent,
+    BlockTransactionOracleManifest, BlockTransactionOraclePhase, BlockTransactionOraclePhaseTrace,
+    BlockTransactionOracleTrace, REPLAY_RESULT_SCHEMA, ReplayCheckStatus, ReplayDriver,
+    ReplayEvidenceKind, ReplayGateResult, ReplayHardwareProvenance, ReplayInvariantResult,
+    ReplayOutcome, ReplayProvenance, ReplayRunResult, ReplayScenarioManifest, run_protocol_replay,
 };
 
 struct SpawnSmokeScenario;
@@ -1792,5 +1796,560 @@ async fn vanilla_and_solaris_timed_action_can_be_diffed() {
     assert!(diff.is_empty(), "{diff}");
 
     vanilla.stop().expect("vanilla stops");
+    solaris_task.abort();
+}
+
+// ---------------------------------------------------------------------------
+// T01-05: checked block transaction/rejection/resync oracle
+// ---------------------------------------------------------------------------
+
+const BLOCK_TRANSACTION_ORACLE_MANIFEST_JSON: &str = r#"{
+  "schema": "solaris.block_transaction.oracle.v1",
+  "id": "block-transaction-26-1-2",
+  "phases": [
+    {"id":"accepted-break","case":"accepted_break","sequence":1},
+    {"id":"accepted-place","case":"accepted_place","sequence":2},
+    {"id":"occupied-place-rejection","case":"occupied_place_rejection","sequence":3},
+    {"id":"out-of-reach-break-rejection","case":"out_of_reach_break_rejection","sequence":4},
+    {"id":"early-stop-break-rejection","case":"early_stop_break_rejection","sequence":6}
+  ]
+}"#;
+
+fn block_transaction_oracle_manifest() -> BlockTransactionOracleManifest {
+    BlockTransactionOracleManifest::from_json(BLOCK_TRANSACTION_ORACLE_MANIFEST_JSON)
+        .expect("checked block transaction oracle manifest")
+}
+
+async fn enter_block_oracle_play(
+    ctx: ScenarioContext,
+) -> Result<(Client, SynchronizePlayerPosition, String)> {
+    let subject = match ctx.kind {
+        ServerKind::Solaris => "solaris",
+        ServerKind::Vanilla => "vanilla",
+    }
+    .to_string();
+    let mut client = Client::connect(ctx.addr).await?;
+    let _login = client.drive_login(ctx.addr, &subject).await?;
+    client.drive_configuration().await?;
+
+    let _: LoginPlay = read_typed_skipping_startup_noise(&mut client).await?;
+    let _: ClientboundChangeDifficulty = read_typed_skipping_startup_noise(&mut client).await?;
+    let _: ClientboundPlayerAbilities = read_typed_skipping_startup_noise(&mut client).await?;
+    let _: ClientboundSetHeldSlot = read_typed_skipping_startup_noise(&mut client).await?;
+    let _: EntityEvent = read_typed_skipping_startup_noise(&mut client).await?;
+    read_packet_id_skipping_startup_noise(&mut client, ClientboundCommands::ID).await?;
+    let sync = read_spawn_position(&mut client).await?;
+    let _: ClientboundInitializeBorder = read_typed_skipping_startup_noise(&mut client).await?;
+    let _: ClientboundSetTime = read_typed_skipping_startup_noise(&mut client).await?;
+    let _: SetDefaultSpawnPosition = read_typed_skipping_startup_noise(&mut client).await?;
+    let _: GameEvent = read_typed_skipping_startup_noise(&mut client).await?;
+    let _: SetCenterChunk = read_typed_skipping_startup_noise(&mut client).await?;
+    client
+        .write_packet(&ConfirmTeleportation {
+            teleport_id: sync.teleport_id,
+        })
+        .await?;
+    client.write_packet(&ServerboundPlayerLoaded).await?;
+
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
+    loop {
+        let frame = client
+            .read_frame_with_timeout(
+                deadline.saturating_duration_since(tokio::time::Instant::now()),
+            )
+            .await
+            .context("block oracle did not receive a Play chunk")?;
+        if frame.id == ClientboundKeepAlive::ID {
+            let keepalive = ClientboundKeepAlive::decode(&mut frame.body.clone())?;
+            client
+                .write_packet(&ServerboundKeepAlive { id: keepalive.id })
+                .await?;
+            continue;
+        }
+        if frame.id == LevelChunkWithLight::ID {
+            break;
+        }
+    }
+    Ok((client, sync, subject))
+}
+
+async fn block_oracle_command_fence(client: &mut Client, command: String) -> Result<()> {
+    client
+        .write_packet(&ServerboundChatCommand { command })
+        .await?;
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+    loop {
+        let frame = client
+            .read_frame_with_timeout(
+                deadline.saturating_duration_since(tokio::time::Instant::now()),
+            )
+            .await
+            .context("block oracle command did not produce feedback")?;
+        if frame.id == ClientboundKeepAlive::ID {
+            let keepalive = ClientboundKeepAlive::decode(&mut frame.body.clone())?;
+            client
+                .write_packet(&ServerboundKeepAlive { id: keepalive.id })
+                .await?;
+        } else if frame.id == SynchronizePlayerPosition::ID {
+            let sync = SynchronizePlayerPosition::decode(&mut frame.body.clone())?;
+            client
+                .write_packet(&ConfirmTeleportation {
+                    teleport_id: sync.teleport_id,
+                })
+                .await?;
+        } else if frame.id == ClientboundSystemChat::ID {
+            let _ = ClientboundSystemChat::decode(&mut frame.body.clone())?;
+            return Ok(());
+        }
+    }
+}
+
+async fn block_oracle_give_and_select_dirt(
+    client: &mut Client,
+    subject: &str,
+    dirt_item_id: u32,
+) -> Result<i16> {
+    let command = if subject == "solaris" {
+        "debug give minecraft:dirt 64 0".to_string()
+    } else {
+        format!("give {subject} minecraft:dirt 64")
+    };
+    client
+        .write_packet(&ServerboundChatCommand { command })
+        .await?;
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+    let mut feedback = false;
+    let mut hotbar_slot = None;
+    while !(feedback && hotbar_slot.is_some()) {
+        let frame = client
+            .read_frame_with_timeout(
+                deadline.saturating_duration_since(tokio::time::Instant::now()),
+            )
+            .await
+            .context("block oracle dirt setup did not converge")?;
+        if frame.id == ClientboundKeepAlive::ID {
+            let keepalive = ClientboundKeepAlive::decode(&mut frame.body.clone())?;
+            client
+                .write_packet(&ServerboundKeepAlive { id: keepalive.id })
+                .await?;
+        } else if frame.id == ClientboundContainerSetSlot::ID {
+            let update = ClientboundContainerSetSlot::decode(&mut frame.body.clone())?;
+            if update.item_stack.item_id == dirt_item_id && update.item_stack.count > 0 {
+                hotbar_slot = match update.container_id {
+                    -2 if (0..=8).contains(&update.slot) => Some(update.slot),
+                    0 if (36..=44).contains(&update.slot) => Some(update.slot - 36),
+                    _ => hotbar_slot,
+                };
+            }
+        } else if frame.id == ClientboundContainerSetContent::ID {
+            let content = ClientboundContainerSetContent::decode(&mut frame.body.clone())?;
+            if content.container_id == 0 {
+                hotbar_slot = content.items.iter().enumerate().find_map(|(slot, stack)| {
+                    (stack.item_id == dirt_item_id && stack.count > 0 && (36..=44).contains(&slot))
+                        .then(|| i16::try_from(slot - 36).expect("hotbar slot fits i16"))
+                });
+            }
+        } else if frame.id == ClientboundSystemChat::ID {
+            let _ = ClientboundSystemChat::decode(&mut frame.body.clone())?;
+            feedback = true;
+        }
+    }
+    let hotbar_slot = hotbar_slot.expect("loop requires a dirt hotbar slot");
+    client
+        .write_packet(&ServerboundSetCarriedItem { slot: hotbar_slot })
+        .await?;
+    block_oracle_command_fence(client, "list".to_string()).await?;
+    Ok(hotbar_slot)
+}
+
+async fn block_oracle_move_x(
+    client: &mut Client,
+    from_x: f64,
+    to_x: f64,
+    y: f64,
+    z: f64,
+) -> Result<()> {
+    const STEPS: u32 = 10;
+    for step in 1..=STEPS {
+        let fraction = f64::from(step) / f64::from(STEPS);
+        client
+            .write_packet(&ServerboundMovePlayerPos {
+                x: from_x + (to_x - from_x) * fraction,
+                y,
+                z,
+                flags: MovePlayerFlags::new(true, false),
+            })
+            .await?;
+    }
+    block_oracle_command_fence(client, "list".to_string()).await
+}
+
+fn sign_extend_section(value: i64, bits: u32) -> i32 {
+    let shift = 64 - bits;
+    ((value << shift) >> shift) as i32
+}
+
+fn section_target_state(packet: &SectionBlocksUpdate, target: (i32, i32, i32)) -> Option<i32> {
+    let section_x = sign_extend_section((packet.section_pos >> 42) & 0x3f_ffff, 22);
+    let section_z = sign_extend_section((packet.section_pos >> 20) & 0x3f_ffff, 22);
+    let section_y = sign_extend_section(packet.section_pos & 0x0f_ffff, 20);
+    packet.changes.iter().find_map(|change| {
+        let local_x = i32::from((change.relative_pos >> 8) & 15);
+        let local_z = i32::from((change.relative_pos >> 4) & 15);
+        let local_y = i32::from(change.relative_pos & 15);
+        let position = (
+            section_x * 16 + local_x,
+            section_y * 16 + local_y,
+            section_z * 16 + local_z,
+        );
+        (position == target).then_some(change.state_id)
+    })
+}
+
+fn push_normalized_block_oracle_event(
+    events: &mut Vec<BlockTransactionOracleEvent>,
+    event: BlockTransactionOracleEvent,
+) {
+    if matches!(
+        (&event, events.last()),
+        (
+            BlockTransactionOracleEvent::TargetUpdate { state_id: current },
+            Some(BlockTransactionOracleEvent::TargetUpdate { state_id: previous })
+        ) if current == previous
+    ) {
+        return;
+    }
+    events.push(event);
+}
+
+async fn collect_block_transaction_phase(
+    client: &mut Client,
+    phase: &BlockTransactionOraclePhase,
+    target: (i32, i32, i32),
+) -> Result<BlockTransactionOraclePhaseTrace> {
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(15);
+    let mut events = Vec::new();
+    loop {
+        let frame = client
+            .read_frame_with_timeout(
+                deadline.saturating_duration_since(tokio::time::Instant::now()),
+            )
+            .await
+            .with_context(|| format!("block oracle phase {} stalled", phase.id))?;
+        if frame.id == ClientboundKeepAlive::ID {
+            let keepalive = ClientboundKeepAlive::decode(&mut frame.body.clone())?;
+            client
+                .write_packet(&ServerboundKeepAlive { id: keepalive.id })
+                .await?;
+            continue;
+        }
+        if frame.id == BlockUpdate::ID {
+            let update = BlockUpdate::decode(&mut frame.body.clone())?;
+            if unpack_block_pos(update.position) == target {
+                push_normalized_block_oracle_event(
+                    &mut events,
+                    BlockTransactionOracleEvent::TargetUpdate {
+                        state_id: update.state_id,
+                    },
+                );
+            }
+        } else if frame.id == SectionBlocksUpdate::ID {
+            let update = SectionBlocksUpdate::decode(&mut frame.body.clone())?;
+            if let Some(state_id) = section_target_state(&update, target) {
+                push_normalized_block_oracle_event(
+                    &mut events,
+                    BlockTransactionOracleEvent::TargetUpdate { state_id },
+                );
+            }
+        } else if frame.id == BlockChangedAck::ID {
+            let ack = BlockChangedAck::decode(&mut frame.body.clone())?;
+            if ack.sequence == phase.sequence {
+                events.push(BlockTransactionOracleEvent::Ack {
+                    sequence: ack.sequence,
+                });
+                client
+                    .write_packet(&ServerboundChatCommand {
+                        command: "list".to_string(),
+                    })
+                    .await?;
+            }
+        } else if frame.id == ClientboundSystemChat::ID
+            && events.iter().any(|event| {
+                matches!(
+                    event,
+                    BlockTransactionOracleEvent::Ack { sequence } if *sequence == phase.sequence
+                )
+            })
+        {
+            let _ = ClientboundSystemChat::decode(&mut frame.body.clone())?;
+            return Ok(BlockTransactionOraclePhaseTrace {
+                id: phase.id.clone(),
+                events,
+            });
+        }
+    }
+}
+
+async fn observe_block_transaction_oracle(
+    ctx: ScenarioContext,
+    manifest: &BlockTransactionOracleManifest,
+) -> Result<BlockTransactionOracleTrace> {
+    manifest.validate()?;
+    let (mut client, spawn, subject) = enter_block_oracle_play(ctx).await?;
+    block_oracle_command_fence(&mut client, "gamemode creative".to_string()).await?;
+    let items_report =
+        mc_data::items::load_items_report(local_vanilla_dir().join("reports/registries.json"))?;
+    let item_registry = mc_data::items::ItemRegistry::from_report(&items_report);
+    let dirt_item_id = item_registry
+        .id_of(&mc_data::Identifier::parse("minecraft:dirt")?)
+        .context("vanilla item registry has minecraft:dirt")?;
+    let _selected_hotbar_slot =
+        block_oracle_give_and_select_dirt(&mut client, &subject, dirt_item_id).await?;
+
+    let target = (
+        spawn.x.floor() as i32,
+        spawn.y.floor() as i32 - 1,
+        spawn.z.floor() as i32,
+    );
+    let working_x = spawn.x + 2.5;
+    block_oracle_move_x(&mut client, spawn.x, working_x, spawn.y, spawn.z).await?;
+    let mut traces = Vec::with_capacity(manifest.phases.len());
+    for phase in &manifest.phases {
+        match phase.case {
+            BlockTransactionOracleCase::AcceptedBreak => {
+                client
+                    .write_packet(&ServerboundPlayerAction {
+                        action: PlayerActionKind::StartDestroyBlock,
+                        position: pack_block_pos(target.0, target.1, target.2),
+                        direction: Direction::Up,
+                        sequence: phase.sequence,
+                    })
+                    .await?;
+            }
+            BlockTransactionOracleCase::AcceptedPlace => {
+                let clicked = (target.0, target.1 - 1, target.2);
+                client
+                    .write_packet(&ServerboundUseItemOn {
+                        hand: InteractionHand::MainHand,
+                        position: pack_block_pos(clicked.0, clicked.1, clicked.2),
+                        direction: Direction::Up,
+                        cursor_x: 0.5,
+                        cursor_y: 1.0,
+                        cursor_z: 0.5,
+                        inside: false,
+                        world_border_hit: false,
+                        sequence: phase.sequence,
+                    })
+                    .await?;
+            }
+            BlockTransactionOracleCase::OccupiedPlaceRejection => {
+                client
+                    .write_packet(&ServerboundUseItemOn {
+                        hand: InteractionHand::MainHand,
+                        position: pack_block_pos(target.0, target.1, target.2),
+                        direction: Direction::Down,
+                        cursor_x: 0.5,
+                        cursor_y: 0.0,
+                        cursor_z: 0.5,
+                        inside: false,
+                        world_border_hit: false,
+                        sequence: phase.sequence,
+                    })
+                    .await?;
+            }
+            BlockTransactionOracleCase::OutOfReachBreakRejection => {
+                block_oracle_move_x(
+                    &mut client,
+                    working_x,
+                    f64::from(target.0) + 20.5,
+                    spawn.y,
+                    spawn.z,
+                )
+                .await?;
+                client
+                    .write_packet(&ServerboundPlayerAction {
+                        action: PlayerActionKind::StartDestroyBlock,
+                        position: pack_block_pos(target.0, target.1, target.2),
+                        direction: Direction::Up,
+                        sequence: phase.sequence,
+                    })
+                    .await?;
+            }
+            BlockTransactionOracleCase::EarlyStopBreakRejection => {
+                block_oracle_move_x(
+                    &mut client,
+                    f64::from(target.0) + 20.5,
+                    working_x,
+                    spawn.y,
+                    spawn.z,
+                )
+                .await?;
+                block_oracle_command_fence(&mut client, "gamemode survival".to_string()).await?;
+                client
+                    .write_packet(&ServerboundPlayerAction {
+                        action: PlayerActionKind::StartDestroyBlock,
+                        position: pack_block_pos(target.0, target.1, target.2),
+                        direction: Direction::Up,
+                        sequence: 5,
+                    })
+                    .await?;
+                client
+                    .write_packet(&ServerboundPlayerAction {
+                        action: PlayerActionKind::StopDestroyBlock,
+                        position: pack_block_pos(target.0, target.1, target.2),
+                        direction: Direction::Up,
+                        sequence: phase.sequence,
+                    })
+                    .await?;
+            }
+        }
+        traces.push(collect_block_transaction_phase(&mut client, phase, target).await?);
+    }
+
+    let trace = BlockTransactionOracleTrace {
+        manifest_id: manifest.id.clone(),
+        phases: traces,
+    };
+    trace.validate_against(manifest)?;
+    let accepted_place_state = trace.phases[1]
+        .events
+        .iter()
+        .find_map(|event| match event {
+            BlockTransactionOracleEvent::TargetUpdate { state_id } => Some(*state_id),
+            BlockTransactionOracleEvent::Ack { .. } => None,
+        })
+        .context("accepted place did not publish a target state")?;
+    anyhow::ensure!(
+        accepted_place_state != 0,
+        "accepted place published air instead of an occupied block state"
+    );
+    let occupied_resync_state = trace.phases[2]
+        .events
+        .iter()
+        .find_map(|event| match event {
+            BlockTransactionOracleEvent::TargetUpdate { state_id } => Some(*state_id),
+            BlockTransactionOracleEvent::Ack { .. } => None,
+        })
+        .context("occupied placement rejection did not resync the target")?;
+    anyhow::ensure!(
+        occupied_resync_state == accepted_place_state,
+        "occupied rejection resynced state {occupied_resync_state}, expected placed state {accepted_place_state}"
+    );
+    Ok(trace)
+}
+
+#[test]
+fn block_oracle_normalizes_only_consecutive_identical_target_updates() {
+    let mut events = Vec::new();
+    push_normalized_block_oracle_event(
+        &mut events,
+        BlockTransactionOracleEvent::TargetUpdate { state_id: 10 },
+    );
+    push_normalized_block_oracle_event(
+        &mut events,
+        BlockTransactionOracleEvent::TargetUpdate { state_id: 10 },
+    );
+    push_normalized_block_oracle_event(
+        &mut events,
+        BlockTransactionOracleEvent::Ack { sequence: 2 },
+    );
+    push_normalized_block_oracle_event(
+        &mut events,
+        BlockTransactionOracleEvent::TargetUpdate { state_id: 10 },
+    );
+    push_normalized_block_oracle_event(
+        &mut events,
+        BlockTransactionOracleEvent::TargetUpdate { state_id: 0 },
+    );
+    assert_eq!(
+        events,
+        [
+            BlockTransactionOracleEvent::TargetUpdate { state_id: 10 },
+            BlockTransactionOracleEvent::Ack { sequence: 2 },
+            BlockTransactionOracleEvent::TargetUpdate { state_id: 10 },
+            BlockTransactionOracleEvent::TargetUpdate { state_id: 0 },
+        ]
+    );
+}
+
+#[tokio::test]
+#[ignore = "requires local .analysis/server.jar, Java 25, and data/vanilla sidecars"]
+async fn checked_block_transaction_manifest_matches_vanilla_oracle_and_solaris() {
+    let availability = vanilla_oracle_availability(repo_root());
+    let OracleAvailability::Available { jar } = availability else {
+        panic!(
+            "{}",
+            availability.skip_message().expect("oracle unavailable")
+        );
+    };
+    assert!(local_vanilla_dir().join("reports/blocks.json").is_file());
+    let manifest = block_transaction_oracle_manifest();
+
+    let vanilla_dir = tempfile::tempdir().expect("vanilla block oracle tempdir");
+    std::fs::write(
+        vanilla_dir.path().join("ops.json"),
+        serde_json::to_vec_pretty(&serde_json::json!([{
+            "uuid": mc_net::offline_uuid("vanilla").to_string(),
+            "name": "vanilla",
+            "level": 4,
+            "bypassesPlayerLimit": false
+        }]))
+        .expect("serialize vanilla block oracle ops.json"),
+    )
+    .expect("write vanilla block oracle ops.json");
+    let vanilla = VanillaServerProcess::launch(&jar, vanilla_dir.path(), Duration::from_secs(90))
+        .expect("vanilla block oracle starts");
+
+    let (solaris, solaris_addr) = spawn_solaris_with_local_vanilla_data()
+        .await
+        .expect("spawn Solaris block oracle");
+    let solaris_task = tokio::spawn(async move { solaris.serve().await });
+
+    let vanilla_trace = observe_block_transaction_oracle(
+        ScenarioContext {
+            kind: ServerKind::Vanilla,
+            addr: vanilla.addr(),
+        },
+        &manifest,
+    )
+    .await
+    .expect("vanilla block transaction trace");
+    let solaris_trace = observe_block_transaction_oracle(
+        ScenarioContext {
+            kind: ServerKind::Solaris,
+            addr: solaris_addr,
+        },
+        &manifest,
+    )
+    .await
+    .expect("Solaris block transaction trace");
+
+    eprintln!(
+        "T01-05 vanilla trace: {}",
+        serde_json::to_string(&vanilla_trace).expect("serialize vanilla trace")
+    );
+    eprintln!(
+        "T01-05 Solaris trace: {}",
+        serde_json::to_string(&solaris_trace).expect("serialize Solaris trace")
+    );
+    assert_eq!(
+        vanilla_trace, solaris_trace,
+        "Solaris block transaction/rejection/resync order diverged from vanilla"
+    );
+    let artifact_dir = repo_root().join(".analysis/runs/t01-05-a");
+    std::fs::create_dir_all(&artifact_dir).expect("create T01-05 artifact dir");
+    std::fs::write(
+        artifact_dir.join("block-transaction-oracle.json"),
+        serde_json::to_vec_pretty(&serde_json::json!({
+            "schema": BLOCK_TRANSACTION_ORACLE_SCHEMA,
+            "manifest": manifest,
+            "vanilla": vanilla_trace,
+            "solaris": solaris_trace,
+        }))
+        .expect("serialize T01-05 oracle artifact"),
+    )
+    .expect("write T01-05 oracle artifact");
+
+    vanilla.stop().expect("vanilla block oracle stops");
     solaris_task.abort();
 }

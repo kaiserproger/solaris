@@ -5,8 +5,11 @@ use std::task::Poll;
 use mc_data::blocks::{BlockReport, BlockStateReport};
 use mc_entity::{EntityItemStack, Vec3};
 use mc_protocol::codec::Identifier;
+use mc_protocol::frame::Compression;
+use mc_protocol::packets::Packet;
 use mc_protocol::packets::play::{
-    Direction, GameMode, ItemStack, PlayerActionKind, ServerboundPlayerAction, pack_block_pos,
+    BlockChangedAck, Direction, GameMode, ItemStack, PlayerActionKind, ServerboundPlayerAction,
+    pack_block_pos,
 };
 use tokio::sync::mpsc;
 
@@ -628,6 +631,50 @@ async fn stale_stair_dependency_rolls_back_break_tool_and_drop_publication() {
             .into_iter()
             .all(|record| record.snapshot.item_stack.is_none())
     );
+}
+
+#[tokio::test]
+async fn out_of_reach_destroy_is_ack_only_like_vanilla() {
+    let mut state = interaction_state_for_blocks(Arc::new(fluid_test_registry()));
+    let target = mc_world::BlockPos { x: 0, y: 64, z: 0 };
+    let pose = PlayerPose::new(20.5, 66.0, 0.5);
+    let mut writer = Vec::new();
+    let mut survival = SurvivalState::FULL;
+    let mut xp = XpState::default();
+
+    handle_block_destroy_action(
+        &mut state,
+        &mut writer,
+        None,
+        GameMode::Survival,
+        &mut survival,
+        &mut xp,
+        pose,
+        ServerboundPlayerAction {
+            action: PlayerActionKind::StartDestroyBlock,
+            position: pack_block_pos(target.x, target.y, target.z),
+            direction: Direction::Up,
+            sequence: 44,
+        },
+    )
+    .await
+    .unwrap();
+
+    let mut bytes = bytes::BytesMut::from(writer.as_slice());
+    let mut frame = mc_protocol::frame::try_decode_frame(&mut bytes, Compression::Disabled)
+        .unwrap()
+        .expect("out-of-reach destroy acknowledgement");
+    assert_eq!(frame.id, BlockChangedAck::ID);
+    assert_eq!(
+        BlockChangedAck::decode(&mut frame.body).unwrap().sequence,
+        44
+    );
+    assert!(
+        bytes.is_empty(),
+        "vanilla sends no target block resync for an out-of-reach START"
+    );
+    assert!(state.pending_break.is_none());
+    assert!(state.pending_use.is_none());
 }
 
 #[tokio::test]
