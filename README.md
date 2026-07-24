@@ -38,11 +38,60 @@ targets a different release id, world version, or protocol. Without
 ## Run
 
 ```sh
+# Optional: copy a minimal starter config.
+# The file uses the same schema as example.toml.
+cat > server-run.toml <<'EOF'
+[server]
+name = "solaris-local"
+motd = "Solaris local server"
+view_distance = 8
+
+[network]
+bind_address = "127.0.0.1"
+port = 25565
+
+[auth]
+online_mode = false
+prevent_proxy_connections = false
+whitelist_enabled = false
+whitelist = []
+banned_players = []
+
+[admin]
+operators = []
+allow_local_dev_operators = true
+
+[plugins]
+directory = "plugins"
+
+[data]
+world_dir = "world"
+seed = 0
+
+[simulation]
+random_tick_speed = 5
+save_interval_ticks = 1200
+spawn_monsters = true
+
+[chunk_pipeline]
+chunk_send_rate = 8
+chunk_load_rate = 16
+chunk_generate_rate = 16
+chunk_prepare_budget_ms = 0
+chunk_prepare_batch_size = 8
+chunk_result_queue_size = 64
+region_cache_size = 9
+
+[autoscale]
+enabled = true
+profile = "balanced"
+EOF
+
 # Just validate the config:
-cargo run --bin mc-server -- --check --config example.toml
+cargo run --release --bin mc-server -- --check --config server-run.toml
 
 # Actually serve:
-cargo run --bin mc-server -- --config example.toml
+cargo run --release --bin mc-server -- --config server-run.toml
 ```
 
 The `--check` JSON includes `operator_warnings`. Treat non-empty warnings as
