@@ -4,14 +4,14 @@ Generated from task cards plus durable Git-common-dir state. Edit task cards, no
 
 ## Counts
 
-- `BLOCKED`: **6**
-- `DONE`: **8**
+- `BLOCKED`: **5**
+- `DONE`: **9**
 - `QUEUED`: **60**
 
 ## Cursor
 
 - Active: `none`
-- Ready: `T04-03, T05-01, T06-01`
+- Ready: `T01-04, T01-05, T01-06, T04-03, T05-01, T06-01`
 - Coordinator: `none`
 - Templates: `none`
 
@@ -30,7 +30,7 @@ Generated from task cards plus durable Git-common-dir state. Edit task cards, no
 
 ## W01
 
-- [ ] `T01-01` · **BLOCKED-INTEGRATED** · Добавить компактный core-gate manifest: scenario → ledger rows → evidence legs
+- [x] `T01-01` · **DONE** · Добавить компактный core-gate manifest: scenario → ledger rows → evidence legs
 - [ ] `T01-02` · **BLOCKED-INTEGRATED** · Разрезать broad block/fluid real-client gate на независимые focused phases
 - [ ] `T01-03` · **BLOCKED-INTEGRATED** · Разрезать inventory/crafting/container real-client gate на focused phases
 - [ ] `T01-04` · **QUEUED** · Добавить restart invariant snapshot и строгую cross-phase валидацию
