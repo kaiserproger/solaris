@@ -10,6 +10,7 @@ use crate::parity::{
 
 pub const REPLAY_SCENARIO_SCHEMA: &str = "solaris.core_replay.scenario.v1";
 pub const REPLAY_RESULT_SCHEMA: &str = "solaris.core_replay.result.v1";
+pub const CORE_GATE_MANIFEST_SCHEMA: &str = "solaris.core_gate.manifest.v1";
 
 const MAX_REPLAY_ACTIONS: usize = 10_000;
 const MAX_REPLAY_CHECKS: usize = 128;
@@ -51,6 +52,224 @@ pub enum ReplayOutcome {
     Failed,
     Degraded,
     Blocked,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CoreGateEvidenceLeg {
+    Unit,
+    Wire,
+    Oracle,
+    RealClient,
+    Performance,
+    Persistence,
+    ReplayNegative,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CoreGateRowScope {
+    Focused,
+    Broad,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct CoreGatePhase {
+    pub id: String,
+    pub scenario_id: String,
+    pub ledger_rows: Vec<String>,
+    pub evidence_legs: BTreeSet<CoreGateEvidenceLeg>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct CoreGateRow {
+    pub row: String,
+    pub scope: CoreGateRowScope,
+    pub required_phases: Vec<String>,
+    pub required_evidence_legs: BTreeSet<CoreGateEvidenceLeg>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct CoreGatePhaseEvidence {
+    pub phase_id: String,
+    pub passed_evidence_legs: BTreeSet<CoreGateEvidenceLeg>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct CoreGateManifest {
+    pub schema: String,
+    pub phases: Vec<CoreGatePhase>,
+    pub rows: Vec<CoreGateRow>,
+}
+
+impl CoreGateManifest {
+    pub fn from_json(input: &str) -> Result<Self> {
+        let manifest: Self =
+            serde_json::from_str(input).context("parse core gate manifest JSON")?;
+        manifest.validate()?;
+        Ok(manifest)
+    }
+
+    pub fn validate(&self) -> Result<()> {
+        ensure!(
+            self.schema == CORE_GATE_MANIFEST_SCHEMA,
+            "unsupported core gate manifest schema: {}",
+            self.schema
+        );
+        ensure!(
+            !self.phases.is_empty(),
+            "core gate manifest phases are empty"
+        );
+        ensure!(
+            self.phases.len() <= MAX_REPLAY_CHECKS,
+            "core gate manifest has too many phases"
+        );
+        ensure!(!self.rows.is_empty(), "core gate manifest rows are empty");
+        ensure!(
+            self.rows.len() <= MAX_REPLAY_CHECKS,
+            "core gate manifest has too many rows"
+        );
+
+        let mut phases_by_id = BTreeMap::new();
+        for phase in &self.phases {
+            validate_identifier("core gate phase id", &phase.id)?;
+            validate_identifier("core gate scenario id", &phase.scenario_id)?;
+            ensure!(
+                phases_by_id.insert(phase.id.as_str(), phase).is_none(),
+                "duplicate core gate phase id: {}",
+                phase.id
+            );
+            ensure!(
+                !phase.ledger_rows.is_empty(),
+                "core gate phase {} has no ledger rows",
+                phase.id
+            );
+            ensure!(
+                !phase.evidence_legs.is_empty(),
+                "core gate phase {} has no evidence legs",
+                phase.id
+            );
+            let mut phase_rows = BTreeSet::new();
+            for row in &phase.ledger_rows {
+                validate_ledger_row(row)?;
+                ensure!(
+                    phase_rows.insert(row.as_str()),
+                    "core gate phase {} repeats ledger row {}",
+                    phase.id,
+                    row
+                );
+            }
+        }
+
+        let mut row_ids = BTreeSet::new();
+        for row in &self.rows {
+            validate_ledger_row(&row.row)?;
+            ensure!(
+                row_ids.insert(row.row.as_str()),
+                "duplicate core gate ledger row: {}",
+                row.row
+            );
+            ensure!(
+                !row.required_phases.is_empty(),
+                "core gate row {} has no required phases",
+                row.row
+            );
+            if row.scope == CoreGateRowScope::Broad {
+                ensure!(
+                    row.required_phases.len() >= 2,
+                    "broad core gate row {} requires at least two focused phases",
+                    row.row
+                );
+            }
+            ensure!(
+                !row.required_evidence_legs.is_empty(),
+                "core gate row {} has no required evidence legs",
+                row.row
+            );
+            let mut required_phase_ids = BTreeSet::new();
+            for phase_id in &row.required_phases {
+                ensure!(
+                    required_phase_ids.insert(phase_id.as_str()),
+                    "core gate row {} repeats required phase {}",
+                    row.row,
+                    phase_id
+                );
+                let phase = phases_by_id.get(phase_id.as_str()).with_context(|| {
+                    format!(
+                        "core gate row {} requires unknown phase {phase_id}",
+                        row.row
+                    )
+                })?;
+                ensure!(
+                    phase
+                        .ledger_rows
+                        .iter()
+                        .any(|candidate| candidate == &row.row),
+                    "core gate phase {} does not cover required row {}",
+                    phase.id,
+                    row.row
+                );
+            }
+        }
+        Ok(())
+    }
+
+    pub fn validate_completion(&self, completed: &[CoreGatePhaseEvidence]) -> Result<()> {
+        self.validate()?;
+        let phases_by_id = self
+            .phases
+            .iter()
+            .map(|phase| (phase.id.as_str(), phase))
+            .collect::<BTreeMap<_, _>>();
+        let mut completed_by_id = BTreeMap::new();
+        for evidence in completed {
+            ensure!(
+                phases_by_id.contains_key(evidence.phase_id.as_str()),
+                "completion references unknown core gate phase {}",
+                evidence.phase_id
+            );
+            ensure!(
+                completed_by_id
+                    .insert(evidence.phase_id.as_str(), evidence)
+                    .is_none(),
+                "duplicate core gate completion for phase {}",
+                evidence.phase_id
+            );
+        }
+
+        for row in &self.rows {
+            let mut row_evidence = BTreeSet::new();
+            for phase_id in &row.required_phases {
+                let phase = phases_by_id
+                    .get(phase_id.as_str())
+                    .expect("validated core gate phase exists");
+                let evidence = completed_by_id.get(phase_id.as_str()).with_context(|| {
+                    format!(
+                        "core gate row {} is missing focused phase {phase_id}",
+                        row.row
+                    )
+                })?;
+                ensure!(
+                    evidence
+                        .passed_evidence_legs
+                        .is_superset(&phase.evidence_legs),
+                    "core gate phase {} is missing declared evidence legs",
+                    phase.id
+                );
+                row_evidence.extend(evidence.passed_evidence_legs.iter().copied());
+            }
+            ensure!(
+                row_evidence.is_superset(&row.required_evidence_legs),
+                "core gate row {} is missing required evidence legs",
+                row.row
+            );
+        }
+        Ok(())
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -944,6 +1163,17 @@ fn derive_outcome(statuses: impl IntoIterator<Item = ReplayCheckStatus>) -> Resu
     })
 }
 
+fn validate_ledger_row(row: &str) -> Result<()> {
+    ensure!(!row.is_empty(), "core gate ledger row is empty");
+    ensure!(row.len() <= 16, "core gate ledger row is too long");
+    ensure!(
+        row.bytes()
+            .all(|byte| byte.is_ascii_uppercase() || byte.is_ascii_digit()),
+        "invalid core gate ledger row: {row}"
+    );
+    Ok(())
+}
+
 fn validate_identifier(label: &str, value: &str) -> Result<()> {
     ensure!(!value.is_empty(), "{label} is empty");
     ensure!(value.len() <= 128, "{label} is longer than 128 bytes");
@@ -999,6 +1229,123 @@ fn validate_relative_artifact_path(value: &str) -> Result<()> {
 mod tests {
     use super::*;
     use serde_json::{Value, json};
+
+    fn core_gate_manifest_json() -> Value {
+        json!({
+            "schema": "solaris.core_gate.manifest.v1",
+            "phases": [
+                {
+                    "id": "solid-edit",
+                    "scenario_id": "m94-02a-solid-place-break-drop",
+                    "ledger_rows": ["B1"],
+                    "evidence_legs": ["unit", "wire", "real_client"]
+                },
+                {
+                    "id": "rejected-resync",
+                    "scenario_id": "m94-02b-rejected-block-resync",
+                    "ledger_rows": ["B1"],
+                    "evidence_legs": ["wire", "oracle", "replay_negative"]
+                }
+            ],
+            "rows": [{
+                "row": "B1",
+                "scope": "broad",
+                "required_phases": ["solid-edit", "rejected-resync"],
+                "required_evidence_legs": [
+                    "unit", "wire", "oracle", "real_client", "replay_negative"
+                ]
+            }]
+        })
+    }
+
+    #[test]
+    fn core_gate_manifest_accepts_focused_phase_and_evidence_matrix() {
+        let manifest = CoreGateManifest::from_json(&core_gate_manifest_json().to_string())
+            .expect("valid core gate manifest");
+        manifest
+            .validate_completion(&[
+                CoreGatePhaseEvidence {
+                    phase_id: "solid-edit".to_owned(),
+                    passed_evidence_legs: [
+                        CoreGateEvidenceLeg::Unit,
+                        CoreGateEvidenceLeg::Wire,
+                        CoreGateEvidenceLeg::RealClient,
+                    ]
+                    .into_iter()
+                    .collect(),
+                },
+                CoreGatePhaseEvidence {
+                    phase_id: "rejected-resync".to_owned(),
+                    passed_evidence_legs: [
+                        CoreGateEvidenceLeg::Wire,
+                        CoreGateEvidenceLeg::Oracle,
+                        CoreGateEvidenceLeg::ReplayNegative,
+                    ]
+                    .into_iter()
+                    .collect(),
+                },
+            ])
+            .expect("complete focused evidence matrix");
+    }
+
+    #[test]
+    fn broad_core_gate_row_rejects_single_phase_manifest() {
+        let mut manifest = core_gate_manifest_json();
+        manifest["rows"][0]["required_phases"] = json!(["solid-edit"]);
+        let error = CoreGateManifest::from_json(&manifest.to_string())
+            .expect_err("broad row must require multiple focused phases");
+        assert!(error.to_string().contains("at least two focused phases"));
+    }
+
+    #[test]
+    fn core_gate_completion_rejects_missing_focused_phase() {
+        let manifest = CoreGateManifest::from_json(&core_gate_manifest_json().to_string())
+            .expect("valid core gate manifest");
+        let error = manifest
+            .validate_completion(&[CoreGatePhaseEvidence {
+                phase_id: "solid-edit".to_owned(),
+                passed_evidence_legs: [
+                    CoreGateEvidenceLeg::Unit,
+                    CoreGateEvidenceLeg::Wire,
+                    CoreGateEvidenceLeg::RealClient,
+                ]
+                .into_iter()
+                .collect(),
+            }])
+            .expect_err("missing focused phase must reject broad row completion");
+        assert!(
+            error
+                .to_string()
+                .contains("missing focused phase rejected-resync")
+        );
+    }
+
+    #[test]
+    fn core_gate_completion_rejects_missing_declared_evidence() {
+        let manifest = CoreGateManifest::from_json(&core_gate_manifest_json().to_string())
+            .expect("valid core gate manifest");
+        let error = manifest
+            .validate_completion(&[
+                CoreGatePhaseEvidence {
+                    phase_id: "solid-edit".to_owned(),
+                    passed_evidence_legs: [CoreGateEvidenceLeg::Unit, CoreGateEvidenceLeg::Wire]
+                        .into_iter()
+                        .collect(),
+                },
+                CoreGatePhaseEvidence {
+                    phase_id: "rejected-resync".to_owned(),
+                    passed_evidence_legs: [
+                        CoreGateEvidenceLeg::Wire,
+                        CoreGateEvidenceLeg::Oracle,
+                        CoreGateEvidenceLeg::ReplayNegative,
+                    ]
+                    .into_iter()
+                    .collect(),
+                },
+            ])
+            .expect_err("missing phase evidence must reject completion");
+        assert!(error.to_string().contains("missing declared evidence legs"));
+    }
 
     fn scenario_json() -> Value {
         json!({
