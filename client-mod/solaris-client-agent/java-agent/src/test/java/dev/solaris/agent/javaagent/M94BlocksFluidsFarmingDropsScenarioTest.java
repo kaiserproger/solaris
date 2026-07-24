@@ -10,6 +10,7 @@ import java.util.List;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertTrue;
+import static org.junit.jupiter.api.Assertions.assertFalse;
 
 final class M94BlocksFluidsFarmingDropsScenarioTest {
     @Test
@@ -42,6 +43,48 @@ final class M94BlocksFluidsFarmingDropsScenarioTest {
         assertTrue(
             report.observations().stream().anyMatch(entry -> entry.contains("blocked: door/trapdoor")),
             "broad scenario must name the remaining broad-row blockers"
+        );
+    }
+
+    @Test
+    void runsOnlySolidSubprobeWhenSolidScenarioIdRequested() {
+        FakeScenarioClient client = new FakeScenarioClient();
+
+        ClientScenarioReport report = new M94BlocksFluidsFarmingDropsScenario().run(
+            M94SolidBlockScenario.ID,
+            Path.of("run/screenshots"),
+            client
+        );
+
+        assertEquals("passed", report.result());
+        assertTrue(
+            client.operations.contains("break:solid-break-clicked:minecraft:dirt:1"),
+            "targeted scenario id should execute the solid subprobe"
+        );
+        assertFalse(
+            client.operations.stream().anyMatch(operation -> operation.startsWith("find-dry-placeable")),
+            "solid phase should not execute dry placeable/fluid probe"
+        );
+    }
+
+    @Test
+    void runsOnlyWaterSubprobeWhenWaterScenarioIdRequested() {
+        FakeScenarioClient client = new FakeScenarioClient();
+
+        ClientScenarioReport report = new M94BlocksFluidsFarmingDropsScenario().run(
+            M94WaterBucketScenario.ID,
+            Path.of("run/screenshots"),
+            client
+        );
+
+        assertEquals("passed", report.result());
+        assertTrue(
+            client.operations.contains("find-dry-placeable:within-survival-reach"),
+            "water phase should execute the dry placeable/fluid probe"
+        );
+        assertFalse(
+            client.operations.stream().anyMatch(operation -> operation.startsWith("break:solid-break")),
+            "water phase should not execute block-break probe"
         );
     }
 

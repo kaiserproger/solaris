@@ -10,6 +10,12 @@ final class M94BlocksFluidsFarmingDropsScenario {
     static final String ID = "m94-02-blocks-fluids-farming-drops";
 
     ClientScenarioReport run(String id, Path screenshotsDir, ScenarioClient client) {
+        if (M94SolidBlockScenario.ID.equals(id)) {
+            return new M94SolidBlockScenario().run(id, screenshotsDir, client);
+        }
+        if (M94WaterBucketScenario.ID.equals(id)) {
+            return new M94WaterBucketScenario().run(id, screenshotsDir, client);
+        }
         if (!ID.equals(id)) {
             return new ClientScenarioReport("blocked", id, List.of("unsupported scenario id: " + id));
         }
