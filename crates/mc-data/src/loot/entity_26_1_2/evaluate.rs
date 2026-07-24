@@ -936,7 +936,25 @@ fn validate_entity_collections(entity: &EntityLootEntity) -> Result<(), EntityLo
             EntityLootLimit::ContextEnchantmentLevels,
             entity.active_enchantments.len(),
         )?;
+        if !entity.is_living
+            && (entity.mainhand.is_some() || !entity.active_enchantments.is_empty())
+        {
+            return Err(EntityLootEvaluationError::InvalidContext {
+                message: format!(
+                    "non-living entity {} cannot supply equipment enchantments",
+                    entity.entity_type
+                ),
+            });
+        }
         if let Some(mainhand) = &entity.mainhand {
+            if mainhand.item().is_none() {
+                return Err(EntityLootEvaluationError::InvalidContext {
+                    message: format!(
+                        "entity {} cannot expose an empty mainhand item",
+                        entity.entity_type
+                    ),
+                });
+            }
             check_context_limit(
                 EntityLootLimit::ContextEnchantments,
                 mainhand.enchantments().len(),

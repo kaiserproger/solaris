@@ -1494,8 +1494,8 @@ fn sample_block_pool_roll_count(
     rolls: LootCount,
     bonus_rolls: LootCount,
 ) -> Result<u64, BlockLootEvaluationError> {
-    let rolls = rolls.try_sample(random.next_u64())?;
-    let bonus_rolls = bonus_rolls.try_sample(random.next_u64())?;
+    let rolls = sample_loot_count(rolls, random)?;
+    let bonus_rolls = sample_loot_count(bonus_rolls, random)?;
     let total = u64::from(rolls).checked_add(u64::from(bonus_rolls)).ok_or(
         BlockLootEvaluationError::ArithmeticOverflow {
             operation: "adding block pool rolls",
