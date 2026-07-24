@@ -77,7 +77,7 @@ Snapshot basis: **2026-07-24 Repomix snapshot**. Coordinator owns this file; wor
 ### W00 — Фиксация текущей истины
 
 - [x] [`T00-01` — Зафиксировать фактический HEAD, dirty tree и владельцев изменений](tasks/T00-01.md) — **P0**, rows `—`, deps `—`, locks `COORD`
-- [ ] [`T00-02` — Снять честный Cargo/Gradle baseline и список реально красных гейтов](tasks/T00-02.md) — **P0**, rows `—`, deps `T00-01`, locks `VALIDATION`
+- [x] [`T00-02` — Снять честный Cargo/Gradle baseline и список реально красных гейтов](tasks/T00-02.md) — **P0**, rows `—`, deps `T00-01`, locks `VALIDATION`
 - [ ] [`T00-03` — Собрать актуальную матрицу real-client сценариев и артефактов](tasks/T00-03.md) — **P0**, rows `Q2`, deps `T00-01`, locks `CLIENT-JAVA,RUNNER`
 - [ ] [`T00-04` — Собрать актуальную матрицу vanilla oracle/replay](tasks/T00-04.md) — **P0**, rows `Q1,Q3`, deps `T00-01`, locks `ORACLE,RUST-HARNESS`
 - [ ] [`T00-05` — Собрать текущую performance/concurrency базу и пробелы](tasks/T00-05.md) — **P0**, rows `O1,O2,O3`, deps `T00-01`, locks `PERF`
