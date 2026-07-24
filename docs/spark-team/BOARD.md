@@ -142,7 +142,7 @@ Snapshot basis: **2026-07-24 Repomix snapshot**. Coordinator owns this file; wor
 - [ ] [`T06-02` — Fault injection: chained/simultaneous TNT world/entity outcome](tasks/T06-02.md) — **P0**, rows `G1,S1,O2`, deps `T06-01`, locks `RUST-NET-ROOT,RUST-WORLD,RUST-ENTITY`
 - [ ] [`T06-03` — Fault injection: cross-region hopper compound commit](tasks/T06-03.md) — **P0**, rows `A1,K1,S1,O2`, deps `T06-01`, locks `RUST-NET-ROOT,RUST-WORLD`
 - [ ] [`T06-04` — Shutdown while journal/checkpoint outcome is unknown](tasks/T06-04.md) — **P0**, rows `S1,O2`, deps `T06-01,T06-03`, locks `RUST-NET-ROOT,RUST-WORLD`
-- [ ] [`T06-05` — Real Anvil compression corpus + unknown NBT preservation](tasks/T06-05.md) — **P1**, rows `W2,S1`, deps `T00-04`, locks `RUST-WORLD`
+- [x] [`T06-05` — Real Anvil compression corpus + unknown NBT preservation](tasks/T06-05.md) — **P1**, rows `W2,S1`, deps `T00-04`, locks `RUST-WORLD`
 - [ ] [`T06-06` — Disconnect during pending chunk prepare/load/generate](tasks/T06-06.md) — **P0**, rows `C1,S2,O2`, deps `T02-08`, locks `RUST-NET-CHUNK,RUST-HARNESS`
 - [ ] [`T06-07` — Natural TCP slow-reader fairness, shedding и recovery](tasks/T06-07.md) — **P0**, rows `S2,O2,O3`, deps `T06-06`, locks `RUST-NET-SESSION,RUST-HARNESS`
 - [ ] [`T06-08` — External online-mode paid-client qualification](tasks/T06-08.md) — **P0**, rows `P2,P3,O4`, deps `T00-02`, locks `EXTERNAL`; **TEMPLATE**

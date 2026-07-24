@@ -4,6 +4,7 @@ use crate::block::{BlockRegistry, BlockStateId};
 use crate::chunk::{BlockPos, Chunk, ChunkPos};
 use mc_data::Identifier;
 use mc_data::block_light::BlockLightTable;
+use mc_nbt::Tag;
 
 #[test]
 fn dirty_flush_uses_unique_region_tmp_without_clobbering_stale_fixed_tmp() {
@@ -861,4 +862,50 @@ fn dirty_flush_commit_skips_nonzero_generation_mismatch() {
 
     assert_eq!(world.commit_dirty_flush(commit).unwrap(), 0);
     assert_eq!(world.dirty_count(), 1);
+}
+
+#[test]
+fn dirty_flush_preserves_unknown_root_extras_after_edit_flush_reopen() {
+    let tmp_world = tempfile::tempdir().unwrap();
+    std::fs::create_dir_all(tmp_world.path().join("region")).unwrap();
+    let registry = air_stone_registry();
+    let cpos = ChunkPos { x: 0, z: 0 };
+    let biome = Identifier::parse("minecraft:plains").unwrap();
+    let extras = vec![
+        ("DataVersion".into(), Tag::Int(4444)),
+        ("InhabitedTime".into(), Tag::Long(123_456)),
+        ("structures".into(), Tag::Compound(Vec::new())),
+    ];
+
+    let mut chunk = Chunk::empty(cpos, BlockStateId(0), biome);
+    chunk.extras = extras.clone();
+    chunk.mark_dirty();
+
+    let mut world =
+        WorldStorage::open_with_capacity(tmp_world.path(), Arc::clone(&registry), 4).unwrap();
+    world.insert_chunk(cpos, chunk).unwrap();
+    assert_eq!(world.flush_dirty().unwrap(), 1);
+    drop(world);
+
+    let mut edited =
+        WorldStorage::open_with_capacity(tmp_world.path(), Arc::clone(&registry), 4).unwrap();
+    edited
+        .set_block_at(BlockPos { x: 1, y: 0, z: 1 }, BlockStateId(1))
+        .unwrap();
+    assert_eq!(edited.flush_dirty().unwrap(), 1);
+    drop(edited);
+
+    let mut reopened =
+        WorldStorage::open_with_capacity(tmp_world.path(), Arc::clone(&registry), 4).unwrap();
+    let chunk = reopened.get_chunk(cpos).unwrap().unwrap();
+    assert_eq!(
+        chunk.extras,
+        vec![
+            ("DataVersion".into(), Tag::Int(4444)),
+            ("LastUpdate".into(), Tag::Long(0)),
+            ("InhabitedTime".into(), Tag::Long(123_456)),
+            ("structures".into(), Tag::Compound(Vec::new())),
+        ]
+    );
+    assert_eq!(chunk.get_block(1, 0, 1).unwrap(), BlockStateId(1));
 }
