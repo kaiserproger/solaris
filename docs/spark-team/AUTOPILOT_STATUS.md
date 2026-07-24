@@ -4,22 +4,23 @@ Generated from task cards plus durable Git-common-dir state. Edit task cards, no
 
 ## Counts
 
-- `QUEUED`: **74**
+- `DONE`: **1**
+- `QUEUED`: **73**
 
 ## Cursor
 
-- Active: `T00-01`
-- Ready: `none`
+- Active: `none`
+- Ready: `T00-02, T00-03, T00-04, T00-05`
 - Coordinator: `none`
 - Templates: `none`
 
 ## Active details
 
-- [ ] `T00-01` · **CLAIMED** · `solaris_evidence` · `/home/kaiserroman/solaris-spark-worktrees/tasks/T00-01`
+- none
 
 ## W00
 
-- [ ] `T00-01` · **CLAIMED** · Зафиксировать фактический HEAD, dirty tree и владельцев изменений
+- [x] `T00-01` · **DONE** · Зафиксировать фактический HEAD, dirty tree и владельцев изменений
 - [ ] `T00-02` · **QUEUED** · Снять честный Cargo/Gradle baseline и список реально красных гейтов
 - [ ] `T00-03` · **QUEUED** · Собрать актуальную матрицу real-client сценариев и артефактов
 - [ ] `T00-04` · **QUEUED** · Собрать актуальную матрицу vanilla oracle/replay
