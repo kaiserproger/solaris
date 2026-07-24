@@ -1,15 +1,25 @@
 # Solaris Spark Autopilot Status
 
-Initial generated state: all cards are `QUEUED` until the campaign claims them.
+Generated from task cards plus durable Git-common-dir state. Edit task cards, not this file.
 
 ## Counts
 
 - `QUEUED`: **74**
-- `DONE`: **0**
+
+## Cursor
+
+- Active: `T00-01`
+- Ready: `none`
+- Coordinator: `none`
+- Templates: `none`
+
+## Active details
+
+- [ ] `T00-01` · **CLAIMED** · `solaris_evidence` · `/home/kaiserroman/solaris-spark-worktrees/tasks/T00-01`
 
 ## W00
 
-- [ ] `T00-01` · **QUEUED** · Зафиксировать фактический HEAD, dirty tree и владельцев изменений
+- [ ] `T00-01` · **CLAIMED** · Зафиксировать фактический HEAD, dirty tree и владельцев изменений
 - [ ] `T00-02` · **QUEUED** · Снять честный Cargo/Gradle baseline и список реально красных гейтов
 - [ ] `T00-03` · **QUEUED** · Собрать актуальную матрицу real-client сценариев и артефактов
 - [ ] `T00-04` · **QUEUED** · Собрать актуальную матрицу vanilla oracle/replay
@@ -41,11 +51,11 @@ Initial generated state: all cards are `QUEUED` until the campaign claims them.
 - [ ] `T03-01` · **QUEUED** · Window-0 cursor rejection/resync conservation
 - [ ] `T03-02` · **QUEUED** · Crafting-table max-craft и cursor conservation
 - [ ] `T03-03` · **QUEUED** · Recipe-book discovery/window sync real-client gate
+- [ ] `T03-04` · **QUEUED** · Furnace/smoker/blast/campfire recipe execution representative client path
 - [ ] `T03-05` · **QUEUED** · Chest max-stack metadata + malformed edge matrix
 - [ ] `T03-06` · **QUEUED** · Two-client shared chest concurrent-click real-client gate
-- [ ] `T03-08` · **QUEUED** · Two-client container save/restart convergence
-- [ ] `T03-04` · **QUEUED** · Furnace/smoker/blast/campfire recipe execution representative client path
 - [ ] `T03-07` · **QUEUED** · Two-client shared furnace concurrent-click real-client gate
+- [ ] `T03-08` · **QUEUED** · Two-client container save/restart convergence
 
 ## W04
 
@@ -53,19 +63,19 @@ Initial generated state: all cards are `QUEUED` until the campaign claims them.
 - [ ] `T04-02` · **QUEUED** · Partial pickup и overflow conservation
 - [ ] `T04-03` · **QUEUED** · Item despawn deadline + restart proof
 - [ ] `T04-04` · **QUEUED** · Two-client shared pickup contention real-client gate
-- [ ] `T04-07` · **QUEUED** · Renewable wheat → bread lifecycle real-client gate
 - [ ] `T04-05` · **QUEUED** · Loot executor: random count ranges и multiple rolls core slice
 - [ ] `T04-06` · **QUEUED** · Loot context vertical slice: Fortune/Silk/Looting/burning
+- [ ] `T04-07` · **QUEUED** · Renewable wheat → bread lifecycle real-client gate
 - [ ] `T04-08` · **QUEUED** · Sugar cane/cactus support cascade representative parity
 
 ## W05
 
 - [ ] `T05-01` · **QUEUED** · Common damage-source matrix + exact rejection boundaries
+- [ ] `T05-02` · **QUEUED** · Arrow lifecycle: spawn/flight/hit/stick/pickup representative oracle
+- [ ] `T05-03` · **QUEUED** · Shield angle/timing + axe-disable representative path
 - [ ] `T05-04` · **QUEUED** · Player death inventory/XP drop conservation
 - [ ] `T05-05` · **QUEUED** · Two-client contested death drops + restart
 - [ ] `T05-06` · **QUEUED** · Entity snapshot version fence across owner/wire/persistence
-- [ ] `T05-02` · **QUEUED** · Arrow lifecycle: spawn/flight/hit/stick/pickup representative oracle
-- [ ] `T05-03` · **QUEUED** · Shield angle/timing + axe-disable representative path
 - [ ] `T05-07` · **QUEUED** · Entity spawn/despawn cap + restart invariants
 - [ ] `T05-08` · **QUEUED** · Representative species AI/pathing parity table + client proof
 
@@ -75,10 +85,10 @@ Initial generated state: all cards are `QUEUED` until the campaign claims them.
 - [ ] `T06-02` · **QUEUED** · Fault injection: chained/simultaneous TNT world/entity outcome
 - [ ] `T06-03` · **QUEUED** · Fault injection: cross-region hopper compound commit
 - [ ] `T06-04` · **QUEUED** · Shutdown while journal/checkpoint outcome is unknown
+- [ ] `T06-05` · **QUEUED** · Real Anvil compression corpus + unknown NBT preservation
 - [ ] `T06-06` · **QUEUED** · Disconnect during pending chunk prepare/load/generate
 - [ ] `T06-07` · **QUEUED** · Natural TCP slow-reader fairness, shedding и recovery
 - [ ] `T06-08` · **QUEUED** · External online-mode paid-client qualification
-- [ ] `T06-05` · **QUEUED** · Real Anvil compression corpus + unknown NBT preservation
 
 ## W07
 
@@ -116,4 +126,4 @@ Initial generated state: all cards are `QUEUED` until the campaign claims them.
 
 ## Machine cursor
 
-Run `python3 docs/spark-team/scripts/autopilot.py next --limit 2 --json` from the campaign worktree.
+Run `python3 docs/spark-team/scripts/autopilot.py dispatch --limit 2 --json` from the campaign worktree.
