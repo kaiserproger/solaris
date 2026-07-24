@@ -1,7 +1,8 @@
 [server]
 name = "solaris-test"
 motd = "First server powered by Solaris: Innovative Minecraft server engine written in Rust"
-view_distance = 8
+view_distance = 32
+simulation_distance = 8
 
 [network]
 bind_address = "127.0.0.1"
@@ -70,11 +71,11 @@ region_cache_size = 9
 # Runtime control owns chunk throughput plus random/scheduled work budgets
 # selected from the hardware profile and runtime p95 pressure.
 enabled = true
-profile = "balanced"
+profile = "high_end"
 # Optional overrides. Omit to use the profile defaults.
-# min_view_distance = 6
-# max_view_distance = 10
+# min_view_distance = 8
+# max_view_distance = 32
 # target_tick_ms = 50
-# target_first_chunk_ms = 1500
-# scale_down_after_ticks = 3
-# scale_up_after_ticks = 10
+# target_first_chunk_ms = 1000
+# scale_down_after_ticks = 4
+# scale_up_after_ticks = 12

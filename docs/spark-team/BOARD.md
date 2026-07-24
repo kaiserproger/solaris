@@ -149,7 +149,7 @@ Snapshot basis: **2026-07-24 Repomix snapshot**. Coordinator owns this file; wor
 
 ### W07 — Профилирование low/balanced/high
 
-- [ ] [`T07-01` — Заморозить low/balanced/high profile configs и budgets](tasks/T07-01.md) — **P0**, rows `O1,O3`, deps `T00-05`, locks `PERF,COORD-DOCS`
+- [x] [`T07-01` — Заморозить low/balanced/high profile configs и budgets](tasks/T07-01.md) — **P0**, rows `O1,O3`, deps `T00-05`, locks `PERF,COORD-DOCS`
 - [ ] [`T07-02` — Versioned performance result schema + provenance validator](tasks/T07-02.md) — **P0**, rows `O1,O2,O3`, deps `T07-01`, locks `RUST-HARNESS`
 - [ ] [`T07-03` — Solo generated-world VD8 clean-host profile](tasks/T07-03.md) — **P0**, rows `W3,C1,C2,O1,O2`, deps `T07-02,T06-05`, locks `PERF`
 - [ ] [`T07-04` — Two-client ordinary survival responsiveness profile](tasks/T07-04.md) — **P0**, rows `S2,O1,O2`, deps `T07-02,T03-06,T04-04`, locks `PERF,CLIENT-JAVA`
