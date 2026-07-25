@@ -22,12 +22,13 @@ replacement-readiness claims.
 
 ## Active Checkpoint
 
-Next: prove scheduled fluid spread across save/restart: a client-created source
-must either persist its pending continuation exactly once or reopen in the final
-settled state, without a duplicate scheduled tick. Do not open a parallel
-lower-priority playable slice until this checkpoint closes.
+Next: close the representative movement boundary matrix for step-up, long fall,
+crouch edge, swim/crouch body, powder snow with leather boots, and non-finite
+rejection through one authoritative geometry contract. The fluid real-client
+rerun remains an external display-gate retry, not a reason to block non-client
+work.
 
-## Recent Closed Checkpoints — 2026-07-25
+## Recent Checkpoints — 2026-07-25
 
 | Slice | Result | Current-tree evidence |
 | --- | --- | --- |
@@ -36,6 +37,7 @@ lower-priority playable slice until this checkpoint closes.
 | Stair neighbour recomputation | Placement publishes root plus corner before acknowledgement and exactly one later debit, survives save/restart, then removal after restart publishes target air plus the straightened neighbour and survives a second reopen. Existing stale placement/break paths retain atomic conservation. | stair unit slice `25/25`; raw-TCP place/restart/remove/restart `1/1`; scoped read-only review passed. |
 | Out-of-reach break rejection | The stale TCP gate now matches the accepted vanilla oracle: an out-of-reach `START_DESTROY_BLOCK` is acknowledgement-only in survival and creative and does not invent a target-cell resync. | exact TCP test passed; full `mc-test-harness` package passed. |
 | Two-client door/trapdoor convergence | Existing mutation-token authority already commits both door halves atomically and a trapdoor as one edit. The actor receives exact decoded `SectionBlocksUpdate`/`BlockUpdate` packets, the loaded observer receives every accepted delta, exact `facing`/`half`/`open` properties remain intact, and replaying the original plan changes neither half and emits no block or inventory publication on the rejection tick or the following owner tick. | exact concurrency/wire test `1/1`; complete `mc-net toggle` slice `6/6`; focused Java playable-route test passed; full package-split L2, Clippy and code-health passed; independent review PASS. |
+| Scheduled fluid restart continuity | Runtime/persistence PASS: a TCP client places a water source, clean save/shutdown preserves either settled water or pending air backed by a concrete persisted source-water tick, restarted simulation reaches the adjacent spread cell, a second reopen keeps source/spread water, and duplicate scheduled requests/sequences are rejected. Real-client rerun remains BLOCKED by the graphical host, not by Solaris. | exact restart gate `1/1`; water-bucket slice `3/3`; lava-water scheduled path `1/1`; M94 Java route PASS; full package-split L2, workspace Clippy, formatter and code-health PASS; reviewer blocker fixed. Approved runner artifact `.analysis/real-client-runs/20260725T123715Z-m94-regression-pack-fPX76A` fails validation because observations stayed `prepared-owner-run/not-run`; `client.log` records `ERROR DISPLAY` and repeated `glfwInit failed`. |
 
 Strict formatter, Clippy `-D warnings`, diff checks, and the affected regression
 slices passed before closeout. These are playable-route claims only, not M100 or
