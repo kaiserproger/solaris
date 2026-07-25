@@ -5,13 +5,13 @@ Generated from task cards plus durable Git-common-dir state. Edit task cards, no
 ## Counts
 
 - `BLOCKED`: **1**
-- `DONE`: **16**
-- `QUEUED`: **57**
+- `DONE`: **17**
+- `QUEUED`: **56**
 
 ## Cursor
 
 - Active: `none`
-- Ready: `T02-01, T02-03, T02-06, T02-08, T04-03, T05-01, T06-01, T07-02, T04-08`
+- Ready: `T02-03, T02-06, T02-07, T02-08, T04-03, T05-01, T06-01, T07-02, T04-08`
 - Coordinator: `none`
 - Templates: `none`
 
@@ -39,7 +39,7 @@ Generated from task cards plus durable Git-common-dir state. Edit task cards, no
 
 ## W02
 
-- [ ] `T02-01` · **QUEUED** · Закрыть B4: воспроизводимый real-client water/swim feel gate
+- [x] `T02-01` · **DONE** · Закрыть B4: воспроизводимый real-client water/swim feel gate
 - [ ] `T02-02` · **QUEUED** · Закрыть P4: полный respawn bundle + restart/rejoin evidence
 - [ ] `T02-03` · **QUEUED** · Заменить small full-cube fallback на точный common sturdy-face contract
 - [ ] `T02-04` · **QUEUED** · Закрыть stair neighbour-shape recomputation real-path proof
