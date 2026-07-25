@@ -22,9 +22,10 @@ replacement-readiness claims.
 
 ## Active Checkpoint
 
-Next: prove two-client door and trapdoor state convergence on the authoritative
-wire path, including rejection/resync and restart state where applicable. Do not
-open a parallel lower-priority playable slice until this checkpoint closes.
+Next: prove scheduled fluid spread across save/restart: a client-created source
+must either persist its pending continuation exactly once or reopen in the final
+settled state, without a duplicate scheduled tick. Do not open a parallel
+lower-priority playable slice until this checkpoint closes.
 
 ## Recent Closed Checkpoints — 2026-07-25
 
@@ -34,6 +35,7 @@ open a parallel lower-priority playable slice until this checkpoint closes.
 | Attachment sturdy faces | Removed the block-name fallback. Torch/attachment support now requires an exact embedded 26.1.2 state fingerprint and complete collision-face coverage; partial faces, fences and mismatches reject through resync-before-ack/no-debit. | `mc-data block_facts` `6/6`; placement support `7/7`; accepted and rejected TCP paths `1/1` each. |
 | Stair neighbour recomputation | Placement publishes root plus corner before acknowledgement and exactly one later debit, survives save/restart, then removal after restart publishes target air plus the straightened neighbour and survives a second reopen. Existing stale placement/break paths retain atomic conservation. | stair unit slice `25/25`; raw-TCP place/restart/remove/restart `1/1`; scoped read-only review passed. |
 | Out-of-reach break rejection | The stale TCP gate now matches the accepted vanilla oracle: an out-of-reach `START_DESTROY_BLOCK` is acknowledgement-only in survival and creative and does not invent a target-cell resync. | exact TCP test passed; full `mc-test-harness` package passed. |
+| Two-client door/trapdoor convergence | Existing mutation-token authority already commits both door halves atomically and a trapdoor as one edit. The actor receives exact decoded `SectionBlocksUpdate`/`BlockUpdate` packets, the loaded observer receives every accepted delta, exact `facing`/`half`/`open` properties remain intact, and replaying the original plan changes neither half and emits no block or inventory publication on the rejection tick or the following owner tick. | exact concurrency/wire test `1/1`; complete `mc-net toggle` slice `6/6`; focused Java playable-route test passed; full package-split L2, Clippy and code-health passed; independent review PASS. |
 
 Strict formatter, Clippy `-D warnings`, diff checks, and the affected regression
 slices passed before closeout. These are playable-route claims only, not M100 or
