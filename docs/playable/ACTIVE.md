@@ -20,11 +20,26 @@ join -> move -> gather -> craft -> build -> fight/farm -> save/rejoin
 This is Playable Spike Mode. Do not turn focused playable evidence into M100
 replacement-readiness claims.
 
-The embedded client now confirms respawn only after an authoritative health
-packet has been applied. The original persisted dead-player save reproduced
-`health=0`; the corrected 26.1.2 client respawned with immediate movement held,
-closed the death/loading screen, restored its inventory, and observed positive
-health. `wait_for_health_below` also now uses strict numeric ordering: the real
+## Active Checkpoint
+
+Next: prove two-client door and trapdoor state convergence on the authoritative
+wire path, including rejection/resync and restart state where applicable. Do not
+open a parallel lower-priority playable slice until this checkpoint closes.
+
+## Recent Closed Checkpoints — 2026-07-25
+
+| Slice | Result | Current-tree evidence |
+| --- | --- | --- |
+| Respawn bundle | Respawn republishes health, abilities, default spawn, chunk view, position and the complete inventory snapshot. A disk-world restart/rejoin restores an alive, damageable player rather than stale dead state. | `mc-net` respawn `6/6`; exact wire lifecycle `1/1`; save/restart/rejoin `1/1`; focused Java route test passed. |
+| Attachment sturdy faces | Removed the block-name fallback. Torch/attachment support now requires an exact embedded 26.1.2 state fingerprint and complete collision-face coverage; partial faces, fences and mismatches reject through resync-before-ack/no-debit. | `mc-data block_facts` `6/6`; placement support `7/7`; accepted and rejected TCP paths `1/1` each. |
+| Stair neighbour recomputation | Placement publishes root plus corner before acknowledgement and exactly one later debit, survives save/restart, then removal after restart publishes target air plus the straightened neighbour and survives a second reopen. Existing stale placement/break paths retain atomic conservation. | stair unit slice `25/25`; raw-TCP place/restart/remove/restart `1/1`; scoped read-only review passed. |
+| Out-of-reach break rejection | The stale TCP gate now matches the accepted vanilla oracle: an out-of-reach `START_DESTROY_BLOCK` is acknowledgement-only in survival and creative and does not invent a target-cell resync. | exact TCP test passed; full `mc-test-harness` package passed. |
+
+Strict formatter, Clippy `-D warnings`, diff checks, and the affected regression
+slices passed before closeout. These are playable-route claims only, not M100 or
+replacement-readiness claims.
+
+`wait_for_health_below` also now uses strict numeric ordering: the real
 client accepts exact zero below a `0.001` threshold without changing its
 push-driven wait. Player collision now consumes the complete embedded vanilla
 shape table before custom-registry fallbacks and supplies vanilla movement
