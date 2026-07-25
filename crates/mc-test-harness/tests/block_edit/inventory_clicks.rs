@@ -113,7 +113,7 @@ async fn survival_container_click_moves_stack_through_server_cursor() {
     .await;
 }
 #[tokio::test]
-async fn malformed_inventory_click_resyncs_without_advancing_state() {
+async fn malformed_inventory_click_resyncs_and_next_valid_click_succeeds() {
     let manifest = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
     let vanilla_dir = manifest.join("../../data/vanilla");
     let blocks_json = vanilla_dir.join("reports/blocks.json");
@@ -216,4 +216,51 @@ async fn malformed_inventory_click_resyncs_without_advancing_state() {
             .all(|(_, stack)| stack.item_id != dirt_id),
         "malformed inventory click must not move dirt into another inventory slot"
     );
+
+    client
+        .write_packet(&ServerboundContainerClick {
+            container_id: 0,
+            state_id: resync.state_id,
+            slot_num: 36,
+            button_num: 0,
+            container_input: ContainerInput::Pickup,
+            changed_slots: Vec::new(),
+            carried_item: HashedStack::Actual {
+                item_id: dirt_id,
+                count: 10,
+                components: HashedStackComponentHashes::empty(),
+            },
+        })
+        .await
+        .expect("send valid pickup after malformed click resync");
+    let expected_pickup_state_id = resync.state_id.wrapping_add(1);
+    let picked_up = wait_for_inventory_content(&mut client, |pkt| {
+        pkt.state_id == expected_pickup_state_id
+            && pkt.items[36].is_empty()
+            && pkt.carried_item.item_id == dirt_id
+            && pkt.carried_item.count == 10
+    })
+    .await;
+
+    client
+        .write_packet(&ServerboundContainerClick {
+            container_id: 0,
+            state_id: picked_up.state_id,
+            slot_num: 37,
+            button_num: 0,
+            container_input: ContainerInput::Pickup,
+            changed_slots: Vec::new(),
+            carried_item: HashedStack::empty(),
+        })
+        .await
+        .expect("place recovered cursor stack after malformed click");
+    let expected_place_state_id = picked_up.state_id.wrapping_add(1);
+    wait_for_inventory_content(&mut client, |pkt| {
+        pkt.state_id == expected_place_state_id
+            && pkt.items[36].is_empty()
+            && pkt.items[37].item_id == dirt_id
+            && pkt.items[37].count == 10
+            && pkt.carried_item.is_empty()
+    })
+    .await;
 }

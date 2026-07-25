@@ -22,11 +22,11 @@ replacement-readiness claims.
 
 ## Active Checkpoint
 
-Next: close Window-0 cursor rejection/resync conservation. A malformed or stale
-click must move neither slot nor cursor, resend the exact state id plus
-server-authoritative cursor/slots, and leave the next valid click usable. This
-checkpoint has unit, wire and replay/negative legs and does not require the
-currently blocked graphical client host.
+Next: close dropped-item merge conservation. Compatible nearby stacks must merge
+once under owner CAS; incompatible or full stacks must remain separate; tracker
+and wire publication must remove the old identity and publish the exact survivor
+count, age and version. This checkpoint has unit and wire legs and no client-rig
+dependency.
 
 ## Recent Checkpoints — 2026-07-25
 
@@ -40,6 +40,7 @@ currently blocked graphical client host.
 | Scheduled fluid restart continuity | Runtime/persistence PASS: a TCP client places a water source, clean save/shutdown preserves either settled water or pending air backed by a concrete persisted source-water tick, restarted simulation reaches the adjacent spread cell, a second reopen keeps source/spread water, and duplicate scheduled requests/sequences are rejected. Real-client rerun remains BLOCKED by the graphical host, not by Solaris. | exact restart gate `1/1`; water-bucket slice `3/3`; lava-water scheduled path `1/1`; M94 Java route PASS; full package-split L2, workspace Clippy, formatter and code-health PASS; reviewer blocker fixed. Approved runner artifact `.analysis/real-client-runs/20260725T123715Z-m94-regression-pack-fPX76A` fails validation because observations stayed `prepared-owner-run/not-run`; `client.log` records `ERROR DISPLAY` and repeated `glfwInit failed`. |
 | Representative movement boundaries | Existing authority is consolidated without production changes: `step_entity` proves farmland step-up, exact terminal-velocity clamp stability, and pre-sampling non-finite rejection; player geometry proves standing/crouching/swimming body and eye dimensions at one collision edge, powder-snow sink/boots/Shift behavior, and the exact long-fall `0.9F` boundary. Crouch coverage is server body-height collision authority, not invented sneak-edge anti-cheat. | `mc-physics` `60/60`; `mc-net movement` `39/39`, including packet-side `collision_correction_applies_powder_snow_movement_context`; full package-split L2, workspace Clippy, formatter and code-health PASS; reviewer terminal-clamp blocker fixed. |
 | Chunk prepare disconnect/rejoin | A client moves from center `(0,0)` to `(3,0)`, disconnects immediately after the new center while batch-1 preparation is active, waits for authoritative unregister, then rejoins with the same offline UUID and restored position. The fresh session receives exactly the required 25-chunk ring with no duplicate/out-of-view chunks, inherited unloads or stale block deltas. Stream drop now releases claims already buffered in `result_rx`; unregister also releases only prepared claims owned by that session, while generic/prewarm claims remain independent. The test uses capacity `121` to exclude unrelated dirty-cache pressure that made a minimal-capacity fixture abandon three chunks. Entity visibility is not claimed by this wire test. | exact reconnect gate PASS in ~7s; `chunk_stream` harness `2/2` executable tests PASS (`1` sidecar gate ignored); buffered-result and unregister claim regressions PASS; M94 save/restart visibility Java test PASS; full package-split L2, workspace Clippy, formatter, diff-check and code-health PASS; independent review PASS. The actual graphical real-client leg remains host-BLOCKED by the already recorded `ERROR DISPLAY`/`glfwInit failed` environment. |
+| Window-0 rejection/resync recovery | The existing authoritative rejection path already conserves inventory. A malformed pickup with an impossible carried item leaves slot 36 and the empty cursor unchanged, moves no dirt elsewhere, and resends the exact unchanged state id. The next valid pickup must advance the state id by exactly one and move all ten items to the cursor; the following valid place must advance exactly once again and move the complete stack to slot 37 with an empty cursor. | exact malformed/recovery TCP gate PASS; ordinary Window-0 cursor flow PASS; `mc-net inventory` `59/59`; full package-split L2, workspace Clippy, formatter, diff-check and code-health PASS; reviewer stale-packet blocker fixed by exact `wrapping_add(1)` assertions. |
 
 Strict formatter, Clippy `-D warnings`, diff checks, and the affected regression
 slices passed before closeout. These are playable-route claims only, not M100 or
