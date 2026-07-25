@@ -26,9 +26,9 @@ use std::time::Duration;
 
 use mc_protocol::packets::Packet;
 use mc_protocol::packets::play::{
-    ClientboundKeepAlive, ConfirmTeleportation, ForgetLevelChunk, GameEvent, LevelChunkWithLight,
-    MovePlayerFlags, ServerboundKeepAlive, ServerboundMovePlayerPos, SetCenterChunk,
-    SynchronizePlayerPosition,
+    BlockUpdate, ClientboundKeepAlive, ConfirmTeleportation, ForgetLevelChunk, GameEvent,
+    LevelChunkWithLight, MovePlayerFlags, SectionBlocksUpdate, ServerboundKeepAlive,
+    ServerboundMovePlayerPos, SetCenterChunk, SynchronizePlayerPosition,
 };
 use mc_test_harness::client::Client;
 
@@ -455,6 +455,282 @@ async fn movement_across_chunk_boundary_replans_view_subscription() {
 
     assert!(saw_new_center, "movement must send SetCenterChunk(3, 0)");
     assert!(saw_unload, "movement must unload a chunk that left view");
+}
+
+#[tokio::test]
+async fn reconnect_during_chunk_prepare_receives_only_the_new_exact_view() {
+    let manifest = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+    let vanilla_dir = manifest.join("../../data/vanilla");
+    let blocks_json = vanilla_dir.join("reports/blocks.json");
+    if !blocks_json.exists() {
+        eprintln!(
+            "skipping: {} missing — run tools/extract-vanilla-data.sh --reports",
+            blocks_json.display()
+        );
+        return;
+    }
+
+    let data = Arc::new(mc_data::load(&vanilla_dir).expect("vanilla data loads"));
+    let report = mc_data::blocks::load_blocks_report(&blocks_json).expect("blocks report loads");
+    let blocks =
+        Arc::new(mc_world::BlockRegistry::from_report(&report).expect("block registry builds"));
+    let generator = Arc::new(mc_worldgen::TerrainGenerator::new(0, Arc::clone(&blocks)));
+    let storage = mc_world::WorldStorage::in_memory_with_capacity(
+        Arc::clone(&blocks),
+        ((2 * MOVEMENT_VIEW_DISTANCE + 7) as usize).pow(2),
+    )
+    .with_generator(generator);
+    let world = Some(Arc::new(tokio::sync::Mutex::new(storage)));
+    let tags = Arc::new(mc_data::tags::load(&vanilla_dir, &data).expect("tags load"));
+    let block_light = mc_data::block_light::load(vanilla_dir.join("reports/block_light.json"))
+        .ok()
+        .map(Arc::new);
+    let policy = mc_net::ChunkPipelinePolicy {
+        chunk_prepare_batch_size: 1,
+        chunk_result_queue_size: 1,
+        ..mc_net::ChunkPipelinePolicy::default()
+    };
+    let cfg = mc_net::ServerConfig {
+        bind_address: "127.0.0.1:0".parse().unwrap(),
+        motd: "T02 chunk prepare reconnect".into(),
+        max_players: 8,
+        view_distance: MOVEMENT_VIEW_DISTANCE,
+        data,
+        blocks,
+        world,
+        tags,
+        recipes: Arc::new(Vec::new()),
+        loot: Arc::new(mc_data::loot::LootTables::default()),
+        block_light,
+        items: Arc::new(mc_data::items::ItemRegistry::default()),
+        item_facts: Arc::new(mc_data::item_components::ItemFactsTable::default()),
+        block_facts: Arc::new(mc_data::block_facts::BlockFactsTable::default()),
+        entity_types: Arc::new(mc_data::entity_types::solaris_required_entity_types()),
+        biome_spawns: Arc::new(mc_data::biomes::BiomeSpawnRules::default()),
+        chunk_pipeline: policy,
+        random_tick: mc_net::RandomTickPolicy {
+            spawn_monsters: false,
+            ..mc_net::RandomTickPolicy::default()
+        },
+        command_permissions: mc_net::CommandPermissionConfig::new(Vec::<String>::new(), true),
+        shutdown: mc_net::ShutdownHandle::default(),
+    };
+    let bound = mc_net::bind(cfg)
+        .await
+        .expect("bind reconnect chunk server");
+    let addr = bound.local_addr().expect("reconnect chunk local_addr");
+    let runtime = bound.runtime_telemetry_handle();
+    tokio::spawn(async move {
+        let _ = bound.serve().await;
+    });
+
+    let (mut first, sync, center) = connect_chunk_stream_client(addr, "T02ChunkRejoin").await;
+    assert_eq!((center.chunk_x, center.chunk_z), (0, 0));
+    wait_for_chunk(&mut first, (0, 0)).await;
+    first
+        .write_packet(&ServerboundMovePlayerPos {
+            x: 48.5,
+            y: sync.y,
+            z: 0.5,
+            flags: MovePlayerFlags::new(true, false),
+        })
+        .await
+        .expect("start chunk prepare before disconnect");
+    wait_for_center(&mut first, (3, 0)).await;
+    drop(first);
+    wait_for_active_session_count(&runtime, 0).await;
+
+    let (mut rejoined, rejoin_sync, center) =
+        connect_chunk_stream_client(addr, "T02ChunkRejoin").await;
+    assert_eq!(
+        rejoin_sync.x, 48.5,
+        "rejoin must restore the authoritative position that selected the new view"
+    );
+    assert_eq!((center.chunk_x, center.chunk_z), (3, 0));
+
+    let expected_count = (2 * MOVEMENT_VIEW_DISTANCE + 1).pow(2) as usize;
+    let expected_x = 3 - MOVEMENT_VIEW_DISTANCE..=3 + MOVEMENT_VIEW_DISTANCE;
+    let expected_z = -MOVEMENT_VIEW_DISTANCE..=MOVEMENT_VIEW_DISTANCE;
+    let mut seen = HashSet::new();
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
+    while seen.len() < expected_count {
+        let frame = rejoined
+            .read_frame_with_timeout(
+                deadline.saturating_duration_since(tokio::time::Instant::now()),
+            )
+            .await
+            .unwrap_or_else(|error| {
+                let missing = expected_z
+                    .clone()
+                    .flat_map(|z| expected_x.clone().map(move |x| (x, z)))
+                    .filter(|position| !seen.contains(position))
+                    .collect::<Vec<_>>();
+                panic!(
+                    "rejoin exact chunk view stalled after {}/{} chunks; missing={missing:?}: {error}",
+                    seen.len(),
+                    expected_count
+                )
+            });
+        if frame.id == ClientboundKeepAlive::ID {
+            let mut body = frame.body;
+            let keepalive = ClientboundKeepAlive::decode(&mut body).expect("decode KeepAlive");
+            rejoined
+                .write_packet(&ServerboundKeepAlive { id: keepalive.id })
+                .await
+                .expect("echo rejoin KeepAlive");
+            continue;
+        }
+        assert_ne!(
+            frame.id,
+            ForgetLevelChunk::ID,
+            "a fresh rejoin must not inherit unloads from the disconnected view"
+        );
+        assert!(
+            frame.id != BlockUpdate::ID && frame.id != SectionBlocksUpdate::ID,
+            "a fresh rejoin must not inherit stale block deltas"
+        );
+        if frame.id == SetCenterChunk::ID {
+            let mut body = frame.body;
+            let repeated = SetCenterChunk::decode(&mut body).expect("decode repeated center");
+            assert_eq!((repeated.chunk_x, repeated.chunk_z), (3, 0));
+            continue;
+        }
+        if frame.id != LevelChunkWithLight::ID {
+            continue;
+        }
+        let mut body = frame.body;
+        let chunk = LevelChunkWithLight::decode(&mut body).expect("decode rejoin chunk");
+        assert!(
+            expected_x.contains(&chunk.chunk_x) && expected_z.contains(&chunk.chunk_z),
+            "rejoin received stale/out-of-view chunk ({}, {})",
+            chunk.chunk_x,
+            chunk.chunk_z
+        );
+        assert!(
+            seen.insert((chunk.chunk_x, chunk.chunk_z)),
+            "rejoin received duplicate chunk ({}, {})",
+            chunk.chunk_x,
+            chunk.chunk_z
+        );
+    }
+
+    for z in expected_z {
+        for x in expected_x.clone() {
+            assert!(
+                seen.contains(&(x, z)),
+                "rejoin missing required chunk ({x}, {z})"
+            );
+        }
+    }
+}
+
+async fn connect_chunk_stream_client(
+    addr: std::net::SocketAddr,
+    name: &str,
+) -> (Client, SynchronizePlayerPosition, SetCenterChunk) {
+    let mut client = Client::connect(addr).await.expect("client connect");
+    let _ = client.drive_login(addr, name).await.expect("drive login");
+    client
+        .drive_configuration()
+        .await
+        .expect("drive configuration");
+    let _ = client.read_play_login().await.expect("play entry");
+    let _: mc_protocol::packets::play::ClientboundCommands =
+        client.read_typed().await.expect("Commands");
+    let sync: SynchronizePlayerPosition = client.read_typed().await.expect("SyncPlayerPos");
+    let _: mc_protocol::packets::play::ClientboundInitializeBorder =
+        client.read_typed().await.expect("InitializeBorder");
+    let _: mc_protocol::packets::play::ClientboundSetTime =
+        client.read_typed().await.expect("SetTime");
+    let _: mc_protocol::packets::play::SetDefaultSpawnPosition =
+        client.read_typed().await.expect("SetDefaultSpawnPosition");
+    let _: GameEvent = client.read_typed().await.expect("GameEvent");
+    let center: SetCenterChunk = client.read_typed().await.expect("SetCenterChunk");
+    client
+        .write_packet(&ConfirmTeleportation {
+            teleport_id: sync.teleport_id,
+        })
+        .await
+        .expect("ack teleport");
+    (client, sync, center)
+}
+
+async fn wait_for_chunk(client: &mut Client, expected: (i32, i32)) {
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
+    loop {
+        let frame = client
+            .read_frame_with_timeout(
+                deadline.saturating_duration_since(tokio::time::Instant::now()),
+            )
+            .await
+            .expect("required chunk");
+        if frame.id == ClientboundKeepAlive::ID {
+            let mut body = frame.body;
+            let keepalive = ClientboundKeepAlive::decode(&mut body).expect("decode KeepAlive");
+            client
+                .write_packet(&ServerboundKeepAlive { id: keepalive.id })
+                .await
+                .expect("echo KeepAlive");
+            continue;
+        }
+        if frame.id == LevelChunkWithLight::ID {
+            let mut body = frame.body;
+            let chunk = LevelChunkWithLight::decode(&mut body).expect("decode required chunk");
+            if (chunk.chunk_x, chunk.chunk_z) == expected {
+                return;
+            }
+        }
+    }
+}
+
+async fn wait_for_center(client: &mut Client, expected: (i32, i32)) {
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
+    loop {
+        let frame = client
+            .read_frame_with_timeout(
+                deadline.saturating_duration_since(tokio::time::Instant::now()),
+            )
+            .await
+            .expect("required center");
+        if frame.id == ClientboundKeepAlive::ID {
+            let mut body = frame.body;
+            let keepalive = ClientboundKeepAlive::decode(&mut body).expect("decode KeepAlive");
+            client
+                .write_packet(&ServerboundKeepAlive { id: keepalive.id })
+                .await
+                .expect("echo KeepAlive");
+            continue;
+        }
+        if frame.id == SetCenterChunk::ID {
+            let mut body = frame.body;
+            let center = SetCenterChunk::decode(&mut body).expect("decode required center");
+            if (center.chunk_x, center.chunk_z) == expected {
+                return;
+            }
+        }
+    }
+}
+
+async fn wait_for_active_session_count(runtime: &mc_net::RuntimeTelemetryHandle, expected: usize) {
+    let mut sessions = runtime.subscribe_active_sessions();
+    tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            if *sessions.borrow_and_update() == expected {
+                return;
+            }
+            sessions
+                .changed()
+                .await
+                .expect("active-session publisher remains available");
+        }
+    })
+    .await
+    .unwrap_or_else(|_| {
+        panic!(
+            "active sessions did not reach {expected}; current={}",
+            runtime.snapshot().active_sessions
+        )
+    });
 }
 
 fn assert_generated_world_chunk_stream_lock_pressure(

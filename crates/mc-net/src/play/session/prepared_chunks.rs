@@ -60,6 +60,7 @@ impl SessionRegistry {
         let claim = PreparedChunkClaim {
             id: cache.next_prepared_claim,
             revision: cache.prepared_revisions.get(&chunk).copied().unwrap_or(0),
+            owner_session: None,
         };
         cache.prepared_in_flight.insert(chunk, claim);
         PreparedChunkClaimResult::Claimed(claim)
@@ -113,6 +114,7 @@ impl SessionRegistry {
         let claim = PreparedChunkClaim {
             id: cache.next_prepared_claim,
             revision: cache.prepared_revisions.get(&chunk).copied().unwrap_or(0),
+            owner_session: Some(session_id),
         };
         cache.prepared_in_flight.insert(chunk, claim);
         SessionPreparedChunkClaimResult::Claimed(claim)
@@ -334,6 +336,22 @@ fn decrement_prepared_count(counts: &mut HashMap<(i32, i32), usize>, chunk: (i32
     if *count == 0 {
         counts.remove(&chunk);
     }
+}
+
+pub(super) fn release_prepared_claims_for_session_locked(
+    cache: &mut PreparedChunkCache,
+    session_id: SessionId,
+) -> usize {
+    let released = cache
+        .prepared_in_flight
+        .iter()
+        .filter_map(|(chunk, claim)| (claim.owner_session == Some(session_id)).then_some(*chunk))
+        .collect::<Vec<_>>();
+    for chunk in &released {
+        cache.prepared_in_flight.remove(chunk);
+        cleanup_prepared_revision_locked(cache, *chunk);
+    }
+    released.len()
 }
 
 pub(super) fn add_prepared_ticket_locked(

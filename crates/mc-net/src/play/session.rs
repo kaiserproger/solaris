@@ -443,6 +443,7 @@ impl Default for PlayerCombatResources {
 pub(super) struct PreparedChunkClaim {
     id: u64,
     pub(super) revision: u64,
+    owner_session: Option<SessionId>,
 }
 
 #[derive(Debug, Clone)]

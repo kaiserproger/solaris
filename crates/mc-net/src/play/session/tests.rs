@@ -2913,6 +2913,34 @@ fn loaded_chunk_index_tracks_shared_load_unload_and_disconnect() {
 }
 
 #[test]
+fn unregister_releases_session_owned_prepared_claim() {
+    let registry = SessionRegistry::new();
+    let chunk = (2, -3);
+    let (tx, _rx) = mpsc::channel(1);
+    let (session, _) = registry.register(
+        &profile("PreparedClaimOwner"),
+        chunk,
+        0,
+        HashSet::from([chunk]),
+        tx,
+        PlayerPose::new(0.5, 64.0, 0.5),
+    );
+    let claim = match registry.prepared_chunk_or_wait_for_earlier_session(chunk, session) {
+        SessionPreparedChunkClaimResult::Claimed(claim) => claim,
+        other => panic!("expected session-owned claim, got {other:?}"),
+    };
+    assert_eq!(claim.owner_session, Some(session));
+
+    registry.unregister(session);
+
+    let replacement = match registry.prepared_chunk_or_claim(chunk) {
+        PreparedChunkClaimResult::Claimed(claim) => claim,
+        other => panic!("expected unregister to release session claim, got {other:?}"),
+    };
+    assert!(registry.release_prepared_chunk_claim(chunk, replacement));
+}
+
+#[test]
 fn prepared_chunk_claim_blocks_duplicate_until_released() {
     let registry = SessionRegistry::new();
     let chunk = (2, -3);
@@ -2932,6 +2960,7 @@ fn prepared_chunk_claim_blocks_duplicate_until_released() {
         PreparedChunkClaim {
             id: first_claim.id.wrapping_add(1),
             revision: first_claim.revision,
+            owner_session: first_claim.owner_session,
         }
     ));
     assert!(matches!(

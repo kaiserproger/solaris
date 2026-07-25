@@ -1992,6 +1992,13 @@ impl ChunkStreamState {
         }
     }
 
+    fn close_and_release_buffered_results(&mut self) {
+        self.result_rx.close();
+        while let Ok(result) = self.result_rx.try_recv() {
+            self.release_prepare_claim_for_result(&result);
+        }
+    }
+
     fn release_prepare_claim_for_result(&self, result: &ChunkPrepareResult) {
         self.release_prepare_claim(
             (result.request.chunk_x, result.request.chunk_z),
@@ -2411,6 +2418,7 @@ impl Drop for ChunkStreamState {
             + self.prewarm_in_flight.len();
         self.resources
             .record_stream_cancellation(cancelled_requests);
+        self.close_and_release_buffered_results();
         self.clear_ready();
     }
 }
@@ -4896,6 +4904,69 @@ mod tests {
         let replacement = match sessions.prepared_chunk_or_claim((0, 0)) {
             PreparedChunkClaimResult::Claimed(claim) => claim,
             other => panic!("expected released ready claim, got {other:?}"),
+        };
+        assert!(sessions.release_prepared_chunk_claim((0, 0), replacement));
+    }
+
+    #[tokio::test]
+    async fn dropping_stream_releases_buffered_prepare_claim() {
+        let registry = Arc::new(BlockRegistry::from_report(&[]).expect("empty registry builds"));
+        let world = Arc::new(Mutex::new(WorldStorage::in_memory_with_capacity(
+            Arc::clone(&registry),
+            1,
+        )));
+        let sessions = Arc::new(SessionRegistry::new());
+        let mut stream = ChunkStreamState::new(
+            Arc::clone(&world),
+            Arc::new(test_biome_registry()),
+            Arc::clone(&registry),
+            None,
+            Arc::new(ItemRegistry::from_report(&[])),
+            Arc::new(TagsData::default()),
+            Arc::new(Vec::new()),
+            Arc::new(mc_data::block_entity_types::BlockEntityTypeRegistry::default()),
+            None,
+            Arc::new(Vec::new()),
+            Arc::new(Vec::new()),
+            Arc::new(Vec::new()),
+            Arc::new(mc_data::biomes::BiomeSpawnRules::default()),
+            Arc::new(mc_data::entity_types::solaris_required_entity_types()),
+            Compression::Disabled,
+            Arc::clone(&sessions),
+            1,
+            0,
+            0,
+            0.0,
+            0,
+            ChunkPipelineResources::with_limits(1, 1),
+            ChunkPipelinePolicy::default(),
+        );
+        let request = stream.scheduler.poll_next().expect("chunk request");
+        let claim = match sessions.prepared_chunk_or_claim((0, 0)) {
+            PreparedChunkClaimResult::Claimed(claim) => claim,
+            other => panic!("expected manual claim, got {other:?}"),
+        };
+        stream
+            .result_tx
+            .try_send(ChunkPrepareResult {
+                request,
+                prepare_claim: Some(PreparedChunkFence::Claimed(claim)),
+                fetch_ms: 0,
+                pressure_flush: PressureFlushTiming::default(),
+                staged: Vec::new(),
+                outcome: ChunkPrepareOutcome::Absent,
+            })
+            .expect("buffer prepare result before stream drop");
+        assert!(matches!(
+            sessions.prepared_chunk_or_claim((0, 0)),
+            PreparedChunkClaimResult::InFlight
+        ));
+
+        drop(stream);
+
+        let replacement = match sessions.prepared_chunk_or_claim((0, 0)) {
+            PreparedChunkClaimResult::Claimed(claim) => claim,
+            other => panic!("expected released buffered claim, got {other:?}"),
         };
         assert!(sessions.release_prepared_chunk_claim((0, 0), replacement));
     }

@@ -22,11 +22,11 @@ replacement-readiness claims.
 
 ## Active Checkpoint
 
-Next: prove chunk visibility/rejoin across a view boundary: disconnect during
-or after prepare, reconnect to the exact loaded set, publish no stale entity or
-block view, and eventually deliver every required chunk. Complete unit/wire work
-normally; classify the real-client leg separately while the graphical host still
-reports `ERROR DISPLAY`/`glfwInit failed`.
+Next: close Window-0 cursor rejection/resync conservation. A malformed or stale
+click must move neither slot nor cursor, resend the exact state id plus
+server-authoritative cursor/slots, and leave the next valid click usable. This
+checkpoint has unit, wire and replay/negative legs and does not require the
+currently blocked graphical client host.
 
 ## Recent Checkpoints — 2026-07-25
 
@@ -39,6 +39,7 @@ reports `ERROR DISPLAY`/`glfwInit failed`.
 | Two-client door/trapdoor convergence | Existing mutation-token authority already commits both door halves atomically and a trapdoor as one edit. The actor receives exact decoded `SectionBlocksUpdate`/`BlockUpdate` packets, the loaded observer receives every accepted delta, exact `facing`/`half`/`open` properties remain intact, and replaying the original plan changes neither half and emits no block or inventory publication on the rejection tick or the following owner tick. | exact concurrency/wire test `1/1`; complete `mc-net toggle` slice `6/6`; focused Java playable-route test passed; full package-split L2, Clippy and code-health passed; independent review PASS. |
 | Scheduled fluid restart continuity | Runtime/persistence PASS: a TCP client places a water source, clean save/shutdown preserves either settled water or pending air backed by a concrete persisted source-water tick, restarted simulation reaches the adjacent spread cell, a second reopen keeps source/spread water, and duplicate scheduled requests/sequences are rejected. Real-client rerun remains BLOCKED by the graphical host, not by Solaris. | exact restart gate `1/1`; water-bucket slice `3/3`; lava-water scheduled path `1/1`; M94 Java route PASS; full package-split L2, workspace Clippy, formatter and code-health PASS; reviewer blocker fixed. Approved runner artifact `.analysis/real-client-runs/20260725T123715Z-m94-regression-pack-fPX76A` fails validation because observations stayed `prepared-owner-run/not-run`; `client.log` records `ERROR DISPLAY` and repeated `glfwInit failed`. |
 | Representative movement boundaries | Existing authority is consolidated without production changes: `step_entity` proves farmland step-up, exact terminal-velocity clamp stability, and pre-sampling non-finite rejection; player geometry proves standing/crouching/swimming body and eye dimensions at one collision edge, powder-snow sink/boots/Shift behavior, and the exact long-fall `0.9F` boundary. Crouch coverage is server body-height collision authority, not invented sneak-edge anti-cheat. | `mc-physics` `60/60`; `mc-net movement` `39/39`, including packet-side `collision_correction_applies_powder_snow_movement_context`; full package-split L2, workspace Clippy, formatter and code-health PASS; reviewer terminal-clamp blocker fixed. |
+| Chunk prepare disconnect/rejoin | A client moves from center `(0,0)` to `(3,0)`, disconnects immediately after the new center while batch-1 preparation is active, waits for authoritative unregister, then rejoins with the same offline UUID and restored position. The fresh session receives exactly the required 25-chunk ring with no duplicate/out-of-view chunks, inherited unloads or stale block deltas. Stream drop now releases claims already buffered in `result_rx`; unregister also releases only prepared claims owned by that session, while generic/prewarm claims remain independent. The test uses capacity `121` to exclude unrelated dirty-cache pressure that made a minimal-capacity fixture abandon three chunks. Entity visibility is not claimed by this wire test. | exact reconnect gate PASS in ~7s; `chunk_stream` harness `2/2` executable tests PASS (`1` sidecar gate ignored); buffered-result and unregister claim regressions PASS; M94 save/restart visibility Java test PASS; full package-split L2, workspace Clippy, formatter, diff-check and code-health PASS; independent review PASS. The actual graphical real-client leg remains host-BLOCKED by the already recorded `ERROR DISPLAY`/`glfwInit failed` environment. |
 
 Strict formatter, Clippy `-D warnings`, diff checks, and the affected regression
 slices passed before closeout. These are playable-route claims only, not M100 or
