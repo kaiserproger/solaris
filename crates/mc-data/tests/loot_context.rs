@@ -35,7 +35,7 @@ fn load_entity_table(name: &str, raw: &str) -> EntityLootCatalog {
     fs::write(entities.join(format!("{name}.json")), raw).unwrap();
     EntityLootCatalog::compile_resources(
         temp.path(),
-        [Identifier::parse(&format!("minecraft:entities/{name}")).unwrap()],
+        [Identifier::parse(format!("minecraft:entities/{name}")).unwrap()],
     )
     .unwrap()
 }
@@ -221,8 +221,8 @@ fn block_roll_range_is_sampled_deterministically_with_a_seed() {
     let context = |seed| {
         BlockLootContext::try_new(&block, &[], &tool, LootRandomBinding::new(None, seed)).unwrap()
     };
-    let first = loot.evaluate_block(&context(0x5eED_u64)).unwrap().unwrap();
-    let second = loot.evaluate_block(&context(0x5eED_u64)).unwrap().unwrap();
+    let first = loot.evaluate_block(&context(0x5EED_u64)).unwrap().unwrap();
+    let second = loot.evaluate_block(&context(0x5EED_u64)).unwrap().unwrap();
 
     assert_eq!(first, second);
     assert!((1..=3).contains(&first.len()));
@@ -243,10 +243,10 @@ fn entity_roll_range_is_sampled_deterministically_with_a_seed() {
     );
     let table = id("minecraft:entities/range_rolls");
     let first = catalog
-        .evaluate(&table, &entity_context(0x5eED_u64))
+        .evaluate(&table, &entity_context(0x5EED_u64))
         .unwrap();
     let second = catalog
-        .evaluate(&table, &entity_context(0x5eED_u64))
+        .evaluate(&table, &entity_context(0x5EED_u64))
         .unwrap();
 
     assert_eq!(first, second);
