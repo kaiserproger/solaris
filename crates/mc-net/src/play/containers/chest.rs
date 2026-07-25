@@ -152,6 +152,28 @@ pub(in crate::play) fn plan_click(input: ChestClickInput<'_>) -> ChestClickPlan 
     }
 }
 
+pub(in crate::play) fn chest_menu_state_change_count(
+    before_view: &ChestView,
+    after_view: &ChestView,
+    before_inventory: &PlayerInventory,
+    after_inventory: &PlayerInventory,
+    before_carried: &ItemStack,
+    after_carried: &ItemStack,
+) -> i32 {
+    let chest_changes = chest_slot_stacks(before_view)
+        .into_iter()
+        .zip(chest_slot_stacks(after_view))
+        .filter(|(before, after)| before != after)
+        .count();
+    let inventory_changes = (9..=44)
+        .filter(|slot| before_inventory.slots[*slot] != after_inventory.slots[*slot])
+        .count();
+    let carried_changes = usize::from(before_carried != after_carried);
+    i32::try_from(chest_changes + inventory_changes + carried_changes)
+        .unwrap_or(i32::MAX)
+        .max(1)
+}
+
 pub(in crate::play) fn chest_wire_items(
     view: &ChestView,
     inventory: &PlayerInventory,
@@ -451,7 +473,8 @@ pub(in crate::play) fn apply_quick_move_click(
             return false;
         }
         let max_stack = item_max_stack(item_facts, items, &original);
-        let (remaining, _) = inventory.merge_stack(original.clone(), max_stack);
+        let remaining =
+            inventory.merge_stack_into_ranges_reversed(original.clone(), &[9..=44], max_stack);
         view.chests[chest_idx].slots[local_slot] = stack_to_furnace_slot(&remaining);
         remaining != original
     } else {

@@ -12,6 +12,7 @@ pub const REPLAY_SCENARIO_SCHEMA: &str = "solaris.core_replay.scenario.v1";
 pub const REPLAY_RESULT_SCHEMA: &str = "solaris.core_replay.result.v1";
 pub const CORE_GATE_MANIFEST_SCHEMA: &str = "solaris.core_gate.manifest.v1";
 pub const BLOCK_TRANSACTION_ORACLE_SCHEMA: &str = "solaris.block_transaction.oracle.v1";
+pub const CONTAINER_STATE_ORACLE_SCHEMA: &str = "solaris.container_state.oracle.v1";
 
 const MAX_REPLAY_ACTIONS: usize = 10_000;
 const MAX_REPLAY_CHECKS: usize = 128;
@@ -179,6 +180,220 @@ impl BlockTransactionOracleTrace {
                     .all(|event| !matches!(event, BlockTransactionOracleEvent::Ack { sequence } if *sequence == expected.sequence)),
                 "block transaction phase {} repeats its ack",
                 actual.id
+            );
+        }
+        Ok(())
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ContainerStateOracleMenu {
+    Chest,
+    CraftingTable,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ContainerStateOracleCase {
+    ChestInitial,
+    ChestQuickMoveIn,
+    ChestStaleClick,
+    ChestQuickMoveOut,
+    ChestReopen,
+    CraftInitial,
+    CraftPrepared,
+    CraftQuickMove,
+    CraftStaleClick,
+    CraftReopen,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ContainerStateOraclePhase {
+    pub id: String,
+    pub menu: ContainerStateOracleMenu,
+    pub case: ContainerStateOracleCase,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ContainerStateOracleManifest {
+    pub schema: String,
+    pub id: String,
+    pub phases: Vec<ContainerStateOraclePhase>,
+}
+
+impl ContainerStateOracleManifest {
+    pub fn from_json(input: &str) -> Result<Self> {
+        let manifest: Self =
+            serde_json::from_str(input).context("parse container state oracle manifest JSON")?;
+        manifest.validate()?;
+        Ok(manifest)
+    }
+
+    pub fn to_pretty_json(&self) -> Result<String> {
+        self.validate()?;
+        serde_json::to_string_pretty(self).context("serialize container state oracle manifest JSON")
+    }
+
+    pub fn validate(&self) -> Result<()> {
+        ensure!(
+            self.schema == CONTAINER_STATE_ORACLE_SCHEMA,
+            "unsupported container state oracle schema: {}",
+            self.schema
+        );
+        validate_identifier("container state oracle id", &self.id)?;
+        ensure!(
+            self.phases.len() == 10,
+            "container state oracle must declare exactly ten focused phases"
+        );
+        let mut ids = BTreeSet::new();
+        let mut cases = BTreeSet::new();
+        for phase in &self.phases {
+            validate_identifier("container state phase id", &phase.id)?;
+            ensure!(
+                ids.insert(phase.id.as_str()),
+                "duplicate container state phase id: {}",
+                phase.id
+            );
+            ensure!(
+                cases.insert(phase.case),
+                "duplicate container state oracle case: {:?}",
+                phase.case
+            );
+            let expected_menu = match phase.case {
+                ContainerStateOracleCase::ChestInitial
+                | ContainerStateOracleCase::ChestQuickMoveIn
+                | ContainerStateOracleCase::ChestStaleClick
+                | ContainerStateOracleCase::ChestQuickMoveOut
+                | ContainerStateOracleCase::ChestReopen => ContainerStateOracleMenu::Chest,
+                ContainerStateOracleCase::CraftInitial
+                | ContainerStateOracleCase::CraftPrepared
+                | ContainerStateOracleCase::CraftQuickMove
+                | ContainerStateOracleCase::CraftStaleClick
+                | ContainerStateOracleCase::CraftReopen => ContainerStateOracleMenu::CraftingTable,
+            };
+            ensure!(
+                phase.menu == expected_menu,
+                "container state phase {} has menu {:?}, expected {:?}",
+                phase.id,
+                phase.menu,
+                expected_menu
+            );
+        }
+        let required = BTreeSet::from([
+            ContainerStateOracleCase::ChestInitial,
+            ContainerStateOracleCase::ChestQuickMoveIn,
+            ContainerStateOracleCase::ChestStaleClick,
+            ContainerStateOracleCase::ChestQuickMoveOut,
+            ContainerStateOracleCase::ChestReopen,
+            ContainerStateOracleCase::CraftInitial,
+            ContainerStateOracleCase::CraftPrepared,
+            ContainerStateOracleCase::CraftQuickMove,
+            ContainerStateOracleCase::CraftStaleClick,
+            ContainerStateOracleCase::CraftReopen,
+        ]);
+        ensure!(
+            cases == required,
+            "container state oracle phases do not cover the required case matrix"
+        );
+        Ok(())
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ContainerStateOracleStack {
+    pub item_id: u32,
+    pub count: i32,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ContainerStateOracleSlot {
+    pub slot: u16,
+    pub stack: ContainerStateOracleStack,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ContainerStateOracleSnapshot {
+    pub menu: ContainerStateOracleMenu,
+    pub state_id_delta: i32,
+    pub slots: Vec<ContainerStateOracleSlot>,
+    pub cursor: ContainerStateOracleStack,
+}
+
+impl ContainerStateOracleSnapshot {
+    fn validate(&self) -> Result<()> {
+        ensure!(
+            self.state_id_delta >= 0,
+            "container state snapshot has negative state-id delta"
+        );
+        ensure!(
+            self.cursor.count >= 0,
+            "container state snapshot has negative cursor count"
+        );
+        let mut previous = None;
+        for slot in &self.slots {
+            ensure!(slot.stack.count >= 0, "container slot has negative count");
+            ensure!(
+                previous.is_none_or(|previous| slot.slot > previous),
+                "container slots must be strictly sorted and unique"
+            );
+            previous = Some(slot.slot);
+        }
+        Ok(())
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ContainerStateOraclePhaseTrace {
+    pub id: String,
+    pub snapshot: ContainerStateOracleSnapshot,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ContainerStateOracleTrace {
+    pub manifest_id: String,
+    pub phases: Vec<ContainerStateOraclePhaseTrace>,
+}
+
+impl ContainerStateOracleTrace {
+    pub fn validate_against(&self, manifest: &ContainerStateOracleManifest) -> Result<()> {
+        manifest.validate()?;
+        ensure!(
+            self.manifest_id == manifest.id,
+            "container state trace manifest id {} does not match {}",
+            self.manifest_id,
+            manifest.id
+        );
+        ensure!(
+            self.phases.len() == manifest.phases.len(),
+            "container state trace phase count does not match manifest"
+        );
+        for (expected, actual) in manifest.phases.iter().zip(&self.phases) {
+            ensure!(
+                actual.id == expected.id,
+                "container state trace phase mismatch: expected {}, got {}",
+                expected.id,
+                actual.id
+            );
+            ensure!(
+                actual.snapshot.menu == expected.menu,
+                "container state trace phase {} has wrong menu",
+                actual.id
+            );
+            actual.snapshot.validate()?;
+        }
+        for index in [0_usize, 4, 5, 9] {
+            ensure!(
+                self.phases[index].snapshot.state_id_delta == 0,
+                "initial/reopen phase {} must normalize state-id to zero",
+                self.phases[index].id
             );
         }
         Ok(())
@@ -1477,6 +1692,115 @@ mod tests {
         let mut wrong_ack = trace;
         wrong_ack.phases[3].events[1] = BlockTransactionOracleEvent::Ack { sequence: 99 };
         assert!(wrong_ack.validate_against(&manifest).is_err());
+    }
+
+    fn container_state_oracle_json() -> Value {
+        json!({
+            "schema": "solaris.container_state.oracle.v1",
+            "id": "inventory-container-26-1-2",
+            "phases": [
+                {"id":"chest-initial","menu":"chest","case":"chest_initial"},
+                {"id":"chest-quick-move-in","menu":"chest","case":"chest_quick_move_in"},
+                {"id":"chest-quick-move-out","menu":"chest","case":"chest_quick_move_out"},
+                {"id":"chest-stale-click","menu":"chest","case":"chest_stale_click"},
+                {"id":"chest-reopen","menu":"chest","case":"chest_reopen"},
+                {"id":"craft-initial","menu":"crafting_table","case":"craft_initial"},
+                {"id":"craft-prepared","menu":"crafting_table","case":"craft_prepared"},
+                {"id":"craft-quick-move","menu":"crafting_table","case":"craft_quick_move"},
+                {"id":"craft-stale-click","menu":"crafting_table","case":"craft_stale_click"},
+                {"id":"craft-reopen","menu":"crafting_table","case":"craft_reopen"}
+            ]
+        })
+    }
+
+    fn empty_container_snapshot(menu: ContainerStateOracleMenu) -> ContainerStateOracleSnapshot {
+        ContainerStateOracleSnapshot {
+            menu,
+            state_id_delta: 0,
+            slots: vec![ContainerStateOracleSlot {
+                slot: 0,
+                stack: ContainerStateOracleStack {
+                    item_id: 0,
+                    count: 0,
+                },
+            }],
+            cursor: ContainerStateOracleStack {
+                item_id: 0,
+                count: 0,
+            },
+        }
+    }
+
+    #[test]
+    fn container_state_oracle_manifest_requires_complete_menu_case_matrix() {
+        let manifest =
+            ContainerStateOracleManifest::from_json(&container_state_oracle_json().to_string())
+                .expect("valid container state oracle manifest");
+        assert_eq!(manifest.phases.len(), 10);
+        assert_eq!(
+            ContainerStateOracleManifest::from_json(
+                &manifest
+                    .to_pretty_json()
+                    .expect("encode container manifest")
+            )
+            .expect("decode container manifest"),
+            manifest
+        );
+
+        let mut wrong_menu = container_state_oracle_json();
+        wrong_menu["phases"][0]["menu"] = json!("crafting_table");
+        assert!(ContainerStateOracleManifest::from_json(&wrong_menu.to_string()).is_err());
+
+        let mut duplicate_case = container_state_oracle_json();
+        duplicate_case["phases"][9]["case"] = json!("craft_initial");
+        assert!(ContainerStateOracleManifest::from_json(&duplicate_case.to_string()).is_err());
+
+        let mut unknown_field = container_state_oracle_json();
+        unknown_field["phases"][0]["expected_state_id"] = json!(0);
+        assert!(ContainerStateOracleManifest::from_json(&unknown_field.to_string()).is_err());
+    }
+
+    #[test]
+    fn container_state_trace_rejects_unsorted_slots_and_nonzero_reopen_baseline() {
+        let manifest =
+            ContainerStateOracleManifest::from_json(&container_state_oracle_json().to_string())
+                .expect("valid container manifest");
+        let phases = manifest
+            .phases
+            .iter()
+            .map(|phase| ContainerStateOraclePhaseTrace {
+                id: phase.id.clone(),
+                snapshot: empty_container_snapshot(phase.menu),
+            })
+            .collect();
+        let trace = ContainerStateOracleTrace {
+            manifest_id: manifest.id.clone(),
+            phases,
+        };
+        trace.validate_against(&manifest).expect("valid trace");
+
+        let mut unsorted = trace.clone();
+        unsorted.phases[1].snapshot.slots = vec![
+            ContainerStateOracleSlot {
+                slot: 2,
+                stack: ContainerStateOracleStack {
+                    item_id: 1,
+                    count: 1,
+                },
+            },
+            ContainerStateOracleSlot {
+                slot: 1,
+                stack: ContainerStateOracleStack {
+                    item_id: 1,
+                    count: 1,
+                },
+            },
+        ];
+        assert!(unsorted.validate_against(&manifest).is_err());
+
+        let mut bad_reopen = trace;
+        bad_reopen.phases[9].snapshot.state_id_delta = 1;
+        assert!(bad_reopen.validate_against(&manifest).is_err());
     }
 
     fn core_gate_manifest_json() -> Value {

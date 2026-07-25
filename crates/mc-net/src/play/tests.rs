@@ -4232,6 +4232,93 @@ fn chest_quick_move_places_player_stack_in_first_empty_storage_slot() {
 }
 
 #[test]
+fn chest_quick_move_from_storage_uses_vanilla_reverse_player_range() {
+    let dirt = Identifier::parse("minecraft:dirt").unwrap();
+    let items = Arc::new(ItemRegistry::from_report(&[ItemReport {
+        id: dirt,
+        protocol_id: 10,
+    }]));
+    let mut state = interaction_state_for_items(Arc::clone(&items));
+    let dirt_id = items
+        .id_of(&Identifier::parse("minecraft:dirt").unwrap())
+        .unwrap();
+    let mut chest = ChestBlockEntity::default();
+    chest.slots[0] = mc_world::FurnaceSlot {
+        item_id: dirt_id,
+        count: 2,
+        damage: None,
+        enchantments: Vec::new(),
+    };
+    let mut view = ChestView {
+        chests: vec![chest],
+    };
+
+    assert!(apply_chest_quick_move_click(&mut state, &mut view, 0));
+    assert!(view.chests[0].slots[0].is_empty());
+    assert_eq!(
+        state.inventory.slots[44],
+        ItemStack::new(dirt_id, 2),
+        "vanilla fills the reverse player range before earlier main-inventory slots"
+    );
+    assert!(state.inventory.slots[9..44].iter().all(ItemStack::is_empty));
+}
+
+#[test]
+fn chest_menu_revision_counts_source_and_destination_slot_changes() {
+    let mut before_chest = ChestBlockEntity::default();
+    before_chest.slots[0] = mc_world::FurnaceSlot {
+        item_id: 10,
+        count: 2,
+        damage: None,
+        enchantments: Vec::new(),
+    };
+    let before_view = ChestView {
+        chests: vec![before_chest],
+    };
+    let after_view = ChestView {
+        chests: vec![ChestBlockEntity::default()],
+    };
+    let before_inventory = PlayerInventory::empty();
+    let mut after_inventory = PlayerInventory::empty();
+    after_inventory.slots[44] = ItemStack::new(10, 2);
+
+    assert_eq!(
+        chest_menu_state_change_count(
+            &before_view,
+            &after_view,
+            &before_inventory,
+            &after_inventory,
+            &ItemStack::EMPTY,
+            &ItemStack::EMPTY,
+        ),
+        2
+    );
+}
+
+#[test]
+fn crafting_menu_revision_counts_result_input_and_destination_changes() {
+    let mut before_window = CraftingTableWindow::new(7);
+    before_window.input[0] = ItemStack::new(10, 1);
+    before_window.result = ItemStack::new(11, 4);
+    let after_window = CraftingTableWindow::new(7);
+    let before_inventory = PlayerInventory::empty();
+    let mut after_inventory = PlayerInventory::empty();
+    after_inventory.slots[44] = ItemStack::new(11, 4);
+
+    assert_eq!(
+        crafting_menu_state_change_count(
+            &before_window,
+            &after_window,
+            &before_inventory,
+            &after_inventory,
+            &ItemStack::EMPTY,
+            &ItemStack::EMPTY,
+        ),
+        3
+    );
+}
+
+#[test]
 fn persistent_container_claim_check_covers_furnace_and_both_chest_halves() {
     let first = mc_world::BlockPos { x: 1, y: 64, z: 2 };
     let second = mc_world::BlockPos { x: 2, y: 64, z: 2 };
@@ -14538,7 +14625,7 @@ async fn disconnect_recovers_crafting_grid_after_connection_projection_is_lost()
         pose,
         ServerboundContainerClick {
             container_id: 7,
-            state_id: 2,
+            state_id: 3,
             slot_num: 1,
             button_num: 0,
             container_input: ContainerInput::Pickup,
@@ -14878,7 +14965,7 @@ async fn crafting_table_result_commit_publishes_once_before_fifo_fence() {
     )
     .await
     .unwrap();
-    assert_eq!(window.state_id, 2);
+    assert_eq!(window.state_id, 4);
     assert!(window.input.iter().all(ItemStack::is_empty));
     assert_eq!(state.carried_item, ItemStack::new(2, 4));
     assert!(matches!(
@@ -14901,7 +14988,7 @@ async fn crafting_table_result_commit_publishes_once_before_fifo_fence() {
         pose,
         ServerboundContainerClick {
             container_id: 7,
-            state_id: 2,
+            state_id: 4,
             slot_num: 0,
             button_num: 0,
             container_input: ContainerInput::Pickup,
@@ -14932,7 +15019,7 @@ async fn crafting_table_result_commit_publishes_once_before_fifo_fence() {
         pose,
         ServerboundContainerClick {
             container_id: 7,
-            state_id: 2,
+            state_id: 4,
             slot_num: 0,
             button_num: 0,
             container_input: ContainerInput::Pickup,
@@ -14946,7 +15033,7 @@ async fn crafting_table_result_commit_publishes_once_before_fifo_fence() {
     )
     .await
     .unwrap();
-    assert_eq!(window.state_id, 3);
+    assert_eq!(window.state_id, 7);
     assert!(window.input.iter().all(ItemStack::is_empty));
     assert_eq!(state.carried_item, ItemStack::new(2, 8));
 
@@ -17505,7 +17592,7 @@ async fn stale_chest_click_after_peer_mutation_resyncs_without_mutating_storage(
     }
     let _ = state
         .sessions
-        .try_chest_slot_dispatches(position, 1, 99, vec![ItemStack::new(stone_id, 2)])
+        .try_chest_slot_dispatches(position, 1, 1, 99, vec![ItemStack::new(stone_id, 2)])
         .expect("peer mutation claims initial chest state");
 
     let mut writer = Vec::new();
@@ -17595,7 +17682,7 @@ async fn chest_commit_snapshot_pairs_world_contents_with_viewer_state_id() {
         .set_chest_block_entity(position, updated.clone())
         .unwrap();
     let (state_id, _) = sessions
-        .try_chest_slot_dispatches(position, 1, 99, vec![ItemStack::new(10, 1)])
+        .try_chest_slot_dispatches(position, 1, 1, 99, vec![ItemStack::new(10, 1)])
         .unwrap();
     assert_eq!(state_id, 2);
     drop(guard);
@@ -17674,8 +17761,8 @@ async fn shared_chest_same_version_click_commits_once_and_conserves_items() {
     .await
     .unwrap();
 
-    assert_eq!(actor_window.state_id, 2);
-    assert_eq!(observer_window.state_id, 2);
+    assert_eq!(actor_window.state_id, 3);
+    assert_eq!(observer_window.state_id, 3);
     assert_eq!(actor.carried_item, ItemStack::new(dirt_id, 1));
     assert!(observer.carried_item.is_empty());
     let chest_count = {
@@ -17695,7 +17782,7 @@ async fn shared_chest_same_version_click_commits_once_and_conserves_items() {
     );
     let observer_packets = decode_container_set_content_packets(&observer_writer);
     assert_eq!(observer_packets.len(), 1);
-    assert_eq!(observer_packets[0].state_id, 2);
+    assert_eq!(observer_packets[0].state_id, 3);
     assert_eq!(observer_packets[0].items[0], ItemStack::new(dirt_id, 1));
     assert!(observer_packets[0].carried_item.is_empty());
 }

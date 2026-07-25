@@ -321,8 +321,8 @@ use containers::{
     ScriptMenuWindow, StonecutterClickAction, StonecutterClickInput, StonecutterWindow,
     adjacent_chest_positions,
     can_place_in_enchanting_menu_slot as can_place_in_enchanting_menu_slot_with_data,
-    chest_menu_title_nbt, chest_slot_stacks, chest_wire_items, client_close_matches,
-    count_valid_enchanting_bookshelves, crafting_menu_title_nbt,
+    chest_menu_state_change_count, chest_menu_title_nbt, chest_slot_stacks, chest_wire_items,
+    client_close_matches, count_valid_enchanting_bookshelves, crafting_menu_title_nbt,
     crafting_table_input_from_projection, crafting_table_input_projection, crafting_wire_items,
     enchant_item_candidate, enchanting_data_values, enchanting_menu_stack,
     enchanting_menu_title_nbt, enchanting_offer, enchanting_player_slot,
@@ -2340,6 +2340,30 @@ where
     Ok(true)
 }
 
+fn crafting_menu_state_change_count(
+    before_window: &CraftingTableWindow,
+    after_window: &CraftingTableWindow,
+    before_inventory: &PlayerInventory,
+    after_inventory: &PlayerInventory,
+    before_carried: &ItemStack,
+    after_carried: &ItemStack,
+) -> i32 {
+    let result_changes = usize::from(before_window.result != after_window.result);
+    let input_changes = before_window
+        .input
+        .iter()
+        .zip(&after_window.input)
+        .filter(|(before, after)| before != after)
+        .count();
+    let inventory_changes = (9..=44)
+        .filter(|slot| before_inventory.slots[*slot] != after_inventory.slots[*slot])
+        .count();
+    let carried_changes = usize::from(before_carried != after_carried);
+    i32::try_from(result_changes + input_changes + inventory_changes + carried_changes)
+        .unwrap_or(i32::MAX)
+        .max(1)
+}
+
 async fn handle_crafting_container_click<W>(
     state: &mut InteractionState,
     writer: &mut W,
@@ -2473,6 +2497,14 @@ where
         write_crafting_content(state, writer, &window).await?;
         return Ok(window);
     }
+    let state_id_increment = crafting_menu_state_change_count(
+        &before_window,
+        &window,
+        &before_inventory,
+        &state.inventory,
+        &before_carried_item,
+        &state.carried_item,
+    );
     let crafted = crafted_result.as_ref().and_then(|result| {
         if quick_moved_result {
             crafted_item_from_inventory_delta(result, &before_inventory, &state.inventory)
@@ -2504,7 +2536,7 @@ where
                 )
                 .await;
         }
-        window.state_id = window.state_id.wrapping_add(1);
+        window.state_id = window.state_id.wrapping_add(state_id_increment);
     }
     write_crafting_content(state, writer, &window).await?;
     Ok(window)
@@ -4730,6 +4762,14 @@ async fn commit_chest_click(
 ) -> Result<ChestCommitOutcome, ConnectionError> {
     #[cfg(test)]
     {
+        let state_id_increment = chest_menu_state_change_count(
+            expected,
+            updated,
+            &player.expected_inventory,
+            &player.updated_inventory,
+            &player.expected_carried_item,
+            &player.updated_carried_item,
+        );
         let mut storage = state.world.lock().await;
         let mut authoritative = Vec::with_capacity(window.positions.len());
         for &position in &window.positions {
@@ -4754,6 +4794,7 @@ async fn commit_chest_click(
         let (state_id, dispatches) = match state.sessions.try_chest_slot_dispatches(
             window.position(),
             window.state_id,
+            state_id_increment,
             state.session_id,
             chest_slot_stacks(updated),
         ) {

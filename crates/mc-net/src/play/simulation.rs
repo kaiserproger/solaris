@@ -38,8 +38,9 @@ use super::{
     ContainerXpPlan, EntityPhysicsQuery, EntityPhysicsStep, FurnaceCommitOutcome, GameMode,
     HerdSpawn, PendingCampfireOutput, PlayerInventoryCommitOutcome, PlayerPose,
     SharedContainerCommit, SurvivalState, WorldHandle, air_state_id, block_edit_changes_light,
-    chest_slot_stacks, furnace_output_was_taken, furnace_slot_stacks, is_campfire_block,
-    schedule_fluid_ticks_near_applied, schedule_leaf_ticks_near_applied,
+    chest_menu_state_change_count, chest_slot_stacks, furnace_output_was_taken,
+    furnace_slot_stacks, is_campfire_block, schedule_fluid_ticks_near_applied,
+    schedule_leaf_ticks_near_applied,
 };
 use mc_data::block_facts::BlockFactsTable;
 use mc_data::block_light::BlockLightTable;
@@ -4120,9 +4121,21 @@ impl SimulationOwner {
                 carried_item,
             }));
         }
-        let slots = chest_slot_stacks(&ChestView {
+        let before_view = ChestView {
+            chests: expected.to_vec(),
+        };
+        let after_view = ChestView {
             chests: updated.to_vec(),
-        });
+        };
+        let state_id_increment = chest_menu_state_change_count(
+            &before_view,
+            &after_view,
+            &player.expected_inventory,
+            &player.updated_inventory,
+            &player.expected_carried_item,
+            &player.updated_carried_item,
+        );
+        let slots = chest_slot_stacks(&after_view);
         let commit = sessions.commit_chest_slots(
             &self.authority,
             ContainerCommitContext {
@@ -4131,6 +4144,7 @@ impl SimulationOwner {
                 actor_session,
                 player,
             },
+            state_id_increment,
             slots,
             || {
                 for (&position, chest) in positions.iter().zip(updated) {
@@ -14390,6 +14404,7 @@ mod tests {
             .try_chest_slot_dispatches(
                 pos,
                 1,
+                1,
                 7,
                 super::super::chest_slot_stacks(&super::super::ChestView {
                     chests: vec![updated.clone()],
@@ -14812,7 +14827,7 @@ mod tests {
         );
         assert!(matches!(
             observer_rx.blocking_recv(),
-            Some(OutboundCommand::ChestSlots { state_id: 2, .. })
+            Some(OutboundCommand::ChestSlots { state_id: 4, .. })
         ));
         assert!(matches!(
             observer_rx.blocking_recv(),
@@ -14825,7 +14840,7 @@ mod tests {
                 if matches!(
                     *outcome,
                     SharedContainerCommit::Committed {
-                        state_id: 2,
+                        state_id: 4,
                         ref inventory,
                         ref carried_item,
                         ..
@@ -14842,7 +14857,7 @@ mod tests {
                         inventory,
                         carried_item,
                     } => {
-                        assert_eq!(state_id, 2);
+                        assert_eq!(state_id, 4);
                         (authoritative, inventory, carried_item)
                     }
                     other => panic!("expected stale chest rejection, got {other:?}"),

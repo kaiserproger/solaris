@@ -1952,6 +1952,7 @@ fn chest_world_commit_does_not_hold_unrelated_session_or_entity_state() {
                     actor_session: session_id,
                     player: &player,
                 },
+                1,
                 Vec::new(),
                 || {
                     commit_entered_tx.send(()).expect("test receiver remains");
@@ -3075,7 +3076,7 @@ fn chest_slot_dispatches_claim_expected_state_exactly_once() {
     assert_eq!(registry.register_chest_viewer(bob, position), 1);
 
     let (state_id, dispatches) = registry
-        .try_chest_slot_dispatches(position, 1, alice, vec![stack.clone()])
+        .try_chest_slot_dispatches(position, 1, 1, alice, vec![stack.clone()])
         .expect("first mutation claims state 1");
 
     assert_eq!(state_id, 2);
@@ -3096,7 +3097,7 @@ fn chest_slot_dispatches_claim_expected_state_exactly_once() {
     }
 
     let conflict = registry
-        .try_chest_slot_dispatches(position, 1, bob, vec![ItemStack::new(11, 1)])
+        .try_chest_slot_dispatches(position, 1, 1, bob, vec![ItemStack::new(11, 1)])
         .expect_err("state 1 cannot be claimed twice");
     assert_eq!(conflict, 2);
     assert_eq!(registry.chest_state_id(position), 2);

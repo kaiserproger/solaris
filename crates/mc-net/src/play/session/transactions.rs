@@ -18,7 +18,7 @@ use crate::play::simulation::{
 };
 use crate::play::{
     ChestCommitOutcome, ContainerPlayerPlan, FurnaceCommitOutcome, SharedContainerCommit,
-    furnace_slot_stacks,
+    chest_menu_state_change_count, furnace_slot_stacks,
 };
 
 use super::SessionId;
@@ -96,6 +96,18 @@ impl ChestTransaction {
             updated,
             player,
         } = request;
+        let state_id_increment = chest_menu_state_change_count(
+            &ChestView {
+                chests: expected.to_vec(),
+            },
+            &ChestView {
+                chests: updated.to_vec(),
+            },
+            &player.expected_inventory,
+            &player.updated_inventory,
+            &player.expected_carried_item,
+            &player.updated_carried_item,
+        );
         let container_wait_started = Instant::now();
         let container_guard = self.containers.lock().unwrap_or_else(|poisoned| {
             warn!("container registry mutex was poisoned during regional chest commit; recovering state");
@@ -172,7 +184,7 @@ impl ChestTransaction {
             player.updated_inventory.clone(),
             player.updated_carried_item.clone(),
         );
-        let state_id = current_state_id.wrapping_add(1);
+        let state_id = current_state_id.wrapping_add(state_id_increment.max(1));
         containers
             .chest_state_ids
             .insert(primary_position, state_id);

@@ -116,6 +116,7 @@ impl SessionRegistry {
         &self,
         position: mc_world::BlockPos,
         expected_state_id: i32,
+        state_id_increment: i32,
         except: SessionId,
         slots: Vec<ItemStack>,
     ) -> Result<(i32, Vec<VisibilityDispatch>), i32> {
@@ -129,7 +130,7 @@ impl SessionRegistry {
             if current_state_id != expected_state_id {
                 return Err(current_state_id);
             }
-            let state_id = current_state_id.wrapping_add(1);
+            let state_id = current_state_id.wrapping_add(state_id_increment.max(1));
             containers.chest_state_ids.insert(position, state_id);
             let recipients = chest_recipients(&containers, position, Some(except));
             (state_id, recipients)
@@ -148,6 +149,7 @@ impl SessionRegistry {
         &self,
         authority: &SimulationAuthority,
         context: ContainerCommitContext<'_>,
+        state_id_increment: i32,
         slots: Vec<ItemStack>,
         commit: impl FnOnce() -> Result<(), E>,
     ) -> Result<
@@ -211,7 +213,7 @@ impl SessionRegistry {
                 player.updated_inventory.clone(),
                 player.updated_carried_item.clone(),
             );
-            let state_id = current_state_id.wrapping_add(1);
+            let state_id = current_state_id.wrapping_add(state_id_increment.max(1));
             containers.chest_state_ids.insert(position, state_id);
             let recipients = chest_recipients(&containers, position, Some(actor_session));
             (
