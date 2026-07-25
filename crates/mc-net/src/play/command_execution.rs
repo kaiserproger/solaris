@@ -4,7 +4,7 @@ use mc_protocol::frame::Compression;
 use mc_protocol::packets::play::{
     ClientCommandAction, ClientboundContainerSetSlot, ClientboundRespawn, ClientboundSetTime,
     ClientboundSystemChat, GameEvent, GameMode, ItemStack, ServerboundClientCommand,
-    SetCenterChunk,
+    SetCenterChunk, SetDefaultSpawnPosition, pack_block_pos,
 };
 use tokio::io::AsyncWriteExt;
 use tracing::{debug, warn};
@@ -752,7 +752,7 @@ where
 pub(super) async fn handle_client_command<W>(
     writer: &mut W,
     compression: Compression,
-    interaction: Option<&mut InteractionState>,
+    mut interaction: Option<&mut InteractionState>,
     chunk_stream: &mut Option<ChunkStreamState>,
     player_pose: &mut PlayerPose,
     respawn_pose: PlayerPose,
@@ -772,7 +772,7 @@ where
             if !survival_state.is_dead() {
                 return Ok(());
             }
-            if let Some(state) = interaction {
+            if let Some(state) = interaction.as_mut() {
                 let expected_inventory = state.inventory.clone();
                 if !commit_player_survival_update(
                     state,
@@ -796,6 +796,30 @@ where
             }
             *player_pose = respawn_pose;
             write_packet(writer, respawn, compression).await?;
+            write_packet(
+                writer,
+                &player_abilities_for_mode(GameMode::from_id(i32::from(respawn.game_mode))),
+                compression,
+            )
+            .await?;
+            write_packet(
+                writer,
+                &SetDefaultSpawnPosition {
+                    dimension: respawn.dimension_name.clone(),
+                    position: pack_block_pos(
+                        respawn_pose.x.floor() as i32,
+                        respawn_pose.y.floor() as i32,
+                        respawn_pose.z.floor() as i32,
+                    ),
+                    yaw: respawn_pose.yaw,
+                    pitch: respawn_pose.pitch,
+                },
+                compression,
+            )
+            .await?;
+            if let Some(state) = interaction.as_mut() {
+                write_inventory_content_resync(state, writer).await?;
+            }
             write_packet(
                 writer,
                 &GameEvent {
