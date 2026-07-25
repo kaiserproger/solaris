@@ -972,6 +972,162 @@ async fn selected_item_drop_debits_slot_and_spawns_exact_stack() {
         .expect("selected item drop server serve");
 }
 
+async fn drop_one_selected_item_wire(
+    client: &mut Client,
+    item_entity_type: i32,
+    item_id: u32,
+    remaining_count: i32,
+    sequence: i32,
+) -> i32 {
+    client
+        .write_packet(&ServerboundPlayerAction {
+            action: PlayerActionKind::DropItem,
+            position: 0,
+            direction: Direction::Down,
+            sequence,
+        })
+        .await
+        .expect("drop selected merge fixture");
+    let mut entity_ids = HashSet::new();
+    let mut dropped_id = None;
+    let mut saw_stack = false;
+    let mut saw_slot = false;
+    let mut saw_ack = false;
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
+    while !(saw_stack && saw_slot && saw_ack) {
+        let frame = client
+            .read_frame_with_timeout(
+                deadline.saturating_duration_since(tokio::time::Instant::now()),
+            )
+            .await
+            .expect("selected merge drop response");
+        if handle_keepalive(client, frame.id, &frame.body).await {
+            continue;
+        }
+        if frame.id == AddEntity::ID {
+            let mut body = frame.body;
+            let packet = AddEntity::decode(&mut body).expect("decode merge drop AddEntity");
+            if packet.entity_type_id == item_entity_type {
+                entity_ids.insert(packet.entity_id);
+                dropped_id = Some(packet.entity_id);
+            }
+        } else if frame.id == ClientboundSetEntityData::ID {
+            let mut body = frame.body;
+            let packet = ClientboundSetEntityData::decode(&mut body)
+                .expect("decode merge drop entity data");
+            if entity_ids.contains(&packet.entity_id) {
+                saw_stack |= packet.values.iter().any(|value| {
+                    matches!(
+                        value,
+                        EntityDataValue::ItemStack { index, stack }
+                            if *index == ITEM_ENTITY_DATA_ITEM_INDEX
+                                && stack.item_id == item_id
+                                && stack.count == 1
+                    )
+                });
+            }
+        } else if frame.id == ClientboundContainerSetSlot::ID {
+            let mut body = frame.body;
+            let packet = ClientboundContainerSetSlot::decode(&mut body)
+                .expect("decode merge drop SetSlot");
+            saw_slot |= packet.slot == 36
+                && if remaining_count == 0 {
+                    packet.item_stack.is_empty()
+                } else {
+                    packet.item_stack.item_id == item_id
+                        && packet.item_stack.count == remaining_count
+                };
+        } else if frame.id == BlockChangedAck::ID {
+            let mut body = frame.body;
+            let packet = BlockChangedAck::decode(&mut body).expect("decode merge drop ack");
+            saw_ack |= packet.sequence == sequence;
+        }
+    }
+    dropped_id.expect("selected merge drop entity id")
+}
+
+#[tokio::test]
+async fn nearby_selected_item_drops_merge_and_publish_survivor() {
+    let data = embedded_play_data();
+    let world = embedded_world(&data);
+    let item_id = data
+        .items
+        .id_of(&mc_data::Identifier::parse("minecraft:birch_log").unwrap())
+        .expect("birch log item");
+    let item_entity_type = mc_data::entity_types::solaris_required_entity_types()
+        .id_of(&mc_data::Identifier::parse("minecraft:item").unwrap())
+        .and_then(|id| i32::try_from(id).ok())
+        .expect("item entity type");
+    let shutdown = mc_net::ShutdownHandle::default();
+    let mut cfg = embedded_playable_config(&data, world, "T04 dropped item merge");
+    cfg.shutdown = shutdown.clone();
+    let bound = mc_net::bind(cfg).await.expect("bind dropped item merge");
+    let addr = bound.local_addr().expect("dropped item merge local_addr");
+    let serve = tokio::spawn(async move { bound.serve().await });
+
+    let (mut client, _) = connect_to_play(addr, "ItemMergeWire").await;
+    drain_until_chunk(&mut client, (0, 0)).await;
+    client
+        .write_packet(&ServerboundChatCommand {
+            command: "debug give minecraft:birch_log 2 0".into(),
+        })
+        .await
+        .expect("give dropped item merge fixture");
+    wait_for_slot_stack(&mut client, item_id, 2).await;
+
+    let first_id =
+        drop_one_selected_item_wire(&mut client, item_entity_type, item_id, 1, 101).await;
+    let second_id =
+        drop_one_selected_item_wire(&mut client, item_entity_type, item_id, 0, 102).await;
+    assert!(first_id < second_id, "first dropped identity must be older/lower");
+
+    let mut saw_survivor = false;
+    let mut saw_consumed_remove = false;
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
+    while !(saw_survivor && saw_consumed_remove) {
+        let frame = client
+            .read_frame_with_timeout(
+                deadline.saturating_duration_since(tokio::time::Instant::now()),
+            )
+            .await
+            .unwrap_or_else(|error| {
+                panic!(
+                    "dropped item merge wire response: {error}; survivor={saw_survivor} remove={saw_consumed_remove}"
+                )
+            });
+        if handle_keepalive(&mut client, frame.id, &frame.body).await {
+            continue;
+        }
+        if frame.id == ClientboundSetEntityData::ID {
+            let mut body = frame.body;
+            let packet = ClientboundSetEntityData::decode(&mut body)
+                .expect("decode merged item entity data");
+            if packet.entity_id == first_id {
+                saw_survivor |= packet.values.iter().any(|value| {
+                    matches!(
+                        value,
+                        EntityDataValue::ItemStack { index, stack }
+                            if *index == ITEM_ENTITY_DATA_ITEM_INDEX
+                                && stack.item_id == item_id
+                                && stack.count == 2
+                    )
+                });
+            }
+        } else if frame.id == RemoveEntities::ID {
+            let mut body = frame.body;
+            let packet = RemoveEntities::decode(&mut body).expect("decode merged item removal");
+            saw_consumed_remove |= packet.entity_ids.contains(&second_id);
+        }
+    }
+
+    shutdown.request();
+    tokio::time::timeout(Duration::from_secs(5), serve)
+        .await
+        .expect("dropped item merge server shutdown")
+        .expect("dropped item merge server join")
+        .expect("dropped item merge server serve");
+}
+
 async fn assert_offhand_swap_before_ack(
     client: &mut Client,
     sequence: i32,

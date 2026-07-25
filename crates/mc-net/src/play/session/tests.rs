@@ -9841,6 +9841,189 @@ fn vehicle_crossing_publishes_authoritative_passenger_motion() {
     );
 }
 
+fn configure_item_merge_resources(registry: &SessionRegistry) {
+    let items = Arc::new(mc_data::items::ItemRegistry::from_report(&[
+        mc_data::items::ItemReport {
+            id: mc_data::Identifier::parse("minecraft:dirt").unwrap(),
+            protocol_id: 42,
+        },
+        mc_data::items::ItemReport {
+            id: mc_data::Identifier::parse("minecraft:stone").unwrap(),
+            protocol_id: 43,
+        },
+    ]));
+    registry.configure_player_combat(
+        None,
+        None,
+        items,
+        Arc::new(mc_data::item_components::ItemFactsTable::default()),
+    );
+}
+
+#[test]
+fn compatible_ready_item_drops_merge_once_and_publish_exact_survivor() {
+    let registry = SessionRegistry::new();
+    configure_item_merge_resources(&registry);
+    let observer = register_test_session(&registry, "MergeObserver");
+    assert!(registry.mark_loaded(observer, (0, 0)).is_empty());
+    let first_dispatches =
+        registry.spawn_item_drop(1, Vec3::new(10.5, 64.0, 0.5), EntityItemStack::new(42, 3));
+    let first_id = first_dispatches
+        .iter()
+        .find_map(|dispatch| match &dispatch.command {
+            OutboundCommand::SpawnEntity(snapshot) => Some(snapshot.id),
+            _ => None,
+        })
+        .expect("first item visible");
+    registry.advance_world_time(2);
+    let second_dispatches =
+        registry.spawn_item_drop(1, Vec3::new(10.75, 64.0, 0.5), EntityItemStack::new(42, 2));
+    let second_id = second_dispatches
+        .iter()
+        .find_map(|dispatch| match &dispatch.command {
+            OutboundCommand::SpawnEntity(snapshot) => Some(snapshot.id),
+            _ => None,
+        })
+        .expect("second item visible");
+    registry.advance_world_time(2);
+
+    let dispatches = registry.item_pickup_ready_dispatches_owned(
+        &SimulationAuthority::for_test(),
+        ITEM_PICKUP_DELAY_TICKS,
+    );
+
+    let entities = registry.lock_entities("inspect merged item rows");
+    let survivor = entities
+        .snapshot(first_id)
+        .expect("merged survivor ECS row");
+    assert_eq!(survivor.item_stack, Some(EntityItemStack::new(42, 5)));
+    assert_eq!(
+        survivor.retained.spawn_tick, 2,
+        "merged age must retain the younger vanilla age"
+    );
+    assert!(
+        entities.snapshot(second_id).is_none(),
+        "consumed item identity must be removed"
+    );
+    drop(entities);
+    assert!(dispatches.iter().any(|dispatch| matches!(
+        &dispatch.command,
+        OutboundCommand::UpdateEntityData(snapshot)
+            if snapshot.id == first_id
+                && snapshot.item_stack == Some(EntityItemStack::new(42, 5))
+    )));
+    assert!(dispatches.iter().any(|dispatch| matches!(
+        &dispatch.command,
+        OutboundCommand::DespawnEntity(snapshot) if snapshot.id == second_id
+    )));
+}
+
+#[test]
+fn incompatible_and_full_item_drops_do_not_merge() {
+    let registry = SessionRegistry::new();
+    configure_item_merge_resources(&registry);
+    registry.spawn_item_drop(1, Vec3::new(10.5, 64.0, 0.5), EntityItemStack::new(42, 1));
+    registry.spawn_item_drop(1, Vec3::new(10.75, 64.0, 0.5), EntityItemStack::new(43, 1));
+    registry.spawn_item_drop(1, Vec3::new(11.5, 64.0, 0.5), EntityItemStack::new(42, 64));
+    registry.spawn_item_drop(1, Vec3::new(11.75, 64.0, 0.5), EntityItemStack::new(42, 1));
+    registry.advance_world_time(ITEM_PICKUP_DELAY_TICKS);
+
+    let dispatches = registry.item_pickup_ready_dispatches_owned(
+        &SimulationAuthority::for_test(),
+        ITEM_PICKUP_DELAY_TICKS,
+    );
+
+    let remaining = registry.nearby_item_entities(Vec3::new(11.0, 64.0, 0.5), 2.0);
+    assert_eq!(remaining.len(), 4);
+    assert!(dispatches.is_empty());
+}
+
+#[test]
+fn expired_different_owner_blocks_do_not_prevent_item_merge() {
+    let registry = SessionRegistry::new();
+    configure_item_merge_resources(&registry);
+    let first_owner = register_test_session(&registry, "MergeOwnerOne");
+    let second_owner = register_test_session(&registry, "MergeOwnerTwo");
+    registry.spawn_item_drop(1, Vec3::new(15.5, 64.0, 0.5), EntityItemStack::new(42, 3));
+    registry.spawn_item_drop(1, Vec3::new(15.75, 64.0, 0.5), EntityItemStack::new(42, 2));
+    let mut ids = registry
+        .persisted_entity_records()
+        .into_iter()
+        .map(|record| record.snapshot.id)
+        .collect::<Vec<_>>();
+    ids.sort_unstable();
+    {
+        let mut entities = registry.lock_entities("seed expired item owner blocks");
+        for (id, owner) in [(ids[0], first_owner), (ids[1], second_owner)] {
+            let expected = entities.snapshot(id).expect("item snapshot");
+            let mut next = expected.clone();
+            next.retained.item_pickup_owner_block = Some(mc_entity::EntityItemPickupOwnerBlock {
+                owner_session: owner,
+                expires_tick: 1,
+            });
+            assert!(entities.replace_snapshot_if_current(expected, next));
+        }
+    }
+    registry.advance_world_time(ITEM_PICKUP_DELAY_TICKS);
+
+    registry.item_pickup_ready_dispatches_owned(
+        &SimulationAuthority::for_test(),
+        ITEM_PICKUP_DELAY_TICKS,
+    );
+
+    let records = registry.persisted_entity_records();
+    assert_eq!(records.len(), 1);
+    assert_eq!(records[0].snapshot.id, ids[0]);
+    assert_eq!(
+        records[0].snapshot.item_stack,
+        Some(EntityItemStack::new(42, 5))
+    );
+    assert_eq!(records[0].snapshot.retained.item_pickup_owner_block, None);
+}
+
+#[test]
+fn item_drops_that_converge_after_pickup_ready_merge_on_physics_tick() {
+    let registry = SessionRegistry::new();
+    configure_item_merge_resources(&registry);
+    registry.spawn_item_drop(1, Vec3::new(20.5, 64.0, 0.5), EntityItemStack::new(42, 3));
+    registry.spawn_item_drop(1, Vec3::new(22.0, 64.0, 0.5), EntityItemStack::new(42, 2));
+    let mut ids = registry
+        .persisted_entity_records()
+        .into_iter()
+        .map(|record| record.snapshot.id)
+        .collect::<Vec<_>>();
+    ids.sort_unstable();
+    registry.advance_world_time(ITEM_PICKUP_DELAY_TICKS);
+    assert!(
+        registry
+            .item_pickup_ready_dispatches_owned(
+                &SimulationAuthority::for_test(),
+                ITEM_PICKUP_DELAY_TICKS,
+            )
+            .is_empty()
+    );
+    assert_eq!(registry.persisted_entity_records().len(), 2);
+
+    registry.apply_entity_physics_and_dispatch(
+        ITEM_PICKUP_DELAY_TICKS + 1,
+        &[EntityPhysicsStep {
+            id: ids[1],
+            position: Vec3::new(20.75, 64.0, 0.5),
+            velocity: Vec3::ZERO,
+            on_ground: true,
+            horizontal_collision: false,
+        }],
+    );
+
+    let records = registry.persisted_entity_records();
+    assert_eq!(records.len(), 1);
+    assert_eq!(records[0].snapshot.id, ids[0]);
+    assert_eq!(
+        records[0].snapshot.item_stack,
+        Some(EntityItemStack::new(42, 5))
+    );
+}
+
 #[test]
 fn item_drop_despawns_after_lifetime() {
     let registry = SessionRegistry::new();

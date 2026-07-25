@@ -9,6 +9,7 @@ use super::explosion_authority::schedule_primed_tnt_deadline_locked;
 use super::interaction_geometry::{
     distance_sq, entity_aabb, entity_geometry, entity_is_near_player_chunk,
 };
+use super::pickups::merge_item_entities_locked;
 use super::simulation_input_publication::ExpectedEntityRoutingMove;
 use super::visibility::{
     LastSentEntityState, entity_wire_move_for_kind, packed_head_yaw_changed,
@@ -947,6 +948,16 @@ impl SessionRegistry {
                 &mut inner, entity_id, old_chunk, new_chunk,
             ));
         }
+        let item_ids = steps
+            .iter()
+            .filter(|step| {
+                old_motion
+                    .get(&step.id)
+                    .is_some_and(|motion| motion.is_item)
+            })
+            .map(|step| step.id)
+            .collect::<Vec<_>>();
+        dispatches.extend(merge_item_entities_locked(&mut inner, &item_ids));
         let ordinary_tracking_turn = tick.is_multiple_of(ENTITY_MOVE_SEND_INTERVAL_TICKS);
         let natural_tracker_ids = steps
             .iter()
