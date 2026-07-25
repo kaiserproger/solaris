@@ -29,6 +29,10 @@ use crate::{
 };
 
 const REQUIRED_ITEM_TAGS: &str = include_str!("../data/required_item_tags.json");
+const FLOWING_WATER_RAW_ID: i32 = 1;
+const WATER_RAW_ID: i32 = 2;
+const FLOWING_LAVA_RAW_ID: i32 = 3;
+const LAVA_RAW_ID: i32 = 4;
 
 /// `(tags/<fs subpath>, "minecraft:<registry id>")` pairs the loader
 /// knows about. We deliberately limit the set to registries the
@@ -1242,6 +1246,7 @@ pub fn solaris_required_client_tags(
 ) -> TagsData {
     let mut tags = solaris_required_item_tags(items);
     add_required_client_fallback_tags(&mut tags);
+    add_required_fluid_tags(&mut tags);
     add_required_block_tags(&mut tags, blocks);
     tags
 }
@@ -1255,6 +1260,19 @@ fn add_required_client_fallback_tags(tags: &mut TagsData) {
             registry_tags.entry(tag_id).or_default();
         }
     }
+}
+
+fn add_required_fluid_tags(tags: &mut TagsData) {
+    let fluid_registry = Identifier::parse("minecraft:fluid").expect("static fluid registry id");
+    let fluid_tags = tags.registries.entry(fluid_registry).or_default();
+    fluid_tags.insert(
+        Identifier::parse("minecraft:water").expect("static water tag id"),
+        vec![FLOWING_WATER_RAW_ID, WATER_RAW_ID],
+    );
+    fluid_tags.insert(
+        Identifier::parse("minecraft:lava").expect("static lava tag id"),
+        vec![FLOWING_LAVA_RAW_ID, LAVA_RAW_ID],
+    );
 }
 
 fn add_required_block_tags(tags: &mut TagsData, blocks: &[crate::blocks::BlockReport]) {
@@ -1811,6 +1829,10 @@ mod tests {
                 ][..],
             ),
             (
+                "minecraft:fluid",
+                &["minecraft:water", "minecraft:lava"][..],
+            ),
+            (
                 "minecraft:item",
                 &[
                     "minecraft:enchantable/armor",
@@ -1859,6 +1881,30 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[test]
+    fn solaris_required_client_tags_bind_builtin_fluid_membership() {
+        let items = crate::items::solaris_required_items();
+        let blocks = crate::blocks::solaris_required_blocks_report();
+        let tags = solaris_required_client_tags(&items, &blocks);
+        let fluid_tags = tags
+            .registries
+            .get(&Identifier::parse("minecraft:fluid").unwrap())
+            .expect("fluid tag registry present");
+
+        assert_eq!(
+            fluid_tags
+                .get(&Identifier::parse("minecraft:water").unwrap())
+                .expect("water tag present"),
+            &[FLOWING_WATER_RAW_ID, WATER_RAW_ID]
+        );
+        assert_eq!(
+            fluid_tags
+                .get(&Identifier::parse("minecraft:lava").unwrap())
+                .expect("lava tag present"),
+            &[FLOWING_LAVA_RAW_ID, LAVA_RAW_ID]
+        );
     }
 
     #[test]

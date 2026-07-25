@@ -11,7 +11,12 @@
     "client_adapter": "client-mod/solaris-client-agent/gradlew --no-configuration-cache :fabric-agent:runClientAgent",
     "client_adapter_source": "auto-gradle-runclient",
     "client_isolation": "Gradle runClient launches use per-run game directories and distinct offline usernames for primary/secondary clients.",
-    "modes": ["--check", "--prepare", "--run", "--validate-run"],
+    "modes": [
+      "--check",
+      "--prepare",
+      "--run",
+      "--validate-run"
+    ],
     "agent_driver": "tools/real-client-agent-driver.py",
     "agent_bridge_url_env": "SOLARIS_REAL_CLIENT_AGENT_BRIDGE_URL",
     "agent_secret_env": "SOLARIS_REAL_CLIENT_AGENT_SECRET",
@@ -60,7 +65,15 @@
     {
       "id": "m94-01-join-rejoin-chunks-movement",
       "title": "Join, chunk visibility, movement, disconnect, and rejoin",
-      "ledger_rows": ["P1", "P4", "W3", "C1", "C2", "B4", "B5"],
+      "ledger_rows": [
+        "P1",
+        "P4",
+        "W3",
+        "C1",
+        "C2",
+        "B4",
+        "B5"
+      ],
       "status": "manual-pending",
       "bounded_time_minutes": 12,
       "screenshots_required": true,
@@ -80,7 +93,17 @@
     {
       "id": "m94-02-blocks-fluids-farming-drops",
       "title": "Block edits, fluids, farming, and visible drops",
-      "ledger_rows": ["B1", "B2", "B3", "F1", "F2", "F3", "F4", "L1", "L2"],
+      "ledger_rows": [
+        "B1",
+        "B2",
+        "B3",
+        "F1",
+        "F2",
+        "F3",
+        "F4",
+        "L1",
+        "L2"
+      ],
       "status": "manual-pending",
       "no_debug_commands": false,
       "bounded_time_minutes": 18,
@@ -100,7 +123,11 @@
     {
       "id": "m94-02a-solid-place-break-drop",
       "title": "Focused solid block placement, break, drop, and pickup",
-      "ledger_rows": ["B1", "B2", "L2"],
+      "ledger_rows": [
+        "B1",
+        "B2",
+        "L2"
+      ],
       "status": "manual-pending",
       "no_debug_commands": false,
       "bounded_time_minutes": 8,
@@ -120,7 +147,11 @@
     {
       "id": "m94-02b-rejected-block-resync",
       "title": "Rejected block, out-of-reach, and water-bucket fallback resync",
-      "ledger_rows": ["B1", "B3", "Q2"],
+      "ledger_rows": [
+        "B1",
+        "B3",
+        "Q2"
+      ],
       "status": "manual-pending",
       "no_debug_commands": false,
       "bounded_time_minutes": 8,
@@ -145,7 +176,10 @@
     {
       "id": "m94-02c-water-bucket-place-pickup",
       "title": "Focused accepted water-bucket placement and pickup",
-      "ledger_rows": ["B1", "B3"],
+      "ledger_rows": [
+        "B1",
+        "B3"
+      ],
       "status": "manual-pending",
       "no_debug_commands": false,
       "bounded_time_minutes": 8,
@@ -167,7 +201,13 @@
     {
       "id": "m94-03-inventory-crafting-containers-stations",
       "title": "Inventory, crafting, containers, and common stations",
-      "ledger_rows": ["I1", "I2", "K1", "K2", "A1"],
+      "ledger_rows": [
+        "I1",
+        "I2",
+        "K1",
+        "K2",
+        "A1"
+      ],
       "status": "manual-pending",
       "no_debug_commands": false,
       "bounded_time_minutes": 18,
@@ -187,7 +227,10 @@
     {
       "id": "m94-03a-inventory-oak-log-to-planks",
       "title": "Focused inventory recipe execution from oak log to planks",
-      "ledger_rows": ["I1", "I2"],
+      "ledger_rows": [
+        "I1",
+        "I2"
+      ],
       "status": "manual-pending",
       "no_debug_commands": false,
       "bounded_time_minutes": 8,
@@ -207,7 +250,12 @@
     {
       "id": "m94-03b-two-client-shared-chest",
       "title": "Focused two-client shared chest deposit and observation",
-      "ledger_rows": ["I1", "K1", "S2", "Q2"],
+      "ledger_rows": [
+        "I1",
+        "K1",
+        "S2",
+        "Q2"
+      ],
       "status": "manual-pending",
       "no_debug_commands": false,
       "bounded_time_minutes": 10,
@@ -227,7 +275,12 @@
     {
       "id": "m94-03c-two-client-shared-chest-live-update",
       "title": "Focused two-client shared chest live slot update",
-      "ledger_rows": ["I1", "K1", "S2", "Q2"],
+      "ledger_rows": [
+        "I1",
+        "K1",
+        "S2",
+        "Q2"
+      ],
       "status": "manual-pending",
       "no_debug_commands": false,
       "bounded_time_minutes": 10,
@@ -249,7 +302,11 @@
     {
       "id": "m94-03d-crafting-table-max-craft",
       "title": "Focused crafting-table max-craft and cursor conservation",
-      "ledger_rows": ["I1", "I2", "Q2"],
+      "ledger_rows": [
+        "I1",
+        "I2",
+        "Q2"
+      ],
       "status": "manual-pending",
       "no_debug_commands": false,
       "bounded_time_minutes": 8,
@@ -267,7 +324,12 @@
     {
       "id": "m94-03e-furnace-family-ui",
       "title": "Focused furnace-family input, fuel, output, and reopen UI",
-      "ledger_rows": ["I2", "K1", "A1", "Q2"],
+      "ledger_rows": [
+        "I2",
+        "K1",
+        "A1",
+        "Q2"
+      ],
       "status": "manual-pending",
       "no_debug_commands": false,
       "bounded_time_minutes": 8,
@@ -284,7 +346,11 @@
     {
       "id": "m94-03f-malformed-container-rejection",
       "title": "Focused malformed container click rejection and resync",
-      "ledger_rows": ["I1", "K1", "Q2"],
+      "ledger_rows": [
+        "I1",
+        "K1",
+        "Q2"
+      ],
       "status": "manual-pending",
       "no_debug_commands": false,
       "bounded_time_minutes": 6,
@@ -302,7 +368,11 @@
     {
       "id": "m94-03g-chest-reopen-conservation",
       "title": "Focused chest close and reopen conservation",
-      "ledger_rows": ["I1", "K1", "Q2"],
+      "ledger_rows": [
+        "I1",
+        "K1",
+        "Q2"
+      ],
       "status": "manual-pending",
       "no_debug_commands": false,
       "bounded_time_minutes": 8,
@@ -320,7 +390,12 @@
     {
       "id": "m94-04-signs-beds-campfires-and-block-entities",
       "title": "Signs, beds, campfires, and block-entity visuals",
-      "ledger_rows": ["E1", "E2", "E3", "S1"],
+      "ledger_rows": [
+        "E1",
+        "E2",
+        "E3",
+        "S1"
+      ],
       "status": "manual-pending",
       "bounded_time_minutes": 16,
       "screenshots_required": true,
@@ -339,7 +414,9 @@
     {
       "id": "m94-04a-regular-sign-place-text",
       "title": "Focused regular sign placement and plain text update",
-      "ledger_rows": ["E1"],
+      "ledger_rows": [
+        "E1"
+      ],
       "status": "manual-pending",
       "bounded_time_minutes": 8,
       "screenshots_required": true,
@@ -361,7 +438,15 @@
     {
       "id": "m94-05-entities-combat-death-respawn",
       "title": "Entities, combat, death, and respawn",
-      "ledger_rows": ["V1", "N1", "N2", "G1", "G2", "G3", "G4"],
+      "ledger_rows": [
+        "V1",
+        "N1",
+        "N2",
+        "G1",
+        "G2",
+        "G3",
+        "G4"
+      ],
       "status": "manual-pending",
       "bounded_time_minutes": 20,
       "screenshots_required": true,
@@ -380,7 +465,14 @@
     {
       "id": "m94-06-save-restart-two-client-visibility",
       "title": "Save/restart and two-client visibility",
-      "ledger_rows": ["S1", "S2", "L2", "K1", "N1", "G4"],
+      "ledger_rows": [
+        "S1",
+        "S2",
+        "L2",
+        "K1",
+        "N1",
+        "G4"
+      ],
       "status": "manual-pending",
       "bounded_time_minutes": 25,
       "screenshots_required": true,
@@ -398,9 +490,40 @@
       ]
     },
     {
+      "id": "m94-07a-deep-water-feel",
+      "title": "Focused deep source-water movement, swim pose, eye transition, and air lifecycle",
+      "ledger_rows": [
+        "B4"
+      ],
+      "status": "manual-pending",
+      "bounded_time_minutes": 5,
+      "screenshots_required": true,
+      "no_debug_commands": false,
+      "steps": [
+        "Wait for the initial client chunk stream to settle, then run the operator-only `debug water-corridor 4 96 0` fixture and require authoritative `verified 68/68` feedback.",
+        "Confirm both fixture cells are visible as water to the client, enter the column by falling through the water boundary, then use bounded jump and sneak inputs to prove retained ascent and dive without rubber-band correction.",
+        "Use sprint plus forward input through the fixed source-water corridor and record horizontal displacement, swimming pose, eye height, body height, and entity/cell fluid heights.",
+        "Remain with eyes submerged long enough to observe air loss, move onto the dry side wall, and record air recovery while the client remains connected."
+      ],
+      "expected_observations": [
+        "The client confirms both operator-fixture cells as `minecraft:water`; entry reports in_water=true, under_water=true, connected=true, and entity fluid height at least 1.0.",
+        "Jump raises Y by at least 0.15 and sneak lowers Y by at least 0.15; both positions remain retained after input release.",
+        "Sprint-swim moves at least one horizontal block, reports swimming pose, and reduces eye/body height to the swimming dimensions.",
+        "Air decreases while eyes remain submerged and increases on the dry side wall; no correction loop or disconnect occurs."
+      ]
+    },
+    {
       "id": "m94-07-m40-m41-route-with-metrics",
       "title": "Named M40/M41 water, drops, sugar cane, mobs, TPS, and lock route",
-      "ledger_rows": ["B3", "B4", "F3", "L2", "N1", "O1", "O2"],
+      "ledger_rows": [
+        "B3",
+        "B4",
+        "F3",
+        "L2",
+        "N1",
+        "O1",
+        "O2"
+      ],
       "status": "manual-pending",
       "bounded_time_minutes": 20,
       "screenshots_required": true,
@@ -420,7 +543,9 @@
     {
       "id": "m94-08-enchanting-efficiency",
       "title": "Targeted enchanting table UI, XP debit, and item component",
-      "ledger_rows": ["G1"],
+      "ledger_rows": [
+        "G1"
+      ],
       "status": "manual-pending",
       "bounded_time_minutes": 5,
       "screenshots_required": true,

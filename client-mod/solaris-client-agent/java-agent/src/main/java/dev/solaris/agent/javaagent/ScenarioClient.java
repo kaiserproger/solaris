@@ -342,6 +342,18 @@ interface ScenarioClient {
         throw new UnsupportedOperationException("scenario client does not support player health waits");
     }
 
+    default ScenarioWaterObservation waterObservation() throws Exception {
+        throw new UnsupportedOperationException("scenario client does not support local water-state reads");
+    }
+
+    default void setView(float yaw, float pitch) throws Exception {
+        throw new UnsupportedOperationException("scenario client does not support view setup");
+    }
+
+    default void pressInputs(List<String> inputs, int ticks, Duration timeout) throws Exception {
+        throw new UnsupportedOperationException("scenario client does not support bounded input probes");
+    }
+
     default boolean teleportTo(double x, double y, double z, Duration timeout) throws Exception {
         throw new UnsupportedOperationException("scenario client does not support teleport setup");
     }

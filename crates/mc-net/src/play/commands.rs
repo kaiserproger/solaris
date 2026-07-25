@@ -39,6 +39,11 @@ pub(crate) enum DebugCommand {
     OutboundPressure {
         count: usize,
     },
+    WaterCorridor {
+        x: i32,
+        y: i32,
+        z: i32,
+    },
     Give {
         item: mc_data::Identifier,
         count: i32,
@@ -287,7 +292,7 @@ fn parse_admin_command_inner(command: &str) -> Result<AdminCommand, CommandError
     }
     if command.starts_with("debug") {
         return Err(CommandError::Usage(
-            "Usage: /debug <survival|give|outbound-pressure> ...",
+            "Usage: /debug <survival|give|outbound-pressure|water-corridor> ...",
         ));
     }
     Err(CommandError::Unknown)
@@ -423,6 +428,16 @@ pub(super) fn parse_debug_command(command: &str) -> Option<DebugCommand> {
         return (parts.next().is_none()
             && (1..=MAX_DEBUG_OUTBOUND_PRESSURE_BURST).contains(&count))
         .then_some(DebugCommand::OutboundPressure { count });
+    }
+    if name == "water-corridor" {
+        let x = parts.next()?.parse::<i32>().ok()?;
+        let y = parts.next()?.parse::<i32>().ok()?;
+        let z = parts.next()?.parse::<i32>().ok()?;
+        return (parts.next().is_none()
+            && (-29_999_984..=29_999_984).contains(&x)
+            && (-60..=316).contains(&y)
+            && (-29_999_984..=29_999_984).contains(&z))
+        .then_some(DebugCommand::WaterCorridor { x, y, z });
     }
     if name != "give" {
         return None;

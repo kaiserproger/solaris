@@ -950,6 +950,21 @@ fn m94_real_client_manifest_covers_required_regression_rows() {
         );
     }
     assert!(
+        scenario_ids.contains("m94-07a-deep-water-feel"),
+        "M94 manifest must keep the focused deep-water real-client scenario"
+    );
+    let deep_water = scenarios
+        .iter()
+        .find(|scenario| scenario["id"] == "m94-07a-deep-water-feel")
+        .expect("focused deep-water scenario exists");
+    assert_eq!(deep_water["ledger_rows"], serde_json::json!(["B4"]));
+    assert_eq!(deep_water["status"], "manual-pending");
+    assert_eq!(
+        deep_water["no_debug_commands"], false,
+        "deep-water fixture uses operator-backed teleport setup and must declare it"
+    );
+
+    assert!(
         scenario_ids.contains("m94-08-enchanting-efficiency"),
         "M94 manifest must keep the focused enchanting scenario"
     );

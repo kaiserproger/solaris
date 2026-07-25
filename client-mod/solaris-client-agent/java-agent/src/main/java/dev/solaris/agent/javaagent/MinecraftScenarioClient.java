@@ -16,6 +16,7 @@ import net.minecraft.network.protocol.game.ServerboundClientCommandPacket;
 import net.minecraft.network.protocol.game.ServerboundPlaceRecipePacket;
 import net.minecraft.network.protocol.game.ServerboundSetCarriedItemPacket;
 import net.minecraft.network.protocol.game.ServerboundSignUpdatePacket;
+import net.minecraft.tags.FluidTags;
 import net.minecraft.world.entity.Entity;
 import net.minecraft.world.entity.animal.sheep.Sheep;
 import net.minecraft.world.entity.item.ItemEntity;
@@ -29,6 +30,7 @@ import net.minecraft.world.item.DyeColor;
 import net.minecraft.world.item.crafting.display.RecipeDisplayId;
 import net.minecraft.world.item.crafting.display.SlotDisplayContext;
 import net.minecraft.world.level.LightLayer;
+import net.minecraft.world.level.material.FluidState;
 import net.minecraft.world.level.block.Blocks;
 import net.minecraft.world.level.block.entity.BlockEntity;
 import net.minecraft.world.level.block.entity.SignBlockEntity;
@@ -1946,6 +1948,59 @@ public final class MinecraftScenarioClient implements ScenarioClient {
             }
             return heldItemFromStack(menu.getSlot(armorMenuSlot).getItem());
         });
+    }
+
+    @Override
+    public ScenarioWaterObservation waterObservation() throws Exception {
+        return executor.callOnClientThread(MinecraftScenarioClient::waterObservationOnClientThread);
+    }
+
+    @Override
+    public void setView(float yaw, float pitch) throws Exception {
+        if (!Float.isFinite(yaw) || !Float.isFinite(pitch) || pitch < -90.0F || pitch > 90.0F) {
+            throw new IllegalArgumentException("view angles must be finite and pitch must be -90..90");
+        }
+        executor.callOnClientThread(() -> {
+            Minecraft minecraft = requireInPlay();
+            minecraft.player.setYRot(yaw);
+            minecraft.player.setXRot(pitch);
+            return null;
+        });
+    }
+
+    @Override
+    public void pressInputs(List<String> inputs, int ticks, Duration timeout) throws Exception {
+        Objects.requireNonNull(inputs, "inputs");
+        Objects.requireNonNull(timeout, "timeout");
+        if (inputs.isEmpty() || inputs.size() > 4) {
+            throw new IllegalArgumentException("water input probe requires 1..4 inputs");
+        }
+        if (ticks < 1 || ticks > 255) {
+            throw new IllegalArgumentException("water input ticks must be 1..255");
+        }
+        for (String input : inputs) {
+            if (!List.of("forward", "back", "left", "right", "jump", "sneak", "sprint").contains(input)) {
+                throw new IllegalArgumentException("unsupported scenario input: " + input);
+            }
+        }
+
+        executor.callOnClientThread(() -> {
+            setScenarioInputs(requireInPlay(), inputs, true);
+            return null;
+        });
+        try {
+            if (!waitForTicks(ticks, timeout)) {
+                throw new TimeoutException("client did not advance " + ticks + " ticks for water input probe");
+            }
+        } finally {
+            executor.callOnClientThread(() -> {
+                Minecraft minecraft = Minecraft.getInstance();
+                if (minecraft.options != null) {
+                    setScenarioInputs(minecraft, inputs, false);
+                }
+                return null;
+            });
+        }
     }
 
     @Override
@@ -4077,6 +4132,57 @@ public final class MinecraftScenarioClient implements ScenarioClient {
 
     static String sheepWoolItemId(DyeColor color) {
         return SheepWoolColor.itemId(color.name());
+    }
+
+    private static ScenarioWaterObservation waterObservationOnClientThread() {
+        Minecraft minecraft = requireInPlay();
+        Player player = minecraft.player;
+        BlockPos feetPosition = player.blockPosition();
+        BlockPos eyePosition = BlockPos.containing(player.getEyePosition());
+        BlockState feetBlock = minecraft.level.getBlockState(feetPosition);
+        BlockState eyeBlock = minecraft.level.getBlockState(eyePosition);
+        FluidState feetFluid = minecraft.level.getFluidState(feetPosition);
+        FluidState eyeFluid = minecraft.level.getFluidState(eyePosition);
+        return new ScenarioWaterObservation(
+            player.getX(),
+            player.getY(),
+            player.getZ(),
+            player.getEyePosition().y,
+            player.getEyeHeight(),
+            player.getBoundingBox().getYsize(),
+            player.isInWater(),
+            player.isUnderWater(),
+            player.isSwimming(),
+            player.getFluidHeight(FluidTags.WATER),
+            BuiltInRegistries.BLOCK.getKey(feetBlock.getBlock()).toString(),
+            BuiltInRegistries.FLUID.getKey(feetFluid.getType()).toString(),
+            feetFluid.isSource(),
+            feetFluid.getHeight(minecraft.level, feetPosition),
+            BuiltInRegistries.BLOCK.getKey(eyeBlock.getBlock()).toString(),
+            BuiltInRegistries.FLUID.getKey(eyeFluid.getType()).toString(),
+            eyeFluid.isSource(),
+            eyeFluid.getHeight(minecraft.level, eyePosition),
+            player.getAirSupply(),
+            player.getMaxAirSupply(),
+            player.getHealth(),
+            player.getPose().toString().toLowerCase(Locale.ROOT),
+            minecraft.getConnection() != null && minecraft.level != null
+        );
+    }
+
+    private static void setScenarioInputs(Minecraft minecraft, List<String> inputs, boolean down) {
+        for (String input : inputs) {
+            switch (input) {
+                case "forward" -> minecraft.options.keyUp.setDown(down);
+                case "back" -> minecraft.options.keyDown.setDown(down);
+                case "left" -> minecraft.options.keyLeft.setDown(down);
+                case "right" -> minecraft.options.keyRight.setDown(down);
+                case "jump" -> minecraft.options.keyJump.setDown(down);
+                case "sneak" -> minecraft.options.keyShift.setDown(down);
+                case "sprint" -> minecraft.options.keySprint.setDown(down);
+                default -> throw new IllegalArgumentException("unsupported scenario input: " + input);
+            }
+        }
     }
 
     private static ScenarioPlayerObservation playerObservation(

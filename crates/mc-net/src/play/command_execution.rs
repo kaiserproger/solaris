@@ -15,6 +15,7 @@ use crate::error::ConnectionError;
 use crate::server::ServerConfig;
 use crate::{RuntimeControlHandle, connection::write_packet};
 
+use super::block_edit_commit::apply_visible_block_edit_batch_conditionally;
 use super::chunk_stream::ChunkStreamState;
 use super::combat::PlayerDamageKind;
 use super::commands::{
@@ -28,10 +29,11 @@ use super::session::{SessionRegistry, dispatch_visibility_commands};
 use super::simulation::SimulationHandle;
 use super::survival::SurvivalState;
 use super::{
-    InteractionState, PlayerPose, clear_shield_use, commit_authoritative_player_pose,
-    commit_player_inventory_candidate, commit_player_survival_update, replan_after_movement,
-    send_player_position_sync, survival_damage_after_equipment, text_component_nbt,
-    write_inventory_content_resync, write_inventory_slot_updates,
+    BlockEdit, InteractionState, PlayerPose, air_state_id, clear_shield_use,
+    commit_authoritative_player_pose, commit_player_inventory_candidate,
+    commit_player_survival_update, replan_after_movement, send_player_position_sync,
+    survival_damage_after_equipment, text_component_nbt, write_inventory_content_resync,
+    write_inventory_slot_updates,
 };
 
 pub(super) fn prepare_game_mode_transition(
@@ -282,12 +284,14 @@ where
             apply_debug_command(
                 writer,
                 compression,
-                survival_state,
-                xp_state,
-                interaction,
-                *player_pose,
                 command,
-                permissions,
+                DebugCommandContext {
+                    survival_state,
+                    xp_state,
+                    interaction,
+                    player_pose: *player_pose,
+                    permissions,
+                },
             )
             .await?;
             send_command_feedback(writer, compression, "Debug command executed").await
@@ -416,21 +420,107 @@ pub(super) fn command_error_message(error: CommandError) -> &'static str {
     }
 }
 
-#[allow(clippy::too_many_arguments)]
+pub(super) fn debug_water_corridor_edits(
+    blocks: &mc_world::BlockRegistry,
+    water: Option<mc_world::BlockStateId>,
+    origin: mc_world::BlockPos,
+) -> Option<Vec<BlockEdit>> {
+    let stone = blocks
+        .block(&mc_data::Identifier::parse("minecraft:stone").ok()?)?
+        .default;
+    let water = water.or_else(|| {
+        blocks
+            .block(&mc_data::Identifier::parse("minecraft:water").ok()?)
+            .map(|block| block.default)
+    })?;
+    let air = air_state_id(blocks);
+    let base_x = origin.x;
+    let base_y = origin.y;
+    let base_z = origin.z;
+    let mut edits = Vec::with_capacity(68);
+
+    for dz in -1..=5 {
+        for dx in -1..=1 {
+            edits.push(BlockEdit {
+                pos: mc_world::BlockPos {
+                    x: base_x + dx,
+                    y: base_y - 1,
+                    z: base_z + dz,
+                },
+                new_state: stone,
+            });
+        }
+    }
+    for dz in 0..=4 {
+        for dy in 0..=1 {
+            for dx in [-1, 1] {
+                edits.push(BlockEdit {
+                    pos: mc_world::BlockPos {
+                        x: base_x + dx,
+                        y: base_y + dy,
+                        z: base_z + dz,
+                    },
+                    new_state: stone,
+                });
+            }
+        }
+    }
+    for dz in [-1, 5] {
+        for dy in 0..=1 {
+            for dx in -1..=1 {
+                edits.push(BlockEdit {
+                    pos: mc_world::BlockPos {
+                        x: base_x + dx,
+                        y: base_y + dy,
+                        z: base_z + dz,
+                    },
+                    new_state: stone,
+                });
+            }
+        }
+    }
+    for dz in 0..=4 {
+        for dy in 0..=1 {
+            edits.push(BlockEdit {
+                pos: mc_world::BlockPos {
+                    x: base_x,
+                    y: base_y + dy,
+                    z: base_z + dz,
+                },
+                new_state: water,
+            });
+        }
+        edits.push(BlockEdit {
+            pos: mc_world::BlockPos {
+                x: base_x,
+                y: base_y + 2,
+                z: base_z + dz,
+            },
+            new_state: air,
+        });
+    }
+
+    Some(edits)
+}
+
+pub(super) struct DebugCommandContext<'a> {
+    pub(super) survival_state: &'a mut SurvivalState,
+    pub(super) xp_state: &'a mut XpState,
+    pub(super) interaction: Option<&'a mut InteractionState>,
+    pub(super) player_pose: PlayerPose,
+    pub(super) permissions: CommandPermissions,
+}
+
 pub(super) async fn apply_debug_command<W>(
     writer: &mut W,
     compression: Compression,
-    survival_state: &mut SurvivalState,
-    xp_state: &mut XpState,
-    mut interaction: Option<&mut InteractionState>,
-    player_pose: PlayerPose,
     command: DebugCommand,
-    permissions: CommandPermissions,
+    mut context: DebugCommandContext<'_>,
 ) -> Result<(), ConnectionError>
 where
     W: AsyncWriteExt + Unpin,
 {
-    if !permissions.op {
+    if !context.permissions.op {
         debug!(command = ?command, "debug command denied for non-op player");
         return Ok(());
     }
@@ -440,22 +530,22 @@ where
             let result = apply_survival_command(
                 writer,
                 compression,
-                survival_state,
-                xp_state,
-                interaction.as_deref_mut(),
-                player_pose,
+                context.survival_state,
+                context.xp_state,
+                context.interaction.as_deref_mut(),
+                context.player_pose,
                 command,
             )
             .await;
-            if survival_state.is_dead()
-                && let Some(state) = interaction.as_mut()
+            if context.survival_state.is_dead()
+                && let Some(state) = context.interaction.as_deref_mut()
             {
                 state.pending_break = None;
             }
             result
         }
         DebugCommand::OutboundPressure { count } => {
-            let Some(state) = interaction else {
+            let Some(state) = context.interaction.as_deref_mut() else {
                 debug!(
                     count,
                     "outbound pressure probe ignored — no interaction state"
@@ -469,12 +559,43 @@ where
             );
             Ok(())
         }
+        DebugCommand::WaterCorridor { x, y, z } => {
+            let Some(state) = context.interaction.as_deref_mut() else {
+                debug!("debug water corridor ignored — no interaction state");
+                return Ok(());
+            };
+            let Some(edits) = debug_water_corridor_edits(
+                &state.blocks,
+                state.water,
+                mc_world::BlockPos { x, y, z },
+            ) else {
+                debug!("debug water corridor ignored — required block states are missing");
+                return Ok(());
+            };
+            let expected = edits.len();
+            let applied =
+                apply_visible_block_edit_batch_conditionally(state, writer, &edits, &[], &[])
+                    .await?
+                    .map_or(0, |outcome| outcome.applied.len());
+            let verified = edits
+                .iter()
+                .filter(|edit| state.world_read.get_cached_block(edit.pos) == Some(edit.new_state))
+                .count();
+            send_command_feedback(
+                writer,
+                compression,
+                &format!(
+                    "Debug water corridor at {x} {y} {z} verified {verified}/{expected} block states; changed {applied}"
+                ),
+            )
+            .await
+        }
         DebugCommand::Give {
             item,
             count,
             hotbar_slot,
         } => {
-            let Some(state) = interaction else {
+            let Some(state) = context.interaction.as_deref_mut() else {
                 debug!(%item, "debug give ignored — no interaction state");
                 return Ok(());
             };
@@ -499,7 +620,7 @@ where
                 expected_inventory,
                 state.carried_item.clone(),
                 None,
-                player_pose,
+                context.player_pose,
             )
             .await?
             {

@@ -1236,7 +1236,7 @@ public final class MinecraftClientFacade implements ClientFacade {
         if (M94SaveRestartVisibilityScenario.supports(id)) {
             return new M94SaveRestartVisibilityScenario().run(id, screenshotsDir, client);
         }
-        if (M94M40M41RouteScenario.ID.equals(id)) {
+        if (M94M40M41RouteScenario.supports(id)) {
             return new M94M40M41RouteScenario().run(id, screenshotsDir, client);
         }
         if (M94SignScenario.ID.equals(id)) {
