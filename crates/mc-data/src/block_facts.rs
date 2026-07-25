@@ -1,8 +1,10 @@
 //! Narrow block-behaviour facts derived from the block report.
 
+use crate::Identifier;
 use crate::block_explosion::BlockExplosionTable;
 use crate::block_mining::{BlockMiningFacts, BlockMiningTable};
 use crate::blocks::BlockReport;
+use crate::collision_shapes::{COLLISION_UNITS_PER_BLOCK, vanilla_collision_shapes};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RandomTickFamily {
@@ -18,6 +20,16 @@ pub enum RandomTickFamily {
 pub enum FluidKind {
     Water,
     Lava,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SturdyFace {
+    Down,
+    Up,
+    North,
+    South,
+    West,
+    East,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -142,6 +154,67 @@ impl BlockFactsTable {
     pub fn has_explosion_table(&self) -> bool {
         self.explosion.is_some()
     }
+}
+
+/// Returns whether the exact embedded 26.1.2 state exposes a completely covered
+/// collision face. A missing or fingerprint-mismatched state is deliberately
+/// non-sturdy; block names are not sufficient evidence for support semantics.
+#[must_use]
+pub fn has_full_sturdy_face(
+    state_id: u32,
+    block: &Identifier,
+    properties: &[(String, String)],
+    face: SturdyFace,
+) -> bool {
+    let Some(shape) = vanilla_collision_shapes().get_for_state(state_id, block, properties) else {
+        return false;
+    };
+    let mut covered = [false; 16 * 16];
+    const CELL_UNITS: i16 = COLLISION_UNITS_PER_BLOCK / 16;
+
+    for collision_box in shape.iter() {
+        let [min_x, min_y, min_z, max_x, max_y, max_z] = collision_box.coordinates();
+        let projected = match face {
+            SturdyFace::Down if min_y == 0 => Some((min_x, max_x, min_z, max_z)),
+            SturdyFace::Up if max_y == COLLISION_UNITS_PER_BLOCK => {
+                Some((min_x, max_x, min_z, max_z))
+            }
+            SturdyFace::North if min_z == 0 => Some((min_x, max_x, min_y, max_y)),
+            SturdyFace::South if max_z == COLLISION_UNITS_PER_BLOCK => {
+                Some((min_x, max_x, min_y, max_y))
+            }
+            SturdyFace::West if min_x == 0 => Some((min_z, max_z, min_y, max_y)),
+            SturdyFace::East if max_x == COLLISION_UNITS_PER_BLOCK => {
+                Some((min_z, max_z, min_y, max_y))
+            }
+            SturdyFace::Down
+            | SturdyFace::Up
+            | SturdyFace::North
+            | SturdyFace::South
+            | SturdyFace::West
+            | SturdyFace::East => None,
+        };
+        let Some((min_a, max_a, min_b, max_b)) = projected else {
+            continue;
+        };
+        for a in 0..16 {
+            for b in 0..16 {
+                let cell_min_a = a * CELL_UNITS;
+                let cell_max_a = cell_min_a + CELL_UNITS;
+                let cell_min_b = b * CELL_UNITS;
+                let cell_max_b = cell_min_b + CELL_UNITS;
+                if min_a <= cell_min_a
+                    && max_a >= cell_max_a
+                    && min_b <= cell_min_b
+                    && max_b >= cell_max_b
+                {
+                    covered[a as usize * 16 + b as usize] = true;
+                }
+            }
+        }
+    }
+
+    covered.into_iter().all(|cell| cell)
 }
 
 fn classify_fluid_kind(path: &str) -> Option<FluidKind> {
@@ -385,6 +458,108 @@ mod tests {
                 level: 0,
                 source: true,
             })
+        );
+    }
+
+    #[test]
+    fn exact_sturdy_faces_cover_full_blocks_and_irregular_common_supports() {
+        let report = crate::blocks::solaris_required_blocks_report();
+        let state = |name: &str, expected: &[(&str, &str)]| {
+            let block = report
+                .iter()
+                .find(|block| block.id.as_str() == name)
+                .unwrap_or_else(|| panic!("missing embedded block {name}"));
+            let state = block
+                .states
+                .iter()
+                .find(|state| {
+                    expected.iter().all(|(key, value)| {
+                        state
+                            .properties
+                            .get(*key)
+                            .is_some_and(|actual| actual == value)
+                    })
+                })
+                .unwrap_or_else(|| panic!("missing embedded state {name} {expected:?}"));
+            let properties = state
+                .properties
+                .iter()
+                .map(|(key, value)| (key.clone(), value.clone()))
+                .collect::<Vec<_>>();
+            (state.id, block.id.clone(), properties)
+        };
+
+        let (stone_id, stone, stone_properties) = state("minecraft:stone", &[]);
+        for face in [
+            SturdyFace::Down,
+            SturdyFace::Up,
+            SturdyFace::North,
+            SturdyFace::South,
+            SturdyFace::West,
+            SturdyFace::East,
+        ] {
+            assert!(has_full_sturdy_face(
+                stone_id,
+                &stone,
+                &stone_properties,
+                face
+            ));
+        }
+
+        let (top_slab_id, top_slab, top_slab_properties) = state(
+            "minecraft:oak_slab",
+            &[("type", "top"), ("waterlogged", "false")],
+        );
+        assert!(has_full_sturdy_face(
+            top_slab_id,
+            &top_slab,
+            &top_slab_properties,
+            SturdyFace::Up
+        ));
+        assert!(!has_full_sturdy_face(
+            top_slab_id,
+            &top_slab,
+            &top_slab_properties,
+            SturdyFace::North
+        ));
+
+        let (bottom_slab_id, bottom_slab, bottom_slab_properties) = state(
+            "minecraft:oak_slab",
+            &[("type", "bottom"), ("waterlogged", "false")],
+        );
+        assert!(has_full_sturdy_face(
+            bottom_slab_id,
+            &bottom_slab,
+            &bottom_slab_properties,
+            SturdyFace::Down
+        ));
+        assert!(!has_full_sturdy_face(
+            bottom_slab_id,
+            &bottom_slab,
+            &bottom_slab_properties,
+            SturdyFace::Up
+        ));
+
+        let (top_stair_id, top_stair, top_stair_properties) = state(
+            "minecraft:oak_stairs",
+            &[
+                ("facing", "north"),
+                ("half", "top"),
+                ("shape", "straight"),
+                ("waterlogged", "false"),
+            ],
+        );
+        assert!(has_full_sturdy_face(
+            top_stair_id,
+            &top_stair,
+            &top_stair_properties,
+            SturdyFace::Up
+        ));
+
+        let (cobblestone_id, _, _) = state("minecraft:cobblestone", &[]);
+        assert!(
+            !has_full_sturdy_face(cobblestone_id, &stone, &stone_properties, SturdyFace::Up),
+            "a numeric state id with the wrong block fingerprint must reject"
         );
     }
 }

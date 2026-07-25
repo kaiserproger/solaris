@@ -785,75 +785,15 @@ fn has_full_sturdy_face(blocks: &BlockRegistry, state_id: BlockStateId, face: Di
     let Some(state) = blocks.by_id(state_id) else {
         return false;
     };
-
-    let shapes = mc_data::collision_shapes::vanilla_collision_shapes();
-    if let Some(boxes) = shapes.get_for_state(state_id.0, &state.block.id, &state.properties) {
-        let mut covered = [false; 16 * 16];
-        const CELL_UNITS: i16 = mc_data::collision_shapes::COLLISION_UNITS_PER_BLOCK / 16;
-        const BLOCK_UNITS: i16 = mc_data::collision_shapes::COLLISION_UNITS_PER_BLOCK;
-        for collision_box in boxes.iter() {
-            let [min_x, min_y, min_z, max_x, max_y, max_z] = collision_box.coordinates();
-            let projected = match face {
-                Direction::Down if min_y == 0 => Some((min_x, max_x, min_z, max_z)),
-                Direction::Up if max_y == BLOCK_UNITS => Some((min_x, max_x, min_z, max_z)),
-                Direction::North if min_z == 0 => Some((min_x, max_x, min_y, max_y)),
-                Direction::South if max_z == BLOCK_UNITS => Some((min_x, max_x, min_y, max_y)),
-                Direction::West if min_x == 0 => Some((min_z, max_z, min_y, max_y)),
-                Direction::East if max_x == BLOCK_UNITS => Some((min_z, max_z, min_y, max_y)),
-                Direction::Down
-                | Direction::Up
-                | Direction::North
-                | Direction::South
-                | Direction::West
-                | Direction::East => None,
-            };
-            let Some((min_a, max_a, min_b, max_b)) = projected else {
-                continue;
-            };
-            for a in 0..16 {
-                for b in 0..16 {
-                    let cell_min_a = a * CELL_UNITS;
-                    let cell_max_a = cell_min_a + CELL_UNITS;
-                    let cell_min_b = b * CELL_UNITS;
-                    let cell_max_b = cell_min_b + CELL_UNITS;
-                    if min_a <= cell_min_a
-                        && max_a >= cell_max_a
-                        && min_b <= cell_min_b
-                        && max_b >= cell_max_b
-                    {
-                        covered[a as usize * 16 + b as usize] = true;
-                    }
-                }
-            }
-        }
-        return covered.into_iter().all(|cell| cell);
-    }
-
-    // The shape oracle does not cover every vanilla state. This intentionally small fallback
-    // admits common full cubes only; it is not a complete vanilla isFaceSturdy implementation.
-    let path = state.block.id.path();
-    matches!(
-        path,
-        "stone"
-            | "cobblestone"
-            | "deepslate"
-            | "cobbled_deepslate"
-            | "dirt"
-            | "grass_block"
-            | "sand"
-            | "red_sand"
-            | "gravel"
-            | "netherrack"
-            | "end_stone"
-            | "obsidian"
-            | "bedrock"
-    ) || path.ends_with("_planks")
-        || path.ends_with("_log")
-        || path.ends_with("_wood")
-        || path.ends_with("_stem")
-        || path.ends_with("_hyphae")
-        || path.ends_with("_concrete")
-        || path.ends_with("_terracotta")
+    let face = match face {
+        Direction::Down => mc_data::block_facts::SturdyFace::Down,
+        Direction::Up => mc_data::block_facts::SturdyFace::Up,
+        Direction::North => mc_data::block_facts::SturdyFace::North,
+        Direction::South => mc_data::block_facts::SturdyFace::South,
+        Direction::West => mc_data::block_facts::SturdyFace::West,
+        Direction::East => mc_data::block_facts::SturdyFace::East,
+    };
+    mc_data::block_facts::has_full_sturdy_face(state_id.0, &state.block.id, &state.properties, face)
 }
 
 fn oriented_stair_or_slab_state(

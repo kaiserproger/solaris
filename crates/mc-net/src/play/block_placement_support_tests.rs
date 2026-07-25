@@ -16,6 +16,23 @@ fn canonical_blocks() -> Arc<BlockRegistry> {
     )
 }
 
+fn blocks_with_remapped_stone_state() -> Arc<BlockRegistry> {
+    let mut report = mc_data::blocks::solaris_required_blocks_report();
+    let stone_index = report
+        .iter()
+        .position(|block| block.id.as_str() == "minecraft:stone")
+        .expect("embedded stone block");
+    let cobblestone_index = report
+        .iter()
+        .position(|block| block.id.as_str() == "minecraft:cobblestone")
+        .expect("embedded cobblestone block");
+    let stone_id = report[stone_index].states[0].id;
+    let cobblestone_id = report[cobblestone_index].states[0].id;
+    report[stone_index].states[0].id = cobblestone_id;
+    report[cobblestone_index].states[0].id = stone_id;
+    Arc::new(BlockRegistry::from_report(&report).unwrap())
+}
+
 fn block_state(blocks: &BlockRegistry, name: &str, properties: &[(&str, &str)]) -> BlockStateId {
     blocks
         .by_name_and_props(
@@ -26,6 +43,75 @@ fn block_state(blocks: &BlockRegistry, name: &str, properties: &[(&str, &str)]) 
                 .collect::<Vec<_>>(),
         )
         .unwrap()
+}
+
+#[test]
+fn standing_torch_uses_exact_full_cube_support() {
+    let blocks = canonical_blocks();
+    let air = blocks
+        .block(&Identifier::parse("minecraft:air").unwrap())
+        .unwrap()
+        .default;
+    let torch = blocks
+        .block(&Identifier::parse("minecraft:torch").unwrap())
+        .unwrap()
+        .default;
+    let stone = blocks
+        .block(&Identifier::parse("minecraft:stone").unwrap())
+        .unwrap()
+        .default;
+    let pos = BlockPos { x: 4, y: 64, z: 4 };
+    let support = BlockPos { y: 63, ..pos };
+    let snapshot = placement_snapshot_for_test(Arc::clone(&blocks), &[(support, stone)]);
+
+    assert!(
+        plan_block_placement(
+            &blocks,
+            torch,
+            Some(&snapshot),
+            pos,
+            PlayerPose::new(4.5, 64.0, 4.5),
+            Direction::Up,
+            1.0,
+            air,
+        )
+        .is_some()
+    );
+}
+
+#[test]
+fn standing_torch_rejects_name_only_full_cube_fallback() {
+    let blocks = blocks_with_remapped_stone_state();
+    let air = blocks
+        .block(&Identifier::parse("minecraft:air").unwrap())
+        .unwrap()
+        .default;
+    let torch = blocks
+        .block(&Identifier::parse("minecraft:torch").unwrap())
+        .unwrap()
+        .default;
+    let stone = blocks
+        .block(&Identifier::parse("minecraft:stone").unwrap())
+        .unwrap()
+        .default;
+    let pos = BlockPos { x: 4, y: 64, z: 4 };
+    let support = BlockPos { y: 63, ..pos };
+    let snapshot = placement_snapshot_for_test(Arc::clone(&blocks), &[(support, stone)]);
+
+    assert!(
+        plan_block_placement(
+            &blocks,
+            torch,
+            Some(&snapshot),
+            pos,
+            PlayerPose::new(4.5, 64.0, 4.5),
+            Direction::Up,
+            1.0,
+            air,
+        )
+        .is_none(),
+        "a block name without an exact 26.1.2 state fingerprint must not become sturdy"
+    );
 }
 
 #[test]
