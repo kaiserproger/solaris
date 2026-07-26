@@ -839,14 +839,37 @@ fn typed_player_damage_applies_only_the_vanilla_reductions() {
     state.inventory.slots[6] = ItemStack::new(11, 1)
         .with_enchantment(Identifier::parse("minecraft:protection").unwrap(), 3);
 
-    let projectile =
-        survival_damage_after_equipment(Some(&state), 10.0, PlayerDamageKind::Projectile);
-    assert!((projectile - 8.3776).abs() < 0.001);
-    let fall = survival_damage_after_equipment(Some(&state), 10.0, PlayerDamageKind::Fall);
-    assert!((fall - 8.8).abs() < 0.001);
-    let generic_kill =
-        survival_damage_after_equipment(Some(&state), 10.0, PlayerDamageKind::GenericKill);
-    assert!((generic_kill - 10.0).abs() < f32::EPSILON);
+    for kind in [
+        PlayerDamageKind::MobAttack,
+        PlayerDamageKind::PlayerAttack,
+        PlayerDamageKind::Projectile,
+        PlayerDamageKind::Campfire,
+        PlayerDamageKind::Fire,
+        PlayerDamageKind::Lava,
+        PlayerDamageKind::Explosion,
+    ] {
+        let reduced = survival_damage_after_equipment(Some(&state), 10.0, kind);
+        assert!((reduced - 8.3776).abs() < 0.001, "{kind:?}");
+    }
+    for kind in [
+        PlayerDamageKind::Fall,
+        PlayerDamageKind::Drowning,
+        PlayerDamageKind::Suffocation,
+        PlayerDamageKind::Starvation,
+        PlayerDamageKind::Generic,
+        PlayerDamageKind::GenericKill,
+    ] {
+        let reduced = survival_damage_after_equipment(Some(&state), 10.0, kind);
+        assert!((reduced - 8.8).abs() < 0.001, "{kind:?}");
+    }
+    assert_eq!(
+        survival_damage_after_equipment(Some(&state), f32::NAN, PlayerDamageKind::Generic),
+        0.0
+    );
+    assert_eq!(
+        survival_damage_after_equipment(Some(&state), 10.0, PlayerDamageKind::Unsupported),
+        0.0
+    );
 }
 
 #[test]

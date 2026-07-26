@@ -972,6 +972,162 @@ async fn selected_item_drop_debits_slot_and_spawns_exact_stack() {
         .expect("selected item drop server serve");
 }
 
+async fn drop_one_selected_item_wire(
+    client: &mut Client,
+    item_entity_type: i32,
+    item_id: u32,
+    remaining_count: i32,
+    sequence: i32,
+) -> i32 {
+    client
+        .write_packet(&ServerboundPlayerAction {
+            action: PlayerActionKind::DropItem,
+            position: 0,
+            direction: Direction::Down,
+            sequence,
+        })
+        .await
+        .expect("drop selected merge fixture");
+    let mut entity_ids = HashSet::new();
+    let mut dropped_id = None;
+    let mut saw_stack = false;
+    let mut saw_slot = false;
+    let mut saw_ack = false;
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
+    while !(saw_stack && saw_slot && saw_ack) {
+        let frame = client
+            .read_frame_with_timeout(
+                deadline.saturating_duration_since(tokio::time::Instant::now()),
+            )
+            .await
+            .expect("selected merge drop response");
+        if handle_keepalive(client, frame.id, &frame.body).await {
+            continue;
+        }
+        if frame.id == AddEntity::ID {
+            let mut body = frame.body;
+            let packet = AddEntity::decode(&mut body).expect("decode merge drop AddEntity");
+            if packet.entity_type_id == item_entity_type {
+                entity_ids.insert(packet.entity_id);
+                dropped_id = Some(packet.entity_id);
+            }
+        } else if frame.id == ClientboundSetEntityData::ID {
+            let mut body = frame.body;
+            let packet = ClientboundSetEntityData::decode(&mut body)
+                .expect("decode merge drop entity data");
+            if entity_ids.contains(&packet.entity_id) {
+                saw_stack |= packet.values.iter().any(|value| {
+                    matches!(
+                        value,
+                        EntityDataValue::ItemStack { index, stack }
+                            if *index == ITEM_ENTITY_DATA_ITEM_INDEX
+                                && stack.item_id == item_id
+                                && stack.count == 1
+                    )
+                });
+            }
+        } else if frame.id == ClientboundContainerSetSlot::ID {
+            let mut body = frame.body;
+            let packet = ClientboundContainerSetSlot::decode(&mut body)
+                .expect("decode merge drop SetSlot");
+            saw_slot |= packet.slot == 36
+                && if remaining_count == 0 {
+                    packet.item_stack.is_empty()
+                } else {
+                    packet.item_stack.item_id == item_id
+                        && packet.item_stack.count == remaining_count
+                };
+        } else if frame.id == BlockChangedAck::ID {
+            let mut body = frame.body;
+            let packet = BlockChangedAck::decode(&mut body).expect("decode merge drop ack");
+            saw_ack |= packet.sequence == sequence;
+        }
+    }
+    dropped_id.expect("selected merge drop entity id")
+}
+
+#[tokio::test]
+async fn nearby_selected_item_drops_merge_and_publish_survivor() {
+    let data = embedded_play_data();
+    let world = embedded_world(&data);
+    let item_id = data
+        .items
+        .id_of(&mc_data::Identifier::parse("minecraft:birch_log").unwrap())
+        .expect("birch log item");
+    let item_entity_type = mc_data::entity_types::solaris_required_entity_types()
+        .id_of(&mc_data::Identifier::parse("minecraft:item").unwrap())
+        .and_then(|id| i32::try_from(id).ok())
+        .expect("item entity type");
+    let shutdown = mc_net::ShutdownHandle::default();
+    let mut cfg = embedded_playable_config(&data, world, "T04 dropped item merge");
+    cfg.shutdown = shutdown.clone();
+    let bound = mc_net::bind(cfg).await.expect("bind dropped item merge");
+    let addr = bound.local_addr().expect("dropped item merge local_addr");
+    let serve = tokio::spawn(async move { bound.serve().await });
+
+    let (mut client, _) = connect_to_play(addr, "ItemMergeWire").await;
+    drain_until_chunk(&mut client, (0, 0)).await;
+    client
+        .write_packet(&ServerboundChatCommand {
+            command: "debug give minecraft:birch_log 2 0".into(),
+        })
+        .await
+        .expect("give dropped item merge fixture");
+    wait_for_slot_stack(&mut client, item_id, 2).await;
+
+    let first_id =
+        drop_one_selected_item_wire(&mut client, item_entity_type, item_id, 1, 101).await;
+    let second_id =
+        drop_one_selected_item_wire(&mut client, item_entity_type, item_id, 0, 102).await;
+    assert!(first_id < second_id, "first dropped identity must be older/lower");
+
+    let mut saw_survivor = false;
+    let mut saw_consumed_remove = false;
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
+    while !(saw_survivor && saw_consumed_remove) {
+        let frame = client
+            .read_frame_with_timeout(
+                deadline.saturating_duration_since(tokio::time::Instant::now()),
+            )
+            .await
+            .unwrap_or_else(|error| {
+                panic!(
+                    "dropped item merge wire response: {error}; survivor={saw_survivor} remove={saw_consumed_remove}"
+                )
+            });
+        if handle_keepalive(&mut client, frame.id, &frame.body).await {
+            continue;
+        }
+        if frame.id == ClientboundSetEntityData::ID {
+            let mut body = frame.body;
+            let packet = ClientboundSetEntityData::decode(&mut body)
+                .expect("decode merged item entity data");
+            if packet.entity_id == first_id {
+                saw_survivor |= packet.values.iter().any(|value| {
+                    matches!(
+                        value,
+                        EntityDataValue::ItemStack { index, stack }
+                            if *index == ITEM_ENTITY_DATA_ITEM_INDEX
+                                && stack.item_id == item_id
+                                && stack.count == 2
+                    )
+                });
+            }
+        } else if frame.id == RemoveEntities::ID {
+            let mut body = frame.body;
+            let packet = RemoveEntities::decode(&mut body).expect("decode merged item removal");
+            saw_consumed_remove |= packet.entity_ids.contains(&second_id);
+        }
+    }
+
+    shutdown.request();
+    tokio::time::timeout(Duration::from_secs(5), serve)
+        .await
+        .expect("dropped item merge server shutdown")
+        .expect("dropped item merge server join")
+        .expect("dropped item merge server serve");
+}
+
 async fn assert_offhand_swap_before_ack(
     client: &mut Client,
     sequence: i32,
@@ -1116,6 +1272,10 @@ async fn dead_survival_player_cannot_mine_or_eat() {
         .id_of(&mc_data::Identifier::parse("minecraft:item").unwrap())
         .and_then(|id| i32::try_from(id).ok())
         .expect("item entity type");
+    let xp_orb_entity_type = entity_types
+        .id_of(&mc_data::Identifier::parse("minecraft:experience_orb").unwrap())
+        .and_then(|id| i32::try_from(id).ok())
+        .expect("experience orb entity type");
 
     let cfg = mc_net::ServerConfig {
         bind_address: "127.0.0.1:0".parse().unwrap(),
@@ -1163,12 +1323,30 @@ async fn dead_survival_player_cannot_mine_or_eat() {
     wait_for_slot_stack(&mut client, apple_id, 2).await;
     client
         .write_packet(&ServerboundChatCommand {
+            command: "debug survival xp 21".into(),
+        })
+        .await
+        .expect("grant recoverable death XP");
+    wait_for_experience(&mut client, |xp| {
+        xp.total_experience == 21 && xp.experience_level == 2
+    })
+    .await;
+    client
+        .write_packet(&ServerboundChatCommand {
             command: "debug survival damage 100".into(),
         })
         .await
         .expect("kill player");
     wait_for_health_level(&mut client, 0.0).await;
-    wait_for_death_inventory_drop(&mut client, item_entity_type, apple_id, 2).await;
+    wait_for_death_inventory_and_xp_drop(
+        &mut client,
+        item_entity_type,
+        xp_orb_entity_type,
+        apple_id,
+        2,
+        14,
+    )
+    .await;
 
     let target_y = sync.y.floor() as i32 - 2;
     let target_pos = pack_block_pos(0, target_y, 0);
@@ -1269,7 +1447,7 @@ async fn dead_survival_player_can_respawn_and_act_again() {
         let _ = bound.serve().await;
     });
 
-    let (mut client, _) = connect_to_play(addr, "M23Respawn").await;
+    let (mut client, sync) = connect_to_play(addr, "M23Respawn").await;
     drain_complete_spawn_view(&mut client).await;
     client
         .write_packet(&ServerboundChatCommand {
@@ -1285,6 +1463,11 @@ async fn dead_survival_player_can_respawn_and_act_again() {
         .await
         .expect("kill player");
     wait_for_health_level(&mut client, 0.0).await;
+    let death_inventory = wait_for_inventory_content(&mut client, |pkt| {
+        pkt.container_id == 0 && pkt.items.iter().all(mc_protocol::packets::play::ItemStack::is_empty)
+    })
+    .await;
+    assert!(death_inventory.items.iter().all(mc_protocol::packets::play::ItemStack::is_empty));
 
     client
         .write_packet(&ServerboundClientCommand {
@@ -1298,13 +1481,19 @@ async fn dead_survival_player_can_respawn_and_act_again() {
     let mut saw_load_start = false;
     let mut saw_full_health = false;
     let mut saw_position_sync = false;
+    let mut saw_abilities = false;
+    let mut saw_default_spawn = false;
+    let mut saw_inventory_resync = false;
     let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
     while !(saw_respawn
         && saw_center_chunk
         && saw_respawn_chunk
         && saw_load_start
         && saw_full_health
-        && saw_position_sync)
+        && saw_position_sync
+        && saw_abilities
+        && saw_default_spawn
+        && saw_inventory_resync)
     {
         let frame = client
             .read_frame_with_timeout(
@@ -1313,7 +1502,7 @@ async fn dead_survival_player_can_respawn_and_act_again() {
             .await
             .unwrap_or_else(|error| {
                 panic!(
-                    "respawn response timed out: respawn={saw_respawn} center={saw_center_chunk} chunk={saw_respawn_chunk} load_start={saw_load_start} health={saw_full_health} position_sync={saw_position_sync}: {error}"
+                    "respawn response timed out: respawn={saw_respawn} center={saw_center_chunk} chunk={saw_respawn_chunk} load_start={saw_load_start} health={saw_full_health} position_sync={saw_position_sync} abilities={saw_abilities} default_spawn={saw_default_spawn} inventory={saw_inventory_resync}: {error}"
                 )
             });
         if handle_keepalive(&mut client, frame.id, &frame.body).await {
@@ -1356,6 +1545,36 @@ async fn dead_survival_player_can_respawn_and_act_again() {
             let pkt = GameEvent::decode(&mut body).expect("decode respawn GameEvent");
             if pkt.event == GameEvent::EVENT_START_WAITING_FOR_CHUNKS {
                 saw_load_start = true;
+            }
+        } else if frame.id == mc_protocol::packets::play::ClientboundPlayerAbilities::ID {
+            let mut body = frame.body;
+            let pkt = mc_protocol::packets::play::ClientboundPlayerAbilities::decode(&mut body)
+                .expect("decode respawn PlayerAbilities");
+            assert!(!pkt.invulnerable);
+            assert!(!pkt.flying);
+            assert!(!pkt.can_fly);
+            assert!(!pkt.instabuild);
+            saw_abilities = true;
+        } else if frame.id == mc_protocol::packets::play::SetDefaultSpawnPosition::ID {
+            let mut body = frame.body;
+            let pkt = mc_protocol::packets::play::SetDefaultSpawnPosition::decode(&mut body)
+                .expect("decode respawn SetDefaultSpawnPosition");
+            assert_eq!(pkt.dimension.as_str(), "minecraft:overworld");
+            assert_eq!(
+                unpack_block_pos(pkt.position),
+                (
+                    sync.x.floor() as i32,
+                    sync.y.floor() as i32,
+                    sync.z.floor() as i32,
+                )
+            );
+            saw_default_spawn = true;
+        } else if frame.id == ClientboundContainerSetContent::ID {
+            let mut body = frame.body;
+            let pkt = ClientboundContainerSetContent::decode(&mut body)
+                .expect("decode respawn inventory resync");
+            if pkt.container_id == 0 && pkt.items.iter().all(mc_protocol::packets::play::ItemStack::is_empty) {
+                saw_inventory_resync = true;
             }
         }
     }
@@ -1416,6 +1635,226 @@ async fn dead_survival_player_can_respawn_and_act_again() {
             }
         }
     }
+}
+
+#[tokio::test]
+async fn respawned_survival_player_rejoins_alive_after_saved_restart() {
+    let data = embedded_play_data();
+    let dirt_id = embedded_item_id(&data, "minecraft:dirt");
+    let entity_types = mc_data::entity_types::solaris_required_entity_types();
+    let item_entity_type = entity_types
+        .id_of(&mc_data::Identifier::parse("minecraft:item").unwrap())
+        .and_then(|id| i32::try_from(id).ok())
+        .expect("embedded item entity type");
+    let xp_orb_entity_type = entity_types
+        .id_of(&mc_data::Identifier::parse("minecraft:experience_orb").unwrap())
+        .and_then(|id| i32::try_from(id).ok())
+        .expect("embedded experience orb entity type");
+    let world_dir = tempfile::tempdir().expect("create respawn persistence world");
+
+    let first_shutdown = mc_net::ShutdownHandle::default();
+    let mut first_cfg = embedded_playable_config(
+        &data,
+        embedded_disk_world(&data, world_dir.path()),
+        "T02 respawn persistence",
+    );
+    first_cfg.shutdown = first_shutdown.clone();
+    let first_bound = mc_net::bind(first_cfg).await.expect("bind first respawn server");
+    let first_addr = first_bound.local_addr().expect("first local_addr");
+    let first_serve = tokio::spawn(async move { first_bound.serve_and_save().await });
+
+    let (mut client, _) = connect_to_play(first_addr, "T02Respawn").await;
+    wait_for_inventory_content(&mut client, |pkt| pkt.container_id == 0).await;
+    drain_until_chunk(&mut client, (0, 0)).await;
+    client
+        .write_packet(&ServerboundChatCommand {
+            command: "gamerule keep_inventory true".into(),
+        })
+        .await
+        .expect("enable keepInventory");
+    assert_eq!(
+        wait_for_system_chat_text(
+            &mut client,
+            tokio::time::Instant::now() + Duration::from_secs(30),
+        )
+        .await,
+        "keep_inventory = true"
+    );
+    client
+        .write_packet(&ServerboundChatCommand {
+            command: "debug give minecraft:dirt 1 0".into(),
+        })
+        .await
+        .expect("give pre-death dirt");
+    wait_for_slot_stack(&mut client, dirt_id, 1).await;
+    client
+        .write_packet(&ServerboundChatCommand {
+            command: "debug survival xp 21".into(),
+        })
+        .await
+        .expect("grant pre-death XP");
+    wait_for_experience(&mut client, |xp| {
+        xp.total_experience == 21 && xp.experience_level == 2
+    })
+    .await;
+    client
+        .write_packet(&ServerboundChatCommand {
+            command: "debug survival damage 100".into(),
+        })
+        .await
+        .expect("kill persisted player");
+    client
+        .write_packet(&ServerboundChatCommand {
+            command: "gamerule keep_inventory".into(),
+        })
+        .await
+        .expect("query keepInventory after death");
+    wait_for_keep_inventory_death_fence(
+        &mut client,
+        item_entity_type,
+        xp_orb_entity_type,
+        dirt_id,
+        1,
+        21,
+    )
+    .await;
+
+    client
+        .write_packet(&ServerboundClientCommand {
+            action: ClientCommandAction::PerformRespawn,
+        })
+        .await
+        .expect("request persisted respawn");
+    let mut saw_full_health = false;
+    let mut saw_position_sync = false;
+    let mut saw_preserved_inventory = false;
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
+    while !(saw_full_health && saw_position_sync && saw_preserved_inventory) {
+        let frame = client
+            .read_frame_with_timeout(
+                deadline.saturating_duration_since(tokio::time::Instant::now()),
+            )
+            .await
+            .expect("complete respawn before persistence save");
+        if handle_keepalive(&mut client, frame.id, &frame.body).await {
+            continue;
+        }
+        if frame.id == SynchronizePlayerPosition::ID {
+            let mut body = frame.body;
+            let pkt = SynchronizePlayerPosition::decode(&mut body)
+                .expect("decode persisted respawn position");
+            client
+                .write_packet(&ConfirmTeleportation {
+                    teleport_id: pkt.teleport_id,
+                })
+                .await
+                .expect("confirm persisted respawn teleport");
+            saw_position_sync = true;
+        } else if frame.id == ClientboundSetHealth::ID {
+            let mut body = frame.body;
+            let pkt = ClientboundSetHealth::decode(&mut body)
+                .expect("decode persisted respawn health");
+            if (pkt.health - 20.0).abs() < f32::EPSILON && pkt.food == 20 {
+                saw_full_health = true;
+            }
+        } else if frame.id == ClientboundContainerSetContent::ID {
+            let mut body = frame.body;
+            let pkt = ClientboundContainerSetContent::decode(&mut body)
+                .expect("decode keepInventory respawn inventory");
+            if pkt.container_id == 0 {
+                let stack = pkt.items.get(36).expect("respawn hotbar slot 36");
+                assert_eq!((stack.item_id, stack.count), (dirt_id, 1));
+                assert!(pkt.carried_item.is_empty());
+                saw_preserved_inventory = true;
+            }
+        } else if frame.id == AddEntity::ID {
+            let mut body = frame.body;
+            let pkt = AddEntity::decode(&mut body).expect("decode respawn AddEntity");
+            assert!(
+                pkt.entity_type_id != item_entity_type
+                    && pkt.entity_type_id != xp_orb_entity_type,
+                "keepInventory respawn must not reveal deferred death drops: {pkt:?}"
+            );
+        }
+    }
+    client
+        .write_packet(&mc_protocol::packets::play::ServerboundPlayerLoaded)
+        .await
+        .expect("acknowledge respawn load");
+    client
+        .write_packet(&ServerboundChatCommand {
+            command: "debug survival xp 1".into(),
+        })
+        .await
+        .expect("prove pre-death XP survived respawn");
+    wait_for_experience(&mut client, |xp| xp.total_experience == 22).await;
+
+    client
+        .write_packet(&ServerboundChatCommand {
+            command: "save-all".into(),
+        })
+        .await
+        .expect("save respawned player");
+    wait_for_save_all_feedback(&mut client).await;
+
+    drop(client);
+    first_shutdown.request();
+    tokio::time::timeout(Duration::from_secs(5), first_serve)
+        .await
+        .expect("first respawn server shutdown")
+        .expect("first respawn server join")
+        .expect("first respawn server serve");
+
+    let second_shutdown = mc_net::ShutdownHandle::default();
+    let mut second_cfg = embedded_playable_config(
+        &data,
+        embedded_disk_world(&data, world_dir.path()),
+        "T02 respawn persistence rejoin",
+    );
+    second_cfg.shutdown = second_shutdown.clone();
+    let second_bound = mc_net::bind(second_cfg).await.expect("bind restarted respawn server");
+    let second_addr = second_bound.local_addr().expect("second local_addr");
+    let second_serve = tokio::spawn(async move { second_bound.serve_and_save().await });
+
+    let (mut rejoined, _) = connect_to_play(second_addr, "T02Respawn").await;
+    wait_for_rejoined_keep_inventory_state(
+        &mut rejoined,
+        item_entity_type,
+        xp_orb_entity_type,
+        dirt_id,
+        1,
+        22,
+    )
+    .await;
+    rejoined
+        .write_packet(&ServerboundChatCommand {
+            command: "gamerule keep_inventory".into(),
+        })
+        .await
+        .expect("query restored keepInventory");
+    assert_eq!(
+        wait_for_system_chat_text(
+            &mut rejoined,
+            tokio::time::Instant::now() + Duration::from_secs(30),
+        )
+        .await,
+        "keep_inventory = true"
+    );
+    rejoined
+        .write_packet(&ServerboundChatCommand {
+            command: "debug survival damage 1".into(),
+        })
+        .await
+        .expect("damage rejoined alive player");
+    wait_for_health_level(&mut rejoined, 19.0).await;
+
+    drop(rejoined);
+    second_shutdown.request();
+    tokio::time::timeout(Duration::from_secs(5), second_serve)
+        .await
+        .expect("second respawn server shutdown")
+        .expect("second respawn server join")
+        .expect("second respawn server serve");
 }
 
 async fn drain_complete_spawn_view(client: &mut Client) {

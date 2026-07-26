@@ -39,8 +39,9 @@ use super::{
     ContainerXpPlan, EntityPhysicsQuery, EntityPhysicsStep, FurnaceCommitOutcome, GameMode,
     HerdSpawn, PendingCampfireOutput, PlayerInventoryCommitOutcome, PlayerPose,
     SharedContainerCommit, SurvivalState, WorldHandle, air_state_id, block_edit_changes_light,
-    chest_slot_stacks, furnace_output_was_taken, furnace_slot_stacks, is_campfire_block,
-    schedule_fluid_ticks_near_applied, schedule_leaf_ticks_near_applied,
+    chest_menu_state_change_count, chest_slot_stacks, furnace_output_was_taken,
+    furnace_slot_stacks, is_campfire_block, schedule_fluid_ticks_near_applied,
+    schedule_leaf_ticks_near_applied,
 };
 use mc_data::block_facts::BlockFactsTable;
 use mc_data::block_light::BlockLightTable;
@@ -212,6 +213,7 @@ pub(crate) struct SimulationSaveSnapshot {
     pub(crate) world_chunk_journal_watermark: Option<u64>,
     pub(crate) world_time: u64,
     pub(crate) players_sleeping_percentage: u32,
+    pub(crate) keep_inventory: bool,
     pub(crate) simulation_tick: u64,
     pub(crate) world_flush_plan: Option<mc_world::DirtyFlushPlan>,
 }
@@ -1622,6 +1624,7 @@ pub(super) struct PlayerSurvivalPlan {
     pub(super) enchanting_table_input: Option<super::EnchantingTableInputPlan>,
     pub(super) item_entity_type_id: Option<i32>,
     pub(super) xp_orb_entity_type_id: Option<i32>,
+    pub(super) keep_inventory: bool,
     pub(super) position: Vec3,
 }
 
@@ -4167,9 +4170,21 @@ impl SimulationOwner {
                 carried_item,
             }));
         }
-        let slots = chest_slot_stacks(&ChestView {
+        let before_view = ChestView {
+            chests: expected.to_vec(),
+        };
+        let after_view = ChestView {
             chests: updated.to_vec(),
-        });
+        };
+        let state_id_increment = chest_menu_state_change_count(
+            &before_view,
+            &after_view,
+            &player.expected_inventory,
+            &player.updated_inventory,
+            &player.expected_carried_item,
+            &player.updated_carried_item,
+        );
+        let slots = chest_slot_stacks(&after_view);
         let commit = sessions.commit_chest_slots(
             &self.authority,
             ContainerCommitContext {
@@ -4178,6 +4193,7 @@ impl SimulationOwner {
                 actor_session,
                 player,
             },
+            state_id_increment,
             slots,
             || {
                 for (&position, chest) in positions.iter().zip(updated) {
@@ -4554,6 +4570,7 @@ impl SimulationOwner {
                             world_chunk_journal_watermark: sessions.world_chunk_journal_watermark(),
                             world_time: sessions.world_time(),
                             players_sleeping_percentage: sessions.players_sleeping_percentage(),
+                            keep_inventory: sessions.keep_inventory(),
                             simulation_tick,
                             world_flush_plan,
                         })
@@ -5961,6 +5978,7 @@ fn valid_player_survival_plan(plan: &PlayerSurvivalPlan) -> bool {
         && xp_is_valid(&plan.updated_xp)
         && position_is_valid
         && (!dies
+            || plan.keep_inventory
             || ((!has_drops || plan.item_entity_type_id.is_some_and(|id| id >= 0))
                 && (dropped_xp == 0 || plan.xp_orb_entity_type_id.is_some_and(|id| id >= 0))))
 }
@@ -7692,6 +7710,7 @@ mod tests {
             enchanting_table_input: None,
             item_entity_type_id: None,
             xp_orb_entity_type_id: None,
+            keep_inventory: false,
             position: Vec3::new(target_pose.x, target_pose.y, target_pose.z),
         };
 
@@ -7841,6 +7860,7 @@ mod tests {
                 enchanting_table_input: None,
                 item_entity_type_id: None,
                 xp_orb_entity_type_id: None,
+                keep_inventory: false,
                 position,
             }
         };
@@ -12313,6 +12333,7 @@ mod tests {
             enchanting_table_input: None,
             item_entity_type_id: Some(1),
             xp_orb_entity_type_id: Some(2),
+            keep_inventory: false,
             position: Vec3::new(0.5, 64.0, 0.5),
         };
         let (handle, mut owner) = simulation_channel_with_capacity(2);
@@ -14578,6 +14599,7 @@ mod tests {
             .try_chest_slot_dispatches(
                 pos,
                 1,
+                1,
                 7,
                 super::super::chest_slot_stacks(&super::super::ChestView {
                     chests: vec![updated.clone()],
@@ -15000,7 +15022,7 @@ mod tests {
         );
         assert!(matches!(
             observer_rx.blocking_recv(),
-            Some(OutboundCommand::ChestSlots { state_id: 2, .. })
+            Some(OutboundCommand::ChestSlots { state_id: 4, .. })
         ));
         assert!(matches!(
             observer_rx.blocking_recv(),
@@ -15013,7 +15035,7 @@ mod tests {
                 if matches!(
                     *outcome,
                     SharedContainerCommit::Committed {
-                        state_id: 2,
+                        state_id: 4,
                         ref inventory,
                         ref carried_item,
                         ..
@@ -15030,7 +15052,7 @@ mod tests {
                         inventory,
                         carried_item,
                     } => {
-                        assert_eq!(state_id, 2);
+                        assert_eq!(state_id, 4);
                         (authoritative, inventory, carried_item)
                     }
                     other => panic!("expected stale chest rejection, got {other:?}"),

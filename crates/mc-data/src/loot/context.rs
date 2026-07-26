@@ -15,6 +15,8 @@ pub enum LootContextError {
     TooManyEnchantments { actual: usize, maximum: usize },
     #[error("loot context contains duplicate enchantment {enchantment}")]
     DuplicateEnchantment { enchantment: Identifier },
+    #[error("loot context cannot attach enchantments to an empty item")]
+    EnchantmentsWithoutItem,
     #[error("loot context has too many block properties: {actual} > {maximum}")]
     TooManyBlockProperties { actual: usize, maximum: usize },
     #[error("loot context contains duplicate block property {property:?}")]
@@ -285,6 +287,9 @@ impl<'a> BlockLootContext<'a> {
         tool: &'a LootContextItem,
         random: LootRandomBinding,
     ) -> Result<Self, LootContextError> {
+        if tool.item().is_none() && !tool.enchantments().is_empty() {
+            return Err(LootContextError::EnchantmentsWithoutItem);
+        }
         Ok(Self {
             block,
             properties: LootBlockProperties::try_from_pairs(properties)?,

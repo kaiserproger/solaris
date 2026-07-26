@@ -23,6 +23,9 @@ mod chunk_view_authority;
 mod combat_load_tests;
 mod container_state;
 mod container_views;
+#[cfg(test)]
+#[path = "session/death_policy_tests.rs"]
+mod death_policy_tests;
 mod entity_combat;
 mod entity_goal_defaults;
 mod entity_lifecycle;
@@ -167,7 +170,8 @@ use outbound::{
 };
 pub(super) use outbound::{
     OutboundCommand, OutboundLightUpdate, PlayerDamagePublication, PlayerEntitySnapshot,
-    ServerEntityMove, ServerEntitySnapshot, VisibilityDispatch, dispatch_visibility_commands,
+    ServerEntityMove, ServerEntitySnapshot, ShieldCooldownPublication, VisibilityDispatch,
+    dispatch_visibility_commands,
 };
 #[cfg(test)]
 pub(super) use outbound::{PlayerInventorySlotDelta, SessionRecipient};
@@ -394,12 +398,14 @@ struct SessionRegistryInner {
     player_persistence: HashMap<SessionId, Arc<Mutex<PlayerPersistedState>>>,
     player_hurt_resistance: HashMap<SessionId, PlayerHurtResistance>,
     active_shields: HashMap<SessionId, ActiveShield>,
+    shield_disabled_until: HashMap<SessionId, u64>,
     disconnected_player_persistence: HashMap<uuid::Uuid, DisconnectedPlayerPersistence>,
     next_disconnected_player_generation: u64,
     sleeping_sessions: HashMap<SessionId, SleepingState>,
     spectator_sessions: HashSet<SessionId>,
     dead_sessions: HashSet<SessionId>,
     client_unloaded_sessions: HashSet<SessionId>,
+    keep_inventory: bool,
     entity_dispatches: EntityDispatchCounters,
     arrow_kill_rewards: ArrowKillRewards,
     player_combat: PlayerCombatResources,
@@ -464,6 +470,7 @@ impl Default for PlayerCombatResources {
 pub(super) struct PreparedChunkClaim {
     id: u64,
     pub(super) revision: u64,
+    owner_session: Option<SessionId>,
 }
 
 #[derive(Debug, Clone)]
@@ -1845,12 +1852,23 @@ fn schedule_item_despawn_locked(
     spawn_tick: u64,
 ) {
     let deadline = spawn_tick.saturating_add(ITEM_DESPAWN_AGE_TICKS);
-    if inner
+    let previous = inner
         .item_despawn_deadline_by_id
-        .insert(entity_id, deadline)
-        == Some(deadline)
-    {
+        .insert(entity_id, deadline);
+    if previous == Some(deadline) {
         return;
+    }
+    if let Some(previous) = previous {
+        let remove_bucket = inner
+            .item_despawn_deadlines
+            .get_mut(&previous)
+            .is_some_and(|bucket| {
+                bucket.retain(|queued| *queued != entity_id);
+                bucket.is_empty()
+            });
+        if remove_bucket {
+            inner.item_despawn_deadlines.remove(&previous);
+        }
     }
     inner
         .item_despawn_deadlines

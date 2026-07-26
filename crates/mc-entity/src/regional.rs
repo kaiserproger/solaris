@@ -1257,6 +1257,12 @@ enum RegionalOwnerCommand {
         snapshots: Vec<(EntitySnapshot, EntitySnapshot)>,
         reply: std::sync::mpsc::Sender<Result<bool, RegionOwnerLaneError>>,
     },
+    MergeItemSnapshotsIfCurrent {
+        survivor_expected: Box<EntitySnapshot>,
+        survivor_next: Box<EntitySnapshot>,
+        consumed_expected: Box<EntitySnapshot>,
+        reply: std::sync::mpsc::Sender<Result<bool, RegionOwnerLaneError>>,
+    },
     SetAnimalStatesIfCurrent {
         states: Vec<(EntitySnapshot, AnimalBreedingState)>,
         defer_journal: bool,
@@ -1421,6 +1427,7 @@ impl RegionalOwnerCommand {
                 | Self::RemoveIfCurrent { .. }
                 | Self::ReplaceSnapshotIfCurrent { .. }
                 | Self::ReplaceSnapshotsIfCurrent { .. }
+                | Self::MergeItemSnapshotsIfCurrent { .. }
                 | Self::SetAnimalStatesIfCurrent { .. }
                 | Self::ApplyVillagerBindingGoal { .. }
                 | Self::SetGoal { .. }
@@ -2030,6 +2037,24 @@ impl RegionalOwnerHandle {
         let (reply, result) = channel();
         self.sender
             .send(RegionalOwnerCommand::ReplaceSnapshotsIfCurrent { snapshots, reply })
+            .map_err(|_| RegionOwnerLaneError::Closed)?;
+        result.recv().map_err(|_| RegionOwnerLaneError::Closed)?
+    }
+
+    pub fn merge_item_snapshots_if_current(
+        &self,
+        survivor_expected: EntitySnapshot,
+        survivor_next: EntitySnapshot,
+        consumed_expected: EntitySnapshot,
+    ) -> Result<bool, RegionOwnerLaneError> {
+        let (reply, result) = channel();
+        self.sender
+            .send(RegionalOwnerCommand::MergeItemSnapshotsIfCurrent {
+                survivor_expected: Box::new(survivor_expected),
+                survivor_next: Box::new(survivor_next),
+                consumed_expected: Box::new(consumed_expected),
+                reply,
+            })
             .map_err(|_| RegionOwnerLaneError::Closed)?;
         result.recv().map_err(|_| RegionOwnerLaneError::Closed)?
     }
@@ -3181,6 +3206,25 @@ fn run_regional_owner_runtime(
             }
             RegionalOwnerCommand::ReplaceSnapshotsIfCurrent { snapshots, reply } => {
                 let result = coordinator.replace_snapshots_if_current(snapshots);
+                if matches!(&result, Ok(true)) {
+                    selected_read_routes
+                        .write()
+                        .unwrap_or_else(|poisoned| poisoned.into_inner())
+                        .clear();
+                }
+                let _ = reply.send(result);
+            }
+            RegionalOwnerCommand::MergeItemSnapshotsIfCurrent {
+                survivor_expected,
+                survivor_next,
+                consumed_expected,
+                reply,
+            } => {
+                let result = coordinator.merge_item_snapshots_if_current(
+                    *survivor_expected,
+                    *survivor_next,
+                    *consumed_expected,
+                );
                 if matches!(&result, Ok(true)) {
                     selected_read_routes
                         .write()
@@ -4567,6 +4611,88 @@ impl RegionalOwnerCoordinator {
                 self.locations.insert(entity_id, target);
                 self.vehicle_passengers = vehicle_passengers;
                 self.passenger_vehicles = passenger_vehicles;
+                Ok(true)
+            }
+            Err(RegionOwnerLaneError::InvalidMutation) => Ok(false),
+            Err(error) => Err(error),
+        }
+    }
+
+    pub fn merge_item_snapshots_if_current(
+        &mut self,
+        survivor_expected: EntitySnapshot,
+        survivor_next: EntitySnapshot,
+        consumed_expected: EntitySnapshot,
+    ) -> Result<bool, RegionOwnerLaneError> {
+        if survivor_expected.id == consumed_expected.id
+            || survivor_expected.id != survivor_next.id
+            || survivor_expected.uuid != survivor_next.uuid
+            || survivor_expected.type_name != "minecraft:item"
+            || survivor_next.type_name != "minecraft:item"
+            || consumed_expected.type_name != "minecraft:item"
+            || survivor_expected.position != survivor_next.position
+            || survivor_expected.vehicle.is_some()
+            || survivor_next.vehicle.is_some()
+            || consumed_expected.vehicle.is_some()
+        {
+            return Err(RegionOwnerLaneError::InvalidMutation);
+        }
+        let Some(survivor_key) = RegionKey::from_position(survivor_expected.position) else {
+            return Err(RegionOwnerLaneError::InvalidMutation);
+        };
+        let Some(consumed_key) = RegionKey::from_position(consumed_expected.position) else {
+            return Err(RegionOwnerLaneError::InvalidMutation);
+        };
+        if self.locations.get(&survivor_expected.id).copied() != Some(survivor_key)
+            || self.locations.get(&consumed_expected.id).copied() != Some(consumed_key)
+            || self.in_flight_transfers.contains_key(&survivor_expected.id)
+            || self.in_flight_transfers.contains_key(&consumed_expected.id)
+            || self.snapshot(survivor_expected.id)?.as_ref() != Some(&survivor_expected)
+            || self.snapshot(consumed_expected.id)?.as_ref() != Some(&consumed_expected)
+        {
+            return Ok(false);
+        }
+        if self.passenger_vehicles.contains_key(&survivor_expected.id)
+            || self.passenger_vehicles.contains_key(&consumed_expected.id)
+            || self.vehicle_passengers.contains_key(&survivor_expected.id)
+            || self.vehicle_passengers.contains_key(&consumed_expected.id)
+        {
+            return Err(RegionOwnerLaneError::InvalidMutation);
+        }
+
+        let (first_sequence, sequence_watermark) = self.commit_state.reserve_sequences(2)?;
+        let survivor_lease = self
+            .ownership
+            .lease(survivor_key)
+            .ok_or(RegionOwnerLaneError::StaleLease)?;
+        let consumed_lease = self
+            .ownership
+            .lease(consumed_key)
+            .ok_or(RegionOwnerLaneError::StaleLease)?;
+        let mut mutations = BTreeMap::<usize, Vec<SequencedRegionMutation>>::new();
+        mutations
+            .entry(survivor_lease.lane)
+            .or_default()
+            .push(SequencedRegionMutation {
+                sequence: first_sequence + 1,
+                lease: survivor_lease,
+                mutation: RegionOwnerMutation::ReplaceSnapshotIfCurrent {
+                    expected: Box::new(survivor_expected),
+                    next: Box::new(survivor_next),
+                },
+            });
+        mutations
+            .entry(consumed_lease.lane)
+            .or_default()
+            .push(SequencedRegionMutation {
+                sequence: sequence_watermark,
+                lease: consumed_lease,
+                mutation: RegionOwnerMutation::RemoveIfCurrent(Box::new(consumed_expected.clone())),
+            });
+        match self.execute_mutations(mutations, sequence_watermark) {
+            Ok(()) => {
+                self.locations.remove(&consumed_expected.id);
+                self.uuids.remove(&consumed_expected.uuid);
                 Ok(true)
             }
             Err(RegionOwnerLaneError::InvalidMutation) => Ok(false),
@@ -12964,6 +13090,168 @@ mod tests {
                 .expect("save barrier")
                 .journal_phases()
                 .contains(&phase)
+        );
+
+        drop(handle);
+        runtime.shutdown().expect("runtime shutdown");
+    }
+
+    #[test]
+    fn item_merge_cas_updates_survivor_and_removes_consumed_atomically() {
+        let runtime = super::RegionalOwnerRuntime::from_store(RegionalEntityStore::new(), 2)
+            .expect("owner runtime");
+        let handle = runtime.handle();
+        let mut survivor = SpawnEntity::new(1, "minecraft:item", Vec3::new(0.5, 64.0, 0.5));
+        survivor.item_stack = Some(crate::EntityItemStack::new(7, 3));
+        survivor.retained.spawn_tick = 4;
+        let survivor_id = handle.spawn(survivor).expect("survivor item");
+        let mut consumed = SpawnEntity::new(1, "minecraft:item", Vec3::new(0.75, 64.0, 0.5));
+        consumed.item_stack = Some(crate::EntityItemStack::new(7, 2));
+        consumed.retained.spawn_tick = 9;
+        let consumed_id = handle.spawn(consumed).expect("consumed item");
+        let survivor_expected = handle
+            .snapshot(survivor_id)
+            .expect("survivor read")
+            .expect("survivor snapshot");
+        let consumed_expected = handle
+            .snapshot(consumed_id)
+            .expect("consumed read")
+            .expect("consumed snapshot");
+        let mut survivor_next = survivor_expected.clone();
+        survivor_next.item_stack = Some(crate::EntityItemStack::new(7, 5));
+        survivor_next.retained.spawn_tick = 9;
+
+        assert!(
+            handle
+                .merge_item_snapshots_if_current(
+                    survivor_expected,
+                    survivor_next.clone(),
+                    consumed_expected,
+                )
+                .expect("merge CAS")
+        );
+        assert_eq!(
+            handle.snapshot(survivor_id).expect("merged survivor read"),
+            Some(survivor_next)
+        );
+        assert!(
+            handle
+                .snapshot(consumed_id)
+                .expect("consumed removal read")
+                .is_none()
+        );
+
+        drop(handle);
+        runtime.shutdown().expect("runtime shutdown");
+    }
+
+    #[test]
+    fn stale_item_merge_cas_changes_neither_entity() {
+        let runtime = super::RegionalOwnerRuntime::from_store(RegionalEntityStore::new(), 2)
+            .expect("owner runtime");
+        let handle = runtime.handle();
+        let mut survivor = SpawnEntity::new(1, "minecraft:item", Vec3::new(0.5, 64.0, 0.5));
+        survivor.item_stack = Some(crate::EntityItemStack::new(7, 3));
+        let survivor_id = handle.spawn(survivor).expect("survivor item");
+        let mut consumed = SpawnEntity::new(1, "minecraft:item", Vec3::new(0.75, 64.0, 0.5));
+        consumed.item_stack = Some(crate::EntityItemStack::new(7, 2));
+        let consumed_id = handle.spawn(consumed).expect("consumed item");
+        let survivor_expected = handle
+            .snapshot(survivor_id)
+            .expect("survivor read")
+            .expect("survivor snapshot");
+        let stale_consumed = handle
+            .snapshot(consumed_id)
+            .expect("consumed read")
+            .expect("consumed snapshot");
+        assert!(
+            handle
+                .set_item_stack_if_current(
+                    stale_consumed.clone(),
+                    Some(crate::EntityItemStack::new(7, 1)),
+                )
+                .expect("change consumed before stale merge")
+        );
+        let current_consumed = handle
+            .snapshot(consumed_id)
+            .expect("current consumed read")
+            .expect("current consumed snapshot");
+        let mut survivor_next = survivor_expected.clone();
+        survivor_next.item_stack = Some(crate::EntityItemStack::new(7, 5));
+
+        assert!(
+            !handle
+                .merge_item_snapshots_if_current(
+                    survivor_expected.clone(),
+                    survivor_next,
+                    stale_consumed,
+                )
+                .expect("stale merge CAS")
+        );
+        assert_eq!(
+            handle
+                .snapshot(survivor_id)
+                .expect("survivor after stale merge"),
+            Some(survivor_expected)
+        );
+        assert_eq!(
+            handle
+                .snapshot(consumed_id)
+                .expect("consumed after stale merge"),
+            Some(current_consumed)
+        );
+
+        drop(handle);
+        runtime.shutdown().expect("runtime shutdown");
+    }
+
+    #[test]
+    fn cross_region_item_merge_rolls_back_both_entities_on_journal_failure() {
+        let journal = Arc::new(Mutex::new(TestDecisionJournalState::default()));
+        let runtime = super::RegionalOwnerRuntime::from_store_with_journal(
+            RegionalEntityStore::new(),
+            2,
+            Box::new(TestDecisionJournal(Arc::clone(&journal))),
+        )
+        .expect("owner runtime");
+        let handle = runtime.handle();
+        let mut survivor = SpawnEntity::new(1, "minecraft:item", Vec3::new(127.9, 64.0, 0.5));
+        survivor.item_stack = Some(crate::EntityItemStack::new(7, 3));
+        let survivor_id = handle.spawn(survivor).expect("survivor item");
+        let mut consumed = SpawnEntity::new(1, "minecraft:item", Vec3::new(128.1, 64.0, 0.5));
+        consumed.item_stack = Some(crate::EntityItemStack::new(7, 2));
+        let consumed_id = handle.spawn(consumed).expect("consumed item");
+        let survivor_expected = handle
+            .snapshot(survivor_id)
+            .expect("survivor read")
+            .expect("survivor snapshot");
+        let consumed_expected = handle
+            .snapshot(consumed_id)
+            .expect("consumed read")
+            .expect("consumed snapshot");
+        let mut survivor_next = survivor_expected.clone();
+        survivor_next.item_stack = Some(crate::EntityItemStack::new(7, 5));
+        journal.lock().expect("journal state").fail_record = true;
+
+        assert_eq!(
+            handle.merge_item_snapshots_if_current(
+                survivor_expected.clone(),
+                survivor_next,
+                consumed_expected.clone(),
+            ),
+            Err(super::RegionOwnerLaneError::Journal)
+        );
+        assert_eq!(
+            handle
+                .snapshot(survivor_id)
+                .expect("survivor rollback read"),
+            Some(survivor_expected)
+        );
+        assert_eq!(
+            handle
+                .snapshot(consumed_id)
+                .expect("consumed rollback read"),
+            Some(consumed_expected)
         );
 
         drop(handle);

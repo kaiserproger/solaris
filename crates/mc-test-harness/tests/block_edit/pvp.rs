@@ -358,6 +358,28 @@ async fn wait_for_exact_pvp_health(client: &mut Client) -> f32 {
     }
 }
 
+async fn wait_for_pvp_health_below(client: &mut Client, ceiling: f32) -> f32 {
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+    loop {
+        let frame = client
+            .read_frame_with_timeout(deadline.saturating_duration_since(tokio::time::Instant::now()))
+            .await
+            .expect("target health below shield-disabled ceiling");
+        if handle_keepalive(client, frame.id, &frame.body).await {
+            continue;
+        }
+        if frame.id == ClientboundSetHealth::ID {
+            let mut body = frame.body;
+            let health = ClientboundSetHealth::decode(&mut body)
+                .expect("decode shield-disabled target SetHealth")
+                .health;
+            if health < ceiling {
+                return health;
+            }
+        }
+    }
+}
+
 async fn wait_for_rejected_pvp_hit_without_health_or_hurt_until_second_attack_animation_fence(
     client: &mut Client,
     attacker_entity_id: i32,
@@ -508,6 +530,330 @@ async fn wait_for_pvp_hurt_and_attacker_health_fence(
             let mut body = frame.body;
             let packet = ClientboundSystemChat::decode(&mut body).expect("decode command fence");
             saw_command_fence |= system_chat_text(&packet).contains("Runtime control:");
+        }
+    }
+}
+
+#[tokio::test]
+async fn frontal_axe_block_disables_shield_until_exact_cooldown_expiry_over_wire() {
+    let data = embedded_play_data();
+    let axe_id = embedded_item_id(&data, "minecraft:stone_axe");
+    let shield_id = embedded_item_id(&data, "minecraft:shield");
+    let shutdown = mc_net::ShutdownHandle::default();
+    let mut config = embedded_playable_config(&data, embedded_world(&data), "shield axe disable wire");
+    config.biome_spawns = Arc::new(mc_data::biomes::BiomeSpawnRules::default());
+    config.shutdown = shutdown.clone();
+    let bound = mc_net::bind(config).await.expect("bind shield axe server");
+    let addr = bound.local_addr().expect("shield axe local_addr");
+    let telemetry = bound.runtime_telemetry_handle();
+    let mut simulation_ticks = telemetry.subscribe_simulation_ticks();
+    let mut player_attacks = telemetry.subscribe_player_attacks();
+    let serve = tokio::spawn(async move { bound.serve().await });
+
+    let (mut attacker, attacker_spawn) = connect_to_play(addr, "AxeWire").await;
+    drain_until_chunk(&mut attacker, (0, 0)).await;
+    let (mut defender, defender_spawn) = connect_to_play(addr, "ShieldWire").await;
+    drain_until_chunk(&mut defender, (0, 0)).await;
+    let (defender_entity, attacker_entity) = tokio::join!(
+        wait_for_pvp_player_entity_id(&mut attacker, "ShieldWire"),
+        wait_for_pvp_player_entity_id(&mut defender, "AxeWire"),
+    );
+
+    move_pvp_player_with_yaw_fence(
+        &mut attacker,
+        attacker_spawn.x,
+        attacker_spawn.y,
+        attacker_spawn.z - 1.0,
+        0.0,
+    )
+    .await;
+    move_pvp_player_with_yaw_fence(
+        &mut defender,
+        defender_spawn.x,
+        defender_spawn.y,
+        defender_spawn.z + 1.0,
+        180.0,
+    )
+    .await;
+
+    attacker
+        .write_packet(&ServerboundChatCommand {
+            command: "debug give minecraft:stone_axe 1 0".into(),
+        })
+        .await
+        .expect("give disabling axe");
+    wait_for_slot_stack(&mut attacker, axe_id, 1).await;
+    defender
+        .write_packet(&ServerboundChatCommand {
+            command: "debug give minecraft:shield 1 0".into(),
+        })
+        .await
+        .expect("give defender shield");
+    wait_for_slot_stack(&mut defender, shield_id, 1).await;
+    defender
+        .write_packet(&ServerboundPlayerAction {
+            action: PlayerActionKind::SwapItemWithOffhand,
+            position: 0,
+            direction: Direction::Down,
+            sequence: 501,
+        })
+        .await
+        .expect("equip defender shield");
+    assert_offhand_swap_before_ack(&mut defender, 501, shield_id, true).await;
+
+    let ready_tick = (*simulation_ticks.borrow()).saturating_add(30);
+    wait_for_pvp_simulation_tick(&mut simulation_ticks, ready_tick).await;
+    defender
+        .write_packet(&ServerboundUseItem {
+            hand: InteractionHand::OffHand,
+            sequence: 502,
+            y_rot: 180.0,
+            x_rot: 0.0,
+        })
+        .await
+        .expect("start frontal shield block");
+    tokio::join!(
+        wait_for_block_ack(&mut defender, 502),
+        wait_for_pvp_shield_flags(&mut attacker, defender_entity, true),
+    );
+    let shield_ready_tick = (*simulation_ticks.borrow()).saturating_add(6);
+    wait_for_pvp_simulation_tick(&mut simulation_ticks, shield_ready_tick).await;
+
+    attacker
+        .write_packet(&mc_protocol::packets::play::ServerboundAttack {
+            entity_id: defender_entity,
+        })
+        .await
+        .expect("send first disabling axe hit");
+    let ((), (), first_hit) = tokio::join!(
+        wait_for_axe_shield_block_target(&mut defender, shield_id, 10, 20.0),
+        wait_for_pvp_shield_flags(&mut attacker, defender_entity, false),
+        wait_for_pvp_attack(&mut player_attacks, attacker_entity as u64, defender_entity),
+    );
+
+    defender
+        .write_packet(&ServerboundUseItem {
+            hand: InteractionHand::OffHand,
+            sequence: 503,
+            y_rot: 180.0,
+            x_rot: 0.0,
+        })
+        .await
+        .expect("attempt shield use during cooldown");
+    wait_for_block_ack(&mut defender, 503).await;
+    defender
+        .write_packet(&mc_protocol::packets::play::ServerboundAttack {
+            entity_id: attacker_entity,
+        })
+        .await
+        .expect("fence disabled shield use with defender attack");
+    wait_for_pvp_attack_animation_without_shield_start(&mut attacker, defender_entity).await;
+
+    wait_for_pvp_simulation_tick(
+        &mut simulation_ticks,
+        first_hit.cooldown_tick.saturating_add(30),
+    )
+    .await;
+    attacker
+        .write_packet(&mc_protocol::packets::play::ServerboundAttack {
+            entity_id: defender_entity,
+        })
+        .await
+        .expect("attack while shield remains disabled");
+    let (damaged_health, second_hit) = tokio::join!(
+        wait_for_pvp_health_below(&mut defender, 20.0),
+        wait_for_pvp_attack(&mut player_attacks, attacker_entity as u64, defender_entity),
+    );
+    assert!(damaged_health < 20.0, "disabled shield must not block the next axe hit");
+    assert!(second_hit.authority_tick < first_hit.authority_tick.saturating_add(100));
+
+    wait_for_pvp_simulation_tick(
+        &mut simulation_ticks,
+        first_hit.authority_tick.saturating_add(100),
+    )
+    .await;
+    defender
+        .write_packet(&ServerboundUseItem {
+            hand: InteractionHand::OffHand,
+            sequence: 504,
+            y_rot: 180.0,
+            x_rot: 0.0,
+        })
+        .await
+        .expect("restart shield use after cooldown expiry");
+    tokio::join!(
+        wait_for_block_ack(&mut defender, 504),
+        wait_for_pvp_shield_flags(&mut attacker, defender_entity, true),
+    );
+    let shield_ready_tick = (*simulation_ticks.borrow()).saturating_add(6);
+    wait_for_pvp_simulation_tick(&mut simulation_ticks, shield_ready_tick).await;
+    attacker
+        .write_packet(&mc_protocol::packets::play::ServerboundAttack {
+            entity_id: defender_entity,
+        })
+        .await
+        .expect("attack reactivated shield after cooldown");
+    tokio::join!(
+        wait_for_axe_shield_block_target(&mut defender, shield_id, 20, damaged_health),
+        wait_for_pvp_shield_flags(&mut attacker, defender_entity, false),
+        wait_for_pvp_attack(&mut player_attacks, attacker_entity as u64, defender_entity),
+    );
+
+    shutdown.request();
+    tokio::time::timeout(Duration::from_secs(5), serve)
+        .await
+        .expect("shield axe server shutdown")
+        .expect("shield axe server join")
+        .expect("shield axe server serve");
+}
+
+async fn move_pvp_player_with_yaw_fence(
+    client: &mut Client,
+    x: f64,
+    y: f64,
+    z: f64,
+    yaw: f32,
+) {
+    client
+        .write_packet(&ServerboundMovePlayerPosRot {
+            x,
+            y,
+            z,
+            yaw,
+            pitch: 0.0,
+            flags: MovePlayerFlags::new(true, false),
+        })
+        .await
+        .expect("move shield PvP player");
+    client
+        .write_packet(&ServerboundChatCommand {
+            command: "status".into(),
+        })
+        .await
+        .expect("send shield PvP movement fence");
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+    loop {
+        let frame = client
+            .read_frame_with_timeout(deadline.saturating_duration_since(tokio::time::Instant::now()))
+            .await
+            .expect("shield PvP movement fence");
+        if handle_keepalive(client, frame.id, &frame.body).await {
+            continue;
+        }
+        if frame.id == ClientboundSystemChat::ID {
+            let mut body = frame.body;
+            let packet = ClientboundSystemChat::decode(&mut body)
+                .expect("decode shield PvP movement fence");
+            if system_chat_text(&packet).contains("Runtime control:") {
+                return;
+            }
+        }
+    }
+}
+
+async fn wait_for_pvp_shield_flags(client: &mut Client, entity_id: i32, using: bool) {
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+    loop {
+        let frame = client
+            .read_frame_with_timeout(deadline.saturating_duration_since(tokio::time::Instant::now()))
+            .await
+            .expect("shield use metadata");
+        if handle_keepalive(client, frame.id, &frame.body).await {
+            continue;
+        }
+        if frame.id == ClientboundSetEntityData::ID {
+            let mut body = frame.body;
+            let packet = ClientboundSetEntityData::decode(&mut body)
+                .expect("decode shield use metadata");
+            if packet.entity_id == entity_id
+                && let Some(value) = packet.values.iter().find_map(|value| match value {
+                    EntityDataValue::Byte { index, value }
+                        if *index == LIVING_ENTITY_DATA_FLAGS_INDEX => Some(*value),
+                    _ => None,
+                })
+                && (value & LIVING_ENTITY_FLAG_USING_ITEM != 0) == using
+            {
+                return;
+            }
+        }
+    }
+}
+
+async fn wait_for_pvp_attack_animation_without_shield_start(client: &mut Client, entity_id: i32) {
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+    loop {
+        let frame = client
+            .read_frame_with_timeout(deadline.saturating_duration_since(tokio::time::Instant::now()))
+            .await
+            .expect("disabled shield attack fence");
+        if handle_keepalive(client, frame.id, &frame.body).await {
+            continue;
+        }
+        if frame.id == ClientboundSetEntityData::ID {
+            let mut body = frame.body;
+            let packet = ClientboundSetEntityData::decode(&mut body)
+                .expect("decode disabled shield metadata");
+            if packet.entity_id == entity_id
+                && packet.values.iter().any(|value| {
+                    matches!(
+                        value,
+                        EntityDataValue::Byte { index, value }
+                            if *index == LIVING_ENTITY_DATA_FLAGS_INDEX && *value & LIVING_ENTITY_FLAG_USING_ITEM != 0
+                    )
+                })
+            {
+                panic!("shield use metadata must stay clear during axe cooldown");
+            }
+        } else if frame.id == EntityAnimation::ID {
+            let mut body = frame.body;
+            let packet = EntityAnimation::decode(&mut body)
+                .expect("decode disabled shield swing fence");
+            if packet.entity_id == entity_id {
+                return;
+            }
+        }
+    }
+}
+
+async fn wait_for_axe_shield_block_target(
+    client: &mut Client,
+    shield_id: u32,
+    expected_damage: i32,
+    expected_health: f32,
+) {
+    let mut saw_cooldown = false;
+    let mut saw_shield_damage = false;
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+    while !(saw_cooldown && saw_shield_damage) {
+        let frame = client
+            .read_frame_with_timeout(deadline.saturating_duration_since(tokio::time::Instant::now()))
+            .await
+            .expect("axe shield block publication");
+        if handle_keepalive(client, frame.id, &frame.body).await {
+            continue;
+        }
+        if frame.id == ClientboundCooldown::ID {
+            let mut body = frame.body;
+            let packet = ClientboundCooldown::decode(&mut body)
+                .expect("decode shield cooldown packet");
+            assert_eq!(packet.cooldown_group.as_str(), "minecraft:shield");
+            assert_eq!(packet.duration, 100);
+            saw_cooldown = true;
+        } else if frame.id == ClientboundContainerSetSlot::ID {
+            let mut body = frame.body;
+            let packet = ClientboundContainerSetSlot::decode(&mut body)
+                .expect("decode shield durability update");
+            if packet.slot == 45 {
+                assert_eq!(packet.item_stack.item_id, shield_id);
+                assert_eq!(packet.item_stack.count, 1);
+                assert_eq!(packet.item_stack.damage, Some(expected_damage));
+                saw_shield_damage = true;
+            }
+        } else if frame.id == ClientboundSetHealth::ID {
+            let mut body = frame.body;
+            let packet = ClientboundSetHealth::decode(&mut body)
+                .expect("decode unexpected shield-block health");
+            assert_eq!(packet.health, expected_health);
         }
     }
 }

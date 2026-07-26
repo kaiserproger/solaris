@@ -66,6 +66,21 @@ impl SessionRegistry {
         }
     }
 
+    pub(in crate::play) fn shield_disable_remaining_ticks(
+        &self,
+        id: SessionId,
+        current_tick: u64,
+    ) -> Option<u64> {
+        let mut inner = self.lock_inner("read shield disable deadline");
+        let deadline = inner.shield_disabled_until.get(&id).copied()?;
+        if deadline <= current_tick {
+            inner.shield_disabled_until.remove(&id);
+            None
+        } else {
+            Some(deadline - current_tick)
+        }
+    }
+
     pub(in crate::play) fn recoverable_player_state(
         &self,
         uuid: uuid::Uuid,
@@ -265,7 +280,9 @@ impl SessionRegistry {
             guard,
         );
         let active_shield = inner.active_shields.get(&actor_session).cloned();
+        let dies = !plan.expected_survival.is_dead() && plan.updated_survival.is_dead();
         if !player_survival_plan_matches(&player_state, plan)
+            || (dies && plan.keep_inventory != inner.keep_inventory)
             || plan
                 .active_shield
                 .as_ref()
@@ -344,6 +361,16 @@ impl SessionRegistry {
         true
     }
 
+    pub(crate) fn keep_inventory(&self) -> bool {
+        self.lock_inner("read keep inventory gamerule")
+            .keep_inventory
+    }
+
+    pub(crate) fn set_keep_inventory(&self, keep_inventory: bool) {
+        self.lock_inner("set keep inventory gamerule")
+            .keep_inventory = keep_inventory;
+    }
+
     pub(in crate::play) fn player_accepts_damage(&self, id: SessionId) -> bool {
         self.movement_recipients
             .load_full()
@@ -385,11 +412,17 @@ pub(super) fn apply_player_survival_plan_locked(
     plan: &PlayerSurvivalPlan,
 ) -> CommittedPlayerSurvival {
     let died = !plan.expected_survival.is_dead() && plan.updated_survival.is_dead();
+    let drops_inventory = died
+        && !plan.keep_inventory
+        && matches!(
+            player_state.game_mode,
+            GameMode::Survival | GameMode::Adventure
+        );
     let mut inventory = plan.updated_inventory.clone();
     let mut carried_item = plan.expected_carried_item.clone();
     let mut xp = plan.updated_xp.clone();
     let mut dispatches = Vec::new();
-    if died {
+    if drops_inventory {
         let mut drops = Vec::new();
         for slot in &mut inventory.slots[1..] {
             let stack = std::mem::take(slot);

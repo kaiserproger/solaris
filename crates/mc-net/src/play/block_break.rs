@@ -28,7 +28,6 @@ use super::{
     ScriptGameplayEventPublisher, XpState, air_state_id, commit_player_survival_update,
     schedule_fluid_ticks_for_interaction, splitmix64, start_falling_blocks_after_edits,
     write_block_ack, write_block_resync, write_inventory_slot_updates,
-    write_loaded_block_resync_then_ack,
 };
 
 const VANILLA_STOP_DESTROY_THRESHOLD: f32 = 0.7;
@@ -701,8 +700,7 @@ where
             sequence = action.sequence,
             "block break ignored: target out of reach"
         );
-        return write_loaded_block_resync_then_ack(state, writer, action.position, action.sequence)
-            .await;
+        return write_block_ack(writer, state.compression, action.sequence).await;
     }
 
     match game_mode {

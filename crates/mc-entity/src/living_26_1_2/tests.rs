@@ -43,11 +43,26 @@ fn canonical_sources_match_the_local_26_1_2_damage_type_tags() {
     assert!(fire.contains(DamageFlags::NO_KNOCKBACK));
     assert!(!fire.contains(DamageFlags::BYPASSES_ARMOR));
 
+    let lava = DamageSource::vanilla(DamageSourceKind::Lava).flags();
+    assert!(lava.contains(DamageFlags::IS_FIRE));
+    assert!(lava.contains(DamageFlags::NO_KNOCKBACK));
+    assert!(!lava.contains(DamageFlags::BYPASSES_ARMOR));
+
     let drowning = DamageSource::vanilla(DamageSourceKind::Drowning).flags();
     assert!(drowning.contains(DamageFlags::BYPASSES_ARMOR));
     assert!(drowning.contains(DamageFlags::IS_DROWNING));
     assert!(drowning.contains(DamageFlags::NO_IMPACT));
     assert!(drowning.contains(DamageFlags::NO_KNOCKBACK));
+
+    let suffocation = DamageSource::vanilla(DamageSourceKind::Suffocation).flags();
+    assert!(suffocation.contains(DamageFlags::BYPASSES_ARMOR));
+    assert!(suffocation.contains(DamageFlags::NO_KNOCKBACK));
+    assert!(!suffocation.contains(DamageFlags::BYPASSES_EFFECTS));
+
+    let starvation = DamageSource::vanilla(DamageSourceKind::Starvation).flags();
+    assert!(starvation.contains(DamageFlags::BYPASSES_ARMOR));
+    assert!(starvation.contains(DamageFlags::BYPASSES_EFFECTS));
+    assert!(starvation.contains(DamageFlags::NO_KNOCKBACK));
 
     let void = DamageSource::vanilla(DamageSourceKind::Void).flags();
     assert!(void.contains(DamageFlags::BYPASSES_ARMOR));
@@ -66,6 +81,91 @@ fn canonical_sources_match_the_local_26_1_2_damage_type_tags() {
     let projectile = DamageSource::vanilla(DamageSourceKind::Projectile).flags();
     assert!(projectile.contains(DamageFlags::IS_PROJECTILE));
     assert!(!projectile.contains(DamageFlags::NO_KNOCKBACK));
+}
+
+#[test]
+fn common_damage_sources_share_reduction_and_immunity_boundaries() {
+    let reductions = ReductionContext {
+        armor: 20,
+        armor_toughness: 8.0,
+        armor_effectiveness: ArmorEffectiveness::Unmodified,
+        resistance: None,
+        enchantment: EnchantmentProtection::None,
+    };
+    for (kind, armor_bypassed, no_knockback) in [
+        (DamageSourceKind::Melee, false, false),
+        (DamageSourceKind::Projectile, false, false),
+        (DamageSourceKind::Fire, false, true),
+        (DamageSourceKind::Lava, false, true),
+        (DamageSourceKind::Fall, true, true),
+        (DamageSourceKind::Drowning, true, true),
+        (DamageSourceKind::Suffocation, true, true),
+        (DamageSourceKind::Starvation, true, true),
+    ] {
+        let mut state = alive(20.0, 0.0);
+        let result = applied(apply(
+            &mut state,
+            event(kind, 10.0),
+            DamageContext {
+                reductions,
+                ..DamageContext::default()
+            },
+        ));
+        assert_eq!(result.after_armor == 10.0, armor_bypassed, "{kind:?}");
+        assert_eq!(
+            result.knockback == KnockbackOutcome::None,
+            no_knockback,
+            "{kind:?}"
+        );
+    }
+
+    for kind in [DamageSourceKind::Fire, DamageSourceKind::Lava] {
+        let mut immune = alive(20.0, 0.0);
+        assert_eq!(
+            apply(
+                &mut immune,
+                event(kind, 2.0),
+                DamageContext {
+                    immunity: TargetImmunityContext {
+                        fire_immune: true,
+                        ..TargetImmunityContext::default()
+                    },
+                    ..DamageContext::default()
+                },
+            ),
+            DamageOutcome::Rejected(DamageRejection::FireImmune),
+            "{kind:?}"
+        );
+        let mut resistant = alive(20.0, 0.0);
+        assert_eq!(
+            apply(
+                &mut resistant,
+                event(kind, 2.0),
+                DamageContext {
+                    fire_resistance: true,
+                    ..DamageContext::default()
+                },
+            ),
+            DamageOutcome::Rejected(DamageRejection::FireResistance),
+            "{kind:?}"
+        );
+    }
+
+    let mut fall_immune = alive(20.0, 0.0);
+    assert_eq!(
+        apply(
+            &mut fall_immune,
+            event(DamageSourceKind::Fall, 2.0),
+            DamageContext {
+                immunity: TargetImmunityContext {
+                    fall_damage_immune: true,
+                    ..TargetImmunityContext::default()
+                },
+                ..DamageContext::default()
+            },
+        ),
+        DamageOutcome::Rejected(DamageRejection::FallDamageImmune)
+    );
 }
 
 #[test]

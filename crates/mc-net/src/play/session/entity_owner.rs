@@ -591,6 +591,31 @@ impl EntityOwnerAccess {
         applied
     }
 
+    pub(super) fn merge_item_snapshots_if_current(
+        &mut self,
+        survivor_expected: EntitySnapshot,
+        survivor_next: EntitySnapshot,
+        consumed_expected: EntitySnapshot,
+    ) -> bool {
+        let survivor_id = survivor_expected.id;
+        let consumed_id = consumed_expected.id;
+        #[cfg(test)]
+        self.record_owner_request();
+        let applied = owner_result(self.handle.merge_item_snapshots_if_current(
+            survivor_expected,
+            survivor_next,
+            consumed_expected,
+        ));
+        self.invalidate(survivor_id);
+        if applied {
+            self.observation.record_entity_remove();
+            self.snapshots.borrow_mut().insert(consumed_id, None);
+        } else {
+            self.invalidate(consumed_id);
+        }
+        applied
+    }
+
     pub(super) fn apply_kinematics_authoritative(
         &mut self,
         states: impl IntoIterator<Item = EntityKinematics>,

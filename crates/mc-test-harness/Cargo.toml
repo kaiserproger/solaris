@@ -43,6 +43,7 @@ serde_json = { workspace = true }
 tempfile = "3"
 
 [dev-dependencies]
+flate2 = { workspace = true }
 mc-net = { path = "../mc-net" }
 mc-script = { path = "../mc-script", features = ["lua-runtime"] }
 mc-world = { path = "../mc-world" }

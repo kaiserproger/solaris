@@ -1983,6 +1983,78 @@ mod tests {
         assert!(body.velocity.y < -10.0);
         assert!(!body.on_ground);
     }
+
+    #[test]
+    fn representative_movement_boundary_matrix_uses_step_entity_authority() {
+        #[derive(Clone, Copy)]
+        enum Boundary {
+            StepUp,
+            LongFall,
+            NonFinite,
+        }
+
+        for (name, boundary) in [
+            ("farmland step-up", Boundary::StepUp),
+            ("terminal long fall", Boundary::LongFall),
+            ("non-finite rejection", Boundary::NonFinite),
+        ] {
+            match boundary {
+                Boundary::StepUp => {
+                    let body = EntityBody {
+                        position: Vec3::new(0.5, 63.0 + 15.0 / 16.0, 0.5),
+                        velocity: Vec3::new(20.0, 0.0, 4.0),
+                        aabb: Aabb::COW,
+                        on_ground: true,
+                    };
+                    let result = step_entity(
+                        body,
+                        &FarmlandToFullBlockStepWorld,
+                        PhysicsConfig::living_entity(),
+                    );
+                    assert!(!result.horizontal_collision, "{name}");
+                    assert_eq!(result.body.position.y, 64.0, "{name}");
+                    assert_eq!(result.body.velocity.y, 0.0, "{name}");
+                    assert!(result.body.on_ground, "{name}");
+                }
+                Boundary::LongFall => {
+                    let world = LocalBlocks {
+                        solids: Vec::new(),
+                        fluids: Vec::new(),
+                    };
+                    let mut body = EntityBody {
+                        position: Vec3::new(0.5, 120.0, 0.5),
+                        velocity: Vec3::ZERO,
+                        aabb: Aabb::COW,
+                        on_ground: false,
+                    };
+                    for _ in 0..200 {
+                        body = step_entity(body, &world, PhysicsConfig::default()).body;
+                    }
+                    assert_eq!(
+                        body.velocity.y, TERMINAL_VELOCITY_BLOCKS_PER_SECOND,
+                        "{name} must reach the exact configured clamp"
+                    );
+                    let clamped = step_entity(body, &world, PhysicsConfig::default()).body;
+                    assert_eq!(
+                        clamped.velocity.y, TERMINAL_VELOCITY_BLOCKS_PER_SECOND,
+                        "{name} must remain at the clamp on the next step"
+                    );
+                    assert!(!clamped.on_ground, "{name}");
+                }
+                Boundary::NonFinite => {
+                    let body = EntityBody {
+                        position: Vec3::new(0.5, 64.0, 0.5),
+                        velocity: Vec3::new(f64::NAN, 0.0, 0.0),
+                        aabb: Aabb::COW,
+                        on_ground: true,
+                    };
+                    let result = step_entity(body, &PanicSampler, PhysicsConfig::default());
+                    assert_eq!(result.body.position, body.position, "{name}");
+                    assert_eq!(result.body.velocity, Vec3::ZERO, "{name}");
+                }
+            }
+        }
+    }
 }
 
 #[cfg(test)]

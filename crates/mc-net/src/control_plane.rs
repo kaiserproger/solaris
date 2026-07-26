@@ -379,7 +379,7 @@ impl AutoscalePolicy {
             AutoscaleProfile::HighEnd => Self {
                 profile,
                 min_view_distance: 8,
-                max_view_distance: 12,
+                max_view_distance: 32,
                 min_chunk_send_rate: 16,
                 max_chunk_send_rate: 32,
                 min_chunk_load_rate: 32,
@@ -2340,6 +2340,50 @@ mod tests {
 
         assert_eq!(policy.min_view_distance, 4);
         assert_eq!(policy.max_view_distance, 32);
+    }
+
+    #[test]
+    fn high_end_profile_scales_view_distance_between_eight_and_thirty_two() {
+        let policy = AutoscalePolicy {
+            scale_down_after_ticks: 1,
+            scale_up_after_ticks: 1,
+            ..AutoscalePolicy::for_profile(AutoscaleProfile::HighEnd)
+        };
+        assert_eq!(policy.min_view_distance, 8);
+        assert_eq!(policy.max_view_distance, 32);
+
+        let mut controller = RuntimeControlPlane::new(
+            policy,
+            RuntimeControlLimits {
+                view_distance: 32,
+                chunk_send_rate: 32,
+                chunk_load_rate: 96,
+                chunk_generate_rate: 64,
+            },
+        );
+        let pressured = RuntimeControlInput {
+            tick_ms: 51,
+            memory_used_mb: 512,
+            memory_limit_mb: 4096,
+        };
+        for expected in (8..32).rev() {
+            let decision = controller.observe(pressured);
+            assert_eq!(decision.action, AutoscaleAction::ScaleDown);
+            assert_eq!(decision.pressure, Some(AutoscalePressure::TickTime));
+            assert_eq!(decision.limits.view_distance, expected);
+        }
+        let floor = controller.observe(pressured);
+        assert_eq!(floor.action, AutoscaleAction::Hold);
+        assert_eq!(floor.limits.view_distance, 8);
+
+        for expected in 9..=32 {
+            let decision = controller.observe(healthy_input());
+            assert_eq!(decision.action, AutoscaleAction::ScaleUp);
+            assert_eq!(decision.limits.view_distance, expected);
+        }
+        let ceiling = controller.observe(healthy_input());
+        assert_eq!(ceiling.action, AutoscaleAction::Hold);
+        assert_eq!(ceiling.limits.view_distance, 32);
     }
 
     #[test]

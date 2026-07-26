@@ -70,6 +70,8 @@ pub struct ItemFacts {
     pub equippable_slot: Option<String>,
     pub weapon: bool,
     pub weapon_damage_per_attack: Option<u32>,
+    pub weapon_disable_blocking_seconds: Option<f32>,
+    pub blocks_attacks_disable_cooldown_scale: Option<f32>,
     pub attack_damage_modifier: Option<f32>,
     pub attack_speed_modifier: Option<f32>,
     pub attack_range: Option<AttackRangeFacts>,
@@ -205,6 +207,8 @@ struct RawComponents {
     equippable: Option<RawEquippable>,
     #[serde(rename = "minecraft:weapon")]
     weapon: Option<RawWeapon>,
+    #[serde(rename = "minecraft:blocks_attacks")]
+    blocks_attacks: Option<RawBlocksAttacks>,
     #[serde(rename = "minecraft:attack_range")]
     attack_range: Option<RawAttackRange>,
     #[serde(default, rename = "minecraft:attribute_modifiers")]
@@ -221,6 +225,7 @@ impl RawItemComponents {
             tool,
             equippable,
             weapon,
+            blocks_attacks,
             attack_range,
             attribute_modifiers,
         } = self.components;
@@ -264,7 +269,15 @@ impl RawItemComponents {
             tool: tool.map(RawTool::into_facts),
             equippable_slot: equippable.map(|raw| raw.slot),
             weapon: weapon.is_some(),
-            weapon_damage_per_attack: weapon.map(|raw| raw.item_damage_per_attack.unwrap_or(1)),
+            weapon_damage_per_attack: weapon
+                .as_ref()
+                .map(|raw| raw.item_damage_per_attack.unwrap_or(1)),
+            weapon_disable_blocking_seconds: weapon
+                .as_ref()
+                .and_then(|raw| raw.disable_blocking_for_seconds),
+            blocks_attacks_disable_cooldown_scale: blocks_attacks
+                .as_ref()
+                .map(|raw| raw.disable_cooldown_scale.unwrap_or(1.0)),
             attack_damage_modifier,
             attack_speed_modifier,
             attack_range: attack_range.map(RawAttackRange::into_facts),
@@ -288,6 +301,8 @@ struct RawEmbeddedItemFacts {
     use_action: Option<RawEmbeddedUseAction>,
     weapon: Option<bool>,
     weapon_damage_per_attack: Option<u32>,
+    weapon_disable_blocking_seconds: Option<f32>,
+    blocks_attacks_disable_cooldown_scale: Option<f32>,
     attack_damage_modifier: Option<f32>,
     attack_speed_modifier: Option<f32>,
     attack_range: Option<RawAttackRange>,
@@ -306,6 +321,8 @@ impl RawEmbeddedItemFacts {
             equippable_slot: None,
             weapon: self.weapon.unwrap_or(false),
             weapon_damage_per_attack: self.weapon_damage_per_attack,
+            weapon_disable_blocking_seconds: self.weapon_disable_blocking_seconds,
+            blocks_attacks_disable_cooldown_scale: self.blocks_attacks_disable_cooldown_scale,
             attack_damage_modifier: self.attack_damage_modifier,
             attack_speed_modifier: self.attack_speed_modifier,
             attack_range: self.attack_range.map(RawAttackRange::into_facts),
@@ -395,6 +412,12 @@ struct RawEquippable {
 #[derive(Deserialize)]
 struct RawWeapon {
     item_damage_per_attack: Option<u32>,
+    disable_blocking_for_seconds: Option<f32>,
+}
+
+#[derive(Deserialize)]
+struct RawBlocksAttacks {
+    disable_cooldown_scale: Option<f32>,
 }
 
 #[derive(Deserialize)]
@@ -717,6 +740,23 @@ mod tests {
     }
 
     #[test]
+    fn embedded_required_item_facts_cover_shield_disable_contract() {
+        let facts = solaris_required_item_facts();
+        for id in ["minecraft:wooden_axe", "minecraft:stone_axe"] {
+            let fact = facts
+                .get(&Identifier::parse(id).unwrap())
+                .unwrap_or_else(|| panic!("missing {id}"));
+            assert_eq!(fact.weapon_disable_blocking_seconds, Some(5.0), "{id}");
+        }
+        let shield = facts
+            .get(&Identifier::parse("minecraft:shield").unwrap())
+            .expect("embedded shield facts");
+        assert_eq!(shield.max_damage, Some(336));
+        assert_eq!(shield.max_stack_size, Some(1));
+        assert_eq!(shield.blocks_attacks_disable_cooldown_scale, Some(1.0));
+    }
+
+    #[test]
     fn embedded_required_item_facts_cover_playable_cooked_food() {
         let facts = solaris_required_item_facts();
         for (id, food, saturation) in [
@@ -825,7 +865,13 @@ mod tests {
             .unwrap();
         assert!(axe.weapon);
         assert_eq!(axe.weapon_damage_per_attack, Some(2));
+        assert_eq!(axe.weapon_disable_blocking_seconds, Some(5.0));
         assert_eq!(axe.attack_damage_modifier, Some(8.0));
+
+        let shield = facts
+            .get(&Identifier::parse("minecraft:shield").unwrap())
+            .unwrap();
+        assert_eq!(shield.blocks_attacks_disable_cooldown_scale, Some(1.0));
 
         let bow = facts
             .get(&Identifier::parse("minecraft:bow").unwrap())

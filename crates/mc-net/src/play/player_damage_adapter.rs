@@ -1,5 +1,7 @@
+use mc_data::block_facts::FluidKind;
 use mc_protocol::frame::Compression;
 use mc_protocol::packets::play::{EntityVec3, GameMode, ItemStack};
+use mc_world::BlockPos;
 use tokio::io::AsyncWriteExt;
 use tracing::debug;
 
@@ -16,7 +18,8 @@ use super::{
     InteractionState, PlayerPose, PlayerSurvivalUpdateOutcome, clear_shield_use,
     commit_player_survival_update, commit_player_survival_update_with_shield,
     finish_committed_shield_damage, plan_active_shield_damage, player_body_block_snapshot,
-    refresh_shield_use_state, shield_blocks_current_damage, survival_damage_after_equipment,
+    player_pose_collides_with_solid, refresh_shield_use_state, shield_blocks_current_damage,
+    survival_damage_after_equipment,
 };
 
 pub(super) async fn apply_fall_damage<W>(
@@ -85,17 +88,16 @@ where
     let Some(state) = state else {
         return Ok(());
     };
-    if !touching_lit_campfire(state, player_pose).await {
+    let Some((amount, kind)) = contact_block_damage(state, player_pose).await else {
         return Ok(());
-    }
+    };
 
     let expected_inventory = state.inventory.clone();
-    let applied_damage =
-        survival_damage_after_equipment(Some(state), 1.0, PlayerDamageKind::Campfire);
+    let applied_damage = survival_damage_after_equipment(Some(state), amount, kind);
     let mut updated_survival = *survival_state;
     updated_survival.apply_damage(applied_damage);
-    if PlayerDamageKind::Campfire.damages_armor() {
-        damage_equipped_armor(state, 1.0);
+    if kind.damages_armor() {
+        damage_equipped_armor(state, amount);
     }
     commit_player_survival_update(
         state,
@@ -113,10 +115,49 @@ where
     Ok(())
 }
 
-async fn touching_lit_campfire(state: &InteractionState, player_pose: PlayerPose) -> bool {
+pub(super) async fn contact_block_damage(
+    state: &InteractionState,
+    player_pose: PlayerPose,
+) -> Option<(f32, PlayerDamageKind)> {
+    if player_pose_collides_with_solid(Some(state), player_pose).await {
+        return Some((1.0, PlayerDamageKind::Suffocation));
+    }
+
     let half_width = 0.301;
     let snapshot = player_body_block_snapshot(state, player_pose, half_width);
+    let min_x = (player_pose.x - half_width).floor() as i32;
+    let max_x = (player_pose.x + half_width).floor() as i32;
+    let min_y = player_pose.y.floor() as i32;
+    let max_y = (player_pose.y + player_pose.body_height() - 1.0e-6).floor() as i32;
+    let min_z = (player_pose.z - half_width).floor() as i32;
+    let max_z = (player_pose.z + half_width).floor() as i32;
+    for x in min_x..=max_x {
+        for y in min_y..=max_y {
+            for z in min_z..=max_z {
+                let Some(state_id) = snapshot.get_cached_block(BlockPos { x, y, z }) else {
+                    continue;
+                };
+                if state
+                    .block_facts
+                    .fluid(state_id.0)
+                    .is_some_and(|fluid| fluid.kind == FluidKind::Lava)
+                {
+                    return Some((4.0, PlayerDamageKind::Lava));
+                }
+                let Some(block_state) = state.blocks.by_id(state_id) else {
+                    continue;
+                };
+                if matches!(
+                    block_state.block.id.as_str(),
+                    "minecraft:fire" | "minecraft:soul_fire"
+                ) {
+                    return Some((1.0, PlayerDamageKind::Fire));
+                }
+            }
+        }
+    }
     player_touches_lit_campfire_in_snapshot(&state.blocks, &snapshot, player_pose)
+        .then_some((1.0, PlayerDamageKind::Campfire))
 }
 
 pub(super) fn player_melee_knockback(knockback: MeleeKnockback) -> EntityVec3 {
@@ -130,6 +171,7 @@ pub(super) struct AppliedPlayerDamagePublication {
     pub(super) xp_changed: bool,
     pub(super) died: bool,
     pub(super) fresh_hurt: bool,
+    pub(super) shield_cooldown: Option<super::session::ShieldCooldownPublication>,
     pub(super) knockback: Option<MeleeKnockback>,
 }
 
@@ -141,6 +183,7 @@ pub(super) fn apply_player_damage_publication(
 ) -> AppliedPlayerDamagePublication {
     let old_survival = *survival_state;
     let old_xp = xp_state.clone();
+    let shield_cooldown = publication.shield_cooldown.clone();
     let health_accepted = survival_state.health == publication.expected_health;
     if health_accepted {
         survival_state.health = publication.health;
@@ -172,7 +215,11 @@ pub(super) fn apply_player_damage_publication(
         {
             shield.stack = state.inventory.slots[shield.slot].clone();
         }
-        refresh_shield_use_state(state);
+        if shield_cooldown.is_some() {
+            clear_shield_use(state);
+        } else {
+            refresh_shield_use_state(state);
+        }
         if health_accepted && publication.died {
             state.pending_break = None;
             state.pending_use = None;
@@ -186,6 +233,7 @@ pub(super) fn apply_player_damage_publication(
         xp_changed: old_xp != *xp_state,
         died: health_accepted && publication.died,
         fresh_hurt: health_accepted && publication.fresh_hurt,
+        shield_cooldown,
         knockback: health_accepted.then_some(publication.knockback).flatten(),
     }
 }
@@ -212,7 +260,9 @@ where
         request,
     } = damage;
     if matches!(game_mode, GameMode::Creative | GameMode::Spectator)
+        || !request.amount.is_finite()
         || request.amount <= 0.0
+        || !request.kind.is_supported()
         || survival_state.is_dead()
     {
         return Ok(false);
@@ -296,4 +346,93 @@ where
         write_packet(writer, &survival_state.as_packet(), compression).await?;
     }
     Ok(applied_damage > 0.0)
+}
+
+#[cfg(test)]
+mod tests {
+    use bytes::BytesMut;
+    use mc_protocol::frame::try_decode_frame;
+    use mc_protocol::packets::Packet;
+    use mc_protocol::packets::play::ClientboundSetHealth;
+
+    use super::{
+        Compression, GameMode, PlayerDamageApplication, PlayerDamageKind, PlayerDamageRequest,
+        PlayerPose, SurvivalState, XpState, apply_player_damage,
+    };
+
+    #[tokio::test]
+    async fn common_environmental_damage_writes_health_and_invalid_sources_fail_closed() {
+        for kind in [
+            PlayerDamageKind::Fire,
+            PlayerDamageKind::Lava,
+            PlayerDamageKind::Drowning,
+            PlayerDamageKind::Suffocation,
+            PlayerDamageKind::Starvation,
+        ] {
+            let mut writer = Vec::new();
+            let mut survival = SurvivalState::FULL;
+            let mut xp = XpState::default();
+            assert!(
+                apply_player_damage(
+                    None,
+                    &mut writer,
+                    Compression::Disabled,
+                    &mut survival,
+                    &mut xp,
+                    GameMode::Survival,
+                    PlayerDamageApplication {
+                        player_pose: PlayerPose::new(0.5, 64.0, 0.5),
+                        request: PlayerDamageRequest {
+                            kind,
+                            amount: 2.0,
+                            source_origin: None,
+                        },
+                    },
+                )
+                .await
+                .expect("environmental damage adapter")
+            );
+            assert_eq!(survival.health, 18.0, "{kind:?}");
+            let mut bytes = BytesMut::from(writer.as_slice());
+            let mut frame = try_decode_frame(&mut bytes, Compression::Disabled)
+                .expect("complete health frame")
+                .expect("health frame");
+            assert_eq!(frame.id, ClientboundSetHealth::ID, "{kind:?}");
+            let packet = ClientboundSetHealth::decode(&mut frame.body).expect("decode health");
+            assert_eq!(packet.health, 18.0, "{kind:?}");
+            assert!(bytes.is_empty(), "{kind:?} emitted an extra packet");
+        }
+
+        for (kind, amount) in [
+            (PlayerDamageKind::Generic, f32::NAN),
+            (PlayerDamageKind::Generic, f32::INFINITY),
+            (PlayerDamageKind::Unsupported, 2.0),
+        ] {
+            let mut writer = Vec::new();
+            let mut survival = SurvivalState::FULL;
+            let mut xp = XpState::default();
+            assert!(
+                !apply_player_damage(
+                    None,
+                    &mut writer,
+                    Compression::Disabled,
+                    &mut survival,
+                    &mut xp,
+                    GameMode::Survival,
+                    PlayerDamageApplication {
+                        player_pose: PlayerPose::new(0.5, 64.0, 0.5),
+                        request: PlayerDamageRequest {
+                            kind,
+                            amount,
+                            source_origin: None,
+                        },
+                    },
+                )
+                .await
+                .expect("invalid damage adapter rejection")
+            );
+            assert_eq!(survival, SurvivalState::FULL);
+            assert!(writer.is_empty());
+        }
+    }
 }

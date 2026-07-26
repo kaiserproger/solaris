@@ -162,7 +162,14 @@ pub(in crate::play) struct PlayerDamagePublication {
     pub(in crate::play) died: bool,
     pub(in crate::play) fresh_hurt: bool,
     pub(in crate::play) shield_blocked: bool,
+    pub(in crate::play) shield_cooldown: Option<ShieldCooldownPublication>,
     pub(in crate::play) knockback: Option<MeleeKnockback>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(in crate::play) struct ShieldCooldownPublication {
+    pub(in crate::play) cooldown_group: mc_data::Identifier,
+    pub(in crate::play) duration: i32,
 }
 
 #[derive(Debug)]

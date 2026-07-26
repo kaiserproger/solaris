@@ -44,20 +44,21 @@ use mc_protocol::packets::play::{
     AGEABLE_ENTITY_DATA_BABY_INDEX, AddEntity, BlockChangedAck, BlockEntityInfo, BlockUpdate,
     ChunkHeightmap, ClientboundBlockEntityData, ClientboundChangeDifficulty,
     ClientboundCommandSuggestions, ClientboundContainerClose, ClientboundContainerSetContent,
-    ClientboundContainerSetData, ClientboundContainerSetSlot, ClientboundCustomPayload,
-    ClientboundInitializeBorder, ClientboundKeepAlive, ClientboundOpenScreen,
-    ClientboundRecipeBookSettings, ClientboundRespawn, ClientboundSetEntityData,
-    ClientboundSetExperience, ClientboundSetHealth, ClientboundSetHeldSlot, ClientboundSystemChat,
-    ClientboundTakeItemEntity, ConfirmTeleportation, ContainerInput, Direction,
-    ENTITY_DATA_POSE_INDEX, ENTITY_DATA_SHARED_FLAGS_INDEX, EntityAnimation, EntityAnimationAction,
-    EntityDataValue, EntityEvent, EntityPose, EntityPositionSync, EntityVec3, ForgetLevelChunk,
-    GameEvent, GameMode, HashedStack, ITEM_ENTITY_DATA_ITEM_INDEX, InteractionHand, ItemStack,
-    LIVING_ENTITY_DATA_FLAGS_INDEX, LevelChunkWithLight, LevelEvent, LightData, LightUpdate,
-    LoginPlay, MoveEntityPosRot, MovePlayerFlags, PlayDisconnect, PlayerActionKind,
-    PlayerCommandAction, PlayerInfoActions, PlayerInfoEntry, PlayerInfoRemove, PlayerInfoUpdate,
-    PlayerInput, PositionMoveRotation, RemoveEntities, RotateHead, SHEEP_ENTITY_DATA_WOOL_INDEX,
-    SectionBlockChange, SectionBlocksUpdate, ServerboundAttack, ServerboundChangeGameMode,
-    ServerboundChat, ServerboundChatAck, ServerboundChatCommand, ServerboundChunkBatchReceived,
+    ClientboundContainerSetData, ClientboundContainerSetSlot, ClientboundCooldown,
+    ClientboundCustomPayload, ClientboundInitializeBorder, ClientboundKeepAlive,
+    ClientboundOpenScreen, ClientboundRecipeBookSettings, ClientboundRespawn,
+    ClientboundSetEntityData, ClientboundSetExperience, ClientboundSetHealth,
+    ClientboundSetHeldSlot, ClientboundSystemChat, ClientboundTakeItemEntity, ConfirmTeleportation,
+    ContainerInput, Direction, ENTITY_DATA_POSE_INDEX, ENTITY_DATA_SHARED_FLAGS_INDEX,
+    EntityAnimation, EntityAnimationAction, EntityDataValue, EntityEvent, EntityPose,
+    EntityPositionSync, EntityVec3, ForgetLevelChunk, GameEvent, GameMode, HashedStack,
+    ITEM_ENTITY_DATA_ITEM_INDEX, InteractionHand, ItemStack, LIVING_ENTITY_DATA_FLAGS_INDEX,
+    LevelChunkWithLight, LevelEvent, LightData, LightUpdate, LoginPlay, MoveEntityPosRot,
+    MovePlayerFlags, PlayDisconnect, PlayerActionKind, PlayerCommandAction, PlayerInfoActions,
+    PlayerInfoEntry, PlayerInfoRemove, PlayerInfoUpdate, PlayerInput, PositionMoveRotation,
+    RemoveEntities, RotateHead, SHEEP_ENTITY_DATA_WOOL_INDEX, SectionBlockChange,
+    SectionBlocksUpdate, ServerboundAttack, ServerboundChangeGameMode, ServerboundChat,
+    ServerboundChatAck, ServerboundChatCommand, ServerboundChunkBatchReceived,
     ServerboundClientCommand, ServerboundClientInformation, ServerboundClientTickEnd,
     ServerboundCommandSuggestion, ServerboundContainerButtonClick, ServerboundContainerClick,
     ServerboundContainerClose, ServerboundCustomPayload, ServerboundInteract, ServerboundKeepAlive,
@@ -322,8 +323,8 @@ use containers::{
     ScriptMenuWindow, StonecutterClickAction, StonecutterClickInput, StonecutterWindow,
     adjacent_chest_positions,
     can_place_in_enchanting_menu_slot as can_place_in_enchanting_menu_slot_with_data,
-    chest_menu_title_nbt, chest_slot_stacks, chest_wire_items, client_close_matches,
-    count_valid_enchanting_bookshelves, crafting_menu_title_nbt,
+    chest_menu_state_change_count, chest_menu_title_nbt, chest_slot_stacks, chest_wire_items,
+    client_close_matches, count_valid_enchanting_bookshelves, crafting_menu_title_nbt,
     crafting_table_input_from_projection, crafting_table_input_projection, crafting_wire_items,
     enchant_item_candidate, enchanting_data_values, enchanting_menu_stack,
     enchanting_menu_title_nbt, enchanting_offer, enchanting_player_slot,
@@ -791,7 +792,7 @@ fn world_time_advance_crosses_night_start(world_time: u64, ticks: u64) -> bool {
     ticks >= ticks_until_night
 }
 const ENTITY_HURT_INVULNERABLE_TICKS: u64 = 6;
-const ITEM_DESPAWN_AGE_TICKS: u64 = 6_000;
+pub const ITEM_DESPAWN_AGE_TICKS: u64 = 6_000;
 const ITEM_DESPAWN_SWEEP_BUDGET: usize = 256;
 const ARROW_ENTITY_HIT_DAMAGE: f32 = 4.0;
 const ARROW_ENTITY_HIT_KNOCKBACK: f64 = 0.6;
@@ -803,6 +804,9 @@ fn survival_damage_after_equipment(
     amount: f32,
     kind: PlayerDamageKind,
 ) -> f32 {
+    if !amount.is_finite() || !kind.is_supported() {
+        return 0.0;
+    }
     let damage = if kind.uses_armor() {
         survival_damage_after_armor(state, amount)
     } else {
@@ -2397,6 +2401,30 @@ where
     Ok(true)
 }
 
+fn crafting_menu_state_change_count(
+    before_window: &CraftingTableWindow,
+    after_window: &CraftingTableWindow,
+    before_inventory: &PlayerInventory,
+    after_inventory: &PlayerInventory,
+    before_carried: &ItemStack,
+    after_carried: &ItemStack,
+) -> i32 {
+    let result_changes = usize::from(before_window.result != after_window.result);
+    let input_changes = before_window
+        .input
+        .iter()
+        .zip(&after_window.input)
+        .filter(|(before, after)| before != after)
+        .count();
+    let inventory_changes = (9..=44)
+        .filter(|slot| before_inventory.slots[*slot] != after_inventory.slots[*slot])
+        .count();
+    let carried_changes = usize::from(before_carried != after_carried);
+    i32::try_from(result_changes + input_changes + inventory_changes + carried_changes)
+        .unwrap_or(i32::MAX)
+        .max(1)
+}
+
 async fn handle_crafting_container_click<W>(
     state: &mut InteractionState,
     writer: &mut W,
@@ -2530,6 +2558,14 @@ where
         write_crafting_content(state, writer, &window).await?;
         return Ok(window);
     }
+    let state_id_increment = crafting_menu_state_change_count(
+        &before_window,
+        &window,
+        &before_inventory,
+        &state.inventory,
+        &before_carried_item,
+        &state.carried_item,
+    );
     let crafted = crafted_result.as_ref().and_then(|result| {
         if quick_moved_result {
             crafted_item_from_inventory_delta(result, &before_inventory, &state.inventory)
@@ -2561,7 +2597,7 @@ where
                 )
                 .await;
         }
-        window.state_id = window.state_id.wrapping_add(1);
+        window.state_id = window.state_id.wrapping_add(state_id_increment);
     }
     write_crafting_content(state, writer, &window).await?;
     Ok(window)
@@ -4744,6 +4780,7 @@ where
             enchanting_table_input,
             item_entity_type_id: item_entity_type_id(&state.entity_types),
             xp_orb_entity_type_id: xp_orb_entity_type_id(&state.entity_types),
+            keep_inventory: state.sessions.keep_inventory(),
             position: Vec3::new(player_pose.x, player_pose.y, player_pose.z),
         })
         .await
@@ -4831,6 +4868,14 @@ async fn commit_chest_click(
 ) -> Result<ChestCommitOutcome, ConnectionError> {
     #[cfg(test)]
     {
+        let state_id_increment = chest_menu_state_change_count(
+            expected,
+            updated,
+            &player.expected_inventory,
+            &player.updated_inventory,
+            &player.expected_carried_item,
+            &player.updated_carried_item,
+        );
         let mut storage = state.world.lock().await;
         let mut authoritative = Vec::with_capacity(window.positions.len());
         for &position in &window.positions {
@@ -4855,6 +4900,7 @@ async fn commit_chest_click(
         let (state_id, dispatches) = match state.sessions.try_chest_slot_dispatches(
             window.position(),
             window.state_id,
+            state_id_increment,
             state.session_id,
             chest_slot_stacks(updated),
         ) {
@@ -6645,6 +6691,7 @@ fn player_attack_cost_plan(
         enchanting_table_input: None,
         item_entity_type_id: None,
         xp_orb_entity_type_id: None,
+        keep_inventory: false,
         position: Vec3::new(player_pose.x, player_pose.y, player_pose.z),
     })
 }
@@ -6954,13 +7001,20 @@ fn start_shield_use(
         PlayerInventory::OFFHAND_SLOT,
     );
     let stack = state.inventory.slots[slot].clone();
-    let Some(shield_use) = shield_use_from_stack(
-        hand,
-        slot,
-        stack,
-        state.sessions.world_time(),
-        stack_is_shield(&state.items, &state.inventory.slots[slot]),
-    ) else {
+    let is_shield = stack_is_shield(&state.items, &stack);
+    if !is_shield {
+        return false;
+    }
+    if state
+        .sessions
+        .shield_disable_remaining_ticks(state.session_id, state.sessions.simulation_tick())
+        .is_some()
+    {
+        return true;
+    }
+    let Some(shield_use) =
+        shield_use_from_stack(hand, slot, stack, state.sessions.world_time(), true)
+    else {
         return false;
     };
     state.pending_break = None;
@@ -12273,6 +12327,17 @@ where
                         }
                         if applied.xp_changed {
                             write_packet(writer, &xp_state.as_packet(), compression).await?;
+                        }
+                        if let Some(cooldown) = applied.shield_cooldown {
+                            write_packet(
+                                writer,
+                                &ClientboundCooldown {
+                                    cooldown_group: cooldown.cooldown_group,
+                                    duration: cooldown.duration,
+                                },
+                                compression,
+                            )
+                            .await?;
                         }
                         if let Some(knockback) = applied.knockback {
                             write_packet(

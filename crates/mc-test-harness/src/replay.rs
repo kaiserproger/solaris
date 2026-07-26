@@ -10,10 +10,395 @@ use crate::parity::{
 
 pub const REPLAY_SCENARIO_SCHEMA: &str = "solaris.core_replay.scenario.v1";
 pub const REPLAY_RESULT_SCHEMA: &str = "solaris.core_replay.result.v1";
+pub const CORE_GATE_MANIFEST_SCHEMA: &str = "solaris.core_gate.manifest.v1";
+pub const BLOCK_TRANSACTION_ORACLE_SCHEMA: &str = "solaris.block_transaction.oracle.v1";
+pub const CONTAINER_STATE_ORACLE_SCHEMA: &str = "solaris.container_state.oracle.v1";
 
 const MAX_REPLAY_ACTIONS: usize = 10_000;
 const MAX_REPLAY_CHECKS: usize = 128;
 const MAX_CONCURRENT_GROUP_REPETITIONS: u16 = 1_000;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum BlockTransactionOracleCase {
+    AcceptedBreak,
+    AcceptedPlace,
+    OccupiedPlaceRejection,
+    OutOfReachBreakRejection,
+    EarlyStopBreakRejection,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct BlockTransactionOraclePhase {
+    pub id: String,
+    pub case: BlockTransactionOracleCase,
+    pub sequence: i32,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct BlockTransactionOracleManifest {
+    pub schema: String,
+    pub id: String,
+    pub phases: Vec<BlockTransactionOraclePhase>,
+}
+
+impl BlockTransactionOracleManifest {
+    pub fn from_json(input: &str) -> Result<Self> {
+        let manifest: Self =
+            serde_json::from_str(input).context("parse block transaction oracle manifest JSON")?;
+        manifest.validate()?;
+        Ok(manifest)
+    }
+
+    pub fn to_pretty_json(&self) -> Result<String> {
+        self.validate()?;
+        serde_json::to_string_pretty(self)
+            .context("serialize block transaction oracle manifest JSON")
+    }
+
+    pub fn validate(&self) -> Result<()> {
+        ensure!(
+            self.schema == BLOCK_TRANSACTION_ORACLE_SCHEMA,
+            "unsupported block transaction oracle schema: {}",
+            self.schema
+        );
+        validate_identifier("block transaction oracle id", &self.id)?;
+        ensure!(
+            self.phases.len() == 5,
+            "block transaction oracle must declare exactly five focused phases"
+        );
+        let mut ids = BTreeSet::new();
+        let mut sequences = BTreeSet::new();
+        let mut cases = BTreeSet::new();
+        for phase in &self.phases {
+            validate_identifier("block transaction phase id", &phase.id)?;
+            ensure!(
+                ids.insert(phase.id.as_str()),
+                "duplicate block transaction phase id: {}",
+                phase.id
+            );
+            ensure!(
+                phase.sequence > 0,
+                "block transaction phase {} has non-positive sequence",
+                phase.id
+            );
+            ensure!(
+                sequences.insert(phase.sequence),
+                "duplicate block transaction sequence: {}",
+                phase.sequence
+            );
+            ensure!(
+                cases.insert(phase.case),
+                "duplicate block transaction oracle case: {:?}",
+                phase.case
+            );
+        }
+        let required = BTreeSet::from([
+            BlockTransactionOracleCase::AcceptedBreak,
+            BlockTransactionOracleCase::AcceptedPlace,
+            BlockTransactionOracleCase::OccupiedPlaceRejection,
+            BlockTransactionOracleCase::OutOfReachBreakRejection,
+            BlockTransactionOracleCase::EarlyStopBreakRejection,
+        ]);
+        ensure!(
+            cases == required,
+            "block transaction oracle phases do not cover the required case matrix"
+        );
+        Ok(())
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case", deny_unknown_fields)]
+pub enum BlockTransactionOracleEvent {
+    TargetUpdate { state_id: i32 },
+    Ack { sequence: i32 },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct BlockTransactionOracleTrace {
+    pub manifest_id: String,
+    pub phases: Vec<BlockTransactionOraclePhaseTrace>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct BlockTransactionOraclePhaseTrace {
+    pub id: String,
+    pub events: Vec<BlockTransactionOracleEvent>,
+}
+
+impl BlockTransactionOracleTrace {
+    pub fn validate_against(&self, manifest: &BlockTransactionOracleManifest) -> Result<()> {
+        manifest.validate()?;
+        ensure!(
+            self.manifest_id == manifest.id,
+            "block transaction trace manifest id {} does not match {}",
+            self.manifest_id,
+            manifest.id
+        );
+        ensure!(
+            self.phases.len() == manifest.phases.len(),
+            "block transaction trace phase count does not match manifest"
+        );
+        for (expected, actual) in manifest.phases.iter().zip(&self.phases) {
+            ensure!(
+                actual.id == expected.id,
+                "block transaction trace phase order/id mismatch: expected {}, got {}",
+                expected.id,
+                actual.id
+            );
+            ensure!(
+                !actual.events.is_empty(),
+                "block transaction trace phase {} has no events",
+                actual.id
+            );
+            let ack_index = actual
+                .events
+                .iter()
+                .position(|event| matches!(event, BlockTransactionOracleEvent::Ack { sequence } if *sequence == expected.sequence))
+                .with_context(|| format!("block transaction phase {} has no matching ack", actual.id))?;
+            if matches!(
+                expected.case,
+                BlockTransactionOracleCase::OccupiedPlaceRejection
+            ) {
+                ensure!(
+                    actual.events[..ack_index].iter().any(|event| matches!(
+                        event,
+                        BlockTransactionOracleEvent::TargetUpdate { .. }
+                    )),
+                    "rejected block transaction phase {} has no authoritative resync before ack",
+                    actual.id
+                );
+            }
+            ensure!(
+                actual.events[ack_index + 1..]
+                    .iter()
+                    .all(|event| !matches!(event, BlockTransactionOracleEvent::Ack { sequence } if *sequence == expected.sequence)),
+                "block transaction phase {} repeats its ack",
+                actual.id
+            );
+        }
+        Ok(())
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ContainerStateOracleMenu {
+    Chest,
+    CraftingTable,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ContainerStateOracleCase {
+    ChestInitial,
+    ChestQuickMoveIn,
+    ChestStaleClick,
+    ChestQuickMoveOut,
+    ChestReopen,
+    CraftInitial,
+    CraftPrepared,
+    CraftQuickMove,
+    CraftStaleClick,
+    CraftReopen,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ContainerStateOraclePhase {
+    pub id: String,
+    pub menu: ContainerStateOracleMenu,
+    pub case: ContainerStateOracleCase,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ContainerStateOracleManifest {
+    pub schema: String,
+    pub id: String,
+    pub phases: Vec<ContainerStateOraclePhase>,
+}
+
+impl ContainerStateOracleManifest {
+    pub fn from_json(input: &str) -> Result<Self> {
+        let manifest: Self =
+            serde_json::from_str(input).context("parse container state oracle manifest JSON")?;
+        manifest.validate()?;
+        Ok(manifest)
+    }
+
+    pub fn to_pretty_json(&self) -> Result<String> {
+        self.validate()?;
+        serde_json::to_string_pretty(self).context("serialize container state oracle manifest JSON")
+    }
+
+    pub fn validate(&self) -> Result<()> {
+        ensure!(
+            self.schema == CONTAINER_STATE_ORACLE_SCHEMA,
+            "unsupported container state oracle schema: {}",
+            self.schema
+        );
+        validate_identifier("container state oracle id", &self.id)?;
+        ensure!(
+            self.phases.len() == 10,
+            "container state oracle must declare exactly ten focused phases"
+        );
+        let mut ids = BTreeSet::new();
+        let mut cases = BTreeSet::new();
+        for phase in &self.phases {
+            validate_identifier("container state phase id", &phase.id)?;
+            ensure!(
+                ids.insert(phase.id.as_str()),
+                "duplicate container state phase id: {}",
+                phase.id
+            );
+            ensure!(
+                cases.insert(phase.case),
+                "duplicate container state oracle case: {:?}",
+                phase.case
+            );
+            let expected_menu = match phase.case {
+                ContainerStateOracleCase::ChestInitial
+                | ContainerStateOracleCase::ChestQuickMoveIn
+                | ContainerStateOracleCase::ChestStaleClick
+                | ContainerStateOracleCase::ChestQuickMoveOut
+                | ContainerStateOracleCase::ChestReopen => ContainerStateOracleMenu::Chest,
+                ContainerStateOracleCase::CraftInitial
+                | ContainerStateOracleCase::CraftPrepared
+                | ContainerStateOracleCase::CraftQuickMove
+                | ContainerStateOracleCase::CraftStaleClick
+                | ContainerStateOracleCase::CraftReopen => ContainerStateOracleMenu::CraftingTable,
+            };
+            ensure!(
+                phase.menu == expected_menu,
+                "container state phase {} has menu {:?}, expected {:?}",
+                phase.id,
+                phase.menu,
+                expected_menu
+            );
+        }
+        let required = BTreeSet::from([
+            ContainerStateOracleCase::ChestInitial,
+            ContainerStateOracleCase::ChestQuickMoveIn,
+            ContainerStateOracleCase::ChestStaleClick,
+            ContainerStateOracleCase::ChestQuickMoveOut,
+            ContainerStateOracleCase::ChestReopen,
+            ContainerStateOracleCase::CraftInitial,
+            ContainerStateOracleCase::CraftPrepared,
+            ContainerStateOracleCase::CraftQuickMove,
+            ContainerStateOracleCase::CraftStaleClick,
+            ContainerStateOracleCase::CraftReopen,
+        ]);
+        ensure!(
+            cases == required,
+            "container state oracle phases do not cover the required case matrix"
+        );
+        Ok(())
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ContainerStateOracleStack {
+    pub item_id: u32,
+    pub count: i32,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ContainerStateOracleSlot {
+    pub slot: u16,
+    pub stack: ContainerStateOracleStack,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ContainerStateOracleSnapshot {
+    pub menu: ContainerStateOracleMenu,
+    pub state_id_delta: i32,
+    pub slots: Vec<ContainerStateOracleSlot>,
+    pub cursor: ContainerStateOracleStack,
+}
+
+impl ContainerStateOracleSnapshot {
+    fn validate(&self) -> Result<()> {
+        ensure!(
+            self.state_id_delta >= 0,
+            "container state snapshot has negative state-id delta"
+        );
+        ensure!(
+            self.cursor.count >= 0,
+            "container state snapshot has negative cursor count"
+        );
+        let mut previous = None;
+        for slot in &self.slots {
+            ensure!(slot.stack.count >= 0, "container slot has negative count");
+            ensure!(
+                previous.is_none_or(|previous| slot.slot > previous),
+                "container slots must be strictly sorted and unique"
+            );
+            previous = Some(slot.slot);
+        }
+        Ok(())
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ContainerStateOraclePhaseTrace {
+    pub id: String,
+    pub snapshot: ContainerStateOracleSnapshot,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ContainerStateOracleTrace {
+    pub manifest_id: String,
+    pub phases: Vec<ContainerStateOraclePhaseTrace>,
+}
+
+impl ContainerStateOracleTrace {
+    pub fn validate_against(&self, manifest: &ContainerStateOracleManifest) -> Result<()> {
+        manifest.validate()?;
+        ensure!(
+            self.manifest_id == manifest.id,
+            "container state trace manifest id {} does not match {}",
+            self.manifest_id,
+            manifest.id
+        );
+        ensure!(
+            self.phases.len() == manifest.phases.len(),
+            "container state trace phase count does not match manifest"
+        );
+        for (expected, actual) in manifest.phases.iter().zip(&self.phases) {
+            ensure!(
+                actual.id == expected.id,
+                "container state trace phase mismatch: expected {}, got {}",
+                expected.id,
+                actual.id
+            );
+            ensure!(
+                actual.snapshot.menu == expected.menu,
+                "container state trace phase {} has wrong menu",
+                actual.id
+            );
+            actual.snapshot.validate()?;
+        }
+        for index in [0_usize, 4, 5, 9] {
+            ensure!(
+                self.phases[index].snapshot.state_id_delta == 0,
+                "initial/reopen phase {} must normalize state-id to zero",
+                self.phases[index].id
+            );
+        }
+        Ok(())
+    }
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -51,6 +436,224 @@ pub enum ReplayOutcome {
     Failed,
     Degraded,
     Blocked,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CoreGateEvidenceLeg {
+    Unit,
+    Wire,
+    Oracle,
+    RealClient,
+    Performance,
+    Persistence,
+    ReplayNegative,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CoreGateRowScope {
+    Focused,
+    Broad,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct CoreGatePhase {
+    pub id: String,
+    pub scenario_id: String,
+    pub ledger_rows: Vec<String>,
+    pub evidence_legs: BTreeSet<CoreGateEvidenceLeg>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct CoreGateRow {
+    pub row: String,
+    pub scope: CoreGateRowScope,
+    pub required_phases: Vec<String>,
+    pub required_evidence_legs: BTreeSet<CoreGateEvidenceLeg>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct CoreGatePhaseEvidence {
+    pub phase_id: String,
+    pub passed_evidence_legs: BTreeSet<CoreGateEvidenceLeg>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct CoreGateManifest {
+    pub schema: String,
+    pub phases: Vec<CoreGatePhase>,
+    pub rows: Vec<CoreGateRow>,
+}
+
+impl CoreGateManifest {
+    pub fn from_json(input: &str) -> Result<Self> {
+        let manifest: Self =
+            serde_json::from_str(input).context("parse core gate manifest JSON")?;
+        manifest.validate()?;
+        Ok(manifest)
+    }
+
+    pub fn validate(&self) -> Result<()> {
+        ensure!(
+            self.schema == CORE_GATE_MANIFEST_SCHEMA,
+            "unsupported core gate manifest schema: {}",
+            self.schema
+        );
+        ensure!(
+            !self.phases.is_empty(),
+            "core gate manifest phases are empty"
+        );
+        ensure!(
+            self.phases.len() <= MAX_REPLAY_CHECKS,
+            "core gate manifest has too many phases"
+        );
+        ensure!(!self.rows.is_empty(), "core gate manifest rows are empty");
+        ensure!(
+            self.rows.len() <= MAX_REPLAY_CHECKS,
+            "core gate manifest has too many rows"
+        );
+
+        let mut phases_by_id = BTreeMap::new();
+        for phase in &self.phases {
+            validate_identifier("core gate phase id", &phase.id)?;
+            validate_identifier("core gate scenario id", &phase.scenario_id)?;
+            ensure!(
+                phases_by_id.insert(phase.id.as_str(), phase).is_none(),
+                "duplicate core gate phase id: {}",
+                phase.id
+            );
+            ensure!(
+                !phase.ledger_rows.is_empty(),
+                "core gate phase {} has no ledger rows",
+                phase.id
+            );
+            ensure!(
+                !phase.evidence_legs.is_empty(),
+                "core gate phase {} has no evidence legs",
+                phase.id
+            );
+            let mut phase_rows = BTreeSet::new();
+            for row in &phase.ledger_rows {
+                validate_ledger_row(row)?;
+                ensure!(
+                    phase_rows.insert(row.as_str()),
+                    "core gate phase {} repeats ledger row {}",
+                    phase.id,
+                    row
+                );
+            }
+        }
+
+        let mut row_ids = BTreeSet::new();
+        for row in &self.rows {
+            validate_ledger_row(&row.row)?;
+            ensure!(
+                row_ids.insert(row.row.as_str()),
+                "duplicate core gate ledger row: {}",
+                row.row
+            );
+            ensure!(
+                !row.required_phases.is_empty(),
+                "core gate row {} has no required phases",
+                row.row
+            );
+            if row.scope == CoreGateRowScope::Broad {
+                ensure!(
+                    row.required_phases.len() >= 2,
+                    "broad core gate row {} requires at least two focused phases",
+                    row.row
+                );
+            }
+            ensure!(
+                !row.required_evidence_legs.is_empty(),
+                "core gate row {} has no required evidence legs",
+                row.row
+            );
+            let mut required_phase_ids = BTreeSet::new();
+            for phase_id in &row.required_phases {
+                ensure!(
+                    required_phase_ids.insert(phase_id.as_str()),
+                    "core gate row {} repeats required phase {}",
+                    row.row,
+                    phase_id
+                );
+                let phase = phases_by_id.get(phase_id.as_str()).with_context(|| {
+                    format!(
+                        "core gate row {} requires unknown phase {phase_id}",
+                        row.row
+                    )
+                })?;
+                ensure!(
+                    phase
+                        .ledger_rows
+                        .iter()
+                        .any(|candidate| candidate == &row.row),
+                    "core gate phase {} does not cover required row {}",
+                    phase.id,
+                    row.row
+                );
+            }
+        }
+        Ok(())
+    }
+
+    pub fn validate_completion(&self, completed: &[CoreGatePhaseEvidence]) -> Result<()> {
+        self.validate()?;
+        let phases_by_id = self
+            .phases
+            .iter()
+            .map(|phase| (phase.id.as_str(), phase))
+            .collect::<BTreeMap<_, _>>();
+        let mut completed_by_id = BTreeMap::new();
+        for evidence in completed {
+            ensure!(
+                phases_by_id.contains_key(evidence.phase_id.as_str()),
+                "completion references unknown core gate phase {}",
+                evidence.phase_id
+            );
+            ensure!(
+                completed_by_id
+                    .insert(evidence.phase_id.as_str(), evidence)
+                    .is_none(),
+                "duplicate core gate completion for phase {}",
+                evidence.phase_id
+            );
+        }
+
+        for row in &self.rows {
+            let mut row_evidence = BTreeSet::new();
+            for phase_id in &row.required_phases {
+                let phase = phases_by_id
+                    .get(phase_id.as_str())
+                    .expect("validated core gate phase exists");
+                let evidence = completed_by_id.get(phase_id.as_str()).with_context(|| {
+                    format!(
+                        "core gate row {} is missing focused phase {phase_id}",
+                        row.row
+                    )
+                })?;
+                ensure!(
+                    evidence
+                        .passed_evidence_legs
+                        .is_superset(&phase.evidence_legs),
+                    "core gate phase {} is missing declared evidence legs",
+                    phase.id
+                );
+                row_evidence.extend(evidence.passed_evidence_legs.iter().copied());
+            }
+            ensure!(
+                row_evidence.is_superset(&row.required_evidence_legs),
+                "core gate row {} is missing required evidence legs",
+                row.row
+            );
+        }
+        Ok(())
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -990,6 +1593,17 @@ fn derive_outcome(statuses: impl IntoIterator<Item = ReplayCheckStatus>) -> Resu
     })
 }
 
+fn validate_ledger_row(row: &str) -> Result<()> {
+    ensure!(!row.is_empty(), "core gate ledger row is empty");
+    ensure!(row.len() <= 16, "core gate ledger row is too long");
+    ensure!(
+        row.bytes()
+            .all(|byte| byte.is_ascii_uppercase() || byte.is_ascii_digit()),
+        "invalid core gate ledger row: {row}"
+    );
+    Ok(())
+}
+
 fn validate_identifier(label: &str, value: &str) -> Result<()> {
     ensure!(!value.is_empty(), "{label} is empty");
     ensure!(value.len() <= 128, "{label} is longer than 128 bytes");
@@ -1063,6 +1677,312 @@ fn validate_relative_artifact_path(value: &str) -> Result<()> {
 mod tests {
     use super::*;
     use serde_json::{Value, json};
+
+    fn block_transaction_oracle_json() -> Value {
+        json!({
+            "schema": "solaris.block_transaction.oracle.v1",
+            "id": "block-transaction-26-1-2",
+            "phases": [
+                {"id":"accepted-break","case":"accepted_break","sequence":1},
+                {"id":"accepted-place","case":"accepted_place","sequence":2},
+                {"id":"occupied-place-rejection","case":"occupied_place_rejection","sequence":3},
+                {"id":"out-of-reach-break-rejection","case":"out_of_reach_break_rejection","sequence":4},
+                {"id":"early-stop-break-rejection","case":"early_stop_break_rejection","sequence":5}
+            ]
+        })
+    }
+
+    #[test]
+    fn block_transaction_oracle_manifest_requires_complete_unique_case_matrix() {
+        let manifest =
+            BlockTransactionOracleManifest::from_json(&block_transaction_oracle_json().to_string())
+                .expect("valid block transaction oracle manifest");
+        assert_eq!(manifest.phases.len(), 5);
+        assert_eq!(
+            BlockTransactionOracleManifest::from_json(
+                &manifest.to_pretty_json().expect("encode manifest")
+            )
+            .expect("decode manifest"),
+            manifest
+        );
+
+        let mut duplicate_case = block_transaction_oracle_json();
+        duplicate_case["phases"][4]["case"] = json!("accepted_break");
+        assert!(BlockTransactionOracleManifest::from_json(&duplicate_case.to_string()).is_err());
+
+        let mut duplicate_sequence = block_transaction_oracle_json();
+        duplicate_sequence["phases"][4]["sequence"] = json!(4);
+        assert!(
+            BlockTransactionOracleManifest::from_json(&duplicate_sequence.to_string()).is_err()
+        );
+
+        let mut unknown_field = block_transaction_oracle_json();
+        unknown_field["phases"][0]["expected_state"] = json!(0);
+        assert!(BlockTransactionOracleManifest::from_json(&unknown_field.to_string()).is_err());
+    }
+
+    #[test]
+    fn block_transaction_trace_requires_authoritative_update_before_matching_ack() {
+        let manifest =
+            BlockTransactionOracleManifest::from_json(&block_transaction_oracle_json().to_string())
+                .expect("valid manifest");
+        let phases = manifest
+            .phases
+            .iter()
+            .map(|phase| BlockTransactionOraclePhaseTrace {
+                id: phase.id.clone(),
+                events: vec![
+                    BlockTransactionOracleEvent::TargetUpdate { state_id: 1 },
+                    BlockTransactionOracleEvent::Ack {
+                        sequence: phase.sequence,
+                    },
+                ],
+            })
+            .collect();
+        let mut trace = BlockTransactionOracleTrace {
+            manifest_id: manifest.id.clone(),
+            phases,
+        };
+        trace.phases[0].events = vec![BlockTransactionOracleEvent::Ack { sequence: 1 }];
+        trace.phases[1].events = vec![BlockTransactionOracleEvent::Ack { sequence: 2 }];
+        trace
+            .validate_against(&manifest)
+            .expect("accepted phases may rely on prediction while rejections resync before ack");
+
+        let mut ack_first = trace.clone();
+        ack_first.phases[2].events.swap(0, 1);
+        assert!(ack_first.validate_against(&manifest).is_err());
+
+        let mut wrong_ack = trace;
+        wrong_ack.phases[3].events[1] = BlockTransactionOracleEvent::Ack { sequence: 99 };
+        assert!(wrong_ack.validate_against(&manifest).is_err());
+    }
+
+    fn container_state_oracle_json() -> Value {
+        json!({
+            "schema": "solaris.container_state.oracle.v1",
+            "id": "inventory-container-26-1-2",
+            "phases": [
+                {"id":"chest-initial","menu":"chest","case":"chest_initial"},
+                {"id":"chest-quick-move-in","menu":"chest","case":"chest_quick_move_in"},
+                {"id":"chest-quick-move-out","menu":"chest","case":"chest_quick_move_out"},
+                {"id":"chest-stale-click","menu":"chest","case":"chest_stale_click"},
+                {"id":"chest-reopen","menu":"chest","case":"chest_reopen"},
+                {"id":"craft-initial","menu":"crafting_table","case":"craft_initial"},
+                {"id":"craft-prepared","menu":"crafting_table","case":"craft_prepared"},
+                {"id":"craft-quick-move","menu":"crafting_table","case":"craft_quick_move"},
+                {"id":"craft-stale-click","menu":"crafting_table","case":"craft_stale_click"},
+                {"id":"craft-reopen","menu":"crafting_table","case":"craft_reopen"}
+            ]
+        })
+    }
+
+    fn empty_container_snapshot(menu: ContainerStateOracleMenu) -> ContainerStateOracleSnapshot {
+        ContainerStateOracleSnapshot {
+            menu,
+            state_id_delta: 0,
+            slots: vec![ContainerStateOracleSlot {
+                slot: 0,
+                stack: ContainerStateOracleStack {
+                    item_id: 0,
+                    count: 0,
+                },
+            }],
+            cursor: ContainerStateOracleStack {
+                item_id: 0,
+                count: 0,
+            },
+        }
+    }
+
+    #[test]
+    fn container_state_oracle_manifest_requires_complete_menu_case_matrix() {
+        let manifest =
+            ContainerStateOracleManifest::from_json(&container_state_oracle_json().to_string())
+                .expect("valid container state oracle manifest");
+        assert_eq!(manifest.phases.len(), 10);
+        assert_eq!(
+            ContainerStateOracleManifest::from_json(
+                &manifest
+                    .to_pretty_json()
+                    .expect("encode container manifest")
+            )
+            .expect("decode container manifest"),
+            manifest
+        );
+
+        let mut wrong_menu = container_state_oracle_json();
+        wrong_menu["phases"][0]["menu"] = json!("crafting_table");
+        assert!(ContainerStateOracleManifest::from_json(&wrong_menu.to_string()).is_err());
+
+        let mut duplicate_case = container_state_oracle_json();
+        duplicate_case["phases"][9]["case"] = json!("craft_initial");
+        assert!(ContainerStateOracleManifest::from_json(&duplicate_case.to_string()).is_err());
+
+        let mut unknown_field = container_state_oracle_json();
+        unknown_field["phases"][0]["expected_state_id"] = json!(0);
+        assert!(ContainerStateOracleManifest::from_json(&unknown_field.to_string()).is_err());
+    }
+
+    #[test]
+    fn container_state_trace_rejects_unsorted_slots_and_nonzero_reopen_baseline() {
+        let manifest =
+            ContainerStateOracleManifest::from_json(&container_state_oracle_json().to_string())
+                .expect("valid container manifest");
+        let phases = manifest
+            .phases
+            .iter()
+            .map(|phase| ContainerStateOraclePhaseTrace {
+                id: phase.id.clone(),
+                snapshot: empty_container_snapshot(phase.menu),
+            })
+            .collect();
+        let trace = ContainerStateOracleTrace {
+            manifest_id: manifest.id.clone(),
+            phases,
+        };
+        trace.validate_against(&manifest).expect("valid trace");
+
+        let mut unsorted = trace.clone();
+        unsorted.phases[1].snapshot.slots = vec![
+            ContainerStateOracleSlot {
+                slot: 2,
+                stack: ContainerStateOracleStack {
+                    item_id: 1,
+                    count: 1,
+                },
+            },
+            ContainerStateOracleSlot {
+                slot: 1,
+                stack: ContainerStateOracleStack {
+                    item_id: 1,
+                    count: 1,
+                },
+            },
+        ];
+        assert!(unsorted.validate_against(&manifest).is_err());
+
+        let mut bad_reopen = trace;
+        bad_reopen.phases[9].snapshot.state_id_delta = 1;
+        assert!(bad_reopen.validate_against(&manifest).is_err());
+    }
+
+    fn core_gate_manifest_json() -> Value {
+        json!({
+            "schema": "solaris.core_gate.manifest.v1",
+            "phases": [
+                {
+                    "id": "solid-edit",
+                    "scenario_id": "m94-02a-solid-place-break-drop",
+                    "ledger_rows": ["B1"],
+                    "evidence_legs": ["unit", "wire", "real_client"]
+                },
+                {
+                    "id": "rejected-resync",
+                    "scenario_id": "m94-02b-rejected-block-resync",
+                    "ledger_rows": ["B1"],
+                    "evidence_legs": ["wire", "oracle", "replay_negative"]
+                }
+            ],
+            "rows": [{
+                "row": "B1",
+                "scope": "broad",
+                "required_phases": ["solid-edit", "rejected-resync"],
+                "required_evidence_legs": [
+                    "unit", "wire", "oracle", "real_client", "replay_negative"
+                ]
+            }]
+        })
+    }
+
+    #[test]
+    fn core_gate_manifest_accepts_focused_phase_and_evidence_matrix() {
+        let manifest = CoreGateManifest::from_json(&core_gate_manifest_json().to_string())
+            .expect("valid core gate manifest");
+        manifest
+            .validate_completion(&[
+                CoreGatePhaseEvidence {
+                    phase_id: "solid-edit".to_owned(),
+                    passed_evidence_legs: [
+                        CoreGateEvidenceLeg::Unit,
+                        CoreGateEvidenceLeg::Wire,
+                        CoreGateEvidenceLeg::RealClient,
+                    ]
+                    .into_iter()
+                    .collect(),
+                },
+                CoreGatePhaseEvidence {
+                    phase_id: "rejected-resync".to_owned(),
+                    passed_evidence_legs: [
+                        CoreGateEvidenceLeg::Wire,
+                        CoreGateEvidenceLeg::Oracle,
+                        CoreGateEvidenceLeg::ReplayNegative,
+                    ]
+                    .into_iter()
+                    .collect(),
+                },
+            ])
+            .expect("complete focused evidence matrix");
+    }
+
+    #[test]
+    fn broad_core_gate_row_rejects_single_phase_manifest() {
+        let mut manifest = core_gate_manifest_json();
+        manifest["rows"][0]["required_phases"] = json!(["solid-edit"]);
+        let error = CoreGateManifest::from_json(&manifest.to_string())
+            .expect_err("broad row must require multiple focused phases");
+        assert!(error.to_string().contains("at least two focused phases"));
+    }
+
+    #[test]
+    fn core_gate_completion_rejects_missing_focused_phase() {
+        let manifest = CoreGateManifest::from_json(&core_gate_manifest_json().to_string())
+            .expect("valid core gate manifest");
+        let error = manifest
+            .validate_completion(&[CoreGatePhaseEvidence {
+                phase_id: "solid-edit".to_owned(),
+                passed_evidence_legs: [
+                    CoreGateEvidenceLeg::Unit,
+                    CoreGateEvidenceLeg::Wire,
+                    CoreGateEvidenceLeg::RealClient,
+                ]
+                .into_iter()
+                .collect(),
+            }])
+            .expect_err("missing focused phase must reject broad row completion");
+        assert!(
+            error
+                .to_string()
+                .contains("missing focused phase rejected-resync")
+        );
+    }
+
+    #[test]
+    fn core_gate_completion_rejects_missing_declared_evidence() {
+        let manifest = CoreGateManifest::from_json(&core_gate_manifest_json().to_string())
+            .expect("valid core gate manifest");
+        let error = manifest
+            .validate_completion(&[
+                CoreGatePhaseEvidence {
+                    phase_id: "solid-edit".to_owned(),
+                    passed_evidence_legs: [CoreGateEvidenceLeg::Unit, CoreGateEvidenceLeg::Wire]
+                        .into_iter()
+                        .collect(),
+                },
+                CoreGatePhaseEvidence {
+                    phase_id: "rejected-resync".to_owned(),
+                    passed_evidence_legs: [
+                        CoreGateEvidenceLeg::Wire,
+                        CoreGateEvidenceLeg::Oracle,
+                        CoreGateEvidenceLeg::ReplayNegative,
+                    ]
+                    .into_iter()
+                    .collect(),
+                },
+            ])
+            .expect_err("missing phase evidence must reject completion");
+        assert!(error.to_string().contains("missing declared evidence legs"));
+    }
 
     fn scenario_json() -> Value {
         json!({

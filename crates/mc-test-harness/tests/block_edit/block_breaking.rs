@@ -839,7 +839,7 @@ async fn wait_for_stale_break_ack_and_resync(
 }
 
 #[tokio::test]
-async fn out_of_reach_survival_and_creative_breaks_resync_target_before_ack() {
+async fn out_of_reach_survival_and_creative_breaks_are_ack_only() {
     let manifest = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
     let vanilla_dir = manifest.join("../../data/vanilla");
     let blocks_json = vanilla_dir.join("reports/blocks.json");
@@ -860,7 +860,6 @@ async fn out_of_reach_survival_and_creative_breaks_resync_target_before_ack() {
         .block(&mc_data::Identifier::parse("minecraft:stone").unwrap())
         .map(|b| b.default)
         .expect("stone in registry");
-    let stone_state_id = stone_state.0 as i32;
     let generator = Arc::new(mc_worldgen::TerrainGenerator::new(0, Arc::clone(&blocks)));
     let mut storage = mc_world::WorldStorage::in_memory_with_capacity(
         Arc::clone(&blocks),
@@ -929,7 +928,7 @@ async fn out_of_reach_survival_and_creative_breaks_resync_target_before_ack() {
         })
         .await
         .expect("send out-of-reach survival start break");
-    read_rejected_break_resync_before_ack(&mut client, 26, (6, seeded_y, 0), stone_state_id).await;
+    read_ack_without_target_update(&mut client, 26, (6, seeded_y, 0)).await;
 
     client
         .write_packet(&ServerboundChatCommand {
@@ -946,7 +945,7 @@ async fn out_of_reach_survival_and_creative_breaks_resync_target_before_ack() {
         })
         .await
         .expect("send out-of-reach creative start break");
-    read_rejected_break_resync_before_ack(&mut client, 27, (6, seeded_y, 0), stone_state_id).await;
+    read_ack_without_target_update(&mut client, 27, (6, seeded_y, 0)).await;
 }
 
 #[tokio::test]
@@ -1118,46 +1117,4 @@ async fn far_out_of_reach_survival_break_does_not_load_target_before_ack() {
         .await
         .expect("send far out-of-reach survival start break");
     read_ack_without_target_update(&mut client, 27, target).await;
-}
-
-async fn read_rejected_break_resync_before_ack(
-    client: &mut Client,
-    sequence: i32,
-    target: (i32, i32, i32),
-    expected_state_id: i32,
-) {
-    let mut saw_target_resync = false;
-    let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
-    loop {
-        let frame = client
-            .read_frame_with_timeout(
-                deadline.saturating_duration_since(tokio::time::Instant::now()),
-            )
-            .await
-            .expect("rejected break resync");
-        if handle_keepalive(client, frame.id, &frame.body).await {
-            continue;
-        }
-        if frame.id == BlockUpdate::ID {
-            let mut body = frame.body;
-            let pkt = BlockUpdate::decode(&mut body).expect("decode rejected break BlockUpdate");
-            if unpack_block_pos(pkt.position) == target {
-                assert_eq!(
-                    pkt.state_id, expected_state_id,
-                    "rejected break must resync the authoritative target state"
-                );
-                saw_target_resync = true;
-            }
-        } else if frame.id == BlockChangedAck::ID {
-            let mut body = frame.body;
-            let pkt = BlockChangedAck::decode(&mut body).expect("decode rejected break ack");
-            if pkt.sequence == sequence {
-                assert!(
-                    saw_target_resync,
-                    "rejected break ack arrived before target-cell BlockUpdate"
-                );
-                return;
-            }
-        }
-    }
 }

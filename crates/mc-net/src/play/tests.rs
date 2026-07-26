@@ -1,4 +1,5 @@
 use super::block_placement::plan_block_placement;
+use super::command_execution::{DebugCommandContext, debug_water_corridor_edits};
 use super::containers::furnace_fuel_ticks;
 use super::falling_blocks::{FallingBlockStart, LandedFallingBlock, plan_falling_block_starts};
 use super::use_item_on_adapter::cursor_y_relative_to_target;
@@ -4235,6 +4236,16 @@ fn debug_commands_parse_survival_mutations_and_give() {
         parse_debug_command("debug outbound-pressure 192"),
         Some(DebugCommand::OutboundPressure { count: 192 })
     );
+    assert_eq!(
+        parse_debug_command("debug water-corridor 4 96 0"),
+        Some(DebugCommand::WaterCorridor { x: 4, y: 96, z: 0 })
+    );
+    assert_eq!(parse_debug_command("debug water-corridor"), None);
+    assert_eq!(parse_debug_command("debug water-corridor 4 317 0"), None);
+    assert_eq!(
+        parse_debug_command("debug water-corridor 4 96 0 extra"),
+        None
+    );
     assert_eq!(parse_debug_command("debug outbound-pressure 0"), None);
     assert_eq!(parse_debug_command("debug outbound-pressure 257"), None);
     assert_eq!(parse_debug_command("damage 7.5"), None);
@@ -4243,6 +4254,47 @@ fn debug_commands_parse_survival_mutations_and_give() {
     assert_eq!(parse_debug_command("debug survival heal inf"), None);
     assert_eq!(parse_debug_command("debug survival feed 2 -inf"), None);
     assert_eq!(parse_debug_command("debug survival exhaust NaN"), None);
+}
+
+#[test]
+fn debug_water_corridor_fixture_is_closed_unique_and_source_filled() {
+    let state = interaction_state_for_blocks(Arc::new(
+        mc_world::BlockRegistry::from_report(&solaris_required_blocks_report()).unwrap(),
+    ));
+    let water = state
+        .blocks
+        .block(&Identifier::parse("minecraft:water").unwrap())
+        .expect("fixture registry has water")
+        .default;
+    let stone = state
+        .blocks
+        .block(&Identifier::parse("minecraft:stone").unwrap())
+        .expect("fixture registry has stone")
+        .default;
+    let edits = debug_water_corridor_edits(
+        &state.blocks,
+        Some(water),
+        mc_world::BlockPos { x: 4, y: 66, z: 0 },
+    )
+    .expect("water corridor plan");
+
+    assert_eq!(edits.len(), 68);
+    let unique = edits.iter().map(|edit| edit.pos).collect::<HashSet<_>>();
+    assert_eq!(unique.len(), edits.len(), "fixture edits must be unique");
+    for z in 0..=4 {
+        assert!(edits.contains(&BlockEdit {
+            pos: mc_world::BlockPos { x: 4, y: 66, z },
+            new_state: water,
+        }));
+        assert!(edits.contains(&BlockEdit {
+            pos: mc_world::BlockPos { x: 4, y: 67, z },
+            new_state: water,
+        }));
+        assert!(edits.contains(&BlockEdit {
+            pos: mc_world::BlockPos { x: 4, y: 65, z },
+            new_state: stone,
+        }));
+    }
 }
 
 #[tokio::test]
@@ -4264,16 +4316,18 @@ async fn debug_give_zero_count_clears_hotbar_slot_before_item_lookup() {
     apply_debug_command(
         &mut writer,
         Compression::Disabled,
-        &mut survival_state,
-        &mut xp_state,
-        Some(&mut state),
-        PlayerPose::new(0.0, 64.0, 0.0),
         DebugCommand::Give {
             item: Identifier::parse("minecraft:air").unwrap(),
             count: 0,
             hotbar_slot: 0,
         },
-        CommandPermissions { op: true },
+        DebugCommandContext {
+            survival_state: &mut survival_state,
+            xp_state: &mut xp_state,
+            interaction: Some(&mut state),
+            player_pose: PlayerPose::new(0.0, 64.0, 0.0),
+            permissions: CommandPermissions { op: true },
+        },
     )
     .await
     .unwrap();
@@ -4318,6 +4372,259 @@ fn chest_quick_move_places_player_stack_in_first_empty_storage_slot() {
     assert_eq!(
         state.inventory.slots[PlayerInventory::HOTBAR_BASE],
         ItemStack::EMPTY
+    );
+}
+
+#[test]
+fn chest_quick_move_from_storage_uses_vanilla_reverse_player_range() {
+    let dirt = Identifier::parse("minecraft:dirt").unwrap();
+    let items = Arc::new(ItemRegistry::from_report(&[ItemReport {
+        id: dirt,
+        protocol_id: 10,
+    }]));
+    let mut state = interaction_state_for_items(Arc::clone(&items));
+    let dirt_id = items
+        .id_of(&Identifier::parse("minecraft:dirt").unwrap())
+        .unwrap();
+    let mut chest = ChestBlockEntity::default();
+    chest.slots[0] = mc_world::FurnaceSlot {
+        item_id: dirt_id,
+        count: 2,
+        damage: None,
+        enchantments: Vec::new(),
+    };
+    let mut view = ChestView {
+        chests: vec![chest],
+    };
+
+    assert!(apply_chest_quick_move_click(&mut state, &mut view, 0));
+    assert!(view.chests[0].slots[0].is_empty());
+    assert_eq!(
+        state.inventory.slots[44],
+        ItemStack::new(dirt_id, 2),
+        "vanilla fills the reverse player range before earlier main-inventory slots"
+    );
+    assert!(state.inventory.slots[9..44].iter().all(ItemStack::is_empty));
+}
+
+#[test]
+fn chest_actions_respect_item_specific_stack_limits() {
+    let bucket = Identifier::parse("minecraft:bucket").unwrap();
+    let snowball = Identifier::parse("minecraft:snowball").unwrap();
+    let items = ItemRegistry::from_report(&[
+        ItemReport {
+            id: bucket.clone(),
+            protocol_id: 10,
+        },
+        ItemReport {
+            id: snowball.clone(),
+            protocol_id: 11,
+        },
+    ]);
+    let item_facts = ItemFactsTable::from_entries([
+        (
+            bucket,
+            mc_data::item_components::ItemFacts {
+                max_stack_size: Some(1),
+                ..mc_data::item_components::ItemFacts::default()
+            },
+        ),
+        (
+            snowball,
+            mc_data::item_components::ItemFacts {
+                max_stack_size: Some(16),
+                ..mc_data::item_components::ItemFacts::default()
+            },
+        ),
+    ]);
+    let new_window = || ChestWindow::new(vec![mc_world::BlockPos { x: 0, y: 64, z: 0 }], 7);
+    let empty_view = || ChestView {
+        chests: vec![ChestBlockEntity::default()],
+    };
+
+    let mut bucket_view = empty_view();
+    bucket_view.chests[0].slots[0] = stack_to_furnace_slot(&ItemStack::new(10, 1));
+    let mut inventory = PlayerInventory::empty();
+    inventory.slots[PlayerInventory::HOTBAR_BASE] = ItemStack::new(10, 1);
+    let bucket_quick_move = plan_chest_click(ChestClickInput {
+        items: &items,
+        item_facts: &item_facts,
+        window: new_window(),
+        view: bucket_view,
+        inventory,
+        carried_item: ItemStack::EMPTY,
+        action: ChestClickAction::QuickMove {
+            slot: SINGLE_CHEST_STORAGE_SLOTS + 27,
+        },
+    });
+    assert!(bucket_quick_move.changed);
+    assert!(bucket_quick_move.inventory.slots[PlayerInventory::HOTBAR_BASE].is_empty());
+    assert_eq!(
+        furnace_slot_to_stack(&bucket_quick_move.view.chests[0].slots[0]),
+        ItemStack::new(10, 1)
+    );
+    assert_eq!(
+        furnace_slot_to_stack(&bucket_quick_move.view.chests[0].slots[1]),
+        ItemStack::new(10, 1)
+    );
+    assert!(
+        bucket_quick_move.view.chests[0].slots[2..]
+            .iter()
+            .all(mc_world::FurnaceSlot::is_empty)
+    );
+
+    let mut full_bucket = ChestBlockEntity::default();
+    full_bucket.slots[0] = stack_to_furnace_slot(&ItemStack::new(10, 1));
+    let bucket_pickup = plan_chest_click(ChestClickInput {
+        items: &items,
+        item_facts: &item_facts,
+        window: new_window(),
+        view: ChestView {
+            chests: vec![full_bucket],
+        },
+        inventory: PlayerInventory::empty(),
+        carried_item: ItemStack::new(10, 1),
+        action: ChestClickAction::Pickup { slot: 0, button: 1 },
+    });
+    assert!(!bucket_pickup.changed);
+    assert_eq!(bucket_pickup.carried_item, ItemStack::new(10, 1));
+    assert_eq!(
+        furnace_slot_to_stack(&bucket_pickup.view.chests[0].slots[0]),
+        ItemStack::new(10, 1)
+    );
+
+    let mut snowball_view = empty_view();
+    snowball_view.chests[0].slots[0] = stack_to_furnace_slot(&ItemStack::new(11, 15));
+    let mut inventory = PlayerInventory::empty();
+    inventory.slots[PlayerInventory::HOTBAR_BASE] = ItemStack::new(11, 16);
+    let snowball_quick_move = plan_chest_click(ChestClickInput {
+        items: &items,
+        item_facts: &item_facts,
+        window: new_window(),
+        view: snowball_view,
+        inventory,
+        carried_item: ItemStack::EMPTY,
+        action: ChestClickAction::QuickMove {
+            slot: SINGLE_CHEST_STORAGE_SLOTS + 27,
+        },
+    });
+    assert!(snowball_quick_move.changed);
+    assert_eq!(
+        furnace_slot_to_stack(&snowball_quick_move.view.chests[0].slots[0]),
+        ItemStack::new(11, 16)
+    );
+    assert_eq!(
+        furnace_slot_to_stack(&snowball_quick_move.view.chests[0].slots[1]),
+        ItemStack::new(11, 15)
+    );
+
+    let mut view = empty_view();
+    view.chests[0].slots[0] = stack_to_furnace_slot(&ItemStack::new(11, 15));
+    let mut window = new_window();
+    let mut inventory = PlayerInventory::empty();
+    let mut carried_item = ItemStack::new(11, 3);
+    let mut changed = false;
+    for click in [
+        QuickCraftClick {
+            header: 0,
+            kind: 1,
+            slot: None,
+        },
+        QuickCraftClick {
+            header: 1,
+            kind: 1,
+            slot: Some(0),
+        },
+        QuickCraftClick {
+            header: 1,
+            kind: 1,
+            slot: Some(1),
+        },
+        QuickCraftClick {
+            header: 2,
+            kind: 1,
+            slot: None,
+        },
+    ] {
+        let plan = plan_chest_click(ChestClickInput {
+            items: &items,
+            item_facts: &item_facts,
+            window,
+            view,
+            inventory,
+            carried_item,
+            action: ChestClickAction::QuickCraft(click),
+        });
+        window = plan.window;
+        view = plan.view;
+        inventory = plan.inventory;
+        carried_item = plan.carried_item;
+        changed = plan.changed;
+    }
+    assert!(changed);
+    assert_eq!(
+        furnace_slot_to_stack(&view.chests[0].slots[0]),
+        ItemStack::new(11, 16)
+    );
+    assert_eq!(
+        furnace_slot_to_stack(&view.chests[0].slots[1]),
+        ItemStack::new(11, 1)
+    );
+    assert_eq!(carried_item, ItemStack::new(11, 1));
+}
+
+#[test]
+fn chest_menu_revision_counts_source_and_destination_slot_changes() {
+    let mut before_chest = ChestBlockEntity::default();
+    before_chest.slots[0] = mc_world::FurnaceSlot {
+        item_id: 10,
+        count: 2,
+        damage: None,
+        enchantments: Vec::new(),
+    };
+    let before_view = ChestView {
+        chests: vec![before_chest],
+    };
+    let after_view = ChestView {
+        chests: vec![ChestBlockEntity::default()],
+    };
+    let before_inventory = PlayerInventory::empty();
+    let mut after_inventory = PlayerInventory::empty();
+    after_inventory.slots[44] = ItemStack::new(10, 2);
+
+    assert_eq!(
+        chest_menu_state_change_count(
+            &before_view,
+            &after_view,
+            &before_inventory,
+            &after_inventory,
+            &ItemStack::EMPTY,
+            &ItemStack::EMPTY,
+        ),
+        2
+    );
+}
+
+#[test]
+fn crafting_menu_revision_counts_result_input_and_destination_changes() {
+    let mut before_window = CraftingTableWindow::new(7);
+    before_window.input[0] = ItemStack::new(10, 1);
+    before_window.result = ItemStack::new(11, 4);
+    let after_window = CraftingTableWindow::new(7);
+    let before_inventory = PlayerInventory::empty();
+    let mut after_inventory = PlayerInventory::empty();
+    after_inventory.slots[44] = ItemStack::new(11, 4);
+
+    assert_eq!(
+        crafting_menu_state_change_count(
+            &before_window,
+            &after_window,
+            &before_inventory,
+            &after_inventory,
+            &ItemStack::EMPTY,
+            &ItemStack::EMPTY,
+        ),
+        3
     );
 }
 
@@ -4412,7 +4719,7 @@ fn admin_dispatcher_parses_slash_commands_and_permissions() {
     assert_eq!(
         parse_admin_command("/gamerule players_sleeping_percentage -1", op),
         Err(CommandError::Usage(
-            "Usage: /gamerule players_sleeping_percentage [value]"
+            "Usage: /gamerule <keep_inventory|players_sleeping_percentage> [value]"
         ))
     );
 }
@@ -8482,6 +8789,240 @@ fn hand_toggle_respects_door_and_trapdoor_material() {
             new_state: mc_world::BlockStateId(20),
         }]
     );
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn two_client_door_and_trapdoor_toggles_converge_and_reject_stale_retry() {
+    let blocks = Arc::new(hand_toggle_test_registry());
+    let mut storage = in_memory_button_world(Arc::clone(&blocks));
+    let door_lower = mc_world::BlockPos { x: 1, y: 64, z: 1 };
+    let door_upper = mc_world::BlockPos {
+        y: 65,
+        ..door_lower
+    };
+    let trapdoor = mc_world::BlockPos { x: 3, y: 64, z: 1 };
+    for (pos, state) in [
+        (door_lower, BlockStateId(1)),
+        (door_upper, BlockStateId(2)),
+        (trapdoor, BlockStateId(13)),
+    ] {
+        storage
+            .set_block_at(pos, state)
+            .expect("seed hand-toggle state");
+    }
+
+    let door_plan =
+        plan_toggle_block_interaction(&blocks, &storage, door_lower, BlockStateId(1), 0)
+            .expect("closed oak door plans one atomic two-half toggle");
+    let trapdoor_plan =
+        plan_toggle_block_interaction(&blocks, &storage, trapdoor, BlockStateId(13), 0)
+            .expect("closed oak trapdoor plans one toggle");
+    assert_eq!(door_plan.preconditions.len(), 2);
+    assert_eq!(trapdoor_plan.preconditions.len(), 1);
+
+    let world = Arc::new(tokio::sync::Mutex::new(storage));
+    let sessions = SessionRegistry::new();
+    let (actor_tx, mut actor_rx) = mpsc::channel(16);
+    let (observer_tx, mut observer_rx) = mpsc::channel(16);
+    let actor_profile = LoggedInProfile {
+        uuid: uuid::Uuid::from_u128(1001),
+        name: "DoorActor".to_owned(),
+    };
+    let observer_profile = LoggedInProfile {
+        uuid: uuid::Uuid::from_u128(1002),
+        name: "DoorObserver".to_owned(),
+    };
+    let (actor, _) = sessions.register(
+        &actor_profile,
+        (0, 0),
+        0,
+        HashSet::from([(0, 0)]),
+        actor_tx,
+        PlayerPose::new(1.5, 64.0, 3.5),
+    );
+    let (observer, _) = sessions.register(
+        &observer_profile,
+        (0, 0),
+        0,
+        HashSet::from([(0, 0)]),
+        observer_tx,
+        PlayerPose::new(4.5, 64.0, 3.5),
+    );
+    let mut setup = sessions.mark_loaded(actor, (0, 0));
+    setup.extend(sessions.mark_loaded(observer, (0, 0)));
+    dispatch_and_clear_setup_packets(setup, &mut [&mut actor_rx, &mut observer_rx]);
+
+    let (handle, mut owner) = simulation_channel();
+    let actor_handle = handle.for_session(actor);
+    let mut door_request = Box::pin(
+        actor_handle.apply_block_edits(door_plan.edits.clone(), door_plan.preconditions.clone()),
+    );
+    let waker = std::task::Waker::noop();
+    let mut context = Context::from_waker(waker);
+    assert!(matches!(
+        std::future::Future::poll(door_request.as_mut(), &mut context),
+        Poll::Pending
+    ));
+    owner
+        .process_commands_with_world(&sessions, Some(&world), None, 1)
+        .await;
+    assert!(door_request.await.unwrap().is_some());
+    let door_deltas = match observer_rx.try_recv().expect("observer door publication") {
+        OutboundCommand::BlockDeltas(deltas) => deltas,
+        other => panic!("expected observer door BlockDeltas, got {other:?}"),
+    };
+    let expected_door_deltas = vec![
+        BlockDelta {
+            x: door_lower.x,
+            y: door_lower.y,
+            z: door_lower.z,
+            state_id: BlockStateId(3),
+        },
+        BlockDelta {
+            x: door_upper.x,
+            y: door_upper.y,
+            z: door_upper.z,
+            state_id: BlockStateId(4),
+        },
+    ];
+    assert_eq!(door_deltas, expected_door_deltas);
+    assert_eq!(
+        plan_block_delta_packets(&door_deltas),
+        vec![BlockDeltaPacket::Section {
+            section_x: 0,
+            section_y: 4,
+            section_z: 0,
+            changes: door_deltas.clone(),
+        }]
+    );
+    let mut wire = Vec::new();
+    send_block_deltas(&mut wire, Compression::Disabled, &door_deltas)
+        .await
+        .expect("encode observer door deltas");
+    let mut frames = bytes::BytesMut::from(wire.as_slice());
+    let mut frame = mc_protocol::frame::try_decode_frame(&mut frames, Compression::Disabled)
+        .expect("decode observer door frame")
+        .expect("observer door frame");
+    assert_eq!(frame.id, SectionBlocksUpdate::ID);
+    assert_eq!(
+        SectionBlocksUpdate::decode(&mut frame.body).expect("decode section door update"),
+        SectionBlocksUpdate {
+            section_pos: mc_protocol::packets::play::pack_section_pos(0, 4, 0),
+            changes: vec![
+                SectionBlockChange {
+                    relative_pos: mc_protocol::packets::play::pack_section_relative_pos(
+                        door_lower.x,
+                        door_lower.y,
+                        door_lower.z,
+                    ),
+                    state_id: 3,
+                },
+                SectionBlockChange {
+                    relative_pos: mc_protocol::packets::play::pack_section_relative_pos(
+                        door_upper.x,
+                        door_upper.y,
+                        door_upper.z,
+                    ),
+                    state_id: 4,
+                },
+            ],
+        }
+    );
+    assert!(frames.is_empty());
+
+    let mut trapdoor_request = Box::pin(actor_handle.apply_block_edits(
+        trapdoor_plan.edits.clone(),
+        trapdoor_plan.preconditions.clone(),
+    ));
+    assert!(matches!(
+        std::future::Future::poll(trapdoor_request.as_mut(), &mut context),
+        Poll::Pending
+    ));
+    owner
+        .process_commands_with_world(&sessions, Some(&world), None, 1)
+        .await;
+    assert!(trapdoor_request.await.unwrap().is_some());
+    let trapdoor_deltas = match observer_rx
+        .try_recv()
+        .expect("observer trapdoor publication")
+    {
+        OutboundCommand::BlockDeltas(deltas) => deltas,
+        other => panic!("expected observer trapdoor BlockDeltas, got {other:?}"),
+    };
+    assert_eq!(
+        trapdoor_deltas,
+        vec![BlockDelta {
+            x: trapdoor.x,
+            y: trapdoor.y,
+            z: trapdoor.z,
+            state_id: BlockStateId(14),
+        }]
+    );
+    let mut wire = Vec::new();
+    send_block_deltas(&mut wire, Compression::Disabled, &trapdoor_deltas)
+        .await
+        .expect("encode actor trapdoor delta");
+    let mut frames = bytes::BytesMut::from(wire.as_slice());
+    let mut frame = mc_protocol::frame::try_decode_frame(&mut frames, Compression::Disabled)
+        .expect("decode actor trapdoor frame")
+        .expect("actor trapdoor frame");
+    assert_eq!(frame.id, BlockUpdate::ID);
+    assert_eq!(
+        BlockUpdate::decode(&mut frame.body).expect("decode actor trapdoor update"),
+        BlockUpdate {
+            position: pack_block_pos(trapdoor.x, trapdoor.y, trapdoor.z),
+            state_id: 14,
+        }
+    );
+    assert!(frames.is_empty());
+
+    assert!(actor_rx.try_recv().is_err());
+    assert!(observer_rx.try_recv().is_err());
+
+    let mut stale_retry =
+        Box::pin(actor_handle.apply_block_edits(door_plan.edits, door_plan.preconditions));
+    assert!(matches!(
+        std::future::Future::poll(stale_retry.as_mut(), &mut context),
+        Poll::Pending
+    ));
+    owner
+        .process_commands_with_world(&sessions, Some(&world), None, 1)
+        .await;
+    assert!(stale_retry.await.unwrap().is_none());
+    assert!(observer_rx.try_recv().is_err());
+    assert!(actor_rx.try_recv().is_err());
+    owner
+        .process_commands_with_world(&sessions, Some(&world), None, 2)
+        .await;
+    assert!(observer_rx.try_recv().is_err());
+    assert!(actor_rx.try_recv().is_err());
+
+    let storage = world.lock().await;
+    assert_eq!(storage.get_cached_block(door_lower), Some(BlockStateId(3)));
+    assert_eq!(storage.get_cached_block(door_upper), Some(BlockStateId(4)));
+    assert_eq!(storage.get_cached_block(trapdoor), Some(BlockStateId(14)));
+    for (pos, expected_half) in [(door_lower, "lower"), (door_upper, "upper")] {
+        let state = blocks
+            .by_id(
+                storage
+                    .get_cached_block(pos)
+                    .expect("door half remains loaded"),
+            )
+            .expect("door half state remains registered");
+        assert_eq!(block_state_property(state, "facing"), Some("north"));
+        assert_eq!(block_state_property(state, "half"), Some(expected_half));
+        assert_eq!(block_state_property(state, "open"), Some("true"));
+    }
+    let state = blocks
+        .by_id(
+            storage
+                .get_cached_block(trapdoor)
+                .expect("trapdoor remains loaded"),
+        )
+        .expect("trapdoor state remains registered");
+    assert_eq!(block_state_property(state, "facing"), Some("north"));
+    assert_eq!(block_state_property(state, "half"), Some("bottom"));
+    assert_eq!(block_state_property(state, "open"), Some("true"));
 }
 
 #[test]
@@ -15078,7 +15619,7 @@ async fn disconnect_recovers_crafting_grid_after_connection_projection_is_lost()
         pose,
         ServerboundContainerClick {
             container_id: 7,
-            state_id: 2,
+            state_id: 3,
             slot_num: 1,
             button_num: 0,
             container_input: ContainerInput::Pickup,
@@ -15418,7 +15959,7 @@ async fn crafting_table_result_commit_publishes_once_before_fifo_fence() {
     )
     .await
     .unwrap();
-    assert_eq!(window.state_id, 2);
+    assert_eq!(window.state_id, 4);
     assert!(window.input.iter().all(ItemStack::is_empty));
     assert_eq!(state.carried_item, ItemStack::new(2, 4));
     assert!(matches!(
@@ -15441,7 +15982,7 @@ async fn crafting_table_result_commit_publishes_once_before_fifo_fence() {
         pose,
         ServerboundContainerClick {
             container_id: 7,
-            state_id: 2,
+            state_id: 4,
             slot_num: 0,
             button_num: 0,
             container_input: ContainerInput::Pickup,
@@ -15472,7 +16013,7 @@ async fn crafting_table_result_commit_publishes_once_before_fifo_fence() {
         pose,
         ServerboundContainerClick {
             container_id: 7,
-            state_id: 2,
+            state_id: 4,
             slot_num: 0,
             button_num: 0,
             container_input: ContainerInput::Pickup,
@@ -15486,7 +16027,7 @@ async fn crafting_table_result_commit_publishes_once_before_fifo_fence() {
     )
     .await
     .unwrap();
-    assert_eq!(window.state_id, 3);
+    assert_eq!(window.state_id, 7);
     assert!(window.input.iter().all(ItemStack::is_empty));
     assert_eq!(state.carried_item, ItemStack::new(2, 8));
 
@@ -18045,7 +18586,7 @@ async fn stale_chest_click_after_peer_mutation_resyncs_without_mutating_storage(
     }
     let _ = state
         .sessions
-        .try_chest_slot_dispatches(position, 1, 99, vec![ItemStack::new(stone_id, 2)])
+        .try_chest_slot_dispatches(position, 1, 1, 99, vec![ItemStack::new(stone_id, 2)])
         .expect("peer mutation claims initial chest state");
 
     let mut writer = Vec::new();
@@ -18135,7 +18676,7 @@ async fn chest_commit_snapshot_pairs_world_contents_with_viewer_state_id() {
         .set_chest_block_entity(position, updated.clone())
         .unwrap();
     let (state_id, _) = sessions
-        .try_chest_slot_dispatches(position, 1, 99, vec![ItemStack::new(10, 1)])
+        .try_chest_slot_dispatches(position, 1, 1, 99, vec![ItemStack::new(10, 1)])
         .unwrap();
     assert_eq!(state_id, 2);
     drop(guard);
@@ -18214,8 +18755,8 @@ async fn shared_chest_same_version_click_commits_once_and_conserves_items() {
     .await
     .unwrap();
 
-    assert_eq!(actor_window.state_id, 2);
-    assert_eq!(observer_window.state_id, 2);
+    assert_eq!(actor_window.state_id, 3);
+    assert_eq!(observer_window.state_id, 3);
     assert_eq!(actor.carried_item, ItemStack::new(dirt_id, 1));
     assert!(observer.carried_item.is_empty());
     let chest_count = {
@@ -18235,7 +18776,7 @@ async fn shared_chest_same_version_click_commits_once_and_conserves_items() {
     );
     let observer_packets = decode_container_set_content_packets(&observer_writer);
     assert_eq!(observer_packets.len(), 1);
-    assert_eq!(observer_packets[0].state_id, 2);
+    assert_eq!(observer_packets[0].state_id, 3);
     assert_eq!(observer_packets[0].items[0], ItemStack::new(dirt_id, 1));
     assert!(observer_packets[0].carried_item.is_empty());
 }
@@ -21024,6 +21565,7 @@ fn older_victim_publication_preserves_newer_attacker_costs() {
             died: false,
             fresh_hurt: true,
             shield_blocked: false,
+            shield_cooldown: None,
             knockback: None,
         },
     );
@@ -21058,6 +21600,7 @@ fn stale_damage_publication_does_not_apply_health_side_effects() {
             died: true,
             fresh_hurt: true,
             shield_blocked: false,
+            shield_cooldown: None,
             knockback: Some(knockback),
         },
     );
@@ -21069,5 +21612,7 @@ fn stale_damage_publication_does_not_apply_health_side_effects() {
     assert_eq!(applied.knockback, None);
 }
 
+include!("tests/contact_damage.rs");
+include!("tests/gamerule_keep_inventory.rs");
 include!("tests/inventory_and_survival.rs");
 include!("tests/spawning_and_world.rs");

@@ -4,8 +4,14 @@ Goal: make Solaris feel playable for one 20-minute vanilla-client session.
 
 Default manual profile: `playable.toml`.
 
-Read this file plus `ACTIVE.md` for playable work. Do not read
-`docs/NEXT_SESSION.md`, `docs/VALIDATION_LEDGER.md`,
+Read this file once, then use `ACTIVE.md` as the **only mutable source of
+truth** for playable status, the current checkpoint, recent evidence, and the
+next action. Do not duplicate playable progress into `docs/spark-team/`,
+milestones, readiness ledgers, `docs/NEXT_SESSION.md`, or archive files.
+`docs/spark-team/` is campaign machinery and must not be changed or committed as
+part of ordinary playable checkpoints.
+
+Do not read `docs/NEXT_SESSION.md`, `docs/VALIDATION_LEDGER.md`,
 `docs/VALIDATION_COVERAGE_AUDIT.md`, or `docs/REPLACEMENT_READINESS.md`
 unless the owner explicitly asks for readiness or ledger work.
 

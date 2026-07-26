@@ -19,6 +19,10 @@ final class M94InventoryCraftingScenario {
     static final String SHARED_CHEST_LIVE_OPEN_ID = "m94-03c-two-client-shared-chest-open-with-dirt";
     static final String SHARED_CHEST_LIVE_WITHDRAW_ID = "m94-03c-two-client-shared-chest-withdraw";
     static final String SHARED_CHEST_LIVE_OBSERVE_EMPTY_ID = "m94-03c-two-client-shared-chest-observe-empty";
+    static final String TABLE_CRAFT_ID = "m94-03d-crafting-table-max-craft";
+    static final String FURNACE_UI_ID = "m94-03e-furnace-family-ui";
+    static final String MALFORMED_REJECTION_ID = "m94-03f-malformed-container-rejection";
+    static final String REOPEN_CONSERVATION_ID = "m94-03g-chest-reopen-conservation";
     static final int OAK_PLANKS_RECIPE_DISPLAY_ID = 697;
     private static final String CONTAINER_SCREEN = "net.minecraft.client.gui.screens.inventory.ContainerScreen";
     private static final String SHARED_CHEST_MARKER_FILE = "m94-03b-shared-chest-marker.properties";
@@ -41,7 +45,11 @@ final class M94InventoryCraftingScenario {
             || SHARED_CHEST_LIVE_UPDATE_ID.equals(id)
             || SHARED_CHEST_LIVE_OPEN_ID.equals(id)
             || SHARED_CHEST_LIVE_WITHDRAW_ID.equals(id)
-            || SHARED_CHEST_LIVE_OBSERVE_EMPTY_ID.equals(id);
+            || SHARED_CHEST_LIVE_OBSERVE_EMPTY_ID.equals(id)
+            || TABLE_CRAFT_ID.equals(id)
+            || FURNACE_UI_ID.equals(id)
+            || MALFORMED_REJECTION_ID.equals(id)
+            || REOPEN_CONSERVATION_ID.equals(id);
     }
 
     ClientScenarioReport run(String id, Path screenshotsDir, ScenarioClient client) {
@@ -73,6 +81,27 @@ final class M94InventoryCraftingScenario {
         }
         if (SHARED_CHEST_LIVE_OBSERVE_EMPTY_ID.equals(id)) {
             return runTwoClientSharedChestLiveObserveEmpty(id, screenshotsDir, client);
+        }
+        if (REOPEN_CONSERVATION_ID.equals(id)) {
+            return runChestReopenConservation(id, screenshotsDir, client);
+        }
+        if (TABLE_CRAFT_ID.equals(id)) {
+            return blockedPhase(
+                id,
+                "crafting-table max-craft requires a dedicated table-grid/cursor client primitive"
+            );
+        }
+        if (FURNACE_UI_ID.equals(id)) {
+            return blockedPhase(
+                id,
+                "furnace-family UI requires dedicated input, fuel, output, and reopen observations"
+            );
+        }
+        if (MALFORMED_REJECTION_ID.equals(id)) {
+            return blockedPhase(
+                id,
+                "malformed container rejection requires a bounded raw-click injection primitive"
+            );
         }
         if (!supports(id)) {
             return new ClientScenarioReport("blocked", id, List.of("unsupported scenario id: " + id));
@@ -130,10 +159,16 @@ final class M94InventoryCraftingScenario {
                 ? runSimpleChestOpenProbe(client, observations)
                 : ChestProbeResult.passed();
             if (broadScenario) {
+                observations.add("focused phase available: " + ID);
+                observations.add("focused phase available: " + SHARED_CHEST_ID);
+                observations.add("focused phase available: " + SHARED_CHEST_LIVE_UPDATE_ID);
+                observations.add("focused phase available: " + REOPEN_CONSERVATION_ID);
+                observations.add("focused phase blocked: " + TABLE_CRAFT_ID);
+                observations.add("focused phase blocked: " + FURNACE_UI_ID);
+                observations.add("focused phase blocked: " + MALFORMED_REJECTION_ID);
                 observations.add(
-                    "blocked: cursor transfer, chest/barrel clicks, furnace-family UI, common stations, "
-                        + "malformed clicks, and recovery paths need dedicated in-client primitives "
-                        + "before " + BROAD_ID + " can be green"
+                    "blocked: broad inventory/container coverage is the conjunction of the named focused phases; "
+                        + "unavailable phases cannot be counted through " + BROAD_ID
                 );
             }
             observations.add("screenshots directory available to driver: " + screenshotsDir);
@@ -468,6 +503,91 @@ final class M94InventoryCraftingScenario {
             observations.add("scenario failed with exception: " + error.getMessage());
             return new ClientScenarioReport("failed", id, observations);
         }
+    }
+
+    private ClientScenarioReport runChestReopenConservation(
+        String id,
+        Path screenshotsDir,
+        ScenarioClient client
+    ) {
+        List<String> observations = new ArrayList<>();
+        try {
+            ScenarioBlockPair pair = client.findDryPlaceablePair(ScenarioReach.WITHIN_SURVIVAL_REACH);
+            if (pair == null) {
+                return blockedPhase(id, "no loaded dry chest target exists within survival reach");
+            }
+            ScenarioHeldItem chest = client.giveAndSelect(
+                "minecraft:chest",
+                1,
+                HOTBAR_SLOT,
+                SETUP_TIMEOUT
+            );
+            if (!chest.matches("minecraft:chest", 1)) {
+                return blockedPhase(id, "chest setup did not converge");
+            }
+            ScenarioUseResult placeUse = client.useItemOn(pair.clicked(), chest);
+            boolean placed = client.waitForBlock(pair.target(), "minecraft:chest", BLOCK_TIMEOUT);
+            if (!placed) {
+                observations.add("chest placement failed: use_result=" + placeUse.result());
+                return new ClientScenarioReport("failed", id, observations);
+            }
+            ScenarioBlockTarget chestTarget = new ScenarioBlockTarget(
+                pair.target().x(),
+                pair.target().y(),
+                pair.target().z(),
+                "up",
+                pair.target().label(),
+                "minecraft:chest"
+            );
+            ScenarioHeldItem emptyHand = client.giveAndSelect(
+                "minecraft:air",
+                0,
+                HOTBAR_SLOT,
+                SETUP_TIMEOUT
+            );
+            if (!emptyHand.matches("minecraft:air", 0)) {
+                return blockedPhase(id, "empty-hand setup did not converge before reopen probe");
+            }
+
+            ScenarioUseResult firstUse = client.useItemOn(chestTarget, emptyHand);
+            boolean firstOpened = client.waitForScreenClassName(CONTAINER_SCREEN, INVENTORY_TIMEOUT);
+            boolean firstEmpty = firstOpened
+                && client.waitForContainerSlotEmpty(SHARED_CHEST_SLOT, INVENTORY_TIMEOUT);
+            boolean firstClosed = firstOpened && client.closeCurrentScreen(INVENTORY_TIMEOUT);
+
+            ScenarioUseResult secondUse = client.useItemOn(chestTarget, emptyHand);
+            boolean secondOpened = firstClosed
+                && client.waitForScreenClassName(CONTAINER_SCREEN, INVENTORY_TIMEOUT);
+            boolean secondEmpty = secondOpened
+                && client.waitForContainerSlotEmpty(SHARED_CHEST_SLOT, INVENTORY_TIMEOUT);
+            boolean secondClosed = secondOpened && client.closeCurrentScreen(INVENTORY_TIMEOUT);
+            boolean passed = firstOpened
+                && firstEmpty
+                && firstClosed
+                && secondOpened
+                && secondEmpty
+                && secondClosed;
+            observations.add(
+                "chest reopen conservation: " + (passed ? "passed" : "failed")
+                    + " first_use=" + firstUse.result()
+                    + " first_opened=" + firstOpened
+                    + " first_empty=" + firstEmpty
+                    + " first_closed=" + firstClosed
+                    + " second_use=" + secondUse.result()
+                    + " second_opened=" + secondOpened
+                    + " second_empty=" + secondEmpty
+                    + " second_closed=" + secondClosed
+            );
+            observations.add("screenshots directory available to driver: " + screenshotsDir);
+            return new ClientScenarioReport(passed ? "passed" : "failed", id, observations);
+        } catch (Exception error) {
+            observations.add("scenario failed with exception: " + error.getMessage());
+            return new ClientScenarioReport("failed", id, observations);
+        }
+    }
+
+    private static ClientScenarioReport blockedPhase(String id, String reason) {
+        return new ClientScenarioReport("blocked", id, List.of("blocked: " + reason));
     }
 
     private static boolean movePrimaryToSharedChestSetup(

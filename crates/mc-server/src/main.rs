@@ -598,13 +598,23 @@ async fn serve(path: &Path) -> Result<()> {
         "item component facts loaded"
     );
 
+    let startup_view_distance = startup_spawn_view_distance(&cfg);
+    let cache_view_distance = runtime_cache_view_distance(&cfg);
+    tracing::info!(
+        configured_view_distance = cfg.server.view_distance,
+        startup_view_distance,
+        cache_view_distance,
+        autoscale_enabled = cfg.autoscale.enabled,
+        "startup spawn preparation policy resolved",
+    );
+
     let world: Option<mc_net::WorldHandle> = if let Some(world_dir) = &cfg.data.world_dir {
         let open_result = (|| -> Result<mc_world::WorldStorage> {
             ensure_world_region_root(world_dir)?;
             Ok(mc_world::WorldStorage::open_with_capacities(
                 world_dir,
                 Arc::clone(&blocks),
-                chunk_cache_size_for_view_distance(cfg.server.view_distance),
+                chunk_cache_size_for_view_distance(cache_view_distance),
                 chunk_pipeline.region_cache_size,
             )?)
         })();
@@ -629,7 +639,7 @@ async fn serve(path: &Path) -> Result<()> {
                     let generated = generate_spawn_window(
                         &mut storage,
                         Arc::clone(&terrain_generator) as Arc<dyn mc_world::ChunkGenerator>,
-                        cfg.server.view_distance,
+                        startup_view_distance,
                         startup_workers,
                         startup_light_workers,
                         Some(block_light.as_ref()),
@@ -648,7 +658,7 @@ async fn serve(path: &Path) -> Result<()> {
                     let prepared = prepare_existing_spawn_window(
                         &mut storage,
                         block_light.as_ref(),
-                        cfg.server.view_distance,
+                        startup_view_distance,
                         startup_light_workers,
                     )?;
                     tracing::info!(
@@ -657,8 +667,9 @@ async fn serve(path: &Path) -> Result<()> {
                         baked = prepared.baked,
                         flushed = 0usize,
                         dirty = prepared.dirty,
-                        view_distance = cfg.server.view_distance,
-                        "existing world spawn window warmed",
+                        configured_view_distance = cfg.server.view_distance,
+                        startup_view_distance,
+                        "existing world startup spawn window warmed",
                     );
                 }
                 tracing::info!(
@@ -935,6 +946,31 @@ fn structure_rules_for_startup(
             .context("resolving Solaris playable ruin");
     }
     Ok(mc_worldgen::StructureRules::none())
+}
+
+fn startup_spawn_view_distance(config: &mc_server::ServerConfig) -> i32 {
+    if config.autoscale.enabled {
+        config
+            .autoscale
+            .to_policy(&config.chunk_pipeline)
+            .min_view_distance
+    } else {
+        config.server.view_distance
+    }
+    .clamp(mc_net::MIN_VIEW_DISTANCE, mc_net::MAX_VIEW_DISTANCE)
+}
+
+fn runtime_cache_view_distance(config: &mc_server::ServerConfig) -> i32 {
+    if config.autoscale.enabled {
+        config
+            .autoscale
+            .to_policy(&config.chunk_pipeline)
+            .max_view_distance
+            .max(config.server.view_distance)
+    } else {
+        config.server.view_distance
+    }
+    .clamp(mc_net::MIN_VIEW_DISTANCE, mc_net::MAX_VIEW_DISTANCE)
 }
 
 fn chunk_cache_size_for_view_distance(view_distance: i32) -> usize {
@@ -1214,6 +1250,7 @@ fn bake_spawn_window_light_for_positions(
     }
 
     let workers = worker_threads.max(1).min(total);
+    let started = Instant::now();
     tracing::info!(
         chunks = total,
         workers,
@@ -1289,6 +1326,15 @@ fn bake_spawn_window_light_for_positions(
         Ok::<(), anyhow::Error>(())
     })?;
 
+    let elapsed = started.elapsed();
+    tracing::info!(
+        baked = total,
+        elapsed_ms = elapsed.as_millis(),
+        chunks_per_second = total as f64 / elapsed.as_secs_f64().max(0.001),
+        workers,
+        view_distance,
+        "spawn-window light bake finished",
+    );
     Ok(total)
 }
 
@@ -1774,6 +1820,53 @@ mod tests {
         assert_eq!(chunk_cache_size_for_view_distance(4), 169);
         assert_eq!(chunk_cache_size_for_view_distance(10), 625);
         assert_eq!(chunk_cache_size_for_view_distance(-1), 9);
+    }
+
+    #[test]
+    fn high_end_startup_prepares_minimum_but_reserves_vd32_cache() {
+        let config: mc_server::ServerConfig =
+            toml::from_str(include_str!("../../../example.toml")).expect("parse example config");
+
+        assert_eq!(config.server.view_distance, 32);
+        assert_eq!(startup_spawn_view_distance(&config), 8);
+        assert_eq!(runtime_cache_view_distance(&config), 32);
+        assert_eq!(chunk_cache_size_for_view_distance(32), 4_761);
+        assert_eq!(spawn_window_positions(8).len(), 361);
+        assert_eq!(spawn_view_positions(8).len(), 289);
+    }
+
+    #[test]
+    fn playable_startup_keeps_its_fixed_vd4_contract() {
+        let config: mc_server::ServerConfig =
+            toml::from_str(include_str!("../../../playable.toml")).expect("parse playable config");
+
+        assert_eq!(startup_spawn_view_distance(&config), 4);
+        assert_eq!(runtime_cache_view_distance(&config), 4);
+    }
+
+    #[test]
+    fn disabled_autoscale_prepares_the_configured_view_distance() {
+        let mut config: mc_server::ServerConfig =
+            toml::from_str(include_str!("../../../example.toml")).expect("parse example config");
+        config.server.view_distance = 24;
+        config.autoscale.enabled = false;
+
+        assert_eq!(startup_spawn_view_distance(&config), 24);
+        assert_eq!(runtime_cache_view_distance(&config), 24);
+    }
+
+    #[test]
+    fn autoscale_overrides_define_startup_and_cache_windows() {
+        let mut config: mc_server::ServerConfig =
+            toml::from_str(include_str!("../../../example.toml")).expect("parse example config");
+        config.server.view_distance = 20;
+        config.autoscale.enabled = true;
+        config.autoscale.profile = mc_server::AutoscaleProfile::HighEnd;
+        config.autoscale.min_view_distance = Some(12);
+        config.autoscale.max_view_distance = Some(28);
+
+        assert_eq!(startup_spawn_view_distance(&config), 12);
+        assert_eq!(runtime_cache_view_distance(&config), 28);
     }
 
     #[test]

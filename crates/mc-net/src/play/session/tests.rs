@@ -59,6 +59,7 @@ fn lethal_survival_commit_pushes_immutable_player_death_before_session_cleanup()
             enchanting_table_input: None,
             item_entity_type_id: None,
             xp_orb_entity_type_id: None,
+            keep_inventory: false,
             position: Vec3::new(pose.x, pose.y, pose.z),
         },
     );
@@ -163,6 +164,7 @@ fn respawn_commit_clears_player_hurt_resistance() {
             enchanting_table_input: None,
             item_entity_type_id: None,
             xp_orb_entity_type_id: None,
+            keep_inventory: false,
             position: Vec3::new(0.5, 64.0, 0.5),
         },
     );
@@ -1952,6 +1954,7 @@ fn chest_world_commit_does_not_hold_unrelated_session_or_entity_state() {
                     actor_session: session_id,
                     player: &player,
                 },
+                1,
                 Vec::new(),
                 || {
                     commit_entered_tx.send(()).expect("test receiver remains");
@@ -2912,6 +2915,34 @@ fn loaded_chunk_index_tracks_shared_load_unload_and_disconnect() {
 }
 
 #[test]
+fn unregister_releases_session_owned_prepared_claim() {
+    let registry = SessionRegistry::new();
+    let chunk = (2, -3);
+    let (tx, _rx) = mpsc::channel(1);
+    let (session, _) = registry.register(
+        &profile("PreparedClaimOwner"),
+        chunk,
+        0,
+        HashSet::from([chunk]),
+        tx,
+        PlayerPose::new(0.5, 64.0, 0.5),
+    );
+    let claim = match registry.prepared_chunk_or_wait_for_earlier_session(chunk, session) {
+        SessionPreparedChunkClaimResult::Claimed(claim) => claim,
+        other => panic!("expected session-owned claim, got {other:?}"),
+    };
+    assert_eq!(claim.owner_session, Some(session));
+
+    registry.unregister(session);
+
+    let replacement = match registry.prepared_chunk_or_claim(chunk) {
+        PreparedChunkClaimResult::Claimed(claim) => claim,
+        other => panic!("expected unregister to release session claim, got {other:?}"),
+    };
+    assert!(registry.release_prepared_chunk_claim(chunk, replacement));
+}
+
+#[test]
 fn prepared_chunk_claim_blocks_duplicate_until_released() {
     let registry = SessionRegistry::new();
     let chunk = (2, -3);
@@ -2931,6 +2962,7 @@ fn prepared_chunk_claim_blocks_duplicate_until_released() {
         PreparedChunkClaim {
             id: first_claim.id.wrapping_add(1),
             revision: first_claim.revision,
+            owner_session: first_claim.owner_session,
         }
     ));
     assert!(matches!(
@@ -3075,7 +3107,7 @@ fn chest_slot_dispatches_claim_expected_state_exactly_once() {
     assert_eq!(registry.register_chest_viewer(bob, position), 1);
 
     let (state_id, dispatches) = registry
-        .try_chest_slot_dispatches(position, 1, alice, vec![stack.clone()])
+        .try_chest_slot_dispatches(position, 1, 1, alice, vec![stack.clone()])
         .expect("first mutation claims state 1");
 
     assert_eq!(state_id, 2);
@@ -3096,7 +3128,7 @@ fn chest_slot_dispatches_claim_expected_state_exactly_once() {
     }
 
     let conflict = registry
-        .try_chest_slot_dispatches(position, 1, bob, vec![ItemStack::new(11, 1)])
+        .try_chest_slot_dispatches(position, 1, 1, bob, vec![ItemStack::new(11, 1)])
         .expect_err("state 1 cannot be claimed twice");
     assert_eq!(conflict, 2);
     assert_eq!(registry.chest_state_id(position), 2);
@@ -7050,6 +7082,7 @@ fn player_attack_uses_authoritative_held_spear_range() {
         enchanting_table_input: None,
         item_entity_type_id: None,
         xp_orb_entity_type_id: None,
+        keep_inventory: false,
         position: Vec3::new(pose.x, pose.y, pose.z),
     };
     let spawn = |z| match &registry.spawn_command_entity(
@@ -7112,6 +7145,7 @@ fn direct_player_melee_kill_pushes_one_authoritative_script_event() {
             enchanting_table_input: None,
             item_entity_type_id: None,
             xp_orb_entity_type_id: None,
+            keep_inventory: false,
             position,
         }
     }
@@ -9811,6 +9845,219 @@ fn vehicle_crossing_publishes_authoritative_passenger_motion() {
             .position,
         Vec3::new(128.5, 64.0, 0.5)
     );
+}
+
+fn configure_item_merge_resources(registry: &SessionRegistry) {
+    let items = Arc::new(mc_data::items::ItemRegistry::from_report(&[
+        mc_data::items::ItemReport {
+            id: mc_data::Identifier::parse("minecraft:dirt").unwrap(),
+            protocol_id: 42,
+        },
+        mc_data::items::ItemReport {
+            id: mc_data::Identifier::parse("minecraft:stone").unwrap(),
+            protocol_id: 43,
+        },
+    ]));
+    registry.configure_player_combat(
+        None,
+        None,
+        items,
+        Arc::new(mc_data::item_components::ItemFactsTable::default()),
+    );
+}
+
+#[test]
+fn compatible_ready_item_drops_merge_once_and_publish_exact_survivor() {
+    let registry = SessionRegistry::new();
+    configure_item_merge_resources(&registry);
+    let observer = register_test_session(&registry, "MergeObserver");
+    assert!(registry.mark_loaded(observer, (0, 0)).is_empty());
+    let first_dispatches =
+        registry.spawn_item_drop(1, Vec3::new(10.5, 64.0, 0.5), EntityItemStack::new(42, 3));
+    let first_id = first_dispatches
+        .iter()
+        .find_map(|dispatch| match &dispatch.command {
+            OutboundCommand::SpawnEntity(snapshot) => Some(snapshot.id),
+            _ => None,
+        })
+        .expect("first item visible");
+    registry.advance_world_time(2);
+    let second_dispatches =
+        registry.spawn_item_drop(1, Vec3::new(10.75, 64.0, 0.5), EntityItemStack::new(42, 2));
+    let second_id = second_dispatches
+        .iter()
+        .find_map(|dispatch| match &dispatch.command {
+            OutboundCommand::SpawnEntity(snapshot) => Some(snapshot.id),
+            _ => None,
+        })
+        .expect("second item visible");
+    registry.advance_world_time(2);
+
+    let dispatches = registry.item_pickup_ready_dispatches_owned(
+        &SimulationAuthority::for_test(),
+        ITEM_PICKUP_DELAY_TICKS,
+    );
+
+    let entities = registry.lock_entities("inspect merged item rows");
+    let survivor = entities
+        .snapshot(first_id)
+        .expect("merged survivor ECS row");
+    assert_eq!(survivor.item_stack, Some(EntityItemStack::new(42, 5)));
+    assert_eq!(
+        survivor.retained.spawn_tick, 2,
+        "merged age must retain the younger vanilla age"
+    );
+    assert!(
+        entities.snapshot(second_id).is_none(),
+        "consumed item identity must be removed"
+    );
+    drop(entities);
+    assert!(dispatches.iter().any(|dispatch| matches!(
+        &dispatch.command,
+        OutboundCommand::UpdateEntityData(snapshot)
+            if snapshot.id == first_id
+                && snapshot.item_stack == Some(EntityItemStack::new(42, 5))
+    )));
+    assert!(dispatches.iter().any(|dispatch| matches!(
+        &dispatch.command,
+        OutboundCommand::DespawnEntity(snapshot) if snapshot.id == second_id
+    )));
+}
+
+#[test]
+fn incompatible_and_full_item_drops_do_not_merge() {
+    let registry = SessionRegistry::new();
+    configure_item_merge_resources(&registry);
+    registry.spawn_item_drop(1, Vec3::new(10.5, 64.0, 0.5), EntityItemStack::new(42, 1));
+    registry.spawn_item_drop(1, Vec3::new(10.75, 64.0, 0.5), EntityItemStack::new(43, 1));
+    registry.spawn_item_drop(1, Vec3::new(11.5, 64.0, 0.5), EntityItemStack::new(42, 64));
+    registry.spawn_item_drop(1, Vec3::new(11.75, 64.0, 0.5), EntityItemStack::new(42, 1));
+    registry.advance_world_time(ITEM_PICKUP_DELAY_TICKS);
+
+    let dispatches = registry.item_pickup_ready_dispatches_owned(
+        &SimulationAuthority::for_test(),
+        ITEM_PICKUP_DELAY_TICKS,
+    );
+
+    let remaining = registry.nearby_item_entities(Vec3::new(11.0, 64.0, 0.5), 2.0);
+    assert_eq!(remaining.len(), 4);
+    assert!(dispatches.is_empty());
+}
+
+#[test]
+fn expired_different_owner_blocks_do_not_prevent_item_merge() {
+    let registry = SessionRegistry::new();
+    configure_item_merge_resources(&registry);
+    let first_owner = register_test_session(&registry, "MergeOwnerOne");
+    let second_owner = register_test_session(&registry, "MergeOwnerTwo");
+    registry.spawn_item_drop(1, Vec3::new(15.5, 64.0, 0.5), EntityItemStack::new(42, 3));
+    registry.spawn_item_drop(1, Vec3::new(15.75, 64.0, 0.5), EntityItemStack::new(42, 2));
+    let mut ids = registry
+        .persisted_entity_records()
+        .into_iter()
+        .map(|record| record.snapshot.id)
+        .collect::<Vec<_>>();
+    ids.sort_unstable();
+    {
+        let mut entities = registry.lock_entities("seed expired item owner blocks");
+        for (id, owner) in [(ids[0], first_owner), (ids[1], second_owner)] {
+            let expected = entities.snapshot(id).expect("item snapshot");
+            let mut next = expected.clone();
+            next.retained.item_pickup_owner_block = Some(mc_entity::EntityItemPickupOwnerBlock {
+                owner_session: owner,
+                expires_tick: 1,
+            });
+            assert!(entities.replace_snapshot_if_current(expected, next));
+        }
+    }
+    registry.advance_world_time(ITEM_PICKUP_DELAY_TICKS);
+
+    registry.item_pickup_ready_dispatches_owned(
+        &SimulationAuthority::for_test(),
+        ITEM_PICKUP_DELAY_TICKS,
+    );
+
+    let records = registry.persisted_entity_records();
+    assert_eq!(records.len(), 1);
+    assert_eq!(records[0].snapshot.id, ids[0]);
+    assert_eq!(
+        records[0].snapshot.item_stack,
+        Some(EntityItemStack::new(42, 5))
+    );
+    assert_eq!(records[0].snapshot.retained.item_pickup_owner_block, None);
+}
+
+#[test]
+fn item_drops_that_converge_after_pickup_ready_merge_on_physics_tick() {
+    let registry = SessionRegistry::new();
+    configure_item_merge_resources(&registry);
+    registry.spawn_item_drop(1, Vec3::new(20.5, 64.0, 0.5), EntityItemStack::new(42, 3));
+    registry.spawn_item_drop(1, Vec3::new(22.0, 64.0, 0.5), EntityItemStack::new(42, 2));
+    let mut ids = registry
+        .persisted_entity_records()
+        .into_iter()
+        .map(|record| record.snapshot.id)
+        .collect::<Vec<_>>();
+    ids.sort_unstable();
+    registry.advance_world_time(ITEM_PICKUP_DELAY_TICKS);
+    assert!(
+        registry
+            .item_pickup_ready_dispatches_owned(
+                &SimulationAuthority::for_test(),
+                ITEM_PICKUP_DELAY_TICKS,
+            )
+            .is_empty()
+    );
+    assert_eq!(registry.persisted_entity_records().len(), 2);
+
+    registry.apply_entity_physics_and_dispatch(
+        ITEM_PICKUP_DELAY_TICKS + 1,
+        &[EntityPhysicsStep {
+            id: ids[1],
+            position: Vec3::new(20.75, 64.0, 0.5),
+            velocity: Vec3::ZERO,
+            on_ground: true,
+            horizontal_collision: false,
+        }],
+    );
+
+    let records = registry.persisted_entity_records();
+    assert_eq!(records.len(), 1);
+    assert_eq!(records[0].snapshot.id, ids[0]);
+    assert_eq!(
+        records[0].snapshot.item_stack,
+        Some(EntityItemStack::new(42, 5))
+    );
+}
+
+#[test]
+fn item_despawn_reschedule_keeps_one_authoritative_queue_entry() {
+    let registry = SessionRegistry::new();
+    registry.spawn_item_drop(1, Vec3::new(0.5, 64.0, 0.5), EntityItemStack::new(42, 3));
+    let entity_id = registry
+        .persisted_entity_records()
+        .into_iter()
+        .next()
+        .map(|record| record.snapshot.id)
+        .expect("spawned item identity");
+    {
+        let mut inner = registry.lock_inner("reschedule item despawn regression");
+        for spawn_tick in 1..=128 {
+            schedule_item_despawn_locked(&mut inner, entity_id, spawn_tick);
+        }
+        assert_eq!(inner.item_despawn_deadline_by_id.len(), 1);
+        assert_eq!(
+            inner
+                .item_despawn_deadlines
+                .values()
+                .flat_map(|bucket| bucket.iter())
+                .filter(|queued| **queued == entity_id)
+                .count(),
+            1,
+            "rescheduling must replace the old queue entry instead of accumulating stale IDs"
+        );
+        assert_eq!(inner.item_despawn_deadlines.len(), 1);
+    }
 }
 
 #[test]

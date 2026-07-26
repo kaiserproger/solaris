@@ -730,11 +730,22 @@ mod tests {
     }
 
     #[test]
-    fn example_config_enables_live_autoscale() {
+    fn example_config_enables_high_end_eight_to_thirty_two_autoscale() {
         let cfg: ServerConfig =
             toml::from_str(include_str!("../../../example.toml")).expect("parse example.toml");
+        let policy = cfg.autoscale.to_policy(&cfg.chunk_pipeline);
+        let limits = cfg
+            .autoscale
+            .initial_limits(&cfg.server, &cfg.chunk_pipeline);
 
         assert!(cfg.autoscale.enabled);
+        assert_eq!(cfg.autoscale.profile, AutoscaleProfile::HighEnd);
+        assert_eq!(cfg.server.view_distance, 32);
+        assert_eq!(cfg.server.simulation_distance, 8);
+        assert_eq!(policy.min_view_distance, 8);
+        assert_eq!(policy.max_view_distance, 32);
+        assert_eq!(policy.target_tick_ms, 50);
+        assert_eq!(limits.view_distance, 32);
     }
 
     #[test]

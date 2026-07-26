@@ -894,6 +894,7 @@ fn sync_regional_journal_directory(_path: &Path) -> Result<(), RegionalDecisionJ
 pub(crate) struct WorldPersistedMetadata {
     pub(crate) world_time: u64,
     pub(crate) players_sleeping_percentage: u32,
+    pub(crate) keep_inventory: bool,
     pub(crate) world_identity: String,
 }
 
@@ -2022,9 +2023,20 @@ pub(crate) fn load_world_metadata(
         })?,
         None => 100,
     };
+    let keep_inventory = match field(&fields, "SolarisKeepInventory") {
+        Some(Tag::Byte(0)) | None => false,
+        Some(Tag::Byte(1)) => true,
+        _ => {
+            return Err(PlayerPersistenceError::InvalidValue {
+                path: path.clone(),
+                field: "SolarisKeepInventory",
+            });
+        }
+    };
     Ok(Some(WorldPersistedMetadata {
         world_time: long_field(&fields, "SolarisWorldTime").unwrap_or(0) as u64,
         players_sleeping_percentage,
+        keep_inventory,
         world_identity: string_field(&fields, "SolarisWorldIdentity")
             .unwrap_or_default()
             .to_string(),
@@ -2048,6 +2060,10 @@ pub(crate) fn save_world_metadata(
         (
             "SolarisPlayersSleepingPercentage".into(),
             Tag::Long(i64::from(metadata.players_sleeping_percentage)),
+        ),
+        (
+            "SolarisKeepInventory".into(),
+            Tag::Byte(i8::from(metadata.keep_inventory)),
         ),
     ]);
     write_player_root(&path, "", &root)
@@ -3955,6 +3971,7 @@ mod tests {
         let metadata = WorldPersistedMetadata {
             world_time: 12345,
             players_sleeping_percentage: 50,
+            keep_inventory: true,
             world_identity: world_identity(tmp.path()),
         };
 
@@ -3979,5 +3996,6 @@ mod tests {
         let loaded = load_world_metadata(tmp.path()).unwrap().unwrap();
 
         assert_eq!(loaded.players_sleeping_percentage, 100);
+        assert!(!loaded.keep_inventory);
     }
 }

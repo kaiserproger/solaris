@@ -21,7 +21,8 @@ mod stonecutter;
 
 pub(in crate::play) use chest::{
     ChestClickAction, ChestClickInput, ChestView, ChestWindow, adjacent_chest_positions,
-    chest_slot_stacks, chest_wire_items, plan_click as plan_chest_click,
+    chest_menu_state_change_count, chest_slot_stacks, chest_wire_items,
+    plan_click as plan_chest_click,
 };
 #[cfg(test)]
 pub(in crate::play) use chest::{

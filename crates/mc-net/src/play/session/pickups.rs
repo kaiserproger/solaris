@@ -4,7 +4,7 @@ use super::entity_lifecycle::{
 };
 use super::interaction_geometry::{distance_sq, entity_aabb};
 use super::outbound::{OutboundCommand, SessionRecipient, VisibilityDispatch};
-use super::visibility::ordered_session_recipient;
+use super::visibility::{despawn_entity_visibility_locked, ordered_session_recipient};
 use super::{
     ServerEntitySnapshot, SessionEntityGuards, SessionId, SessionRegistry, SessionRegistryInner,
     initialize_entity_wire_state_locked, schedule_item_despawn_locked, server_entity_snapshot_from,
@@ -13,7 +13,7 @@ use super::{
 };
 use crate::play::GameMode;
 use crate::play::campfire::PendingCampfireOutput;
-use crate::play::inventory::PlayerInventory;
+use crate::play::inventory::{PlayerInventory, can_stack, item_max_stack};
 use crate::play::persistence::XpState;
 use crate::play::simulation::SimulationAuthority;
 use mc_entity::{
@@ -28,6 +28,7 @@ use tracing::warn;
 
 pub(in crate::play) const ENTITY_PICKUP_RADIUS: f64 = 2.25;
 pub(in crate::play) const ITEM_PICKUP_DELAY_TICKS: u64 = 4;
+const ITEM_MERGE_RADIUS: f64 = 0.5;
 const PLAYER_ITEM_OWNER_PICKUP_BLOCK_TICKS: u64 = 100;
 
 #[cfg(test)]
@@ -203,14 +204,14 @@ impl SessionRegistry {
         _authority: &SimulationAuthority,
         tick: u64,
     ) -> Vec<VisibilityDispatch> {
-        let session_ids = {
+        let (session_ids, mut dispatches) = {
             let mut inner = self.lock_session_entities("publish item pickup readiness");
             let due_ticks = inner
                 .item_pickup_ready
                 .range(..=tick)
                 .map(|(&ready_tick, _)| ready_tick)
                 .collect::<Vec<_>>();
-            let entity_ids = due_ticks
+            let mut entity_ids = due_ticks
                 .into_iter()
                 .flat_map(|ready_tick| {
                     inner
@@ -219,6 +220,9 @@ impl SessionRegistry {
                         .unwrap_or_default()
                 })
                 .collect::<Vec<_>>();
+            entity_ids.sort_unstable();
+            entity_ids.dedup();
+            let dispatches = merge_item_entities_locked(&mut inner, &entity_ids);
             let positions = entity_ids
                 .into_iter()
                 .filter_map(|entity_id| inner.entities.snapshot(entity_id))
@@ -232,7 +236,7 @@ impl SessionRegistry {
                 })
                 .map(|entity| entity.position)
                 .collect::<Vec<_>>();
-            if positions.is_empty() {
+            let session_ids = if positions.is_empty() {
                 Vec::new()
             } else {
                 let radius_sq = ENTITY_PICKUP_RADIUS * ENTITY_PICKUP_RADIUS;
@@ -247,9 +251,11 @@ impl SessionRegistry {
                             .then_some(session_id)
                     })
                     .collect::<Vec<_>>()
-            }
+            };
+            (session_ids, dispatches)
         };
-        self.pickup_candidate_dispatches(session_ids)
+        dispatches.extend(self.pickup_candidate_dispatches(session_ids));
+        dispatches
     }
 
     pub(in crate::play) fn spawn_item_drop_owned(
@@ -799,6 +805,184 @@ pub(super) fn block_item_pickup_for_owner_locked(
         expires_tick,
     });
     let _ = inner.entities.replace_snapshot_if_current(expected, next);
+}
+
+fn item_stack_probe(stack: &EntityItemStack) -> ItemStack {
+    ItemStack {
+        item_id: stack.item_id,
+        count: stack.count,
+        damage: stack.damage,
+        enchantments: stack.enchantments.clone(),
+        custom_name: None,
+    }
+}
+
+fn merged_item_owner_block(
+    left: Option<EntityItemPickupOwnerBlock>,
+    right: Option<EntityItemPickupOwnerBlock>,
+    lifecycle_tick: u64,
+) -> Option<Option<EntityItemPickupOwnerBlock>> {
+    let left = left.filter(|block| lifecycle_tick < block.expires_tick);
+    let right = right.filter(|block| lifecycle_tick < block.expires_tick);
+    match (left, right) {
+        (None, None) => Some(None),
+        (Some(left), Some(right)) if left.owner_session == right.owner_session => {
+            Some(Some(EntityItemPickupOwnerBlock {
+                owner_session: left.owner_session,
+                expires_tick: left.expires_tick.max(right.expires_tick),
+            }))
+        }
+        _ => None,
+    }
+}
+
+pub(super) fn merge_item_entities_locked(
+    inner: &mut SessionEntityGuards<'_>,
+    ready_ids: &[EntityId],
+) -> Vec<VisibilityDispatch> {
+    let items = Arc::clone(&inner.player_combat.items);
+    let item_facts = Arc::clone(&inner.player_combat.item_facts);
+    let mut consumed_ids = HashSet::new();
+    let mut dispatches = Vec::new();
+    let radius_sq = ITEM_MERGE_RADIUS * ITEM_MERGE_RADIUS;
+
+    for &ready_id in ready_ids {
+        if consumed_ids.contains(&ready_id) {
+            continue;
+        }
+        let Some(ready) = inner.entities.snapshot(ready_id) else {
+            continue;
+        };
+        if ready.lifecycle != EntityLifecycle::Alive || ready.type_name != "minecraft:item" {
+            continue;
+        }
+        let Some(ready_stack) = ready.item_stack.as_ref() else {
+            continue;
+        };
+        if ready_stack.count <= 0 {
+            continue;
+        }
+
+        let mut candidates =
+            nearby_entity_candidate_ids_locked(inner, ready.position, ITEM_MERGE_RADIUS);
+        candidates.sort_unstable();
+        for candidate_id in candidates {
+            if candidate_id == ready_id || consumed_ids.contains(&candidate_id) {
+                continue;
+            }
+            let Some(candidate) = inner.entities.snapshot(candidate_id) else {
+                continue;
+            };
+            if candidate.lifecycle != EntityLifecycle::Alive
+                || candidate.type_name != "minecraft:item"
+                || distance_sq(ready.position, candidate.position) > radius_sq
+            {
+                continue;
+            }
+            let Some(merged_owner_block) = merged_item_owner_block(
+                ready.retained.item_pickup_owner_block,
+                candidate.retained.item_pickup_owner_block,
+                inner.entity_lifecycle_tick,
+            ) else {
+                continue;
+            };
+            let Some(candidate_stack) = candidate.item_stack.as_ref() else {
+                continue;
+            };
+            if candidate_stack.count <= 0
+                || !can_stack(
+                    &item_stack_probe(ready_stack),
+                    &item_stack_probe(candidate_stack),
+                )
+            {
+                continue;
+            }
+
+            let (survivor_expected, consumed_expected) = if ready_stack.count
+                > candidate_stack.count
+                || (ready_stack.count == candidate_stack.count && ready.id < candidate.id)
+            {
+                (ready.clone(), candidate.clone())
+            } else {
+                (candidate.clone(), ready.clone())
+            };
+            let Some(survivor_stack) = survivor_expected.item_stack.as_ref() else {
+                continue;
+            };
+            let Some(consumed_stack) = consumed_expected.item_stack.as_ref() else {
+                continue;
+            };
+            let Some(merged_count) = survivor_stack.count.checked_add(consumed_stack.count) else {
+                continue;
+            };
+            if items.name_of(survivor_stack.item_id).is_none() {
+                continue;
+            }
+            let max_stack = item_max_stack(&item_facts, &items, &item_stack_probe(survivor_stack));
+            if merged_count > max_stack {
+                continue;
+            }
+
+            let mut survivor_next = survivor_expected.clone();
+            let mut merged_stack = survivor_stack.clone();
+            merged_stack.count = merged_count;
+            survivor_next.item_stack = Some(merged_stack);
+            survivor_next.retained.spawn_tick = survivor_expected
+                .retained
+                .spawn_tick
+                .max(consumed_expected.retained.spawn_tick);
+            survivor_next.retained.item_pickup_ready_tick = survivor_expected
+                .retained
+                .item_pickup_ready_tick
+                .max(consumed_expected.retained.item_pickup_ready_tick);
+            survivor_next.retained.item_pickup_owner_block = merged_owner_block;
+
+            if !inner.entities.merge_item_snapshots_if_current(
+                survivor_expected.clone(),
+                survivor_next.clone(),
+                consumed_expected.clone(),
+            ) {
+                continue;
+            }
+
+            let survivor_id = survivor_next.id;
+            let consumed_id = consumed_expected.id;
+            let survivor_published = server_entity_snapshot_from(survivor_next.clone());
+            let consumed_published = server_entity_snapshot_from(consumed_expected);
+            inner
+                .published_entity_snapshots
+                .insert(survivor_id, survivor_published.clone());
+            schedule_item_despawn_locked(inner, survivor_id, survivor_next.retained.spawn_tick);
+            if survivor_next
+                .retained
+                .item_pickup_ready_tick
+                .is_some_and(|ready_tick| ready_tick > inner.entity_lifecycle_tick)
+            {
+                inner
+                    .item_pickup_ready
+                    .entry(
+                        survivor_next
+                            .retained
+                            .item_pickup_ready_tick
+                            .expect("future pickup readiness was checked"),
+                    )
+                    .or_default()
+                    .push(survivor_id);
+            }
+
+            let update_recipients =
+                session_recipients(inner, visible_entity_observers_locked(inner, survivor_id));
+            inner.entity_dispatches.data += update_recipients.len() as u64;
+            dispatches.extend(visibility_dispatches(update_recipients, || {
+                OutboundCommand::UpdateEntityData(survivor_published.clone())
+            }));
+            dispatches.extend(despawn_entity_visibility_locked(inner, &consumed_published));
+            clear_removed_entity_tracking_locked(inner, consumed_id);
+            consumed_ids.insert(consumed_id);
+            break;
+        }
+    }
+    dispatches
 }
 
 pub(super) fn spawn_item_drop_locked(

@@ -1,7 +1,8 @@
 use super::interaction_geometry::{player_aabb_for_pose, within_entity_attack_reach};
 use super::outbound::{
     OutboundCommand, PlayerCarriedItemDelta, PlayerDamagePublication, PlayerHurtEvent,
-    PlayerInventorySlotDelta, PlayerXpDelta, SessionRecipient, VisibilityDispatch,
+    PlayerInventorySlotDelta, PlayerXpDelta, SessionRecipient, ShieldCooldownPublication,
+    VisibilityDispatch,
 };
 use super::player_state::{
     apply_player_survival_plan_locked, player_attack_cost_plan_matches,
@@ -17,14 +18,16 @@ use super::{
 use crate::play::combat::{
     ActiveShield, PlayerDamageKind, PlayerDamageRequest, PlayerHurtResolution,
     damage_active_shield_slot, melee_knockback, shield_block_knockback, shield_blocks_damage_since,
-    shield_use_matches_slot,
+    shield_disable_ticks, shield_use_matches_slot,
 };
 use crate::play::inventory::{
-    damage_inventory_armor, inventory_damage_after_armor, inventory_damage_after_protection,
+    PlayerInventory, damage_inventory_armor, inventory_damage_after_armor,
+    inventory_damage_after_protection,
 };
 use crate::play::simulation::{PlayerSurvivalPlan, SimulationAuthority};
 use crate::play::{GameMode, PlayerPose};
 use mc_entity::{EntityId, Vec3};
+use mc_protocol::packets::play::ItemStack;
 use std::sync::Arc;
 use std::time::Instant;
 use tracing::warn;
@@ -44,6 +47,7 @@ struct PlayerAttackCommit<'a> {
     attacker_costs: Option<&'a PlayerSurvivalPlan>,
     expected_shield: Option<ActiveShield>,
     shield_after_block: Option<ShieldAfterBlock>,
+    shield_disable: Option<ShieldDisablePlan>,
     next_resistance: Option<crate::play::combat::PlayerHurtResistance>,
     target_plan: &'a PlayerSurvivalPlan,
 }
@@ -51,6 +55,22 @@ struct PlayerAttackCommit<'a> {
 enum ShieldAfterBlock {
     Refresh(ActiveShield),
     Remove,
+}
+
+#[derive(Clone)]
+struct ShieldDisablePlan {
+    attacker_slot: usize,
+    expected_attacker_stack: ItemStack,
+    cooldown_group: mc_data::Identifier,
+    duration_ticks: u64,
+    deadline_tick: u64,
+}
+
+struct AuthoritativeAttackerContext {
+    mode: GameMode,
+    attack_range: Option<mc_data::item_components::AttackRangeFacts>,
+    held_slot: usize,
+    held_stack: ItemStack,
 }
 
 impl SessionRegistry {
@@ -140,9 +160,10 @@ impl SessionRegistry {
             .copied()
             .unwrap_or_default();
         let combat_resources = inner.player_combat.clone();
+        let keep_inventory = inner.keep_inventory;
         drop(inner);
 
-        let Some((authoritative_mode, attack_range)) = authoritative_attacker_reach(
+        let Some(attacker_context) = authoritative_attacker_reach(
             attacker_session,
             &attacker_state,
             &combat_resources,
@@ -150,12 +171,13 @@ impl SessionRegistry {
         ) else {
             return PlayerAttackResult::ValidationRejected;
         };
+        let authoritative_mode = attacker_context.mode;
         if !within_entity_attack_reach(
             attacker_pose,
             target_position,
             player_aabb_for_pose(target_pose),
             authoritative_mode,
-            attack_range,
+            attacker_context.attack_range,
         ) {
             return PlayerAttackResult::ValidationRejected;
         }
@@ -201,6 +223,25 @@ impl SessionRegistry {
                 &expected.inventory,
             )
         });
+        let shield_disable = shield_blocks
+            .then(|| {
+                let shield = active_shield.as_ref()?;
+                let duration_ticks = shield_disable_ticks(
+                    items,
+                    &combat_resources.item_facts,
+                    &attacker_context.held_stack,
+                    &shield.expected_stack,
+                )?;
+                let cooldown_group = items.name_of(shield.expected_stack.item_id)?.clone();
+                Some(ShieldDisablePlan {
+                    attacker_slot: attacker_context.held_slot,
+                    expected_attacker_stack: attacker_context.held_stack.clone(),
+                    cooldown_group,
+                    duration_ticks,
+                    deadline_tick: authority_tick.saturating_add(duration_ticks),
+                })
+            })
+            .flatten();
 
         let mut updated_inventory = expected.inventory.clone();
         let mut updated_survival = expected.survival;
@@ -210,7 +251,7 @@ impl SessionRegistry {
         let shield_after_block;
         if shield_blocks {
             let shield = active_shield.as_ref().expect("shield was checked above");
-            shield_after_block = match damage_active_shield_slot(
+            let durability_transition = match damage_active_shield_slot(
                 items,
                 &combat_resources.item_facts,
                 &mut updated_inventory.slots,
@@ -218,14 +259,19 @@ impl SessionRegistry {
                 &shield.expected_stack,
                 damage.amount,
             ) {
-                Some((_, _, true)) => Some(ShieldAfterBlock::Remove),
+                Some((_, _, true)) => ShieldAfterBlock::Remove,
                 Some((_, updated_stack, false)) => {
                     let mut refreshed = shield.clone();
                     refreshed.expected_stack = updated_stack;
-                    Some(ShieldAfterBlock::Refresh(refreshed))
+                    ShieldAfterBlock::Refresh(refreshed)
                 }
-                None => Some(ShieldAfterBlock::Refresh(shield.clone())),
+                None => ShieldAfterBlock::Refresh(shield.clone()),
             };
+            shield_after_block = Some(if shield_disable.is_some() {
+                ShieldAfterBlock::Remove
+            } else {
+                durability_transition
+            });
             damage_applied = false;
             fresh_hurt = false;
             next_resistance = None;
@@ -266,8 +312,17 @@ impl SessionRegistry {
             enchanting_table_input: None,
             item_entity_type_id: combat_resources.item_entity_type_id,
             xp_orb_entity_type_id: combat_resources.xp_orb_entity_type_id,
+            keep_inventory,
             position: target_position,
         };
+        let shield_cooldown = shield_disable.as_ref().and_then(|disable| {
+            i32::try_from(disable.duration_ticks)
+                .ok()
+                .map(|duration| ShieldCooldownPublication {
+                    cooldown_group: disable.cooldown_group.clone(),
+                    duration,
+                })
+        });
         let Some((mut committed, committed_attacker_costs, staged_damage_wake)) = self
             .commit_player_attack(
                 authority,
@@ -278,6 +333,7 @@ impl SessionRegistry {
                     attacker_costs: if damage_applied { attacker_costs } else { None },
                     expected_shield: active_shield,
                     shield_after_block,
+                    shield_disable,
                     next_resistance,
                     target_plan: &target_plan,
                 },
@@ -315,6 +371,7 @@ impl SessionRegistry {
             died: committed.died,
             fresh_hurt: damage_applied && fresh_hurt,
             shield_blocked: shield_blocks,
+            shield_cooldown,
             knockback: source_origin.and_then(|source| {
                 if shield_blocks {
                     shield_block_knockback(
@@ -384,6 +441,7 @@ impl SessionRegistry {
             attacker_costs,
             expected_shield,
             shield_after_block,
+            shield_disable,
             next_resistance,
             target_plan,
         } = commit;
@@ -441,6 +499,14 @@ impl SessionRegistry {
         {
             return None;
         }
+        if let Some(disable) = &shield_disable
+            && (PlayerInventory::HOTBAR_BASE + usize::from(attacker_state.selected_hotbar_slot)
+                != disable.attacker_slot
+                || attacker_state.inventory.slots.get(disable.attacker_slot)
+                    != Some(&disable.expected_attacker_stack))
+        {
+            return None;
+        }
 
         let staged_damage_wake = (target_plan.updated_survival.health
             < target_plan.expected_survival.health)
@@ -479,6 +545,14 @@ impl SessionRegistry {
                     inner.active_shields.remove(&target_session);
                 }
             }
+        }
+        if let Some(disable) = shield_disable {
+            inner.active_shields.remove(&target_session);
+            inner
+                .shield_disabled_until
+                .entry(target_session)
+                .and_modify(|deadline| *deadline = (*deadline).max(disable.deadline_tick))
+                .or_insert(disable.deadline_tick);
         }
         if let Some(next_resistance) = next_resistance {
             inner
@@ -520,7 +594,7 @@ fn authoritative_attacker_reach(
     attacker_state: &std::sync::Mutex<crate::play::persistence::PlayerPersistedState>,
     resources: &super::PlayerCombatResources,
     operation: &'static str,
-) -> Option<(GameMode, Option<mc_data::item_components::AttackRangeFacts>)> {
+) -> Option<AuthoritativeAttackerContext> {
     let wait_started = Instant::now();
     let state = attacker_state.lock().unwrap_or_else(|poisoned| {
         warn!(
@@ -538,7 +612,14 @@ fn authoritative_attacker_reach(
     if state.survival.is_dead() || state.game_mode == GameMode::Spectator {
         return None;
     }
-    Some((state.game_mode, held_attack_range(resources, &state)))
+    let held_slot = PlayerInventory::HOTBAR_BASE + usize::from(state.selected_hotbar_slot);
+    let held_stack = state.inventory.slots.get(held_slot)?.clone();
+    Some(AuthoritativeAttackerContext {
+        mode: state.game_mode,
+        attack_range: held_attack_range(resources, &state),
+        held_slot,
+        held_stack,
+    })
 }
 
 pub(super) fn held_attack_range(
@@ -718,6 +799,7 @@ pub(super) fn prepare_projectile_player_damage_locked(
         enchanting_table_input: None,
         item_entity_type_id: combat_resources.item_entity_type_id,
         xp_orb_entity_type_id: combat_resources.xp_orb_entity_type_id,
+        keep_inventory: inner.keep_inventory,
         position: target_position,
     };
     let prepared = PreparedProjectilePlayerDamage {
@@ -832,6 +914,7 @@ pub(super) fn commit_projectile_player_damage_locked(
         died: committed.died,
         fresh_hurt: damage_applied && fresh_hurt,
         shield_blocked,
+        shield_cooldown: None,
         knockback: source_origin.and_then(|source| {
             if shield_blocked {
                 shield_block_knockback(
@@ -911,8 +994,8 @@ mod tests {
 
     use super::{
         EntityAttackOutcome, EntityId, OutboundCommand, PlayerAttackCommit, PlayerAttackResult,
-        PlayerEntityAttack, PreparedProjectilePlayerDamage, ShieldAfterBlock, VisibilityDispatch,
-        commit_projectile_player_damage_locked,
+        PlayerEntityAttack, PreparedProjectilePlayerDamage, ShieldAfterBlock,
+        ShieldCooldownPublication, VisibilityDispatch, commit_projectile_player_damage_locked,
     };
     use crate::login::LoggedInProfile;
     use crate::play::combat::{
@@ -922,7 +1005,7 @@ mod tests {
     use crate::play::persistence::PlayerPersistedState;
     use crate::play::session::SessionRegistry;
     use crate::play::simulation::{PlayerSurvivalPlan, SimulationAuthority};
-    use crate::play::{GameMode, PlayerPose, SurvivalState};
+    use crate::play::{GameMode, PlayerInventory, PlayerPose, SurvivalState};
 
     fn shield_items() -> (ItemRegistry, ItemFactsTable, u32, u32) {
         let shield = Identifier::parse("minecraft:shield").unwrap();
@@ -986,6 +1069,7 @@ mod tests {
             enchanting_table_input: None,
             item_entity_type_id: None,
             xp_orb_entity_type_id: None,
+            keep_inventory: false,
             position: mc_entity::Vec3::new(pose.x, pose.y, pose.z),
         }
     }
@@ -1116,6 +1200,7 @@ mod tests {
                 attacker_costs: None,
                 expected_shield: Some(initial_shield),
                 shield_after_block: Some(ShieldAfterBlock::Refresh(refreshed_shield.clone())),
+                shield_disable: None,
                 next_resistance: None,
                 target_plan: &refresh_plan,
             },
@@ -1142,6 +1227,7 @@ mod tests {
                 attacker_costs: None,
                 expected_shield: Some(refreshed_shield),
                 shield_after_block: Some(ShieldAfterBlock::Remove),
+                shield_disable: None,
                 next_resistance: None,
                 target_plan: &break_plan,
             },
@@ -1152,6 +1238,236 @@ mod tests {
                 .lock_inner("verify broken shield removal")
                 .active_shields
                 .contains_key(&target)
+        );
+    }
+
+    #[test]
+    fn frontal_axe_block_disables_shield_with_exact_owner_deadline_and_publication() {
+        let shield_name = Identifier::parse("minecraft:shield").unwrap();
+        let axe_name = Identifier::parse("minecraft:iron_axe").unwrap();
+        let items = Arc::new(ItemRegistry::from_report(&[
+            ItemReport {
+                id: shield_name.clone(),
+                protocol_id: 1,
+            },
+            ItemReport {
+                id: axe_name.clone(),
+                protocol_id: 2,
+            },
+        ]));
+        let facts = Arc::new(ItemFactsTable::from_entries([
+            (
+                shield_name.clone(),
+                ItemFacts {
+                    max_damage: Some(336),
+                    blocks_attacks_disable_cooldown_scale: Some(1.0),
+                    ..ItemFacts::default()
+                },
+            ),
+            (
+                axe_name,
+                ItemFacts {
+                    weapon: true,
+                    weapon_damage_per_attack: Some(2),
+                    weapon_disable_blocking_seconds: Some(5.0),
+                    ..ItemFacts::default()
+                },
+            ),
+        ]));
+        let registry = SessionRegistry::new();
+        registry.configure_player_combat(None, None, Arc::clone(&items), Arc::clone(&facts));
+
+        let attacker_pose = PlayerPose::new(0.5, 64.0, 0.5);
+        let mut attacker_state = PlayerPersistedState::new_default(attacker_pose);
+        attacker_state.inventory.slots[PlayerInventory::HOTBAR_BASE] = ItemStack::new(2, 1);
+        let attacker = register_player(&registry, "AxeDisableAtk", attacker_pose, attacker_state);
+
+        let mut target_pose = PlayerPose::new(0.5, 64.0, 1.5);
+        target_pose.yaw = 180.0;
+        let mut target_state = PlayerPersistedState::new_default(target_pose);
+        target_state.inventory.slots[PlayerInventory::OFFHAND_SLOT] = ItemStack::new(1, 1);
+        let target = register_player(&registry, "AxeDisableDef", target_pose, target_state);
+        registry.set_active_shield(
+            target,
+            Some(ActiveShield {
+                started_tick: 0,
+                slot: PlayerInventory::OFFHAND_SLOT,
+                expected_stack: ItemStack::new(1, 1),
+            }),
+        );
+        registry.advance_world_time(crate::play::combat::SHIELD_ACTIVATION_DELAY_TICKS);
+        let authority_tick = registry.simulation_tick();
+        let target_entity = {
+            let inner = registry.lock_inner("read axe-disable target entity");
+            EntityId(inner.sessions[&target].entity_id)
+        };
+
+        let result = registry.player_attack_entity(
+            &SimulationAuthority::for_test(),
+            PlayerEntityAttack {
+                attacker_session: attacker,
+                entity_id: target_entity,
+                amount: 4.0,
+                attacker_costs: None,
+                authority_tick,
+            },
+        );
+        let PlayerAttackResult::Damaged(outcome) = result else {
+            panic!("front axe hit must reach player shield authority")
+        };
+        let EntityAttackOutcome::PlayerDamaged {
+            dispatches,
+            damage_applied,
+            ..
+        } = *outcome
+        else {
+            panic!("player target must use player damage publication")
+        };
+        assert!(!damage_applied, "the disabling axe hit is still blocked");
+        let cooldown = dispatches
+            .iter()
+            .find_map(|dispatch| match &dispatch.command {
+                OutboundCommand::PlayerDamageCommitted { publication, .. } => {
+                    assert!(publication.shield_blocked);
+                    publication.shield_cooldown.clone()
+                }
+                _ => None,
+            });
+        assert_eq!(
+            cooldown,
+            Some(ShieldCooldownPublication {
+                cooldown_group: shield_name,
+                duration: 100,
+            })
+        );
+
+        let target_uuid = crate::login::offline_uuid("AxeDisableDef");
+        let persisted = registry
+            .persisted_player_states()
+            .into_iter()
+            .find(|(uuid, _, _)| *uuid == target_uuid)
+            .map(|(_, state, _)| state)
+            .expect("target persistence remains registered");
+        assert_eq!(persisted.survival.health, SurvivalState::MAX_HEALTH);
+        assert_eq!(
+            persisted.inventory.slots[PlayerInventory::OFFHAND_SLOT].damage,
+            Some(5),
+        );
+        {
+            let inner = registry.lock_inner("verify axe-disable owner state");
+            assert!(!inner.active_shields.contains_key(&target));
+            assert_eq!(
+                inner.shield_disabled_until.get(&target),
+                Some(&authority_tick.saturating_add(100)),
+            );
+        }
+        assert_eq!(
+            registry.shield_disable_remaining_ticks(target, authority_tick),
+            Some(100)
+        );
+        assert_eq!(
+            registry.shield_disable_remaining_ticks(target, authority_tick + 99),
+            Some(1)
+        );
+        assert_eq!(
+            registry.shield_disable_remaining_ticks(target, authority_tick + 100),
+            None
+        );
+    }
+
+    #[test]
+    fn stale_axe_identity_rejects_shield_disable_without_target_mutation() {
+        let registry = SessionRegistry::new();
+        let pose = PlayerPose::new(0.5, 64.0, 0.5);
+        let mut attacker_state = PlayerPersistedState::new_default(pose);
+        attacker_state.inventory.slots[PlayerInventory::HOTBAR_BASE] = ItemStack::new(2, 1);
+        let attacker = register_player(&registry, "StaleAxeAtk", pose, attacker_state);
+        let mut target_state = PlayerPersistedState::new_default(pose);
+        target_state.inventory.slots[PlayerInventory::OFFHAND_SLOT] = ItemStack::new(1, 1);
+        let target = register_player(&registry, "StaleAxeDef", pose, target_state.clone());
+        let shield = ActiveShield {
+            started_tick: 0,
+            slot: PlayerInventory::OFFHAND_SLOT,
+            expected_stack: ItemStack::new(1, 1),
+        };
+        registry.set_active_shield(target, Some(shield.clone()));
+        let target_plan = survival_plan(&target_state, target_state.inventory.clone(), pose);
+        {
+            let attacker_state = registry
+                .lock_inner("replace stale axe fixture")
+                .player_persistence[&attacker]
+                .clone();
+            attacker_state
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .inventory
+                .slots[PlayerInventory::HOTBAR_BASE] = ItemStack::new(3, 1);
+        }
+
+        let committed = registry.commit_player_attack(
+            &SimulationAuthority::for_test(),
+            PlayerAttackCommit {
+                attacker_session: attacker,
+                target_session: target,
+                expected_attacker_mode: GameMode::Survival,
+                attacker_costs: None,
+                expected_shield: Some(shield.clone()),
+                shield_after_block: Some(ShieldAfterBlock::Remove),
+                shield_disable: Some(super::ShieldDisablePlan {
+                    attacker_slot: PlayerInventory::HOTBAR_BASE,
+                    expected_attacker_stack: ItemStack::new(2, 1),
+                    cooldown_group: Identifier::parse("minecraft:shield").unwrap(),
+                    duration_ticks: 100,
+                    deadline_tick: 100,
+                }),
+                next_resistance: None,
+                target_plan: &target_plan,
+            },
+        );
+        assert!(committed.is_none());
+        {
+            let attacker_state = registry
+                .lock_inner("switch stale axe selected slot")
+                .player_persistence[&attacker]
+                .clone();
+            let mut attacker_state = attacker_state
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            attacker_state.inventory.slots[PlayerInventory::HOTBAR_BASE] = ItemStack::new(2, 1);
+            attacker_state.inventory.slots[PlayerInventory::HOTBAR_BASE + 1] = ItemStack::new(3, 1);
+            attacker_state.selected_hotbar_slot = 1;
+        }
+        let selected_slot_stale = registry.commit_player_attack(
+            &SimulationAuthority::for_test(),
+            PlayerAttackCommit {
+                attacker_session: attacker,
+                target_session: target,
+                expected_attacker_mode: GameMode::Survival,
+                attacker_costs: None,
+                expected_shield: Some(shield.clone()),
+                shield_after_block: Some(ShieldAfterBlock::Remove),
+                shield_disable: Some(super::ShieldDisablePlan {
+                    attacker_slot: PlayerInventory::HOTBAR_BASE,
+                    expected_attacker_stack: ItemStack::new(2, 1),
+                    cooldown_group: Identifier::parse("minecraft:shield").unwrap(),
+                    duration_ticks: 100,
+                    deadline_tick: 100,
+                }),
+                next_resistance: None,
+                target_plan: &target_plan,
+            },
+        );
+        assert!(selected_slot_stale.is_none());
+
+        let inner = registry.lock_inner("verify stale axe rejection");
+        assert_eq!(inner.active_shields.get(&target), Some(&shield));
+        assert!(!inner.shield_disabled_until.contains_key(&target));
+        let target_state = inner.player_persistence[&target]
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        assert_eq!(
+            target_state.inventory.slots,
+            target_plan.expected_inventory.slots
         );
     }
 

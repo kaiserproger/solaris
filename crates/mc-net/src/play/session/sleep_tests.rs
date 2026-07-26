@@ -229,6 +229,7 @@ fn rejected_damage_does_not_stage_wake() {
             enchanting_table_input: None,
             item_entity_type_id: None,
             xp_orb_entity_type_id: None,
+            keep_inventory: false,
             position: Vec3::new(0.5, 64.0, 0.5),
         },
     );
@@ -271,6 +272,7 @@ fn accepted_lethal_damage_stages_wake_and_defers_death_publication() {
             enchanting_table_input: None,
             item_entity_type_id: None,
             xp_orb_entity_type_id: None,
+            keep_inventory: false,
             position: Vec3::new(0.5, 64.0, 0.5),
         },
     );

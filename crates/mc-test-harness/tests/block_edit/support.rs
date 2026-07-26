@@ -357,17 +357,21 @@ pub(super) async fn wait_for_health_near(client: &mut Client, health: f32, toler
     }
 }
 
-pub(super) async fn wait_for_death_inventory_drop(
+pub(super) async fn wait_for_death_inventory_and_xp_drop(
     client: &mut Client,
     item_entity_type: i32,
+    xp_orb_entity_type: i32,
     item_id: u32,
     count: i32,
+    xp_value: i32,
 ) {
     let mut item_entities = HashSet::new();
     let mut saw_drop_stack = false;
+    let mut saw_xp_orb = false;
     let mut saw_inventory_clear = false;
+    let mut saw_xp_reset = false;
     let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
-    while !(saw_drop_stack && saw_inventory_clear) {
+    while !(saw_drop_stack && saw_xp_orb && saw_inventory_clear && saw_xp_reset) {
         let frame = client
             .read_frame_with_timeout(
                 deadline.saturating_duration_since(tokio::time::Instant::now()),
@@ -382,6 +386,12 @@ pub(super) async fn wait_for_death_inventory_drop(
             let pkt = AddEntity::decode(&mut body).expect("decode death drop AddEntity");
             if pkt.entity_type_id == item_entity_type {
                 item_entities.insert(pkt.entity_id);
+            } else if pkt.entity_type_id == xp_orb_entity_type {
+                assert_eq!(
+                    pkt.data, xp_value,
+                    "death XP orb must carry the recoverable value"
+                );
+                saw_xp_orb = true;
             }
         } else if frame.id == ClientboundSetEntityData::ID {
             let mut body = frame.body;
@@ -404,6 +414,119 @@ pub(super) async fn wait_for_death_inventory_drop(
             saw_inventory_clear |= pkt.container_id == 0
                 && pkt.items.get(36).is_some_and(|stack| stack.is_empty())
                 && pkt.carried_item.is_empty();
+        } else if frame.id == ClientboundSetExperience::ID {
+            let mut body = frame.body;
+            let pkt =
+                ClientboundSetExperience::decode(&mut body).expect("decode death experience reset");
+            saw_xp_reset |= pkt.total_experience == 0 && pkt.experience_level == 0;
+        }
+    }
+}
+
+pub(super) async fn wait_for_keep_inventory_death_fence(
+    client: &mut Client,
+    item_entity_type: i32,
+    xp_orb_entity_type: i32,
+    item_id: u32,
+    count: i32,
+    total_xp: i32,
+) {
+    let mut saw_death_health = false;
+    let mut saw_preserved_inventory = false;
+    let mut saw_gamerule_feedback = false;
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
+    while !(saw_death_health && saw_preserved_inventory && saw_gamerule_feedback) {
+        let frame = client
+            .read_frame_with_timeout(
+                deadline.saturating_duration_since(tokio::time::Instant::now()),
+            )
+            .await
+            .expect("keepInventory death fence");
+        if handle_keepalive(client, frame.id, &frame.body).await {
+            continue;
+        }
+        if frame.id == AddEntity::ID {
+            let mut body = frame.body;
+            let packet = AddEntity::decode(&mut body).expect("decode keepInventory AddEntity");
+            assert!(
+                packet.entity_type_id != item_entity_type
+                    && packet.entity_type_id != xp_orb_entity_type,
+                "keepInventory death must not spawn item or XP entities: {packet:?}"
+            );
+        } else if frame.id == ClientboundSetHealth::ID {
+            let mut body = frame.body;
+            let packet =
+                ClientboundSetHealth::decode(&mut body).expect("decode keepInventory health");
+            saw_death_health |= packet.health == 0.0;
+        } else if frame.id == ClientboundContainerSetContent::ID {
+            let mut body = frame.body;
+            let packet = ClientboundContainerSetContent::decode(&mut body)
+                .expect("decode keepInventory inventory snapshot");
+            if packet.container_id == 0 {
+                let stack = packet.items.get(36).expect("hotbar slot 36");
+                assert_eq!((stack.item_id, stack.count), (item_id, count));
+                assert!(packet.carried_item.is_empty());
+                saw_preserved_inventory = true;
+            }
+        } else if frame.id == ClientboundSetExperience::ID {
+            let mut body = frame.body;
+            let packet = ClientboundSetExperience::decode(&mut body)
+                .expect("decode keepInventory experience");
+            assert_eq!(packet.total_experience, total_xp);
+        } else if frame.id == ClientboundSystemChat::ID {
+            let mut body = frame.body;
+            let packet = ClientboundSystemChat::decode(&mut body)
+                .expect("decode keepInventory gamerule feedback");
+            saw_gamerule_feedback |= system_chat_text(&packet) == "keep_inventory = true";
+        }
+    }
+}
+
+pub(super) async fn wait_for_rejoined_keep_inventory_state(
+    client: &mut Client,
+    item_entity_type: i32,
+    xp_orb_entity_type: i32,
+    item_id: u32,
+    count: i32,
+    total_xp: i32,
+) {
+    let mut saw_inventory = false;
+    let mut saw_experience = false;
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
+    while !(saw_inventory && saw_experience) {
+        let frame = client
+            .read_frame_with_timeout(
+                deadline.saturating_duration_since(tokio::time::Instant::now()),
+            )
+            .await
+            .expect("rejoined keepInventory state");
+        if handle_keepalive(client, frame.id, &frame.body).await {
+            continue;
+        }
+        if frame.id == ClientboundContainerSetContent::ID {
+            let mut body = frame.body;
+            let packet = ClientboundContainerSetContent::decode(&mut body)
+                .expect("decode rejoined inventory snapshot");
+            if packet.container_id == 0 {
+                let stack = packet.items.get(36).expect("rejoined hotbar slot 36");
+                assert_eq!((stack.item_id, stack.count), (item_id, count));
+                assert!(packet.carried_item.is_empty());
+                saw_inventory = true;
+            }
+        } else if frame.id == ClientboundSetExperience::ID {
+            let mut body = frame.body;
+            let packet = ClientboundSetExperience::decode(&mut body)
+                .expect("decode rejoined experience snapshot");
+            assert_eq!(packet.total_experience, total_xp);
+            saw_experience = true;
+        } else if frame.id == AddEntity::ID {
+            let mut body = frame.body;
+            let packet = AddEntity::decode(&mut body).expect("decode rejoined AddEntity");
+            assert!(
+                packet.entity_type_id != item_entity_type
+                    && packet.entity_type_id != xp_orb_entity_type,
+                "restart must not restore keepInventory death drops: {packet:?}"
+            );
         }
     }
 }

@@ -305,3 +305,116 @@ async fn crafting_table_container_crafts_shapeless_and_shaped_results() {
     })
     .await;
 }
+
+#[tokio::test]
+async fn crafting_table_shift_click_max_crafts_every_matching_input() {
+    let data = embedded_play_data();
+    let air_state = embedded_block_state(&data, "minecraft:air");
+    let crafting_table_state = embedded_block_state(&data, "minecraft:crafting_table");
+    let oak_log_id = embedded_item_id(&data, "minecraft:oak_log");
+    let oak_planks_id = embedded_item_id(&data, "minecraft:oak_planks");
+    let mut world = embedded_world(&data);
+    let support_y = top_non_air_y(&mut world, 2, 2, air_state).expect("table column terrain");
+    let table_pos = mc_world::BlockPos {
+        x: 2,
+        y: support_y + 1,
+        z: 2,
+    };
+    world
+        .set_block_at(table_pos, crafting_table_state)
+        .expect("seed max-craft table")
+        .expect("replace table target");
+
+    let shutdown = mc_net::ShutdownHandle::default();
+    let mut cfg = embedded_playable_config(&data, world, "crafting max-craft wire");
+    cfg.shutdown = shutdown.clone();
+    let bound = mc_net::bind(cfg).await.expect("bind max-craft server");
+    let addr = bound.local_addr().expect("max-craft local_addr");
+    let serve = tokio::spawn(async move { bound.serve().await });
+
+    let (mut client, _) = connect_to_play(addr, "MaxCrafter").await;
+    drain_until_chunk(&mut client, (0, 0)).await;
+    client
+        .write_packet(&ServerboundChatCommand {
+            command: "debug give minecraft:oak_log 5 0".into(),
+        })
+        .await
+        .expect("give max-craft logs");
+    wait_for_slot_stack(&mut client, oak_log_id, 5).await;
+    client
+        .write_packet(&ServerboundUseItemOn {
+            hand: InteractionHand::MainHand,
+            position: pack_block_pos(table_pos.x, table_pos.y, table_pos.z),
+            direction: Direction::Up,
+            cursor_x: 0.5,
+            cursor_y: 1.0,
+            cursor_z: 0.5,
+            inside: false,
+            world_border_hit: false,
+            sequence: 451,
+        })
+        .await
+        .expect("open max-craft table");
+    let opened = wait_for_open_screen(&mut client, 12).await;
+    let mut content = wait_for_furnace_content(&mut client, opened.container_id, |packet| {
+        packet.items.len() == 46 && packet.items[0].is_empty()
+    })
+    .await;
+
+    client
+        .write_packet(&ServerboundContainerClick {
+            container_id: opened.container_id,
+            state_id: content.state_id,
+            slot_num: 1,
+            button_num: 0,
+            container_input: ContainerInput::Swap,
+            changed_slots: Vec::new(),
+            carried_item: HashedStack::empty(),
+        })
+        .await
+        .expect("swap all logs into crafting input");
+    content = wait_for_furnace_content(&mut client, opened.container_id, |packet| {
+        packet.items[0].item_id == oak_planks_id
+            && packet.items[0].count == 4
+            && packet.items[1].item_id == oak_log_id
+            && packet.items[1].count == 5
+            && packet.items[37].is_empty()
+            && packet.carried_item.is_empty()
+    })
+    .await;
+
+    client
+        .write_packet(&ServerboundContainerClick {
+            container_id: opened.container_id,
+            state_id: content.state_id,
+            slot_num: 0,
+            button_num: 0,
+            container_input: ContainerInput::QuickMove,
+            changed_slots: Vec::new(),
+            carried_item: HashedStack::empty(),
+        })
+        .await
+        .expect("max-craft all matching logs");
+    wait_for_furnace_content(&mut client, opened.container_id, |packet| {
+        packet.items[0].is_empty()
+            && packet.items[1].is_empty()
+            && packet.carried_item.is_empty()
+            && packet.items[10..=45]
+                .iter()
+                .filter(|stack| stack.item_id == oak_planks_id)
+                .map(|stack| stack.count)
+                .sum::<i32>()
+                == 20
+            && packet.items[10..=45]
+                .iter()
+                .all(|stack| stack.item_id != oak_log_id)
+    })
+    .await;
+
+    shutdown.request();
+    tokio::time::timeout(Duration::from_secs(5), serve)
+        .await
+        .expect("max-craft server shutdown")
+        .expect("max-craft server join")
+        .expect("max-craft server serve");
+}

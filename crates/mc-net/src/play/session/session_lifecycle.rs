@@ -2,7 +2,8 @@ use super::container_state::CONTAINER_REGISTRY_SHARDS;
 use super::outbound::{OrderedDispatchState, OutboundCommand, VisibilityDispatch};
 use super::prepared_chunks::{
     add_prepared_ticket_locked, add_prewarm_frontier_locked, prune_prepared_cache_locked,
-    remove_prepared_ticket_locked, remove_prewarm_frontier_locked,
+    release_prepared_claims_for_session_locked, remove_prepared_ticket_locked,
+    remove_prewarm_frontier_locked,
 };
 use super::visibility::{
     refresh_visibility_locked, remove_player_visibility_locked, session_snapshot,
@@ -289,6 +290,7 @@ impl SessionRegistry {
             inner.client_unloaded_sessions.remove(&id);
             inner.player_hurt_resistance.remove(&id);
             inner.active_shields.remove(&id);
+            inner.shield_disabled_until.remove(&id);
             for &chunk in &session.loaded {
                 remove_loaded_chunk_reference_locked(&mut inner, chunk);
             }
@@ -349,7 +351,7 @@ impl SessionRegistry {
             for &chunk in &session.desired {
                 remove_ticket(&mut inner.tickets, chunk, id);
             }
-            {
+            let released_prepare_claims = {
                 let mut cache = self.lock_prepared_cache("unregister prepared chunk demand");
                 for &chunk in &session.desired {
                     remove_prepared_ticket_locked(
@@ -358,6 +360,8 @@ impl SessionRegistry {
                         !session.loaded.contains(&chunk),
                     );
                 }
+                let released_prepare_claims =
+                    release_prepared_claims_for_session_locked(&mut cache, id);
                 remove_prewarm_frontier_locked(
                     &mut cache,
                     session.center,
@@ -366,7 +370,8 @@ impl SessionRegistry {
                 );
                 prune_prepared_cache_locked(&mut cache);
                 self.publish_prepared_cache(&cache);
-            }
+                released_prepare_claims
+            };
             debug!(
                 session_id = id,
                 player = %session.name,
@@ -374,6 +379,7 @@ impl SessionRegistry {
                 loaded = loaded_len,
                 sessions = inner.sessions.len(),
                 tickets = inner.tickets.len(),
+                released_prepare_claims,
                 player_save_requested,
                 "play session unregistered"
             );

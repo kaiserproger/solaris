@@ -10,7 +10,6 @@ import java.util.List;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertTrue;
-import static org.junit.jupiter.api.Assertions.assertFalse;
 
 final class M94BlocksFluidsFarmingDropsScenarioTest {
     @Test
@@ -47,11 +46,11 @@ final class M94BlocksFluidsFarmingDropsScenarioTest {
     }
 
     @Test
-    void runsOnlySolidSubprobeWhenSolidScenarioIdRequested() {
+    void supportsIndependentSolidPhaseId() {
         FakeScenarioClient client = new FakeScenarioClient();
 
         ClientScenarioReport report = new M94BlocksFluidsFarmingDropsScenario().run(
-            M94SolidBlockScenario.ID,
+            M94BlocksFluidsFarmingDropsScenario.SOLID_PHASE_ID,
             Path.of("run/screenshots"),
             client
         );
@@ -59,32 +58,32 @@ final class M94BlocksFluidsFarmingDropsScenarioTest {
         assertEquals("passed", report.result());
         assertTrue(
             client.operations.contains("break:solid-break-clicked:minecraft:dirt:1"),
-            "targeted scenario id should execute the solid subprobe"
+            "solid phase must run break/drop operations"
         );
-        assertFalse(
-            client.operations.stream().anyMatch(operation -> operation.startsWith("find-dry-placeable")),
-            "solid phase should not execute dry placeable/fluid probe"
+        assertTrue(
+            report.observations().stream().anyMatch(entry -> entry.contains("solid placement:")),
+            "solid phase must expose placement observations"
         );
     }
 
     @Test
-    void runsOnlyWaterSubprobeWhenWaterScenarioIdRequested() {
+    void supportsIndependentWaterPhaseId() {
         FakeScenarioClient client = new FakeScenarioClient();
 
         ClientScenarioReport report = new M94BlocksFluidsFarmingDropsScenario().run(
-            M94WaterBucketScenario.ID,
+            M94BlocksFluidsFarmingDropsScenario.WATER_PHASE_ID,
             Path.of("run/screenshots"),
             client
         );
 
         assertEquals("passed", report.result());
         assertTrue(
-            client.operations.contains("find-dry-placeable:within-survival-reach"),
-            "water phase should execute the dry placeable/fluid probe"
+            client.operations.contains("use:minecraft:water_bucket:water-clicked"),
+            "water phase must place water and update held item"
         );
-        assertFalse(
-            client.operations.stream().anyMatch(operation -> operation.startsWith("break:solid-break")),
-            "water phase should not execute block-break probe"
+        assertTrue(
+            report.observations().stream().anyMatch(entry -> entry.contains("water pickup:")),
+            "water phase must expose pickup observations"
         );
     }
 

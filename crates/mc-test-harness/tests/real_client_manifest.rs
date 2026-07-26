@@ -5,6 +5,8 @@ use std::process::Command;
 use mc_test_harness::replay::ReplayScenarioManifest;
 use serde_json::{Value, json};
 
+use mc_test_harness::replay::{CoreGateEvidenceLeg, CoreGateManifest, CoreGatePhaseEvidence};
+
 const M94_MANIFEST: &str =
     include_str!("../../../docs/real-client-regression/manifests/m94-regression-pack.json");
 
@@ -927,6 +929,21 @@ fn m94_real_client_manifest_covers_required_regression_rows() {
         scenario_ids.contains("m94-02c-water-bucket-place-pickup"),
         "M94 manifest must keep the focused accepted water-bucket real-client scenario"
     );
+    for id in [
+        "m94-02-blocks-fluids-farming-drops",
+        "m94-02a-solid-place-break-drop",
+        "m94-02b-rejected-block-resync",
+        "m94-02c-water-bucket-place-pickup",
+    ] {
+        let scenario = scenarios
+            .iter()
+            .find(|scenario| scenario["id"] == id)
+            .expect("focused block/fluid scenario exists");
+        assert_eq!(
+            scenario["no_debug_commands"], false,
+            "{id} uses explicit operator-backed setup and must not masquerade as no-debug evidence"
+        );
+    }
     assert!(
         scenario_ids.contains("m94-04a-regular-sign-place-text"),
         "M94 manifest must keep the focused regular sign real-client scenario"
@@ -943,6 +960,40 @@ fn m94_real_client_manifest_covers_required_regression_rows() {
         scenario_ids.contains("m94-03c-two-client-shared-chest-live-update"),
         "M94 manifest must keep the focused two-client shared chest live-update scenario"
     );
+    for id in [
+        "m94-03-inventory-crafting-containers-stations",
+        "m94-03a-inventory-oak-log-to-planks",
+        "m94-03b-two-client-shared-chest",
+        "m94-03c-two-client-shared-chest-live-update",
+        "m94-03d-crafting-table-max-craft",
+        "m94-03e-furnace-family-ui",
+        "m94-03f-malformed-container-rejection",
+        "m94-03g-chest-reopen-conservation",
+    ] {
+        let scenario = scenarios
+            .iter()
+            .find(|scenario| scenario["id"] == id)
+            .expect("focused inventory/container scenario exists");
+        assert_eq!(
+            scenario["no_debug_commands"], false,
+            "{id} uses explicit fixture setup and must declare its debug-command policy"
+        );
+    }
+    assert!(
+        scenario_ids.contains("m94-07a-deep-water-feel"),
+        "M94 manifest must keep the focused deep-water real-client scenario"
+    );
+    let deep_water = scenarios
+        .iter()
+        .find(|scenario| scenario["id"] == "m94-07a-deep-water-feel")
+        .expect("focused deep-water scenario exists");
+    assert_eq!(deep_water["ledger_rows"], serde_json::json!(["B4"]));
+    assert_eq!(deep_water["status"], "manual-pending");
+    assert_eq!(
+        deep_water["no_debug_commands"], false,
+        "deep-water fixture uses operator-backed teleport setup and must declare it"
+    );
+
     assert!(
         scenario_ids.contains("m94-08-enchanting-efficiency"),
         "M94 manifest must keep the focused enchanting scenario"
@@ -972,6 +1023,93 @@ fn m94_real_client_manifest_covers_required_regression_rows() {
             "missing M94 ledger row {row}"
         );
     }
+}
+
+#[test]
+fn m94_broad_block_row_requires_focused_phases_and_independent_evidence() {
+    let m94: Value = serde_json::from_str(M94_MANIFEST).expect("parse M94 manifest");
+    let scenario_ids = m94["scenarios"]
+        .as_array()
+        .expect("M94 scenarios")
+        .iter()
+        .map(|scenario| scenario["id"].as_str().expect("scenario id"))
+        .collect::<BTreeSet<_>>();
+    for required in [
+        "m94-02a-solid-place-break-drop",
+        "m94-02b-rejected-block-resync",
+        "m94-02c-water-bucket-place-pickup",
+    ] {
+        assert!(
+            scenario_ids.contains(required),
+            "missing focused M94 phase {required}"
+        );
+    }
+
+    let manifest = CoreGateManifest::from_json(
+        &json!({
+            "schema": "solaris.core_gate.manifest.v1",
+            "phases": [
+                {
+                    "id": "solid-edit",
+                    "scenario_id": "m94-02a-solid-place-break-drop",
+                    "ledger_rows": ["B1"],
+                    "evidence_legs": ["unit", "wire", "real_client"]
+                },
+                {
+                    "id": "rejected-resync",
+                    "scenario_id": "m94-02b-rejected-block-resync",
+                    "ledger_rows": ["B1"],
+                    "evidence_legs": ["wire", "oracle", "replay_negative"]
+                },
+                {
+                    "id": "water-contact",
+                    "scenario_id": "m94-02c-water-bucket-place-pickup",
+                    "ledger_rows": ["B1"],
+                    "evidence_legs": ["wire", "real_client"]
+                }
+            ],
+            "rows": [{
+                "row": "B1",
+                "scope": "broad",
+                "required_phases": ["solid-edit", "rejected-resync", "water-contact"],
+                "required_evidence_legs": [
+                    "unit", "wire", "oracle", "real_client", "replay_negative"
+                ]
+            }]
+        })
+        .to_string(),
+    )
+    .expect("valid M94 core gate manifest");
+
+    let error = manifest
+        .validate_completion(&[
+            CoreGatePhaseEvidence {
+                phase_id: "solid-edit".to_owned(),
+                passed_evidence_legs: [
+                    CoreGateEvidenceLeg::Unit,
+                    CoreGateEvidenceLeg::Wire,
+                    CoreGateEvidenceLeg::RealClient,
+                ]
+                .into_iter()
+                .collect(),
+            },
+            CoreGatePhaseEvidence {
+                phase_id: "rejected-resync".to_owned(),
+                passed_evidence_legs: [
+                    CoreGateEvidenceLeg::Wire,
+                    CoreGateEvidenceLeg::Oracle,
+                    CoreGateEvidenceLeg::ReplayNegative,
+                ]
+                .into_iter()
+                .collect(),
+            },
+        ])
+        .expect_err("broad row must not pass while water phase is absent");
+    assert!(
+        error
+            .to_string()
+            .contains("missing focused phase water-contact")
+    );
 }
 
 #[test]

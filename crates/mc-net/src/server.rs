@@ -4378,9 +4378,11 @@ async fn bind_internal(
                     }
                     simulation_owner.restore_world_time(&sessions, metadata.world_time);
                     sessions.set_players_sleeping_percentage(metadata.players_sleeping_percentage);
+                    sessions.set_keep_inventory(metadata.keep_inventory);
                     info!(
                         world_time = metadata.world_time,
                         players_sleeping_percentage = metadata.players_sleeping_percentage,
+                        keep_inventory = metadata.keep_inventory,
                         "loaded world metadata"
                     );
                 }
@@ -4718,6 +4720,7 @@ async fn save_all_with_context_snapshot_locked(
         world_chunk_journal_watermark,
         world_time,
         players_sleeping_percentage,
+        keep_inventory,
         mut world_flush_plan,
     ) = match snapshot {
         Some(snapshot) => (
@@ -4728,6 +4731,7 @@ async fn save_all_with_context_snapshot_locked(
             snapshot.world_chunk_journal_watermark,
             snapshot.world_time,
             snapshot.players_sleeping_percentage,
+            snapshot.keep_inventory,
             snapshot.world_flush_plan,
         ),
         None => {
@@ -4740,6 +4744,7 @@ async fn save_all_with_context_snapshot_locked(
                 sessions.world_chunk_journal_watermark(),
                 sessions.world_time(),
                 sessions.players_sleeping_percentage(),
+                sessions.keep_inventory(),
                 None,
             )
         }
@@ -4963,6 +4968,7 @@ async fn save_all_with_context_snapshot_locked(
     let metadata = play::persistence::WorldPersistedMetadata {
         world_time,
         players_sleeping_percentage,
+        keep_inventory,
         world_identity: play::persistence::world_identity(&root),
     };
     match save_world_metadata_blocking(root.clone(), metadata).await {
@@ -9345,6 +9351,7 @@ end
             &play::persistence::WorldPersistedMetadata {
                 world_time: 77,
                 players_sleeping_percentage: 100,
+                keep_inventory: false,
                 world_identity: "different-world".into(),
             },
         )
