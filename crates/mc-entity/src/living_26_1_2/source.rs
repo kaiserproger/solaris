@@ -8,7 +8,10 @@
 pub enum DamageSourceKind {
     Fall,
     Fire,
+    Lava,
     Drowning,
+    Suffocation,
+    Starvation,
     Void,
     Generic,
     Melee,
@@ -62,10 +65,18 @@ impl DamageSource {
             DamageSourceKind::Fall => DamageFlags::BYPASSES_ARMOR
                 .union(DamageFlags::IS_FALL)
                 .union(DamageFlags::NO_KNOCKBACK),
-            DamageSourceKind::Fire => DamageFlags::IS_FIRE.union(DamageFlags::NO_KNOCKBACK),
+            DamageSourceKind::Fire | DamageSourceKind::Lava => {
+                DamageFlags::IS_FIRE.union(DamageFlags::NO_KNOCKBACK)
+            }
             DamageSourceKind::Drowning => DamageFlags::BYPASSES_ARMOR
                 .union(DamageFlags::IS_DROWNING)
                 .union(DamageFlags::NO_IMPACT)
+                .union(DamageFlags::NO_KNOCKBACK),
+            DamageSourceKind::Suffocation => {
+                DamageFlags::BYPASSES_ARMOR.union(DamageFlags::NO_KNOCKBACK)
+            }
+            DamageSourceKind::Starvation => DamageFlags::BYPASSES_ARMOR
+                .union(DamageFlags::BYPASSES_EFFECTS)
                 .union(DamageFlags::NO_KNOCKBACK),
             DamageSourceKind::Void => DamageFlags::BYPASSES_ARMOR
                 .union(DamageFlags::BYPASSES_INVULNERABILITY)

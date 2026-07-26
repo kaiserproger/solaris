@@ -20900,5 +20900,6 @@ fn stale_damage_publication_does_not_apply_health_side_effects() {
     assert_eq!(applied.knockback, None);
 }
 
+include!("tests/contact_damage.rs");
 include!("tests/inventory_and_survival.rs");
 include!("tests/spawning_and_world.rs");

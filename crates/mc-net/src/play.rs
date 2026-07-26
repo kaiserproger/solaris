@@ -799,6 +799,9 @@ fn survival_damage_after_equipment(
     amount: f32,
     kind: PlayerDamageKind,
 ) -> f32 {
+    if !amount.is_finite() || !kind.is_supported() {
+        return 0.0;
+    }
     let damage = if kind.uses_armor() {
         survival_damage_after_armor(state, amount)
     } else {
