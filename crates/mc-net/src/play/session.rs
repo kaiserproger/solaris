@@ -1771,12 +1771,23 @@ fn schedule_item_despawn_locked(
     spawn_tick: u64,
 ) {
     let deadline = spawn_tick.saturating_add(ITEM_DESPAWN_AGE_TICKS);
-    if inner
+    let previous = inner
         .item_despawn_deadline_by_id
-        .insert(entity_id, deadline)
-        == Some(deadline)
-    {
+        .insert(entity_id, deadline);
+    if previous == Some(deadline) {
         return;
+    }
+    if let Some(previous) = previous {
+        let remove_bucket = inner
+            .item_despawn_deadlines
+            .get_mut(&previous)
+            .is_some_and(|bucket| {
+                bucket.retain(|queued| *queued != entity_id);
+                bucket.is_empty()
+            });
+        if remove_bucket {
+            inner.item_despawn_deadlines.remove(&previous);
+        }
     }
     inner
         .item_despawn_deadlines

@@ -1710,6 +1710,7 @@ dependencies = [
  "anyhow",
  "bytes",
  "clap",
+ "flate2",
  "mc-data",
  "mc-nbt",
  "mc-net",

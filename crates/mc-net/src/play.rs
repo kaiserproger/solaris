@@ -787,7 +787,7 @@ fn world_time_advance_crosses_night_start(world_time: u64, ticks: u64) -> bool {
     ticks >= ticks_until_night
 }
 const ENTITY_HURT_INVULNERABLE_TICKS: u64 = 6;
-const ITEM_DESPAWN_AGE_TICKS: u64 = 6_000;
+pub const ITEM_DESPAWN_AGE_TICKS: u64 = 6_000;
 const ITEM_DESPAWN_SWEEP_BUDGET: usize = 256;
 const ARROW_ENTITY_HIT_DAMAGE: f32 = 4.0;
 const ARROW_ENTITY_HIT_KNOCKBACK: f64 = 0.6;

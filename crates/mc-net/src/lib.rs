@@ -54,8 +54,8 @@ pub use error::ConnectionError;
 pub use lock_metrics::{LockMetricSnapshot, LockMetricsSnapshot, lock_pressure_snapshot};
 pub use login::{LoginAccessConfig, offline_uuid};
 pub use play::{
-    DEFAULT_VIEW_DISTANCE, EntityEffectHandle, EntityEffectRequestError, PlayerAttackObservation,
-    RandomTickPolicy,
+    DEFAULT_VIEW_DISTANCE, EntityEffectHandle, EntityEffectRequestError, ITEM_DESPAWN_AGE_TICKS,
+    PlayerAttackObservation, RandomTickPolicy,
 };
 pub use runtime_tick_metrics::{RuntimeLatencyPercentiles, RuntimeTickPercentiles};
 pub use script::PluginStorageStartError;

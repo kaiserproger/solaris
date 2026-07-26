@@ -10025,6 +10025,36 @@ fn item_drops_that_converge_after_pickup_ready_merge_on_physics_tick() {
 }
 
 #[test]
+fn item_despawn_reschedule_keeps_one_authoritative_queue_entry() {
+    let registry = SessionRegistry::new();
+    registry.spawn_item_drop(1, Vec3::new(0.5, 64.0, 0.5), EntityItemStack::new(42, 3));
+    let entity_id = registry
+        .persisted_entity_records()
+        .into_iter()
+        .next()
+        .map(|record| record.snapshot.id)
+        .expect("spawned item identity");
+    {
+        let mut inner = registry.lock_inner("reschedule item despawn regression");
+        for spawn_tick in 1..=128 {
+            schedule_item_despawn_locked(&mut inner, entity_id, spawn_tick);
+        }
+        assert_eq!(inner.item_despawn_deadline_by_id.len(), 1);
+        assert_eq!(
+            inner
+                .item_despawn_deadlines
+                .values()
+                .flat_map(|bucket| bucket.iter())
+                .filter(|queued| **queued == entity_id)
+                .count(),
+            1,
+            "rescheduling must replace the old queue entry instead of accumulating stale IDs"
+        );
+        assert_eq!(inner.item_despawn_deadlines.len(), 1);
+    }
+}
+
+#[test]
 fn item_drop_despawns_after_lifetime() {
     let registry = SessionRegistry::new();
     registry.spawn_item_drop(1, Vec3::new(0.5, 64.0, 0.5), EntityItemStack::new(42, 3));
