@@ -21021,6 +21021,7 @@ fn older_victim_publication_preserves_newer_attacker_costs() {
             died: false,
             fresh_hurt: true,
             shield_blocked: false,
+            shield_cooldown: None,
             knockback: None,
         },
     );
@@ -21055,6 +21056,7 @@ fn stale_damage_publication_does_not_apply_health_side_effects() {
             died: true,
             fresh_hurt: true,
             shield_blocked: false,
+            shield_cooldown: None,
             knockback: Some(knockback),
         },
     );

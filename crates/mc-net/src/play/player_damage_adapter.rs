@@ -171,6 +171,7 @@ pub(super) struct AppliedPlayerDamagePublication {
     pub(super) xp_changed: bool,
     pub(super) died: bool,
     pub(super) fresh_hurt: bool,
+    pub(super) shield_cooldown: Option<super::session::ShieldCooldownPublication>,
     pub(super) knockback: Option<MeleeKnockback>,
 }
 
@@ -182,6 +183,7 @@ pub(super) fn apply_player_damage_publication(
 ) -> AppliedPlayerDamagePublication {
     let old_survival = *survival_state;
     let old_xp = xp_state.clone();
+    let shield_cooldown = publication.shield_cooldown.clone();
     let health_accepted = survival_state.health == publication.expected_health;
     if health_accepted {
         survival_state.health = publication.health;
@@ -213,7 +215,11 @@ pub(super) fn apply_player_damage_publication(
         {
             shield.stack = state.inventory.slots[shield.slot].clone();
         }
-        refresh_shield_use_state(state);
+        if shield_cooldown.is_some() {
+            clear_shield_use(state);
+        } else {
+            refresh_shield_use_state(state);
+        }
         if health_accepted && publication.died {
             state.pending_break = None;
             state.pending_use = None;
@@ -227,6 +233,7 @@ pub(super) fn apply_player_damage_publication(
         xp_changed: old_xp != *xp_state,
         died: health_accepted && publication.died,
         fresh_hurt: health_accepted && publication.fresh_hurt,
+        shield_cooldown,
         knockback: health_accepted.then_some(publication.knockback).flatten(),
     }
 }

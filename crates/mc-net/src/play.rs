@@ -44,20 +44,21 @@ use mc_protocol::packets::play::{
     AGEABLE_ENTITY_DATA_BABY_INDEX, AddEntity, BlockChangedAck, BlockEntityInfo, BlockUpdate,
     ChunkHeightmap, ClientboundBlockEntityData, ClientboundChangeDifficulty,
     ClientboundCommandSuggestions, ClientboundContainerClose, ClientboundContainerSetContent,
-    ClientboundContainerSetData, ClientboundContainerSetSlot, ClientboundCustomPayload,
-    ClientboundInitializeBorder, ClientboundKeepAlive, ClientboundOpenScreen,
-    ClientboundRecipeBookSettings, ClientboundRespawn, ClientboundSetEntityData,
-    ClientboundSetExperience, ClientboundSetHealth, ClientboundSetHeldSlot, ClientboundSystemChat,
-    ClientboundTakeItemEntity, ConfirmTeleportation, ContainerInput, Direction,
-    ENTITY_DATA_POSE_INDEX, ENTITY_DATA_SHARED_FLAGS_INDEX, EntityAnimation, EntityAnimationAction,
-    EntityDataValue, EntityEvent, EntityPose, EntityPositionSync, EntityVec3, ForgetLevelChunk,
-    GameEvent, GameMode, HashedStack, ITEM_ENTITY_DATA_ITEM_INDEX, InteractionHand, ItemStack,
-    LIVING_ENTITY_DATA_FLAGS_INDEX, LevelChunkWithLight, LevelEvent, LightData, LightUpdate,
-    LoginPlay, MoveEntityPosRot, MovePlayerFlags, PlayDisconnect, PlayerActionKind,
-    PlayerCommandAction, PlayerInfoActions, PlayerInfoEntry, PlayerInfoRemove, PlayerInfoUpdate,
-    PlayerInput, PositionMoveRotation, RemoveEntities, RotateHead, SHEEP_ENTITY_DATA_WOOL_INDEX,
-    SectionBlockChange, SectionBlocksUpdate, ServerboundAttack, ServerboundChangeGameMode,
-    ServerboundChat, ServerboundChatAck, ServerboundChatCommand, ServerboundChunkBatchReceived,
+    ClientboundContainerSetData, ClientboundContainerSetSlot, ClientboundCooldown,
+    ClientboundCustomPayload, ClientboundInitializeBorder, ClientboundKeepAlive,
+    ClientboundOpenScreen, ClientboundRecipeBookSettings, ClientboundRespawn,
+    ClientboundSetEntityData, ClientboundSetExperience, ClientboundSetHealth,
+    ClientboundSetHeldSlot, ClientboundSystemChat, ClientboundTakeItemEntity, ConfirmTeleportation,
+    ContainerInput, Direction, ENTITY_DATA_POSE_INDEX, ENTITY_DATA_SHARED_FLAGS_INDEX,
+    EntityAnimation, EntityAnimationAction, EntityDataValue, EntityEvent, EntityPose,
+    EntityPositionSync, EntityVec3, ForgetLevelChunk, GameEvent, GameMode, HashedStack,
+    ITEM_ENTITY_DATA_ITEM_INDEX, InteractionHand, ItemStack, LIVING_ENTITY_DATA_FLAGS_INDEX,
+    LevelChunkWithLight, LevelEvent, LightData, LightUpdate, LoginPlay, MoveEntityPosRot,
+    MovePlayerFlags, PlayDisconnect, PlayerActionKind, PlayerCommandAction, PlayerInfoActions,
+    PlayerInfoEntry, PlayerInfoRemove, PlayerInfoUpdate, PlayerInput, PositionMoveRotation,
+    RemoveEntities, RotateHead, SHEEP_ENTITY_DATA_WOOL_INDEX, SectionBlockChange,
+    SectionBlocksUpdate, ServerboundAttack, ServerboundChangeGameMode, ServerboundChat,
+    ServerboundChatAck, ServerboundChatCommand, ServerboundChunkBatchReceived,
     ServerboundClientCommand, ServerboundClientInformation, ServerboundClientTickEnd,
     ServerboundCommandSuggestion, ServerboundContainerButtonClick, ServerboundContainerClick,
     ServerboundContainerClose, ServerboundCustomPayload, ServerboundInteract, ServerboundKeepAlive,
@@ -6898,13 +6899,20 @@ fn start_shield_use(
         PlayerInventory::OFFHAND_SLOT,
     );
     let stack = state.inventory.slots[slot].clone();
-    let Some(shield_use) = shield_use_from_stack(
-        hand,
-        slot,
-        stack,
-        state.sessions.world_time(),
-        stack_is_shield(&state.items, &state.inventory.slots[slot]),
-    ) else {
+    let is_shield = stack_is_shield(&state.items, &stack);
+    if !is_shield {
+        return false;
+    }
+    if state
+        .sessions
+        .shield_disable_remaining_ticks(state.session_id, state.sessions.simulation_tick())
+        .is_some()
+    {
+        return true;
+    }
+    let Some(shield_use) =
+        shield_use_from_stack(hand, slot, stack, state.sessions.world_time(), true)
+    else {
         return false;
     };
     state.pending_break = None;
@@ -12159,6 +12167,17 @@ where
                         }
                         if applied.xp_changed {
                             write_packet(writer, &xp_state.as_packet(), compression).await?;
+                        }
+                        if let Some(cooldown) = applied.shield_cooldown {
+                            write_packet(
+                                writer,
+                                &ClientboundCooldown {
+                                    cooldown_group: cooldown.cooldown_group,
+                                    duration: cooldown.duration,
+                                },
+                                compression,
+                            )
+                            .await?;
                         }
                         if let Some(knockback) = applied.knockback {
                             write_packet(

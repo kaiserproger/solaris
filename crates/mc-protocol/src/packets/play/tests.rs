@@ -818,6 +818,22 @@ fn serverbound_change_game_mode_id_and_layout_match_javap() {
 }
 
 #[test]
+fn clientbound_cooldown_id_and_layout_match_javap() {
+    assert_eq!(ClientboundCooldown::ID, 0x16);
+    let packet = ClientboundCooldown {
+        cooldown_group: sample_identifier("minecraft:shield"),
+        duration: 100,
+    };
+    let mut buf = Vec::new();
+    packet.encode(&mut buf).unwrap();
+    assert_eq!(buf, b"\x10minecraft:shield\x64");
+
+    let mut cursor: &[u8] = &buf;
+    assert_eq!(ClientboundCooldown::decode(&mut cursor).unwrap(), packet);
+    assert!(cursor.is_empty());
+}
+
+#[test]
 fn clientbound_set_time_id_and_empty_clock_map_layout_match_javap() {
     assert_eq!(ClientboundSetTime::ID, 0x71);
     let packet = ClientboundSetTime { game_time: 6000 };

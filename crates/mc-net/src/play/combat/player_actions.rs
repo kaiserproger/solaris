@@ -348,6 +348,27 @@ pub(in crate::play) fn shield_durability_damage(blocked_damage: f32) -> i32 {
     }
 }
 
+pub(in crate::play) fn shield_disable_ticks(
+    items: &ItemRegistry,
+    item_facts: &ItemFactsTable,
+    attacker_stack: &ItemStack,
+    shield_stack: &ItemStack,
+) -> Option<u64> {
+    let attacker = items.name_of(attacker_stack.item_id)?;
+    let shield = items.name_of(shield_stack.item_id)?;
+    let seconds = item_facts
+        .get(attacker)
+        .and_then(|facts| facts.weapon_disable_blocking_seconds)?;
+    let scale = item_facts
+        .get(shield)
+        .and_then(|facts| facts.blocks_attacks_disable_cooldown_scale)?;
+    if !seconds.is_finite() || !scale.is_finite() || seconds <= 0.0 || scale <= 0.0 {
+        return None;
+    }
+    let ticks = (seconds * scale * 20.0).round();
+    (ticks > 0.0 && ticks <= u64::MAX as f32).then_some(ticks as u64)
+}
+
 pub(in crate::play) fn shield_blocks_damage(
     player_position: Vec3,
     player_yaw: f32,
@@ -400,9 +421,12 @@ fn held_item_id(held: &ItemStack) -> Option<u32> {
 
 #[cfg(test)]
 mod tests {
+    use mc_data::Identifier;
+    use mc_data::item_components::{ItemFacts, ItemFactsTable};
+    use mc_data::items::{ItemRegistry, ItemReport};
     use mc_protocol::packets::play::{GameMode, ItemStack};
 
-    use super::{begin_player_attack_attempt, shield_durability_damage};
+    use super::{begin_player_attack_attempt, shield_disable_ticks, shield_durability_damage};
 
     #[test]
     fn spectator_attack_attempt_is_rejected_without_mutating_state() {
@@ -415,6 +439,53 @@ mod tests {
                 Some(100),
                 106,
             ),
+            None,
+        );
+    }
+
+    #[test]
+    fn shield_disable_duration_uses_exact_weapon_and_blocking_components() {
+        let axe = Identifier::parse("minecraft:iron_axe").unwrap();
+        let sword = Identifier::parse("minecraft:iron_sword").unwrap();
+        let shield = Identifier::parse("minecraft:shield").unwrap();
+        let items = ItemRegistry::from_report(&[
+            ItemReport {
+                id: axe.clone(),
+                protocol_id: 1,
+            },
+            ItemReport {
+                id: sword.clone(),
+                protocol_id: 2,
+            },
+            ItemReport {
+                id: shield.clone(),
+                protocol_id: 3,
+            },
+        ]);
+        let facts = ItemFactsTable::from_entries([
+            (
+                axe,
+                ItemFacts {
+                    weapon_disable_blocking_seconds: Some(5.0),
+                    ..ItemFacts::default()
+                },
+            ),
+            (sword, ItemFacts::default()),
+            (
+                shield,
+                ItemFacts {
+                    blocks_attacks_disable_cooldown_scale: Some(1.0),
+                    ..ItemFacts::default()
+                },
+            ),
+        ]);
+
+        assert_eq!(
+            shield_disable_ticks(&items, &facts, &ItemStack::new(1, 1), &ItemStack::new(3, 1),),
+            Some(100),
+        );
+        assert_eq!(
+            shield_disable_ticks(&items, &facts, &ItemStack::new(2, 1), &ItemStack::new(3, 1),),
             None,
         );
     }

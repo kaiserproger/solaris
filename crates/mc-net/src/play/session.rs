@@ -159,7 +159,8 @@ use outbound::{
 };
 pub(super) use outbound::{
     OutboundCommand, OutboundLightUpdate, PlayerDamagePublication, PlayerEntitySnapshot,
-    ServerEntityMove, ServerEntitySnapshot, VisibilityDispatch, dispatch_visibility_commands,
+    ServerEntityMove, ServerEntitySnapshot, ShieldCooldownPublication, VisibilityDispatch,
+    dispatch_visibility_commands,
 };
 #[cfg(test)]
 pub(super) use outbound::{PlayerInventorySlotDelta, SessionRecipient};
@@ -376,6 +377,7 @@ struct SessionRegistryInner {
     player_persistence: HashMap<SessionId, Arc<Mutex<PlayerPersistedState>>>,
     player_hurt_resistance: HashMap<SessionId, PlayerHurtResistance>,
     active_shields: HashMap<SessionId, ActiveShield>,
+    shield_disabled_until: HashMap<SessionId, u64>,
     disconnected_player_persistence: HashMap<uuid::Uuid, DisconnectedPlayerPersistence>,
     next_disconnected_player_generation: u64,
     sleeping_sessions: HashMap<SessionId, SleepingState>,

@@ -294,6 +294,7 @@ impl SessionRegistry {
             inner.client_unloaded_sessions.remove(&id);
             inner.player_hurt_resistance.remove(&id);
             inner.active_shields.remove(&id);
+            inner.shield_disabled_until.remove(&id);
             for &chunk in &session.loaded {
                 remove_loaded_chunk_reference_locked(&mut inner, chunk);
             }

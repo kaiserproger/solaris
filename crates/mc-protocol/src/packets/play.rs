@@ -947,6 +947,33 @@ impl Packet for ClientboundChangeDifficulty {
     }
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ClientboundCooldown {
+    pub cooldown_group: Identifier,
+    pub duration: i32,
+}
+
+impl Packet for ClientboundCooldown {
+    // `.analysis/protocol-dump.txt` / `GameProtocols`:
+    // CLIENTBOUND_COOLDOWN is clientbound registration index 22,
+    // wire id 0x16. `ClientboundCooldownPacket.STREAM_CODEC` is
+    // `Identifier.STREAM_CODEC` followed by `VAR_INT` duration.
+    const ID: i32 = 0x16;
+
+    fn encode<B: BufMut>(&self, buf: &mut B) -> Result<(), CodecError> {
+        buf.write_identifier(&self.cooldown_group)?;
+        buf.write_varint(self.duration);
+        Ok(())
+    }
+
+    fn decode<B: Buf>(buf: &mut B) -> Result<Self, CodecError> {
+        Ok(Self {
+            cooldown_group: buf.read_identifier()?,
+            duration: buf.read_varint()?,
+        })
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ClientboundSetTime {
     pub game_time: i64,

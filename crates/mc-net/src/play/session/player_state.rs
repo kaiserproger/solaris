@@ -66,6 +66,21 @@ impl SessionRegistry {
         }
     }
 
+    pub(in crate::play) fn shield_disable_remaining_ticks(
+        &self,
+        id: SessionId,
+        current_tick: u64,
+    ) -> Option<u64> {
+        let mut inner = self.lock_inner("read shield disable deadline");
+        let deadline = inner.shield_disabled_until.get(&id).copied()?;
+        if deadline <= current_tick {
+            inner.shield_disabled_until.remove(&id);
+            None
+        } else {
+            Some(deadline - current_tick)
+        }
+    }
+
     pub(in crate::play) fn recoverable_player_state(
         &self,
         uuid: uuid::Uuid,

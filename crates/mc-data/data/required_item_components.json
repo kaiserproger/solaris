@@ -15,7 +15,8 @@
   },
   "minecraft:wooden_axe": {
     "max_damage": 59,
-    "attack_damage_modifier": 6.0
+    "attack_damage_modifier": 6.0,
+    "weapon_disable_blocking_seconds": 5.0
   },
   "minecraft:wooden_hoe": {
     "max_damage": 59,
@@ -40,7 +41,8 @@
   },
   "minecraft:stone_axe": {
     "max_damage": 131,
-    "attack_damage_modifier": 8.0
+    "attack_damage_modifier": 8.0,
+    "weapon_disable_blocking_seconds": 5.0
   },
   "minecraft:stone_hoe": {
     "max_damage": 131,
@@ -113,5 +115,10 @@
   },
   "minecraft:netherite_spear": {
     "attack_range": { "min_reach": 2.0, "max_reach": 4.5, "min_creative_reach": 2.0, "max_creative_reach": 6.5, "hitbox_margin": 0.125, "mob_factor": 0.5 }
+  },
+  "minecraft:shield": {
+    "max_stack_size": 1,
+    "max_damage": 336,
+    "blocks_attacks_disable_cooldown_scale": 1.0
   }
 }
