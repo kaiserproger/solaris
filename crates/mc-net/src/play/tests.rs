@@ -4318,6 +4318,172 @@ fn chest_quick_move_from_storage_uses_vanilla_reverse_player_range() {
 }
 
 #[test]
+fn chest_actions_respect_item_specific_stack_limits() {
+    let bucket = Identifier::parse("minecraft:bucket").unwrap();
+    let snowball = Identifier::parse("minecraft:snowball").unwrap();
+    let items = ItemRegistry::from_report(&[
+        ItemReport {
+            id: bucket.clone(),
+            protocol_id: 10,
+        },
+        ItemReport {
+            id: snowball.clone(),
+            protocol_id: 11,
+        },
+    ]);
+    let item_facts = ItemFactsTable::from_entries([
+        (
+            bucket,
+            mc_data::item_components::ItemFacts {
+                max_stack_size: Some(1),
+                ..mc_data::item_components::ItemFacts::default()
+            },
+        ),
+        (
+            snowball,
+            mc_data::item_components::ItemFacts {
+                max_stack_size: Some(16),
+                ..mc_data::item_components::ItemFacts::default()
+            },
+        ),
+    ]);
+    let new_window = || ChestWindow::new(vec![mc_world::BlockPos { x: 0, y: 64, z: 0 }], 7);
+    let empty_view = || ChestView {
+        chests: vec![ChestBlockEntity::default()],
+    };
+
+    let mut bucket_view = empty_view();
+    bucket_view.chests[0].slots[0] = stack_to_furnace_slot(&ItemStack::new(10, 1));
+    let mut inventory = PlayerInventory::empty();
+    inventory.slots[PlayerInventory::HOTBAR_BASE] = ItemStack::new(10, 1);
+    let bucket_quick_move = plan_chest_click(ChestClickInput {
+        items: &items,
+        item_facts: &item_facts,
+        window: new_window(),
+        view: bucket_view,
+        inventory,
+        carried_item: ItemStack::EMPTY,
+        action: ChestClickAction::QuickMove {
+            slot: SINGLE_CHEST_STORAGE_SLOTS + 27,
+        },
+    });
+    assert!(bucket_quick_move.changed);
+    assert!(bucket_quick_move.inventory.slots[PlayerInventory::HOTBAR_BASE].is_empty());
+    assert_eq!(
+        furnace_slot_to_stack(&bucket_quick_move.view.chests[0].slots[0]),
+        ItemStack::new(10, 1)
+    );
+    assert_eq!(
+        furnace_slot_to_stack(&bucket_quick_move.view.chests[0].slots[1]),
+        ItemStack::new(10, 1)
+    );
+    assert!(
+        bucket_quick_move.view.chests[0].slots[2..]
+            .iter()
+            .all(mc_world::FurnaceSlot::is_empty)
+    );
+
+    let mut full_bucket = ChestBlockEntity::default();
+    full_bucket.slots[0] = stack_to_furnace_slot(&ItemStack::new(10, 1));
+    let bucket_pickup = plan_chest_click(ChestClickInput {
+        items: &items,
+        item_facts: &item_facts,
+        window: new_window(),
+        view: ChestView {
+            chests: vec![full_bucket],
+        },
+        inventory: PlayerInventory::empty(),
+        carried_item: ItemStack::new(10, 1),
+        action: ChestClickAction::Pickup { slot: 0, button: 1 },
+    });
+    assert!(!bucket_pickup.changed);
+    assert_eq!(bucket_pickup.carried_item, ItemStack::new(10, 1));
+    assert_eq!(
+        furnace_slot_to_stack(&bucket_pickup.view.chests[0].slots[0]),
+        ItemStack::new(10, 1)
+    );
+
+    let mut snowball_view = empty_view();
+    snowball_view.chests[0].slots[0] = stack_to_furnace_slot(&ItemStack::new(11, 15));
+    let mut inventory = PlayerInventory::empty();
+    inventory.slots[PlayerInventory::HOTBAR_BASE] = ItemStack::new(11, 16);
+    let snowball_quick_move = plan_chest_click(ChestClickInput {
+        items: &items,
+        item_facts: &item_facts,
+        window: new_window(),
+        view: snowball_view,
+        inventory,
+        carried_item: ItemStack::EMPTY,
+        action: ChestClickAction::QuickMove {
+            slot: SINGLE_CHEST_STORAGE_SLOTS + 27,
+        },
+    });
+    assert!(snowball_quick_move.changed);
+    assert_eq!(
+        furnace_slot_to_stack(&snowball_quick_move.view.chests[0].slots[0]),
+        ItemStack::new(11, 16)
+    );
+    assert_eq!(
+        furnace_slot_to_stack(&snowball_quick_move.view.chests[0].slots[1]),
+        ItemStack::new(11, 15)
+    );
+
+    let mut view = empty_view();
+    view.chests[0].slots[0] = stack_to_furnace_slot(&ItemStack::new(11, 15));
+    let mut window = new_window();
+    let mut inventory = PlayerInventory::empty();
+    let mut carried_item = ItemStack::new(11, 3);
+    let mut changed = false;
+    for click in [
+        QuickCraftClick {
+            header: 0,
+            kind: 1,
+            slot: None,
+        },
+        QuickCraftClick {
+            header: 1,
+            kind: 1,
+            slot: Some(0),
+        },
+        QuickCraftClick {
+            header: 1,
+            kind: 1,
+            slot: Some(1),
+        },
+        QuickCraftClick {
+            header: 2,
+            kind: 1,
+            slot: None,
+        },
+    ] {
+        let plan = plan_chest_click(ChestClickInput {
+            items: &items,
+            item_facts: &item_facts,
+            window,
+            view,
+            inventory,
+            carried_item,
+            action: ChestClickAction::QuickCraft(click),
+        });
+        window = plan.window;
+        view = plan.view;
+        inventory = plan.inventory;
+        carried_item = plan.carried_item;
+        changed = plan.changed;
+    }
+    assert!(changed);
+    assert_eq!(
+        furnace_slot_to_stack(&view.chests[0].slots[0]),
+        ItemStack::new(11, 16)
+    );
+    assert_eq!(
+        furnace_slot_to_stack(&view.chests[0].slots[1]),
+        ItemStack::new(11, 1)
+    );
+    assert_eq!(carried_item, ItemStack::new(11, 1));
+}
+
+#[test]
 fn chest_menu_revision_counts_source_and_destination_slot_changes() {
     let mut before_chest = ChestBlockEntity::default();
     before_chest.slots[0] = mc_world::FurnaceSlot {

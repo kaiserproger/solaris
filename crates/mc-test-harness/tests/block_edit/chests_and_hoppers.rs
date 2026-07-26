@@ -1060,3 +1060,189 @@ async fn unsupported_chest_click_modes_resync_without_trusting_client_slots() {
         .await;
     }
 }
+
+
+#[tokio::test]
+async fn chest_rejects_overstack_predictions_and_recovers_with_exact_item_limits() {
+    let data = embedded_play_data();
+    let air_state = embedded_block_state(&data, "minecraft:air");
+    let chest_state = embedded_block_state(&data, "minecraft:chest");
+    let bucket_id = embedded_item_id(&data, "minecraft:bucket");
+    let snowball_id = embedded_item_id(&data, "minecraft:snowball");
+    let mut world = embedded_world(&data);
+    let chest_pos = mc_world::BlockPos {
+        x: 2,
+        y: top_non_air_y(&mut world, 2, 2, air_state).expect("chest limit column terrain") + 1,
+        z: 2,
+    };
+    world
+        .set_block_at(chest_pos, chest_state)
+        .expect("seed chest limit block")
+        .expect("replace chest limit target");
+    let mut chest = mc_world::ChestBlockEntity::default();
+    chest.slots[0] = mc_world::FurnaceSlot {
+        item_id: bucket_id,
+        count: 1,
+        damage: None,
+        enchantments: Vec::new(),
+    };
+    chest.slots[1] = mc_world::FurnaceSlot {
+        item_id: snowball_id,
+        count: 16,
+        damage: None,
+        enchantments: Vec::new(),
+    };
+    world
+        .set_chest_block_entity(chest_pos, chest)
+        .expect("seed chest limit entity");
+
+    let shutdown = mc_net::ShutdownHandle::default();
+    let mut cfg = embedded_playable_config(&data, world, "chest max-stack replay");
+    cfg.shutdown = shutdown.clone();
+    let bound = mc_net::bind(cfg).await.expect("bind chest limit server");
+    let addr = bound.local_addr().expect("chest limit local_addr");
+    let serve = tokio::spawn(async move { bound.serve().await });
+
+    let (mut client, _) = connect_to_play(addr, "ChestLimits").await;
+    drain_until_chunk(&mut client, (0, 0)).await;
+    client
+        .write_packet(&ServerboundUseItemOn {
+            hand: InteractionHand::MainHand,
+            position: pack_block_pos(chest_pos.x, chest_pos.y, chest_pos.z),
+            direction: Direction::Up,
+            cursor_x: 0.5,
+            cursor_y: 1.0,
+            cursor_z: 0.5,
+            inside: false,
+            world_border_hit: false,
+            sequence: 461,
+        })
+        .await
+        .expect("open chest limit container");
+    let opened = wait_for_open_screen(&mut client, 2).await;
+    let initial = wait_for_furnace_content(&mut client, opened.container_id, |packet| {
+        packet.items[0].item_id == bucket_id
+            && packet.items[0].count == 1
+            && packet.items[1].item_id == snowball_id
+            && packet.items[1].count == 16
+            && packet.carried_item.is_empty()
+    })
+    .await;
+
+    for (slot_num, item_id, impossible_count) in [(0, bucket_id, 2), (1, snowball_id, 17)] {
+        client
+            .write_packet(&ServerboundContainerClick {
+                container_id: opened.container_id,
+                state_id: initial.state_id,
+                slot_num,
+                button_num: 0,
+                container_input: ContainerInput::Pickup,
+                changed_slots: vec![(slot_num, HashedStack::empty())],
+                carried_item: HashedStack::Actual {
+                    item_id,
+                    count: impossible_count,
+                    components: HashedStackComponentHashes::empty(),
+                },
+            })
+            .await
+            .expect("send impossible max-stack prediction");
+        wait_for_furnace_content(&mut client, opened.container_id, |packet| {
+            packet.state_id == initial.state_id
+                && packet.items[0].item_id == bucket_id
+                && packet.items[0].count == 1
+                && packet.items[1].item_id == snowball_id
+                && packet.items[1].count == 16
+                && packet.carried_item.is_empty()
+        })
+        .await;
+    }
+
+    client
+        .write_packet(&ServerboundContainerClick {
+            container_id: opened.container_id,
+            state_id: initial.state_id,
+            slot_num: 0,
+            button_num: 0,
+            container_input: ContainerInput::Pickup,
+            changed_slots: vec![(0, HashedStack::empty())],
+            carried_item: HashedStack::Actual {
+                item_id: bucket_id,
+                count: 1,
+                components: HashedStackComponentHashes::empty(),
+            },
+        })
+        .await
+        .expect("recover with valid bucket pickup");
+    let carrying_bucket = wait_for_furnace_content(&mut client, opened.container_id, |packet| {
+        packet.state_id == initial.state_id.wrapping_add(2)
+            && packet.items[0].is_empty()
+            && packet.items[1].item_id == snowball_id
+            && packet.items[1].count == 16
+            && packet.carried_item.item_id == bucket_id
+            && packet.carried_item.count == 1
+    })
+    .await;
+
+    client
+        .write_packet(&ServerboundContainerClick {
+            container_id: opened.container_id,
+            state_id: carrying_bucket.state_id,
+            slot_num: 1,
+            button_num: 0,
+            container_input: ContainerInput::Pickup,
+            changed_slots: vec![(1, HashedStack::empty())],
+            carried_item: HashedStack::Actual {
+                item_id: bucket_id,
+                count: 2,
+                components: HashedStackComponentHashes::empty(),
+            },
+        })
+        .await
+        .expect("send impossible cursor prediction after recovery");
+    wait_for_furnace_content(&mut client, opened.container_id, |packet| {
+        packet.state_id == carrying_bucket.state_id
+            && packet.items[0].is_empty()
+            && packet.items[1].item_id == snowball_id
+            && packet.items[1].count == 16
+            && packet.carried_item.item_id == bucket_id
+            && packet.carried_item.count == 1
+    })
+    .await;
+
+    client
+        .write_packet(&ServerboundContainerClick {
+            container_id: opened.container_id,
+            state_id: carrying_bucket.state_id,
+            slot_num: 2,
+            button_num: 0,
+            container_input: ContainerInput::Pickup,
+            changed_slots: vec![(
+                2,
+                HashedStack::Actual {
+                    item_id: bucket_id,
+                    count: 1,
+                    components: HashedStackComponentHashes::empty(),
+                },
+            )],
+            carried_item: HashedStack::empty(),
+        })
+        .await
+        .expect("place recovered bucket into empty chest slot");
+    wait_for_furnace_content(&mut client, opened.container_id, |packet| {
+        packet.state_id == carrying_bucket.state_id.wrapping_add(2)
+            && packet.items[0].is_empty()
+            && packet.items[1].item_id == snowball_id
+            && packet.items[1].count == 16
+            && packet.items[2].item_id == bucket_id
+            && packet.items[2].count == 1
+            && packet.carried_item.is_empty()
+    })
+    .await;
+
+    shutdown.request();
+    tokio::time::timeout(Duration::from_secs(5), serve)
+        .await
+        .expect("chest limit server shutdown")
+        .expect("chest limit server join")
+        .expect("chest limit server serve");
+}
