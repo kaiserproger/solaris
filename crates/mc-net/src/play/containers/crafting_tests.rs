@@ -227,6 +227,67 @@ fn result_quick_move_crafts_every_matching_item_into_the_vanilla_reverse_range()
 }
 
 #[test]
+fn crafting_table_max_craft_respects_whole_output_batch_capacity() {
+    let input = Identifier::parse("minecraft:oak_log").unwrap();
+    let output = Identifier::parse("minecraft:oak_planks").unwrap();
+    let filler = Identifier::parse("minecraft:dirt").unwrap();
+    let items = ItemRegistry::from_report(&[
+        ItemReport {
+            id: input.clone(),
+            protocol_id: 7,
+        },
+        ItemReport {
+            id: output.clone(),
+            protocol_id: 42,
+        },
+        ItemReport {
+            id: filler,
+            protocol_id: 99,
+        },
+    ]);
+    let recipes = [Recipe {
+        id: Identifier::parse("minecraft:oak_planks").unwrap(),
+        kind: RecipeKind::Shapeless(ShapelessRecipe {
+            ingredients: vec![Ingredient {
+                alternatives: vec![IngredientAlternative::Item(input)],
+            }],
+        }),
+        result: RecipeResult {
+            item: output,
+            count: 4,
+        },
+    }];
+    let item_facts = ItemFactsTable::default();
+    let tags = TagsData::default();
+
+    for (existing_output, expected_crafts, expected_inputs) in [(56, 2, 3), (62, 0, 5)] {
+        let mut inventory = PlayerInventory::empty();
+        for slot in 9..=43 {
+            inventory.slots[slot] = ItemStack::new(99, 64);
+        }
+        inventory.slots[44] = ItemStack::new(42, existing_output);
+        let before = inventory.clone();
+        let mut window = CraftingTableWindow::new(7);
+        window.input[0] = ItemStack::new(7, 5);
+        super::refresh_crafting_result(&items, &item_facts, &tags, &recipes, &mut window);
+
+        let (changed, discarded) =
+            window.apply_quick_move_click(&items, &item_facts, &tags, &recipes, &mut inventory, 0);
+
+        assert_eq!(changed, expected_crafts > 0);
+        assert!(discarded.is_empty());
+        assert_eq!(window.input[0], ItemStack::new(7, expected_inputs));
+        assert_eq!(
+            inventory.slots[44],
+            ItemStack::new(42, existing_output + expected_crafts * 4)
+        );
+        if expected_crafts == 0 {
+            assert_eq!(inventory.slots, before.slots);
+        }
+    }
+}
+
+#[test]
 fn crafting_table_result_pickup_consumes_the_matching_grid() {
     let items = ItemRegistry::from_report(&[]);
     let item_facts = ItemFactsTable::default();
