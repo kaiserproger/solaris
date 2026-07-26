@@ -1,0 +1,37 @@
+{
+  "schema": 1,
+  "screens": [{
+    "id": "ruby-live:showcase",
+    "title": "Ruby Loader Fixture",
+    "body": "Owner ruby-live: custom item, block carrier, asset pack, and interaction.",
+    "item_id": "ruby-live:ruby",
+    "block_id": "ruby-live:ruby_block"
+  }],
+  "blocks": [{
+    "id": "ruby-live:ruby_block",
+    "model": "ruby-live:block/ruby_block",
+    "name": "Ruby Fixture Block"
+  }],
+  "items": [{
+    "id": "ruby-live:ruby",
+    "base_item": "minecraft:paper",
+    "name": "Ruby Fixture Item"
+  }],
+  "assets": [{
+    "id": "ruby-live:ruby_item_definition",
+    "path": "assets/ruby-live/items/ruby.json",
+    "sha256": "@ITEM_SHA256@",
+    "size_bytes": @ITEM_SIZE@
+  }, {
+    "id": "ruby-live:ruby_block_model",
+    "path": "assets/ruby-live/models/block/ruby_block.json",
+    "sha256": "@BLOCK_SHA256@",
+    "size_bytes": @BLOCK_SIZE@
+  }],
+  "interactions": [{
+    "id": "ruby-live:confirm",
+    "screen_id": "ruby-live:showcase",
+    "label": "Confirm Ruby",
+    "payload": "ruby-confirmed"
+  }]
+}

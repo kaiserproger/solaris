@@ -1,0 +1,37 @@
+{
+  "schema": 1,
+  "screens": [{
+    "id": "sapphire-live:showcase",
+    "title": "Sapphire Loader Fixture",
+    "body": "Owner sapphire-live: custom item, block carrier, asset pack, and interaction.",
+    "item_id": "sapphire-live:sapphire",
+    "block_id": "sapphire-live:sapphire_block"
+  }],
+  "blocks": [{
+    "id": "sapphire-live:sapphire_block",
+    "model": "sapphire-live:block/sapphire_block",
+    "name": "Sapphire Fixture Block"
+  }],
+  "items": [{
+    "id": "sapphire-live:sapphire",
+    "base_item": "minecraft:paper",
+    "name": "Sapphire Fixture Item"
+  }],
+  "assets": [{
+    "id": "sapphire-live:sapphire_item_definition",
+    "path": "assets/sapphire-live/items/sapphire.json",
+    "sha256": "@ITEM_SHA256@",
+    "size_bytes": @ITEM_SIZE@
+  }, {
+    "id": "sapphire-live:sapphire_block_model",
+    "path": "assets/sapphire-live/models/block/sapphire_block.json",
+    "sha256": "@BLOCK_SHA256@",
+    "size_bytes": @BLOCK_SIZE@
+  }],
+  "interactions": [{
+    "id": "sapphire-live:confirm",
+    "screen_id": "sapphire-live:showcase",
+    "label": "Confirm Sapphire",
+    "payload": "sapphire-confirmed"
+  }]
+}

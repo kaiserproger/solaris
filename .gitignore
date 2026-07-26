@@ -25,10 +25,12 @@
 /data/vanilla/version.json
 /data/vanilla/reports/
 
-# Side-effect of running vanilla-server-derived helpers (Bootstrap
-# initialises a log4j root logger that writes here). Local-only.
+# Side-effect of running vanilla-server-derived helpers and client launchers.
+# Local-only runtime state must never enter source control.
 /logs/
 /client-mod/solaris-client-agent/*/logs/
+/client-mod/solaris-client-agent/*/.analysis/
+/client-mod/solaris-client-agent/*/run*/
 
 # Local Claude / session-scratch dirs (per-session prompt drafts,
 # downloaded manifests, harness settings). Not part of the project.
@@ -37,3 +39,19 @@
 
 # Local CodeGraph index. Derived from source; regenerate with `codegraph init`.
 /.codegraph/
+
+# Agent/runtime scratch and generated local launch state.
+/.ai-bridge/
+/.codex/
+/run/
+/run-mcp/
+/run-far-travel*/
+/docs/spark-team/
+**/__pycache__/
+**/r.*.*.mca
+
+# Local decompile/oracle and repository snapshots.
+/net/
+/patches/
+/repomix-*.md
+/repomix-output.md

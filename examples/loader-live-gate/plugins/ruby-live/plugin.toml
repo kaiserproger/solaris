@@ -1,0 +1,24 @@
+id = "ruby-live"
+name = "Ruby Loader Live Gate"
+version = "1.0.0"
+api = "0.6.0"
+player_commands = ["loader_ruby"]
+
+[client]
+schema = 1
+
+[[client.bundles]]
+id = "rich-content"
+version = "1"
+artifact = "client/rich-content.zip"
+sha256 = "70dd527ac0c5075faf1dff65e8e426f657746d42215e4fc4fd18244ac5b9d765"
+size_bytes = 1009
+loaders = ["fabric", "neoforge", "forge"]
+content = ["blocks", "items", "screens", "assets", "interactions"]
+permissions = [
+  "register_blocks",
+  "register_items",
+  "open_screens",
+  "load_assets",
+  "send_interactions",
+]

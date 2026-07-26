@@ -1,0 +1,89 @@
+plugins {
+    id 'java'
+    id 'net.minecraftforge.gradle'
+}
+
+def minecraftVersion = providers.gradleProperty('minecraftVersion')
+def clientMcpToken = providers.environmentVariable('SOLARIS_CLIENT_MCP_TOKEN')
+    .orElse(providers.gradleProperty('solaris.clientMcp.token'))
+    .orElse('')
+def clientMcpPort = providers.environmentVariable('SOLARIS_CLIENT_MCP_PORT')
+    .orElse(providers.gradleProperty('solaris.clientMcp.port'))
+    .orElse('39095')
+def clientMcpGameDir = providers.gradleProperty('solaris.clientMcp.gameDir')
+    .orElse(rootProject.file('../../.analysis/minecraft-loader-mcp/forge').absolutePath)
+def clientMcpUsername = providers.gradleProperty('solaris.clientMcp.username').orElse('SolarisLoader')
+def java25Launcher = javaToolchains.launcherFor {
+    languageVersion = JavaLanguageVersion.of(25)
+}
+
+fgtools.configure('slimelauncher') {
+    javaLauncher.set(java25Launcher)
+}
+
+repositories {
+    minecraft.mavenizer(it)
+    maven fg.forgeMaven
+    maven fg.minecraftLibsMaven
+    mavenCentral()
+}
+
+dependencies {
+    implementation minecraft.dependency("net.minecraftforge:forge:${providers.gradleProperty('forgeVersion').get()}")
+    implementation project(':bridge-core')
+    implementation project(':loader-core')
+    testImplementation 'org.junit.jupiter:junit-jupiter-api:5.10.2'
+    testRuntimeOnly 'org.junit.jupiter:junit-jupiter-engine:5.10.2'
+    testRuntimeOnly 'org.junit.platform:junit-platform-launcher:1.10.2'
+}
+
+sourceSets {
+    main.java.srcDir rootProject.file('loader-platform-common/src/main/java')
+    main.java.srcDir rootProject.file('java-agent/src/main/java')
+    main.output.resourcesDir = layout.buildDirectory.dir('classes/java/main').get().asFile
+    test.java.srcDir rootProject.file('loader-platform-common/src/test/java')
+}
+
+minecraft {
+    mappings channel: 'official', version: minecraftVersion.get()
+    runs {
+        clientMcp {
+            client = true
+            mainClass.set('net.minecraftforge.bootstrap.ForgeBootstrap')
+            workingDir.set(layout.dir(clientMcpGameDir.map { file(it) }))
+            args '--gameDir', '.',
+                '--launchTarget', 'forge_userdev_client',
+                '--version', 'MOD_DEV',
+                '--assetIndex', '{asset_index}',
+                '--assetsDir', '{assets_root}'
+            jvmArgs '-Djava.net.preferIPv6Addresses=system',
+                '-XX:+UseCompactObjectHeaders'
+            args '--username', clientMcpUsername.get()
+            environment 'MCP_MAPPINGS', '{mcp_mappings}'
+            environment 'MOD_CLASSES', '{source_roots}'
+            environment 'SOLARIS_CLIENT_MCP_TOKEN', clientMcpToken.get()
+            environment 'SOLARIS_CLIENT_MCP_PORT', clientMcpPort.get()
+            systemProperty 'forge.enableGameTest', 'true'
+            mods {
+                solaris_loader {
+                    source sourceSets.main
+                }
+            }
+        }
+    }
+}
+
+tasks.named('jar', Jar) {
+    dependsOn project(':loader-core').tasks.named('classes')
+    from project(':loader-core').layout.buildDirectory.dir('classes/java/main')
+}
+
+tasks.configureEach {
+    if (name == 'runClientMcp') {
+        group = 'verification'
+        description = 'Runs the Forge Loader client with the embedded Solaris MCP server.'
+        mainClass.set('net.minecraftforge.launcher.Main')
+        dependsOn rootProject.tasks.named('validateLoaderClientMcpRunProperties')
+        notCompatibleWithConfigurationCache('The Loader MCP profile uses per-run credentials and game directories.')
+    }
+}

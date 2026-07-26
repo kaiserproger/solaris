@@ -82,6 +82,7 @@
       "title": "Block edits, fluids, farming, and visible drops",
       "ledger_rows": ["B1", "B2", "B3", "F1", "F2", "F3", "F4", "L1", "L2"],
       "status": "manual-pending",
+      "no_debug_commands": true,
       "bounded_time_minutes": 18,
       "screenshots_required": true,
       "steps": [

@@ -1,0 +1,25 @@
+{
+  "schemaVersion": 1,
+  "id": "solaris_loader",
+  "version": "0.1.0",
+  "name": "Solaris Loader",
+  "description": "Solaris client-bundle configuration transport.",
+  "environment": "client",
+  "entrypoints": {
+    "main": [
+      "dev.solaris.loader.fabric.SolarisFabricContent"
+    ],
+    "client": [
+      "dev.solaris.loader.fabric.SolarisFabricLoader"
+    ]
+  },
+  "mixins": [
+    "solaris-loader.mixins.json"
+  ],
+  "depends": {
+    "fabricloader": ">=0.19.3",
+    "fabric-api": "*",
+    "minecraft": "=26.1.2",
+    "java": ">=25"
+  }
+}

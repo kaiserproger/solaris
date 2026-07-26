@@ -1,0 +1,24 @@
+id = "sapphire-live"
+name = "Sapphire Loader Live Gate"
+version = "1.0.0"
+api = "0.6.0"
+player_commands = ["loader_sapphire"]
+
+[client]
+schema = 1
+
+[[client.bundles]]
+id = "rich-content"
+version = "1"
+artifact = "client/rich-content.zip"
+sha256 = "@ARTIFACT_SHA256@"
+size_bytes = @ARTIFACT_SIZE@
+loaders = ["fabric", "neoforge", "forge"]
+content = ["blocks", "items", "screens", "assets", "interactions"]
+permissions = [
+  "register_blocks",
+  "register_items",
+  "open_screens",
+  "load_assets",
+  "send_interactions",
+]
