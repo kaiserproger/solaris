@@ -212,6 +212,7 @@ pub(crate) struct SimulationSaveSnapshot {
     pub(crate) world_chunk_journal_watermark: Option<u64>,
     pub(crate) world_time: u64,
     pub(crate) players_sleeping_percentage: u32,
+    pub(crate) keep_inventory: bool,
     pub(crate) simulation_tick: u64,
     pub(crate) world_flush_plan: Option<mc_world::DirtyFlushPlan>,
 }
@@ -1608,6 +1609,7 @@ pub(super) struct PlayerSurvivalPlan {
     pub(super) enchanting_table_input: Option<super::EnchantingTableInputPlan>,
     pub(super) item_entity_type_id: Option<i32>,
     pub(super) xp_orb_entity_type_id: Option<i32>,
+    pub(super) keep_inventory: bool,
     pub(super) position: Vec3,
 }
 
@@ -4521,6 +4523,7 @@ impl SimulationOwner {
                             world_chunk_journal_watermark: sessions.world_chunk_journal_watermark(),
                             world_time: sessions.world_time(),
                             players_sleeping_percentage: sessions.players_sleeping_percentage(),
+                            keep_inventory: sessions.keep_inventory(),
                             simulation_tick,
                             world_flush_plan,
                         })
@@ -5924,6 +5927,7 @@ fn valid_player_survival_plan(plan: &PlayerSurvivalPlan) -> bool {
         && xp_is_valid(&plan.updated_xp)
         && position_is_valid
         && (!dies
+            || plan.keep_inventory
             || ((!has_drops || plan.item_entity_type_id.is_some_and(|id| id >= 0))
                 && (dropped_xp == 0 || plan.xp_orb_entity_type_id.is_some_and(|id| id >= 0))))
 }
@@ -7650,6 +7654,7 @@ mod tests {
             enchanting_table_input: None,
             item_entity_type_id: None,
             xp_orb_entity_type_id: None,
+            keep_inventory: false,
             position: Vec3::new(target_pose.x, target_pose.y, target_pose.z),
         };
 
@@ -7799,6 +7804,7 @@ mod tests {
                 enchanting_table_input: None,
                 item_entity_type_id: None,
                 xp_orb_entity_type_id: None,
+                keep_inventory: false,
                 position,
             }
         };
@@ -12196,6 +12202,7 @@ mod tests {
             enchanting_table_input: None,
             item_entity_type_id: Some(1),
             xp_orb_entity_type_id: Some(2),
+            keep_inventory: false,
             position: Vec3::new(0.5, 64.0, 0.5),
         };
         let (handle, mut owner) = simulation_channel_with_capacity(2);

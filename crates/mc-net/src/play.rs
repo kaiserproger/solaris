@@ -4678,6 +4678,7 @@ where
             enchanting_table_input,
             item_entity_type_id: item_entity_type_id(&state.entity_types),
             xp_orb_entity_type_id: xp_orb_entity_type_id(&state.entity_types),
+            keep_inventory: state.sessions.keep_inventory(),
             position: Vec3::new(player_pose.x, player_pose.y, player_pose.z),
         })
         .await
@@ -6587,6 +6588,7 @@ fn player_attack_cost_plan(
         enchanting_table_input: None,
         item_entity_type_id: None,
         xp_orb_entity_type_id: None,
+        keep_inventory: false,
         position: Vec3::new(player_pose.x, player_pose.y, player_pose.z),
     })
 }

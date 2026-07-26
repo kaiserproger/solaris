@@ -23,6 +23,9 @@ mod chunk_view_authority;
 mod combat_load_tests;
 mod container_state;
 mod container_views;
+#[cfg(test)]
+#[path = "session/death_policy_tests.rs"]
+mod death_policy_tests;
 mod entity_combat;
 mod entity_goal_defaults;
 mod entity_lifecycle;
@@ -379,6 +382,7 @@ struct SessionRegistryInner {
     spectator_sessions: HashSet<SessionId>,
     dead_sessions: HashSet<SessionId>,
     client_unloaded_sessions: HashSet<SessionId>,
+    keep_inventory: bool,
     entity_dispatches: EntityDispatchCounters,
     arrow_kill_rewards: ArrowKillRewards,
     player_combat: PlayerCombatResources,

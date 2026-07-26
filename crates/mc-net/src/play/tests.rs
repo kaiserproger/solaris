@@ -4463,7 +4463,7 @@ fn admin_dispatcher_parses_slash_commands_and_permissions() {
     assert_eq!(
         parse_admin_command("/gamerule players_sleeping_percentage -1", op),
         Err(CommandError::Usage(
-            "Usage: /gamerule players_sleeping_percentage [value]"
+            "Usage: /gamerule <keep_inventory|players_sleeping_percentage> [value]"
         ))
     );
 }
@@ -20901,5 +20901,6 @@ fn stale_damage_publication_does_not_apply_health_side_effects() {
 }
 
 include!("tests/contact_damage.rs");
+include!("tests/gamerule_keep_inventory.rs");
 include!("tests/inventory_and_survival.rs");
 include!("tests/spawning_and_world.rs");

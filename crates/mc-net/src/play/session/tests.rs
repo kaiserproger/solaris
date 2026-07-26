@@ -59,6 +59,7 @@ fn lethal_survival_commit_pushes_immutable_player_death_before_session_cleanup()
             enchanting_table_input: None,
             item_entity_type_id: None,
             xp_orb_entity_type_id: None,
+            keep_inventory: false,
             position: Vec3::new(pose.x, pose.y, pose.z),
         },
     );
@@ -163,6 +164,7 @@ fn respawn_commit_clears_player_hurt_resistance() {
             enchanting_table_input: None,
             item_entity_type_id: None,
             xp_orb_entity_type_id: None,
+            keep_inventory: false,
             position: Vec3::new(0.5, 64.0, 0.5),
         },
     );
@@ -7080,6 +7082,7 @@ fn player_attack_uses_authoritative_held_spear_range() {
         enchanting_table_input: None,
         item_entity_type_id: None,
         xp_orb_entity_type_id: None,
+        keep_inventory: false,
         position: Vec3::new(pose.x, pose.y, pose.z),
     };
     let spawn = |z| match &registry.spawn_command_entity(
@@ -7142,6 +7145,7 @@ fn direct_player_melee_kill_pushes_one_authoritative_script_event() {
             enchanting_table_input: None,
             item_entity_type_id: None,
             xp_orb_entity_type_id: None,
+            keep_inventory: false,
             position,
         }
     }

@@ -140,6 +140,7 @@ impl SessionRegistry {
             .copied()
             .unwrap_or_default();
         let combat_resources = inner.player_combat.clone();
+        let keep_inventory = inner.keep_inventory;
         drop(inner);
 
         let Some((authoritative_mode, attack_range)) = authoritative_attacker_reach(
@@ -266,6 +267,7 @@ impl SessionRegistry {
             enchanting_table_input: None,
             item_entity_type_id: combat_resources.item_entity_type_id,
             xp_orb_entity_type_id: combat_resources.xp_orb_entity_type_id,
+            keep_inventory,
             position: target_position,
         };
         let Some((mut committed, committed_attacker_costs, staged_damage_wake)) = self
@@ -718,6 +720,7 @@ pub(super) fn prepare_projectile_player_damage_locked(
         enchanting_table_input: None,
         item_entity_type_id: combat_resources.item_entity_type_id,
         xp_orb_entity_type_id: combat_resources.xp_orb_entity_type_id,
+        keep_inventory: inner.keep_inventory,
         position: target_position,
     };
     let prepared = PreparedProjectilePlayerDamage {
@@ -986,6 +989,7 @@ mod tests {
             enchanting_table_input: None,
             item_entity_type_id: None,
             xp_orb_entity_type_id: None,
+            keep_inventory: false,
             position: mc_entity::Vec3::new(pose.x, pose.y, pose.z),
         }
     }

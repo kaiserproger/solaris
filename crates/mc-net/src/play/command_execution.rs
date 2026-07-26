@@ -98,6 +98,13 @@ where
             .await?;
             send_command_feedback(writer, compression, &format!("Set game mode to {mode:?}")).await
         }
+        AdminCommand::KeepInventory(value) => {
+            if let Some(value) = value {
+                sessions.set_keep_inventory(value);
+            }
+            let value = sessions.keep_inventory();
+            send_command_feedback(writer, compression, &format!("keep_inventory = {value}")).await
+        }
         AdminCommand::PlayersSleepingPercentage(value) => {
             if let Some(value) = value {
                 sessions.set_players_sleeping_percentage(value);

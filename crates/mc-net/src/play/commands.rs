@@ -54,6 +54,7 @@ pub(crate) enum DebugCommand {
 #[derive(Debug, Clone, PartialEq)]
 pub(crate) enum AdminCommand {
     GameMode(GameMode),
+    KeepInventory(Option<bool>),
     PlayersSleepingPercentage(Option<u32>),
     Give {
         item: mc_data::Identifier,
@@ -96,7 +97,7 @@ const ROOT_COMMANDS: &[&str] = &[
     "time", "tp",
 ];
 const GAME_MODES: &[&str] = &["survival", "creative", "adventure", "spectator"];
-const GAME_RULES: &[&str] = &["players_sleeping_percentage"];
+const GAME_RULES: &[&str] = &["keep_inventory", "players_sleeping_percentage"];
 const MAX_DEBUG_OUTBOUND_PRESSURE_BURST: usize = 256;
 
 #[cfg(test)]
@@ -171,9 +172,17 @@ pub(crate) fn command_tree_packet_with_plugin_roots(
                 )
                 .restricted(true),
                 CommandNode::literal("status", Vec::new(), true).restricted(true),
-                CommandNode::literal("gamerule", vec![21], false).restricted(true),
+                CommandNode::literal("gamerule", vec![21, 23], false).restricted(true),
                 CommandNode::literal("players_sleeping_percentage", vec![22], true)
                     .restricted(true),
+                CommandNode::argument(
+                    "value",
+                    CommandArgumentParser::String(CommandStringKind::SingleWord),
+                    Vec::new(),
+                    true,
+                )
+                .restricted(true),
+                CommandNode::literal("keep_inventory", vec![24], true).restricted(true),
                 CommandNode::argument(
                     "value",
                     CommandArgumentParser::String(CommandStringKind::SingleWord),
@@ -226,7 +235,7 @@ fn parse_admin_command_inner(command: &str) -> Result<AdminCommand, CommandError
     }
     if command.starts_with("gamerule") {
         return Err(CommandError::Usage(
-            "Usage: /gamerule players_sleeping_percentage [value]",
+            "Usage: /gamerule <keep_inventory|players_sleeping_percentage> [value]",
         ));
     }
     if let Some(mode) = parse_gamemode_command(command) {
@@ -405,14 +414,25 @@ fn parse_game_mode(mode: &str) -> Option<GameMode> {
 
 fn parse_gamerule_command(command: &str) -> Option<AdminCommand> {
     let mut parts = command.split_whitespace();
-    if parts.next()? != "gamerule" || parts.next()? != "players_sleeping_percentage" {
+    if parts.next()? != "gamerule" {
         return None;
     }
-    let value = parts.next().map(str::parse::<u32>).transpose().ok()?;
-    parts
-        .next()
-        .is_none()
-        .then_some(AdminCommand::PlayersSleepingPercentage(value))
+    let rule = parts.next()?;
+    let value = parts.next();
+    if parts.next().is_some() {
+        return None;
+    }
+    match rule {
+        "keep_inventory" => {
+            let value = value.map(str::parse::<bool>).transpose().ok()?;
+            Some(AdminCommand::KeepInventory(value))
+        }
+        "players_sleeping_percentage" => {
+            let value = value.map(str::parse::<u32>).transpose().ok()?;
+            Some(AdminCommand::PlayersSleepingPercentage(value))
+        }
+        _ => None,
+    }
 }
 
 pub(super) fn parse_debug_command(command: &str) -> Option<DebugCommand> {

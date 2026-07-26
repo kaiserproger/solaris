@@ -1272,6 +1272,10 @@ async fn dead_survival_player_cannot_mine_or_eat() {
         .id_of(&mc_data::Identifier::parse("minecraft:item").unwrap())
         .and_then(|id| i32::try_from(id).ok())
         .expect("item entity type");
+    let xp_orb_entity_type = entity_types
+        .id_of(&mc_data::Identifier::parse("minecraft:experience_orb").unwrap())
+        .and_then(|id| i32::try_from(id).ok())
+        .expect("experience orb entity type");
 
     let cfg = mc_net::ServerConfig {
         bind_address: "127.0.0.1:0".parse().unwrap(),
@@ -1319,12 +1323,30 @@ async fn dead_survival_player_cannot_mine_or_eat() {
     wait_for_slot_stack(&mut client, apple_id, 2).await;
     client
         .write_packet(&ServerboundChatCommand {
+            command: "debug survival xp 21".into(),
+        })
+        .await
+        .expect("grant recoverable death XP");
+    wait_for_experience(&mut client, |xp| {
+        xp.total_experience == 21 && xp.experience_level == 2
+    })
+    .await;
+    client
+        .write_packet(&ServerboundChatCommand {
             command: "debug survival damage 100".into(),
         })
         .await
         .expect("kill player");
     wait_for_health_level(&mut client, 0.0).await;
-    wait_for_death_inventory_drop(&mut client, item_entity_type, apple_id, 2).await;
+    wait_for_death_inventory_and_xp_drop(
+        &mut client,
+        item_entity_type,
+        xp_orb_entity_type,
+        apple_id,
+        2,
+        14,
+    )
+    .await;
 
     let target_y = sync.y.floor() as i32 - 2;
     let target_pos = pack_block_pos(0, target_y, 0);
@@ -1619,6 +1641,15 @@ async fn dead_survival_player_can_respawn_and_act_again() {
 async fn respawned_survival_player_rejoins_alive_after_saved_restart() {
     let data = embedded_play_data();
     let dirt_id = embedded_item_id(&data, "minecraft:dirt");
+    let entity_types = mc_data::entity_types::solaris_required_entity_types();
+    let item_entity_type = entity_types
+        .id_of(&mc_data::Identifier::parse("minecraft:item").unwrap())
+        .and_then(|id| i32::try_from(id).ok())
+        .expect("embedded item entity type");
+    let xp_orb_entity_type = entity_types
+        .id_of(&mc_data::Identifier::parse("minecraft:experience_orb").unwrap())
+        .and_then(|id| i32::try_from(id).ok())
+        .expect("embedded experience orb entity type");
     let world_dir = tempfile::tempdir().expect("create respawn persistence world");
 
     let first_shutdown = mc_net::ShutdownHandle::default();
@@ -1637,6 +1668,20 @@ async fn respawned_survival_player_rejoins_alive_after_saved_restart() {
     drain_until_chunk(&mut client, (0, 0)).await;
     client
         .write_packet(&ServerboundChatCommand {
+            command: "gamerule keep_inventory true".into(),
+        })
+        .await
+        .expect("enable keepInventory");
+    assert_eq!(
+        wait_for_system_chat_text(
+            &mut client,
+            tokio::time::Instant::now() + Duration::from_secs(30),
+        )
+        .await,
+        "keep_inventory = true"
+    );
+    client
+        .write_packet(&ServerboundChatCommand {
             command: "debug give minecraft:dirt 1 0".into(),
         })
         .await
@@ -1644,18 +1689,34 @@ async fn respawned_survival_player_rejoins_alive_after_saved_restart() {
     wait_for_slot_stack(&mut client, dirt_id, 1).await;
     client
         .write_packet(&ServerboundChatCommand {
+            command: "debug survival xp 21".into(),
+        })
+        .await
+        .expect("grant pre-death XP");
+    wait_for_experience(&mut client, |xp| {
+        xp.total_experience == 21 && xp.experience_level == 2
+    })
+    .await;
+    client
+        .write_packet(&ServerboundChatCommand {
             command: "debug survival damage 100".into(),
         })
         .await
         .expect("kill persisted player");
-    wait_for_health_level(&mut client, 0.0).await;
-    wait_for_inventory_content(&mut client, |pkt| {
-        pkt.container_id == 0
-            && pkt
-                .items
-                .iter()
-                .all(mc_protocol::packets::play::ItemStack::is_empty)
-    })
+    client
+        .write_packet(&ServerboundChatCommand {
+            command: "gamerule keep_inventory".into(),
+        })
+        .await
+        .expect("query keepInventory after death");
+    wait_for_keep_inventory_death_fence(
+        &mut client,
+        item_entity_type,
+        xp_orb_entity_type,
+        dirt_id,
+        1,
+        21,
+    )
     .await;
 
     client
@@ -1666,8 +1727,9 @@ async fn respawned_survival_player_rejoins_alive_after_saved_restart() {
         .expect("request persisted respawn");
     let mut saw_full_health = false;
     let mut saw_position_sync = false;
+    let mut saw_preserved_inventory = false;
     let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
-    while !(saw_full_health && saw_position_sync) {
+    while !(saw_full_health && saw_position_sync && saw_preserved_inventory) {
         let frame = client
             .read_frame_with_timeout(
                 deadline.saturating_duration_since(tokio::time::Instant::now()),
@@ -1695,12 +1757,37 @@ async fn respawned_survival_player_rejoins_alive_after_saved_restart() {
             if (pkt.health - 20.0).abs() < f32::EPSILON && pkt.food == 20 {
                 saw_full_health = true;
             }
+        } else if frame.id == ClientboundContainerSetContent::ID {
+            let mut body = frame.body;
+            let pkt = ClientboundContainerSetContent::decode(&mut body)
+                .expect("decode keepInventory respawn inventory");
+            if pkt.container_id == 0 {
+                let stack = pkt.items.get(36).expect("respawn hotbar slot 36");
+                assert_eq!((stack.item_id, stack.count), (dirt_id, 1));
+                assert!(pkt.carried_item.is_empty());
+                saw_preserved_inventory = true;
+            }
+        } else if frame.id == AddEntity::ID {
+            let mut body = frame.body;
+            let pkt = AddEntity::decode(&mut body).expect("decode respawn AddEntity");
+            assert!(
+                pkt.entity_type_id != item_entity_type
+                    && pkt.entity_type_id != xp_orb_entity_type,
+                "keepInventory respawn must not reveal deferred death drops: {pkt:?}"
+            );
         }
     }
     client
         .write_packet(&mc_protocol::packets::play::ServerboundPlayerLoaded)
         .await
         .expect("acknowledge respawn load");
+    client
+        .write_packet(&ServerboundChatCommand {
+            command: "debug survival xp 1".into(),
+        })
+        .await
+        .expect("prove pre-death XP survived respawn");
+    wait_for_experience(&mut client, |xp| xp.total_experience == 22).await;
 
     client
         .write_packet(&ServerboundChatCommand {
@@ -1730,6 +1817,29 @@ async fn respawned_survival_player_rejoins_alive_after_saved_restart() {
     let second_serve = tokio::spawn(async move { second_bound.serve_and_save().await });
 
     let (mut rejoined, _) = connect_to_play(second_addr, "T02Respawn").await;
+    wait_for_rejoined_keep_inventory_state(
+        &mut rejoined,
+        item_entity_type,
+        xp_orb_entity_type,
+        dirt_id,
+        1,
+        22,
+    )
+    .await;
+    rejoined
+        .write_packet(&ServerboundChatCommand {
+            command: "gamerule keep_inventory".into(),
+        })
+        .await
+        .expect("query restored keepInventory");
+    assert_eq!(
+        wait_for_system_chat_text(
+            &mut rejoined,
+            tokio::time::Instant::now() + Duration::from_secs(30),
+        )
+        .await,
+        "keep_inventory = true"
+    );
     rejoined
         .write_packet(&ServerboundChatCommand {
             command: "debug survival damage 1".into(),
