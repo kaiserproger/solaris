@@ -56,6 +56,7 @@ async fn lua_player_inventory_transactions_are_atomic_authoritative_and_targeted
         chunk_pipeline: mc_net::ChunkPipelinePolicy::default(),
         random_tick: mc_net::RandomTickPolicy::default(),
         command_permissions: mc_net::CommandPermissionConfig::new(Vec::<String>::new(), false),
+        loader_manifest: None,
         shutdown: shutdown.clone(),
     };
     let bound = mc_net::bind_with_scripts(cfg, boundary)
@@ -167,6 +168,7 @@ async fn worldless_runtime_rejects_player_inventory_before_mutation() {
         chunk_pipeline: mc_net::ChunkPipelinePolicy::default(),
         random_tick: mc_net::RandomTickPolicy::default(),
         command_permissions: mc_net::CommandPermissionConfig::new(Vec::<String>::new(), false),
+        loader_manifest: None,
         shutdown: shutdown.clone(),
     };
     let bound = mc_net::bind_with_scripts(cfg, boundary)

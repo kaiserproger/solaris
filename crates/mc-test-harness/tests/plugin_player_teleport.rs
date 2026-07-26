@@ -112,6 +112,7 @@ async fn lua_player_teleport_commits_through_the_session_owner_and_reports_exact
         chunk_pipeline: mc_net::ChunkPipelinePolicy::default(),
         random_tick: mc_net::RandomTickPolicy::default(),
         command_permissions: mc_net::CommandPermissionConfig::new(Vec::<String>::new(), false),
+        loader_manifest: None,
         shutdown: shutdown.clone(),
     };
     let bound = mc_net::bind_with_scripts(cfg, boundary)

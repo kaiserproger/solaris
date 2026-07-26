@@ -1,5 +1,22 @@
-#[tokio::test]
-async fn embedded_generated_seed_survival_crafts_tool_and_persists_without_debug() {
+#[test]
+fn embedded_generated_seed_survival_crafts_tool_and_persists_without_debug() {
+    let test = std::thread::Builder::new()
+        .name("embedded_generated_seed_survival_crafts_tool_and_persists_without_debug".to_owned())
+        .stack_size(4 * 1024 * 1024)
+        .spawn(|| {
+            tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .expect("build generated survival crafting runtime")
+                .block_on(embedded_generated_seed_survival_crafts_tool_and_persists_without_debug_inner());
+        })
+        .expect("spawn generated survival crafting runtime");
+    if let Err(panic) = test.join() {
+        std::panic::resume_unwind(panic);
+    }
+}
+
+async fn embedded_generated_seed_survival_crafts_tool_and_persists_without_debug_inner() {
     let data = embedded_play_data();
     let air_state = embedded_block_state(&data, "minecraft:air");
     let crafting_table_state = embedded_block_state(&data, "minecraft:crafting_table");
@@ -230,8 +247,25 @@ async fn embedded_generated_seed_survival_crafts_tool_and_persists_without_debug
         .expect("generated-world rejoin serve");
 }
 
-#[tokio::test]
-async fn embedded_survival_mines_logs_and_crafts_wooden_pickaxe_at_table() {
+#[test]
+fn embedded_survival_mines_logs_and_crafts_wooden_pickaxe_at_table() {
+    let test = std::thread::Builder::new()
+        .name("embedded_survival_mines_logs_and_crafts_wooden_pickaxe_at_table".to_owned())
+        .stack_size(4 * 1024 * 1024)
+        .spawn(|| {
+            tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .expect("build survival crafting table runtime")
+                .block_on(embedded_survival_mines_logs_and_crafts_wooden_pickaxe_at_table_inner());
+        })
+        .expect("spawn survival crafting table runtime");
+    if let Err(panic) = test.join() {
+        std::panic::resume_unwind(panic);
+    }
+}
+
+async fn embedded_survival_mines_logs_and_crafts_wooden_pickaxe_at_table_inner() {
     let data = embedded_play_data();
     let air_state = embedded_block_state(&data, "minecraft:air");
     let oak_log_state = embedded_block_state(&data, "minecraft:oak_log");

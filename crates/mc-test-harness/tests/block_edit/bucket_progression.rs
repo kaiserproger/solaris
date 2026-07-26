@@ -1,5 +1,22 @@
-#[tokio::test]
-async fn embedded_bucket_recipe_composes_with_water_pickup_and_placement() {
+#[test]
+fn embedded_bucket_recipe_composes_with_water_pickup_and_placement() {
+    let test = std::thread::Builder::new()
+        .name("embedded_bucket_recipe_composes_with_water_pickup_and_placement".to_owned())
+        .stack_size(4 * 1024 * 1024)
+        .spawn(|| {
+            tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .expect("build bucket progression runtime")
+                .block_on(embedded_bucket_recipe_composes_with_water_pickup_and_placement_inner());
+        })
+        .expect("spawn bucket progression thread");
+    if let Err(panic) = test.join() {
+        std::panic::resume_unwind(panic);
+    }
+}
+
+async fn embedded_bucket_recipe_composes_with_water_pickup_and_placement_inner() {
     let data = embedded_play_data();
     let air_state = embedded_block_state(&data, "minecraft:air");
     let dirt_state = embedded_block_state(&data, "minecraft:dirt");

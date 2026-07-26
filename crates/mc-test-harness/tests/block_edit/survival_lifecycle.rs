@@ -1,5 +1,22 @@
-#[tokio::test]
-async fn survival_double_chest_opens_combined_storage_and_mutates_second_half() {
+#[test]
+fn survival_double_chest_opens_combined_storage_and_mutates_second_half() {
+    let test = std::thread::Builder::new()
+        .name("survival_double_chest_opens_combined_storage_and_mutates_second_half".to_owned())
+        .stack_size(4 * 1024 * 1024)
+        .spawn(|| {
+            tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .expect("build survival lifecycle runtime")
+                .block_on(survival_double_chest_opens_combined_storage_and_mutates_second_half_inner());
+        })
+        .expect("spawn survival lifecycle thread");
+    if let Err(panic) = test.join() {
+        std::panic::resume_unwind(panic);
+    }
+}
+
+async fn survival_double_chest_opens_combined_storage_and_mutates_second_half_inner() {
     let manifest = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
     let vanilla_dir = manifest.join("../../data/vanilla");
     let blocks_json = vanilla_dir.join("reports/blocks.json");
@@ -105,6 +122,7 @@ async fn survival_double_chest_opens_combined_storage_and_mutates_second_half() 
         chunk_pipeline: mc_net::ChunkPipelinePolicy::default(),
         random_tick: mc_net::RandomTickPolicy::default(),
         command_permissions: mc_net::CommandPermissionConfig::new(Vec::<String>::new(), true),
+        loader_manifest: None,
         shutdown: mc_net::ShutdownHandle::default(),
     };
     let bound = mc_net::bind(cfg).await.expect("bind");
@@ -172,8 +190,25 @@ async fn survival_double_chest_opens_combined_storage_and_mutates_second_half() 
     assert!(right.slots[0].is_empty());
 }
 
-#[tokio::test]
-async fn survival_generic_damage_bypasses_armor_and_durability() {
+#[test]
+fn survival_generic_damage_bypasses_armor_and_durability() {
+    let test = std::thread::Builder::new()
+        .name("survival_generic_damage_bypasses_armor_and_durability".to_owned())
+        .stack_size(4 * 1024 * 1024)
+        .spawn(|| {
+            tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .expect("build survival lifecycle runtime")
+                .block_on(survival_generic_damage_bypasses_armor_and_durability_inner());
+        })
+        .expect("spawn survival lifecycle thread");
+    if let Err(panic) = test.join() {
+        std::panic::resume_unwind(panic);
+    }
+}
+
+async fn survival_generic_damage_bypasses_armor_and_durability_inner() {
     let manifest = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
     let vanilla_dir = manifest.join("../../data/vanilla");
     let blocks_json = vanilla_dir.join("reports/blocks.json");
@@ -230,6 +265,7 @@ async fn survival_generic_damage_bypasses_armor_and_durability() {
         chunk_pipeline: mc_net::ChunkPipelinePolicy::default(),
         random_tick: mc_net::RandomTickPolicy::default(),
         command_permissions: mc_net::CommandPermissionConfig::new(Vec::<String>::new(), true),
+        loader_manifest: None,
         shutdown: mc_net::ShutdownHandle::default(),
     };
     let bound = mc_net::bind(cfg).await.expect("bind");
@@ -316,8 +352,25 @@ async fn survival_generic_damage_bypasses_armor_and_durability() {
     .await;
 }
 
-#[tokio::test]
-async fn survival_use_item_eats_apple_and_updates_food() {
+#[test]
+fn survival_use_item_eats_apple_and_updates_food() {
+    let test = std::thread::Builder::new()
+        .name("survival_use_item_eats_apple_and_updates_food".to_owned())
+        .stack_size(4 * 1024 * 1024)
+        .spawn(|| {
+            tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .expect("build survival lifecycle runtime")
+                .block_on(survival_use_item_eats_apple_and_updates_food_inner());
+        })
+        .expect("spawn survival lifecycle thread");
+    if let Err(panic) = test.join() {
+        std::panic::resume_unwind(panic);
+    }
+}
+
+async fn survival_use_item_eats_apple_and_updates_food_inner() {
     let manifest = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
     let vanilla_dir = manifest.join("../../data/vanilla");
     let blocks_json = vanilla_dir.join("reports/blocks.json");
@@ -383,6 +436,7 @@ async fn survival_use_item_eats_apple_and_updates_food() {
         chunk_pipeline: mc_net::ChunkPipelinePolicy::default(),
         random_tick: mc_net::RandomTickPolicy::default(),
         command_permissions: mc_net::CommandPermissionConfig::new(Vec::<String>::new(), true),
+        loader_manifest: None,
         shutdown: mc_net::ShutdownHandle::default(),
     };
     let bound = mc_net::bind(cfg).await.expect("bind");
@@ -504,8 +558,25 @@ async fn survival_use_item_eats_apple_and_updates_food() {
     }
 }
 
-#[tokio::test]
-async fn survival_use_item_release_cancels_food_use() {
+#[test]
+fn survival_use_item_release_cancels_food_use() {
+    let test = std::thread::Builder::new()
+        .name("survival_use_item_release_cancels_food_use".to_owned())
+        .stack_size(4 * 1024 * 1024)
+        .spawn(|| {
+            tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .expect("build survival lifecycle runtime")
+                .block_on(survival_use_item_release_cancels_food_use_inner());
+        })
+        .expect("spawn survival lifecycle thread");
+    if let Err(panic) = test.join() {
+        std::panic::resume_unwind(panic);
+    }
+}
+
+async fn survival_use_item_release_cancels_food_use_inner() {
     let manifest = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
     let vanilla_dir = manifest.join("../../data/vanilla");
     let blocks_json = vanilla_dir.join("reports/blocks.json");
@@ -563,6 +634,7 @@ async fn survival_use_item_release_cancels_food_use() {
         chunk_pipeline: mc_net::ChunkPipelinePolicy::default(),
         random_tick: mc_net::RandomTickPolicy::default(),
         command_permissions: mc_net::CommandPermissionConfig::new(Vec::<String>::new(), true),
+        loader_manifest: None,
         shutdown: mc_net::ShutdownHandle::default(),
     };
     let bound = mc_net::bind(cfg).await.expect("bind");
@@ -611,8 +683,25 @@ async fn survival_use_item_release_cancels_food_use() {
     assert_no_food_or_slot_change_until_world_ticks(&mut client, apple_id, 40).await;
 }
 
-#[tokio::test]
-async fn survival_bow_release_spawns_and_moves_arrow() {
+#[test]
+fn survival_bow_release_spawns_and_moves_arrow() {
+    let test = std::thread::Builder::new()
+        .name("survival_bow_release_spawns_and_moves_arrow".to_owned())
+        .stack_size(4 * 1024 * 1024)
+        .spawn(|| {
+            tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .expect("build survival lifecycle runtime")
+                .block_on(survival_bow_release_spawns_and_moves_arrow_inner());
+        })
+        .expect("spawn survival lifecycle thread");
+    if let Err(panic) = test.join() {
+        std::panic::resume_unwind(panic);
+    }
+}
+
+async fn survival_bow_release_spawns_and_moves_arrow_inner() {
     let manifest = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
     let vanilla_dir = manifest.join("../../data/vanilla");
     let blocks_json = vanilla_dir.join("reports/blocks.json");
@@ -676,6 +765,7 @@ async fn survival_bow_release_spawns_and_moves_arrow() {
         chunk_pipeline: mc_net::ChunkPipelinePolicy::default(),
         random_tick: mc_net::RandomTickPolicy::default(),
         command_permissions: mc_net::CommandPermissionConfig::new(Vec::<String>::new(), true),
+        loader_manifest: None,
         shutdown: mc_net::ShutdownHandle::default(),
     };
     let bound = mc_net::bind(cfg).await.expect("bind");
@@ -872,8 +962,25 @@ async fn survival_bow_release_spawns_and_moves_arrow() {
     }
 }
 
-#[tokio::test]
-async fn selected_item_drop_debits_slot_and_spawns_exact_stack() {
+#[test]
+fn selected_item_drop_debits_slot_and_spawns_exact_stack() {
+    let test = std::thread::Builder::new()
+        .name("selected_item_drop_debits_slot_and_spawns_exact_stack".to_owned())
+        .stack_size(4 * 1024 * 1024)
+        .spawn(|| {
+            tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .expect("build survival lifecycle runtime")
+                .block_on(selected_item_drop_debits_slot_and_spawns_exact_stack_inner());
+        })
+        .expect("spawn survival lifecycle thread");
+    if let Err(panic) = test.join() {
+        std::panic::resume_unwind(panic);
+    }
+}
+
+async fn selected_item_drop_debits_slot_and_spawns_exact_stack_inner() {
     let data = embedded_play_data();
     let world = embedded_world(&data);
     let item_id = data
@@ -1046,8 +1153,25 @@ async fn drop_one_selected_item_wire(
     dropped_id.expect("selected merge drop entity id")
 }
 
-#[tokio::test]
-async fn nearby_selected_item_drops_merge_and_publish_survivor() {
+#[test]
+fn nearby_selected_item_drops_merge_and_publish_survivor() {
+    let test = std::thread::Builder::new()
+        .name("nearby_selected_item_drops_merge_and_publish_survivor".to_owned())
+        .stack_size(4 * 1024 * 1024)
+        .spawn(|| {
+            tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .expect("build survival lifecycle runtime")
+                .block_on(nearby_selected_item_drops_merge_and_publish_survivor_inner());
+        })
+        .expect("spawn survival lifecycle thread");
+    if let Err(panic) = test.join() {
+        std::panic::resume_unwind(panic);
+    }
+}
+
+async fn nearby_selected_item_drops_merge_and_publish_survivor_inner() {
     let data = embedded_play_data();
     let world = embedded_world(&data);
     let item_id = data
@@ -1175,8 +1299,25 @@ async fn assert_offhand_swap_before_ack(
     }
 }
 
-#[tokio::test]
-async fn offhand_swap_updates_both_slots_and_owner_inventory() {
+#[test]
+fn offhand_swap_updates_both_slots_and_owner_inventory() {
+    let test = std::thread::Builder::new()
+        .name("offhand_swap_updates_both_slots_and_owner_inventory".to_owned())
+        .stack_size(4 * 1024 * 1024)
+        .spawn(|| {
+            tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .expect("build survival lifecycle runtime")
+                .block_on(offhand_swap_updates_both_slots_and_owner_inventory_inner());
+        })
+        .expect("spawn survival lifecycle thread");
+    if let Err(panic) = test.join() {
+        std::panic::resume_unwind(panic);
+    }
+}
+
+async fn offhand_swap_updates_both_slots_and_owner_inventory_inner() {
     let data = embedded_play_data();
     let world = embedded_world(&data);
     let item_id = data
@@ -1230,8 +1371,25 @@ async fn offhand_swap_updates_both_slots_and_owner_inventory() {
         .expect("offhand swap server serve");
 }
 
-#[tokio::test]
-async fn dead_survival_player_cannot_mine_or_eat() {
+#[test]
+fn dead_survival_player_cannot_mine_or_eat() {
+    let test = std::thread::Builder::new()
+        .name("dead_survival_player_cannot_mine_or_eat".to_owned())
+        .stack_size(4 * 1024 * 1024)
+        .spawn(|| {
+            tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .expect("build survival lifecycle runtime")
+                .block_on(dead_survival_player_cannot_mine_or_eat_inner());
+        })
+        .expect("spawn survival lifecycle thread");
+    if let Err(panic) = test.join() {
+        std::panic::resume_unwind(panic);
+    }
+}
+
+async fn dead_survival_player_cannot_mine_or_eat_inner() {
     let manifest = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
     let vanilla_dir = manifest.join("../../data/vanilla");
     let blocks_json = vanilla_dir.join("reports/blocks.json");
@@ -1297,6 +1455,7 @@ async fn dead_survival_player_cannot_mine_or_eat() {
         chunk_pipeline: mc_net::ChunkPipelinePolicy::default(),
         random_tick: mc_net::RandomTickPolicy::default(),
         command_permissions: mc_net::CommandPermissionConfig::new(Vec::<String>::new(), true),
+        loader_manifest: None,
         shutdown: mc_net::ShutdownHandle::default(),
     };
     let bound = mc_net::bind(cfg).await.expect("bind");
@@ -1383,8 +1542,25 @@ async fn dead_survival_player_cannot_mine_or_eat() {
     read_ack_without_food_or_slot_change(&mut client, 73, apple_id).await;
 }
 
-#[tokio::test]
-async fn dead_survival_player_can_respawn_and_act_again() {
+#[test]
+fn dead_survival_player_can_respawn_and_act_again() {
+    let test = std::thread::Builder::new()
+        .name("dead_survival_player_can_respawn_and_act_again".to_owned())
+        .stack_size(4 * 1024 * 1024)
+        .spawn(|| {
+            tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .expect("build survival lifecycle runtime")
+                .block_on(dead_survival_player_can_respawn_and_act_again_inner());
+        })
+        .expect("spawn survival lifecycle thread");
+    if let Err(panic) = test.join() {
+        std::panic::resume_unwind(panic);
+    }
+}
+
+async fn dead_survival_player_can_respawn_and_act_again_inner() {
     let manifest = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
     let vanilla_dir = manifest.join("../../data/vanilla");
     let blocks_json = vanilla_dir.join("reports/blocks.json");
@@ -1439,6 +1615,7 @@ async fn dead_survival_player_can_respawn_and_act_again() {
         chunk_pipeline: mc_net::ChunkPipelinePolicy::default(),
         random_tick: mc_net::RandomTickPolicy::default(),
         command_permissions: mc_net::CommandPermissionConfig::new(Vec::<String>::new(), true),
+        loader_manifest: None,
         shutdown: mc_net::ShutdownHandle::default(),
     };
     let bound = mc_net::bind(cfg).await.expect("bind");
@@ -1637,8 +1814,25 @@ async fn dead_survival_player_can_respawn_and_act_again() {
     }
 }
 
-#[tokio::test]
-async fn respawned_survival_player_rejoins_alive_after_saved_restart() {
+#[test]
+fn respawned_survival_player_rejoins_alive_after_saved_restart() {
+    let test = std::thread::Builder::new()
+        .name("respawned_survival_player_rejoins_alive_after_saved_restart".to_owned())
+        .stack_size(4 * 1024 * 1024)
+        .spawn(|| {
+            tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .expect("build survival lifecycle runtime")
+                .block_on(respawned_survival_player_rejoins_alive_after_saved_restart_inner());
+        })
+        .expect("spawn survival lifecycle thread");
+    if let Err(panic) = test.join() {
+        std::panic::resume_unwind(panic);
+    }
+}
+
+async fn respawned_survival_player_rejoins_alive_after_saved_restart_inner() {
     let data = embedded_play_data();
     let dirt_id = embedded_item_id(&data, "minecraft:dirt");
     let entity_types = mc_data::entity_types::solaris_required_entity_types();

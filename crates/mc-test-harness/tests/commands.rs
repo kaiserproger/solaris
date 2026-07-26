@@ -60,6 +60,7 @@ async fn start_server_with_shutdown_and_chunk_pipeline(
         chunk_pipeline,
         random_tick: mc_net::RandomTickPolicy::default(),
         command_permissions: mc_net::CommandPermissionConfig::new(Vec::<String>::new(), true),
+        loader_manifest: None,
         shutdown,
     };
     let bound = mc_net::bind(cfg).await.expect("bind");
@@ -115,6 +116,7 @@ async fn start_server_with_runtime_control_and_shutdown(
         chunk_pipeline,
         random_tick: mc_net::RandomTickPolicy::default(),
         command_permissions: mc_net::CommandPermissionConfig::new(Vec::<String>::new(), true),
+        loader_manifest: None,
         shutdown,
     };
     let bound = mc_net::bind(cfg).await.expect("bind");
@@ -268,6 +270,7 @@ async fn lua_0_6_player_command_reaches_the_server_chat_adapter() {
         chunk_pipeline: mc_net::ChunkPipelinePolicy::default(),
         random_tick: mc_net::RandomTickPolicy::default(),
         command_permissions: mc_net::CommandPermissionConfig::new(Vec::<String>::new(), false),
+        loader_manifest: None,
         shutdown: shutdown.clone(),
     };
     let bound = mc_net::bind_with_scripts(cfg, boundary)
@@ -481,6 +484,7 @@ async fn lua_gameplay_events_follow_authoritative_commits() {
         chunk_pipeline: mc_net::ChunkPipelinePolicy::default(),
         random_tick: mc_net::RandomTickPolicy::default(),
         command_permissions: mc_net::CommandPermissionConfig::new(Vec::<String>::new(), true),
+        loader_manifest: None,
         shutdown: shutdown.clone(),
     };
     let bound = mc_net::bind_with_scripts(cfg, boundary)
@@ -1436,6 +1440,7 @@ async fn lua_zone_membership_events_reach_only_the_owner_from_normal_player_move
         chunk_pipeline: mc_net::ChunkPipelinePolicy::default(),
         random_tick: mc_net::RandomTickPolicy::default(),
         command_permissions: mc_net::CommandPermissionConfig::new(Vec::<String>::new(), false),
+        loader_manifest: None,
         shutdown: shutdown.clone(),
     };
     let bound = mc_net::bind_with_scripts(cfg, boundary)
@@ -1600,6 +1605,7 @@ async fn lua_colony_upsert_reaches_the_owning_plugin_with_correlated_result() {
         chunk_pipeline: mc_net::ChunkPipelinePolicy::default(),
         random_tick: mc_net::RandomTickPolicy::default(),
         command_permissions: mc_net::CommandPermissionConfig::new(Vec::<String>::new(), false),
+        loader_manifest: None,
         shutdown: shutdown.clone(),
     };
     let bound = mc_net::bind_with_scripts(cfg, boundary)
@@ -1725,6 +1731,7 @@ async fn lua_villager_order_reaches_the_regional_owner_and_returns_targeted_resu
         chunk_pipeline: mc_net::ChunkPipelinePolicy::default(),
         random_tick: mc_net::RandomTickPolicy::default(),
         command_permissions: mc_net::CommandPermissionConfig::new(Vec::<String>::new(), false),
+        loader_manifest: None,
         shutdown: shutdown.clone(),
     };
     let bound = mc_net::bind_with_scripts(cfg, boundary)
@@ -1862,6 +1869,7 @@ async fn lua_inventory_menu_opens_on_the_client_and_routes_click_to_its_owner() 
         chunk_pipeline: mc_net::ChunkPipelinePolicy::default(),
         random_tick: mc_net::RandomTickPolicy::default(),
         command_permissions: mc_net::CommandPermissionConfig::new(Vec::<String>::new(), false),
+        loader_manifest: None,
         shutdown: shutdown.clone(),
     };
     let bound = mc_net::bind_with_scripts(cfg, boundary)
@@ -2140,6 +2148,7 @@ async fn lua_inventory_storage_transaction_commits_and_rejects_stale_storage_ato
         chunk_pipeline: mc_net::ChunkPipelinePolicy::default(),
         random_tick: mc_net::RandomTickPolicy::default(),
         command_permissions: mc_net::CommandPermissionConfig::new(Vec::<String>::new(), true),
+        loader_manifest: None,
         shutdown: shutdown.clone(),
     };
     let bound = mc_net::bind_with_scripts(cfg, boundary)
@@ -2349,6 +2358,7 @@ async fn lua_operator_command_is_hidden_from_non_operators_and_routes_for_operat
         chunk_pipeline: mc_net::ChunkPipelinePolicy::default(),
         random_tick: mc_net::RandomTickPolicy::default(),
         command_permissions: mc_net::CommandPermissionConfig::new(["LuaOperator"], false),
+        loader_manifest: None,
         shutdown: shutdown.clone(),
     };
     let bound = mc_net::bind_with_scripts(cfg, boundary)

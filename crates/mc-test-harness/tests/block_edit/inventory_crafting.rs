@@ -70,6 +70,7 @@ async fn place_recipe_crafts_torch_from_authoritative_inventory() {
         chunk_pipeline: mc_net::ChunkPipelinePolicy::default(),
         random_tick: mc_net::RandomTickPolicy::default(),
         command_permissions: mc_net::CommandPermissionConfig::new(Vec::<String>::new(), true),
+        loader_manifest: None,
         shutdown: mc_net::ShutdownHandle::default(),
     };
     let bound = mc_net::bind(cfg).await.expect("bind");
@@ -238,6 +239,7 @@ async fn place_recipe_crafts_tag_based_planks_sticks_and_table() {
         chunk_pipeline: mc_net::ChunkPipelinePolicy::default(),
         random_tick: mc_net::RandomTickPolicy::default(),
         command_permissions: mc_net::CommandPermissionConfig::new(Vec::<String>::new(), true),
+        loader_manifest: None,
         shutdown: mc_net::ShutdownHandle::default(),
     };
     let bound = mc_net::bind(cfg).await.expect("bind");

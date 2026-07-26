@@ -127,6 +127,7 @@ async fn player_entity_killed_reaches_lua_once_after_the_lethal_melee_commit() {
         chunk_pipeline: mc_net::ChunkPipelinePolicy::default(),
         random_tick: mc_net::RandomTickPolicy::default(),
         command_permissions: mc_net::CommandPermissionConfig::new(Vec::<String>::new(), true),
+        loader_manifest: None,
         shutdown: shutdown.clone(),
     };
     let bound = mc_net::bind_with_scripts(cfg, boundary)

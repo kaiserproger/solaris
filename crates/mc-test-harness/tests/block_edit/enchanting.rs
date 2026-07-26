@@ -1,5 +1,22 @@
-#[tokio::test]
-async fn survival_enchanting_table_applies_high_efficiency_sharpness_and_protection() {
+#[test]
+fn survival_enchanting_table_applies_high_efficiency_sharpness_and_protection() {
+    let test = std::thread::Builder::new()
+        .name("survival_enchanting_table_applies_high_efficiency_sharpness_and_protection".to_owned())
+        .stack_size(4 * 1024 * 1024)
+        .spawn(|| {
+            tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .expect("build enchanting integration runtime")
+                .block_on(survival_enchanting_table_applies_high_efficiency_sharpness_and_protection_inner());
+        })
+        .expect("spawn enchanting integration thread");
+    if let Err(panic) = test.join() {
+        std::panic::resume_unwind(panic);
+    }
+}
+
+async fn survival_enchanting_table_applies_high_efficiency_sharpness_and_protection_inner() {
     let manifest = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
     let vanilla_dir = manifest.join("../../data/vanilla");
     let blocks_json = vanilla_dir.join("reports/blocks.json");
@@ -131,6 +148,7 @@ async fn survival_enchanting_table_applies_high_efficiency_sharpness_and_protect
         chunk_pipeline: mc_net::ChunkPipelinePolicy::default(),
         random_tick: mc_net::RandomTickPolicy::default(),
         command_permissions: mc_net::CommandPermissionConfig::new(Vec::<String>::new(), true),
+        loader_manifest: None,
         shutdown: mc_net::ShutdownHandle::default(),
     };
     let bound = mc_net::bind(cfg).await.expect("bind");

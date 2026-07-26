@@ -118,6 +118,7 @@ async fn survival_campfire_cooks_held_input_into_item_entity() {
         chunk_pipeline: mc_net::ChunkPipelinePolicy::default(),
         random_tick: mc_net::RandomTickPolicy::default(),
         command_permissions: mc_net::CommandPermissionConfig::new(Vec::<String>::new(), true),
+        loader_manifest: None,
         shutdown: mc_net::ShutdownHandle::default(),
     };
     let bound = mc_net::bind(cfg).await.expect("bind");
@@ -336,6 +337,7 @@ async fn survival_unlit_campfire_does_not_finish_cooking() {
         chunk_pipeline: mc_net::ChunkPipelinePolicy::default(),
         random_tick: mc_net::RandomTickPolicy::default(),
         command_permissions: mc_net::CommandPermissionConfig::new(Vec::<String>::new(), true),
+        loader_manifest: None,
         shutdown: mc_net::ShutdownHandle::default(),
     };
     let bound = mc_net::bind(cfg).await.expect("bind");
@@ -557,6 +559,7 @@ async fn survival_campfire_in_flight_state_flushes_to_disk() {
         chunk_pipeline: mc_net::ChunkPipelinePolicy::default(),
         random_tick: mc_net::RandomTickPolicy::default(),
         command_permissions: mc_net::CommandPermissionConfig::new(Vec::<String>::new(), true),
+        loader_manifest: None,
         shutdown: mc_net::ShutdownHandle::default(),
     };
     let bound = mc_net::bind(cfg).await.expect("bind");
@@ -778,6 +781,7 @@ async fn survival_campfire_in_flight_state_resumes_after_reopen() {
         chunk_pipeline: mc_net::ChunkPipelinePolicy::default(),
         random_tick: mc_net::RandomTickPolicy::default(),
         command_permissions: mc_net::CommandPermissionConfig::new(Vec::<String>::new(), true),
+        loader_manifest: None,
         shutdown: first_shutdown.clone(),
     };
     let bound = mc_net::bind(cfg).await.expect("bind first server");
@@ -888,6 +892,7 @@ async fn survival_campfire_in_flight_state_resumes_after_reopen() {
         chunk_pipeline: mc_net::ChunkPipelinePolicy::default(),
         random_tick: mc_net::RandomTickPolicy::default(),
         command_permissions: mc_net::CommandPermissionConfig::new(Vec::<String>::new(), true),
+        loader_manifest: None,
         shutdown: second_shutdown.clone(),
     };
     let bound = mc_net::bind(cfg).await.expect("bind second server");
@@ -1006,6 +1011,7 @@ async fn survival_campfire_finishes_while_no_clients_are_connected() {
         chunk_pipeline: mc_net::ChunkPipelinePolicy::default(),
         random_tick: mc_net::RandomTickPolicy::default(),
         command_permissions: mc_net::CommandPermissionConfig::new(Vec::<String>::new(), true),
+        loader_manifest: None,
         shutdown: shutdown.clone(),
     };
     let bound = mc_net::bind(cfg).await.expect("bind");
@@ -1194,6 +1200,7 @@ async fn survival_campfire_finishes_after_restart_before_any_client_reconnects()
         chunk_pipeline: mc_net::ChunkPipelinePolicy::default(),
         random_tick: mc_net::RandomTickPolicy::default(),
         command_permissions: mc_net::CommandPermissionConfig::new(Vec::<String>::new(), true),
+        loader_manifest: None,
         shutdown: first_shutdown.clone(),
     };
     let bound = mc_net::bind(cfg).await.expect("bind first server");
@@ -1306,6 +1313,7 @@ async fn survival_campfire_finishes_after_restart_before_any_client_reconnects()
         chunk_pipeline: mc_net::ChunkPipelinePolicy::default(),
         random_tick: mc_net::RandomTickPolicy::default(),
         command_permissions: mc_net::CommandPermissionConfig::new(Vec::<String>::new(), true),
+        loader_manifest: None,
         shutdown: second_shutdown.clone(),
     };
     let bound = mc_net::bind(cfg).await.expect("bind second server");

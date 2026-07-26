@@ -78,6 +78,7 @@ impl SessionRegistry {
         let claim = PreparedChunkClaim {
             id: cache.next_prepared_claim,
             revision: cache.prepared_revisions.get(&chunk).copied().unwrap_or(0),
+            owner_session: None,
         };
         cache.prepared_in_flight.insert(chunk, claim);
         PreparedChunkClaimResult::Claimed(claim)

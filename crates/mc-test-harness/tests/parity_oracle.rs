@@ -374,6 +374,7 @@ async fn spawn_solaris() -> Result<(mc_net::BoundServer, std::net::SocketAddr)> 
         },
         random_tick: mc_net::RandomTickPolicy::default(),
         command_permissions: mc_net::CommandPermissionConfig::new(Vec::<String>::new(), true),
+        loader_manifest: None,
         shutdown: mc_net::ShutdownHandle::default(),
     };
     let bound = mc_net::bind(cfg).await?;
@@ -487,6 +488,7 @@ async fn spawn_solaris_with_local_vanilla_data_internal(
         },
         random_tick: mc_net::RandomTickPolicy::default(),
         command_permissions: mc_net::CommandPermissionConfig::new(Vec::<String>::new(), true),
+        loader_manifest: None,
         shutdown: mc_net::ShutdownHandle::default(),
     };
     let bound = mc_net::bind(cfg).await?;

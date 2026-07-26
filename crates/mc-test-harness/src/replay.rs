@@ -1622,24 +1622,6 @@ fn validate_identifier(label: &str, value: &str) -> Result<()> {
     Ok(())
 }
 
-fn validate_ledger_row(value: &str) -> Result<()> {
-    ensure!(!value.is_empty(), "ledger row is empty");
-    ensure!(value.len() <= 32, "ledger row is longer than 32 bytes: {value}");
-    let mut bytes = value.bytes();
-    let first = bytes.next().expect("non-empty ledger row");
-    ensure!(
-        first.is_ascii_uppercase(),
-        "ledger row must start with uppercase ASCII: {value}"
-    );
-    ensure!(
-        bytes.all(|byte| {
-            byte.is_ascii_uppercase() || byte.is_ascii_digit() || byte == b'-' || byte == b'_'
-        }),
-        "ledger row contains unsupported characters: {value}"
-    );
-    Ok(())
-}
-
 fn validate_non_empty(label: &str, value: &str) -> Result<()> {
     ensure!(!value.trim().is_empty(), "{label} is empty");
     ensure!(value.len() <= 1024, "{label} is longer than 1024 bytes");
@@ -2456,7 +2438,11 @@ mod tests {
     fn scenario_rejects_compact_manifest_with_row_leg_count_mismatch() {
         let mut value = scenario_json();
         value["ledger_rows"] = json!(["Q1", "Q2"]);
-        value["evidence_legs"] = json!(["protocol-session", "oracle-comparison", "real-client-observation"]);
+        value["evidence_legs"] = json!([
+            "protocol-session",
+            "oracle-comparison",
+            "real-client-observation"
+        ]);
         assert!(
             ReplayScenarioManifest::from_json(&value.to_string()).is_err(),
             "scenario row and evidence leg counts must match"
@@ -2467,8 +2453,11 @@ mod tests {
     fn scenario_accepts_compact_manifest_with_rows_and_legs() {
         let mut value = scenario_json();
         value["ledger_rows"] = json!(["Q1", "Q2", "Q3"]);
-        value["evidence_legs"] =
-            json!(["protocol-session", "oracle-comparison", "real-client-observation"]);
+        value["evidence_legs"] = json!([
+            "protocol-session",
+            "oracle-comparison",
+            "real-client-observation"
+        ]);
 
         ReplayScenarioManifest::from_json(&value.to_string())
             .expect("compact scenario with compact ledger/evidence manifest");

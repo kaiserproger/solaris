@@ -69,6 +69,7 @@ async fn lua_timer_is_pushed_by_simulation_ticks_without_tick_subscription() {
         chunk_pipeline: mc_net::ChunkPipelinePolicy::default(),
         random_tick: mc_net::RandomTickPolicy::default(),
         command_permissions: mc_net::CommandPermissionConfig::new(Vec::<String>::new(), false),
+        loader_manifest: None,
         shutdown: shutdown.clone(),
     };
     let bound = mc_net::bind_with_scripts(config, boundary)

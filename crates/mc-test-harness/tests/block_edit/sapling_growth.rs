@@ -73,6 +73,7 @@ async fn survival_bonemeal_grows_oak_sapling_into_tree() {
             ..mc_net::RandomTickPolicy::default()
         },
         command_permissions: mc_net::CommandPermissionConfig::new(Vec::<String>::new(), true),
+        loader_manifest: None,
         shutdown: mc_net::ShutdownHandle::default(),
     };
     let bound = mc_net::bind(cfg).await.expect("bind");
@@ -248,6 +249,7 @@ async fn survival_bonemeal_stage_one_oak_replaces_existing_canopy_leaf() {
             ..mc_net::RandomTickPolicy::default()
         },
         command_permissions: mc_net::CommandPermissionConfig::new(Vec::<String>::new(), true),
+        loader_manifest: None,
         shutdown: mc_net::ShutdownHandle::default(),
     };
     let bound = mc_net::bind(cfg).await.expect("bind");
@@ -393,6 +395,7 @@ async fn survival_bonemeal_does_not_consume_on_single_dark_oak() {
             ..mc_net::RandomTickPolicy::default()
         },
         command_permissions: mc_net::CommandPermissionConfig::new(Vec::<String>::new(), true),
+        loader_manifest: None,
         shutdown: mc_net::ShutdownHandle::default(),
     };
     let bound = mc_net::bind(cfg).await.expect("bind");
@@ -850,6 +853,7 @@ async fn start_mega_sapling_wire_fixture(
             ..mc_net::RandomTickPolicy::default()
         },
         command_permissions: mc_net::CommandPermissionConfig::new(Vec::<String>::new(), true),
+        loader_manifest: None,
         shutdown: mc_net::ShutdownHandle::default(),
     };
     let bound = mc_net::bind(cfg).await.expect("bind");

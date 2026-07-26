@@ -370,7 +370,7 @@ fn core_replay_real_client_prepare_copies_canonical_manifest() {
 fn core_replay_core_gate_manifest_supports_compact_ledger_rows_and_evidence_legs() {
     let repo_root = repo_root();
     let core_manifest = repo_root.join("tools/core-replay-scenarios/core-actions-seed-81.json");
-    let mut scenario: Value = serde_json::from_slice(
+    let scenario: Value = serde_json::from_slice(
         &std::fs::read(&core_manifest).expect("read core replay scenario manifest"),
     )
     .expect("core replay scenario manifest parses");
@@ -392,7 +392,11 @@ fn core_replay_core_gate_manifest_supports_compact_ledger_rows_and_evidence_legs
         ReplayScenarioManifest::from_json(&bad.to_string()).is_err(),
         "compact rows and evidence legs mismatch must fail"
     );
-    assert!(compact["id"].as_str().is_some_and(|id| id == "core-actions-seed-81"));
+    assert!(
+        compact["id"]
+            .as_str()
+            .is_some_and(|id| id == "core-actions-seed-81")
+    );
 }
 
 #[test]

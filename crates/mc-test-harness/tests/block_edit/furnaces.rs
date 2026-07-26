@@ -1,5 +1,22 @@
-#[tokio::test]
-async fn two_clients_stale_furnace_click_after_peer_update_resyncs() {
+#[test]
+fn two_clients_stale_furnace_click_after_peer_update_resyncs() {
+    let test = std::thread::Builder::new()
+        .name("two_clients_stale_furnace_click_after_peer_update_resyncs".to_owned())
+        .stack_size(4 * 1024 * 1024)
+        .spawn(|| {
+            tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .expect("build furnace integration runtime")
+                .block_on(two_clients_stale_furnace_click_after_peer_update_resyncs_inner());
+        })
+        .expect("spawn furnace integration thread");
+    if let Err(panic) = test.join() {
+        std::panic::resume_unwind(panic);
+    }
+}
+
+async fn two_clients_stale_furnace_click_after_peer_update_resyncs_inner() {
     let manifest = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
     let vanilla_dir = manifest.join("../../data/vanilla");
     let blocks_json = vanilla_dir.join("reports/blocks.json");
@@ -76,6 +93,7 @@ async fn two_clients_stale_furnace_click_after_peer_update_resyncs() {
         chunk_pipeline: mc_net::ChunkPipelinePolicy::default(),
         random_tick: mc_net::RandomTickPolicy::default(),
         command_permissions: mc_net::CommandPermissionConfig::new(Vec::<String>::new(), true),
+        loader_manifest: None,
         shutdown: mc_net::ShutdownHandle::default(),
     };
     let bound = mc_net::bind(cfg).await.expect("bind");
@@ -205,8 +223,25 @@ async fn two_clients_stale_furnace_click_after_peer_update_resyncs() {
     assert!(resync.carried_item.is_empty());
 }
 
-#[tokio::test]
-async fn malformed_furnace_clicks_resync_without_trusting_client_slots() {
+#[test]
+fn malformed_furnace_clicks_resync_without_trusting_client_slots() {
+    let test = std::thread::Builder::new()
+        .name("malformed_furnace_clicks_resync_without_trusting_client_slots".to_owned())
+        .stack_size(4 * 1024 * 1024)
+        .spawn(|| {
+            tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .expect("build furnace integration runtime")
+                .block_on(malformed_furnace_clicks_resync_without_trusting_client_slots_inner());
+        })
+        .expect("spawn furnace integration thread");
+    if let Err(panic) = test.join() {
+        std::panic::resume_unwind(panic);
+    }
+}
+
+async fn malformed_furnace_clicks_resync_without_trusting_client_slots_inner() {
     let manifest = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
     let vanilla_dir = manifest.join("../../data/vanilla");
     let blocks_json = vanilla_dir.join("reports/blocks.json");
@@ -293,6 +328,7 @@ async fn malformed_furnace_clicks_resync_without_trusting_client_slots() {
         chunk_pipeline: mc_net::ChunkPipelinePolicy::default(),
         random_tick: mc_net::RandomTickPolicy::default(),
         command_permissions: mc_net::CommandPermissionConfig::new(Vec::<String>::new(), true),
+        loader_manifest: None,
         shutdown: mc_net::ShutdownHandle::default(),
     };
     let bound = mc_net::bind(cfg).await.expect("bind");
@@ -393,8 +429,25 @@ async fn malformed_furnace_clicks_resync_without_trusting_client_slots() {
     );
 }
 
-#[tokio::test]
-async fn survival_furnace_container_smelts_input_with_fuel() {
+#[test]
+fn survival_furnace_container_smelts_input_with_fuel() {
+    let test = std::thread::Builder::new()
+        .name("survival_furnace_container_smelts_input_with_fuel".to_owned())
+        .stack_size(4 * 1024 * 1024)
+        .spawn(|| {
+            tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .expect("build furnace integration runtime")
+                .block_on(survival_furnace_container_smelts_input_with_fuel_inner());
+        })
+        .expect("spawn furnace integration thread");
+    if let Err(panic) = test.join() {
+        std::panic::resume_unwind(panic);
+    }
+}
+
+async fn survival_furnace_container_smelts_input_with_fuel_inner() {
     let manifest = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
     let vanilla_dir = manifest.join("../../data/vanilla");
     let blocks_json = vanilla_dir.join("reports/blocks.json");
@@ -494,6 +547,7 @@ async fn survival_furnace_container_smelts_input_with_fuel() {
         chunk_pipeline: mc_net::ChunkPipelinePolicy::default(),
         random_tick: mc_net::RandomTickPolicy::default(),
         command_permissions: mc_net::CommandPermissionConfig::new(Vec::<String>::new(), true),
+        loader_manifest: None,
         shutdown: mc_net::ShutdownHandle::default(),
     };
     let bound = mc_net::bind(cfg).await.expect("bind");
@@ -755,8 +809,25 @@ async fn survival_furnace_container_smelts_input_with_fuel() {
     }
 }
 
-#[tokio::test]
-async fn survival_specialized_furnaces_open_vanilla_menu_types() {
+#[test]
+fn survival_specialized_furnaces_open_vanilla_menu_types() {
+    let test = std::thread::Builder::new()
+        .name("survival_specialized_furnaces_open_vanilla_menu_types".to_owned())
+        .stack_size(4 * 1024 * 1024)
+        .spawn(|| {
+            tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .expect("build furnace integration runtime")
+                .block_on(survival_specialized_furnaces_open_vanilla_menu_types_inner());
+        })
+        .expect("spawn furnace integration thread");
+    if let Err(panic) = test.join() {
+        std::panic::resume_unwind(panic);
+    }
+}
+
+async fn survival_specialized_furnaces_open_vanilla_menu_types_inner() {
     let manifest = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
     let vanilla_dir = manifest.join("../../data/vanilla");
     let blocks_json = vanilla_dir.join("reports/blocks.json");
@@ -854,6 +925,7 @@ async fn survival_specialized_furnaces_open_vanilla_menu_types() {
         chunk_pipeline: mc_net::ChunkPipelinePolicy::default(),
         random_tick: mc_net::RandomTickPolicy::default(),
         command_permissions: mc_net::CommandPermissionConfig::new(Vec::<String>::new(), true),
+        loader_manifest: None,
         shutdown: mc_net::ShutdownHandle::default(),
     };
     let bound = mc_net::bind(cfg).await.expect("bind");

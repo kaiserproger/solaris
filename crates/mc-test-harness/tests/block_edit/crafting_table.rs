@@ -1,5 +1,22 @@
-#[tokio::test]
-async fn crafting_table_container_crafts_shapeless_and_shaped_results() {
+#[test]
+fn crafting_table_container_crafts_shapeless_and_shaped_results() {
+    let test = std::thread::Builder::new()
+        .name("crafting_table_container_crafts_shapeless_and_shaped_results".to_owned())
+        .stack_size(4 * 1024 * 1024)
+        .spawn(|| {
+            tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .expect("build crafting table container runtime")
+                .block_on(crafting_table_container_crafts_shapeless_and_shaped_results_inner());
+        })
+        .expect("spawn crafting table container runtime");
+    if let Err(panic) = test.join() {
+        std::panic::resume_unwind(panic);
+    }
+}
+
+async fn crafting_table_container_crafts_shapeless_and_shaped_results_inner() {
     let manifest = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
     let vanilla_dir = manifest.join("../../data/vanilla");
     let blocks_json = vanilla_dir.join("reports/blocks.json");
@@ -97,6 +114,7 @@ async fn crafting_table_container_crafts_shapeless_and_shaped_results() {
         chunk_pipeline: mc_net::ChunkPipelinePolicy::default(),
         random_tick: mc_net::RandomTickPolicy::default(),
         command_permissions: mc_net::CommandPermissionConfig::new(Vec::<String>::new(), true),
+        loader_manifest: None,
         shutdown: mc_net::ShutdownHandle::default(),
     };
     let bound = mc_net::bind(cfg).await.expect("bind");
@@ -306,8 +324,25 @@ async fn crafting_table_container_crafts_shapeless_and_shaped_results() {
     .await;
 }
 
-#[tokio::test]
-async fn crafting_table_shift_click_max_crafts_every_matching_input() {
+#[test]
+fn crafting_table_shift_click_max_crafts_every_matching_input() {
+    let test = std::thread::Builder::new()
+        .name("crafting_table_shift_click_max_crafts_every_matching_input".to_owned())
+        .stack_size(4 * 1024 * 1024)
+        .spawn(|| {
+            tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .expect("build crafting table max-craft runtime")
+                .block_on(crafting_table_shift_click_max_crafts_every_matching_input_inner());
+        })
+        .expect("spawn crafting table max-craft runtime");
+    if let Err(panic) = test.join() {
+        std::panic::resume_unwind(panic);
+    }
+}
+
+async fn crafting_table_shift_click_max_crafts_every_matching_input_inner() {
     let data = embedded_play_data();
     let air_state = embedded_block_state(&data, "minecraft:air");
     let crafting_table_state = embedded_block_state(&data, "minecraft:crafting_table");

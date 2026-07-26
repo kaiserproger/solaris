@@ -151,6 +151,7 @@ async fn place_dirt_persists_through_flush_to_disk_inner() {
         chunk_pipeline: mc_net::ChunkPipelinePolicy::default(),
         random_tick: mc_net::RandomTickPolicy::default(),
         command_permissions: mc_net::CommandPermissionConfig::new(Vec::<String>::new(), true),
+        loader_manifest: None,
         shutdown: shutdown.clone(),
     };
     let bound = mc_net::bind(cfg).await.expect("bind");
@@ -463,6 +464,7 @@ async fn item_despawn_deadline_survives_restart_inner() {
             ..mc_net::RandomTickPolicy::default()
         },
         command_permissions: mc_net::CommandPermissionConfig::new(Vec::<String>::new(), true),
+        loader_manifest: None,
         shutdown: first_shutdown.clone(),
     };
     let first_bound = mc_net::bind(first_cfg)
@@ -560,6 +562,7 @@ async fn item_despawn_deadline_survives_restart_inner() {
             ..mc_net::RandomTickPolicy::default()
         },
         command_permissions: mc_net::CommandPermissionConfig::new(Vec::<String>::new(), true),
+        loader_manifest: None,
         shutdown: second_shutdown.clone(),
     };
     let second_bound = mc_net::bind(second_cfg)

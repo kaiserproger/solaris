@@ -23,6 +23,28 @@ cargo build
 Use debug builds for development; release builds are reserved for CI/owner-run
 checks.
 
+## Install a tagged Linux build
+
+Tagged releases publish SHA-256-verified server archives for Linux x86_64 and
+AArch64. Solaris is still stabilization-alpha, so treat installed binaries as
+test builds rather than replacement-ready production releases.
+
+```sh
+curl -fsSL https://raw.githubusercontent.com/kaiserproger/solaris/main/install.sh | bash
+```
+
+The installer writes `solaris` to `$HOME/.local/bin` for a regular user and to
+`/usr/local/bin` when run as root. Override the destination or pin a release:
+
+```sh
+curl -fsSL https://raw.githubusercontent.com/kaiserproger/solaris/main/install.sh | \
+  SOLARIS_INSTALL_DIR="$HOME/bin" SOLARIS_VERSION="v0.1.0" bash
+```
+
+The script downloads the matching GitHub release archive, verifies its published
+SHA-256 checksum before extraction, rejects unsafe archive paths, and only then
+replaces the destination binary.
+
 ## Runtime Data
 
 Solaris ships its required registry/data baseline as repo-owned JSON assets

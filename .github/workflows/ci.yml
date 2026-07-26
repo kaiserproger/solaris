@@ -4,10 +4,15 @@ on:
   pull_request:
   push:
     branches: [main]
+    tags: ["v*"]
+  workflow_dispatch:
 
 env:
   CARGO_TERM_COLOR: always
   RUSTFLAGS: "-D warnings"
+
+permissions:
+  contents: read
 
 jobs:
   fmt:
@@ -56,4 +61,114 @@ jobs:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@1.94
       - uses: Swatinem/rust-cache@v2
-      - run: cargo build --release --workspace
+      - run: cargo build --locked --release --workspace
+
+  loader:
+    name: Loader modules
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "25"
+          cache: gradle
+      - name: Verify reproducible Loader fixture
+        run: tools/build-loader-live-gate-fixture.sh --check
+      - name: Test shared and platform Loader modules
+        working-directory: client-mod/solaris-client-agent
+        run: >-
+          ./gradlew
+          :loader-core:test
+          :loader-fabric:test
+          :loader-neoforge:test
+          :loader-forge:test
+          --no-daemon
+
+  release-tools:
+    name: Release tools
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - name: Validate installer
+        run: tools/test-install.sh
+
+  release-build:
+    name: Release binary (${{ matrix.target }})
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: [fmt, clippy, code-health, test, build, loader, release-tools]
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: ubuntu-24.04
+            target: x86_64-unknown-linux-gnu
+          - runner: ubuntu-24.04-arm
+            target: aarch64-unknown-linux-gnu
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@1.94
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: release-${{ matrix.target }}
+      - name: Build server binary
+        env:
+          TARGET: ${{ matrix.target }}
+        run: cargo build --locked --release -p mc-server --bin mc-server --target "$TARGET"
+      - name: Package release asset
+        env:
+          TARGET: ${{ matrix.target }}
+        run: |
+          set -euo pipefail
+          asset="solaris-${TARGET}.tar.gz"
+          package_dir="dist/package-${TARGET}"
+          mkdir -p "$package_dir"
+          install -m 0755 "target/${TARGET}/release/mc-server" "$package_dir/solaris"
+          install -m 0644 README.md LICENSE-APACHE LICENSE-MIT "$package_dir/"
+          printf '%s\n' "$GITHUB_REF_NAME" > "$package_dir/VERSION"
+          tar -C "$package_dir" -czf "dist/${asset}" \
+            solaris README.md LICENSE-APACHE LICENSE-MIT VERSION
+          (
+            cd dist
+            sha256sum "$asset" > "${asset}.sha256"
+          )
+      - uses: actions/upload-artifact@v4
+        with:
+          name: solaris-${{ matrix.target }}
+          path: |
+            dist/solaris-${{ matrix.target }}.tar.gz
+            dist/solaris-${{ matrix.target }}.tar.gz.sha256
+          if-no-files-found: error
+          retention-days: 7
+
+  release:
+    name: Publish GitHub release
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: [release-build]
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: solaris-*
+          path: dist
+          merge-multiple: true
+      - name: Create release and upload binaries
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ github.ref_name }}
+        run: |
+          set -euo pipefail
+          gh release view "$TAG" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1 || \
+            gh release create "$TAG" \
+              --repo "$GITHUB_REPOSITORY" \
+              --verify-tag \
+              --generate-notes \
+              --title "Solaris ${TAG}"
+          gh release upload "$TAG" \
+            --repo "$GITHUB_REPOSITORY" \
+            --clobber \
+            dist/*.tar.gz \
+            dist/*.tar.gz.sha256

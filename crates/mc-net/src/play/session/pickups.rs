@@ -813,7 +813,8 @@ fn item_stack_probe(stack: &EntityItemStack) -> ItemStack {
         count: stack.count,
         damage: stack.damage,
         enchantments: stack.enchantments.clone(),
-        custom_name: None,
+        custom_name: stack.custom_name.as_deref().cloned(),
+        item_model: stack.item_model.as_deref().cloned().map(Arc::new),
     }
 }
 

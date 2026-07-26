@@ -23,6 +23,13 @@ pub enum ConnectionError {
     #[error("peer disconnected mid-packet")]
     Eof,
 
+    /// A peer kept extending one incomplete inbound frame beyond the
+    /// serverbound buffering budget. This is deliberately lower than the
+    /// protocol's clientbound frame ceiling because Solaris accepts no
+    /// serverbound packet remotely close to that size.
+    #[error("inbound packet buffer exceeded {max} bytes")]
+    InboundBufferLimitExceeded { max: usize },
+
     /// The peer sent a packet whose ID is not the one expected in the
     /// current state. We use this both during the handshake (where we
     /// expect exactly one packet, of one ID) and inside each state for

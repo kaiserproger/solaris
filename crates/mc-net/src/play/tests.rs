@@ -8896,7 +8896,7 @@ async fn two_client_door_and_trapdoor_toggles_converge_and_reject_stale_retry() 
         }]
     );
     let mut wire = Vec::new();
-    send_block_deltas(&mut wire, Compression::Disabled, &door_deltas)
+    send_block_deltas(&mut wire, Compression::Disabled, &door_deltas, None)
         .await
         .expect("encode observer door deltas");
     let mut frames = bytes::BytesMut::from(wire.as_slice());
@@ -8959,7 +8959,7 @@ async fn two_client_door_and_trapdoor_toggles_converge_and_reject_stale_retry() 
         }]
     );
     let mut wire = Vec::new();
-    send_block_deltas(&mut wire, Compression::Disabled, &trapdoor_deltas)
+    send_block_deltas(&mut wire, Compression::Disabled, &trapdoor_deltas, None)
         .await
         .expect("encode actor trapdoor delta");
     let mut frames = bytes::BytesMut::from(wire.as_slice());

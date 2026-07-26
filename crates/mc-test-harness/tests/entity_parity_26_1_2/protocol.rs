@@ -280,6 +280,15 @@ fn normalize_metadata_value(value: EntityDataValue, aliases: &EntityAliases) -> 
                 |state| format!("block-state:{}", state.raw()),
             ),
         },
+        EntityDataValue::VillagerData {
+            index,
+            villager_type,
+            profession,
+            level,
+        } => MetadataEntry {
+            index,
+            value: format!("villager-data:{villager_type}:{profession}:{level}"),
+        },
         EntityDataValue::OptionalUnsignedInt { index, value } => MetadataEntry {
             index,
             value: value.map_or_else(

@@ -91,8 +91,25 @@ fn seed_zero_playable_ruin_is_deterministic_and_contains_fixed_loot() {
     assert!(unrelated.chests.is_empty());
 }
 
-#[tokio::test]
-async fn fresh_seed_server_spawn_is_dry_with_clear_body_space() {
+#[test]
+fn fresh_seed_server_spawn_is_dry_with_clear_body_space() {
+    let test = std::thread::Builder::new()
+        .name("fresh_seed_server_spawn_is_dry_with_clear_body_space".to_owned())
+        .stack_size(4 * 1024 * 1024)
+        .spawn(|| {
+            tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .expect("build worldgen integration runtime")
+                .block_on(fresh_seed_server_spawn_is_dry_with_clear_body_space_inner());
+        })
+        .expect("spawn worldgen integration thread");
+    if let Err(panic) = test.join() {
+        std::panic::resume_unwind(panic);
+    }
+}
+
+async fn fresh_seed_server_spawn_is_dry_with_clear_body_space_inner() {
     let report = mc_data::blocks::solaris_required_blocks_report();
     let blocks = Arc::new(mc_world::BlockRegistry::from_report(&report).expect("block registry"));
     let items = Arc::new(mc_data::items::solaris_required_items());
@@ -134,6 +151,7 @@ async fn fresh_seed_server_spawn_is_dry_with_clear_body_space() {
             chunk_pipeline: mc_net::ChunkPipelinePolicy::default(),
             random_tick: mc_net::RandomTickPolicy::default(),
             command_permissions: mc_net::CommandPermissionConfig::new(Vec::<String>::new(), true),
+            loader_manifest: None,
             shutdown: shutdown.clone(),
         };
         let bound = mc_net::bind(config).await.expect("bind fresh seed server");
@@ -225,8 +243,25 @@ fn is_spawn_hazard(path: &str) -> bool {
     )
 }
 
-#[tokio::test]
-async fn generated_playable_ruin_chest_loot_moves_to_inventory_and_survives_restart() {
+#[test]
+fn generated_playable_ruin_chest_loot_moves_to_inventory_and_survives_restart() {
+    let test = std::thread::Builder::new()
+        .name("generated_playable_ruin_chest_loot_moves_to_inventory_and_survives_restart".to_owned())
+        .stack_size(4 * 1024 * 1024)
+        .spawn(|| {
+            tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .expect("build worldgen integration runtime")
+                .block_on(generated_playable_ruin_chest_loot_moves_to_inventory_and_survives_restart_inner());
+        })
+        .expect("spawn worldgen integration thread");
+    if let Err(panic) = test.join() {
+        std::panic::resume_unwind(panic);
+    }
+}
+
+async fn generated_playable_ruin_chest_loot_moves_to_inventory_and_survives_restart_inner() {
     let report = mc_data::blocks::solaris_required_blocks_report();
     let blocks = Arc::new(mc_world::BlockRegistry::from_report(&report).expect("block registry"));
     let items = Arc::new(mc_data::items::solaris_required_items());
@@ -390,6 +425,7 @@ fn ruin_server_config(
         chunk_pipeline: mc_net::ChunkPipelinePolicy::default(),
         random_tick: mc_net::RandomTickPolicy::default(),
         command_permissions: mc_net::CommandPermissionConfig::new(Vec::<String>::new(), true),
+        loader_manifest: None,
         shutdown,
     }
 }
@@ -640,8 +676,25 @@ fn system_chat_text(packet: &ClientboundSystemChat) -> String {
         .expect("system chat component text")
 }
 
-#[tokio::test]
-async fn empty_world_plus_generator_produces_terrain_on_demand() {
+#[test]
+fn empty_world_plus_generator_produces_terrain_on_demand() {
+    let test = std::thread::Builder::new()
+        .name("empty_world_plus_generator_produces_terrain_on_demand".to_owned())
+        .stack_size(4 * 1024 * 1024)
+        .spawn(|| {
+            tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .expect("build worldgen integration runtime")
+                .block_on(empty_world_plus_generator_produces_terrain_on_demand_inner());
+        })
+        .expect("spawn worldgen integration thread");
+    if let Err(panic) = test.join() {
+        std::panic::resume_unwind(panic);
+    }
+}
+
+async fn empty_world_plus_generator_produces_terrain_on_demand_inner() {
     let manifest = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
     let vanilla_dir = manifest.join("../../data/vanilla");
     let blocks_json = vanilla_dir.join("reports/blocks.json");

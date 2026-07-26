@@ -105,7 +105,7 @@
         "L2"
       ],
       "status": "manual-pending",
-      "no_debug_commands": true,
+      "no_debug_commands": false,
       "bounded_time_minutes": 18,
       "screenshots_required": true,
       "steps": [

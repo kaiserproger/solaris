@@ -102,6 +102,7 @@ async fn water_bucket_spread_waits_for_scheduled_fluid_delay() {
             ..mc_net::RandomTickPolicy::default()
         },
         command_permissions: mc_net::CommandPermissionConfig::new(Vec::<String>::new(), true),
+        loader_manifest: None,
         shutdown: mc_net::ShutdownHandle::default(),
     };
     let bound = mc_net::bind(cfg).await.expect("bind");
@@ -303,6 +304,7 @@ async fn lava_bucket_next_to_water_solidifies_through_scheduled_fluid_tick() {
             ..mc_net::RandomTickPolicy::default()
         },
         command_permissions: mc_net::CommandPermissionConfig::new(Vec::<String>::new(), true),
+        loader_manifest: None,
         shutdown: mc_net::ShutdownHandle::default(),
     };
     let bound = mc_net::bind(cfg).await.expect("bind");
@@ -467,6 +469,7 @@ async fn water_bucket_scheduled_spread_survives_save_restart_without_duplicate_t
             ..mc_net::RandomTickPolicy::default()
         },
         command_permissions: mc_net::CommandPermissionConfig::new(Vec::<String>::new(), true),
+        loader_manifest: None,
         shutdown: first_shutdown.clone(),
     };
     let first_bound = mc_net::bind(first_cfg)
@@ -593,6 +596,7 @@ async fn water_bucket_scheduled_spread_survives_save_restart_without_duplicate_t
             ..mc_net::RandomTickPolicy::default()
         },
         command_permissions: mc_net::CommandPermissionConfig::new(Vec::<String>::new(), true),
+        loader_manifest: None,
         shutdown: second_shutdown.clone(),
     };
     let second_bound = mc_net::bind(second_cfg)

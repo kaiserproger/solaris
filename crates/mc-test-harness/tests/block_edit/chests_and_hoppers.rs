@@ -1,5 +1,22 @@
-#[tokio::test]
-async fn two_clients_stale_chest_click_after_peer_update_resyncs() {
+#[test]
+fn two_clients_stale_chest_click_after_peer_update_resyncs() {
+    let test = std::thread::Builder::new()
+        .name("two_clients_stale_chest_click_after_peer_update_resyncs".to_owned())
+        .stack_size(4 * 1024 * 1024)
+        .spawn(|| {
+            tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .expect("build chest integration runtime")
+                .block_on(two_clients_stale_chest_click_after_peer_update_resyncs_inner());
+        })
+        .expect("spawn chest integration thread");
+    if let Err(panic) = test.join() {
+        std::panic::resume_unwind(panic);
+    }
+}
+
+async fn two_clients_stale_chest_click_after_peer_update_resyncs_inner() {
     let manifest = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
     let vanilla_dir = manifest.join("../../data/vanilla");
     let blocks_json = vanilla_dir.join("reports/blocks.json");
@@ -70,6 +87,7 @@ async fn two_clients_stale_chest_click_after_peer_update_resyncs() {
         chunk_pipeline: mc_net::ChunkPipelinePolicy::default(),
         random_tick: mc_net::RandomTickPolicy::default(),
         command_permissions: mc_net::CommandPermissionConfig::new(Vec::<String>::new(), true),
+        loader_manifest: None,
         shutdown: mc_net::ShutdownHandle::default(),
     };
     let bound = mc_net::bind(cfg).await.expect("bind");
@@ -197,8 +215,25 @@ async fn two_clients_stale_chest_click_after_peer_update_resyncs() {
     assert!(resync.carried_item.is_empty());
 }
 
-#[tokio::test]
-async fn server_origin_hopper_tick_updates_open_chests_and_comparator_over_tcp() {
+#[test]
+fn server_origin_hopper_tick_updates_open_chests_and_comparator_over_tcp() {
+    let test = std::thread::Builder::new()
+        .name("server_origin_hopper_tick_updates_open_chests_and_comparator_over_tcp".to_owned())
+        .stack_size(4 * 1024 * 1024)
+        .spawn(|| {
+            tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .expect("build chest integration runtime")
+                .block_on(server_origin_hopper_tick_updates_open_chests_and_comparator_over_tcp_inner());
+        })
+        .expect("spawn chest integration thread");
+    if let Err(panic) = test.join() {
+        std::panic::resume_unwind(panic);
+    }
+}
+
+async fn server_origin_hopper_tick_updates_open_chests_and_comparator_over_tcp_inner() {
     let manifest = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
     let vanilla_dir = manifest.join("../../data/vanilla");
     let blocks_json = vanilla_dir.join("reports/blocks.json");
@@ -336,6 +371,7 @@ async fn server_origin_hopper_tick_updates_open_chests_and_comparator_over_tcp()
         chunk_pipeline: mc_net::ChunkPipelinePolicy::default(),
         random_tick: mc_net::RandomTickPolicy::default(),
         command_permissions: mc_net::CommandPermissionConfig::new(Vec::<String>::new(), true),
+        loader_manifest: None,
         shutdown: mc_net::ShutdownHandle::default(),
     };
     let bound = mc_net::bind(cfg).await.expect("bind");
@@ -463,8 +499,25 @@ async fn server_origin_hopper_tick_updates_open_chests_and_comparator_over_tcp()
     .await;
 }
 
-#[tokio::test]
-async fn chest_quickcraft_left_drag_splits_carried_stack_across_empty_slots() {
+#[test]
+fn chest_quickcraft_left_drag_splits_carried_stack_across_empty_slots() {
+    let test = std::thread::Builder::new()
+        .name("chest_quickcraft_left_drag_splits_carried_stack_across_empty_slots".to_owned())
+        .stack_size(4 * 1024 * 1024)
+        .spawn(|| {
+            tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .expect("build chest QuickCraft test runtime")
+                .block_on(chest_quickcraft_left_drag_splits_carried_stack_across_empty_slots_inner());
+        })
+        .expect("spawn chest QuickCraft test thread");
+    if let Err(panic) = test.join() {
+        std::panic::resume_unwind(panic);
+    }
+}
+
+async fn chest_quickcraft_left_drag_splits_carried_stack_across_empty_slots_inner() {
     let manifest = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
     let vanilla_dir = manifest.join("../../data/vanilla");
     let blocks_json = vanilla_dir.join("reports/blocks.json");
@@ -542,6 +595,7 @@ async fn chest_quickcraft_left_drag_splits_carried_stack_across_empty_slots() {
         chunk_pipeline: mc_net::ChunkPipelinePolicy::default(),
         random_tick: mc_net::RandomTickPolicy::default(),
         command_permissions: mc_net::CommandPermissionConfig::new(Vec::<String>::new(), true),
+        loader_manifest: None,
         shutdown: mc_net::ShutdownHandle::default(),
     };
     let bound = mc_net::bind(cfg).await.expect("bind");
@@ -687,8 +741,25 @@ async fn chest_quickcraft_left_drag_splits_carried_stack_across_empty_slots() {
     );
 }
 
-#[tokio::test]
-async fn chest_quickcraft_right_drag_places_one_per_selected_slot_and_merges_partial_stack() {
+#[test]
+fn chest_quickcraft_right_drag_places_one_per_selected_slot_and_merges_partial_stack() {
+    let test = std::thread::Builder::new()
+        .name("chest_quickcraft_right_drag_places_one_per_selected_slot_and_merges_partial_stack".to_owned())
+        .stack_size(4 * 1024 * 1024)
+        .spawn(|| {
+            tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .expect("build chest QuickCraft test runtime")
+                .block_on(chest_quickcraft_right_drag_places_one_per_selected_slot_and_merges_partial_stack_inner());
+        })
+        .expect("spawn chest QuickCraft test thread");
+    if let Err(panic) = test.join() {
+        std::panic::resume_unwind(panic);
+    }
+}
+
+async fn chest_quickcraft_right_drag_places_one_per_selected_slot_and_merges_partial_stack_inner() {
     let manifest = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
     let vanilla_dir = manifest.join("../../data/vanilla");
     let blocks_json = vanilla_dir.join("reports/blocks.json");
@@ -772,6 +843,7 @@ async fn chest_quickcraft_right_drag_places_one_per_selected_slot_and_merges_par
         chunk_pipeline: mc_net::ChunkPipelinePolicy::default(),
         random_tick: mc_net::RandomTickPolicy::default(),
         command_permissions: mc_net::CommandPermissionConfig::new(Vec::<String>::new(), true),
+        loader_manifest: None,
         shutdown: mc_net::ShutdownHandle::default(),
     };
     let bound = mc_net::bind(cfg).await.expect("bind");
@@ -921,8 +993,25 @@ async fn chest_quickcraft_right_drag_places_one_per_selected_slot_and_merges_par
     );
 }
 
-#[tokio::test]
-async fn unsupported_chest_click_modes_resync_without_trusting_client_slots() {
+#[test]
+fn unsupported_chest_click_modes_resync_without_trusting_client_slots() {
+    let test = std::thread::Builder::new()
+        .name("unsupported_chest_click_modes_resync_without_trusting_client_slots".to_owned())
+        .stack_size(4 * 1024 * 1024)
+        .spawn(|| {
+            tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .expect("build chest integration runtime")
+                .block_on(unsupported_chest_click_modes_resync_without_trusting_client_slots_inner());
+        })
+        .expect("spawn chest integration thread");
+    if let Err(panic) = test.join() {
+        std::panic::resume_unwind(panic);
+    }
+}
+
+async fn unsupported_chest_click_modes_resync_without_trusting_client_slots_inner() {
     let manifest = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
     let vanilla_dir = manifest.join("../../data/vanilla");
     let blocks_json = vanilla_dir.join("reports/blocks.json");
@@ -1000,6 +1089,7 @@ async fn unsupported_chest_click_modes_resync_without_trusting_client_slots() {
         chunk_pipeline: mc_net::ChunkPipelinePolicy::default(),
         random_tick: mc_net::RandomTickPolicy::default(),
         command_permissions: mc_net::CommandPermissionConfig::new(Vec::<String>::new(), true),
+        loader_manifest: None,
         shutdown: mc_net::ShutdownHandle::default(),
     };
     let bound = mc_net::bind(cfg).await.expect("bind");
@@ -1062,8 +1152,25 @@ async fn unsupported_chest_click_modes_resync_without_trusting_client_slots() {
 }
 
 
-#[tokio::test]
-async fn chest_rejects_overstack_predictions_and_recovers_with_exact_item_limits() {
+#[test]
+fn chest_rejects_overstack_predictions_and_recovers_with_exact_item_limits() {
+    let test = std::thread::Builder::new()
+        .name("chest_rejects_overstack_predictions_and_recovers_with_exact_item_limits".to_owned())
+        .stack_size(4 * 1024 * 1024)
+        .spawn(|| {
+            tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .expect("build chest item-limit replay runtime")
+                .block_on(chest_rejects_overstack_predictions_and_recovers_with_exact_item_limits_inner());
+        })
+        .expect("spawn chest item-limit replay thread");
+    if let Err(panic) = test.join() {
+        std::panic::resume_unwind(panic);
+    }
+}
+
+async fn chest_rejects_overstack_predictions_and_recovers_with_exact_item_limits_inner() {
     let data = embedded_play_data();
     let air_state = embedded_block_state(&data, "minecraft:air");
     let chest_state = embedded_block_state(&data, "minecraft:chest");

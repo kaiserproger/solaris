@@ -84,6 +84,7 @@ async fn station_noop_and_creative_placement_preserve_inventory() {
         chunk_pipeline: mc_net::ChunkPipelinePolicy::default(),
         random_tick: mc_net::RandomTickPolicy::default(),
         command_permissions: mc_net::CommandPermissionConfig::new(Vec::<String>::new(), true),
+        loader_manifest: None,
         shutdown: mc_net::ShutdownHandle::default(),
     };
     let bound = mc_net::bind(cfg).await.expect("bind");
@@ -401,6 +402,7 @@ async fn adjacent_stair_place_remove_recomputes_neighbor_on_wire_and_survives_re
             ..mc_net::RandomTickPolicy::default()
         },
         command_permissions: mc_net::CommandPermissionConfig::new(Vec::<String>::new(), true),
+        loader_manifest: None,
         shutdown: shutdown.clone(),
     };
     let bound = mc_net::bind(cfg).await.expect("bind stair wire server");
@@ -570,6 +572,7 @@ async fn adjacent_stair_place_remove_recomputes_neighbor_on_wire_and_survives_re
             ..mc_net::RandomTickPolicy::default()
         },
         command_permissions: mc_net::CommandPermissionConfig::new(Vec::<String>::new(), true),
+        loader_manifest: None,
         shutdown: second_shutdown.clone(),
     };
     let second_bound = mc_net::bind(second_cfg)

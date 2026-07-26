@@ -1,5 +1,22 @@
-#[tokio::test]
-async fn embedded_save_restart_rejoin_preserves_inventory_and_edited_block() {
+#[test]
+fn embedded_save_restart_rejoin_preserves_inventory_and_edited_block() {
+    let test = std::thread::Builder::new()
+        .name("embedded_save_restart_rejoin_preserves_inventory_and_edited_block".to_owned())
+        .stack_size(4 * 1024 * 1024)
+        .spawn(|| {
+            tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .expect("build persistence restart runtime")
+                .block_on(embedded_save_restart_rejoin_preserves_inventory_and_edited_block_inner());
+        })
+        .expect("spawn persistence restart runtime");
+    if let Err(panic) = test.join() {
+        std::panic::resume_unwind(panic);
+    }
+}
+
+async fn embedded_save_restart_rejoin_preserves_inventory_and_edited_block_inner() {
     let data = embedded_play_data();
     let air_state = embedded_block_state(&data, "minecraft:air");
     let dirt_state = embedded_block_state(&data, "minecraft:dirt");
@@ -253,8 +270,25 @@ async fn embedded_save_restart_rejoin_preserves_inventory_and_edited_block() {
         .expect("second server serve");
 }
 
-#[tokio::test]
-async fn embedded_non_op_shutdown_restart_preserves_survival_edit_and_inventory() {
+#[test]
+fn embedded_non_op_shutdown_restart_preserves_survival_edit_and_inventory() {
+    let test = std::thread::Builder::new()
+        .name("embedded_non_op_shutdown_restart_preserves_survival_edit_and_inventory".to_owned())
+        .stack_size(4 * 1024 * 1024)
+        .spawn(|| {
+            tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .expect("build persistence non-op restart runtime")
+                .block_on(embedded_non_op_shutdown_restart_preserves_survival_edit_and_inventory_inner());
+        })
+        .expect("spawn persistence non-op restart runtime");
+    if let Err(panic) = test.join() {
+        std::panic::resume_unwind(panic);
+    }
+}
+
+async fn embedded_non_op_shutdown_restart_preserves_survival_edit_and_inventory_inner() {
     let data = embedded_play_data();
     let air_state = embedded_block_state(&data, "minecraft:air");
     let jungle_log_state = embedded_block_state(&data, "minecraft:jungle_log");

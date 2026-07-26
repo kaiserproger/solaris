@@ -19,6 +19,14 @@ use crate::encryption::MinecraftCipher;
 use crate::error::ConnectionError;
 
 pub(crate) const PRE_PLAY_READ_TIMEOUT: Duration = Duration::from_secs(10);
+/// Maximum bytes retained while waiting for one incomplete serverbound frame.
+///
+/// The protocol encoder supports larger clientbound chunk frames, but every
+/// accepted serverbound payload is independently bounded well below 1 MiB
+/// (`CustomPayload` defaults to 32 KiB and container collections have explicit
+/// count/hash budgets). Keeping a separate inbound ceiling prevents slow peers
+/// from turning the generic frame maximum into per-connection memory pressure.
+pub(crate) const MAX_INBOUND_BUFFER_BYTES: usize = 1024 * 1024;
 #[cfg(not(test))]
 pub(crate) const OUTBOUND_WRITE_STALL_TIMEOUT: Duration = Duration::from_secs(5);
 #[cfg(test)]
@@ -218,7 +226,13 @@ where
         if let Some(frame) = try_decode_frame(buf, compression)? {
             return Ok(frame);
         }
-        let read = reader.read_buf(buf).await?;
+        let remaining = MAX_INBOUND_BUFFER_BYTES.saturating_sub(buf.len());
+        if remaining == 0 {
+            return Err(ConnectionError::InboundBufferLimitExceeded {
+                max: MAX_INBOUND_BUFFER_BYTES,
+            });
+        }
+        let read = reader.take(remaining as u64).read_buf(buf).await?;
         if read == 0 {
             return Err(ConnectionError::Eof);
         }
@@ -368,6 +382,35 @@ mod tests {
         .unwrap();
 
         assert_eq!(decoded, packet);
+    }
+
+    #[tokio::test]
+    async fn read_frame_rejects_slow_incomplete_payload_at_inbound_buffer_limit() {
+        let (mut client, mut server) = tokio::io::duplex(MAX_INBOUND_BUFFER_BYTES * 2);
+        let writer = tokio::spawn(async move {
+            // VarInt21 for a frame longer than the Solaris serverbound budget,
+            // followed by exactly enough bytes to fill that budget without
+            // completing the declared frame.
+            client.write_all(&[0xff, 0xff, 0x7f]).await.unwrap();
+            client
+                .write_all(&vec![0_u8; MAX_INBOUND_BUFFER_BYTES - 3])
+                .await
+                .unwrap();
+        });
+        let mut buf = BytesMut::new();
+
+        let error = read_frame(&mut server, &mut buf, Compression::Disabled)
+            .await
+            .unwrap_err();
+
+        assert!(matches!(
+            error,
+            ConnectionError::InboundBufferLimitExceeded {
+                max: MAX_INBOUND_BUFFER_BYTES
+            }
+        ));
+        assert_eq!(buf.len(), MAX_INBOUND_BUFFER_BYTES);
+        writer.await.unwrap();
     }
 
     #[tokio::test]

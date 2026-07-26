@@ -34,7 +34,7 @@ use mc_script::{
 };
 use mc_world::{BlockRegistry, ChunkGeometry, MAX_Y, MIN_Y, OVERWORLD_GEOMETRY, WorldStorage};
 use tokio::net::TcpListener;
-use tokio::sync::{Mutex, Notify, broadcast};
+use tokio::sync::{Mutex, Notify, Semaphore, broadcast};
 use tracing::{debug, info, warn};
 
 use crate::chunk_pipeline::ChunkPipelineResources;
@@ -67,10 +67,20 @@ type PhysicsMaterialCache = HashMap<
 
 static PHYSICS_MATERIAL_CACHE: OnceLock<std::sync::Mutex<PhysicsMaterialCache>> = OnceLock::new();
 const CONNECTION_DRAIN_TIMEOUT: Duration = Duration::from_secs(5);
+const MIN_CONNECTION_TASKS: usize = 32;
+const MAX_CONNECTION_TASKS: usize = 512;
 const ENTITY_TICKER_DRAIN_TIMEOUT: Duration = Duration::from_secs(5);
 const DIRTY_ONLY_FLUSH_MAX_CHUNKS: usize = 64;
 const DIRTY_ONLY_FLUSH_STALE_REGION_RETRIES: usize = 3;
 const SLOW_SIMULATION_ATTRIBUTION_LIMIT: usize = 8;
+
+fn connection_task_limit(max_players: u32) -> usize {
+    usize::try_from(max_players)
+        .unwrap_or(usize::MAX)
+        .saturating_mul(2)
+        .saturating_add(16)
+        .clamp(MIN_CONNECTION_TASKS, MAX_CONNECTION_TASKS)
+}
 
 #[derive(Debug, Clone, Default)]
 pub struct CommandPermissionConfig {
@@ -920,6 +930,9 @@ impl BoundServer {
         let script_storage = self.script_storage;
         let script_zones = self.script_zones;
         let shutdown = config.shutdown.clone();
+        let connection_task_limit = connection_task_limit(config.max_players);
+        let connection_permits = Arc::new(Semaphore::new(connection_task_limit));
+        info!(connection_task_limit, "bounded concurrent connection tasks");
         if let Some(scripts) = scripts.as_ref() {
             scripts.enqueue_event(ScriptEvent::server_started());
         }
@@ -2058,7 +2071,7 @@ impl BoundServer {
         let mut accept_error = None;
         loop {
             tokio::select! {
-                result = self.listener.accept() => {
+                result = self.listener.accept(), if connection_permits.available_permits() > 0 => {
                     let (socket, peer) = match result {
                         Ok(accepted) => accepted,
                         Err(error) => {
@@ -2073,8 +2086,12 @@ impl BoundServer {
                         }
                     };
                     debug!(%peer, "accepted connection");
+                    let connection_permit = Arc::clone(&connection_permits)
+                        .try_acquire_owned()
+                        .expect("accept branch is enabled only while a connection permit exists");
                     let services = connection_services.clone();
                     connections.spawn(async move {
+                        let _connection_permit = connection_permit;
                         if let Err(err) = Box::pin(handle_connection(socket, peer, services)).await {
                             match err {
                                 err if is_client_disconnect(&err) => {
@@ -5095,6 +5112,16 @@ mod tests {
 
     fn canonical_entity_types() -> Arc<EntityTypeRegistry> {
         Arc::new(mc_data::entity_types::solaris_required_entity_types())
+    }
+
+    #[test]
+    fn connection_task_limit_scales_with_players_and_stays_bounded() {
+        assert_eq!(connection_task_limit(0), MIN_CONNECTION_TASKS);
+        assert_eq!(connection_task_limit(8), MIN_CONNECTION_TASKS);
+        assert_eq!(connection_task_limit(20), 56);
+        assert_eq!(connection_task_limit(128), 272);
+        assert_eq!(connection_task_limit(512), MAX_CONNECTION_TASKS);
+        assert_eq!(connection_task_limit(u32::MAX), MAX_CONNECTION_TASKS);
     }
 
     #[test]

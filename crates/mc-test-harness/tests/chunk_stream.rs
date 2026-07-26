@@ -94,6 +94,7 @@ async fn vanilla_client_receives_spawn_view_distance_window() {
         chunk_pipeline: policy,
         random_tick: mc_net::RandomTickPolicy::default(),
         command_permissions: mc_net::CommandPermissionConfig::new(Vec::<String>::new(), true),
+        loader_manifest: None,
         shutdown: mc_net::ShutdownHandle::default(),
     };
     let bound = mc_net::bind(cfg).await.expect("bind");
@@ -328,6 +329,7 @@ async fn movement_across_chunk_boundary_replans_view_subscription() {
         chunk_pipeline: policy,
         random_tick: mc_net::RandomTickPolicy::default(),
         command_permissions: mc_net::CommandPermissionConfig::new(Vec::<String>::new(), true),
+        loader_manifest: None,
         shutdown: mc_net::ShutdownHandle::default(),
     };
     let bound = mc_net::bind(cfg).await.expect("bind");
@@ -513,6 +515,7 @@ async fn reconnect_during_chunk_prepare_receives_only_the_new_exact_view() {
             ..mc_net::RandomTickPolicy::default()
         },
         command_permissions: mc_net::CommandPermissionConfig::new(Vec::<String>::new(), true),
+        loader_manifest: None,
         shutdown: mc_net::ShutdownHandle::default(),
     };
     let bound = mc_net::bind(cfg)

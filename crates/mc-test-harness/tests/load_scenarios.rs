@@ -3324,6 +3324,7 @@ async fn start_load_server_with_options(options: LoadServerOptions) -> LoadServe
             seed: 0,
         },
         command_permissions: mc_net::CommandPermissionConfig::new(Vec::<String>::new(), true),
+        loader_manifest: None,
         shutdown: mc_net::ShutdownHandle::default(),
     };
     let shutdown = cfg.shutdown.clone();
