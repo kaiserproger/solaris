@@ -9,35 +9,43 @@ and is not startup context.
 
 - Date: 2026-07-27.
 - Branch: `main`.
-- Checkpoint base: `5fa3f2b` (`feat(play): add villager trading reputation`),
-  after `17fb424` (`test(perf): refresh load and benchmark matrix`),
-  `94b001b` (`feat(play): assign villager profession from job site`) and
-  `1ae92e0` (`feat(play): add authoritative villager trading`). The old
-  `dev/M100-client-agent` Loader cursor is no longer the active Solaris checkpoint.
-- Current closeout moves gossip out of merchant state into one persisted retained
-  `VillagerGossipState`, so unemployed and employed villagers share the same
-  authority. Exact 26.1.2 `TRADING` remains `+2`, max `25`, decay/day `2`; accepted
-  player melee now records `MINOR_NEGATIVE +25`, max `200`, decay/day `20` in the
-  same regional damage CAS. Values below vanilla's stored floor `2` disappear.
-- Merchant screens project the total weighted reputation only for the opening
-  player's UUID. Selection and final owner commit independently recompute that
-  UUID and debit the exact personal cost. Offer use, villager XP/level, player
-  inventory/cursor, merchant inputs and `TRADING` gossip still commit through one
-  stale-fenced session/entity CAS; invulnerability and stale replay cannot
-  duplicate `VILLAGER_HURT` gossip.
-- The generated-village raw-TCP gate now performs trade -> close -> player attack
-  -> reopen -> select, observes `special_price=+2` and exact `17`-coal debit, then
-  saves and proves the same surcharge after restart. The gossip ledger and last
-  decay timestamp also round-trip through the entity checkpoint.
-- Saves written by `5fa3f2b` migrate their merchant-owned `player_reputations`
-  and decay timestamp into retained gossip during load, then omit the superseded
-  fields on the next save. The timestamp now uses Java's exact persisted `0`
-  sentinel. These changes close the two independent-review findings.
-- This closes trading gossip plus the direct `VILLAGER_HURT` event only. Gossip
-  transfer between villagers, `VILLAGER_KILLED`/major-negative propagation,
-  remaining event types, village population/defence policy, and Hero of the
-  Village pricing remain open. Species-specific `UnsupportedSpecial` attack
-  profiles also remain in the playable queue.
+- Checkpoint base: `00168d6` (`feat(play): add villager hurt gossip`), after
+  `5fa3f2b` (`feat(play): add villager trading reputation`) and the earlier
+  merchant/profession/performance checkpoints. The old `dev/M100-client-agent`
+  Loader cursor is no longer the active Solaris checkpoint.
+- Current closeout adds bounded villager-to-villager transfer for the currently
+  supported `TRADING` and `MINOR_NEGATIVE` entries. Only `Idle` or `Meet`
+  initiators participate; the source must be within exact `distance² <= 5`.
+  Existing runtime interaction target wins while valid, otherwise the bounded
+  active-population spatial index selects the nearest eligible villager with an
+  entity-ID tie break.
+- Transfer is one-way from target to initiator. It performs at most ten weighted
+  draws using Java's 48-bit `nextInt(bound)` algorithm, deduplicates selected
+  `(player,type)` entries, subtracts transfer value `20`, drops results below the
+  stored floor `2`, and merges through `max` rather than addition. Both villagers
+  receive the same 1,200-tick cooldown and one villager participates in at most
+  one pair per tick. The full vanilla per-entity `RandomSource` stream is not yet
+  reproduced: Solaris derives the initial seed from both UUIDs and the tick, so
+  bit-for-bit selected-entry identity is explicitly not claimed.
+- Gossip plus both cooldown updates commit through one two-entity stale-fenced
+  regional CAS. A stale source or receiver changes neither participant. The
+  production simulation route builds the neighbour index only from the bounded
+  active villager population and runs initiators on the existing staggered brain
+  cadence rather than scanning all stored entities.
+- Interaction target and gossip cooldown are runtime-only like Java's
+  `lastGossipTime`: checkpoint restart preserves transferred gossip but resets
+  target and cooldown. Oracle facts, local source paths and SHA-256 fingerprints
+  are recorded in `docs/evidence/villager-gossip-transfer-26.1.2.md`. Existing
+  trade/hurt pricing, legacy-save migration, daily decay and raw-TCP surcharge
+  evidence remain green.
+- The independent review blocked on unavailable oracle evidence and an implicit
+  full-`RandomSource` parity claim. Both findings were fixed with the checked-in
+  fact sheet, Java legacy `nextInt` port, explicit deterministic-seed boundary and
+  focused regressions; no second reviewer was run.
+- This closes transfer only for the two implemented gossip types. `VILLAGER_KILLED`
+  / `MAJOR_NEGATIVE`, positive gossip types, remaining reputation events, Hero of
+  the Village pricing, and village population/defence policy remain open.
+  Species-specific `UnsupportedSpecial` attacks also remain in the playable queue.
 - The performance baseline remains as recorded by `17fb424`: debug/release
   20-client VD8 and bounded replay/soak gates pass; O3 explosion authority is
   still above the frozen p99 budget, and exact low/high cgroups plus long soaks

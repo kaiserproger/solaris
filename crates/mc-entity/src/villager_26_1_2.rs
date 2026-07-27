@@ -7,7 +7,7 @@
 
 use serde::{Deserialize, Serialize};
 
-use crate::{GoalState, Vec3};
+use crate::{EntityId, GoalState, Vec3};
 
 const DAY_LENGTH: i64 = 24_000;
 const MAX_SCHEDULE_ENTRIES: usize = 32;
@@ -109,6 +109,10 @@ pub struct VillagerBrainState {
     pub pois: VillagerPoiSet,
     pub override_order: Option<VillagerBrainOverride>,
     pub override_expires_tick: Option<u64>,
+    #[serde(skip)]
+    pub interaction_target: Option<EntityId>,
+    #[serde(skip)]
+    pub last_gossip_time: u64,
 }
 
 impl VillagerBrainState {
@@ -120,6 +124,8 @@ impl VillagerBrainState {
             pois,
             override_order: None,
             override_expires_tick: None,
+            interaction_target: None,
+            last_gossip_time: 0,
         }
     }
 
@@ -131,6 +137,8 @@ impl VillagerBrainState {
             pois,
             override_order: None,
             override_expires_tick: None,
+            interaction_target: None,
+            last_gossip_time: 0,
         }
     }
 

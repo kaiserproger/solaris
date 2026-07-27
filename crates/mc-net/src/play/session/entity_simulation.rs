@@ -113,6 +113,9 @@ fn record_movement_exhaustive_membership_check() {
 const VILLAGER_BRAIN_TICK_INTERVAL: u64 = 20;
 const VILLAGER_BRAIN_COMMIT_BATCH: usize = 64;
 const VILLAGER_RESTOCK_REACH_SQUARED: f64 = 4.0;
+const VILLAGER_GOSSIP_REACH_SQUARED: f64 = 5.0;
+const VILLAGER_GOSSIP_COOLDOWN_TICKS: u64 = 1_200;
+const VILLAGER_GOSSIP_CELL_SIZE: f64 = 3.0;
 
 #[derive(Clone, Copy)]
 struct VillagerProfessionContext<'a> {
@@ -126,6 +129,23 @@ struct VillagerBrainTransitionReport {
     #[cfg(test)]
     applied: usize,
     metadata_updates: Vec<EntitySnapshot>,
+}
+
+fn current_villager_brain(
+    entity: &EntitySnapshot,
+) -> Option<mc_entity::villager_26_1_2::VillagerBrainState> {
+    let villager = entity.retained.villager?;
+    Some(entity.retained.villager_brain.clone().unwrap_or_else(|| {
+        let job_site =
+            (villager.profession != mc_entity::VillagerProfession::None).then_some(entity.position);
+        mc_entity::villager_26_1_2::VillagerBrainState::adult(
+            mc_entity::villager_26_1_2::VillagerPoiSet {
+                home: Some(entity.position),
+                job_site,
+                meeting_point: Some(entity.position),
+            },
+        )
+    }))
 }
 
 fn villager_job_site_block_pos(position: Vec3) -> mc_world::BlockPos {
@@ -301,20 +321,9 @@ fn apply_villager_brain_transitions_with_professions(
         {
             continue;
         }
-        let Some(villager) = expected.retained.villager else {
+        let Some(current) = current_villager_brain(&expected) else {
             continue;
         };
-        let current = expected.retained.villager_brain.clone().unwrap_or_else(|| {
-            let job_site = (villager.profession != mc_entity::VillagerProfession::None)
-                .then_some(expected.position);
-            mc_entity::villager_26_1_2::VillagerBrainState::adult(
-                mc_entity::villager_26_1_2::VillagerPoiSet {
-                    home: Some(expected.position),
-                    job_site,
-                    meeting_point: Some(expected.position),
-                },
-            )
-        });
         let Ok(plan) = validated_profile.plan(&current, lifecycle_tick, day_time) else {
             continue;
         };
@@ -408,6 +417,229 @@ fn commit_villager_brain_transition_batch(
     let right = batch.split_off(count / 2);
     commit_villager_brain_transition_batch(entities, batch)
         + commit_villager_brain_transition_batch(entities, right)
+}
+
+fn villager_gossip_activity_allows_transfer(
+    activity: mc_entity::villager_26_1_2::VillagerActivity,
+) -> bool {
+    matches!(
+        activity,
+        mc_entity::villager_26_1_2::VillagerActivity::Idle
+            | mc_entity::villager_26_1_2::VillagerActivity::Meet
+    )
+}
+
+fn villager_gossip_cooldown_ready(timestamp: u64, last_gossip_time: u64) -> bool {
+    timestamp < last_gossip_time
+        || timestamp >= last_gossip_time.saturating_add(VILLAGER_GOSSIP_COOLDOWN_TICKS)
+}
+
+fn villager_gossip_cell(position: Vec3) -> (i32, i32, i32) {
+    (
+        (position.x / VILLAGER_GOSSIP_CELL_SIZE).floor() as i32,
+        (position.y / VILLAGER_GOSSIP_CELL_SIZE).floor() as i32,
+        (position.z / VILLAGER_GOSSIP_CELL_SIZE).floor() as i32,
+    )
+}
+
+// Solaris does not yet own vanilla's complete per-entity RandomSource stream.
+// Mix stable actor facts into a deterministic seed, while the transfer container
+// itself uses Java's exact legacy nextInt(bound) algorithm.
+fn villager_gossip_seed(receiver: uuid::Uuid, source: uuid::Uuid, timestamp: u64) -> u64 {
+    let receiver = receiver.as_u128();
+    let source = source.as_u128();
+    splitmix64(
+        (receiver as u64)
+            ^ ((receiver >> 64) as u64).rotate_left(11)
+            ^ (source as u64).rotate_left(23)
+            ^ ((source >> 64) as u64).rotate_left(37)
+            ^ timestamp.wrapping_mul(0x9E37_79B9_7F4A_7C15),
+    )
+}
+
+fn select_villager_gossip_target(
+    receiver: &EntitySnapshot,
+    receiver_brain: &mc_entity::villager_26_1_2::VillagerBrainState,
+    candidates: &HashMap<EntityId, EntitySnapshot>,
+    cells: &HashMap<(i32, i32, i32), Vec<EntityId>>,
+    reserved: &HashSet<EntityId>,
+    timestamp: u64,
+) -> Option<EntityId> {
+    let eligible = |target: EntityId| {
+        if target == receiver.id || reserved.contains(&target) {
+            return None;
+        }
+        let snapshot = candidates.get(&target)?;
+        let brain = current_villager_brain(snapshot)?;
+        if !villager_gossip_cooldown_ready(timestamp, brain.last_gossip_time) {
+            return None;
+        }
+        let distance = distance_sq(receiver.position, snapshot.position);
+        (distance <= VILLAGER_GOSSIP_REACH_SQUARED).then_some((target, distance))
+    };
+
+    if let Some(target) = receiver_brain.interaction_target
+        && eligible(target).is_some()
+    {
+        return Some(target);
+    }
+
+    let (cell_x, cell_y, cell_z) = villager_gossip_cell(receiver.position);
+    let mut best = None::<(EntityId, f64)>;
+    for x in (cell_x - 1)..=(cell_x + 1) {
+        for y in (cell_y - 1)..=(cell_y + 1) {
+            for z in (cell_z - 1)..=(cell_z + 1) {
+                let Some(ids) = cells.get(&(x, y, z)) else {
+                    continue;
+                };
+                for &target in ids {
+                    let Some((target, distance)) = eligible(target) else {
+                        continue;
+                    };
+                    if best.is_none_or(|(best_id, best_distance)| {
+                        distance < best_distance || distance == best_distance && target < best_id
+                    }) {
+                        best = Some((target, distance));
+                    }
+                }
+            }
+        }
+    }
+    best.map(|(target, _)| target)
+}
+
+pub(super) fn commit_villager_gossip_transfer_pair(
+    entities: &mut EntityStoreGuard<'_>,
+    receiver: EntitySnapshot,
+    source: EntitySnapshot,
+    timestamp: u64,
+) -> bool {
+    if receiver.id == source.id
+        || receiver.lifecycle != EntityLifecycle::Alive
+        || source.lifecycle != EntityLifecycle::Alive
+        || receiver.type_name != "minecraft:villager"
+        || source.type_name != "minecraft:villager"
+        || distance_sq(receiver.position, source.position) > VILLAGER_GOSSIP_REACH_SQUARED
+    {
+        return false;
+    }
+    let Some(mut receiver_brain) = current_villager_brain(&receiver) else {
+        return false;
+    };
+    let Some(mut source_brain) = current_villager_brain(&source) else {
+        return false;
+    };
+    if !villager_gossip_activity_allows_transfer(receiver_brain.activity)
+        || !villager_gossip_cooldown_ready(timestamp, receiver_brain.last_gossip_time)
+        || !villager_gossip_cooldown_ready(timestamp, source_brain.last_gossip_time)
+    {
+        return false;
+    }
+
+    let source_gossip = source.retained.villager_gossip.clone().unwrap_or_default();
+    let mut receiver_gossip = receiver
+        .retained
+        .villager_gossip
+        .clone()
+        .unwrap_or_default();
+    let Ok(gossip_changed) = receiver_gossip.transfer_from_seeded(
+        &source_gossip,
+        villager_gossip_seed(receiver.uuid, source.uuid, timestamp),
+        mc_entity::villager_gossip_26_1_2::MAX_TRANSFER_COUNT,
+    ) else {
+        return false;
+    };
+
+    receiver_brain.interaction_target = Some(source.id);
+    receiver_brain.last_gossip_time = timestamp;
+    source_brain.last_gossip_time = timestamp;
+    let mut receiver_next = receiver.clone();
+    receiver_next.retained.villager_brain = Some(receiver_brain);
+    if gossip_changed || receiver.retained.villager_gossip.is_some() {
+        receiver_next.retained.villager_gossip = Some(receiver_gossip);
+    }
+    let mut source_next = source.clone();
+    source_next.retained.villager_brain = Some(source_brain);
+
+    entities.replace_snapshots_if_current([(receiver, receiver_next), (source, source_next)])
+}
+
+pub(super) fn apply_villager_gossip_transfers(
+    entities: &mut EntityStoreGuard<'_>,
+    initiator_ids: &HashSet<EntityId>,
+    candidate_ids: &HashSet<EntityId>,
+    timestamp: u64,
+) -> usize {
+    if initiator_ids.is_empty() || candidate_ids.len() < 2 {
+        return 0;
+    }
+    let mut candidates = HashMap::<EntityId, EntitySnapshot>::new();
+    let mut cells = HashMap::<(i32, i32, i32), Vec<EntityId>>::new();
+    let mut ordered_candidates = candidate_ids.iter().copied().collect::<Vec<_>>();
+    ordered_candidates.sort_unstable();
+    for id in ordered_candidates {
+        let Some(snapshot) = entities.snapshot(id) else {
+            continue;
+        };
+        if snapshot.lifecycle != EntityLifecycle::Alive
+            || snapshot.type_name != "minecraft:villager"
+            || snapshot.retained.villager.is_none()
+        {
+            continue;
+        }
+        cells
+            .entry(villager_gossip_cell(snapshot.position))
+            .or_default()
+            .push(id);
+        candidates.insert(id, snapshot);
+    }
+
+    let mut ordered_initiators = initiator_ids.iter().copied().collect::<Vec<_>>();
+    ordered_initiators.sort_unstable();
+    let mut reserved = HashSet::new();
+    let mut applied = 0;
+    for receiver_id in ordered_initiators {
+        if reserved.contains(&receiver_id) {
+            continue;
+        }
+        let Some(receiver) = candidates.get(&receiver_id).cloned() else {
+            continue;
+        };
+        let Some(receiver_brain) = current_villager_brain(&receiver) else {
+            continue;
+        };
+        if !villager_gossip_activity_allows_transfer(receiver_brain.activity)
+            || !villager_gossip_cooldown_ready(timestamp, receiver_brain.last_gossip_time)
+        {
+            continue;
+        }
+        let Some(source_id) = select_villager_gossip_target(
+            &receiver,
+            &receiver_brain,
+            &candidates,
+            &cells,
+            &reserved,
+            timestamp,
+        ) else {
+            continue;
+        };
+        let Some(source) = candidates.get(&source_id).cloned() else {
+            continue;
+        };
+        if commit_villager_gossip_transfer_pair(entities, receiver, source, timestamp) {
+            reserved.insert(receiver_id);
+            reserved.insert(source_id);
+            applied += 1;
+        }
+    }
+    applied
+}
+
+fn splitmix64(mut value: u64) -> u64 {
+    value = value.wrapping_add(0x9E37_79B9_7F4A_7C15);
+    value = (value ^ (value >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+    value = (value ^ (value >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+    value ^ (value >> 31)
 }
 
 impl SessionRegistry {
@@ -632,6 +864,7 @@ impl SessionRegistry {
         let mut active_entity_ids = HashSet::new();
         let mut active_hostile_ids = HashSet::new();
         let mut active_villager_ids = HashSet::new();
+        let mut active_villager_population_ids = HashSet::new();
         let mut sheep_grazing_entities = HashSet::new();
         let mut active_entity_aabbs = HashMap::new();
         let mut active_entity_kinds = HashMap::new();
@@ -645,6 +878,11 @@ impl SessionRegistry {
                     active_entity_ids.insert(entity.id);
                     if is_hostile_entity(entity.type_name) {
                         active_hostile_ids.insert(entity.id);
+                    }
+                    if entity.type_name == "minecraft:villager"
+                        && entity.retained.villager.is_some()
+                    {
+                        active_villager_population_ids.insert(entity.id);
                     }
                     if entity.retained.sheep_grazing_ticks.is_some() {
                         sheep_grazing_entities.insert(entity.id);
@@ -724,6 +962,12 @@ impl SessionRegistry {
             villager_day_time,
             &villager_profile,
             profession_context,
+        );
+        let _gossip_transfers = apply_villager_gossip_transfers(
+            &mut entities,
+            &active_villager_ids,
+            &active_villager_population_ids,
+            tick,
         );
         let cleared_overrides = overridden_villagers
             .iter()

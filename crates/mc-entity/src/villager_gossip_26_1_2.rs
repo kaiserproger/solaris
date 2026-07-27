@@ -4,6 +4,7 @@ use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
 pub const MAX_PLAYER_GOSSIPS: usize = 64;
+pub const MAX_TRANSFER_COUNT: usize = 10;
 const DISCARD_THRESHOLD: i32 = 2;
 const DAY_LENGTH_TICKS: i64 = 24_000;
 const TRADING_MAX: i32 = 25;
@@ -12,6 +13,7 @@ const TRADING_DECAY_PER_DAY: i32 = 2;
 const MINOR_NEGATIVE_MAX: i32 = 200;
 const MINOR_NEGATIVE_ADD: i32 = 25;
 const MINOR_NEGATIVE_DECAY_PER_DAY: i32 = 20;
+const TRANSFER_DECAY: i32 = 20;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum VillagerGossipEvent {
@@ -99,6 +101,64 @@ impl VillagerGossipState {
         true
     }
 
+    /// Applies the Java 26.1.2 weighted-transfer shape with Java legacy
+    /// `nextInt(bound)` draws. The caller owns the seed; reproducing the complete
+    /// per-entity vanilla `RandomSource` stream is outside this state container.
+    pub fn transfer_from_seeded(
+        &mut self,
+        source: &Self,
+        seed: u64,
+        max_count: usize,
+    ) -> Result<bool, VillagerGossipError> {
+        self.validate()?;
+        source.validate()?;
+        let entries = source.transfer_entries();
+        if entries.is_empty() || max_count == 0 {
+            return Ok(false);
+        }
+        let total_weight = entries
+            .iter()
+            .map(|entry| u32::try_from(entry.value).expect("validated gossip is positive"))
+            .sum::<u32>();
+        if total_weight == 0 {
+            return Ok(false);
+        }
+
+        let mut random = JavaLegacyRandom::new(seed as i64);
+        let mut selected =
+            Vec::<(Uuid, GossipField)>::with_capacity(max_count.min(MAX_TRANSFER_COUNT));
+        for _ in 0..max_count.min(MAX_TRANSFER_COUNT) {
+            let choice = random.next_int(total_weight);
+            let mut cumulative = 0_u32;
+            let Some(entry) = entries.iter().find(|entry| {
+                cumulative = cumulative.saturating_add(entry.value as u32);
+                choice < cumulative
+            }) else {
+                continue;
+            };
+            if !selected.contains(&(entry.player, entry.field)) {
+                selected.push((entry.player, entry.field));
+            }
+        }
+
+        let mut changed = false;
+        for (player, field) in selected {
+            let Some(entry) = entries
+                .iter()
+                .find(|entry| entry.player == player && entry.field == field)
+            else {
+                continue;
+            };
+            let transferred = entry.value.saturating_sub(TRANSFER_DECAY);
+            if transferred < DISCARD_THRESHOLD {
+                continue;
+            }
+            changed |= self.merge_transferred(player, field, transferred);
+        }
+        self.validate()?;
+        Ok(changed)
+    }
+
     pub fn merge_legacy_trading(
         &mut self,
         last_decay_game_time: Option<i64>,
@@ -181,6 +241,39 @@ impl VillagerGossipState {
         });
         self.player_gossips.last_mut()
     }
+
+    fn transfer_entries(&self) -> Vec<TransferEntry> {
+        let mut entries = Vec::with_capacity(self.player_gossips.len().saturating_mul(2));
+        for gossip in &self.player_gossips {
+            if gossip.minor_negative > 0 {
+                entries.push(TransferEntry {
+                    player: gossip.player,
+                    field: GossipField::MinorNegative,
+                    value: gossip.minor_negative,
+                });
+            }
+            if gossip.trading > 0 {
+                entries.push(TransferEntry {
+                    player: gossip.player,
+                    field: GossipField::Trading,
+                    value: gossip.trading,
+                });
+            }
+        }
+        entries
+    }
+
+    fn merge_transferred(&mut self, player: Uuid, field: GossipField, value: i32) -> bool {
+        let Some(gossip) = self.player_gossip_mut_or_insert(player) else {
+            return false;
+        };
+        let current = field.value_mut(gossip);
+        if *current >= value {
+            return false;
+        }
+        *current = value;
+        true
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -189,10 +282,17 @@ pub enum VillagerGossipError {
     InvalidState,
 }
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum GossipField {
     Trading,
     MinorNegative,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct TransferEntry {
+    player: Uuid,
+    field: GossipField,
+    value: i32,
 }
 
 impl GossipField {
@@ -211,6 +311,45 @@ fn valid_stored_value(value: i32, maximum: i32) -> bool {
 fn decayed_value(value: i32, decay: i32) -> i32 {
     let value = value.saturating_sub(decay);
     if value < DISCARD_THRESHOLD { 0 } else { value }
+}
+
+const JAVA_RANDOM_MULTIPLIER: u64 = 0x5DEECE66D;
+const JAVA_RANDOM_ADDEND: u64 = 0xB;
+const JAVA_RANDOM_MASK: u64 = (1_u64 << 48) - 1;
+
+struct JavaLegacyRandom {
+    seed: u64,
+}
+
+impl JavaLegacyRandom {
+    fn new(seed: i64) -> Self {
+        Self {
+            seed: ((seed as u64) ^ JAVA_RANDOM_MULTIPLIER) & JAVA_RANDOM_MASK,
+        }
+    }
+
+    fn next_bits(&mut self, bits: u32) -> u32 {
+        self.seed = self
+            .seed
+            .wrapping_mul(JAVA_RANDOM_MULTIPLIER)
+            .wrapping_add(JAVA_RANDOM_ADDEND)
+            & JAVA_RANDOM_MASK;
+        (self.seed >> (48 - bits)) as u32
+    }
+
+    fn next_int(&mut self, bound: u32) -> u32 {
+        debug_assert!(bound > 0 && bound <= i32::MAX as u32);
+        if bound.is_power_of_two() {
+            return ((u64::from(bound) * u64::from(self.next_bits(31))) >> 31) as u32;
+        }
+        loop {
+            let bits = self.next_bits(31);
+            let value = bits % bound;
+            if bits.wrapping_sub(value).wrapping_add(bound - 1) as i32 >= 0 {
+                return value;
+            }
+        }
+    }
 }
 
 #[cfg(test)]
@@ -258,6 +397,69 @@ mod tests {
         assert!(gossip.decay(48_100).unwrap());
         assert_eq!(gossip.player_reputation(player), 0);
         assert!(gossip.player_gossips.is_empty());
+    }
+
+    #[test]
+    fn java_legacy_next_int_matches_known_seeded_draw() {
+        let mut random = JavaLegacyRandom::new(0x1234_ABCD);
+        assert_eq!(random.next_int(20), 3);
+    }
+
+    #[test]
+    fn weighted_transfer_applies_type_decay_deduplicates_draws_and_merges_by_max() {
+        let player = Uuid::from_u128(7);
+        let mut source = VillagerGossipState::default();
+        for _ in 0..13 {
+            source.record_event(VillagerGossipEvent::Trade { player });
+        }
+        for _ in 0..2 {
+            source.record_event(VillagerGossipEvent::HurtByPlayer { player });
+        }
+        assert_eq!(source.trading_value(player), 25);
+        assert_eq!(source.minor_negative_value(player), 50);
+
+        let mut receiver = VillagerGossipState::default();
+        assert!(
+            receiver
+                .transfer_from_seeded(&source, 0xA11C_E5E5, MAX_TRANSFER_COUNT)
+                .unwrap()
+        );
+        assert!(matches!(receiver.trading_value(player), 0 | 5));
+        assert!(matches!(receiver.minor_negative_value(player), 0 | 30));
+        assert!(receiver.trading_value(player) != 0 || receiver.minor_negative_value(player) != 0);
+
+        let once = receiver.clone();
+        receiver
+            .transfer_from_seeded(&source, 0xA11C_E5E5, MAX_TRANSFER_COUNT)
+            .unwrap();
+        assert_eq!(receiver, once, "transfer merge must use max, not addition");
+    }
+
+    #[test]
+    fn transfer_drops_values_below_the_storage_floor_and_never_exceeds_ten_unique_entries() {
+        let mut source = VillagerGossipState::default();
+        for index in 0..20_u128 {
+            let player = Uuid::from_u128(index + 1);
+            source.player_gossips.push(VillagerPlayerGossip {
+                player,
+                trading: if index == 0 { 21 } else { 25 },
+                minor_negative: 0,
+            });
+        }
+        source.validate().unwrap();
+
+        let mut receiver = VillagerGossipState::default();
+        receiver
+            .transfer_from_seeded(&source, 0x55AA_1234, MAX_TRANSFER_COUNT)
+            .unwrap();
+        assert_eq!(receiver.trading_value(Uuid::from_u128(1)), 0);
+        assert!(receiver.player_gossips.len() <= MAX_TRANSFER_COUNT);
+        assert!(
+            receiver
+                .player_gossips
+                .iter()
+                .all(|entry| entry.trading == 5 && entry.minor_negative == 0)
+        );
     }
 
     #[test]

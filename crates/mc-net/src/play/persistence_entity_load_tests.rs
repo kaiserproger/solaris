@@ -507,6 +507,67 @@ fn assigned_toolsmith_profession_and_merchant_catalog_survive_checkpoint_restart
 }
 
 #[test]
+fn transferred_gossip_survives_checkpoint_while_runtime_interaction_resets() {
+    let tmp = tempfile::tempdir().unwrap();
+    let player = uuid::Uuid::from_u128(0xBEEF);
+    let mut source = mc_entity::villager_gossip_26_1_2::VillagerGossipState::default();
+    source.record_event(
+        mc_entity::villager_gossip_26_1_2::VillagerGossipEvent::HurtByPlayer { player },
+    );
+    source.record_event(
+        mc_entity::villager_gossip_26_1_2::VillagerGossipEvent::HurtByPlayer { player },
+    );
+    let mut receiver = mc_entity::villager_gossip_26_1_2::VillagerGossipState::default();
+    assert!(
+        receiver
+            .transfer_from_seeded(
+                &source,
+                0x1234,
+                mc_entity::villager_gossip_26_1_2::MAX_TRANSFER_COUNT,
+            )
+            .unwrap()
+    );
+    assert_eq!(receiver.minor_negative_value(player), 30);
+
+    let mut record = PersistedEntityRecord::from(snapshot(48, EntityLifecycle::Alive));
+    record.snapshot.type_id = 139;
+    record.snapshot.type_name = "minecraft:villager".into();
+    record.snapshot.item_stack = None;
+    record.snapshot.retained.villager = Some(mc_entity::VillagerData::new(
+        mc_entity::VillagerKind::Plains,
+        mc_entity::VillagerProfession::None,
+        1,
+    ));
+    let mut brain = mc_entity::villager_26_1_2::VillagerBrainState::adult(
+        mc_entity::villager_26_1_2::VillagerPoiSet::default(),
+    );
+    brain.interaction_target = Some(EntityId(49));
+    brain.last_gossip_time = 1_200;
+    record.snapshot.retained.villager_brain = Some(brain);
+    record.snapshot.retained.villager_gossip = Some(receiver);
+
+    save_persisted_entity_records(
+        tmp.path(),
+        &items(),
+        &PersistedEntityCheckpoint::new(0, [record]),
+    )
+    .unwrap();
+    let loaded = load_persisted_entities(tmp.path(), &items(), &entity_types()).unwrap();
+    let retained = &loaded.records[0].snapshot.retained;
+    assert_eq!(
+        retained
+            .villager_gossip
+            .as_ref()
+            .unwrap()
+            .minor_negative_value(player),
+        30
+    );
+    let brain = retained.villager_brain.as_ref().unwrap();
+    assert_eq!(brain.interaction_target, None);
+    assert_eq!(brain.last_gossip_time, 0);
+}
+
+#[test]
 fn legacy_merchant_reputation_migrates_to_retained_villager_gossip() {
     let customer = uuid::Uuid::from_u128(0xCAFE);
     let merchant = mc_entity::villager_merchant_26_1_2::VillagerMerchantState::new(vec![
