@@ -7,45 +7,35 @@ and is not startup context.
 
 ## Current Checkpoint
 
-- Date: 2026-07-22.
-- Branch: `dev/M100-client-agent`.
-- Latest recorded checkpoint: the client fluid-contact blocker is fixed after
-  the bounded protocol, pose, and water-plant commit `7ac0fa6`. Basic economy
-  and land claims shipped in `1c2ba4a`. The prior mob death deadline checkpoint is
-  `45ff133` (`fix(play): index mob death deadlines`).
-  The reach checkpoint is `5146926`, creeper checkpoint is `9af1309`,
-  dry-spawn checkpoint is `6b0dcec`, autoscale checkpoint is `5b7017a`, and
-  water checkpoint is `547525e`.
-  Delivery-order checkpoint `5e2908a` remains binding.
+- Date: 2026-07-27.
+- Branch: `main`.
+- Latest committed baseline: `17fb424` (`test(perf): refresh load and benchmark
+  matrix`), after `94b001b` (`feat(play): assign villager profession from job
+  site`) and `1ae92e0` (`feat(play): add authoritative villager trading`). The
+  old `dev/M100-client-agent` Loader cursor is no longer the active Solaris
+  checkpoint.
+- Current closeout adds the first bounded player-specific villager gossip slice.
+  Successful merchant commits add exact 26.1.2 `TRADING` reputation `+2`, cap it
+  at `25`, decay it by `2` once at least 24,000 ticks have elapsed, and remove
+  entries below vanilla's stored-value floor `2`. The per-villager ledger and
+  last decay timestamp survive entity checkpoints; legacy merchant state loads
+  through serde defaults.
+- Merchant screens project a special price only for the opening player's UUID,
+  selection moves that player's exact discounted payment, and the authoritative
+  trade commit recomputes the actor UUID rather than trusting client/window
+  state. Offer use, villager XP/level, player inventory/cursor, merchant inputs,
+  and reputation still commit through one stale-fenced session/entity CAS.
+- This closes only trading-gossip accrual, personal pricing, decay, and restart
+  continuity. Gossip transfer between villagers, non-trading gossip types,
+  village population/defence policy, and Hero of the Village pricing remain
+  open. Species-specific `UnsupportedSpecial` attack profiles also remain in
+  the playable queue.
+- The performance baseline remains as recorded by `17fb424`: debug/release
+  20-client VD8 and bounded replay/soak gates pass; O3 explosion authority is
+  still above the frozen p99 budget, and exact low/high cgroups plus long soaks
+  remain open.
 - The worktree may contain unrelated owner files and local artifacts. Inspect
   exact ownership before editing; never clean or stage them by accident.
-- The current uncommitted Solaris Loader checkpoint defines one protocol-1
-  plugin manifest and Configuration acknowledgement for Fabric, NeoForge, and
-  Forge. It validates explicit content permissions and exact SHA-256-derived
-  cache identities while leaving servers without client bundles on the vanilla
-  path. Native 26.1.2 Configuration payload registration now exists on all
-  three platforms. Missing exact cache identities now use a bounded
-  request/artifact flow; plugin startup verifies source bytes and the shared
-  Java core stages, size/SHA-verifies, and atomically publishes cache entries
-  before acknowledgement. Fabric, NeoForge, and Forge now prompt in Minecraft
-  for unknown server-address plus permission-set decisions and persist exact
-  allow/deny choices under the Loader cache; denial happens before request or
-  staging. Verified allowed ZIPs now activate one closed archive index for
-  immutable owned screen definitions and exact asset bytes across all three
-  adapters before acknowledgement, with logout clearing the active registry.
-  Host-attested plugins can now open those immutable title/body screens through
-  an ordered Play payload only on the exact connection that completed the
-  Loader acknowledgement; all three adapters fence queued UI work to that
-  origin. Verified asset paths now mount through one transient required
-  Minecraft client pack; acknowledgement waits for exact-byte resource
-  visibility, and the exact connection close removes the pack without letting
-  stale work clear a newer mount. Closed owner-namespaced interaction
-  declarations now render as bounded screen buttons on all three adapters.
-  Their Play action is emitted only for the current definition and connection,
-  accepted only from the exact Loader-acknowledged session, and delivered as a
-  targeted `loader.interaction` event solely to the owner Lua plugin. Blocks and
-  items remain later slices. The interaction slice has automated coverage but
-  no PrismLauncher 26.1.2 visual run.
 - Fresh-player spawn now chooses the nearest non-hazardous collidable support
   with collision-free, non-fluid body space in the resident 11x11 spawn window.
   Focused tests cover water, transparent collision, and magma support. A new

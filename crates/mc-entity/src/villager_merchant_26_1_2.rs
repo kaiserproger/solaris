@@ -1,14 +1,26 @@
 //! Persisted, protocol-neutral villager merchant state for Java Edition 26.1.2.
 
 use serde::{Deserialize, Serialize};
+use uuid::Uuid;
 
 use crate::EntityItemStack;
 
 const MAX_OFFERS: usize = 32;
 const MAX_STACK_COUNT: i32 = 64;
+const MAX_PLAYER_REPUTATIONS: usize = 64;
+const MAX_TRADING_REPUTATION: i32 = 25;
+const MIN_STORED_REPUTATION: i32 = 2;
+const TRADING_REPUTATION_PER_TRADE: i32 = 2;
+const TRADING_REPUTATION_DECAY_PER_DAY: i32 = 2;
 const MAX_RESTOCKS_PER_DAY: u8 = 2;
 const DAY_LENGTH_TICKS: i64 = 24_000;
 const RESTOCK_COOLDOWN_TICKS: i64 = 1_200;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct VillagerPlayerReputation {
+    pub player: Uuid,
+    pub trading: i32,
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub struct VillagerTradeCost {
@@ -86,11 +98,20 @@ impl VillagerTradeOffer {
 
     #[must_use]
     pub fn modified_cost_a_count(&self, item_max_stack: i32) -> i32 {
+        self.modified_cost_a_count_with_special_price(item_max_stack, self.special_price)
+    }
+
+    #[must_use]
+    pub fn modified_cost_a_count_with_special_price(
+        &self,
+        item_max_stack: i32,
+        special_price: i32,
+    ) -> i32 {
         let item_max_stack = item_max_stack.clamp(1, MAX_STACK_COUNT);
         let demand_delta = ((self.cost_a.count as f32 * self.demand as f32) * self.price_multiplier)
             .floor()
             .max(0.0) as i32;
-        (self.cost_a.count + demand_delta + self.special_price).clamp(1, item_max_stack)
+        (self.cost_a.count + demand_delta + special_price).clamp(1, item_max_stack)
     }
 
     #[must_use]
@@ -120,6 +141,10 @@ pub struct VillagerMerchantState {
     pub last_restock_day: i64,
     #[serde(default)]
     pub last_restock_game_time: Option<i64>,
+    #[serde(default)]
+    pub last_reputation_decay_game_time: Option<i64>,
+    #[serde(default)]
+    pub player_reputations: Vec<VillagerPlayerReputation>,
 }
 
 impl VillagerMerchantState {
@@ -130,24 +155,71 @@ impl VillagerMerchantState {
             restocks_today: 0,
             last_restock_day: i64::MIN,
             last_restock_game_time: None,
+            last_reputation_decay_game_time: None,
+            player_reputations: Vec::new(),
         };
         state.validate()?;
         Ok(state)
     }
 
     pub fn validate(&self) -> Result<(), VillagerMerchantError> {
-        if self.offers.len() > MAX_OFFERS || self.xp < 0 {
+        if self.offers.len() > MAX_OFFERS
+            || self.player_reputations.len() > MAX_PLAYER_REPUTATIONS
+            || self.xp < 0
+        {
             return Err(VillagerMerchantError::InvalidCounters);
         }
         if self.restocks_today > MAX_RESTOCKS_PER_DAY
             || self.last_restock_game_time.is_some_and(|time| time < 0)
+            || self
+                .last_reputation_decay_game_time
+                .is_some_and(|time| time < 0)
         {
             return Err(VillagerMerchantError::InvalidCounters);
         }
         for offer in &self.offers {
             offer.validate()?;
         }
+        for (index, reputation) in self.player_reputations.iter().enumerate() {
+            if !(MIN_STORED_REPUTATION..=MAX_TRADING_REPUTATION).contains(&reputation.trading)
+                || self.player_reputations[..index]
+                    .iter()
+                    .any(|existing| existing.player == reputation.player)
+            {
+                return Err(VillagerMerchantError::InvalidReputation);
+            }
+        }
         Ok(())
+    }
+
+    #[must_use]
+    pub fn trading_reputation(&self, player: Uuid) -> i32 {
+        self.player_reputations
+            .iter()
+            .find(|reputation| reputation.player == player)
+            .map_or(0, |reputation| reputation.trading)
+    }
+
+    #[must_use]
+    pub fn player_special_price(&self, player: Uuid, offer_index: usize) -> Option<i32> {
+        let offer = self.offers.get(offer_index)?;
+        let reputation_discount =
+            ((self.trading_reputation(player) as f32) * offer.price_multiplier).floor() as i32;
+        Some(offer.special_price.saturating_sub(reputation_discount))
+    }
+
+    #[must_use]
+    pub fn modified_cost_a_count_for_player(
+        &self,
+        player: Uuid,
+        offer_index: usize,
+        item_max_stack: i32,
+    ) -> Option<i32> {
+        let offer = self.offers.get(offer_index)?;
+        Some(offer.modified_cost_a_count_with_special_price(
+            item_max_stack,
+            self.player_special_price(player, offer_index)?,
+        ))
     }
 
     pub fn record_trade(
@@ -161,6 +233,57 @@ impl VillagerMerchantState {
         offer.record_use()?;
         self.xp = self.xp.saturating_add(offer.xp);
         Ok((offer.result.clone(), offer.xp))
+    }
+
+    pub fn record_player_trade(
+        &mut self,
+        player: Uuid,
+        offer_index: usize,
+    ) -> Result<(EntityItemStack, i32), VillagerMerchantError> {
+        let result = self.record_trade(offer_index)?;
+        if let Some(reputation) = self
+            .player_reputations
+            .iter_mut()
+            .find(|reputation| reputation.player == player)
+        {
+            reputation.trading = reputation
+                .trading
+                .saturating_add(TRADING_REPUTATION_PER_TRADE)
+                .min(MAX_TRADING_REPUTATION);
+        } else if self.player_reputations.len() < MAX_PLAYER_REPUTATIONS {
+            self.player_reputations.push(VillagerPlayerReputation {
+                player,
+                trading: TRADING_REPUTATION_PER_TRADE,
+            });
+        }
+        Ok(result)
+    }
+
+    pub fn decay_trading_reputation(
+        &mut self,
+        game_time: i64,
+    ) -> Result<bool, VillagerMerchantError> {
+        if game_time < 0 {
+            return Err(VillagerMerchantError::InvalidGameTime);
+        }
+        let Some(last_decay) = self.last_reputation_decay_game_time else {
+            self.last_reputation_decay_game_time = Some(game_time);
+            return Ok(true);
+        };
+        if game_time < last_decay.saturating_add(DAY_LENGTH_TICKS) {
+            return Ok(false);
+        }
+
+        for reputation in &mut self.player_reputations {
+            reputation.trading = reputation
+                .trading
+                .saturating_sub(TRADING_REPUTATION_DECAY_PER_DAY);
+        }
+        self.player_reputations
+            .retain(|reputation| reputation.trading >= MIN_STORED_REPUTATION);
+        self.last_reputation_decay_game_time = Some(game_time);
+        self.validate()?;
+        Ok(true)
     }
 
     pub fn restock(&mut self, game_time: i64) -> Result<bool, VillagerMerchantError> {
@@ -209,6 +332,7 @@ pub enum VillagerMerchantError {
     InvalidCounters,
     InvalidPriceMultiplier,
     InvalidGameTime,
+    InvalidReputation,
     UnknownOffer,
     OutOfStock,
 }
@@ -254,6 +378,69 @@ mod tests {
             merchant.record_trade(0),
             Err(VillagerMerchantError::OutOfStock)
         );
+    }
+
+    #[test]
+    fn successful_player_trades_build_bounded_reputation_and_lower_personal_price() {
+        let player = Uuid::from_u128(7);
+        let mut offer = offer();
+        offer.price_multiplier = 0.2;
+        offer.max_uses = 100;
+        let mut merchant = VillagerMerchantState::new(vec![offer]).unwrap();
+
+        assert_eq!(merchant.player_special_price(player, 0), Some(0));
+        assert_eq!(
+            merchant.modified_cost_a_count_for_player(player, 0, 64),
+            Some(15)
+        );
+        for _ in 0..3 {
+            merchant.record_player_trade(player, 0).unwrap();
+        }
+
+        assert_eq!(merchant.trading_reputation(player), 6);
+        assert_eq!(merchant.player_special_price(player, 0), Some(-1));
+        assert_eq!(
+            merchant.modified_cost_a_count_for_player(player, 0, 64),
+            Some(14)
+        );
+        for _ in 0..20 {
+            merchant.record_player_trade(player, 0).unwrap();
+        }
+        assert_eq!(merchant.trading_reputation(player), MAX_TRADING_REPUTATION);
+        assert_eq!(merchant.trading_reputation(Uuid::from_u128(8)), 0);
+    }
+
+    #[test]
+    fn full_reputation_ledger_never_rejects_or_duplicates_a_trade() {
+        let mut merchant = VillagerMerchantState::new(vec![offer()]).unwrap();
+        merchant.player_reputations = (0..MAX_PLAYER_REPUTATIONS)
+            .map(|index| VillagerPlayerReputation {
+                player: Uuid::from_u128(index as u128 + 1),
+                trading: MIN_STORED_REPUTATION,
+            })
+            .collect();
+        let newcomer = Uuid::from_u128(1_000);
+
+        merchant.record_player_trade(newcomer, 0).unwrap();
+        assert_eq!(merchant.offers[0].uses, 1);
+        assert_eq!(merchant.trading_reputation(newcomer), 0);
+        assert_eq!(merchant.player_reputations.len(), MAX_PLAYER_REPUTATIONS);
+        merchant.validate().unwrap();
+    }
+
+    #[test]
+    fn trading_reputation_decays_once_per_vanilla_day_and_drops_values_below_two() {
+        let player = Uuid::from_u128(7);
+        let mut merchant = VillagerMerchantState::new(vec![offer()]).unwrap();
+        merchant.record_player_trade(player, 0).unwrap();
+        assert_eq!(merchant.trading_reputation(player), 2);
+
+        assert!(merchant.decay_trading_reputation(100).unwrap());
+        assert!(!merchant.decay_trading_reputation(24_099).unwrap());
+        assert_eq!(merchant.trading_reputation(player), 2);
+        assert!(merchant.decay_trading_reputation(24_100).unwrap());
+        assert_eq!(merchant.trading_reputation(player), 0);
+        assert!(merchant.player_reputations.is_empty());
     }
 
     #[test]

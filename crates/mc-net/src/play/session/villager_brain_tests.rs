@@ -419,6 +419,7 @@ fn unsupported_job_site_keeps_villager_unemployed_without_merchant_state() {
 fn working_villager_restocks_only_at_job_site_with_cooldown_and_daily_limit() {
     let registry = SessionRegistry::new();
     let id = install_brain(&registry);
+    let customer = crate::login::offline_uuid("RestockCustomer");
     {
         let mut entities = registry.lock_entities("install villager restock fixture");
         let expected = entities.snapshot(id).unwrap();
@@ -431,6 +432,7 @@ fn working_villager_restocks_only_at_job_site_with_cooldown_and_daily_limit() {
             0.2,
         )])
         .unwrap();
+        merchant.record_player_trade(customer, 0).unwrap();
         merchant.offers[0].uses = 1;
         next.retained.villager_merchant = Some(merchant);
         assert!(entities.replace_snapshot_if_current(expected, next));
@@ -441,11 +443,13 @@ fn working_villager_restocks_only_at_job_site_with_cooldown_and_daily_limit() {
         .lock_entities("read merchant away from job site")
         .snapshot(id)
         .unwrap();
+    let away_merchant = away.retained.villager_merchant.as_ref().unwrap();
     assert_eq!(
-        away.retained.villager_merchant.as_ref().unwrap().offers[0].uses,
-        1,
+        away_merchant.offers[0].uses, 1,
         "work activity alone must not restock away from the claimed job site"
     );
+    assert_eq!(away_merchant.trading_reputation(customer), 2);
+    assert_eq!(away_merchant.last_reputation_decay_game_time, Some(2_000));
 
     {
         let mut entities = registry.lock_entities("move merchant to job site");
@@ -506,6 +510,12 @@ fn working_villager_restocks_only_at_job_site_with_cooldown_and_daily_limit() {
     assert_eq!(next_day_merchant.offers[0].uses, 0);
     assert_eq!(next_day_merchant.restocks_today, 1);
     assert_eq!(next_day_merchant.last_restock_day, 1);
+    assert_eq!(next_day_merchant.trading_reputation(customer), 0);
+    assert!(next_day_merchant.player_reputations.is_empty());
+    assert_eq!(
+        next_day_merchant.last_reputation_decay_game_time,
+        Some(26_000)
+    );
 }
 
 #[tokio::test]

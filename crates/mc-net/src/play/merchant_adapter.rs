@@ -9,6 +9,9 @@ pub(super) async fn open_merchant_container<W>(
 where
     W: AsyncWriteExt + Unpin,
 {
+    let Some(customer) = state.sessions.session_player_uuid(state.session_id) else {
+        return Ok(false);
+    };
     let Some(merchant) = state.sessions.villager_merchant_snapshot(entity_id) else {
         return Ok(false);
     };
@@ -24,6 +27,7 @@ where
     let window = MerchantWindow::new(
         next_container_id(state),
         entity_id,
+        customer,
         merchant,
         merchant_input,
     );

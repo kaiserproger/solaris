@@ -461,18 +461,19 @@ fn assigned_toolsmith_profession_and_merchant_catalog_survive_checkpoint_restart
                 meeting_point: Some(Vec3::new(3.5, 64.0, 1.5)),
             },
         ));
-    record.snapshot.retained.villager_merchant = Some(
-        mc_entity::villager_merchant_26_1_2::VillagerMerchantState::new(vec![
-            mc_entity::villager_merchant_26_1_2::VillagerTradeOffer::new(
-                mc_entity::villager_merchant_26_1_2::VillagerTradeCost::new(1, 15),
-                EntityItemStack::new(1, 1),
-                16,
-                2,
-                0.05,
-            ),
-        ])
-        .unwrap(),
-    );
+    let customer = uuid::Uuid::from_u128(99);
+    let mut merchant = mc_entity::villager_merchant_26_1_2::VillagerMerchantState::new(vec![
+        mc_entity::villager_merchant_26_1_2::VillagerTradeOffer::new(
+            mc_entity::villager_merchant_26_1_2::VillagerTradeCost::new(1, 15),
+            EntityItemStack::new(1, 1),
+            16,
+            2,
+            0.05,
+        ),
+    ])
+    .unwrap();
+    merchant.record_player_trade(customer, 0).unwrap();
+    record.snapshot.retained.villager_merchant = Some(merchant);
 
     save_persisted_entity_records(
         tmp.path(),
@@ -489,7 +490,9 @@ fn assigned_toolsmith_profession_and_merchant_catalog_survive_checkpoint_restart
         retained.villager.unwrap().profession,
         mc_entity::VillagerProfession::Toolsmith
     );
-    assert_eq!(retained.villager_merchant.as_ref().unwrap().offers.len(), 1);
+    let merchant = retained.villager_merchant.as_ref().unwrap();
+    assert_eq!(merchant.offers.len(), 1);
+    assert_eq!(merchant.trading_reputation(customer), 2);
 }
 
 #[test]

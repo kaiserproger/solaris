@@ -2367,7 +2367,7 @@ where
         writer,
         &ClientboundMerchantOffers {
             container_id: window.container_id,
-            offers: merchant_protocol_offers(&window.merchant),
+            offers: merchant_protocol_offers(window),
             villager_level: i32::from(window.merchant.level()),
             villager_xp: window.merchant.xp,
             show_progress: true,

@@ -122,6 +122,12 @@ fn merchant_trade_commits_player_and_villager_once_and_rejects_stale_replay() {
     assert_eq!(committed.merchant_input, None);
     assert_eq!(committed.merchant.offers[0].uses, 1);
     assert_eq!(committed.merchant.xp, 1);
+    assert_eq!(
+        committed
+            .merchant
+            .trading_reputation(crate::login::offline_uuid("MerchantOwner")),
+        2
+    );
     let snapshot = registry
         .lock_entities("read committed merchant")
         .snapshot(entity_id)
@@ -141,18 +147,16 @@ fn merchant_trade_commits_player_and_villager_once_and_rejects_stale_replay() {
             .commit_merchant_trade(&authority, session, &plan)
             .is_none()
     );
+    let replayed = registry
+        .lock_entities("read replay merchant")
+        .snapshot(entity_id)
+        .unwrap();
+    let replayed = replayed.retained.villager_merchant.as_ref().unwrap();
+    assert_eq!(replayed.offers[0].uses, 1);
     assert_eq!(
-        registry
-            .lock_entities("read replay merchant")
-            .snapshot(entity_id)
-            .unwrap()
-            .retained
-            .villager_merchant
-            .as_ref()
-            .unwrap()
-            .offers[0]
-            .uses,
-        1
+        replayed.trading_reputation(crate::login::offline_uuid("MerchantOwner")),
+        2,
+        "stale replay must not duplicate reputation"
     );
 }
 

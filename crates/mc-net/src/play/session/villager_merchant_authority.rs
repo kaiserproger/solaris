@@ -18,6 +18,13 @@ use super::{
 };
 
 impl SessionRegistry {
+    pub(in crate::play) fn session_player_uuid(&self, session_id: SessionId) -> Option<uuid::Uuid> {
+        self.lock_inner("read merchant customer uuid")
+            .sessions
+            .get(&session_id)
+            .map(|session| session.uuid)
+    }
+
     pub(in crate::play) fn villager_merchant_snapshot(
         &self,
         entity_id: EntityId,
@@ -36,7 +43,10 @@ impl SessionRegistry {
         plan: &MerchantTradePlan,
     ) -> Option<CommittedMerchantTrade> {
         let mut inner = self.lock_session_entities("commit villager merchant trade");
-        let player_pose = inner.sessions.get(&actor_session)?.pose;
+        let (player_pose, player_uuid) = inner
+            .sessions
+            .get(&actor_session)
+            .map(|session| (session.pose, session.uuid))?;
         let player_state = inner.player_persistence.get(&actor_session)?.clone();
         let wait_started = Instant::now();
         let guard = player_state.lock().unwrap_or_else(|poisoned| {
@@ -76,14 +86,20 @@ impl SessionRegistry {
         }
         let mut villager = entity.retained.villager?;
         let offer = plan.expected_merchant.offers.get(plan.offer_index)?;
-        let modified_cost_a = offer.modified_cost_a_count(plan.cost_a_max_stack);
+        let modified_cost_a = plan.expected_merchant.modified_cost_a_count_for_player(
+            player_uuid,
+            plan.offer_index,
+            plan.cost_a_max_stack,
+        )?;
         let mut inputs = *plan.expected_merchant_input.clone()?;
         if !inputs_satisfy_offer(&inputs, offer, modified_cost_a) {
             return None;
         }
 
         let mut merchant = plan.expected_merchant.clone();
-        let (result, _) = merchant.record_trade(plan.offer_index).ok()?;
+        let (result, _) = merchant
+            .record_player_trade(player_uuid, plan.offer_index)
+            .ok()?;
         let result = wire_item_stack(&result);
         let mut inventory = plan.expected_inventory.clone();
         let mut carried_item = plan.expected_carried_item.clone();

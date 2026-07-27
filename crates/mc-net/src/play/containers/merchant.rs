@@ -13,6 +13,7 @@ pub(in crate::play) const MERCHANT_MENU_SLOT_COUNT: usize = 39;
 pub(in crate::play) struct MerchantWindow {
     pub(in crate::play) container_id: i32,
     pub(in crate::play) entity_id: mc_entity::EntityId,
+    pub(in crate::play) customer: uuid::Uuid,
     pub(in crate::play) state_id: i32,
     pub(in crate::play) selected_offer: Option<usize>,
     pub(in crate::play) inputs: [ItemStack; 2],
@@ -24,12 +25,14 @@ impl MerchantWindow {
     pub(in crate::play) fn new(
         container_id: i32,
         entity_id: mc_entity::EntityId,
+        customer: uuid::Uuid,
         merchant: VillagerMerchantState,
         persisted_inputs: Option<Box<[ItemStack; 2]>>,
     ) -> Self {
         Self {
             container_id,
             entity_id,
+            customer,
             state_id: 1,
             selected_offer: None,
             inputs: persisted_inputs.map_or_else(
@@ -96,11 +99,13 @@ fn wire_item_stack(stack: &mc_entity::EntityItemStack) -> ItemStack {
     }
 }
 
-pub(in crate::play) fn protocol_offers(merchant: &VillagerMerchantState) -> Vec<MerchantOffer> {
-    merchant
+pub(in crate::play) fn protocol_offers(window: &MerchantWindow) -> Vec<MerchantOffer> {
+    window
+        .merchant
         .offers
         .iter()
-        .map(|offer| MerchantOffer {
+        .enumerate()
+        .map(|(offer_index, offer)| MerchantOffer {
             cost_a: MerchantItemCost {
                 item_id: offer.cost_a.item_id,
                 count: offer.cost_a.count,
@@ -114,7 +119,10 @@ pub(in crate::play) fn protocol_offers(merchant: &VillagerMerchantState) -> Vec<
             uses: offer.uses,
             max_uses: offer.max_uses,
             xp: offer.xp,
-            special_price: offer.special_price,
+            special_price: window
+                .merchant
+                .player_special_price(window.customer, offer_index)
+                .unwrap_or(offer.special_price),
             price_multiplier: offer.price_multiplier,
             demand: offer.demand,
         })
@@ -142,7 +150,10 @@ pub(in crate::play) fn select_offer(
     )?;
 
     let max_a = item_max_stack_for_id(item_facts, items, offer.cost_a.item_id);
-    let count_a = offer.modified_cost_a_count(max_a);
+    let count_a =
+        window
+            .merchant
+            .modified_cost_a_count_for_player(window.customer, selection, max_a)?;
     updated_window.inputs[0] =
         take_cost(&mut updated_inventory, offer.cost_a.item_id, count_a, max_a)?;
     if let Some(cost_b) = offer.cost_b {
@@ -171,7 +182,14 @@ pub(in crate::play) fn refresh_selected_offer(
         return;
     };
     let max_a = item_max_stack_for_id(item_facts, items, offer.cost_a.item_id);
-    let modified_cost_a = offer.modified_cost_a_count(max_a);
+    let Some(modified_cost_a) =
+        window
+            .merchant
+            .modified_cost_a_count_for_player(window.customer, offer_index, max_a)
+    else {
+        window.result = ItemStack::EMPTY;
+        return;
+    };
     if offer.is_out_of_stock() || !inputs_satisfy_offer(&window.inputs, offer, modified_cost_a) {
         window.result = ItemStack::EMPTY;
         return;
@@ -275,7 +293,13 @@ mod tests {
             0.2,
         )])
         .unwrap();
-        let window = MerchantWindow::new(2, mc_entity::EntityId(7), merchant, None);
+        let window = MerchantWindow::new(
+            2,
+            mc_entity::EntityId(7),
+            uuid::Uuid::from_u128(7),
+            merchant,
+            None,
+        );
         let mut inventory = PlayerInventory::empty();
         inventory.slots[36] = ItemStack::new(emerald, 3);
 
@@ -303,7 +327,13 @@ mod tests {
             0.05,
         )])
         .unwrap();
-        let window = MerchantWindow::new(2, mc_entity::EntityId(7), merchant, None);
+        let window = MerchantWindow::new(
+            2,
+            mc_entity::EntityId(7),
+            uuid::Uuid::from_u128(7),
+            merchant,
+            None,
+        );
         let mut inventory = PlayerInventory::empty();
         inventory.slots[36] = ItemStack::new(coal, 8);
         inventory.slots[37] = ItemStack::new(coal, 24);
@@ -318,5 +348,45 @@ mod tests {
         refresh_selected_offer(&items, &facts, &mut selected);
         assert_eq!(selected.inputs[0], ItemStack::new(coal, 17));
         assert_eq!(selected.result, ItemStack::new(emerald, 1));
+    }
+
+    #[test]
+    fn protocol_and_selection_apply_only_the_current_customers_reputation() {
+        let items = mc_data::items::solaris_required_items();
+        let facts = mc_data::item_components::solaris_required_item_facts();
+        let emerald = items
+            .id_of(&mc_data::Identifier::parse("minecraft:emerald").unwrap())
+            .unwrap();
+        let axe = items
+            .id_of(&mc_data::Identifier::parse("minecraft:stone_axe").unwrap())
+            .unwrap();
+        let customer = uuid::Uuid::from_u128(7);
+        let mut offer = VillagerTradeOffer::new(
+            VillagerTradeCost::new(emerald, 5),
+            EntityItemStack::new(axe, 1),
+            12,
+            1,
+            1.0,
+        );
+        offer.max_uses = 16;
+        let mut merchant = VillagerMerchantState::new(vec![offer]).unwrap();
+        merchant.record_player_trade(customer, 0).unwrap();
+        let window = MerchantWindow::new(2, mc_entity::EntityId(7), customer, merchant, None);
+        let mut inventory = PlayerInventory::empty();
+        inventory.slots[36] = ItemStack::new(emerald, 3);
+
+        assert_eq!(protocol_offers(&window)[0].special_price, -2);
+        let (selected, inventory) = select_offer(&items, &facts, &window, &inventory, 0).unwrap();
+        assert_eq!(selected.inputs[0], ItemStack::new(emerald, 3));
+        assert_eq!(inventory.slots[36], ItemStack::EMPTY);
+
+        let stranger = MerchantWindow::new(
+            3,
+            mc_entity::EntityId(7),
+            uuid::Uuid::from_u128(8),
+            window.merchant,
+            None,
+        );
+        assert_eq!(protocol_offers(&stranger)[0].special_price, 0);
     }
 }
