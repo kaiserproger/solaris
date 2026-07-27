@@ -11,6 +11,8 @@ use mc_entity::{
 use mc_protocol::packets::play::{GameMode, ItemStack};
 use tokio::sync::mpsc;
 
+use super::entity_combat::commit_villager_killed_witness_gossip;
+use super::entity_lifecycle::track_entity_chunk_locked;
 use super::*;
 use crate::login::LoggedInProfile;
 use crate::play::persistence::PlayerPersistedState;
@@ -86,6 +88,28 @@ fn spawn_merchant(
     ));
     spawn.retained.villager_merchant = Some(merchant);
     entities.spawn(spawn)
+}
+
+fn spawn_tracked_villager(
+    registry: &SessionRegistry,
+    position: Vec3,
+    merchant: Option<VillagerMerchantState>,
+) -> mc_entity::EntityId {
+    let mut inner = registry.lock_session_entities("spawn tracked villager gossip fixture");
+    let mut spawn = SpawnEntity::new(139, "minecraft:villager", position);
+    spawn.retained.villager = Some(VillagerData::new(
+        VillagerKind::Plains,
+        if merchant.is_some() {
+            VillagerProfession::Toolsmith
+        } else {
+            VillagerProfession::None
+        },
+        1,
+    ));
+    spawn.retained.villager_merchant = merchant;
+    let id = inner.entities.spawn(spawn);
+    track_entity_chunk_locked(&mut inner, id, position);
+    id
 }
 
 fn trade_plan(
@@ -176,6 +200,148 @@ fn player_hurt_records_minor_negative_once_with_accepted_damage() {
             .minor_negative_value(player_uuid),
         25,
         "invulnerability replay must not duplicate hurt gossip"
+    );
+}
+
+#[test]
+fn lethal_player_attack_records_major_negative_for_indexed_witnesses_once() {
+    let registry = SessionRegistry::new();
+    let authority = SimulationAuthority::for_test();
+    let (session, state) = register_player(&registry, "VillagerMurderer");
+    let victim = spawn_tracked_villager(&registry, Vec3::new(1.5, 64.0, 0.5), None);
+    let witness = spawn_tracked_villager(
+        &registry,
+        Vec3::new(17.0, 79.5, 0.5),
+        Some(merchant(17, 23)),
+    );
+    let outside = spawn_tracked_villager(&registry, Vec3::new(18.1, 64.0, 0.5), None);
+    let costs = {
+        let player = state.lock().unwrap();
+        unchanged_attack_plan(&player)
+    };
+    let pose = PlayerPose::new(0.5, 64.0, 0.5);
+
+    assert!(matches!(
+        registry.player_attack_server_entity(
+            &authority,
+            ServerEntityPlayerAttack {
+                entity_id: victim,
+                amount: 100.0,
+                game_mode: GameMode::Survival,
+                player_pose: pose,
+                attacker: Some((session, &costs)),
+            },
+        ),
+        PlayerAttackResult::Damaged(outcome)
+            if matches!(*outcome, EntityAttackOutcome::Killed { .. })
+    ));
+
+    let murderer = crate::login::offline_uuid("VillagerMurderer");
+    let entities = registry.lock_entities("read villager killed gossip");
+    let victim_after = entities.snapshot(victim).unwrap();
+    assert_eq!(
+        victim_after
+            .retained
+            .villager_gossip
+            .as_ref()
+            .unwrap()
+            .minor_negative_value(murderer),
+        25,
+        "the murdered villager still receives the direct hurt event"
+    );
+    let witness_after = entities.snapshot(witness).unwrap();
+    let witness_gossip = witness_after.retained.villager_gossip.as_ref().unwrap();
+    assert_eq!(witness_gossip.major_negative_value(murderer), 25);
+    assert_eq!(witness_gossip.player_reputation(murderer), -125);
+    let offer = &witness_after
+        .retained
+        .villager_merchant
+        .as_ref()
+        .unwrap()
+        .offers[0];
+    assert_eq!(offer.special_price_for_reputation(-125), 25);
+    assert_eq!(offer.modified_cost_a_count_for_reputation(64, -125), 26);
+    assert!(
+        entities
+            .snapshot(outside)
+            .unwrap()
+            .retained
+            .villager_gossip
+            .is_none(),
+        "a villager beyond the victim's 16-block sensor AABB must not witness the kill"
+    );
+    drop(entities);
+
+    assert!(matches!(
+        registry.player_attack_server_entity(
+            &authority,
+            ServerEntityPlayerAttack {
+                entity_id: victim,
+                amount: 100.0,
+                game_mode: GameMode::Survival,
+                player_pose: pose,
+                attacker: Some((session, &costs)),
+            },
+        ),
+        PlayerAttackResult::AcceptedNoDamage
+    ));
+    assert_eq!(
+        registry
+            .lock_entities("read villager killed replay")
+            .snapshot(witness)
+            .unwrap()
+            .retained
+            .villager_gossip
+            .as_ref()
+            .unwrap()
+            .major_negative_value(murderer),
+        25,
+        "replaying lethal damage must not duplicate the witness event"
+    );
+}
+
+#[test]
+fn stale_kill_witness_isolated_without_starving_current_neighbor() {
+    let registry = SessionRegistry::new();
+    let murderer = uuid::Uuid::from_u128(0xDEAD);
+    let stale = spawn_tracked_villager(&registry, Vec3::new(1.5, 64.0, 0.5), None);
+    let current = spawn_tracked_villager(&registry, Vec3::new(2.5, 64.0, 0.5), None);
+    let mut entities = registry.lock_entities("commit stale villager killed witnesses");
+    let stale_expected = entities.snapshot(stale).unwrap();
+    let current_expected = entities.snapshot(current).unwrap();
+
+    let mut stale_current = stale_expected.clone();
+    stale_current
+        .retained
+        .villager_gossip
+        .get_or_insert_with(Default::default)
+        .record_event(
+            mc_entity::villager_gossip_26_1_2::VillagerGossipEvent::Trade { player: murderer },
+        );
+    assert!(entities.replace_snapshot_if_current(stale_expected.clone(), stale_current));
+    assert_eq!(
+        commit_villager_killed_witness_gossip(
+            &mut entities,
+            vec![stale_expected, current_expected],
+            murderer,
+        ),
+        1
+    );
+
+    let stale_after = entities.snapshot(stale).unwrap();
+    let stale_gossip = stale_after.retained.villager_gossip.as_ref().unwrap();
+    assert_eq!(stale_gossip.trading_value(murderer), 2);
+    assert_eq!(stale_gossip.major_negative_value(murderer), 0);
+    assert_eq!(
+        entities
+            .snapshot(current)
+            .unwrap()
+            .retained
+            .villager_gossip
+            .as_ref()
+            .unwrap()
+            .major_negative_value(murderer),
+        25
     );
 }
 

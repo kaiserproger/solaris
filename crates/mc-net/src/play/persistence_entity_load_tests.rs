@@ -503,6 +503,7 @@ fn assigned_toolsmith_profession_and_merchant_catalog_survive_checkpoint_restart
     let gossip = retained.villager_gossip.as_ref().unwrap();
     assert_eq!(gossip.trading_value(customer), 2);
     assert_eq!(gossip.minor_negative_value(customer), 25);
+    assert_eq!(gossip.major_negative_value(customer), 0);
     assert_eq!(gossip.last_decay_game_time, 777);
 }
 
@@ -528,6 +529,10 @@ fn transferred_gossip_survives_checkpoint_while_runtime_interaction_resets() {
             .unwrap()
     );
     assert_eq!(receiver.minor_negative_value(player), 30);
+    assert!(receiver.record_event(
+        mc_entity::villager_gossip_26_1_2::VillagerGossipEvent::KilledByPlayer { player },
+    ));
+    assert_eq!(receiver.major_negative_value(player), 25);
 
     let mut record = PersistedEntityRecord::from(snapshot(48, EntityLifecycle::Alive));
     record.snapshot.type_id = 139;
@@ -561,6 +566,14 @@ fn transferred_gossip_survives_checkpoint_while_runtime_interaction_resets() {
             .unwrap()
             .minor_negative_value(player),
         30
+    );
+    assert_eq!(
+        retained
+            .villager_gossip
+            .as_ref()
+            .unwrap()
+            .major_negative_value(player),
+        25
     );
     let brain = retained.villager_brain.as_ref().unwrap();
     assert_eq!(brain.interaction_target, None);

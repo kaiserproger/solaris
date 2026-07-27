@@ -95,6 +95,7 @@ class AgentClient:
         self.bridge_url = validate_loopback_url(bridge_url)
         self.secret = secret
         self.next_id = 1
+        self.opener = request.build_opener(request.ProxyHandler({}))
 
     def call(self, command: str, payload: dict[str, Any], timeout_seconds: float) -> dict[str, Any]:
         request_id = self.next_id
@@ -115,7 +116,7 @@ class AgentClient:
             method="POST",
         )
         try:
-            with request.urlopen(rpc_request, timeout=timeout_seconds) as response:
+            with self.opener.open(rpc_request, timeout=timeout_seconds) as response:
                 decoded = json.loads(response.read().decode("utf-8"))
         except error.HTTPError as exc:
             raise RuntimeError(structured_http_error(command, request_id, exc)) from exc

@@ -1,24 +1,108 @@
-use super::entity_lifecycle::schedule_entity_death_locked;
+use super::entity_lifecycle::{nearby_entity_candidate_ids_locked, schedule_entity_death_locked};
 use super::interaction_geometry::{entity_geometry, within_entity_attack_reach};
 use super::player_combat::held_attack_range;
 use super::player_state::{apply_player_survival_plan_locked, player_attack_cost_plan_matches};
 use super::script_commit_events::push_player_entity_killed_event_locked;
 use super::{
     CommittedPlayerAttackCosts, ENTITY_DEATH_TICKS, ENTITY_EVENT_DEATH,
-    ENTITY_HURT_INVULNERABLE_TICKS, EntityAttackOutcome, EntityKillRewards, OutboundCommand,
-    PlayerAttackResult, ServerEntitySnapshot, SessionEntityGuards, SessionId, SessionRegistry,
-    VisibilityDispatch, apply_player_melee_knockback_locked, entity_event_dispatches_locked,
-    entity_item_stack, entity_kill_drop_stacks, mob_xp_value, record_entity_dispatches_locked,
-    server_entity_snapshot_from, session_recipients, spawn_item_drop_locked, spawn_xp_orb_locked,
-    visibility_dispatches, visible_entity_observers_locked,
+    ENTITY_HURT_INVULNERABLE_TICKS, EntityAttackOutcome, EntityKillRewards, EntityStoreGuard,
+    OutboundCommand, PlayerAttackResult, ServerEntitySnapshot, SessionEntityGuards, SessionId,
+    SessionRegistry, VisibilityDispatch, apply_player_melee_knockback_locked,
+    entity_event_dispatches_locked, entity_item_stack, entity_kill_drop_stacks, mob_xp_value,
+    record_entity_dispatches_locked, server_entity_snapshot_from, session_recipients,
+    spawn_item_drop_locked, spawn_xp_orb_locked, visibility_dispatches,
+    visible_entity_observers_locked,
 };
 use crate::play::simulation::{PlayerSurvivalPlan, SimulationAuthority};
 use crate::play::{GameMode, PlayerPose};
 use mc_entity::{
-    EntityDamageRequest, EntityEffectRejection, EntityEffectRequest, EntityEffectResult, EntityId,
-    EntitySnapshot, Vec3,
+    AttributeKind, EntityDamageRequest, EntityEffectRejection, EntityEffectRequest,
+    EntityEffectResult, EntityId, EntityLifecycle, EntitySnapshot, Vec3,
 };
 use std::time::Instant;
+
+const VILLAGER_WITNESS_FOLLOW_RANGE_DEFAULT: f64 = 16.0;
+const VILLAGER_WITNESS_FOLLOW_RANGE_MAX: f64 = 2_048.0;
+
+fn villager_killed_witness_snapshots_locked(
+    inner: &SessionEntityGuards<'_>,
+    victim: &EntitySnapshot,
+) -> Vec<EntitySnapshot> {
+    if victim.type_name != "minecraft:villager" || victim.retained.villager.is_none() {
+        return Vec::new();
+    }
+    let follow_range = victim
+        .attributes
+        .base(&AttributeKind::FollowRange)
+        .unwrap_or(VILLAGER_WITNESS_FOLLOW_RANGE_DEFAULT);
+    if !follow_range.is_finite() || follow_range <= 0.0 {
+        return Vec::new();
+    }
+    let follow_range = follow_range.min(VILLAGER_WITNESS_FOLLOW_RANGE_MAX);
+    nearby_entity_candidate_ids_locked(inner, victim.position, follow_range)
+        .into_iter()
+        .filter(|id| *id != victim.id)
+        .filter_map(|id| inner.entities.snapshot(id))
+        .filter(|witness| {
+            witness.lifecycle == EntityLifecycle::Alive
+                && witness.type_name == "minecraft:villager"
+                && witness.retained.villager.is_some()
+                && (witness.position.x - victim.position.x).abs() <= follow_range
+                && (witness.position.y - victim.position.y).abs() <= follow_range
+                && (witness.position.z - victim.position.z).abs() <= follow_range
+        })
+        .collect()
+}
+
+pub(super) fn commit_villager_killed_witness_gossip(
+    entities: &mut EntityStoreGuard<'_>,
+    witnesses: Vec<EntitySnapshot>,
+    murderer: uuid::Uuid,
+) -> usize {
+    let transitions = witnesses
+        .into_iter()
+        .filter_map(|expected| {
+            if expected.lifecycle != EntityLifecycle::Alive
+                || expected.type_name != "minecraft:villager"
+                || expected.retained.villager.is_none()
+            {
+                return None;
+            }
+            let mut next = expected.clone();
+            let gossip = next
+                .retained
+                .villager_gossip
+                .get_or_insert_with(Default::default);
+            gossip
+                .record_event(
+                    mc_entity::villager_gossip_26_1_2::VillagerGossipEvent::KilledByPlayer {
+                        player: murderer,
+                    },
+                )
+                .then_some((expected, next))
+        })
+        .collect::<Vec<_>>();
+    commit_villager_killed_witness_gossip_batch(entities, transitions)
+}
+
+fn commit_villager_killed_witness_gossip_batch(
+    entities: &mut EntityStoreGuard<'_>,
+    mut batch: Vec<(EntitySnapshot, EntitySnapshot)>,
+) -> usize {
+    let count = batch.len();
+    if count == 0 {
+        return 0;
+    }
+    if entities.replace_snapshots_if_current(batch.iter().cloned()) {
+        return count;
+    }
+    if count == 1 {
+        return 0;
+    }
+    let right = batch.split_off(count / 2);
+    commit_villager_killed_witness_gossip_batch(entities, batch)
+        + commit_villager_killed_witness_gossip_batch(entities, right)
+}
 
 pub(in crate::play) struct ServerEntityPlayerAttack<'a> {
     pub(in crate::play) entity_id: EntityId,
@@ -364,9 +448,28 @@ pub(super) fn attack_server_entity_locked(
     rewards: &EntityKillRewards,
     gossip_event: Option<mc_entity::villager_gossip_26_1_2::VillagerGossipEvent>,
 ) -> Option<EntityAttackOutcome> {
-    let damage = damage_server_entity_locked(inner, entity_id, amount, gossip_event)?;
+    let expected = inner.entities.snapshot(entity_id)?;
+    let murderer = match gossip_event {
+        Some(mc_entity::villager_gossip_26_1_2::VillagerGossipEvent::HurtByPlayer { player }) => {
+            Some(player)
+        }
+        _ => None,
+    };
+    let witnesses = if murderer.is_some()
+        && amount.is_finite()
+        && amount >= expected.health
+        && expected.lifecycle == EntityLifecycle::Alive
+    {
+        villager_killed_witness_snapshots_locked(inner, &expected)
+    } else {
+        Vec::new()
+    };
+    let damage = damage_expected_server_entity_locked(inner, expected, amount, gossip_event)?;
     let health_dispatches = publish_accepted_entity_health_locked(inner, &damage.snapshot);
     if damage.killed {
+        if let Some(murderer) = murderer {
+            commit_villager_killed_witness_gossip(&mut inner.entities, witnesses, murderer);
+        }
         let (entity, mut dispatches) = begin_server_entity_death_locked(inner, &damage, rewards);
         dispatches.splice(0..0, health_dispatches);
         return Some(EntityAttackOutcome::Killed {
@@ -387,14 +490,24 @@ pub(super) fn attack_server_entity_locked(
     })
 }
 
+#[cfg(test)]
 pub(super) fn damage_server_entity_locked(
     inner: &mut SessionEntityGuards<'_>,
     entity_id: EntityId,
     amount: f32,
     gossip_event: Option<mc_entity::villager_gossip_26_1_2::VillagerGossipEvent>,
 ) -> Option<mc_entity::EntityDamage> {
-    let tick = inner.entity_lifecycle_tick;
     let expected = inner.entities.snapshot(entity_id)?;
+    damage_expected_server_entity_locked(inner, expected, amount, gossip_event)
+}
+
+fn damage_expected_server_entity_locked(
+    inner: &mut SessionEntityGuards<'_>,
+    expected: EntitySnapshot,
+    amount: f32,
+    gossip_event: Option<mc_entity::villager_gossip_26_1_2::VillagerGossipEvent>,
+) -> Option<mc_entity::EntityDamage> {
+    let tick = inner.entity_lifecycle_tick;
     if expected
         .retained
         .last_damage_tick

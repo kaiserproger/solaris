@@ -13,12 +13,15 @@ const TRADING_DECAY_PER_DAY: i32 = 2;
 const MINOR_NEGATIVE_MAX: i32 = 200;
 const MINOR_NEGATIVE_ADD: i32 = 25;
 const MINOR_NEGATIVE_DECAY_PER_DAY: i32 = 20;
-const TRANSFER_DECAY: i32 = 20;
+const MAJOR_NEGATIVE_MAX: i32 = 100;
+const MAJOR_NEGATIVE_ADD: i32 = 25;
+const MAJOR_NEGATIVE_DECAY_PER_DAY: i32 = 10;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum VillagerGossipEvent {
     Trade { player: Uuid },
     HurtByPlayer { player: Uuid },
+    KilledByPlayer { player: Uuid },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -28,6 +31,8 @@ pub struct VillagerPlayerGossip {
     pub trading: i32,
     #[serde(default)]
     pub minor_negative: i32,
+    #[serde(default)]
+    pub major_negative: i32,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
@@ -46,7 +51,8 @@ impl VillagerGossipState {
         for (index, gossip) in self.player_gossips.iter().enumerate() {
             if !valid_stored_value(gossip.trading, TRADING_MAX)
                 || !valid_stored_value(gossip.minor_negative, MINOR_NEGATIVE_MAX)
-                || gossip.trading == 0 && gossip.minor_negative == 0
+                || !valid_stored_value(gossip.major_negative, MAJOR_NEGATIVE_MAX)
+                || gossip.trading == 0 && gossip.minor_negative == 0 && gossip.major_negative == 0
                 || self.player_gossips[..index]
                     .iter()
                     .any(|existing| existing.player == gossip.player)
@@ -62,7 +68,9 @@ impl VillagerGossipState {
         self.player_gossips
             .iter()
             .find(|gossip| gossip.player == player)
-            .map_or(0, |gossip| gossip.trading - gossip.minor_negative)
+            .map_or(0, |gossip| {
+                gossip.trading - gossip.minor_negative - 5 * gossip.major_negative
+            })
     }
 
     #[must_use]
@@ -81,6 +89,14 @@ impl VillagerGossipState {
             .map_or(0, |gossip| gossip.minor_negative)
     }
 
+    #[must_use]
+    pub fn major_negative_value(&self, player: Uuid) -> i32 {
+        self.player_gossips
+            .iter()
+            .find(|gossip| gossip.player == player)
+            .map_or(0, |gossip| gossip.major_negative)
+    }
+
     pub fn record_event(&mut self, event: VillagerGossipEvent) -> bool {
         let (player, field, amount, maximum) = match event {
             VillagerGossipEvent::Trade { player } => {
@@ -92,12 +108,22 @@ impl VillagerGossipState {
                 MINOR_NEGATIVE_ADD,
                 MINOR_NEGATIVE_MAX,
             ),
+            VillagerGossipEvent::KilledByPlayer { player } => (
+                player,
+                GossipField::MajorNegative,
+                MAJOR_NEGATIVE_ADD,
+                MAJOR_NEGATIVE_MAX,
+            ),
         };
         let Some(gossip) = self.player_gossip_mut_or_insert(player) else {
             return false;
         };
         let value = field.value_mut(gossip);
-        *value = value.saturating_add(amount).min(maximum);
+        let next = value.saturating_add(amount).min(maximum);
+        if next == *value {
+            return false;
+        }
+        *value = next;
         true
     }
 
@@ -118,7 +144,7 @@ impl VillagerGossipState {
         }
         let total_weight = entries
             .iter()
-            .map(|entry| u32::try_from(entry.value).expect("validated gossip is positive"))
+            .map(|entry| entry.selection_weight)
             .sum::<u32>();
         if total_weight == 0 {
             return Ok(false);
@@ -131,7 +157,7 @@ impl VillagerGossipState {
             let choice = random.next_int(total_weight);
             let mut cumulative = 0_u32;
             let Some(entry) = entries.iter().find(|entry| {
-                cumulative = cumulative.saturating_add(entry.value as u32);
+                cumulative = cumulative.saturating_add(entry.selection_weight);
                 choice < cumulative
             }) else {
                 continue;
@@ -149,7 +175,7 @@ impl VillagerGossipState {
             else {
                 continue;
             };
-            let transferred = entry.value.saturating_sub(TRANSFER_DECAY);
+            let transferred = entry.value.saturating_sub(field.transfer_decay());
             if transferred < DISCARD_THRESHOLD {
                 continue;
             }
@@ -189,6 +215,7 @@ impl VillagerGossipState {
                     player,
                     trading,
                     minor_negative: 0,
+                    major_negative: 0,
                 });
             }
         }
@@ -215,9 +242,12 @@ impl VillagerGossipState {
             gossip.trading = decayed_value(gossip.trading, TRADING_DECAY_PER_DAY);
             gossip.minor_negative =
                 decayed_value(gossip.minor_negative, MINOR_NEGATIVE_DECAY_PER_DAY);
+            gossip.major_negative =
+                decayed_value(gossip.major_negative, MAJOR_NEGATIVE_DECAY_PER_DAY);
         }
-        self.player_gossips
-            .retain(|gossip| gossip.trading != 0 || gossip.minor_negative != 0);
+        self.player_gossips.retain(|gossip| {
+            gossip.trading != 0 || gossip.minor_negative != 0 || gossip.major_negative != 0
+        });
         self.last_decay_game_time = game_time;
         self.validate()?;
         Ok(true)
@@ -238,18 +268,31 @@ impl VillagerGossipState {
             player,
             trading: 0,
             minor_negative: 0,
+            major_negative: 0,
         });
         self.player_gossips.last_mut()
     }
 
     fn transfer_entries(&self) -> Vec<TransferEntry> {
-        let mut entries = Vec::with_capacity(self.player_gossips.len().saturating_mul(2));
+        let mut entries = Vec::with_capacity(self.player_gossips.len().saturating_mul(3));
         for gossip in &self.player_gossips {
+            if gossip.major_negative > 0 {
+                entries.push(TransferEntry {
+                    player: gossip.player,
+                    field: GossipField::MajorNegative,
+                    value: gossip.major_negative,
+                    selection_weight: u32::try_from(gossip.major_negative)
+                        .expect("validated gossip is positive")
+                        .saturating_mul(5),
+                });
+            }
             if gossip.minor_negative > 0 {
                 entries.push(TransferEntry {
                     player: gossip.player,
                     field: GossipField::MinorNegative,
                     value: gossip.minor_negative,
+                    selection_weight: u32::try_from(gossip.minor_negative)
+                        .expect("validated gossip is positive"),
                 });
             }
             if gossip.trading > 0 {
@@ -257,6 +300,8 @@ impl VillagerGossipState {
                     player: gossip.player,
                     field: GossipField::Trading,
                     value: gossip.trading,
+                    selection_weight: u32::try_from(gossip.trading)
+                        .expect("validated gossip is positive"),
                 });
             }
         }
@@ -286,6 +331,7 @@ pub enum VillagerGossipError {
 enum GossipField {
     Trading,
     MinorNegative,
+    MajorNegative,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -293,6 +339,7 @@ struct TransferEntry {
     player: Uuid,
     field: GossipField,
     value: i32,
+    selection_weight: u32,
 }
 
 impl GossipField {
@@ -300,6 +347,14 @@ impl GossipField {
         match self {
             Self::Trading => &mut gossip.trading,
             Self::MinorNegative => &mut gossip.minor_negative,
+            Self::MajorNegative => &mut gossip.major_negative,
+        }
+    }
+
+    const fn transfer_decay(self) -> i32 {
+        match self {
+            Self::Trading | Self::MinorNegative => 20,
+            Self::MajorNegative => 10,
         }
     }
 }
@@ -357,7 +412,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn trade_and_hurt_events_use_exact_26_1_2_values_weights_and_caps() {
+    fn trade_hurt_and_kill_events_use_exact_26_1_2_values_weights_and_caps() {
         let player = Uuid::from_u128(7);
         let mut gossip = VillagerGossipState::default();
 
@@ -367,13 +422,19 @@ mod tests {
         assert!(gossip.record_event(VillagerGossipEvent::HurtByPlayer { player }));
         assert_eq!(gossip.minor_negative_value(player), 25);
         assert_eq!(gossip.player_reputation(player), -23);
+        assert!(gossip.record_event(VillagerGossipEvent::KilledByPlayer { player }));
+        assert_eq!(gossip.major_negative_value(player), 25);
+        assert_eq!(gossip.player_reputation(player), -148);
 
         for _ in 0..100 {
             gossip.record_event(VillagerGossipEvent::Trade { player });
             gossip.record_event(VillagerGossipEvent::HurtByPlayer { player });
+            gossip.record_event(VillagerGossipEvent::KilledByPlayer { player });
         }
         assert_eq!(gossip.trading_value(player), TRADING_MAX);
         assert_eq!(gossip.minor_negative_value(player), MINOR_NEGATIVE_MAX);
+        assert_eq!(gossip.major_negative_value(player), MAJOR_NEGATIVE_MAX);
+        assert_eq!(gossip.player_reputation(player), -675);
         gossip.validate().unwrap();
     }
 
@@ -383,6 +444,7 @@ mod tests {
         let mut gossip = VillagerGossipState::default();
         gossip.record_event(VillagerGossipEvent::Trade { player });
         gossip.record_event(VillagerGossipEvent::HurtByPlayer { player });
+        gossip.record_event(VillagerGossipEvent::KilledByPlayer { player });
 
         assert!(!gossip.decay(0).unwrap());
         assert_eq!(gossip.last_decay_game_time, 0);
@@ -391,10 +453,16 @@ mod tests {
         assert!(!gossip.decay(24_099).unwrap());
         assert_eq!(gossip.trading_value(player), 2);
         assert_eq!(gossip.minor_negative_value(player), 25);
+        assert_eq!(gossip.major_negative_value(player), 25);
         assert!(gossip.decay(24_100).unwrap());
         assert_eq!(gossip.trading_value(player), 0);
         assert_eq!(gossip.minor_negative_value(player), 5);
+        assert_eq!(gossip.major_negative_value(player), 15);
         assert!(gossip.decay(48_100).unwrap());
+        assert_eq!(gossip.minor_negative_value(player), 0);
+        assert_eq!(gossip.major_negative_value(player), 5);
+        assert_eq!(gossip.player_reputation(player), -25);
+        assert!(gossip.decay(72_100).unwrap());
         assert_eq!(gossip.player_reputation(player), 0);
         assert!(gossip.player_gossips.is_empty());
     }
@@ -416,7 +484,10 @@ mod tests {
             source.record_event(VillagerGossipEvent::HurtByPlayer { player });
         }
         assert_eq!(source.trading_value(player), 25);
+        source.record_event(VillagerGossipEvent::KilledByPlayer { player });
+        source.record_event(VillagerGossipEvent::KilledByPlayer { player });
         assert_eq!(source.minor_negative_value(player), 50);
+        assert_eq!(source.major_negative_value(player), 50);
 
         let mut receiver = VillagerGossipState::default();
         assert!(
@@ -426,7 +497,12 @@ mod tests {
         );
         assert!(matches!(receiver.trading_value(player), 0 | 5));
         assert!(matches!(receiver.minor_negative_value(player), 0 | 30));
-        assert!(receiver.trading_value(player) != 0 || receiver.minor_negative_value(player) != 0);
+        assert_eq!(receiver.major_negative_value(player), 40);
+        assert!(
+            receiver.trading_value(player) != 0
+                || receiver.minor_negative_value(player) != 0
+                || receiver.major_negative_value(player) != 0
+        );
 
         let once = receiver.clone();
         receiver
@@ -444,6 +520,7 @@ mod tests {
                 player,
                 trading: if index == 0 { 21 } else { 25 },
                 minor_negative: 0,
+                major_negative: 0,
             });
         }
         source.validate().unwrap();
@@ -454,12 +531,9 @@ mod tests {
             .unwrap();
         assert_eq!(receiver.trading_value(Uuid::from_u128(1)), 0);
         assert!(receiver.player_gossips.len() <= MAX_TRANSFER_COUNT);
-        assert!(
-            receiver
-                .player_gossips
-                .iter()
-                .all(|entry| entry.trading == 5 && entry.minor_negative == 0)
-        );
+        assert!(receiver.player_gossips.iter().all(|entry| {
+            entry.trading == 5 && entry.minor_negative == 0 && entry.major_negative == 0
+        }));
     }
 
     #[test]
@@ -471,6 +545,7 @@ mod tests {
                     player: Uuid::from_u128(index as u128 + 1),
                     trading: 2,
                     minor_negative: 0,
+                    major_negative: 0,
                 })
                 .collect(),
         };

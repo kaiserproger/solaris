@@ -2008,7 +2008,7 @@ where
         //    interaction state passes the M5.d/M5.e/M6.f break/place
         //    handlers everything they need to mutate the world and emit
         //    relight + container packets back to the client.
-        let play_result = play_loop(
+        let play_result = Box::pin(play_loop(
             reader,
             writer,
             buf,
@@ -2037,7 +2037,7 @@ where
             extension_player_id,
             scripts,
             script_zones,
-        )
+        ))
         .await;
         if let Some(state) = interaction.as_mut() {
             if let Some(bed) = sessions.request_sleep_wake(session_id) {
@@ -12213,7 +12213,7 @@ where
     R: AsyncReadExt + Unpin,
     W: AsyncWriteExt + Unpin,
 {
-    let result = play_loop_inner(
+    let result = Box::pin(play_loop_inner(
         reader,
         writer,
         buf,
@@ -12242,7 +12242,7 @@ where
         extension_player_id,
         scripts,
         script_zones,
-    )
+    ))
     .await;
 
     if let Err(ConnectionError::WriteTimeout { timeout }) = result {
@@ -13212,7 +13212,7 @@ where
                     let mut body = frame.body;
                     let use_on = ServerboundUseItemOn::decode(&mut body)?;
                     if let Some(state) = interaction.as_deref_mut() {
-                        handle_use_item_on(
+                        Box::pin(handle_use_item_on(
                             state,
                             writer,
                             script_gameplay_events.as_ref(),
@@ -13222,7 +13222,7 @@ where
                             player_pose,
                             &mut respawn_pose,
                             use_on,
-                        )
+                        ))
                         .await?;
                     } else {
                         debug!(

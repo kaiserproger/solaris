@@ -366,6 +366,7 @@ struct PlaySession {
     script_operator: bool,
     dimension: String,
     loader_session: Option<crate::LoaderSession>,
+    last_broadcast_world_time: Option<u64>,
 }
 
 #[derive(Debug, Clone)]

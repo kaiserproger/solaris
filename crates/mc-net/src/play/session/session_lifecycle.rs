@@ -136,6 +136,7 @@ impl SessionRegistry {
                 script_operator: registration.script_operator,
                 dimension: registration.dimension.to_owned(),
                 loader_session: registration.loader_session,
+                last_broadcast_world_time: None,
             },
         );
         {

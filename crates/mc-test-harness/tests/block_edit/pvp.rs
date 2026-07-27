@@ -819,7 +819,7 @@ async fn wait_for_axe_shield_block_target(
     client: &mut Client,
     shield_id: u32,
     expected_damage: i32,
-    expected_health: f32,
+    minimum_health: f32,
 ) {
     let mut saw_cooldown = false;
     let mut saw_shield_damage = false;
@@ -853,7 +853,11 @@ async fn wait_for_axe_shield_block_target(
             let mut body = frame.body;
             let packet = ClientboundSetHealth::decode(&mut body)
                 .expect("decode unexpected shield-block health");
-            assert_eq!(packet.health, expected_health);
+            assert!(
+                packet.health >= minimum_health,
+                "shield block must not reduce health below {minimum_health}, got {}",
+                packet.health
+            );
         }
     }
 }

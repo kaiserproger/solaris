@@ -582,8 +582,19 @@ impl SessionRegistry {
 
     pub(in crate::play) fn broadcast_world_time(&self, world_time: u64) -> Vec<VisibilityDispatch> {
         let recipients = {
-            let inner = self.lock_inner("broadcast world time");
-            session_recipients(&inner, inner.sessions.keys().copied().collect::<Vec<_>>())
+            let mut inner = self.lock_inner("broadcast world time");
+            let recipients = inner
+                .sessions
+                .iter_mut()
+                .filter_map(|(&id, session)| {
+                    if session.last_broadcast_world_time == Some(world_time) {
+                        return None;
+                    }
+                    session.last_broadcast_world_time = Some(world_time);
+                    Some(id)
+                })
+                .collect::<Vec<_>>();
+            session_recipients(&inner, recipients)
         };
         visibility_dispatches(recipients, || OutboundCommand::WorldTime { world_time })
     }

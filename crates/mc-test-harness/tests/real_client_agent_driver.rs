@@ -1,10 +1,130 @@
 use std::collections::VecDeque;
-use std::io::{Read, Write};
+use std::io::{BufRead, BufReader, Read, Write};
 use std::net::{TcpListener, TcpStream};
-use std::process::Command;
+use std::os::unix::process::ExitStatusExt;
+use std::process::{Child, ChildStdin, ChildStdout, Command, Stdio};
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, OnceLock};
 use std::thread;
+
+struct SerializedPythonCommand(Command);
+
+struct PythonDriverWorker {
+    _child: Child,
+    stdin: ChildStdin,
+    stdout: BufReader<ChildStdout>,
+}
+
+const PYTHON_DRIVER_WORKER: &str = include_str!("support/real_client_agent_driver_worker.py");
+
+impl SerializedPythonCommand {
+    fn new(program: impl AsRef<std::ffi::OsStr>) -> Self {
+        Self(Command::new(program))
+    }
+
+    fn arg(&mut self, arg: impl AsRef<std::ffi::OsStr>) -> &mut Self {
+        self.0.arg(arg);
+        self
+    }
+
+    fn output(&mut self) -> std::io::Result<std::process::Output> {
+        let args = self.0.get_args().map(ToOwned::to_owned).collect::<Vec<_>>();
+        let Some(driver_path) = args.first() else {
+            return self.0.output();
+        };
+        if std::path::Path::new(driver_path).file_name()
+            != Some(std::ffi::OsStr::new("real-client-agent-driver.py"))
+        {
+            return self.0.output();
+        }
+
+        static PYTHON_DRIVER: OnceLock<Mutex<PythonDriverWorker>> = OnceLock::new();
+        let worker = PYTHON_DRIVER.get_or_init(|| {
+            Mutex::new(
+                PythonDriverWorker::start(driver_path)
+                    .expect("start persistent real-client driver worker"),
+            )
+        });
+        worker
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .run(&args[1..])
+    }
+}
+
+impl PythonDriverWorker {
+    fn start(driver_path: &std::ffi::OsStr) -> std::io::Result<Self> {
+        let mut child = Command::new("python3")
+            .arg("-u")
+            .arg("-c")
+            .arg(PYTHON_DRIVER_WORKER)
+            .arg(driver_path)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::inherit())
+            .spawn()?;
+        let stdin = child
+            .stdin
+            .take()
+            .expect("persistent Python worker stdin is piped");
+        let stdout = child
+            .stdout
+            .take()
+            .expect("persistent Python worker stdout is piped");
+        Ok(Self {
+            _child: child,
+            stdin,
+            stdout: BufReader::new(stdout),
+        })
+    }
+
+    fn run(&mut self, args: &[std::ffi::OsString]) -> std::io::Result<std::process::Output> {
+        let request = json!({
+            "args": args
+                .iter()
+                .map(|arg| arg.to_string_lossy())
+                .collect::<Vec<_>>()
+        });
+        serde_json::to_writer(&mut self.stdin, &request).map_err(std::io::Error::other)?;
+        self.stdin.write_all(b"\n")?;
+        self.stdin.flush()?;
+
+        let mut response = String::new();
+        if self.stdout.read_line(&mut response)? == 0 {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::UnexpectedEof,
+                "persistent Python driver worker stopped",
+            ));
+        }
+        let response: Value = serde_json::from_str(&response).map_err(std::io::Error::other)?;
+        let code = response["code"]
+            .as_i64()
+            .and_then(|code| i32::try_from(code).ok())
+            .ok_or_else(|| {
+                std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    "persistent Python driver worker returned an invalid exit code",
+                )
+            })?;
+        let stdout = response["stdout"].as_str().ok_or_else(|| {
+            std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "persistent Python driver worker returned invalid stdout",
+            )
+        })?;
+        let stderr = response["stderr"].as_str().ok_or_else(|| {
+            std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "persistent Python driver worker returned invalid stderr",
+            )
+        })?;
+        Ok(std::process::Output {
+            status: std::process::ExitStatus::from_raw(code << 8),
+            stdout: stdout.as_bytes().to_vec(),
+            stderr: stderr.as_bytes().to_vec(),
+        })
+    }
+}
 
 use mc_test_harness::replay::{
     ReplayDriver, ReplayOutcome, ReplayRunResult, ReplayScenarioManifest,
@@ -89,7 +209,7 @@ fn agent_driver_executes_checked_core_replay_manifest_and_emits_valid_result() {
     let manifest_path = repo_root.join("tools/core-replay-scenarios/core-actions-seed-81.json");
     let bridge = FakeBridge::start(13);
 
-    let output = Command::new("python3")
+    let output = SerializedPythonCommand::new("python3")
         .arg(repo_root.join("tools/real-client-agent-driver.py"))
         .arg("--bridge-url")
         .arg(format!("http://127.0.0.1:{}/rpc", bridge.port))
@@ -212,7 +332,7 @@ fn agent_driver_rejects_malformed_core_replay_before_bridge_rpcs() {
     .expect("write malformed manifest");
     let bridge = FakeBridge::start(1);
 
-    let output = Command::new("python3")
+    let output = SerializedPythonCommand::new("python3")
         .arg(repo_root.join("tools/real-client-agent-driver.py"))
         .arg("--bridge-url")
         .arg(format!("http://127.0.0.1:{}/rpc", bridge.port))
@@ -262,7 +382,7 @@ fn agent_driver_writes_passed_observation_from_loopback_bridge() {
     let run_dir = tempfile::tempdir().expect("create run dir");
     let bridge = FakeBridge::start(6);
 
-    let output = Command::new("python3")
+    let output = SerializedPythonCommand::new("python3")
         .arg(repo_root.join("tools/real-client-agent-driver.py"))
         .arg("--bridge-url")
         .arg(format!("http://127.0.0.1:{}/rpc", bridge.port))
@@ -353,7 +473,7 @@ fn agent_driver_runs_generated_ruin_cache_phases_without_screenshots() {
         let run_dir = tempfile::tempdir().expect("create run dir");
         let bridge = FakeBridge::start(5);
 
-        let output = Command::new("python3")
+        let output = SerializedPythonCommand::new("python3")
             .arg(repo_root.join("tools/real-client-agent-driver.py"))
             .arg("--bridge-url")
             .arg(format!("http://127.0.0.1:{}/rpc", bridge.port))
@@ -405,7 +525,7 @@ fn agent_driver_rejects_non_loopback_server_addr() {
     let run_dir = tempfile::tempdir().expect("create run dir");
     let bridge = FakeBridge::start(6);
 
-    let output = Command::new("python3")
+    let output = SerializedPythonCommand::new("python3")
         .arg(repo_root.join("tools/real-client-agent-driver.py"))
         .arg("--bridge-url")
         .arg(format!("http://127.0.0.1:{}/rpc", bridge.port))
@@ -456,7 +576,7 @@ fn agent_driver_connects_when_client_is_not_already_in_play() {
     let run_dir = tempfile::tempdir().expect("create run dir");
     let bridge = FakeBridge::start_with_wait_play(8, vec![false, true]);
 
-    let output = Command::new("python3")
+    let output = SerializedPythonCommand::new("python3")
         .arg(repo_root.join("tools/real-client-agent-driver.py"))
         .arg("--bridge-url")
         .arg(format!("http://127.0.0.1:{}/rpc", bridge.port))
@@ -517,7 +637,7 @@ fn agent_driver_waits_when_client_is_already_connecting() {
         ],
     );
 
-    let output = Command::new("python3")
+    let output = SerializedPythonCommand::new("python3")
         .arg(repo_root.join("tools/real-client-agent-driver.py"))
         .arg("--bridge-url")
         .arg(format!("http://127.0.0.1:{}/rpc", bridge.port))
@@ -585,7 +705,7 @@ fn agent_driver_waits_for_interactive_play_screen_before_scenario() {
         ],
     );
 
-    let output = Command::new("python3")
+    let output = SerializedPythonCommand::new("python3")
         .arg(repo_root.join("tools/real-client-agent-driver.py"))
         .arg("--bridge-url")
         .arg(format!("http://127.0.0.1:{}/rpc", bridge.port))
@@ -677,7 +797,7 @@ assert calls[0][0] == "close_screen", calls
 assert calls[0][1] >= 10.0, calls
 "#;
 
-    let output = Command::new("python3")
+    let output = SerializedPythonCommand::new("python3")
         .arg("-c")
         .arg(probe)
         .arg(driver)
@@ -698,7 +818,7 @@ fn agent_driver_waits_for_async_screenshot_file() {
     let run_dir = tempfile::tempdir().expect("create run dir");
     let bridge = FakeBridge::start_with_deferred_screenshot(6);
 
-    let output = Command::new("python3")
+    let output = SerializedPythonCommand::new("python3")
         .arg(repo_root.join("tools/real-client-agent-driver.py"))
         .arg("--bridge-url")
         .arg(format!("http://127.0.0.1:{}/rpc", bridge.port))
@@ -745,7 +865,7 @@ fn agent_driver_rejects_invalid_screenshot_artifact() {
     let run_dir = tempfile::tempdir().expect("create run dir");
     let bridge = FakeBridge::start_with_screenshot_bytes(5, b"fake png");
 
-    let output = Command::new("python3")
+    let output = SerializedPythonCommand::new("python3")
         .arg(repo_root.join("tools/real-client-agent-driver.py"))
         .arg("--bridge-url")
         .arg(format!("http://127.0.0.1:{}/rpc", bridge.port))
@@ -800,7 +920,7 @@ fn agent_driver_rejects_passed_broad_blocked_only_scenario() {
     let run_dir = tempfile::tempdir().expect("create run dir");
     let bridge = FakeBridge::start(6);
 
-    let output = Command::new("python3")
+    let output = SerializedPythonCommand::new("python3")
         .arg(repo_root.join("tools/real-client-agent-driver.py"))
         .arg("--bridge-url")
         .arg(format!("http://127.0.0.1:{}/rpc", bridge.port))
@@ -868,7 +988,7 @@ fn agent_driver_runs_join_rejoin_movement_scenario_without_run_scenario_rpc() {
     .expect("write server release marker");
     let bridge = FakeBridge::start(13);
 
-    let output = Command::new("python3")
+    let output = SerializedPythonCommand::new("python3")
         .arg(repo_root.join("tools/real-client-agent-driver.py"))
         .arg("--bridge-url")
         .arg(format!("http://127.0.0.1:{}/rpc", bridge.port))
@@ -960,7 +1080,7 @@ fn agent_driver_waits_for_server_session_release_before_rejoin() {
     let bridge =
         FakeBridge::start_requiring_server_release_before_connect(13, server_log_path.clone());
 
-    let output = Command::new("python3")
+    let output = SerializedPythonCommand::new("python3")
         .arg(repo_root.join("tools/real-client-agent-driver.py"))
         .arg("--bridge-url")
         .arg(format!("http://127.0.0.1:{}/rpc", bridge.port))
@@ -1033,7 +1153,7 @@ fn agent_driver_appends_phase_observations_and_recomputes_blocked_result() {
     .expect("write existing observations");
     let bridge = FakeBridge::start_with_scenario_result(6, "blocked");
 
-    let output = Command::new("python3")
+    let output = SerializedPythonCommand::new("python3")
         .arg(repo_root.join("tools/real-client-agent-driver.py"))
         .arg("--bridge-url")
         .arg(format!("http://127.0.0.1:{}/rpc", bridge.port))
@@ -1090,7 +1210,7 @@ fn agent_driver_coordinates_two_real_client_bridges_for_m94_06_visibility() {
     let primary = FakeBridge::start_with_scenario_result(6, "passed");
     let secondary = FakeBridge::start_with_scenario_result(6, "passed");
 
-    let output = Command::new("python3")
+    let output = SerializedPythonCommand::new("python3")
         .arg(repo_root.join("tools/real-client-agent-driver.py"))
         .arg("--bridge-url")
         .arg(format!("http://127.0.0.1:{}/rpc", primary.port))
@@ -1208,7 +1328,7 @@ fn agent_driver_coordinates_two_real_client_bridges_for_m94_06_shared_drop() {
     let primary = FakeBridge::start_with_scenario_result(6, "passed");
     let secondary = FakeBridge::start_with_scenario_result(6, "passed");
 
-    let output = Command::new("python3")
+    let output = SerializedPythonCommand::new("python3")
         .arg(repo_root.join("tools/real-client-agent-driver.py"))
         .arg("--bridge-url")
         .arg(format!("http://127.0.0.1:{}/rpc", primary.port))
@@ -1291,7 +1411,7 @@ fn agent_driver_coordinates_two_real_client_bridges_for_m94_03b_shared_chest() {
     let primary = FakeBridge::start_with_scenario_result(6, "passed");
     let secondary = FakeBridge::start_with_scenario_result(6, "passed");
 
-    let output = Command::new("python3")
+    let output = SerializedPythonCommand::new("python3")
         .arg(repo_root.join("tools/real-client-agent-driver.py"))
         .arg("--bridge-url")
         .arg(format!("http://127.0.0.1:{}/rpc", primary.port))
@@ -1374,7 +1494,7 @@ fn agent_driver_coordinates_two_real_client_bridges_for_m94_03c_shared_chest_liv
     let primary = FakeBridge::start_with_scenario_result(7, "passed");
     let secondary = FakeBridge::start_with_scenario_result(6, "passed");
 
-    let output = Command::new("python3")
+    let output = SerializedPythonCommand::new("python3")
         .arg(repo_root.join("tools/real-client-agent-driver.py"))
         .arg("--bridge-url")
         .arg(format!("http://127.0.0.1:{}/rpc", primary.port))
@@ -1470,7 +1590,7 @@ fn agent_driver_coordinates_two_real_client_bridges_for_m94_06_shared_pickup() {
     let primary = FakeBridge::start_with_scenario_result(7, "passed");
     let secondary = FakeBridge::start_with_scenario_result(7, "passed");
 
-    let output = Command::new("python3")
+    let output = SerializedPythonCommand::new("python3")
         .arg(repo_root.join("tools/real-client-agent-driver.py"))
         .arg("--bridge-url")
         .arg(format!("http://127.0.0.1:{}/rpc", primary.port))
@@ -1569,7 +1689,7 @@ fn agent_driver_coordinates_two_real_client_bridges_for_playable_38_inventory_dr
     let primary = FakeBridge::start_with_scenario_result(7, "passed");
     let secondary = FakeBridge::start_with_scenario_result(7, "passed");
 
-    let output = Command::new("python3")
+    let output = SerializedPythonCommand::new("python3")
         .arg(repo_root.join("tools/real-client-agent-driver.py"))
         .arg("--bridge-url")
         .arg(format!("http://127.0.0.1:{}/rpc", primary.port))
@@ -1686,7 +1806,7 @@ fn agent_driver_coordinates_two_real_client_bridges_for_playable_39_short_soak()
     let primary = FakeBridge::start_with_scenario_result(17, "passed");
     let secondary = FakeBridge::start_with_scenario_result(17, "passed");
 
-    let output = Command::new("python3")
+    let output = SerializedPythonCommand::new("python3")
         .arg(repo_root.join("tools/real-client-agent-driver.py"))
         .arg("--bridge-url")
         .arg(format!("http://127.0.0.1:{}/rpc", primary.port))
@@ -1794,7 +1914,7 @@ fn agent_driver_coordinates_two_real_client_bridges_for_playable_40_chunk_crossi
     let primary = FakeBridge::start_with_scenario_result(29, "passed");
     let secondary = FakeBridge::start_with_scenario_result(29, "passed");
 
-    let output = Command::new("python3")
+    let output = SerializedPythonCommand::new("python3")
         .arg(repo_root.join("tools/real-client-agent-driver.py"))
         .arg("--bridge-url")
         .arg(format!("http://127.0.0.1:{}/rpc", primary.port))
@@ -1888,7 +2008,7 @@ fn agent_driver_coordinates_two_real_client_bridges_for_playable_41_chunk_prewar
     let primary = FakeBridge::start_with_scenario_result(29, "passed");
     let secondary = FakeBridge::start_with_scenario_result(29, "passed");
 
-    let output = Command::new("python3")
+    let output = SerializedPythonCommand::new("python3")
         .arg(repo_root.join("tools/real-client-agent-driver.py"))
         .arg("--bridge-url")
         .arg(format!("http://127.0.0.1:{}/rpc", primary.port))
@@ -1984,7 +2104,7 @@ fn agent_driver_fails_closed_without_bridge() {
     let run_dir = tempfile::tempdir().expect("create run dir");
     let unused_port = reserve_then_release_port();
 
-    let output = Command::new("python3")
+    let output = SerializedPythonCommand::new("python3")
         .arg(repo_root.join("tools/real-client-agent-driver.py"))
         .arg("--bridge-url")
         .arg(format!("http://127.0.0.1:{unused_port}/rpc"))
@@ -2031,7 +2151,7 @@ fn agent_driver_reports_structured_bridge_error_body() {
     let run_dir = tempfile::tempdir().expect("create run dir");
     let bridge = FailingWaitPlayBridge::start();
 
-    let output = Command::new("python3")
+    let output = SerializedPythonCommand::new("python3")
         .arg(repo_root.join("tools/real-client-agent-driver.py"))
         .arg("--bridge-url")
         .arg(format!("http://127.0.0.1:{}/rpc", bridge.port))
@@ -2104,7 +2224,7 @@ fn agent_driver_coordinates_two_client_shared_chest_across_restart_phases() {
     );
 
     let run_phase = |scenario: &str, append: bool| {
-        let mut command = Command::new("python3");
+        let mut command = SerializedPythonCommand::new("python3");
         command
             .arg(repo_root.join("tools/real-client-agent-driver.py"))
             .arg("--bridge-url")
@@ -2286,7 +2406,7 @@ fn agent_driver_rejects_restart_snapshot_missing_typed_field_before_bridge_calls
     let primary_port = reserve_then_release_port();
     let secondary_port = reserve_then_release_port();
 
-    let output = Command::new("python3")
+    let output = SerializedPythonCommand::new("python3")
         .arg(repo_root.join("tools/real-client-agent-driver.py"))
         .arg("--bridge-url")
         .arg(format!("http://127.0.0.1:{primary_port}/rpc"))
@@ -2351,7 +2471,7 @@ fn agent_driver_rejects_restart_marker_drift_across_phases() {
         VALID_PNG_1X1,
     );
 
-    let before = Command::new("python3")
+    let before = SerializedPythonCommand::new("python3")
         .arg(repo_root.join("tools/real-client-agent-driver.py"))
         .arg("--bridge-url")
         .arg(format!("http://127.0.0.1:{}/rpc", primary.port))
@@ -2382,7 +2502,7 @@ fn agent_driver_rejects_restart_marker_drift_across_phases() {
     .expect("drift P45 marker");
     let primary_port = reserve_then_release_port();
     let secondary_port = reserve_then_release_port();
-    let after = Command::new("python3")
+    let after = SerializedPythonCommand::new("python3")
         .arg(repo_root.join("tools/real-client-agent-driver.py"))
         .arg("--bridge-url")
         .arg(format!("http://127.0.0.1:{primary_port}/rpc"))
