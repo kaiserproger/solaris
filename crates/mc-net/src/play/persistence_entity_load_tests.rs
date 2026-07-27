@@ -479,6 +479,11 @@ fn assigned_toolsmith_profession_and_merchant_catalog_survive_checkpoint_restart
     gossip.record_event(
         mc_entity::villager_gossip_26_1_2::VillagerGossipEvent::HurtByPlayer { player: customer },
     );
+    gossip.record_event(
+        mc_entity::villager_gossip_26_1_2::VillagerGossipEvent::ZombieVillagerCured {
+            player: customer,
+        },
+    );
     gossip.last_decay_game_time = 777;
     record.snapshot.retained.villager_gossip = Some(gossip);
     record.snapshot.retained.villager_merchant = Some(merchant);
@@ -504,7 +509,26 @@ fn assigned_toolsmith_profession_and_merchant_catalog_survive_checkpoint_restart
     assert_eq!(gossip.trading_value(customer), 2);
     assert_eq!(gossip.minor_negative_value(customer), 25);
     assert_eq!(gossip.major_negative_value(customer), 0);
+    assert_eq!(gossip.minor_positive_value(customer), 25);
+    assert_eq!(gossip.major_positive_value(customer), 20);
     assert_eq!(gossip.last_decay_game_time, 777);
+}
+
+#[test]
+fn gossip_snapshot_without_positive_fields_fails_closed() {
+    let player = uuid::Uuid::from_u128(0xABCD);
+    let mut gossip = mc_entity::villager_gossip_26_1_2::VillagerGossipState::default();
+    gossip.record_event(mc_entity::villager_gossip_26_1_2::VillagerGossipEvent::Trade { player });
+    let mut retained = mc_entity::EntityRetainedState::default();
+    retained.villager_gossip = Some(gossip);
+    let mut encoded = serde_json::to_value(retained).unwrap();
+    let entry = encoded["villager_gossip"]["player_gossips"][0]
+        .as_object_mut()
+        .expect("gossip JSON object");
+    entry.remove("minor_positive");
+    entry.remove("major_positive");
+
+    assert!(serde_json::from_value::<mc_entity::EntityRetainedState>(encoded).is_err());
 }
 
 #[test]

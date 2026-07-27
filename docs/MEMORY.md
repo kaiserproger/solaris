@@ -9,43 +9,36 @@ and is not startup context.
 
 - Date: 2026-07-27.
 - Branch: `main`.
-- Checkpoint base: `00168d6` (`feat(play): add villager hurt gossip`), after
-  `5fa3f2b` (`feat(play): add villager trading reputation`) and the earlier
-  merchant/profession/performance checkpoints. The old `dev/M100-client-agent`
-  Loader cursor is no longer the active Solaris checkpoint.
-- Current closeout adds bounded villager-to-villager transfer for the currently
-  supported `TRADING` and `MINOR_NEGATIVE` entries. Only `Idle` or `Meet`
-  initiators participate; the source must be within exact `distance² <= 5`.
-  Existing runtime interaction target wins while valid, otherwise the bounded
-  active-population spatial index selects the nearest eligible villager with an
-  entity-ID tie break.
-- Transfer is one-way from target to initiator. It performs at most ten weighted
-  draws using Java's 48-bit `nextInt(bound)` algorithm, deduplicates selected
-  `(player,type)` entries, subtracts transfer value `20`, drops results below the
-  stored floor `2`, and merges through `max` rather than addition. Both villagers
-  receive the same 1,200-tick cooldown and one villager participates in at most
-  one pair per tick. The full vanilla per-entity `RandomSource` stream is not yet
-  reproduced: Solaris derives the initial seed from both UUIDs and the tick, so
-  bit-for-bit selected-entry identity is explicitly not claimed.
-- Gossip plus both cooldown updates commit through one two-entity stale-fenced
-  regional CAS. A stale source or receiver changes neither participant. The
-  production simulation route builds the neighbour index only from the bounded
-  active villager population and runs initiators on the existing staggered brain
-  cadence rather than scanning all stored entities.
-- Interaction target and gossip cooldown are runtime-only like Java's
-  `lastGossipTime`: checkpoint restart preserves transferred gossip but resets
-  target and cooldown. Oracle facts, local source paths and SHA-256 fingerprints
-  are recorded in `docs/evidence/villager-gossip-transfer-26.1.2.md`. Existing
-  trade/hurt pricing, legacy-save migration, daily decay and raw-TCP surcharge
-  evidence remain green.
-- The independent review blocked on unavailable oracle evidence and an implicit
-  full-`RandomSource` parity claim. Both findings were fixed with the checked-in
-  fact sheet, Java legacy `nextInt` port, explicit deterministic-seed boundary and
-  focused regressions; no second reviewer was run.
-- This closes transfer only for the two implemented gossip types. `VILLAGER_KILLED`
-  / `MAJOR_NEGATIVE`, positive gossip types, remaining reputation events, Hero of
-  the Village pricing, and village population/defence policy remain open.
-  Species-specific `UnsupportedSpecial` attacks also remain in the playable queue.
+- Checkpoint base: `6082385` (`feat(play): add villager kill gossip and stabilize tests`),
+  after `45a047d` (`feat(play): add villager gossip transfer`), `00168d6`
+  (`feat(play): add villager hurt gossip`) and `5fa3f2b` (`feat(play): add villager
+  trading reputation`). The old Loader cursor is not the active Solaris checkpoint.
+- `6082385` already closed player-caused villager death gossip: living indexed
+  villager witnesses within the victim's bounded follow-range cube receive exact
+  `MAJOR_NEGATIVE +25` through stale-fenced recursively split regional CAS batches.
+  Replayed or stale victims cannot duplicate the event. Documentation had not been
+  advanced and incorrectly still listed `VILLAGER_KILLED` as open.
+- The current closeout models the remaining vanilla `MINOR_POSITIVE` and
+  `MAJOR_POSITIVE` gossip fields. `ZOMBIE_VILLAGER_CURED` atomically adds `+25` and
+  `+20`; total reputation uses weights `+1` and `+5`; daily decay is `1` and `0`;
+  transfer decay is `5` and `20`. The persistent schema intentionally has no
+  compatibility defaults for these new alpha fields: older gossip snapshots fail
+  loading rather than being silently migrated.
+- Transfer now includes all five vanilla gossip types under the existing bounded
+  ten-draw Java-legacy `nextInt(bound)` shape. A capped `MINOR_POSITIVE 25` entry can
+  transfer as `20`; a capped `MAJOR_POSITIVE 20` entry decays to zero on transfer and
+  therefore everlasting cure memory does not propagate. The deterministic Solaris
+  seed boundary remains unchanged and bit-for-bit vanilla entry selection is not
+  claimed.
+- Positive values persist through the existing entity checkpoint and immediately
+  affect merchant special pricing through the shared weighted reputation authority.
+  Oracle paths and fingerprints are recorded in
+  `docs/evidence/villager-positive-gossip-26.1.2.md` and the transfer fact sheet.
+- Solaris still lacks zombie-villager curing/conversion gameplay, so no production
+  path emits `ZombieVillagerCured` yet. Conversion timing, ingredients/effects,
+  entity replacement, advancement/sound, Hero of the Village pricing, village
+  population/defence policy and species-specific `UnsupportedSpecial` attacks remain
+  open.
 - The performance baseline remains as recorded by `17fb424`: debug/release
   20-client VD8 and bounded replay/soak gates pass; O3 explosion authority is
   still above the frozen p99 budget, and exact low/high cgroups plus long soaks

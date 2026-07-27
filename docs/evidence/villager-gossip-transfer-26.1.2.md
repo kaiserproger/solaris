@@ -21,7 +21,7 @@ This note records the bounded facts used by the Solaris gossip-transfer checkpoi
 - `lastGossipTime` and the interaction target are runtime state; only the gossip container and daily-decay timestamp are saved.
 - `GossipContainer` makes at most ten weighted random draws, weighting each entry by the absolute weighted reputation, and deduplicates repeated selections.
 - A selected entry loses its type's `decayPerTransfer`, is discarded below the stored-value floor `2`, and merges into an existing entry with `max(old,new)`.
-- For the currently implemented Solaris types, both `TRADING` and `MINOR_NEGATIVE` have transfer decay `20`. Their weights have absolute magnitude `1`, so their selection weight is their stored value.
+- Solaris models all five types in this selection pool. `TRADING` and `MINOR_NEGATIVE` have absolute weight `1` and transfer decay `20`; `MAJOR_NEGATIVE` has absolute weight `5` and transfer decay `10`; `MINOR_POSITIVE` has weight `1` and transfer decay `5`; `MAJOR_POSITIVE` has weight `5` and transfer decay `20`. Because `MAJOR_POSITIVE` is capped at `20`, a selected everlasting-memory entry is always discarded rather than propagated.
 
 ## Deliberate RNG boundary
 
