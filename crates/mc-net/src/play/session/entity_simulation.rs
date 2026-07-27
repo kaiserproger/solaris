@@ -112,6 +112,7 @@ fn record_movement_exhaustive_membership_check() {
 
 const VILLAGER_BRAIN_TICK_INTERVAL: u64 = 20;
 const VILLAGER_BRAIN_COMMIT_BATCH: usize = 64;
+const VILLAGER_RESTOCK_REACH_SQUARED: f64 = 4.0;
 
 fn villager_schedule_boundary(
     profile: &mc_entity::villager_26_1_2::VillagerBrainProfile,
@@ -185,6 +186,22 @@ pub(super) fn villager_brain_due_for_tick(
         || villager_brain_phase_due(entity, lifecycle_tick)
 }
 
+fn villager_can_restock_at_job_site(
+    position: Vec3,
+    brain: &mc_entity::villager_26_1_2::VillagerBrainState,
+) -> bool {
+    if brain.activity != mc_entity::villager_26_1_2::VillagerActivity::Work {
+        return false;
+    }
+    let Some(job_site) = brain.pois.job_site else {
+        return false;
+    };
+    let dx = position.x - job_site.x;
+    let dy = position.y - job_site.y;
+    let dz = position.z - job_site.z;
+    dx * dx + dy * dy + dz * dz <= VILLAGER_RESTOCK_REACH_SQUARED
+}
+
 pub(super) fn apply_villager_brain_transitions(
     entities: &mut EntityStoreGuard<'_>,
     ids: &HashSet<EntityId>,
@@ -227,14 +244,28 @@ pub(super) fn apply_villager_brain_transitions(
         let Ok(plan) = validated_profile.plan(&current, lifecycle_tick, day_time) else {
             continue;
         };
+        let restocked_merchant =
+            expected
+                .retained
+                .villager_merchant
+                .clone()
+                .and_then(|mut merchant| {
+                    (villager_can_restock_at_job_site(expected.position, &plan.state)
+                        && merchant.restock(day_time).ok() == Some(true))
+                    .then_some(merchant)
+                });
         if expected.goal == plan.goal
             && expected.retained.villager_brain.as_ref() == Some(&plan.state)
+            && restocked_merchant.is_none()
         {
             continue;
         }
         let mut next = expected.clone();
         next.goal = plan.goal;
         next.retained.villager_brain = Some(plan.state);
+        if let Some(merchant) = restocked_merchant {
+            next.retained.villager_merchant = Some(merchant);
+        }
         transitions.push((expected, next));
     }
     commit_villager_brain_transitions(entities, transitions)

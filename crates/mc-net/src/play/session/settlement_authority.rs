@@ -1,3 +1,4 @@
+use mc_data::items::ItemRegistry;
 use mc_entity::{EntitySnapshot, SpawnEntity};
 
 use crate::play::SettlementInhabitantSpawn;
@@ -57,6 +58,7 @@ fn settlement_candidate(
     entity.retained.spawn_tick = lifecycle_tick;
     entity.retained.villager = Some(spawn.villager);
     entity.retained.villager_brain = Some(spawn.villager_brain.clone());
+    entity.retained.villager_merchant = spawn.villager_merchant.clone();
     apply_entity_facts(&mut entity);
     let plan = mc_entity::villager_26_1_2::plan_villager_brain(
         &spawn.villager_brain,
@@ -68,6 +70,36 @@ fn settlement_candidate(
     entity.retained.villager_brain = Some(plan.state);
     entity.goal = plan.goal;
     entity
+}
+
+pub(in crate::play) fn toolsmith_merchant_state(
+    items: &ItemRegistry,
+) -> Option<mc_entity::villager_merchant_26_1_2::VillagerMerchantState> {
+    use mc_entity::villager_merchant_26_1_2::{
+        VillagerMerchantState, VillagerTradeCost, VillagerTradeOffer,
+    };
+
+    let offers = mc_data::villager_trades_26_1_2::toolsmith_novice_offers_26_1_2()
+        .into_iter()
+        .map(|spec| {
+            let cost_a = VillagerTradeCost::new(items.id_of(&spec.cost_a.item)?, spec.cost_a.count);
+            let result =
+                mc_entity::EntityItemStack::new(items.id_of(&spec.result_item)?, spec.result_count);
+            let mut offer = VillagerTradeOffer::new(
+                cost_a,
+                result,
+                spec.max_uses,
+                spec.xp,
+                spec.price_multiplier,
+            );
+            offer.cost_b = match spec.cost_b {
+                Some(cost) => Some(VillagerTradeCost::new(items.id_of(&cost.item)?, cost.count)),
+                None => None,
+            };
+            Some(offer)
+        })
+        .collect::<Option<Vec<_>>>()?;
+    VillagerMerchantState::new(offers).ok()
 }
 
 fn install_settlement_inhabitants_locked(
@@ -122,6 +154,7 @@ mod tests {
                     meeting_point: Some(Vec3::new(72.5, 65.0, 8.5)),
                 },
             ),
+            villager_merchant: toolsmith_merchant_state(&mc_data::items::solaris_required_items()),
         }
     }
 
@@ -172,6 +205,15 @@ mod tests {
                 speed: 0.3,
             }
         );
+        let merchant = records[0]
+            .snapshot
+            .retained
+            .villager_merchant
+            .as_ref()
+            .expect("toolsmith merchant state persists");
+        assert_eq!(merchant.offers.len(), 5);
+        assert_eq!(merchant.offers[0].cost_a.count, 15);
+        assert_eq!(merchant.offers[0].max_uses, 16);
     }
 
     #[test]

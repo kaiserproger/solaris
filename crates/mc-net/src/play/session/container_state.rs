@@ -15,6 +15,8 @@ use super::outbound::{
 };
 use super::{SessionId, SessionRegistry};
 
+type PlayerMerchantContainerState = (PlayerInventory, ItemStack, Option<Box<[ItemStack; 2]>>);
+
 #[derive(Debug)]
 pub(in crate::play) enum ContainerStateCommitError<E> {
     Rejected {
@@ -216,6 +218,38 @@ impl SessionRegistry {
             guard,
         );
         Some((state.inventory.clone(), state.carried_item.clone()))
+    }
+
+    pub(in crate::play) fn player_merchant_container_state(
+        &self,
+        id: SessionId,
+    ) -> Option<PlayerMerchantContainerState> {
+        let state = {
+            let inner = self.lock_inner("find player merchant container state");
+            if !inner.sessions.contains_key(&id) {
+                return None;
+            }
+            inner.player_persistence.get(&id).cloned()
+        }?;
+        let wait_started = Instant::now();
+        let guard = state.lock().unwrap_or_else(|poisoned| {
+            warn!(
+                session_id = id,
+                "player persistence mutex was poisoned while reading merchant state; recovering state"
+            );
+            poisoned.into_inner()
+        });
+        let state = crate::lock_metrics::timed_guard(
+            crate::lock_metrics::LockMetricKind::PlayerPersistence,
+            "read player merchant container state",
+            wait_started,
+            guard,
+        );
+        Some((
+            state.inventory.clone(),
+            state.carried_item.clone(),
+            state.merchant_input.clone(),
+        ))
     }
 
     #[cfg(test)]

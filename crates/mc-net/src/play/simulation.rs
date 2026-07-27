@@ -331,6 +331,7 @@ pub(super) enum SimulationCommand {
     CommitBucketUse(Box<BucketUseCommand>),
     CommitFoodUse(FoodUseCommand),
     CommitAnimalFeed(AnimalFeedCommand),
+    CommitMerchantTrade(Box<MerchantTradeCommand>),
     CommitSheepShear(SheepShearCommand),
     CommitPlayerSurvival(Box<PlayerSurvivalCommand>),
     CommitPlayerPose {
@@ -407,6 +408,7 @@ impl SimulationCommand {
             Self::CommitBucketUse(_) => "commit_bucket_use",
             Self::CommitFoodUse(_) => "commit_food_use",
             Self::CommitAnimalFeed(_) => "commit_animal_feed",
+            Self::CommitMerchantTrade(_) => "commit_merchant_trade",
             Self::CommitSheepShear(_) => "commit_sheep_shear",
             Self::CommitPlayerSurvival(_) => "commit_player_survival",
             Self::CommitPlayerPose { .. } => "commit_player_pose",
@@ -470,6 +472,7 @@ pub(super) enum SimulationResponse {
     BucketUse(Result<Option<Box<CommittedBucketUse>>, SimulationRequestError>),
     FoodUse(Result<Option<Box<CommittedFoodUse>>, SimulationRequestError>),
     AnimalFeed(Result<Option<Box<CommittedAnimalFeed>>, SimulationRequestError>),
+    MerchantTrade(Result<Option<Box<CommittedMerchantTrade>>, SimulationRequestError>),
     SheepShear(Result<Option<Box<CommittedSheepShear>>, SimulationRequestError>),
     PlayerSurvival(Result<Option<Box<PlayerSurvivalCommitOutcome>>, SimulationRequestError>),
     PlayerPose(Result<CommittedPlayerPose, SimulationRequestError>),
@@ -1573,6 +1576,40 @@ pub(super) struct CommittedAnimalFeed {
     pub(super) dispatches: Vec<VisibilityDispatch>,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum MerchantTradeDestination {
+    Cursor,
+    Inventory,
+}
+
+#[derive(Debug, Clone)]
+pub(super) struct MerchantTradePlan {
+    pub(super) entity_id: EntityId,
+    pub(super) expected_merchant: mc_entity::villager_merchant_26_1_2::VillagerMerchantState,
+    pub(super) offer_index: usize,
+    pub(super) expected_inventory: PlayerInventory,
+    pub(super) expected_carried_item: ItemStack,
+    pub(super) expected_merchant_input: Option<Box<[ItemStack; 2]>>,
+    pub(super) destination: MerchantTradeDestination,
+    pub(super) cost_a_max_stack: i32,
+    pub(super) result_max_stack: i32,
+}
+
+#[derive(Debug)]
+pub(super) struct MerchantTradeCommand {
+    actor_session: SessionId,
+    plan: MerchantTradePlan,
+}
+
+#[derive(Debug)]
+pub(super) struct CommittedMerchantTrade {
+    pub(super) inventory: PlayerInventory,
+    pub(super) carried_item: ItemStack,
+    pub(super) merchant_input: Option<Box<[ItemStack; 2]>>,
+    pub(super) merchant: mc_entity::villager_merchant_26_1_2::VillagerMerchantState,
+    pub(super) dispatches: Vec<VisibilityDispatch>,
+}
+
 #[derive(Debug, Clone)]
 pub(super) struct SheepShearPlan {
     pub(super) entity_id: EntityId,
@@ -2299,6 +2336,28 @@ impl SimulationHandle {
                 Ok(committed.map(|committed| *committed))
             }
             Ok(Ok(SimulationResponse::AnimalFeed(Err(error)))) => Err(error),
+            Ok(Ok(_)) => Err(SimulationRequestError::ResponseMismatch),
+            Ok(Err(error)) => Err(error),
+            Err(_) => Err(SimulationRequestError::OwnerStopped),
+        }
+    }
+
+    pub(super) async fn commit_merchant_trade(
+        &self,
+        plan: MerchantTradePlan,
+    ) -> Result<Option<CommittedMerchantTrade>, SimulationRequestError> {
+        let actor_session = self.session_id()?;
+        let receiver = self.enqueue_player_command(SimulationCommand::CommitMerchantTrade(
+            Box::new(MerchantTradeCommand {
+                actor_session,
+                plan,
+            }),
+        ))?;
+        match receiver.await {
+            Ok(Ok(SimulationResponse::MerchantTrade(Ok(committed)))) => {
+                Ok(committed.map(|committed| *committed))
+            }
+            Ok(Ok(SimulationResponse::MerchantTrade(Err(error)))) => Err(error),
             Ok(Ok(_)) => Err(SimulationRequestError::ResponseMismatch),
             Ok(Err(error)) => Err(error),
             Err(_) => Err(SimulationRequestError::OwnerStopped),
@@ -5380,6 +5439,25 @@ impl SimulationOwner {
                     };
                     SimulationResponse::AnimalFeed(result)
                 }
+                SimulationCommand::CommitMerchantTrade(command) => {
+                    let result = if valid_merchant_trade_plan(&command.plan) {
+                        Ok(sessions
+                            .commit_merchant_trade(
+                                &self.authority,
+                                command.actor_session,
+                                &command.plan,
+                            )
+                            .map(|mut committed| {
+                                dispatch_visibility_commands(std::mem::take(
+                                    &mut committed.dispatches,
+                                ));
+                                Box::new(committed)
+                            }))
+                    } else {
+                        Err(SimulationRequestError::InvalidCommand)
+                    };
+                    SimulationResponse::MerchantTrade(result)
+                }
                 SimulationCommand::CommitSheepShear(command) => {
                     let result = if valid_sheep_shear_plan(&command.plan) {
                         Ok(sessions
@@ -5938,6 +6016,18 @@ fn valid_animal_feed_plan(plan: &AnimalFeedPlan) -> bool {
         && !plan.targets.is_empty()
 }
 
+fn valid_merchant_trade_plan(plan: &MerchantTradePlan) -> bool {
+    plan.offer_index < plan.expected_merchant.offers.len()
+        && plan.expected_merchant.validate().is_ok()
+        && (1..=64).contains(&plan.cost_a_max_stack)
+        && (1..=64).contains(&plan.result_max_stack)
+        && plan.expected_merchant_input.as_ref().is_some_and(|inputs| {
+            inputs
+                .iter()
+                .all(|stack| stack.is_empty() || stack.count > 0)
+        })
+}
+
 fn valid_sheep_shear_plan(plan: &SheepShearPlan) -> bool {
     plan.held_slot < 46
         && plan.expected_held.item_id == plan.shears_item_id
@@ -6244,6 +6334,7 @@ mod tests {
             updated_carried_item: ItemStack::EMPTY,
             crafting_table_input: None,
             enchanting_table_input: None,
+            merchant_input: None,
             drops: Vec::new(),
             xp_orb: None,
         }
@@ -8467,6 +8558,7 @@ mod tests {
             updated_carried_item: updated_cursor.clone(),
             crafting_table_input: None,
             enchanting_table_input: None,
+            merchant_input: None,
             drops: vec![ContainerDropPlan {
                 entity_type_id: 1,
                 position: Vec3::new(0.5, 65.0, 0.5),
@@ -8513,6 +8605,7 @@ mod tests {
             updated_carried_item: updated_cursor.clone(),
             crafting_table_input: None,
             enchanting_table_input: None,
+            merchant_input: None,
             drops: vec![ContainerDropPlan {
                 entity_type_id: 1,
                 position: Vec3::new(0.5, 65.0, 0.5),
@@ -8566,6 +8659,7 @@ mod tests {
             updated_carried_item: ItemStack::EMPTY,
             crafting_table_input: None,
             enchanting_table_input: None,
+            merchant_input: None,
             drops: Vec::new(),
             xp_orb: None,
         };
@@ -14983,6 +15077,7 @@ mod tests {
             updated_carried_item: updated_carried_item.clone(),
             crafting_table_input: None,
             enchanting_table_input: None,
+            merchant_input: None,
             drops: vec![ContainerDropPlan {
                 entity_type_id: 1,
                 position: drop_position,

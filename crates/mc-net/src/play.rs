@@ -46,8 +46,8 @@ use mc_protocol::packets::play::{
     ClientboundCommandSuggestions, ClientboundContainerClose, ClientboundContainerSetContent,
     ClientboundContainerSetData, ClientboundContainerSetSlot, ClientboundCooldown,
     ClientboundCustomPayload, ClientboundInitializeBorder, ClientboundKeepAlive,
-    ClientboundOpenScreen, ClientboundRecipeBookSettings, ClientboundRespawn,
-    ClientboundSetEntityData, ClientboundSetExperience, ClientboundSetHealth,
+    ClientboundMerchantOffers, ClientboundOpenScreen, ClientboundRecipeBookSettings,
+    ClientboundRespawn, ClientboundSetEntityData, ClientboundSetExperience, ClientboundSetHealth,
     ClientboundSetHeldSlot, ClientboundSystemChat, ClientboundTakeItemEntity, ConfirmTeleportation,
     ContainerInput, Direction, ENTITY_DATA_POSE_INDEX, ENTITY_DATA_SHARED_FLAGS_INDEX,
     EntityAnimation, EntityAnimationAction, EntityDataValue, EntityEvent, EntityPose,
@@ -66,9 +66,10 @@ use mc_protocol::packets::play::{
     ServerboundMovePlayerStatusOnly, ServerboundPlaceRecipe, ServerboundPlayerAction,
     ServerboundPlayerCommand, ServerboundPlayerInput, ServerboundPlayerLoaded,
     ServerboundRecipeBookChangeSettings, ServerboundRecipeBookSeenRecipe, ServerboundResourcePack,
-    ServerboundSetCarriedItem, ServerboundSignUpdate, ServerboundSwing, ServerboundUseItem,
-    ServerboundUseItemOn, SetCenterChunk, SetDefaultSpawnPosition, SetEntityMotion,
-    SynchronizePlayerPosition, pack_section_pos, pack_section_relative_pos, unpack_block_pos,
+    ServerboundSelectTrade, ServerboundSetCarriedItem, ServerboundSignUpdate, ServerboundSwing,
+    ServerboundUseItem, ServerboundUseItemOn, SetCenterChunk, SetDefaultSpawnPosition,
+    SetEntityMotion, SynchronizePlayerPosition, pack_section_pos, pack_section_relative_pos,
+    unpack_block_pos,
 };
 use mc_protocol::packets::{CustomPayload, Packet};
 use mc_script::{
@@ -128,6 +129,7 @@ mod inhabited_time_tests;
 mod inventory;
 mod item_blocks;
 mod lighting;
+mod merchant_adapter;
 mod movement;
 #[cfg(test)]
 mod movement_tests;
@@ -148,6 +150,7 @@ mod script_gameplay_events;
 mod script_gameplay_events_tests;
 
 use client_load::ClientLoadGate;
+use merchant_adapter::{handle_select_trade, open_merchant_container};
 use player_breathing::{PlayerBreathingState, player_can_drown};
 // Router and storage-owner wiring land separately; keep the bounded adapter
 // contract available without creating a second ingress path here.
@@ -231,8 +234,8 @@ pub(crate) fn prewarm_entity_pathing_tables() -> std::num::NonZeroUsize {
 pub(crate) use simulation::simulation_channel;
 use simulation::{
     ActiveShieldTransition, AnimalFeedPlan, AnimalFeedTargets, AuthoritativePlayerStateSnapshot,
-    BowReleasePlan, CommittedPlayerPose, FoodUsePlan, PlayerSurvivalCommitOutcome,
-    PlayerSurvivalPlan, SelectedItemDropPlan, SheepShearPlan,
+    BowReleasePlan, CommittedPlayerPose, FoodUsePlan, MerchantTradeDestination, MerchantTradePlan,
+    PlayerSurvivalCommitOutcome, PlayerSurvivalPlan, SelectedItemDropPlan, SheepShearPlan,
 };
 pub use simulation::{EntityEffectHandle, EntityEffectRequestError};
 
@@ -318,10 +321,10 @@ use containers::{
     ActiveContainer, CRAFTING_MENU_TYPE_ID, ChestClickAction, ChestClickInput, ChestView,
     ChestWindow, CraftingTableWindow, ENCHANTING_MENU_SLOT_COUNT, ENCHANTING_MENU_TYPE_ID,
     EnchantingTableWindow, FURNACE_MENU_SLOT_COUNT, FurnaceClickAction, FurnaceClickInput,
-    FurnaceKind, FurnaceWindow, QuickCraftClick, QuickCraftOutcome, QuickCraftState,
-    STONECUTTER_MENU_TYPE_ID, ScriptMenuClick, ScriptMenuClickDisposition, ScriptMenuOpenError,
-    ScriptMenuWindow, StonecutterClickAction, StonecutterClickInput, StonecutterWindow,
-    adjacent_chest_positions,
+    FurnaceKind, FurnaceWindow, MERCHANT_MENU_TYPE_ID, MerchantWindow, QuickCraftClick,
+    QuickCraftOutcome, QuickCraftState, STONECUTTER_MENU_TYPE_ID, ScriptMenuClick,
+    ScriptMenuClickDisposition, ScriptMenuOpenError, ScriptMenuWindow, StonecutterClickAction,
+    StonecutterClickInput, StonecutterWindow, adjacent_chest_positions,
     can_place_in_enchanting_menu_slot as can_place_in_enchanting_menu_slot_with_data,
     chest_menu_state_change_count, chest_menu_title_nbt, chest_slot_stacks, chest_wire_items,
     client_close_matches, count_valid_enchanting_bookshelves, crafting_menu_title_nbt,
@@ -351,6 +354,10 @@ use containers::{
     inventory_crafting_input, item_is_efficiency_enchantable,
     refresh_inventory_crafting_result as refresh_inventory_crafting_result_with_data,
     repair_item_crafting_result, set_chest_menu_stack, stack_to_furnace_slot,
+};
+use containers::{
+    merchant_input_from_projection, merchant_input_projection, merchant_menu_title_nbt,
+    merchant_protocol_offers, merchant_wire_items, select_merchant_offer,
 };
 #[cfg(test)]
 use fluids::{WATER_FLOW_DELAY_TICKS, fluid_tick_edits, supported_flow_state};
@@ -918,6 +925,7 @@ pub(super) struct SettlementInhabitantSpawn {
     position: Vec3,
     villager: mc_entity::VillagerData,
     villager_brain: mc_entity::villager_26_1_2::VillagerBrainState,
+    villager_merchant: Option<mc_entity::villager_merchant_26_1_2::VillagerMerchantState>,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -1113,6 +1121,7 @@ struct ContainerPlayerPlan {
     updated_carried_item: ItemStack,
     crafting_table_input: Option<CraftingTableInputPlan>,
     enchanting_table_input: Option<EnchantingTableInputPlan>,
+    merchant_input: Option<MerchantInputPlan>,
     drops: Vec<ContainerDropPlan>,
     xp_orb: Option<ContainerXpPlan>,
 }
@@ -1125,6 +1134,12 @@ struct CraftingTableInputPlan {
 
 #[derive(Debug, Clone)]
 struct EnchantingTableInputPlan {
+    expected: Option<Box<[ItemStack; 2]>>,
+    updated: Option<Box<[ItemStack; 2]>>,
+}
+
+#[derive(Debug, Clone)]
+struct MerchantInputPlan {
     expected: Option<Box<[ItemStack; 2]>>,
     updated: Option<Box<[ItemStack; 2]>>,
 }
@@ -1155,6 +1170,7 @@ enum PlayerInventoryCommitOutcome {
         carried_item: ItemStack,
         crafting_table_input: Option<Box<[ItemStack; 9]>>,
         enchanting_table_input: Option<Box<[ItemStack; 2]>>,
+        merchant_input: Option<Box<[ItemStack; 2]>>,
         dispatches: Vec<VisibilityDispatch>,
     },
     Rejected {
@@ -1162,6 +1178,7 @@ enum PlayerInventoryCommitOutcome {
         carried_item: ItemStack,
         crafting_table_input: Option<Box<[ItemStack; 9]>>,
         enchanting_table_input: Option<Box<[ItemStack; 2]>>,
+        merchant_input: Option<Box<[ItemStack; 2]>>,
     },
 }
 
@@ -2281,7 +2298,19 @@ async fn store_inventory_crafting_inputs(
     state: &mut InteractionState,
     player_pose: PlayerPose,
 ) -> Result<(), ConnectionError> {
-    settle_player_inventory_returns(state, None, None, false, true, false, player_pose).await
+    settle_player_inventory_returns(
+        state,
+        InventoryReturnPlan {
+            enchanting_table_input: None,
+            merchant_input: None,
+            crafting_table_input: None,
+            return_crafting_table_input: false,
+            return_inventory_crafting_inputs: true,
+            return_cursor: false,
+            player_pose,
+        },
+    )
+    .await
 }
 
 async fn write_stonecutter_content<W>(
@@ -2303,6 +2332,62 @@ where
         state.compression,
     )
     .await
+}
+
+async fn write_merchant_content<W>(
+    state: &InteractionState,
+    writer: &mut W,
+    window: &MerchantWindow,
+) -> Result<(), ConnectionError>
+where
+    W: AsyncWriteExt + Unpin,
+{
+    write_packet(
+        writer,
+        &ClientboundContainerSetContent {
+            container_id: window.container_id,
+            state_id: window.state_id,
+            items: merchant_wire_items(window, &state.inventory),
+            carried_item: state.carried_item.clone(),
+        },
+        state.compression,
+    )
+    .await
+}
+
+async fn write_merchant_offers<W>(
+    state: &InteractionState,
+    writer: &mut W,
+    window: &MerchantWindow,
+) -> Result<(), ConnectionError>
+where
+    W: AsyncWriteExt + Unpin,
+{
+    write_packet(
+        writer,
+        &ClientboundMerchantOffers {
+            container_id: window.container_id,
+            offers: merchant_protocol_offers(&window.merchant),
+            villager_level: i32::from(window.merchant.level()),
+            villager_xp: window.merchant.xp,
+            show_progress: true,
+            can_restock: true,
+        },
+        state.compression,
+    )
+    .await
+}
+
+async fn write_merchant_window<W>(
+    state: &InteractionState,
+    writer: &mut W,
+    window: &MerchantWindow,
+) -> Result<(), ConnectionError>
+where
+    W: AsyncWriteExt + Unpin,
+{
+    write_merchant_content(state, writer, window).await?;
+    write_merchant_offers(state, writer, window).await
 }
 
 async fn open_stonecutter_container<W>(
@@ -3901,6 +3986,7 @@ async fn commit_crafting_table_candidate(
             updated: crafting_table_input_projection(&window.input),
         }),
         enchanting_table_input: None,
+        merchant_input: None,
         drops,
         xp_orb: None,
     };
@@ -3929,6 +4015,7 @@ async fn commit_crafting_table_candidate(
             carried_item,
             crafting_table_input,
             enchanting_table_input: _,
+            merchant_input: _,
             dispatches: _,
         } => {
             state.inventory = inventory;
@@ -3948,6 +4035,7 @@ async fn commit_crafting_table_candidate(
             carried_item,
             crafting_table_input,
             enchanting_table_input: _,
+            merchant_input: _,
         } => {
             state.inventory = inventory;
             state.carried_item = carried_item;
@@ -3983,6 +4071,7 @@ async fn commit_stonecutter_candidate(
             updated: stonecutter_input_projection(&window.input),
         }),
         enchanting_table_input: None,
+        merchant_input: None,
         drops: Vec::new(),
         xp_orb: None,
     };
@@ -4011,6 +4100,7 @@ async fn commit_stonecutter_candidate(
             carried_item,
             crafting_table_input,
             enchanting_table_input: _,
+            merchant_input: _,
             dispatches: _,
         } => {
             state.inventory = inventory;
@@ -4031,6 +4121,7 @@ async fn commit_stonecutter_candidate(
             carried_item,
             crafting_table_input,
             enchanting_table_input: _,
+            merchant_input: _,
         } => {
             state.inventory = inventory;
             state.carried_item = carried_item;
@@ -4082,6 +4173,7 @@ async fn commit_enchanting_table_candidate(
             expected: enchanting_table_input_projection(expected_input),
             updated: enchanting_table_input_projection(&window.inputs),
         }),
+        merchant_input: None,
         drops,
         xp_orb: None,
     };
@@ -4103,6 +4195,7 @@ async fn commit_enchanting_table_candidate(
             carried_item,
             crafting_table_input: _,
             enchanting_table_input,
+            merchant_input: _,
             dispatches: _,
         } => {
             state.inventory = inventory;
@@ -4115,6 +4208,7 @@ async fn commit_enchanting_table_candidate(
             carried_item,
             crafting_table_input: _,
             enchanting_table_input,
+            merchant_input: _,
         } => {
             state.inventory = inventory;
             state.carried_item = carried_item;
@@ -4152,6 +4246,7 @@ async fn commit_player_inventory_candidate(
         updated_carried_item: state.carried_item.clone(),
         crafting_table_input: None,
         enchanting_table_input: None,
+        merchant_input: None,
         drops,
         xp_orb: None,
     };
@@ -4172,6 +4267,7 @@ async fn commit_player_inventory_candidate(
             carried_item,
             crafting_table_input: _,
             enchanting_table_input: _,
+            merchant_input: _,
             dispatches: _,
         } => {
             state.inventory = inventory;
@@ -4183,6 +4279,7 @@ async fn commit_player_inventory_candidate(
             carried_item,
             crafting_table_input: _,
             enchanting_table_input: _,
+            merchant_input: _,
         } => {
             state.inventory = inventory;
             state.carried_item = carried_item;
@@ -4191,16 +4288,82 @@ async fn commit_player_inventory_candidate(
     }
 }
 
-async fn settle_player_inventory_returns(
-    state: &mut InteractionState,
-    enchanting_table_input: Option<&[ItemStack; 2]>,
-    crafting_table_input: Option<&[ItemStack; 9]>,
+struct InventoryReturnPlan<'a> {
+    enchanting_table_input: Option<&'a [ItemStack; 2]>,
+    merchant_input: Option<&'a [ItemStack; 2]>,
+    crafting_table_input: Option<&'a [ItemStack; 9]>,
     return_crafting_table_input: bool,
     return_inventory_crafting_inputs: bool,
     return_cursor: bool,
     player_pose: PlayerPose,
+}
+
+impl<'a> InventoryReturnPlan<'a> {
+    #[cfg(test)]
+    fn cursor(player_pose: PlayerPose) -> Self {
+        Self {
+            enchanting_table_input: None,
+            merchant_input: None,
+            crafting_table_input: None,
+            return_crafting_table_input: false,
+            return_inventory_crafting_inputs: false,
+            return_cursor: true,
+            player_pose,
+        }
+    }
+
+    fn disconnect(
+        enchanting_table_input: Option<&'a [ItemStack; 2]>,
+        merchant_input: Option<&'a [ItemStack; 2]>,
+        crafting_table_input: Option<&'a [ItemStack; 9]>,
+        return_crafting_table_input: bool,
+        player_pose: PlayerPose,
+    ) -> Self {
+        Self {
+            enchanting_table_input,
+            merchant_input,
+            crafting_table_input,
+            return_crafting_table_input,
+            return_inventory_crafting_inputs: true,
+            return_cursor: true,
+            player_pose,
+        }
+    }
+
+    fn container(
+        enchanting_table_input: Option<&'a [ItemStack; 2]>,
+        merchant_input: Option<&'a [ItemStack; 2]>,
+        crafting_table_input: Option<&'a [ItemStack; 9]>,
+        return_crafting_table_input: bool,
+        player_pose: PlayerPose,
+    ) -> Self {
+        Self {
+            enchanting_table_input,
+            merchant_input,
+            crafting_table_input,
+            return_crafting_table_input,
+            return_inventory_crafting_inputs: false,
+            return_cursor: false,
+            player_pose,
+        }
+    }
+}
+
+async fn settle_player_inventory_returns(
+    state: &mut InteractionState,
+    plan: InventoryReturnPlan<'_>,
 ) -> Result<(), ConnectionError> {
+    let InventoryReturnPlan {
+        enchanting_table_input,
+        merchant_input,
+        crafting_table_input,
+        return_crafting_table_input,
+        return_inventory_crafting_inputs,
+        return_cursor,
+        player_pose,
+    } = plan;
     let return_enchanting_table_input = enchanting_table_input.is_some();
+    let return_merchant_input = merchant_input.is_some();
     let has_inventory_crafting_inputs = return_inventory_crafting_inputs
         && state.inventory.slots[1..=4]
             .iter()
@@ -4208,6 +4371,7 @@ async fn settle_player_inventory_returns(
     let has_cursor = return_cursor && !state.carried_item.is_empty();
     if !return_crafting_table_input
         && !return_enchanting_table_input
+        && !return_merchant_input
         && !has_inventory_crafting_inputs
         && !has_cursor
     {
@@ -4221,6 +4385,7 @@ async fn settle_player_inventory_returns(
         crafting_table_input.and_then(crafting_table_input_projection);
     let mut authoritative_enchanting_table_input =
         enchanting_table_input.and_then(enchanting_table_input_projection);
+    let mut authoritative_merchant_input = merchant_input.and_then(merchant_input_projection);
     loop {
         let expected_inventory = state.inventory.clone();
         let expected_carried_item = state.carried_item.clone();
@@ -4231,6 +4396,10 @@ async fn settle_player_inventory_returns(
         if return_enchanting_table_input
             && let Some(input) = authoritative_enchanting_table_input.as_deref()
         {
+            returned.extend(input.iter().cloned());
+        }
+
+        if return_merchant_input && let Some(input) = authoritative_merchant_input.as_deref() {
             returned.extend(input.iter().cloned());
         }
 
@@ -4296,6 +4465,10 @@ async fn settle_player_inventory_returns(
                     updated: None,
                 }
             }),
+            merchant_input: return_merchant_input.then(|| MerchantInputPlan {
+                expected: authoritative_merchant_input.clone(),
+                updated: None,
+            }),
             drops,
             xp_orb: None,
         };
@@ -4305,6 +4478,7 @@ async fn settle_player_inventory_returns(
                 carried_item,
                 crafting_table_input: _,
                 enchanting_table_input: _,
+                merchant_input: _,
                 dispatches: _,
             }) => {
                 state.inventory = inventory;
@@ -4316,6 +4490,7 @@ async fn settle_player_inventory_returns(
                 carried_item,
                 crafting_table_input,
                 enchanting_table_input,
+                merchant_input,
             }) => {
                 state.inventory = inventory;
                 state.carried_item = carried_item;
@@ -4324,6 +4499,9 @@ async fn settle_player_inventory_returns(
                 }
                 if return_enchanting_table_input {
                     authoritative_enchanting_table_input = enchanting_table_input;
+                }
+                if return_merchant_input {
+                    authoritative_merchant_input = merchant_input;
                 }
             }
             Err(error) => {
@@ -4342,12 +4520,15 @@ async fn settle_recovered_player_inventory(
 ) -> Result<(), ConnectionError> {
     settle_player_inventory_returns(
         state,
-        recovered.enchanting_table_input.as_deref(),
-        recovered.crafting_table_input.as_deref(),
-        recovered.crafting_table_input.is_some(),
-        true,
-        true,
-        recovered.pose,
+        InventoryReturnPlan {
+            enchanting_table_input: recovered.enchanting_table_input.as_deref(),
+            merchant_input: recovered.merchant_input.as_deref(),
+            crafting_table_input: recovered.crafting_table_input.as_deref(),
+            return_crafting_table_input: recovered.crafting_table_input.is_some(),
+            return_inventory_crafting_inputs: true,
+            return_cursor: true,
+            player_pose: recovered.pose,
+        },
     )
     .await
 }
@@ -5022,6 +5203,7 @@ where
             updated_carried_item: state.carried_item.clone(),
             crafting_table_input: None,
             enchanting_table_input: None,
+            merchant_input: None,
             drops: drop.into_iter().collect(),
             xp_orb: None,
         };
@@ -5286,6 +5468,7 @@ where
             updated_carried_item: plan.carried_item,
             crafting_table_input: None,
             enchanting_table_input: None,
+            merchant_input: None,
             drops: drop.into_iter().collect(),
             xp_orb,
         };
@@ -5471,6 +5654,10 @@ where
                     write_chest_content(state, writer, &window, &view).await?;
                     state.active_container = Some(ActiveContainer::Chest(window));
                 }
+                ActiveContainer::Merchant(window) => {
+                    write_merchant_window(state, writer, &window).await?;
+                    state.active_container = Some(ActiveContainer::Merchant(window));
+                }
                 ActiveContainer::Script(window) => {
                     write_script_menu_content(state, writer, &window).await?;
                     state.active_container = Some(ActiveContainer::Script(window));
@@ -5558,6 +5745,13 @@ where
                 let chest =
                     handle_chest_container_click(state, writer, chest, player_pose, packet).await?;
                 state.active_container = Some(ActiveContainer::Chest(chest));
+            }
+            ActiveContainer::Merchant(merchant) if merchant.container_id == packet.container_id => {
+                let merchant = merchant_adapter::handle_merchant_container_click(
+                    state, writer, merchant, packet,
+                )
+                .await?;
+                state.active_container = Some(ActiveContainer::Merchant(merchant));
             }
             ActiveContainer::Script(window) => {
                 let click = ScriptMenuClick::from_packet(
@@ -6214,7 +6408,12 @@ where
         return Ok(());
     }
 
-    handle_vanilla_interact(state, writer, packet).await?;
+    let merchant_opened = accepted.entity_type == "minecraft:villager"
+        && !packet.using_secondary_action
+        && open_merchant_container(state, writer, accepted.entity_id, accepted.player_pose).await?;
+    if !merchant_opened {
+        handle_vanilla_interact(state, writer, packet).await?;
+    }
     if let Some(script_events) = script_events {
         let hand = match packet.hand {
             InteractionHand::MainHand => ScriptInteractionHand::MainHand,
@@ -11589,7 +11788,7 @@ async fn settle_disconnected_cursor(
         });
         state.pose
     };
-    match settle_player_inventory_returns(interaction, None, None, false, false, true, pose).await {
+    match settle_player_inventory_returns(interaction, InventoryReturnPlan::cursor(pose)).await {
         Ok(()) => true,
         Err(error) => {
             warn!(?error, "cursor settlement deferred");
@@ -11602,7 +11801,7 @@ async fn settle_disconnected_inventory(
     interaction: &mut InteractionState,
     player_save_state: &Arc<Mutex<PlayerPersistedState>>,
 ) -> bool {
-    let (pose, owner_has_crafting_table_input, owner_enchanting_table_input) = {
+    let (pose, owner_has_crafting_table_input, owner_enchanting_table_input, owner_merchant_input) = {
         let state = player_save_state.lock().unwrap_or_else(|poisoned| {
             warn!("player persistence mutex was poisoned while settling disconnect inventory");
             poisoned.into_inner()
@@ -11611,6 +11810,7 @@ async fn settle_disconnected_inventory(
             state.pose,
             state.crafting_table_input.is_some(),
             state.enchanting_table_input.clone(),
+            state.merchant_input.clone(),
         )
     };
     let active = interaction.active_container.take();
@@ -11626,6 +11826,10 @@ async fn settle_disconnected_inventory(
     let enchanting_table_input = match &active {
         Some(ActiveContainer::EnchantingTable(window)) => Some(window.inputs.clone()),
         _ => owner_enchanting_table_input.map(|input| *input),
+    };
+    let merchant_input = match &active {
+        Some(ActiveContainer::Merchant(window)) => Some(window.inputs.clone()),
+        _ => owner_merchant_input.map(|input| *input),
     };
     match &active {
         Some(ActiveContainer::Furnace(window)) => {
@@ -11643,12 +11847,13 @@ async fn settle_disconnected_inventory(
 
     match settle_player_inventory_returns(
         interaction,
-        enchanting_table_input.as_ref(),
-        crafting_table_input.as_ref(),
-        return_crafting_table_input,
-        true,
-        true,
-        pose,
+        InventoryReturnPlan::disconnect(
+            enchanting_table_input.as_ref(),
+            merchant_input.as_ref(),
+            crafting_table_input.as_ref(),
+            return_crafting_table_input,
+            pose,
+        ),
     )
     .await
     {
@@ -11660,6 +11865,7 @@ async fn settle_disconnected_inventory(
                     ActiveContainer::CraftingTable(_)
                         | ActiveContainer::EnchantingTable(_)
                         | ActiveContainer::Stonecutter(_)
+                        | ActiveContainer::Merchant(_)
                 )
             }) {
                 interaction.active_container = active;
@@ -13102,6 +13308,14 @@ where
                             recipe = recipe.recipe_display_id,
                             "PlaceRecipe ignored — no world configured"
                         );
+                    }
+                } else if frame.id == ServerboundSelectTrade::ID {
+                    let mut body = frame.body;
+                    let selection = ServerboundSelectTrade::decode(&mut body)?;
+                    if let Some(state) = interaction.as_deref_mut() {
+                        handle_select_trade(state, writer, selection).await?;
+                    } else {
+                        debug!(offer_index = selection.offer_index, "SelectTrade ignored - no world configured");
                     }
                 } else if frame.id == ServerboundContainerButtonClick::ID {
                     let mut body = frame.body;

@@ -52,6 +52,7 @@ pub mod loot;
 pub mod mob_behavior_26_1_2;
 pub mod recipes;
 pub mod tags;
+pub mod villager_trades_26_1_2;
 pub mod worldgen_features;
 pub mod worldgen_inventory;
 pub mod worldgen_ores;

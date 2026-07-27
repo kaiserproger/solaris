@@ -151,6 +151,7 @@ struct GameplayDecisionState {
     primed_tnt: Option<crate::EntityPrimedTntState>,
     villager: Option<crate::VillagerData>,
     villager_brain: Option<crate::villager_26_1_2::VillagerBrainState>,
+    villager_merchant: Option<crate::villager_merchant_26_1_2::VillagerMerchantState>,
 }
 
 #[derive(Component)]
@@ -1265,6 +1266,7 @@ fn insert_snapshot_into_world(world: &mut World, snapshot: EntitySnapshot) -> bo
         primed_tnt,
         villager,
         villager_brain,
+        villager_merchant,
     } = retained;
     let living_state = living_state_from_snapshot(health, lifecycle, retained_living);
     if living_state.validate().is_err() {
@@ -1313,6 +1315,7 @@ fn insert_snapshot_into_world(world: &mut World, snapshot: EntitySnapshot) -> bo
             primed_tnt,
             villager,
             villager_brain,
+            villager_merchant,
         },
         PersistentState,
         VisibilityState,
@@ -1417,6 +1420,7 @@ fn restore_snapshot_in_world(world: &mut World, snapshot: EntitySnapshot) -> boo
         primed_tnt,
         villager,
         villager_brain,
+        villager_merchant,
     } = retained;
     let living_state = living_state_from_snapshot(health, lifecycle, retained_living);
     if living_state.validate().is_err() {
@@ -1459,6 +1463,7 @@ fn restore_snapshot_in_world(world: &mut World, snapshot: EntitySnapshot) -> boo
                 primed_tnt,
                 villager,
                 villager_brain,
+                villager_merchant,
             },
         ));
         replace_optional_component(&mut entity, active_effects);
@@ -1562,6 +1567,7 @@ fn snapshot_from_world(world: &World, id: EntityId) -> Option<EntitySnapshot> {
             primed_tnt: gameplay.primed_tnt,
             villager: gameplay.villager,
             villager_brain: gameplay.villager_brain.clone(),
+            villager_merchant: gameplay.villager_merchant.clone(),
         },
     })
 }
@@ -1624,6 +1630,7 @@ fn entity_view_from_world(world: &World, id: EntityId) -> Option<EntityView<'_>>
             primed_tnt: gameplay.primed_tnt,
             villager: gameplay.villager,
             villager_brain: gameplay.villager_brain.clone(),
+            villager_merchant: gameplay.villager_merchant.clone(),
         },
     })
 }

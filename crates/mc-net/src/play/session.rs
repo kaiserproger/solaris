@@ -101,6 +101,7 @@ mod script_teleport_endpoint;
 mod script_teleport_endpoint_tests;
 mod session_lifecycle;
 mod settlement_authority;
+pub(super) use settlement_authority::toolsmith_merchant_state;
 mod simulation_input_publication;
 #[cfg(test)]
 mod simulation_input_publication_tests;
@@ -109,6 +110,9 @@ mod survival_action_authority;
 mod transactions;
 #[cfg(test)]
 mod villager_brain_tests;
+mod villager_merchant_authority;
+#[cfg(test)]
+mod villager_merchant_tests;
 mod visibility;
 
 pub(super) fn prewarm_canonical_pathing_state_facts() -> usize {

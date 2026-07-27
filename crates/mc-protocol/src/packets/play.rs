@@ -20,6 +20,7 @@ use crate::error::CodecError;
 use crate::packets::login::GameProfileProperty;
 
 mod entity_sync_26_1_2;
+mod merchant;
 
 pub use entity_sync_26_1_2::{
     AttributeId, AttributeModifierOperation, ClientboundRemoveEntityEffect,
@@ -27,6 +28,9 @@ pub use entity_sync_26_1_2::{
     ClientboundUpdateEntityEffect, EntityAttributeModifier, EntityAttributeSnapshot,
     EntityEffectFlags, EntityEquipment, EquipmentSlot, LIVING_ENTITY_DATA_HEALTH_INDEX_26_1_2,
     MobEffectId,
+};
+pub use merchant::{
+    ClientboundMerchantOffers, MerchantItemCost, MerchantOffer, ServerboundSelectTrade,
 };
 
 /// Vanilla's ceiling on the chunk-data payload (`TWO_MEGABYTES` in

@@ -1936,6 +1936,7 @@ fn chest_world_commit_does_not_hold_unrelated_session_or_entity_state() {
             updated_carried_item: state.carried_item.clone(),
             crafting_table_input: None,
             enchanting_table_input: None,
+            merchant_input: None,
             drops: Vec::new(),
             xp_orb: None,
         }
@@ -2017,6 +2018,7 @@ fn furnace_world_commit_does_not_hold_unrelated_session_or_entity_state() {
             updated_carried_item: state.carried_item.clone(),
             crafting_table_input: None,
             enchanting_table_input: None,
+            merchant_input: None,
             drops: Vec::new(),
             xp_orb: None,
         }

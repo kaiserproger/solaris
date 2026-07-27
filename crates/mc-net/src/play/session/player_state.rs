@@ -141,12 +141,17 @@ impl SessionRegistry {
                 .enchanting_table_input
                 .as_ref()
                 .is_some_and(|plan| player_state.enchanting_table_input != plan.expected)
+            || player
+                .merchant_input
+                .as_ref()
+                .is_some_and(|plan| player_state.merchant_input != plan.expected)
         {
             return Ok(PlayerInventoryCommitOutcome::Rejected {
                 inventory: player_state.inventory.clone(),
                 carried_item: player_state.carried_item.clone(),
                 crafting_table_input: player_state.crafting_table_input.clone(),
                 enchanting_table_input: player_state.enchanting_table_input.clone(),
+                merchant_input: player_state.merchant_input.clone(),
             });
         }
 
@@ -159,6 +164,9 @@ impl SessionRegistry {
         }
         if let Some(plan) = &player.enchanting_table_input {
             player_state.enchanting_table_input = plan.updated.clone();
+        }
+        if let Some(plan) = &player.merchant_input {
+            player_state.merchant_input = plan.updated.clone();
         }
         let mut dispatches = Vec::new();
         for drop in &player.drops {
@@ -174,6 +182,7 @@ impl SessionRegistry {
             carried_item: player_state.carried_item.clone(),
             crafting_table_input: player_state.crafting_table_input.clone(),
             enchanting_table_input: player_state.enchanting_table_input.clone(),
+            merchant_input: player_state.merchant_input.clone(),
             dispatches,
         })
     }

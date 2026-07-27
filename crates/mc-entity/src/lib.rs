@@ -27,6 +27,7 @@ mod runtime;
 pub mod runtime_26_1_2;
 pub mod synced_data_26_1_2;
 pub mod villager_26_1_2;
+pub mod villager_merchant_26_1_2;
 
 #[cfg(test)]
 #[path = "entity_scale_26_1_2_tests.rs"]
@@ -452,6 +453,8 @@ pub struct EntityRetainedState {
     pub villager: Option<VillagerData>,
     #[serde(default)]
     pub villager_brain: Option<villager_26_1_2::VillagerBrainState>,
+    #[serde(default)]
+    pub villager_merchant: Option<villager_merchant_26_1_2::VillagerMerchantState>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]

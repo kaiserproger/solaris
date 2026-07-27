@@ -5,14 +5,15 @@ use mc_nbt::Tag;
 use crate::error::ConnectionError;
 use crate::play::recipes::ingredient_accepts_item;
 use crate::play::{
-    FURNACE_CONTAINER_ID_MAX, FURNACE_CONTAINER_ID_MIN, InteractionState, PlayerPose,
-    settle_player_inventory_returns,
+    FURNACE_CONTAINER_ID_MAX, FURNACE_CONTAINER_ID_MIN, InteractionState, InventoryReturnPlan,
+    PlayerPose, settle_player_inventory_returns,
 };
 
 mod chest;
 mod crafting;
 mod enchanting;
 mod furnace;
+mod merchant;
 pub(in crate::play) mod quickcraft;
 mod script_menu;
 #[cfg(test)]
@@ -61,6 +62,12 @@ pub(in crate::play) use furnace::{
     furnace_menu_title_for_block_id, furnace_output_was_taken, furnace_slot_to_stack, plan_click,
     tick,
 };
+pub(in crate::play) use merchant::{
+    MERCHANT_MENU_TYPE_ID, MerchantWindow, inputs_satisfy_offer, merchant_input_from_projection,
+    merchant_input_projection, merchant_menu_title_nbt, merchant_wire_items,
+    protocol_offers as merchant_protocol_offers, refresh_selected_offer,
+    select_offer as select_merchant_offer,
+};
 pub(in crate::play) use quickcraft::{QuickCraftClick, QuickCraftOutcome, QuickCraftState};
 pub(in crate::play) use script_menu::{
     ScriptMenuClick, ScriptMenuClickDisposition, ScriptMenuOpenError, ScriptMenuWindow,
@@ -80,6 +87,7 @@ pub(super) enum ActiveContainer {
     Stonecutter(StonecutterWindow),
     Furnace(FurnaceWindow),
     Chest(ChestWindow),
+    Merchant(MerchantWindow),
     Script(ScriptMenuWindow),
 }
 
@@ -91,6 +99,7 @@ impl ActiveContainer {
             Self::Stonecutter(window) => window.container_id,
             Self::Furnace(window) => window.container_id,
             Self::Chest(window) => window.container_id,
+            Self::Merchant(window) => window.container_id,
             Self::Script(window) => window.container_id,
         }
     }
@@ -296,12 +305,7 @@ pub(super) async fn store_active_container(
         Some(ActiveContainer::CraftingTable(window)) => {
             if let Err(error) = settle_player_inventory_returns(
                 state,
-                None,
-                Some(&window.input),
-                true,
-                false,
-                false,
-                player_pose,
+                InventoryReturnPlan::container(None, None, Some(&window.input), true, player_pose),
             )
             .await
             {
@@ -312,12 +316,13 @@ pub(super) async fn store_active_container(
         Some(ActiveContainer::EnchantingTable(window)) => {
             if let Err(error) = settle_player_inventory_returns(
                 state,
-                Some(&window.inputs),
-                None,
-                false,
-                false,
-                false,
-                player_pose,
+                InventoryReturnPlan::container(
+                    Some(&window.inputs),
+                    None,
+                    None,
+                    false,
+                    player_pose,
+                ),
             )
             .await
             {
@@ -329,16 +334,28 @@ pub(super) async fn store_active_container(
             let input = stonecutter_input_array(&window.input);
             if let Err(error) = settle_player_inventory_returns(
                 state,
-                None,
-                Some(&input),
-                true,
-                false,
-                false,
-                player_pose,
+                InventoryReturnPlan::container(None, None, Some(&input), true, player_pose),
             )
             .await
             {
                 state.active_container = Some(ActiveContainer::Stonecutter(window));
+                return Err(error);
+            }
+        }
+        Some(ActiveContainer::Merchant(window)) => {
+            if let Err(error) = settle_player_inventory_returns(
+                state,
+                InventoryReturnPlan::container(
+                    None,
+                    Some(&window.inputs),
+                    None,
+                    false,
+                    player_pose,
+                ),
+            )
+            .await
+            {
+                state.active_container = Some(ActiveContainer::Merchant(window));
                 return Err(error);
             }
         }

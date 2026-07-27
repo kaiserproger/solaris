@@ -18,13 +18,14 @@ use std::time::Duration;
 
 use mc_protocol::packets::Packet;
 use mc_protocol::packets::play::{
-    AddEntity, ClientboundCommands, ClientboundContainerSetContent, ClientboundKeepAlive,
-    ClientboundOpenScreen, ClientboundSetEntityData, ClientboundSystemChat, ConfirmTeleportation,
-    ContainerInput, Direction, EntityDataValue, GameEvent, HashedStack, InteractionHand,
+    AddEntity, ClientboundCommands, ClientboundContainerSetContent, ClientboundContainerSetSlot,
+    ClientboundKeepAlive, ClientboundMerchantOffers, ClientboundOpenScreen,
+    ClientboundSetEntityData, ClientboundSystemChat, ConfirmTeleportation, ContainerInput,
+    Direction, EntityDataValue, EntityVec3, GameEvent, HashedStack, InteractionHand,
     LevelChunkWithLight, MovePlayerFlags, ServerboundChatCommand, ServerboundContainerClick,
-    ServerboundKeepAlive, ServerboundMovePlayerPosRot, ServerboundMovePlayerStatusOnly,
-    ServerboundUseItemOn, SetCenterChunk, SetDefaultSpawnPosition, SynchronizePlayerPosition,
-    pack_block_pos,
+    ServerboundInteract, ServerboundKeepAlive, ServerboundMovePlayerPosRot,
+    ServerboundMovePlayerStatusOnly, ServerboundSelectTrade, ServerboundUseItemOn, SetCenterChunk,
+    SetDefaultSpawnPosition, SynchronizePlayerPosition, pack_block_pos,
 };
 use mc_test_harness::client::Client;
 use mc_world::ChunkGenerator;
@@ -774,13 +775,16 @@ async fn generated_village_villager_wire_and_restart_are_stable_inner() {
         villager_type_id,
     };
 
-    let first = run_generated_village_observation(&fixture, "VillageGate", true).await;
-    let second = run_generated_village_observation(&fixture, "VillageGate", false).await;
+    let first = run_generated_village_observation(&fixture, "VillageGate", true, true).await;
+    let second = run_generated_village_observation(&fixture, "VillageGate", false, false).await;
 
     assert_eq!(
-        second.uuid, first.uuid,
+        second.villager.uuid, first.villager.uuid,
         "restart must restore the same villager identity"
     );
+    assert_eq!(first.merchant_uses, 1);
+    assert_eq!(second.merchant_uses, 1);
+    assert_eq!(second.merchant_xp, 2);
 }
 
 struct GeneratedVillageFixture<'a> {
@@ -793,11 +797,18 @@ struct GeneratedVillageFixture<'a> {
     villager_type_id: i32,
 }
 
+struct GeneratedVillageObservation {
+    villager: AddEntity,
+    merchant_uses: i32,
+    merchant_xp: i32,
+}
+
 async fn run_generated_village_observation(
     fixture: &GeneratedVillageFixture<'_>,
     player_name: &str,
+    trade: bool,
     save: bool,
-) -> AddEntity {
+) -> GeneratedVillageObservation {
     let shutdown = mc_net::ShutdownHandle::default();
     let bound = mc_net::bind(ruin_server_config(
         fixture.report,
@@ -822,6 +833,8 @@ async fn run_generated_village_observation(
         spawn_count, 1,
         "chunk marker and restored entity must not duplicate villager"
     );
+    let (merchant_uses, merchant_xp) =
+        exercise_generated_toolsmith(&mut client, villager.entity_id, &fixture.items, trade).await;
 
     if save {
         client
@@ -839,7 +852,185 @@ async fn run_generated_village_observation(
         .expect("generated village shutdown")
         .expect("generated village server join")
         .expect("generated village server result");
-    villager
+    GeneratedVillageObservation {
+        villager,
+        merchant_uses,
+        merchant_xp,
+    }
+}
+
+async fn exercise_generated_toolsmith(
+    client: &mut Client,
+    villager_entity_id: i32,
+    items: &mc_data::items::ItemRegistry,
+    trade: bool,
+) -> (i32, i32) {
+    let coal_id = ruin_item_id(items, "minecraft:coal");
+    let emerald_id = ruin_item_id(items, "minecraft:emerald");
+    if trade {
+        client
+            .write_packet(&ServerboundChatCommand {
+                command: "give minecraft:coal 32".into(),
+            })
+            .await
+            .expect("give coal for generated toolsmith trade");
+        wait_for_inventory_item(client, coal_id, 32).await;
+    }
+
+    client
+        .write_packet(&ServerboundInteract {
+            entity_id: villager_entity_id,
+            hand: InteractionHand::MainHand,
+            location: EntityVec3::ZERO,
+            using_secondary_action: false,
+        })
+        .await
+        .expect("open generated toolsmith merchant");
+    let opened = wait_for_merchant_screen(client).await;
+    let mut content = wait_for_container_content(client, opened.container_id, |packet| {
+        packet.items.len() == 39
+    })
+    .await;
+    let mut offers = wait_for_merchant_offers(client, opened.container_id, |_| true).await;
+    assert_eq!(offers.offers.len(), 5);
+    assert_eq!(offers.offers[0].cost_a.item_id, coal_id);
+    assert_eq!(offers.offers[0].cost_a.count, 15);
+    assert_eq!(offers.offers[0].result.item_id, emerald_id);
+    assert_eq!(offers.offers[0].result.count, 1);
+
+    if !trade {
+        assert_eq!(container_item_count(&content, coal_id), 17);
+        return (offers.offers[0].uses, offers.villager_xp);
+    }
+    assert_eq!(offers.offers[0].uses, 0);
+    assert_eq!(offers.villager_xp, 0);
+
+    client
+        .write_packet(&ServerboundSelectTrade { offer_index: 0 })
+        .await
+        .expect("select generated toolsmith coal trade");
+    content = wait_for_container_content(client, opened.container_id, |packet| {
+        packet.items.len() == 39
+            && packet.items[0].item_id == coal_id
+            && packet.items[0].count == 32
+            && packet.items[2].item_id == emerald_id
+            && packet.items[2].count == 1
+    })
+    .await;
+
+    let selected_state_id = content.state_id;
+    client
+        .write_packet(&ServerboundContainerClick {
+            container_id: opened.container_id,
+            state_id: selected_state_id,
+            slot_num: 2,
+            button_num: 0,
+            container_input: ContainerInput::QuickMove,
+            changed_slots: Vec::new(),
+            carried_item: HashedStack::empty(),
+        })
+        .await
+        .expect("quick-move generated toolsmith result");
+    content = wait_for_container_content(client, opened.container_id, |packet| {
+        packet.state_id > selected_state_id
+            && packet.items.len() == 39
+            && packet.items[0].item_id == coal_id
+            && packet.items[0].count == 17
+            && packet.items[2].item_id == emerald_id
+            && packet.items[2].count == 1
+            && packet.items[3..]
+                .iter()
+                .filter(|stack| stack.item_id == emerald_id)
+                .map(|stack| stack.count)
+                .sum::<i32>()
+                == 1
+    })
+    .await;
+    offers = wait_for_merchant_offers(client, opened.container_id, |packet| {
+        packet.offers[0].uses == 1 && packet.villager_xp == 2
+    })
+    .await;
+    assert_eq!(container_item_count(&content, coal_id), 17);
+    (offers.offers[0].uses, offers.villager_xp)
+}
+
+async fn wait_for_inventory_item(client: &mut Client, item_id: u32, count: i32) {
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+    loop {
+        let mut frame = client
+            .read_frame_with_timeout(
+                deadline.saturating_duration_since(tokio::time::Instant::now()),
+            )
+            .await
+            .expect("generated toolsmith inventory grant");
+        if handle_keepalive(client, frame.id, &frame.body).await {
+            continue;
+        }
+        if frame.id == ClientboundContainerSetSlot::ID {
+            let packet = ClientboundContainerSetSlot::decode(&mut frame.body)
+                .expect("decode generated toolsmith inventory slot");
+            if packet.container_id == 0
+                && packet.item_stack.item_id == item_id
+                && packet.item_stack.count == count
+            {
+                return;
+            }
+        } else if frame.id == ClientboundContainerSetContent::ID {
+            let packet = ClientboundContainerSetContent::decode(&mut frame.body)
+                .expect("decode generated toolsmith inventory content");
+            if packet.container_id == 0 && container_item_count(&packet, item_id) == count {
+                return;
+            }
+        }
+    }
+}
+
+async fn wait_for_merchant_screen(client: &mut Client) -> ClientboundOpenScreen {
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+    loop {
+        let mut frame = client
+            .read_frame_with_timeout(
+                deadline.saturating_duration_since(tokio::time::Instant::now()),
+            )
+            .await
+            .expect("generated toolsmith merchant screen");
+        if handle_keepalive(client, frame.id, &frame.body).await {
+            continue;
+        }
+        if frame.id == ClientboundOpenScreen::ID {
+            let packet = ClientboundOpenScreen::decode(&mut frame.body)
+                .expect("decode generated toolsmith merchant screen");
+            if packet.menu_type == 19 {
+                return packet;
+            }
+        }
+    }
+}
+
+async fn wait_for_merchant_offers(
+    client: &mut Client,
+    container_id: i32,
+    predicate: impl Fn(&ClientboundMerchantOffers) -> bool,
+) -> ClientboundMerchantOffers {
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+    loop {
+        let mut frame = client
+            .read_frame_with_timeout(
+                deadline.saturating_duration_since(tokio::time::Instant::now()),
+            )
+            .await
+            .expect("generated toolsmith merchant offers");
+        if handle_keepalive(client, frame.id, &frame.body).await {
+            continue;
+        }
+        if frame.id == ClientboundMerchantOffers::ID {
+            let packet = ClientboundMerchantOffers::decode(&mut frame.body)
+                .expect("decode generated toolsmith merchant offers");
+            if packet.container_id == container_id && predicate(&packet) {
+                return packet;
+            }
+        }
+    }
 }
 
 async fn observe_generated_village_villager(

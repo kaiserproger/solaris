@@ -1,6 +1,7 @@
 use super::campfire::campfire_cooking_states_from_chunk;
 use super::session::{
     PreparedChunkClaim, PreparedChunkClaimResult, SessionPreparedChunkClaimResult,
+    toolsmith_merchant_state,
 };
 use super::*;
 use mc_world::light::compute_chunk_light_in;
@@ -2174,6 +2175,10 @@ impl ChunkStreamState {
                                                 meeting_point: to_vec3(marker.meeting_point),
                                             },
                                         ),
+                                    villager_merchant: (profession
+                                        == mc_entity::VillagerProfession::Toolsmith)
+                                        .then(|| toolsmith_merchant_state(&self.items))
+                                        .flatten(),
                                 })
                             })
                             .collect()

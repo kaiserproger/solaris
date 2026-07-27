@@ -53,6 +53,7 @@ const ENCHANTMENTS_COMPONENT: &str = "minecraft:enchantments";
 const CARRIED_ITEM_FIELD: &str = "SolarisCarriedItem";
 const CRAFTING_TABLE_INPUT_FIELD: &str = "SolarisCraftingTableInput";
 const ENCHANTING_TABLE_INPUT_FIELD: &str = "SolarisEnchantingTableInput";
+const MERCHANT_INPUT_FIELD: &str = "SolarisMerchantInput";
 static TMP_FILE_COUNTER: AtomicU64 = AtomicU64::new(0);
 
 #[derive(Debug, Error)]
@@ -1171,6 +1172,7 @@ pub(crate) struct PlayerPersistedState {
     pub(super) carried_item: ItemStack,
     pub(super) crafting_table_input: Option<Box<[ItemStack; 9]>>,
     pub(super) enchanting_table_input: Option<Box<[ItemStack; 2]>>,
+    pub(super) merchant_input: Option<Box<[ItemStack; 2]>>,
     pub(super) selected_hotbar_slot: u8,
     pub(super) spawn: SpawnState,
     pub(super) xp: XpState,
@@ -1187,6 +1189,7 @@ impl PlayerPersistedState {
             carried_item: ItemStack::EMPTY,
             crafting_table_input: None,
             enchanting_table_input: None,
+            merchant_input: None,
             selected_hotbar_slot: 0,
             spawn: SpawnState::from_pose(spawn),
             xp: XpState::default(),
@@ -1445,6 +1448,8 @@ pub(super) fn load_player_state(
         item_stack_projection_from_field::<9>(items, &fields, CRAFTING_TABLE_INPUT_FIELD)?;
     state.enchanting_table_input =
         item_stack_projection_from_field::<2>(items, &fields, ENCHANTING_TABLE_INPUT_FIELD)?;
+    state.merchant_input =
+        item_stack_projection_from_field::<2>(items, &fields, MERCHANT_INPUT_FIELD)?;
 
     validate_player_numeric_state(&path, &state)?;
     Ok(Some(state))
@@ -1519,6 +1524,11 @@ pub(crate) fn save_player_state(
         &mut fields,
         ENCHANTING_TABLE_INPUT_FIELD,
         item_stack_projection_tag(items, state.enchanting_table_input.as_deref())?,
+    );
+    set_field(
+        &mut fields,
+        MERCHANT_INPUT_FIELD,
+        item_stack_projection_tag(items, state.merchant_input.as_deref())?,
     );
 
     write_player_root(&path, &root_name, &Tag::Compound(fields))
@@ -3409,6 +3419,8 @@ mod tests {
         enchanting_table_input[0] = ItemStack::new(2, 1);
         enchanting_table_input[1] = ItemStack::new(1, 7);
         state.enchanting_table_input = Some(Box::new(enchanting_table_input.clone()));
+        let merchant_input = [ItemStack::new(1, 15), ItemStack::new(2, 1)];
+        state.merchant_input = Some(Box::new(merchant_input.clone()));
         let efficiency = Identifier::parse("minecraft:efficiency").unwrap();
         state.inventory.slots[9] = ItemStack::new(2, 1)
             .with_damage(11)
@@ -3444,6 +3456,7 @@ mod tests {
             loaded.enchanting_table_input.as_deref(),
             Some(&enchanting_table_input)
         );
+        assert_eq!(loaded.merchant_input.as_deref(), Some(&merchant_input));
         assert_eq!(
             loaded.inventory.slots[9],
             ItemStack::new(2, 1)
