@@ -15,6 +15,7 @@ val clientMcpPort = providers.environmentVariable("SOLARIS_CLIENT_MCP_PORT")
 val clientMcpGameDir = providers.gradleProperty("solaris.clientMcp.gameDir")
     .orElse(rootProject.file("../../.analysis/minecraft-loader-mcp/fabric").absolutePath)
 val clientMcpUsername = providers.gradleProperty("solaris.clientMcp.username").orElse("SolarisLoader")
+val clientMcpRuntime by configurations.creating
 
 loom {
     runs {
@@ -30,7 +31,7 @@ dependencies {
     implementation("net.fabricmc:fabric-loader:${fabricLoaderVersion.get()}")
     implementation("net.fabricmc.fabric-api:fabric-api:${fabricApiVersion.get()}")
     include(project(":loader-core"))
-    runtimeOnly(project(":java-agent"))
+    clientMcpRuntime(project(":java-agent"))
     testImplementation("org.junit.jupiter:junit-jupiter-api:5.10.2")
     testRuntimeOnly("org.junit.jupiter:junit-jupiter-engine:5.10.2")
     testRuntimeOnly("org.junit.platform:junit-platform-launcher:1.10.2")
@@ -49,6 +50,7 @@ tasks.named<JavaExec>("runClientMcp") {
     group = "verification"
     description = "Runs the Fabric Loader client with the embedded Solaris MCP server."
     dependsOn(rootProject.tasks.named("validateLoaderClientMcpRunProperties"))
+    classpath += clientMcpRuntime
     workingDir(file(clientMcpGameDir.get()))
     args("--username", clientMcpUsername.get())
     environment("SOLARIS_CLIENT_MCP_TOKEN", clientMcpToken.get())
