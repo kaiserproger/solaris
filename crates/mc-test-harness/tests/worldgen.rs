@@ -22,10 +22,11 @@ use mc_protocol::packets::play::{
     ClientboundKeepAlive, ClientboundMerchantOffers, ClientboundOpenScreen,
     ClientboundSetEntityData, ClientboundSystemChat, ConfirmTeleportation, ContainerInput,
     Direction, EntityDataValue, EntityVec3, GameEvent, HashedStack, InteractionHand,
-    LevelChunkWithLight, MovePlayerFlags, ServerboundChatCommand, ServerboundContainerClick,
-    ServerboundInteract, ServerboundKeepAlive, ServerboundMovePlayerPosRot,
-    ServerboundMovePlayerStatusOnly, ServerboundSelectTrade, ServerboundUseItemOn, SetCenterChunk,
-    SetDefaultSpawnPosition, SynchronizePlayerPosition, pack_block_pos,
+    LevelChunkWithLight, MovePlayerFlags, ServerboundAttack, ServerboundChatCommand,
+    ServerboundContainerClick, ServerboundContainerClose, ServerboundInteract,
+    ServerboundKeepAlive, ServerboundMovePlayerPosRot, ServerboundMovePlayerStatusOnly,
+    ServerboundSelectTrade, ServerboundUseItemOn, SetCenterChunk, SetDefaultSpawnPosition,
+    SynchronizePlayerPosition, pack_block_pos,
 };
 use mc_test_harness::client::Client;
 use mc_world::ChunkGenerator;
@@ -891,7 +892,7 @@ async fn exercise_generated_toolsmith(
         packet.items.len() == 39
     })
     .await;
-    let mut offers = wait_for_merchant_offers(client, opened.container_id, |_| true).await;
+    let offers = wait_for_merchant_offers(client, opened.container_id, |_| true).await;
     assert_eq!(offers.offers.len(), 5);
     assert_eq!(offers.offers[0].cost_a.item_id, coal_id);
     assert_eq!(offers.offers[0].cost_a.count, 15);
@@ -900,6 +901,10 @@ async fn exercise_generated_toolsmith(
 
     if !trade {
         assert_eq!(container_item_count(&content, coal_id), 17);
+        assert_eq!(
+            offers.offers[0].special_price, 2,
+            "same player must retain the persisted villager-hurt surcharge after restart"
+        );
         return (offers.offers[0].uses, offers.villager_xp);
     }
     assert_eq!(offers.offers[0].uses, 0);
@@ -946,12 +951,56 @@ async fn exercise_generated_toolsmith(
                 == 1
     })
     .await;
-    offers = wait_for_merchant_offers(client, opened.container_id, |packet| {
+    let _ = wait_for_merchant_offers(client, opened.container_id, |packet| {
         packet.offers[0].uses == 1 && packet.villager_xp == 2
     })
     .await;
     assert_eq!(container_item_count(&content, coal_id), 17);
-    (offers.offers[0].uses, offers.villager_xp)
+
+    client
+        .write_packet(&ServerboundContainerClose {
+            container_id: opened.container_id,
+        })
+        .await
+        .expect("close generated toolsmith merchant before attack");
+    client
+        .write_packet(&ServerboundAttack {
+            entity_id: villager_entity_id,
+        })
+        .await
+        .expect("attack generated toolsmith for hurt gossip");
+    client
+        .write_packet(&ServerboundInteract {
+            entity_id: villager_entity_id,
+            hand: InteractionHand::MainHand,
+            location: EntityVec3::ZERO,
+            using_secondary_action: false,
+        })
+        .await
+        .expect("reopen generated toolsmith after attack");
+    let punished_screen = wait_for_merchant_screen(client).await;
+    let punished_offers =
+        wait_for_merchant_offers(client, punished_screen.container_id, |packet| {
+            packet.offers[0].uses == 1
+                && packet.villager_xp == 2
+                && packet.offers[0].special_price == 2
+        })
+        .await;
+    client
+        .write_packet(&ServerboundSelectTrade { offer_index: 0 })
+        .await
+        .expect("select punished generated toolsmith trade");
+    let punished_content =
+        wait_for_container_content(client, punished_screen.container_id, |packet| {
+            packet.items.len() == 39
+                && packet.items[0].item_id == coal_id
+                && packet.items[0].count == 17
+                && packet.items[2].item_id == emerald_id
+                && packet.items[2].count == 1
+        })
+        .await;
+    assert_eq!(container_item_count(&punished_content, coal_id), 17);
+    (punished_offers.offers[0].uses, punished_offers.villager_xp)
 }
 
 async fn wait_for_inventory_item(client: &mut Client, item_id: u32, count: i32) {

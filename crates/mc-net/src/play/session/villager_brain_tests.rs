@@ -432,8 +432,12 @@ fn working_villager_restocks_only_at_job_site_with_cooldown_and_daily_limit() {
             0.2,
         )])
         .unwrap();
-        merchant.record_player_trade(customer, 0).unwrap();
+        let mut gossip = mc_entity::villager_gossip_26_1_2::VillagerGossipState::default();
+        gossip.record_event(
+            mc_entity::villager_gossip_26_1_2::VillagerGossipEvent::Trade { player: customer },
+        );
         merchant.offers[0].uses = 1;
+        next.retained.villager_gossip = Some(gossip);
         next.retained.villager_merchant = Some(merchant);
         assert!(entities.replace_snapshot_if_current(expected, next));
     }
@@ -448,8 +452,9 @@ fn working_villager_restocks_only_at_job_site_with_cooldown_and_daily_limit() {
         away_merchant.offers[0].uses, 1,
         "work activity alone must not restock away from the claimed job site"
     );
-    assert_eq!(away_merchant.trading_reputation(customer), 2);
-    assert_eq!(away_merchant.last_reputation_decay_game_time, Some(2_000));
+    let away_gossip = away.retained.villager_gossip.as_ref().unwrap();
+    assert_eq!(away_gossip.trading_value(customer), 2);
+    assert_eq!(away_gossip.last_decay_game_time, 2_000);
 
     {
         let mut entities = registry.lock_entities("move merchant to job site");
@@ -510,12 +515,10 @@ fn working_villager_restocks_only_at_job_site_with_cooldown_and_daily_limit() {
     assert_eq!(next_day_merchant.offers[0].uses, 0);
     assert_eq!(next_day_merchant.restocks_today, 1);
     assert_eq!(next_day_merchant.last_restock_day, 1);
-    assert_eq!(next_day_merchant.trading_reputation(customer), 0);
-    assert!(next_day_merchant.player_reputations.is_empty());
-    assert_eq!(
-        next_day_merchant.last_reputation_decay_game_time,
-        Some(26_000)
-    );
+    let next_day_gossip = next_day.retained.villager_gossip.as_ref().unwrap();
+    assert_eq!(next_day_gossip.trading_value(customer), 0);
+    assert!(next_day_gossip.player_gossips.is_empty());
+    assert_eq!(next_day_gossip.last_decay_game_time, 26_000);
 }
 
 #[tokio::test]

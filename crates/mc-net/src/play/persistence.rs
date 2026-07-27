@@ -1534,6 +1534,32 @@ pub(crate) fn save_player_state(
     write_player_root(&path, &root_name, &Tag::Compound(fields))
 }
 
+fn migrate_legacy_villager_gossip(
+    retained: &mut mc_entity::EntityRetainedState,
+) -> Result<(), mc_entity::villager_gossip_26_1_2::VillagerGossipError> {
+    let legacy_gossip = retained
+        .villager_merchant
+        .as_mut()
+        .map(mc_entity::villager_merchant_26_1_2::VillagerMerchantState::take_legacy_gossip)
+        .transpose()?
+        .flatten();
+    let Some(legacy_gossip) = legacy_gossip else {
+        return Ok(());
+    };
+    if let Some(gossip) = retained.villager_gossip.as_mut() {
+        gossip.merge_legacy_trading(
+            Some(legacy_gossip.last_decay_game_time),
+            legacy_gossip
+                .player_gossips
+                .into_iter()
+                .map(|entry| (entry.player, entry.trading)),
+        )?;
+    } else {
+        retained.villager_gossip = Some(legacy_gossip);
+    }
+    Ok(())
+}
+
 pub(crate) fn load_persisted_entities(
     world_root: &Path,
     items: &ItemRegistry,
@@ -1754,6 +1780,12 @@ pub(crate) fn load_persisted_entities(
                         }
                     })
                 })?;
+        migrate_legacy_villager_gossip(&mut retained).map_err(|_| {
+            PlayerPersistenceError::InvalidValue {
+                path: path.clone(),
+                field: ENTITY_RETAINED_STATE_FIELD,
+            }
+        })?;
         if let Some(fall_distance) = float_field(fields, "FallDistance") {
             retained.fall_distance = f64::from(fall_distance);
         }

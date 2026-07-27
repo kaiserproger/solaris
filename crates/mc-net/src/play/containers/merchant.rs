@@ -1,5 +1,6 @@
 use mc_data::item_components::ItemFactsTable;
 use mc_data::items::ItemRegistry;
+use mc_entity::villager_gossip_26_1_2::VillagerGossipState;
 use mc_entity::villager_merchant_26_1_2::{VillagerMerchantState, VillagerTradeOffer};
 use mc_nbt::Tag;
 use mc_protocol::packets::play::{ItemStack, MerchantItemCost, MerchantOffer};
@@ -18,6 +19,7 @@ pub(in crate::play) struct MerchantWindow {
     pub(in crate::play) selected_offer: Option<usize>,
     pub(in crate::play) inputs: [ItemStack; 2],
     pub(in crate::play) result: ItemStack,
+    pub(in crate::play) gossip: VillagerGossipState,
     pub(in crate::play) merchant: VillagerMerchantState,
 }
 
@@ -26,6 +28,7 @@ impl MerchantWindow {
         container_id: i32,
         entity_id: mc_entity::EntityId,
         customer: uuid::Uuid,
+        gossip: VillagerGossipState,
         merchant: VillagerMerchantState,
         persisted_inputs: Option<Box<[ItemStack; 2]>>,
     ) -> Self {
@@ -40,6 +43,7 @@ impl MerchantWindow {
                 |inputs| *inputs,
             ),
             result: ItemStack::EMPTY,
+            gossip,
             merchant,
         }
     }
@@ -100,12 +104,12 @@ fn wire_item_stack(stack: &mc_entity::EntityItemStack) -> ItemStack {
 }
 
 pub(in crate::play) fn protocol_offers(window: &MerchantWindow) -> Vec<MerchantOffer> {
+    let reputation = window.gossip.player_reputation(window.customer);
     window
         .merchant
         .offers
         .iter()
-        .enumerate()
-        .map(|(offer_index, offer)| MerchantOffer {
+        .map(|offer| MerchantOffer {
             cost_a: MerchantItemCost {
                 item_id: offer.cost_a.item_id,
                 count: offer.cost_a.count,
@@ -119,10 +123,7 @@ pub(in crate::play) fn protocol_offers(window: &MerchantWindow) -> Vec<MerchantO
             uses: offer.uses,
             max_uses: offer.max_uses,
             xp: offer.xp,
-            special_price: window
-                .merchant
-                .player_special_price(window.customer, offer_index)
-                .unwrap_or(offer.special_price),
+            special_price: offer.special_price_for_reputation(reputation),
             price_multiplier: offer.price_multiplier,
             demand: offer.demand,
         })
@@ -150,10 +151,8 @@ pub(in crate::play) fn select_offer(
     )?;
 
     let max_a = item_max_stack_for_id(item_facts, items, offer.cost_a.item_id);
-    let count_a =
-        window
-            .merchant
-            .modified_cost_a_count_for_player(window.customer, selection, max_a)?;
+    let reputation = window.gossip.player_reputation(window.customer);
+    let count_a = offer.modified_cost_a_count_for_reputation(max_a, reputation);
     updated_window.inputs[0] =
         take_cost(&mut updated_inventory, offer.cost_a.item_id, count_a, max_a)?;
     if let Some(cost_b) = offer.cost_b {
@@ -182,14 +181,8 @@ pub(in crate::play) fn refresh_selected_offer(
         return;
     };
     let max_a = item_max_stack_for_id(item_facts, items, offer.cost_a.item_id);
-    let Some(modified_cost_a) =
-        window
-            .merchant
-            .modified_cost_a_count_for_player(window.customer, offer_index, max_a)
-    else {
-        window.result = ItemStack::EMPTY;
-        return;
-    };
+    let reputation = window.gossip.player_reputation(window.customer);
+    let modified_cost_a = offer.modified_cost_a_count_for_reputation(max_a, reputation);
     if offer.is_out_of_stock() || !inputs_satisfy_offer(&window.inputs, offer, modified_cost_a) {
         window.result = ItemStack::EMPTY;
         return;
@@ -297,6 +290,7 @@ mod tests {
             2,
             mc_entity::EntityId(7),
             uuid::Uuid::from_u128(7),
+            VillagerGossipState::default(),
             merchant,
             None,
         );
@@ -331,6 +325,7 @@ mod tests {
             2,
             mc_entity::EntityId(7),
             uuid::Uuid::from_u128(7),
+            VillagerGossipState::default(),
             merchant,
             None,
         );
@@ -369,9 +364,13 @@ mod tests {
             1.0,
         );
         offer.max_uses = 16;
-        let mut merchant = VillagerMerchantState::new(vec![offer]).unwrap();
-        merchant.record_player_trade(customer, 0).unwrap();
-        let window = MerchantWindow::new(2, mc_entity::EntityId(7), customer, merchant, None);
+        let merchant = VillagerMerchantState::new(vec![offer]).unwrap();
+        let mut gossip = VillagerGossipState::default();
+        gossip.record_event(
+            mc_entity::villager_gossip_26_1_2::VillagerGossipEvent::Trade { player: customer },
+        );
+        let window =
+            MerchantWindow::new(2, mc_entity::EntityId(7), customer, gossip, merchant, None);
         let mut inventory = PlayerInventory::empty();
         inventory.slots[36] = ItemStack::new(emerald, 3);
 
@@ -384,6 +383,7 @@ mod tests {
             3,
             mc_entity::EntityId(7),
             uuid::Uuid::from_u128(8),
+            window.gossip,
             window.merchant,
             None,
         );

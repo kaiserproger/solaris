@@ -1004,6 +1004,7 @@ fn server_snapshot_health_comes_from_accepted_ecs_damage_snapshot() {
                 amount: 3.5,
                 tick: 1,
                 death_remove_tick: 21,
+                villager_gossip_event: None,
             },
         )
         .expect("damage is accepted");

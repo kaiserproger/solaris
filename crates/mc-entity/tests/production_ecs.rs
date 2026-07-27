@@ -196,6 +196,7 @@ fn effect_tick_mutates_authoritative_living_state_and_expires_in_ecs() {
                 amount: 12.0,
                 tick: 1,
                 death_remove_tick: 21,
+                villager_gossip_event: None,
             },
         )
         .expect("seed damaged ECS living state");

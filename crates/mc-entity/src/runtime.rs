@@ -151,6 +151,7 @@ struct GameplayDecisionState {
     primed_tnt: Option<crate::EntityPrimedTntState>,
     villager: Option<crate::VillagerData>,
     villager_brain: Option<crate::villager_26_1_2::VillagerBrainState>,
+    villager_gossip: Option<crate::villager_gossip_26_1_2::VillagerGossipState>,
     villager_merchant: Option<crate::villager_merchant_26_1_2::VillagerMerchantState>,
 }
 
@@ -1266,6 +1267,7 @@ fn insert_snapshot_into_world(world: &mut World, snapshot: EntitySnapshot) -> bo
         primed_tnt,
         villager,
         villager_brain,
+        villager_gossip,
         villager_merchant,
     } = retained;
     let living_state = living_state_from_snapshot(health, lifecycle, retained_living);
@@ -1315,6 +1317,7 @@ fn insert_snapshot_into_world(world: &mut World, snapshot: EntitySnapshot) -> bo
             primed_tnt,
             villager,
             villager_brain,
+            villager_gossip,
             villager_merchant,
         },
         PersistentState,
@@ -1420,6 +1423,7 @@ fn restore_snapshot_in_world(world: &mut World, snapshot: EntitySnapshot) -> boo
         primed_tnt,
         villager,
         villager_brain,
+        villager_gossip,
         villager_merchant,
     } = retained;
     let living_state = living_state_from_snapshot(health, lifecycle, retained_living);
@@ -1463,6 +1467,7 @@ fn restore_snapshot_in_world(world: &mut World, snapshot: EntitySnapshot) -> boo
                 primed_tnt,
                 villager,
                 villager_brain,
+                villager_gossip,
                 villager_merchant,
             },
         ));
@@ -1567,6 +1572,7 @@ fn snapshot_from_world(world: &World, id: EntityId) -> Option<EntitySnapshot> {
             primed_tnt: gameplay.primed_tnt,
             villager: gameplay.villager,
             villager_brain: gameplay.villager_brain.clone(),
+            villager_gossip: gameplay.villager_gossip.clone(),
             villager_merchant: gameplay.villager_merchant.clone(),
         },
     })
@@ -1630,6 +1636,7 @@ fn entity_view_from_world(world: &World, id: EntityId) -> Option<EntityView<'_>>
             primed_tnt: gameplay.primed_tnt,
             villager: gameplay.villager,
             villager_brain: gameplay.villager_brain.clone(),
+            villager_gossip: gameplay.villager_gossip.clone(),
             villager_merchant: gameplay.villager_merchant.clone(),
         },
     })
@@ -2194,6 +2201,14 @@ fn apply_combat_commands(world: &mut World) {
                         continue;
                     };
                     gameplay.last_damage_tick = Some(request.tick);
+                    if gameplay.villager.is_some()
+                        && let Some(event) = request.villager_gossip_event
+                    {
+                        gameplay
+                            .villager_gossip
+                            .get_or_insert_with(Default::default)
+                            .record_event(event);
+                    }
                     if killed {
                         gameplay.death_remove_tick = Some(request.death_remove_tick);
                         gameplay.sheep_grazing_ticks = None;
@@ -2445,6 +2460,7 @@ mod tests {
                 amount: 5.0,
                 tick: 4,
                 death_remove_tick: 24,
+                villager_gossip_event: None,
             },
         });
         runtime.run_stage(EntityStage::CombatLifecycle);
@@ -2479,6 +2495,7 @@ mod tests {
                 amount: initial.health,
                 tick: 5,
                 death_remove_tick: 25,
+                villager_gossip_event: None,
             },
         });
         runtime.queue_combat(EntityCombatCommand::Remove { id: initial.id });

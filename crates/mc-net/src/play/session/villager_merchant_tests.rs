@@ -14,7 +14,9 @@ use tokio::sync::mpsc;
 use super::*;
 use crate::login::LoggedInProfile;
 use crate::play::persistence::PlayerPersistedState;
-use crate::play::simulation::{MerchantTradeDestination, MerchantTradePlan, SimulationAuthority};
+use crate::play::simulation::{
+    MerchantTradeDestination, MerchantTradePlan, PlayerSurvivalPlan, SimulationAuthority,
+};
 
 fn register_player(
     registry: &SessionRegistry,
@@ -53,6 +55,24 @@ fn merchant(emerald: u32, axe: u32) -> VillagerMerchantState {
     .unwrap()
 }
 
+fn unchanged_attack_plan(state: &PlayerPersistedState) -> PlayerSurvivalPlan {
+    PlayerSurvivalPlan {
+        expected_survival: state.survival,
+        updated_survival: state.survival,
+        expected_inventory: state.inventory.clone(),
+        updated_inventory: state.inventory.clone(),
+        expected_carried_item: state.carried_item.clone(),
+        expected_xp: state.xp.clone(),
+        updated_xp: state.xp.clone(),
+        active_shield: None,
+        enchanting_table_input: None,
+        item_entity_type_id: None,
+        xp_orb_entity_type_id: None,
+        keep_inventory: false,
+        position: Vec3::new(state.pose.x, state.pose.y, state.pose.z),
+    }
+}
+
 fn spawn_merchant(
     registry: &SessionRegistry,
     merchant: VillagerMerchantState,
@@ -79,6 +99,7 @@ fn trade_plan(
     MerchantTradePlan {
         entity_id,
         expected_merchant: merchant,
+        expected_gossip: mc_entity::villager_gossip_26_1_2::VillagerGossipState::default(),
         offer_index: 0,
         expected_inventory: inventory,
         expected_carried_item: carried_item,
@@ -87,6 +108,75 @@ fn trade_plan(
         cost_a_max_stack: 64,
         result_max_stack: 1,
     }
+}
+
+#[test]
+fn player_hurt_records_minor_negative_once_with_accepted_damage() {
+    let registry = SessionRegistry::new();
+    let authority = SimulationAuthority::for_test();
+    let (session, state) = register_player(&registry, "VillagerHurter");
+    let entity_id = spawn_merchant(&registry, merchant(17, 23));
+    let pose = PlayerPose::new(0.5, 64.0, 0.5);
+    let costs = {
+        let player = state.lock().unwrap();
+        unchanged_attack_plan(&player)
+    };
+
+    assert!(matches!(
+        registry.player_attack_server_entity(
+            &authority,
+            ServerEntityPlayerAttack {
+                entity_id,
+                amount: 1.0,
+                game_mode: GameMode::Survival,
+                player_pose: pose,
+                attacker: Some((session, &costs)),
+            },
+        ),
+        PlayerAttackResult::Damaged(_)
+    ));
+    let after_hit = registry
+        .lock_entities("read villager hurt gossip")
+        .snapshot(entity_id)
+        .unwrap();
+    let player_uuid = crate::login::offline_uuid("VillagerHurter");
+    assert_eq!(
+        after_hit
+            .retained
+            .villager_gossip
+            .as_ref()
+            .unwrap()
+            .minor_negative_value(player_uuid),
+        25
+    );
+
+    assert!(matches!(
+        registry.player_attack_server_entity(
+            &authority,
+            ServerEntityPlayerAttack {
+                entity_id,
+                amount: 1.0,
+                game_mode: GameMode::Survival,
+                player_pose: pose,
+                attacker: Some((session, &costs)),
+            },
+        ),
+        PlayerAttackResult::AcceptedNoDamage
+    ));
+    let replayed = registry
+        .lock_entities("read villager hurt replay")
+        .snapshot(entity_id)
+        .unwrap();
+    assert_eq!(
+        replayed
+            .retained
+            .villager_gossip
+            .as_ref()
+            .unwrap()
+            .minor_negative_value(player_uuid),
+        25,
+        "invulnerability replay must not duplicate hurt gossip"
+    );
 }
 
 #[test]
@@ -124,8 +214,8 @@ fn merchant_trade_commits_player_and_villager_once_and_rejects_stale_replay() {
     assert_eq!(committed.merchant.xp, 1);
     assert_eq!(
         committed
-            .merchant
-            .trading_reputation(crate::login::offline_uuid("MerchantOwner")),
+            .gossip
+            .trading_value(crate::login::offline_uuid("MerchantOwner")),
         2
     );
     let snapshot = registry
@@ -151,10 +241,11 @@ fn merchant_trade_commits_player_and_villager_once_and_rejects_stale_replay() {
         .lock_entities("read replay merchant")
         .snapshot(entity_id)
         .unwrap();
-    let replayed = replayed.retained.villager_merchant.as_ref().unwrap();
-    assert_eq!(replayed.offers[0].uses, 1);
+    let replayed_merchant = replayed.retained.villager_merchant.as_ref().unwrap();
+    assert_eq!(replayed_merchant.offers[0].uses, 1);
+    let replayed_gossip = replayed.retained.villager_gossip.as_ref().unwrap();
     assert_eq!(
-        replayed.trading_reputation(crate::login::offline_uuid("MerchantOwner")),
+        replayed_gossip.trading_value(crate::login::offline_uuid("MerchantOwner")),
         2,
         "stale replay must not duplicate reputation"
     );
@@ -191,6 +282,7 @@ fn merchant_inventory_trade_keeps_payment_remainder_for_repeated_quick_move() {
             &MerchantTradePlan {
                 entity_id,
                 expected_merchant: merchant,
+                expected_gossip: mc_entity::villager_gossip_26_1_2::VillagerGossipState::default(),
                 offer_index: 0,
                 expected_inventory: inventory,
                 expected_carried_item: ItemStack::EMPTY,
@@ -225,6 +317,7 @@ fn merchant_inventory_trade_keeps_payment_remainder_for_repeated_quick_move() {
             &MerchantTradePlan {
                 entity_id,
                 expected_merchant: first.merchant.clone(),
+                expected_gossip: first.gossip.clone(),
                 offer_index: 0,
                 expected_inventory: first.inventory.clone(),
                 expected_carried_item: first.carried_item.clone(),
@@ -260,6 +353,7 @@ fn merchant_inventory_trade_keeps_payment_remainder_for_repeated_quick_move() {
                 &MerchantTradePlan {
                     entity_id,
                     expected_merchant: second.merchant,
+                    expected_gossip: second.gossip,
                     offer_index: 0,
                     expected_inventory: second.inventory,
                     expected_carried_item: second.carried_item,

@@ -27,6 +27,7 @@ mod runtime;
 pub mod runtime_26_1_2;
 pub mod synced_data_26_1_2;
 pub mod villager_26_1_2;
+pub mod villager_gossip_26_1_2;
 pub mod villager_merchant_26_1_2;
 
 #[cfg(test)]
@@ -454,6 +455,8 @@ pub struct EntityRetainedState {
     #[serde(default)]
     pub villager_brain: Option<villager_26_1_2::VillagerBrainState>,
     #[serde(default)]
+    pub villager_gossip: Option<villager_gossip_26_1_2::VillagerGossipState>,
+    #[serde(default)]
     pub villager_merchant: Option<villager_merchant_26_1_2::VillagerMerchantState>,
 }
 
@@ -577,6 +580,7 @@ pub struct EntityDamageRequest {
     pub amount: f32,
     pub tick: u64,
     pub death_remove_tick: u64,
+    pub villager_gossip_event: Option<villager_gossip_26_1_2::VillagerGossipEvent>,
 }
 
 impl EntityDamageRequest {
@@ -2819,21 +2823,25 @@ mod tests {
                 amount: 0.0,
                 tick: 1,
                 death_remove_tick: 21,
+                villager_gossip_event: None,
             },
             EntityDamageRequest {
                 amount: -1.0,
                 tick: 1,
                 death_remove_tick: 21,
+                villager_gossip_event: None,
             },
             EntityDamageRequest {
                 amount: f32::NAN,
                 tick: 1,
                 death_remove_tick: 21,
+                villager_gossip_event: None,
             },
             EntityDamageRequest {
                 amount: 1.0,
                 tick: 21,
                 death_remove_tick: 20,
+                villager_gossip_event: None,
             },
         ] {
             assert!(store.damage(id, invalid).is_none());
@@ -2847,6 +2855,7 @@ mod tests {
                     amount: 5.0,
                     tick: 1,
                     death_remove_tick: 21,
+                    villager_gossip_event: None,
                 },
             )
             .unwrap();
@@ -2863,6 +2872,7 @@ mod tests {
                     amount: 20.0,
                     tick: 2,
                     death_remove_tick: 22,
+                    villager_gossip_event: None,
                 },
             )
             .unwrap();

@@ -8265,6 +8265,7 @@ mod tests {
             amount,
             tick: 10,
             death_remove_tick: 30,
+            villager_gossip_event: None,
         }
     }
 

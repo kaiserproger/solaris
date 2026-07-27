@@ -87,7 +87,7 @@ pub(super) enum ActiveContainer {
     Stonecutter(StonecutterWindow),
     Furnace(FurnaceWindow),
     Chest(ChestWindow),
-    Merchant(MerchantWindow),
+    Merchant(Box<MerchantWindow>),
     Script(ScriptMenuWindow),
 }
 

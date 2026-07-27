@@ -12,7 +12,7 @@ where
     let Some(customer) = state.sessions.session_player_uuid(state.session_id) else {
         return Ok(false);
     };
-    let Some(merchant) = state.sessions.villager_merchant_snapshot(entity_id) else {
+    let Some((merchant, gossip)) = state.sessions.villager_merchant_snapshot(entity_id) else {
         return Ok(false);
     };
     store_active_container(state, player_pose).await?;
@@ -28,6 +28,7 @@ where
         next_container_id(state),
         entity_id,
         customer,
+        gossip,
         merchant,
         merchant_input,
     );
@@ -42,7 +43,7 @@ where
     )
     .await?;
     write_merchant_window(state, writer, &window).await?;
-    state.active_container = Some(ActiveContainer::Merchant(window));
+    state.active_container = Some(ActiveContainer::Merchant(Box::new(window)));
     Ok(true)
 }
 
@@ -61,12 +62,15 @@ where
         state.active_container = Some(active);
         return Ok(());
     };
-    let Some(current_merchant) = state.sessions.villager_merchant_snapshot(window.entity_id) else {
+    let Some((current_merchant, current_gossip)) =
+        state.sessions.villager_merchant_snapshot(window.entity_id)
+    else {
         state.active_container = Some(ActiveContainer::Merchant(window));
         return Ok(());
     };
-    if current_merchant != window.merchant {
+    if current_merchant != window.merchant || current_gossip != window.gossip {
         window.merchant = current_merchant;
+        window.gossip = current_gossip;
         window.selected_offer = None;
         window.result = ItemStack::EMPTY;
         write_merchant_window(state, writer, &window).await?;
@@ -112,7 +116,7 @@ where
         }) => {
             state.inventory = inventory;
             state.carried_item = carried_item;
-            window = planned_window;
+            *window = planned_window;
             window.inputs = merchant_input_from_projection(merchant_input);
         }
         Ok(PlayerInventoryCommitOutcome::Rejected {
@@ -143,9 +147,9 @@ where
 pub(super) async fn handle_merchant_container_click<W>(
     state: &mut InteractionState,
     writer: &mut W,
-    mut window: MerchantWindow,
+    mut window: Box<MerchantWindow>,
     packet: ServerboundContainerClick,
-) -> Result<MerchantWindow, ConnectionError>
+) -> Result<Box<MerchantWindow>, ConnectionError>
 where
     W: AsyncWriteExt + Unpin,
 {
@@ -169,12 +173,15 @@ where
         write_merchant_window(state, writer, &window).await?;
         return Ok(window);
     };
-    let Some(current_merchant) = state.sessions.villager_merchant_snapshot(window.entity_id) else {
+    let Some((current_merchant, current_gossip)) =
+        state.sessions.villager_merchant_snapshot(window.entity_id)
+    else {
         write_merchant_window(state, writer, &window).await?;
         return Ok(window);
     };
-    if current_merchant != window.merchant {
+    if current_merchant != window.merchant || current_gossip != window.gossip {
         window.merchant = current_merchant;
+        window.gossip = current_gossip;
         window.selected_offer = None;
         window.result = ItemStack::EMPTY;
         write_merchant_window(state, writer, &window).await?;
@@ -222,6 +229,7 @@ where
     let plan = MerchantTradePlan {
         entity_id: window.entity_id,
         expected_merchant: window.merchant.clone(),
+        expected_gossip: window.gossip.clone(),
         offer_index,
         expected_inventory: state.inventory.clone(),
         expected_carried_item: state.carried_item.clone(),
@@ -236,6 +244,7 @@ where
             state.carried_item = committed.carried_item;
             window.inputs = merchant_input_from_projection(committed.merchant_input);
             window.merchant = committed.merchant;
+            window.gossip = committed.gossip;
             super::containers::refresh_selected_offer(&state.items, &state.item_facts, &mut window);
             window.state_id = window.state_id.wrapping_add(1);
         }
@@ -248,8 +257,11 @@ where
                 state.carried_item = carried_item;
                 window.inputs = merchant_input_from_projection(merchant_input);
             }
-            if let Some(merchant) = state.sessions.villager_merchant_snapshot(window.entity_id) {
+            if let Some((merchant, gossip)) =
+                state.sessions.villager_merchant_snapshot(window.entity_id)
+            {
                 window.merchant = merchant;
+                window.gossip = gossip;
             }
             window.selected_offer = None;
             window.result = ItemStack::EMPTY;

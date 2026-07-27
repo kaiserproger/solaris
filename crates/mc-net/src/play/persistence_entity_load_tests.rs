@@ -462,7 +462,7 @@ fn assigned_toolsmith_profession_and_merchant_catalog_survive_checkpoint_restart
             },
         ));
     let customer = uuid::Uuid::from_u128(99);
-    let mut merchant = mc_entity::villager_merchant_26_1_2::VillagerMerchantState::new(vec![
+    let merchant = mc_entity::villager_merchant_26_1_2::VillagerMerchantState::new(vec![
         mc_entity::villager_merchant_26_1_2::VillagerTradeOffer::new(
             mc_entity::villager_merchant_26_1_2::VillagerTradeCost::new(1, 15),
             EntityItemStack::new(1, 1),
@@ -472,7 +472,15 @@ fn assigned_toolsmith_profession_and_merchant_catalog_survive_checkpoint_restart
         ),
     ])
     .unwrap();
-    merchant.record_player_trade(customer, 0).unwrap();
+    let mut gossip = mc_entity::villager_gossip_26_1_2::VillagerGossipState::default();
+    gossip.record_event(
+        mc_entity::villager_gossip_26_1_2::VillagerGossipEvent::Trade { player: customer },
+    );
+    gossip.record_event(
+        mc_entity::villager_gossip_26_1_2::VillagerGossipEvent::HurtByPlayer { player: customer },
+    );
+    gossip.last_decay_game_time = 777;
+    record.snapshot.retained.villager_gossip = Some(gossip);
     record.snapshot.retained.villager_merchant = Some(merchant);
 
     save_persisted_entity_records(
@@ -492,7 +500,54 @@ fn assigned_toolsmith_profession_and_merchant_catalog_survive_checkpoint_restart
     );
     let merchant = retained.villager_merchant.as_ref().unwrap();
     assert_eq!(merchant.offers.len(), 1);
-    assert_eq!(merchant.trading_reputation(customer), 2);
+    let gossip = retained.villager_gossip.as_ref().unwrap();
+    assert_eq!(gossip.trading_value(customer), 2);
+    assert_eq!(gossip.minor_negative_value(customer), 25);
+    assert_eq!(gossip.last_decay_game_time, 777);
+}
+
+#[test]
+fn legacy_merchant_reputation_migrates_to_retained_villager_gossip() {
+    let customer = uuid::Uuid::from_u128(0xCAFE);
+    let merchant = mc_entity::villager_merchant_26_1_2::VillagerMerchantState::new(vec![
+        mc_entity::villager_merchant_26_1_2::VillagerTradeOffer::new(
+            mc_entity::villager_merchant_26_1_2::VillagerTradeCost::new(1, 15),
+            EntityItemStack::new(1, 1),
+            16,
+            2,
+            0.05,
+        ),
+    ])
+    .unwrap();
+    let mut retained = mc_entity::EntityRetainedState::default();
+    retained.villager_merchant = Some(merchant);
+    let mut encoded = serde_json::to_value(retained).unwrap();
+    let merchant = encoded["villager_merchant"]
+        .as_object_mut()
+        .expect("merchant JSON object");
+    merchant.insert(
+        "last_reputation_decay_game_time".into(),
+        serde_json::json!(777),
+    );
+    merchant.insert(
+        "player_reputations".into(),
+        serde_json::json!([{ "player": customer, "trading": 6 }]),
+    );
+    encoded
+        .as_object_mut()
+        .expect("retained JSON object")
+        .remove("villager_gossip");
+
+    let mut loaded: mc_entity::EntityRetainedState = serde_json::from_value(encoded).unwrap();
+    assert!(loaded.villager_gossip.is_none());
+    migrate_legacy_villager_gossip(&mut loaded).unwrap();
+
+    let gossip = loaded.villager_gossip.as_ref().unwrap();
+    assert_eq!(gossip.trading_value(customer), 6);
+    assert_eq!(gossip.last_decay_game_time, 777);
+    let merchant = serde_json::to_value(loaded.villager_merchant.as_ref().unwrap()).unwrap();
+    assert!(merchant.get("player_reputations").is_none());
+    assert!(merchant.get("last_reputation_decay_game_time").is_none());
 }
 
 #[test]

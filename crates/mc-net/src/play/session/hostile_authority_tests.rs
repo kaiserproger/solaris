@@ -412,6 +412,7 @@ fn attacker_death_between_melee_plan_and_commit_cancels_damage_and_swing() {
                 amount: 100.0,
                 tick: due_tick,
                 death_remove_tick: due_tick + ENTITY_DEATH_TICKS,
+                villager_gossip_event: None,
             },
         )
         .expect("lethal hostile damage commits");
@@ -758,6 +759,7 @@ fn despawning_creeper_cannot_reach_fuse_expiry() {
                     amount: 100.0,
                     tick: 101,
                     death_remove_tick: 121,
+                    villager_gossip_event: None,
                 },
             )
             .expect("lethal creeper damage commits");

@@ -9,27 +9,35 @@ and is not startup context.
 
 - Date: 2026-07-27.
 - Branch: `main`.
-- Latest committed baseline: `17fb424` (`test(perf): refresh load and benchmark
-  matrix`), after `94b001b` (`feat(play): assign villager profession from job
-  site`) and `1ae92e0` (`feat(play): add authoritative villager trading`). The
-  old `dev/M100-client-agent` Loader cursor is no longer the active Solaris
-  checkpoint.
-- Current closeout adds the first bounded player-specific villager gossip slice.
-  Successful merchant commits add exact 26.1.2 `TRADING` reputation `+2`, cap it
-  at `25`, decay it by `2` once at least 24,000 ticks have elapsed, and remove
-  entries below vanilla's stored-value floor `2`. The per-villager ledger and
-  last decay timestamp survive entity checkpoints; legacy merchant state loads
-  through serde defaults.
-- Merchant screens project a special price only for the opening player's UUID,
-  selection moves that player's exact discounted payment, and the authoritative
-  trade commit recomputes the actor UUID rather than trusting client/window
-  state. Offer use, villager XP/level, player inventory/cursor, merchant inputs,
-  and reputation still commit through one stale-fenced session/entity CAS.
-- This closes only trading-gossip accrual, personal pricing, decay, and restart
-  continuity. Gossip transfer between villagers, non-trading gossip types,
-  village population/defence policy, and Hero of the Village pricing remain
-  open. Species-specific `UnsupportedSpecial` attack profiles also remain in
-  the playable queue.
+- Checkpoint base: `5fa3f2b` (`feat(play): add villager trading reputation`),
+  after `17fb424` (`test(perf): refresh load and benchmark matrix`),
+  `94b001b` (`feat(play): assign villager profession from job site`) and
+  `1ae92e0` (`feat(play): add authoritative villager trading`). The old
+  `dev/M100-client-agent` Loader cursor is no longer the active Solaris checkpoint.
+- Current closeout moves gossip out of merchant state into one persisted retained
+  `VillagerGossipState`, so unemployed and employed villagers share the same
+  authority. Exact 26.1.2 `TRADING` remains `+2`, max `25`, decay/day `2`; accepted
+  player melee now records `MINOR_NEGATIVE +25`, max `200`, decay/day `20` in the
+  same regional damage CAS. Values below vanilla's stored floor `2` disappear.
+- Merchant screens project the total weighted reputation only for the opening
+  player's UUID. Selection and final owner commit independently recompute that
+  UUID and debit the exact personal cost. Offer use, villager XP/level, player
+  inventory/cursor, merchant inputs and `TRADING` gossip still commit through one
+  stale-fenced session/entity CAS; invulnerability and stale replay cannot
+  duplicate `VILLAGER_HURT` gossip.
+- The generated-village raw-TCP gate now performs trade -> close -> player attack
+  -> reopen -> select, observes `special_price=+2` and exact `17`-coal debit, then
+  saves and proves the same surcharge after restart. The gossip ledger and last
+  decay timestamp also round-trip through the entity checkpoint.
+- Saves written by `5fa3f2b` migrate their merchant-owned `player_reputations`
+  and decay timestamp into retained gossip during load, then omit the superseded
+  fields on the next save. The timestamp now uses Java's exact persisted `0`
+  sentinel. These changes close the two independent-review findings.
+- This closes trading gossip plus the direct `VILLAGER_HURT` event only. Gossip
+  transfer between villagers, `VILLAGER_KILLED`/major-negative propagation,
+  remaining event types, village population/defence policy, and Hero of the
+  Village pricing remain open. Species-specific `UnsupportedSpecial` attack
+  profiles also remain in the playable queue.
 - The performance baseline remains as recorded by `17fb424`: debug/release
   20-client VD8 and bounded replay/soak gates pass; O3 explosion authority is
   still above the frozen p99 budget, and exact low/high cgroups plus long soaks

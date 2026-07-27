@@ -1625,6 +1625,7 @@ pub(super) enum MerchantTradeDestination {
 pub(super) struct MerchantTradePlan {
     pub(super) entity_id: EntityId,
     pub(super) expected_merchant: mc_entity::villager_merchant_26_1_2::VillagerMerchantState,
+    pub(super) expected_gossip: mc_entity::villager_gossip_26_1_2::VillagerGossipState,
     pub(super) offer_index: usize,
     pub(super) expected_inventory: PlayerInventory,
     pub(super) expected_carried_item: ItemStack,
@@ -1646,6 +1647,7 @@ pub(super) struct CommittedMerchantTrade {
     pub(super) carried_item: ItemStack,
     pub(super) merchant_input: Option<Box<[ItemStack; 2]>>,
     pub(super) merchant: mc_entity::villager_merchant_26_1_2::VillagerMerchantState,
+    pub(super) gossip: mc_entity::villager_gossip_26_1_2::VillagerGossipState,
     pub(super) dispatches: Vec<VisibilityDispatch>,
 }
 

@@ -93,6 +93,14 @@ impl SessionRegistry {
             player_pose.y,
             player_pose.z,
         ));
+        let attacker_uuid = if let Some((attacker_session, _)) = attacker {
+            let Some(session) = inner.sessions.get(&attacker_session) else {
+                return PlayerAttackResult::ValidationRejected;
+            };
+            Some(session.uuid)
+        } else {
+            None
+        };
         let attacker_persistence = if let Some((attacker_session, _)) = attacker {
             let Some(state) = inner.player_persistence.get(&attacker_session).cloned() else {
                 return PlayerAttackResult::ValidationRejected;
@@ -137,9 +145,21 @@ impl SessionRegistry {
         ) {
             return PlayerAttackResult::ValidationRejected;
         }
-        let Some(mut outcome) =
-            attack_server_entity_locked(&mut inner, entity_id, amount, knockback_origin, &rewards)
-        else {
+        let gossip_event =
+            (target.type_name == "minecraft:villager")
+                .then_some(attacker_uuid)
+                .flatten()
+                .map(|player| {
+                    mc_entity::villager_gossip_26_1_2::VillagerGossipEvent::HurtByPlayer { player }
+                });
+        let Some(mut outcome) = attack_server_entity_locked(
+            &mut inner,
+            entity_id,
+            amount,
+            knockback_origin,
+            &rewards,
+            gossip_event,
+        ) else {
             return PlayerAttackResult::AcceptedNoDamage;
         };
         let committed_attacker = attacker.zip(attacker_state.as_mut()).map(
@@ -193,7 +213,14 @@ impl SessionRegistry {
     ) -> Option<EntityAttackOutcome> {
         let mut outcome = {
             let mut inner = self.lock_session_entities("attack server entity");
-            attack_server_entity_locked(&mut inner, entity_id, amount, knockback_origin, rewards)?
+            attack_server_entity_locked(
+                &mut inner,
+                entity_id,
+                amount,
+                knockback_origin,
+                rewards,
+                None,
+            )?
         };
         self.append_spawned_xp_pickup_candidates(outcome.dispatches_mut());
         Some(outcome)
@@ -206,7 +233,7 @@ impl SessionRegistry {
         amount: f32,
     ) -> Option<mc_entity::EntityDamage> {
         let mut inner = self.lock_session_entities("damage server entity test");
-        let damage = damage_server_entity_locked(&mut inner, entity_id, amount)?;
+        let damage = damage_server_entity_locked(&mut inner, entity_id, amount, None)?;
         if damage.killed {
             schedule_entity_death_locked(&mut inner, &damage.snapshot);
         }
@@ -335,8 +362,9 @@ pub(super) fn attack_server_entity_locked(
     amount: f32,
     knockback_origin: Option<Vec3>,
     rewards: &EntityKillRewards,
+    gossip_event: Option<mc_entity::villager_gossip_26_1_2::VillagerGossipEvent>,
 ) -> Option<EntityAttackOutcome> {
-    let damage = damage_server_entity_locked(inner, entity_id, amount)?;
+    let damage = damage_server_entity_locked(inner, entity_id, amount, gossip_event)?;
     let health_dispatches = publish_accepted_entity_health_locked(inner, &damage.snapshot);
     if damage.killed {
         let (entity, mut dispatches) = begin_server_entity_death_locked(inner, &damage, rewards);
@@ -363,6 +391,7 @@ pub(super) fn damage_server_entity_locked(
     inner: &mut SessionEntityGuards<'_>,
     entity_id: EntityId,
     amount: f32,
+    gossip_event: Option<mc_entity::villager_gossip_26_1_2::VillagerGossipEvent>,
 ) -> Option<mc_entity::EntityDamage> {
     let tick = inner.entity_lifecycle_tick;
     let expected = inner.entities.snapshot(entity_id)?;
@@ -379,6 +408,7 @@ pub(super) fn damage_server_entity_locked(
             amount,
             tick,
             death_remove_tick: tick.saturating_add(ENTITY_DEATH_TICKS),
+            villager_gossip_event: gossip_event,
         },
     )
 }

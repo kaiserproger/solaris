@@ -243,6 +243,7 @@ impl SessionRegistry {
                     impact.damage,
                     None,
                     &rewards,
+                    None,
                 ) else {
                     continue;
                 };

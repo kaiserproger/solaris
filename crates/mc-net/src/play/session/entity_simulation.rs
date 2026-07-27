@@ -320,21 +320,24 @@ fn apply_villager_brain_transitions_with_professions(
         };
         let profession_assignment = profession_context
             .and_then(|context| supported_profession_assignment(&expected, &plan.state, context));
+        let updated_gossip = expected
+            .retained
+            .villager_gossip
+            .clone()
+            .and_then(|mut gossip| (gossip.decay(day_time).ok() == Some(true)).then_some(gossip));
         let updated_merchant =
             expected
                 .retained
                 .villager_merchant
                 .clone()
                 .and_then(|mut merchant| {
-                    let reputation_changed =
-                        merchant.decay_trading_reputation(day_time).ok() == Some(true);
-                    let restocked =
-                        villager_can_restock_at_job_site(expected.position, &plan.state)
-                            && merchant.restock(day_time).ok() == Some(true);
-                    (reputation_changed || restocked).then_some(merchant)
+                    (villager_can_restock_at_job_site(expected.position, &plan.state)
+                        && merchant.restock(day_time).ok() == Some(true))
+                    .then_some(merchant)
                 });
         if expected.goal == plan.goal
             && expected.retained.villager_brain.as_ref() == Some(&plan.state)
+            && updated_gossip.is_none()
             && updated_merchant.is_none()
             && profession_assignment.is_none()
         {
@@ -343,6 +346,9 @@ fn apply_villager_brain_transitions_with_professions(
         let mut next = expected.clone();
         next.goal = plan.goal;
         next.retained.villager_brain = Some(plan.state);
+        if let Some(gossip) = updated_gossip {
+            next.retained.villager_gossip = Some(gossip);
+        }
         if let Some(merchant) = updated_merchant {
             next.retained.villager_merchant = Some(merchant);
         }

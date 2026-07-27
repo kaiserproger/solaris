@@ -51,6 +51,7 @@ fn regional_owner_effect_transaction_is_version_fenced_and_returns_ecs_projectio
                 amount: 12.0,
                 tick: 1,
                 death_remove_tick: 21,
+                villager_gossip_event: None,
             },
         )
         .expect("damage owner request")
@@ -389,6 +390,7 @@ fn nearest_villager_filters_type_lifecycle_vertical_distance_radius_and_unreques
                 amount: 20.0,
                 tick: 1,
                 death_remove_tick: 21,
+                villager_gossip_event: None,
             },
         )
         .expect("damage despawning fixture");
@@ -930,6 +932,7 @@ fn persistent_owner_lane_damage_rollback_restores_snapshot() {
                     amount: 20.0,
                     tick: 7,
                     death_remove_tick: 27,
+                    villager_gossip_event: None,
                 },
             },
         }],
