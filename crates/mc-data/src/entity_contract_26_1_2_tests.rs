@@ -15,7 +15,7 @@ use crate::entity_types::{
 const REVIEWED_CONTRACT_CHECKSUM: u64 = 0xe352_261a_b2a0_160b;
 
 fn registry_report() -> Vec<EntityTypeReport> {
-    entity_types()
+    entity_type_contracts_26_1_2()
         .map(|contract| EntityTypeReport {
             id: Identifier::parse(contract.name).unwrap(),
             protocol_id: contract.protocol_id,
@@ -101,7 +101,7 @@ fn dense_registry_ids_are_exhaustive_and_round_trip() {
     assert_eq!(MINECRAFT_VERSION, "26.1.2");
     assert_eq!(ENTITY_TYPE_COUNT, 157);
 
-    for (expected_id, contract) in entity_types().enumerate() {
+    for (expected_id, contract) in entity_type_contracts_26_1_2().enumerate() {
         assert_eq!(contract.protocol_id as usize, expected_id);
         assert_eq!(by_protocol_id(contract.protocol_id), Some(contract));
         assert_eq!(by_name(contract.name), Some(contract));
@@ -110,7 +110,7 @@ fn dense_registry_ids_are_exhaustive_and_round_trip() {
 
 #[test]
 fn behavior_contract_is_total_for_all_157_rows() {
-    let contracts: Vec<_> = entity_types().collect();
+    let contracts: Vec<_> = entity_type_contracts_26_1_2().collect();
     assert_eq!(contracts.len(), ENTITY_TYPE_COUNT);
 
     for (expected_id, contract) in contracts.into_iter().enumerate() {
@@ -481,7 +481,7 @@ fn public_strict_contract_lookup_has_no_unknown_or_alias_fallback() {
 fn reviewed_contract_checksum_detects_committed_data_drift() {
     let mut checksum = 14_695_981_039_346_656_037_u64;
 
-    for contract in entity_types() {
+    for contract in entity_type_contracts_26_1_2() {
         checksum = hash_bytes(checksum, &contract.protocol_id.to_le_bytes());
         checksum = hash_bytes(checksum, contract.name.as_bytes());
         checksum = hash_bytes(checksum, &[0]);
@@ -622,7 +622,7 @@ fn contract_has_no_duplicate_names_or_generic_facts() {
     ];
     let mut names = HashSet::with_capacity(ENTITY_TYPE_COUNT);
 
-    for contract in entity_types() {
+    for contract in entity_type_contracts_26_1_2() {
         assert!(names.insert(contract.name), "duplicate {}", contract.name);
         assert!(contract.name.starts_with("minecraft:"));
         assert_ne!(contract.name, "minecraft:unknown");

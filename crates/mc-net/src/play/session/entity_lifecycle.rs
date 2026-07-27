@@ -71,10 +71,16 @@ impl SessionRegistry {
     ) -> Vec<VisibilityDispatch> {
         let chunk = chunk_pos_from_coords(position.x, position.z);
         let hostile = is_hostile_entity(&entity_type_name);
+        let mob_behaviors = self.mob_behavior_table();
         let mut inner = self.lock_session_entities("spawn command entity");
         let active = hostile && inner.loaded_chunk_refcounts.contains_key(&chunk);
-        let (entity_id, dispatches) =
-            spawn_command_entity_locked(&mut inner, entity_type_id, entity_type_name, position);
+        let (entity_id, dispatches) = spawn_command_entity_locked(
+            &mut inner,
+            entity_type_id,
+            entity_type_name,
+            position,
+            &mob_behaviors,
+        );
         drop(inner);
         if active {
             self.publish_active_hostile_entity(entity_id);
@@ -118,11 +124,12 @@ pub(super) fn spawn_command_entity_locked(
     entity_type_id: i32,
     entity_type_name: String,
     position: Vec3,
+    mob_behaviors: &mc_data::mob_behavior_26_1_2::MobBehaviorTable,
 ) -> (EntityId, Vec<VisibilityDispatch>) {
     let hostile = is_hostile_entity(&entity_type_name);
     let mut entity = SpawnEntity::new(entity_type_id, entity_type_name, position);
     apply_entity_facts(&mut entity);
-    apply_default_mob_goal(&mut entity, hostile);
+    apply_default_mob_goal(&mut entity, mob_behaviors);
     entity.retained.spawn_tick = inner.entity_lifecycle_tick;
     let aabb = entity_aabb(&entity.type_name);
     let is_sheep = entity.type_name == "minecraft:sheep";

@@ -110,6 +110,170 @@ fn record_movement_exhaustive_membership_check() {
     MOVEMENT_EXHAUSTIVE_MEMBERSHIP_CHECKS.set(MOVEMENT_EXHAUSTIVE_MEMBERSHIP_CHECKS.get() + 1);
 }
 
+const VILLAGER_BRAIN_TICK_INTERVAL: u64 = 20;
+const VILLAGER_BRAIN_COMMIT_BATCH: usize = 64;
+
+fn villager_schedule_boundary(
+    profile: &mc_entity::villager_26_1_2::VillagerBrainProfile,
+    schedule: mc_entity::villager_26_1_2::VillagerScheduleKind,
+    day_time: i64,
+) -> bool {
+    let entries = match schedule {
+        mc_entity::villager_26_1_2::VillagerScheduleKind::Adult => &profile.adult_schedule,
+        mc_entity::villager_26_1_2::VillagerScheduleKind::Baby => &profile.baby_schedule,
+    };
+    let normalized = day_time.rem_euclid(24_000);
+    entries.iter().any(|entry| entry.day_time == normalized)
+}
+
+fn any_villager_schedule_boundary(
+    profile: &mc_entity::villager_26_1_2::VillagerBrainProfile,
+    day_time: i64,
+) -> bool {
+    villager_schedule_boundary(
+        profile,
+        mc_entity::villager_26_1_2::VillagerScheduleKind::Adult,
+        day_time,
+    ) || villager_schedule_boundary(
+        profile,
+        mc_entity::villager_26_1_2::VillagerScheduleKind::Baby,
+        day_time,
+    )
+}
+
+fn villager_brain_phase_due(entity: EntityId, lifecycle_tick: u64) -> bool {
+    lifecycle_tick
+        .wrapping_add(u64::from(entity.0.unsigned_abs()))
+        .is_multiple_of(VILLAGER_BRAIN_TICK_INTERVAL)
+}
+
+pub(super) fn villager_brain_probe_ids(
+    active_population: &HashSet<EntityId>,
+    overridden_villagers: &HashSet<EntityId>,
+    lifecycle_tick: u64,
+    day_time: i64,
+    profile: &mc_entity::villager_26_1_2::VillagerBrainProfile,
+) -> HashSet<EntityId> {
+    let mut due = if any_villager_schedule_boundary(profile, day_time) {
+        active_population.clone()
+    } else {
+        active_population
+            .iter()
+            .copied()
+            .filter(|entity| villager_brain_phase_due(*entity, lifecycle_tick))
+            .collect()
+    };
+    due.extend(
+        overridden_villagers
+            .iter()
+            .copied()
+            .filter(|entity| active_population.contains(entity)),
+    );
+    due
+}
+
+pub(super) fn villager_brain_due_for_tick(
+    entity: EntityId,
+    schedule: mc_entity::villager_26_1_2::VillagerScheduleKind,
+    override_expires_tick: Option<u64>,
+    lifecycle_tick: u64,
+    day_time: i64,
+    profile: &mc_entity::villager_26_1_2::VillagerBrainProfile,
+) -> bool {
+    override_expires_tick.is_some_and(|expires| lifecycle_tick >= expires)
+        || villager_schedule_boundary(profile, schedule, day_time)
+        || villager_brain_phase_due(entity, lifecycle_tick)
+}
+
+pub(super) fn apply_villager_brain_transitions(
+    entities: &mut EntityStoreGuard<'_>,
+    ids: &HashSet<EntityId>,
+    lifecycle_tick: u64,
+    day_time: i64,
+    profile: &mc_entity::villager_26_1_2::VillagerBrainProfile,
+) -> usize {
+    if ids.is_empty() {
+        return 0;
+    }
+    let Ok(validated_profile) = profile.validated() else {
+        return 0;
+    };
+    let mut ordered = ids.iter().copied().collect::<Vec<_>>();
+    ordered.sort_unstable();
+    let mut transitions = Vec::new();
+    for id in ordered {
+        let Some(expected) = entities.snapshot(id) else {
+            continue;
+        };
+        if expected.lifecycle != EntityLifecycle::Alive
+            || expected.type_name != "minecraft:villager"
+        {
+            continue;
+        }
+        let Some(villager) = expected.retained.villager else {
+            continue;
+        };
+        let current = expected.retained.villager_brain.clone().unwrap_or_else(|| {
+            let job_site = (villager.profession != mc_entity::VillagerProfession::None)
+                .then_some(expected.position);
+            mc_entity::villager_26_1_2::VillagerBrainState::adult(
+                mc_entity::villager_26_1_2::VillagerPoiSet {
+                    home: Some(expected.position),
+                    job_site,
+                    meeting_point: Some(expected.position),
+                },
+            )
+        });
+        let Ok(plan) = validated_profile.plan(&current, lifecycle_tick, day_time) else {
+            continue;
+        };
+        if expected.goal == plan.goal
+            && expected.retained.villager_brain.as_ref() == Some(&plan.state)
+        {
+            continue;
+        }
+        let mut next = expected.clone();
+        next.goal = plan.goal;
+        next.retained.villager_brain = Some(plan.state);
+        transitions.push((expected, next));
+    }
+    commit_villager_brain_transitions(entities, transitions)
+}
+
+pub(super) fn commit_villager_brain_transitions(
+    entities: &mut EntityStoreGuard<'_>,
+    transitions: Vec<(EntitySnapshot, EntitySnapshot)>,
+) -> usize {
+    let mut transitions = transitions.into_iter();
+    let mut applied = 0;
+    loop {
+        let batch = transitions
+            .by_ref()
+            .take(VILLAGER_BRAIN_COMMIT_BATCH)
+            .collect::<Vec<_>>();
+        if batch.is_empty() {
+            return applied;
+        }
+        applied += commit_villager_brain_transition_batch(entities, batch);
+    }
+}
+
+fn commit_villager_brain_transition_batch(
+    entities: &mut EntityStoreGuard<'_>,
+    mut batch: Vec<(EntitySnapshot, EntitySnapshot)>,
+) -> usize {
+    let count = batch.len();
+    if entities.replace_snapshots_if_current(batch.iter().cloned()) {
+        return count;
+    }
+    if count <= 1 {
+        return 0;
+    }
+    let right = batch.split_off(count / 2);
+    commit_villager_brain_transition_batch(entities, batch)
+        + commit_villager_brain_transition_batch(entities, right)
+}
+
 impl SessionRegistry {
     pub(in crate::play) fn tick_entities_and_collect_physics_queries_owned(
         &self,
@@ -234,6 +398,16 @@ impl SessionRegistry {
                     })
             })
             .collect::<HashSet<_>>();
+        let villager_day_time = i64::try_from(self.world_time()).unwrap_or(i64::MAX);
+        let villager_profile = self.villager_brain_profile();
+        let overridden_villagers = self.overridden_villager_entities();
+        let villager_brain_probe_ids = villager_brain_probe_ids(
+            &active_population_ids,
+            &overridden_villagers,
+            tick,
+            villager_day_time,
+            &villager_profile,
+        );
         let simulation_budget = cpu_resources.map_or(usize::MAX, |cpu| {
             cpu.cpu_limit()
                 .max(1)
@@ -252,6 +426,7 @@ impl SessionRegistry {
         }
         let mut active_entity_ids = HashSet::new();
         let mut active_hostile_ids = HashSet::new();
+        let mut active_villager_ids = HashSet::new();
         let mut sheep_grazing_entities = HashSet::new();
         let mut active_entity_aabbs = HashMap::new();
         let mut active_entity_kinds = HashMap::new();
@@ -311,6 +486,51 @@ impl SessionRegistry {
                 }
             }
         });
+        entities.visit_simulation_entities_for_ids(&villager_brain_probe_ids, |entity| {
+            if entity.lifecycle == EntityLifecycle::Alive
+                && entity.type_name == "minecraft:villager"
+                && entity.retained.villager.is_some()
+                && villager_brain_due_for_tick(
+                    entity.id,
+                    entity.retained.villager_brain.as_ref().map_or(
+                        mc_entity::villager_26_1_2::VillagerScheduleKind::Adult,
+                        |brain| brain.schedule,
+                    ),
+                    entity
+                        .retained
+                        .villager_brain
+                        .as_ref()
+                        .and_then(|brain| brain.override_expires_tick),
+                    tick,
+                    villager_day_time,
+                    &villager_profile,
+                )
+            {
+                active_villager_ids.insert(entity.id);
+            }
+        });
+        apply_villager_brain_transitions(
+            &mut entities,
+            &active_villager_ids,
+            tick,
+            villager_day_time,
+            &villager_profile,
+        );
+        let cleared_overrides = overridden_villagers
+            .iter()
+            .copied()
+            .filter(|entity| {
+                entities.snapshot(*entity).is_none_or(|snapshot| {
+                    snapshot.lifecycle != EntityLifecycle::Alive
+                        || snapshot
+                            .retained
+                            .villager_brain
+                            .as_ref()
+                            .is_none_or(|brain| brain.override_order.is_none())
+                })
+            })
+            .collect::<Vec<_>>();
+        self.clear_villager_overrides(&cleared_overrides);
         if active_entity_ids.is_empty() {
             self.publish_active_entity_selection(
                 live_session_generation,
@@ -319,10 +539,12 @@ impl SessionRegistry {
             );
             return Vec::new();
         }
+        let mob_behaviors = self.mob_behavior_table();
         update_hostile_targets(
             &mut entities,
             &hostile_target_positions,
             Some(&active_hostile_ids),
+            &mob_behaviors,
         );
         self.publish_active_entity_selection(
             live_session_generation,

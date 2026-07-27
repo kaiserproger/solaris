@@ -26,6 +26,7 @@ mod regional;
 mod runtime;
 pub mod runtime_26_1_2;
 pub mod synced_data_26_1_2;
+pub mod villager_26_1_2;
 
 #[cfg(test)]
 #[path = "entity_scale_26_1_2_tests.rs"]
@@ -449,6 +450,8 @@ pub struct EntityRetainedState {
     pub primed_tnt: Option<EntityPrimedTntState>,
     #[serde(default)]
     pub villager: Option<VillagerData>,
+    #[serde(default)]
+    pub villager_brain: Option<villager_26_1_2::VillagerBrainState>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]

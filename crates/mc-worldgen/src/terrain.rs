@@ -1605,13 +1605,23 @@ impl TerrainGenerator {
                     let y = origin_y.checked_add(marker[1])?;
                     let z = origin_z.checked_add(marker[2])?;
                     (x.div_euclid(16) == chunk.pos.x && z.div_euclid(16) == chunk.pos.z).then(
-                        || SettlementInhabitantMarker {
-                            claim: format!("{}@{center_x},{center_z}", inhabitant.id),
-                            entity_type: inhabitant.entity_type.clone(),
-                            position: [f64::from(x) + 0.5, f64::from(y), f64::from(z) + 0.5],
-                            villager_kind: inhabitant.villager_kind.clone(),
-                            profession: inhabitant.profession.clone(),
-                            level: inhabitant.level,
+                        || {
+                            let position = [f64::from(x) + 0.5, f64::from(y), f64::from(z) + 0.5];
+                            SettlementInhabitantMarker {
+                                claim: format!("{}@{center_x},{center_z}", inhabitant.id),
+                                entity_type: inhabitant.entity_type.clone(),
+                                position,
+                                villager_kind: inhabitant.villager_kind.clone(),
+                                profession: inhabitant.profession.clone(),
+                                level: inhabitant.level,
+                                home: Some(position),
+                                job_site: (inhabitant.profession != "none").then_some(position),
+                                meeting_point: Some([
+                                    f64::from(center_x) + 0.5,
+                                    f64::from(origin_y),
+                                    f64::from(center_z) + 0.5,
+                                ]),
+                            }
                         },
                     )
                 }),

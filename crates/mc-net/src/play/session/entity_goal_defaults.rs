@@ -1,27 +1,35 @@
+use mc_data::mob_behavior_26_1_2::{MobBehaviorTable, MobMovementPolicy};
 use mc_entity::{AttributeKind, GoalState, SpawnEntity};
 
-use crate::play::{HOSTILE_WANDER_SPEED, PASSIVE_WANDER_SPEED};
-
-use super::entity_physics_class::entity_type_uses_aquatic_physics;
-
-pub(super) fn apply_default_mob_goal(entity: &mut SpawnEntity, hostile: bool) {
-    entity.goal = if entity_type_uses_aquatic_physics(&entity.type_name) {
-        entity.on_ground = false;
-        GoalState::AquaticWander {
-            speed: PASSIVE_WANDER_SPEED * 0.9,
-            vertical_speed: 0.18,
-            period_ticks: 45,
+pub(super) fn apply_default_mob_goal(entity: &mut SpawnEntity, behaviors: &MobBehaviorTable) {
+    let Some(profile) = behaviors.get_by_name(&entity.type_name) else {
+        entity.goal = GoalState::Idle;
+        return;
+    };
+    entity.goal = match profile.movement {
+        MobMovementPolicy::Immobile => GoalState::Idle,
+        MobMovementPolicy::AquaticWander | MobMovementPolicy::AmphibiousWander => {
+            entity.on_ground = false;
+            GoalState::AquaticWander {
+                speed: profile.wander_speed * 0.9,
+                vertical_speed: 0.18,
+                period_ticks: profile.wander_period_ticks.max(20),
+            }
         }
-    } else if hostile {
-        GoalState::Wander {
-            speed: HOSTILE_WANDER_SPEED,
-            period_ticks: 20,
-        }
-    } else {
-        GoalState::Wander {
-            speed: passive_ground_wander_speed(entity),
-            period_ticks: 80,
-        }
+        MobMovementPolicy::HostilePursuit => GoalState::Wander {
+            speed: profile.wander_speed,
+            period_ticks: profile.wander_period_ticks,
+        },
+        MobMovementPolicy::GroundWander
+        | MobMovementPolicy::FlyingWander
+        | MobMovementPolicy::VillagerSchedule => GoalState::Wander {
+            speed: if profile.wander_speed > 0.0 {
+                profile.wander_speed
+            } else {
+                passive_ground_wander_speed(entity)
+            },
+            period_ticks: profile.wander_period_ticks,
+        },
     };
 }
 

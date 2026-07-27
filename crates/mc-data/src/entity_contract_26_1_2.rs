@@ -709,8 +709,7 @@ pub fn entity_type_contract_26_1_2_by_name(name: &str) -> Option<EntityTypeContr
     by_name(name)
 }
 
-#[cfg(test)]
-pub(crate) fn entity_types()
+pub(crate) fn entity_type_contracts_26_1_2()
 -> impl ExactSizeIterator<Item = EntityTypeContract> + DoubleEndedIterator + Clone {
     ENTITY_TYPES.iter().copied()
 }

@@ -2,18 +2,21 @@ use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use std::sync::atomic::Ordering;
 
+use mc_data::mob_behavior_26_1_2::{MobBehaviorTable, MobCombatPolicy};
 use mc_entity::{
     AttributeKind, EntityId, EntityLifecycle, EntityPrimedTntState, EntitySnapshot, GoalState,
     Rotation, SpawnEntity, Vec3,
 };
 use mc_world::BlockStateId;
 
+#[cfg(test)]
+use crate::play::HOSTILE_FOLLOW_SPEED;
 use crate::play::combat::{PlayerDamageKind, PlayerDamageRequest};
 use crate::play::simulation::SimulationAuthority;
 use crate::play::{
-    CREEPER_CANCEL_RANGE, CREEPER_FUSE_TICKS, CREEPER_TRIGGER_RANGE, HOSTILE_FOLLOW_SPEED,
-    HOSTILE_MELEE_PERIOD_TICKS, HOSTILE_MELEE_RANGE, HOSTILE_MELEE_VERTICAL_REACH,
-    SKELETON_ARROW_SPEED, SKELETON_SHOT_PERIOD_TICKS, SKELETON_SHOT_RANGE,
+    CREEPER_CANCEL_RANGE, CREEPER_FUSE_TICKS, CREEPER_TRIGGER_RANGE, HOSTILE_MELEE_PERIOD_TICKS,
+    HOSTILE_MELEE_RANGE, HOSTILE_MELEE_VERTICAL_REACH, SKELETON_ARROW_SPEED,
+    SKELETON_SHOT_PERIOD_TICKS, SKELETON_SHOT_RANGE,
 };
 
 #[cfg(test)]
@@ -111,8 +114,9 @@ impl SessionRegistry {
             };
             #[cfg(test)]
             self.pause_before_hostile_reconciliation_for_test();
+            let mob_behaviors = self.mob_behavior_table();
             let mut entities = self.lock_entities("reconcile hostiles after live session change");
-            update_hostile_targets(&mut entities, &player_positions, None);
+            update_hostile_targets(&mut entities, &player_positions, None, &mob_behaviors);
             drop(entities);
             if self.live_session_generation.load(Ordering::Acquire) == generation {
                 return;
@@ -198,6 +202,7 @@ impl SessionRegistry {
         if loaded_entity_ids.is_empty() {
             return (0, Vec::new());
         }
+        let mob_behaviors = self.mob_behavior_table();
         let mut hostiles = Vec::new();
         {
             let entities = self.lock_entities("scan hostile attack candidates");
@@ -210,16 +215,19 @@ impl SessionRegistry {
                 if entity.lifecycle != EntityLifecycle::Alive {
                     return;
                 }
-                let kind = match entity.type_name {
-                    "minecraft:creeper" => HostileAttackKind::Creeper,
-                    "minecraft:skeleton" => HostileAttackKind::Skeleton,
-                    entity_type if is_hostile_entity(entity_type) => HostileAttackKind::Melee {
+                let Some(profile) = mob_behaviors.get_by_name(entity.type_name) else {
+                    return;
+                };
+                let kind = match profile.combat {
+                    MobCombatPolicy::CreeperFuse => HostileAttackKind::Creeper,
+                    MobCombatPolicy::Arrow => HostileAttackKind::Skeleton,
+                    MobCombatPolicy::Melee => HostileAttackKind::Melee {
                         attack_damage: entity
                             .attributes
                             .base(&AttributeKind::AttackDamage)
                             .unwrap_or(3.0) as f32,
                     },
-                    _ => return,
+                    MobCombatPolicy::None | MobCombatPolicy::UnsupportedSpecial => return,
                 };
                 let period = match kind {
                     HostileAttackKind::Creeper => 1,
@@ -700,10 +708,14 @@ pub(super) fn update_hostile_targets(
     entities: &mut EntityOwnerAccess,
     players: &[Vec3],
     active_ids: Option<&HashSet<EntityId>>,
+    mob_behaviors: &MobBehaviorTable,
 ) {
     let mut hostiles = Vec::new();
     let mut collect_hostile = |entity: mc_entity::EntityView<'_>| {
         if entity.lifecycle == EntityLifecycle::Alive && is_hostile_entity(entity.type_name) {
+            let Some(profile) = mob_behaviors.get_by_name(entity.type_name) else {
+                return;
+            };
             let follow_range = entity
                 .attributes
                 .base(&AttributeKind::FollowRange)
@@ -712,9 +724,15 @@ pub(super) fn update_hostile_targets(
                 entity.id,
                 entity.position,
                 follow_range,
-                entity.type_name == "minecraft:skeleton",
-                entity.type_name == "minecraft:creeper",
+                matches!(
+                    profile.combat,
+                    MobCombatPolicy::Arrow | MobCombatPolicy::UnsupportedSpecial
+                ),
+                profile.combat == MobCombatPolicy::CreeperFuse,
                 entity.retained.primed_tnt.is_some(),
+                profile.wander_speed,
+                profile.wander_period_ticks,
+                profile.pursuit_speed,
                 entity.goal.clone(),
             ));
         }
@@ -727,14 +745,27 @@ pub(super) fn update_hostile_targets(
     if players.is_empty() {
         let changed = hostiles
             .into_iter()
-            .filter_map(|(hostile_id, _, _, _, is_creeper, fuse_active, current)| {
-                let goal = if is_creeper && fuse_active {
-                    GoalState::Idle
-                } else {
-                    hostile_wander_goal()
-                };
-                changed_hostile_goal(hostile_id, &current, goal)
-            })
+            .filter_map(
+                |(
+                    hostile_id,
+                    _,
+                    _,
+                    _,
+                    is_creeper,
+                    fuse_active,
+                    wander_speed,
+                    wander_period_ticks,
+                    _,
+                    current,
+                )| {
+                    let goal = if is_creeper && fuse_active {
+                        GoalState::Idle
+                    } else {
+                        hostile_wander_goal_for(wander_speed, wander_period_ticks)
+                    };
+                    changed_hostile_goal(hostile_id, &current, goal)
+                },
+            )
             .collect::<Vec<_>>();
         if !changed.is_empty() {
             let _ = entities.set_goals_deferred_journal(changed);
@@ -751,6 +782,9 @@ pub(super) fn update_hostile_targets(
                 uses_ranged_attack,
                 is_creeper,
                 fuse_active,
+                wander_speed,
+                wander_period_ticks,
+                pursuit_speed,
                 current,
             )| {
                 let max_distance_sq = follow_range * follow_range;
@@ -764,7 +798,7 @@ pub(super) fn update_hostile_targets(
                     });
                 let goal = match target {
                     None if is_creeper && fuse_active => GoalState::Idle,
-                    None => hostile_wander_goal(),
+                    None => hostile_wander_goal_for(wander_speed, wander_period_ticks),
                     Some(target)
                         if is_creeper
                             && (fuse_active
@@ -785,7 +819,7 @@ pub(super) fn update_hostile_targets(
                     }
                     Some(target) => GoalState::FollowPosition {
                         target,
-                        speed: HOSTILE_FOLLOW_SPEED,
+                        speed: pursuit_speed,
                     },
                 };
                 changed_hostile_goal(hostile_id, &current, goal)
@@ -797,10 +831,15 @@ pub(super) fn update_hostile_targets(
     }
 }
 
+#[cfg(test)]
 pub(super) fn hostile_wander_goal() -> GoalState {
+    hostile_wander_goal_for(HOSTILE_FOLLOW_SPEED, 20)
+}
+
+fn hostile_wander_goal_for(speed: f64, period_ticks: u32) -> GoalState {
     GoalState::Wander {
-        speed: HOSTILE_FOLLOW_SPEED,
-        period_ticks: 20,
+        speed,
+        period_ticks,
     }
 }
 

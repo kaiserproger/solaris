@@ -2879,6 +2879,29 @@ mod tests {
             mc_entity::VillagerProfession::Toolsmith,
             1,
         ));
+        let mut brain = mc_entity::villager_26_1_2::VillagerBrainState::adult(
+            mc_entity::villager_26_1_2::VillagerPoiSet {
+                home: Some(Vec3::new(72.5, 66.0, 8.5)),
+                job_site: Some(Vec3::new(73.5, 66.0, 8.5)),
+                meeting_point: Some(Vec3::new(72.5, 65.0, 8.5)),
+            },
+        );
+        brain
+            .set_override(
+                mc_entity::villager_26_1_2::VillagerBrainOverride::Hold,
+                10,
+                600,
+            )
+            .unwrap();
+        let brain_plan = mc_entity::villager_26_1_2::plan_villager_brain(
+            &brain,
+            &mc_entity::villager_26_1_2::VillagerBrainProfile::vanilla_26_1_2(),
+            10,
+            9_000,
+        )
+        .unwrap();
+        spawn.goal = brain_plan.goal.clone();
+        spawn.retained.villager_brain = Some(brain_plan.state.clone());
         let mut store = EntityStore::new();
         let id = store.spawn(spawn);
         let snapshot = store.snapshot(id).unwrap();
@@ -2899,6 +2922,11 @@ mod tests {
                 1,
             ))
         );
+        assert_eq!(
+            loaded.records[0].snapshot.retained.villager_brain,
+            Some(brain_plan.state)
+        );
+        assert_eq!(loaded.records[0].snapshot.goal, GoalState::Idle);
     }
 
     fn replay_entity(type_name: &str, spawn_tick: u64) -> EntitySnapshot {

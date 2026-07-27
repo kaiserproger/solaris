@@ -18,12 +18,13 @@ use std::time::Duration;
 
 use mc_protocol::packets::Packet;
 use mc_protocol::packets::play::{
-    ClientboundCommands, ClientboundContainerSetContent, ClientboundKeepAlive,
-    ClientboundOpenScreen, ClientboundSystemChat, ConfirmTeleportation, ContainerInput, Direction,
-    GameEvent, HashedStack, InteractionHand, LevelChunkWithLight, MovePlayerFlags,
-    ServerboundChatCommand, ServerboundContainerClick, ServerboundKeepAlive,
-    ServerboundMovePlayerPosRot, ServerboundMovePlayerStatusOnly, ServerboundUseItemOn,
-    SetCenterChunk, SetDefaultSpawnPosition, SynchronizePlayerPosition, pack_block_pos,
+    AddEntity, ClientboundCommands, ClientboundContainerSetContent, ClientboundKeepAlive,
+    ClientboundOpenScreen, ClientboundSetEntityData, ClientboundSystemChat, ConfirmTeleportation,
+    ContainerInput, Direction, EntityDataValue, GameEvent, HashedStack, InteractionHand,
+    LevelChunkWithLight, MovePlayerFlags, ServerboundChatCommand, ServerboundContainerClick,
+    ServerboundKeepAlive, ServerboundMovePlayerPosRot, ServerboundMovePlayerStatusOnly,
+    ServerboundUseItemOn, SetCenterChunk, SetDefaultSpawnPosition, SynchronizePlayerPosition,
+    pack_block_pos,
 };
 use mc_test_harness::client::Client;
 use mc_world::ChunkGenerator;
@@ -674,6 +675,266 @@ fn system_chat_text(packet: &ClientboundSystemChat) -> String {
             _ => None,
         })
         .expect("system chat component text")
+}
+
+#[test]
+fn generated_village_villager_wire_and_restart_are_stable() {
+    let test = std::thread::Builder::new()
+        .name("generated_village_villager_wire_and_restart_are_stable".to_owned())
+        .stack_size(4 * 1024 * 1024)
+        .spawn(|| {
+            tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .expect("build generated village integration runtime")
+                .block_on(generated_village_villager_wire_and_restart_are_stable_inner());
+        })
+        .expect("spawn generated village integration thread");
+    if let Err(panic) = test.join() {
+        std::panic::resume_unwind(panic);
+    }
+}
+
+async fn generated_village_villager_wire_and_restart_are_stable_inner() {
+    let manifest = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+    let vanilla_dir = manifest.join("../../data/vanilla");
+    let required = [
+        vanilla_dir
+            .join("data/minecraft/structure/village/plains/town_centers/plains_fountain_01.nbt"),
+        vanilla_dir.join("data/minecraft/structure/village/plains/houses/plains_small_house_1.nbt"),
+        vanilla_dir.join("data/minecraft/structure/village/plains/houses/plains_tool_smith_1.nbt"),
+    ];
+    if required.iter().any(|path| !path.is_file())
+        || !vanilla_dir.join("data/minecraft/worldgen").is_dir()
+    {
+        eprintln!("skipping generated village gate: vanilla structure sidecars are missing");
+        return;
+    }
+
+    let report = mc_data::blocks::solaris_required_blocks_report();
+    let blocks = Arc::new(mc_world::BlockRegistry::from_report(&report).expect("block registry"));
+    let items = Arc::new(mc_data::items::solaris_required_items());
+    let parts = [
+        mc_worldgen::PlainsVillagePrototypePart::Fountain,
+        mc_worldgen::PlainsVillagePrototypePart::SmallHouse,
+        mc_worldgen::PlainsVillagePrototypePart::Toolsmith,
+    ];
+    let rules = mc_worldgen::StructureRules::plains_village_prototype_with_plan(
+        &vanilla_dir,
+        &blocks,
+        &parts,
+        vec![mc_worldgen::StructureInhabitant {
+            id: "resident".to_owned(),
+            entity_type: "minecraft:villager".to_owned(),
+            villager_kind: "plains".to_owned(),
+            profession: "toolsmith".to_owned(),
+            level: 1,
+        }],
+    )
+    .expect("load fixed village prototype")
+    .with_fixed_center((72, 8));
+    let generator =
+        Arc::new(mc_worldgen::TerrainGenerator::new(0, Arc::clone(&blocks)).with_structures(rules));
+
+    let mut markers = Vec::new();
+    for chunk_x in 3..=5 {
+        for chunk_z in -1..=1 {
+            markers.extend(
+                generator
+                    .generate(mc_world::ChunkPos {
+                        x: chunk_x,
+                        z: chunk_z,
+                    })
+                    .settlement_inhabitants(),
+            );
+        }
+    }
+    assert_eq!(
+        markers.len(),
+        1,
+        "one planned inhabitant must yield one marker"
+    );
+    let marker = markers.remove(0);
+    assert!(marker.home.is_some());
+    assert!(marker.job_site.is_some());
+    assert!(marker.meeting_point.is_some());
+
+    let villager_type_id = mc_data::entity_types::solaris_required_entity_types()
+        .id_of(&mc_data::Identifier::parse("minecraft:villager").unwrap())
+        .and_then(|id| i32::try_from(id).ok())
+        .expect("villager entity type");
+    let world_dir = tempfile::tempdir().expect("generated village disk world");
+    let fixture = GeneratedVillageFixture {
+        report: &report,
+        blocks,
+        items,
+        generator,
+        world_dir: world_dir.path(),
+        marker: &marker,
+        villager_type_id,
+    };
+
+    let first = run_generated_village_observation(&fixture, "VillageGate", true).await;
+    let second = run_generated_village_observation(&fixture, "VillageGate", false).await;
+
+    assert_eq!(
+        second.uuid, first.uuid,
+        "restart must restore the same villager identity"
+    );
+}
+
+struct GeneratedVillageFixture<'a> {
+    report: &'a [mc_data::blocks::BlockReport],
+    blocks: Arc<mc_world::BlockRegistry>,
+    items: Arc<mc_data::items::ItemRegistry>,
+    generator: Arc<mc_worldgen::TerrainGenerator>,
+    world_dir: &'a std::path::Path,
+    marker: &'a mc_world::SettlementInhabitantMarker,
+    villager_type_id: i32,
+}
+
+async fn run_generated_village_observation(
+    fixture: &GeneratedVillageFixture<'_>,
+    player_name: &str,
+    save: bool,
+) -> AddEntity {
+    let shutdown = mc_net::ShutdownHandle::default();
+    let bound = mc_net::bind(ruin_server_config(
+        fixture.report,
+        Arc::clone(&fixture.blocks),
+        Arc::clone(&fixture.items),
+        Arc::clone(&fixture.generator),
+        fixture.world_dir,
+        shutdown.clone(),
+        "generated village villager gate",
+    ))
+    .await
+    .expect("bind generated village server");
+    let addr = bound
+        .local_addr()
+        .expect("generated village server address");
+    let serve = tokio::spawn(async move { bound.serve().await });
+    let mut client = connect_ruin_client(addr, player_name).await;
+    let (villager, spawn_count) =
+        observe_generated_village_villager(&mut client, fixture.marker, fixture.villager_type_id)
+            .await;
+    assert_eq!(
+        spawn_count, 1,
+        "chunk marker and restored entity must not duplicate villager"
+    );
+
+    if save {
+        client
+            .write_packet(&ServerboundChatCommand {
+                command: "save-all".into(),
+            })
+            .await
+            .expect("save generated village");
+        wait_for_save_all_feedback(&mut client).await;
+    }
+    drop(client);
+    shutdown.request();
+    tokio::time::timeout(Duration::from_secs(5), serve)
+        .await
+        .expect("generated village shutdown")
+        .expect("generated village server join")
+        .expect("generated village server result");
+    villager
+}
+
+async fn observe_generated_village_villager(
+    client: &mut Client,
+    marker: &mc_world::SettlementInhabitantMarker,
+    villager_type_id: i32,
+) -> (AddEntity, usize) {
+    client
+        .write_packet(&ServerboundMovePlayerPosRot {
+            x: marker.position[0],
+            y: marker.position[1],
+            z: marker.position[2],
+            yaw: 0.0,
+            pitch: 0.0,
+            flags: MovePlayerFlags::new(true, false),
+        })
+        .await
+        .expect("move to generated village");
+
+    let target_chunk = (
+        (marker.position[0].floor() as i32).div_euclid(16),
+        (marker.position[2].floor() as i32).div_euclid(16),
+    );
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(8);
+    let mut chunk_loaded = false;
+    let mut villager = None;
+    let mut spawn_count = 0_usize;
+    let mut matching_metadata = std::collections::HashSet::new();
+    loop {
+        let mut frame = client
+            .read_frame_with_timeout(
+                deadline.saturating_duration_since(tokio::time::Instant::now()),
+            )
+            .await
+            .expect("generated village visibility");
+        if handle_keepalive(client, frame.id, &frame.body).await {
+            continue;
+        }
+        if frame.id == SynchronizePlayerPosition::ID {
+            let correction = SynchronizePlayerPosition::decode(&mut frame.body)
+                .expect("decode village movement correction");
+            panic!("movement to generated village was rejected: {correction:?}");
+        }
+        if frame.id == LevelChunkWithLight::ID {
+            let chunk = LevelChunkWithLight::decode(&mut frame.body)
+                .expect("decode generated village chunk");
+            chunk_loaded |= (chunk.chunk_x, chunk.chunk_z) == target_chunk;
+        } else if frame.id == AddEntity::ID {
+            let entity = AddEntity::decode(&mut frame.body).expect("decode village villager");
+            if entity.entity_type_id == villager_type_id {
+                spawn_count += 1;
+                villager.get_or_insert(entity);
+            }
+        } else if frame.id == ClientboundSetEntityData::ID {
+            let data = ClientboundSetEntityData::decode(&mut frame.body)
+                .expect("decode generated villager metadata");
+            if data.values.iter().any(|value| {
+                matches!(
+                    value,
+                    EntityDataValue::VillagerData {
+                        index: 19,
+                        villager_type: 2,
+                        profession: 13,
+                        level: 1,
+                    }
+                )
+            }) {
+                matching_metadata.insert(data.entity_id);
+            }
+        }
+        if chunk_loaded
+            && villager
+                .as_ref()
+                .is_some_and(|entity| matching_metadata.contains(&entity.entity_id))
+        {
+            break;
+        }
+    }
+
+    let settle_deadline = tokio::time::Instant::now() + Duration::from_millis(750);
+    while tokio::time::Instant::now() < settle_deadline {
+        let remaining = settle_deadline.saturating_duration_since(tokio::time::Instant::now());
+        let Ok(Ok(mut frame)) = tokio::time::timeout(remaining, client.read_frame()).await else {
+            break;
+        };
+        if handle_keepalive(client, frame.id, &frame.body).await {
+            continue;
+        }
+        if frame.id == AddEntity::ID {
+            let entity = AddEntity::decode(&mut frame.body).expect("decode late village entity");
+            spawn_count += usize::from(entity.entity_type_id == villager_type_id);
+        }
+    }
+
+    (villager.expect("generated villager AddEntity"), spawn_count)
 }
 
 #[test]

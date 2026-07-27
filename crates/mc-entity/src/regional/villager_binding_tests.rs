@@ -136,13 +136,13 @@ fn binding_goal_applies_follow_position_and_idle_without_consuming_token() {
     };
     assert_eq!(
         handle.apply_villager_binding_goal("goal-token".to_owned(), follow.clone()),
-        Ok(true)
+        Ok(Some(villager))
     );
     assert_eq!(handle.snapshot(villager).unwrap().unwrap().goal, follow);
 
     assert_eq!(
         handle.apply_villager_binding_goal("goal-token".to_owned(), GoalState::Idle),
-        Ok(true)
+        Ok(Some(villager))
     );
     assert_eq!(
         handle.snapshot(villager).unwrap().unwrap().goal,
@@ -160,7 +160,7 @@ fn binding_goal_returns_false_for_missing_token() {
 
     assert_eq!(
         handle.apply_villager_binding_goal("missing".to_owned(), GoalState::Idle),
-        Ok(false)
+        Ok(None)
     );
 
     runtime.shutdown().expect("regional owner shutdown");
@@ -171,7 +171,7 @@ fn binding_goal_expires_on_the_exact_lifecycle_tick() {
     let runtime = RegionalOwnerRuntime::from_store(RegionalEntityStore::new(), 1)
         .expect("regional owner runtime");
     let handle = runtime.handle();
-    handle
+    let villager = handle
         .spawn(entity("minecraft:villager", Vec3::new(0.0, 64.0, 0.0)))
         .expect("spawn villager");
     handle
@@ -184,7 +184,7 @@ fn binding_goal_expires_on_the_exact_lifecycle_tick() {
         .expect("advance before expiry");
     assert_eq!(
         handle.apply_villager_binding_goal("expiring".to_owned(), GoalState::Idle),
-        Ok(true)
+        Ok(Some(villager))
     );
 
     handle
@@ -192,7 +192,7 @@ fn binding_goal_expires_on_the_exact_lifecycle_tick() {
         .expect("advance to exact expiry");
     assert_eq!(
         handle.apply_villager_binding_goal("expiring".to_owned(), GoalState::Idle),
-        Ok(false)
+        Ok(None)
     );
 
     runtime.shutdown().expect("regional owner shutdown");
@@ -214,7 +214,7 @@ fn binding_goal_releases_claim_when_bound_entity_was_removed() {
 
     assert_eq!(
         handle.apply_villager_binding_goal("reusable".to_owned(), GoalState::Idle),
-        Ok(false)
+        Ok(None)
     );
 
     handle

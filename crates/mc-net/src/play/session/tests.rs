@@ -3430,7 +3430,7 @@ fn all_living_aquatic_and_amphibious_classes_use_aquatic_water_rules() {
         let mut entity = SpawnEntity::new(1, type_name, Vec3::ZERO);
         super::entity_goal_defaults::apply_default_mob_goal(
             &mut entity,
-            is_hostile_entity(type_name),
+            &mc_data::mob_behavior_26_1_2::MobBehaviorTable::vanilla_26_1_2(),
         );
         assert_eq!(
             entity.goal,

@@ -424,6 +424,27 @@ pub struct RuntimeTelemetrySnapshot {
 }
 
 #[derive(Clone)]
+pub struct EntityBehaviorHandle {
+    sessions: Arc<play::SessionRegistry>,
+}
+
+impl EntityBehaviorHandle {
+    pub fn configure_mob_behavior_table(
+        &self,
+        table: mc_data::mob_behavior_26_1_2::MobBehaviorTable,
+    ) -> Result<(), mc_data::mob_behavior_26_1_2::MobBehaviorError> {
+        self.sessions.configure_mob_behavior_table(table)
+    }
+
+    pub fn configure_villager_brain_profile(
+        &self,
+        profile: mc_entity::villager_26_1_2::VillagerBrainProfile,
+    ) -> Result<(), mc_entity::villager_26_1_2::VillagerBrainError> {
+        self.sessions.configure_villager_brain_profile(profile)
+    }
+}
+
+#[derive(Clone)]
 pub struct RuntimeTelemetryHandle {
     tick_metrics: RuntimeTickMetricsHandle,
     sessions: Arc<play::SessionRegistry>,
@@ -869,6 +890,13 @@ impl BoundServer {
     #[must_use]
     pub fn entity_effect_handle(&self) -> crate::EntityEffectHandle {
         self.simulation.entity_effect_handle()
+    }
+
+    #[must_use]
+    pub fn entity_behavior_handle(&self) -> EntityBehaviorHandle {
+        EntityBehaviorHandle {
+            sessions: Arc::clone(&self.sessions),
+        }
     }
 
     #[must_use]

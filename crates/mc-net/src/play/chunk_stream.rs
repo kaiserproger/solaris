@@ -2149,6 +2149,9 @@ impl ChunkStreamState {
                                     "toolsmith" => mc_entity::VillagerProfession::Toolsmith,
                                     _ => return None,
                                 };
+                                let to_vec3 = |position: Option<[f64; 3]>| {
+                                    position.map(|[x, y, z]| Vec3::new(x, y, z))
+                                };
                                 Some(SettlementInhabitantSpawn {
                                     claim: marker.claim,
                                     entity_type_id,
@@ -2163,6 +2166,14 @@ impl ChunkStreamState {
                                         profession,
                                         marker.level,
                                     ),
+                                    villager_brain:
+                                        mc_entity::villager_26_1_2::VillagerBrainState::adult(
+                                            mc_entity::villager_26_1_2::VillagerPoiSet {
+                                                home: to_vec3(marker.home),
+                                                job_site: to_vec3(marker.job_site),
+                                                meeting_point: to_vec3(marker.meeting_point),
+                                            },
+                                        ),
                                 })
                             })
                             .collect()

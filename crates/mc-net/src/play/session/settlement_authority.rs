@@ -3,7 +3,6 @@ use mc_entity::{EntitySnapshot, SpawnEntity};
 use crate::play::SettlementInhabitantSpawn;
 use crate::play::simulation::SimulationAuthority;
 
-use super::entity_goal_defaults::apply_default_mob_goal;
 use super::entity_lifecycle::track_entity_chunk_locked;
 use super::interaction_geometry::entity_aabb;
 use super::outbound::VisibilityDispatch;
@@ -29,9 +28,11 @@ impl SessionRegistry {
         }
 
         let lifecycle_tick = inner.entity_lifecycle_tick;
+        let day_time = i64::try_from(self.world_time()).unwrap_or(i64::MAX);
+        let profile = mc_entity::villager_26_1_2::VillagerBrainProfile::vanilla_26_1_2();
         let candidates = pending
             .iter()
-            .map(|spawn| settlement_candidate(spawn, lifecycle_tick))
+            .map(|spawn| settlement_candidate(spawn, lifecycle_tick, day_time, &profile))
             .collect::<Vec<_>>();
         let committed = inner.entities.spawn_unique_batch(candidates);
         for spawn in pending {
@@ -41,7 +42,12 @@ impl SessionRegistry {
     }
 }
 
-fn settlement_candidate(spawn: &SettlementInhabitantSpawn, lifecycle_tick: u64) -> SpawnEntity {
+fn settlement_candidate(
+    spawn: &SettlementInhabitantSpawn,
+    lifecycle_tick: u64,
+    day_time: i64,
+    profile: &mc_entity::villager_26_1_2::VillagerBrainProfile,
+) -> SpawnEntity {
     let mut entity = SpawnEntity::new(
         spawn.entity_type_id,
         spawn.entity_type_name.clone(),
@@ -50,8 +56,17 @@ fn settlement_candidate(spawn: &SettlementInhabitantSpawn, lifecycle_tick: u64) 
     entity.uuid = Some(settlement_uuid(&spawn.claim));
     entity.retained.spawn_tick = lifecycle_tick;
     entity.retained.villager = Some(spawn.villager);
+    entity.retained.villager_brain = Some(spawn.villager_brain.clone());
     apply_entity_facts(&mut entity);
-    apply_default_mob_goal(&mut entity, false);
+    let plan = mc_entity::villager_26_1_2::plan_villager_brain(
+        &spawn.villager_brain,
+        profile,
+        lifecycle_tick,
+        day_time,
+    )
+    .expect("settlement markers construct a validated villager brain");
+    entity.retained.villager_brain = Some(plan.state);
+    entity.goal = plan.goal;
     entity
 }
 
@@ -100,6 +115,13 @@ mod tests {
             entity_type_name: "minecraft:villager".to_owned(),
             position: Vec3::new(72.5, 66.0, 8.5),
             villager: VillagerData::new(VillagerKind::Plains, VillagerProfession::Toolsmith, 1),
+            villager_brain: mc_entity::villager_26_1_2::VillagerBrainState::adult(
+                mc_entity::villager_26_1_2::VillagerPoiSet {
+                    home: Some(Vec3::new(72.5, 66.0, 8.5)),
+                    job_site: Some(Vec3::new(73.5, 66.0, 8.5)),
+                    meeting_point: Some(Vec3::new(72.5, 65.0, 8.5)),
+                },
+            ),
         }
     }
 
@@ -132,6 +154,23 @@ mod tests {
                 VillagerProfession::Toolsmith,
                 1,
             ))
+        );
+        let brain = records[0]
+            .snapshot
+            .retained
+            .villager_brain
+            .as_ref()
+            .expect("settlement villager brain persists");
+        assert_eq!(
+            brain.activity,
+            mc_entity::villager_26_1_2::VillagerActivity::Rest
+        );
+        assert_eq!(
+            records[0].snapshot.goal,
+            mc_entity::GoalState::FollowPosition {
+                target: Vec3::new(72.5, 66.0, 8.5),
+                speed: 0.3,
+            }
         );
     }
 

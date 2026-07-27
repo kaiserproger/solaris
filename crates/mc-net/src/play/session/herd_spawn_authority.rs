@@ -212,6 +212,7 @@ impl SessionRegistry {
             return HerdSpawnOutcome::committed(Vec::new());
         }
         let lifecycle_tick = self.simulation_tick();
+        let mob_behaviors = self.mob_behavior_table();
         let candidates = selected
             .iter()
             .flat_map(|(chunk, spawns)| {
@@ -221,6 +222,7 @@ impl SessionRegistry {
                     &player_positions,
                     lifecycle_tick,
                     minimum_player_distance,
+                    &mob_behaviors,
                 )
             })
             .collect::<Vec<_>>();
@@ -271,6 +273,7 @@ impl SessionRegistry {
             return HerdSpawnOutcome::committed(Vec::new());
         }
         let lifecycle_tick = self.simulation_tick();
+        let mob_behaviors = self.mob_behavior_table();
         let candidates = claimed
             .chunks
             .iter()
@@ -281,6 +284,7 @@ impl SessionRegistry {
                     &claimed.player_positions,
                     lifecycle_tick,
                     MIN_ENTITY_SPAWN_DISTANCE_FROM_PLAYER,
+                    &mob_behaviors,
                 )
             })
             .collect::<Vec<_>>();
@@ -431,6 +435,7 @@ fn build_herd_spawn_candidates(
     player_positions: &[Vec3],
     lifecycle_tick: u64,
     minimum_player_distance: f64,
+    mob_behaviors: &mc_data::mob_behavior_26_1_2::MobBehaviorTable,
 ) -> Vec<SpawnEntity> {
     let mut passive_count = 0_usize;
     let mut hostile_count = 0_usize;
@@ -460,7 +465,7 @@ fn build_herd_spawn_candidates(
             debug_assert_eq!(entity.type_name, "minecraft:sheep");
             entity.animal = Some(mc_entity::AnimalBreedingState::adult_sheep(color));
         }
-        apply_default_mob_goal(&mut entity, spawn.hostile);
+        apply_default_mob_goal(&mut entity, mob_behaviors);
         entities.push(entity);
         if spawn.hostile {
             hostile_count += 1;

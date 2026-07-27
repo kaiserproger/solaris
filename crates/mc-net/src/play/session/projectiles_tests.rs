@@ -12,6 +12,7 @@ fn grounded_arrow_ages_in_a_dense_entity_chunk() {
     let registry = SessionRegistry::new();
     let arrow_id;
     {
+        let mob_behaviors = registry.mob_behavior_table();
         let mut inner = registry.lock_session_entities("seed dense grounded arrow");
         arrow_id = spawn_arrow_locked(
             &mut inner,
@@ -28,6 +29,7 @@ fn grounded_arrow_ages_in_a_dense_entity_chunk() {
                 4,
                 "minecraft:cow".to_owned(),
                 Vec3::new(1.0 + f64::from(ordinal) * 0.01, 64.0, 0.5),
+                &mob_behaviors,
             );
         }
 

@@ -107,6 +107,8 @@ mod simulation_input_publication_tests;
 mod sleep;
 mod survival_action_authority;
 mod transactions;
+#[cfg(test)]
+mod villager_brain_tests;
 mod visibility;
 
 pub(super) fn prewarm_canonical_pathing_state_facts() -> usize {
@@ -495,6 +497,9 @@ pub(crate) struct SessionRegistry {
     movement_recipients: arc_swap::ArcSwap<MovementRecipientIndex>,
     active_simulation_entities: arc_swap::ArcSwap<HashSet<EntityId>>,
     active_hostile_entities: arc_swap::ArcSwap<HashSet<EntityId>>,
+    overridden_villager_entities: arc_swap::ArcSwap<HashSet<EntityId>>,
+    villager_brain_profile: arc_swap::ArcSwap<mc_entity::villager_26_1_2::VillagerBrainProfile>,
+    mob_behavior_table: arc_swap::ArcSwap<mc_data::mob_behavior_26_1_2::MobBehaviorTable>,
     hostile_arrow_entity_type_id: AtomicI32,
     prepared_cache: Mutex<PreparedChunkCache>,
     entities: SessionEntityOwners,
@@ -788,6 +793,13 @@ impl SessionRegistry {
             movement_recipients: arc_swap::ArcSwap::from_pointee(MovementRecipientIndex::new()),
             active_simulation_entities: arc_swap::ArcSwap::from_pointee(HashSet::new()),
             active_hostile_entities: arc_swap::ArcSwap::from_pointee(HashSet::new()),
+            overridden_villager_entities: arc_swap::ArcSwap::from_pointee(HashSet::new()),
+            villager_brain_profile: arc_swap::ArcSwap::from_pointee(
+                mc_entity::villager_26_1_2::VillagerBrainProfile::vanilla_26_1_2(),
+            ),
+            mob_behavior_table: arc_swap::ArcSwap::from_pointee(
+                mc_data::mob_behavior_26_1_2::MobBehaviorTable::vanilla_26_1_2(),
+            ),
             hostile_arrow_entity_type_id: AtomicI32::new(-1),
             prepared_cache: Mutex::new(PreparedChunkCache::default()),
             entities: SessionEntityOwners::new(
@@ -902,6 +914,66 @@ impl SessionRegistry {
             #[cfg(test)]
             hostile_entity_scan_visits: AtomicU64::new(0),
         }
+    }
+
+    #[allow(dead_code)]
+    pub(crate) fn configure_mob_behavior_table(
+        &self,
+        table: mc_data::mob_behavior_26_1_2::MobBehaviorTable,
+    ) -> Result<(), mc_data::mob_behavior_26_1_2::MobBehaviorError> {
+        table.validate()?;
+        self.mob_behavior_table.store(Arc::new(table));
+        Ok(())
+    }
+
+    fn mob_behavior_table(&self) -> Arc<mc_data::mob_behavior_26_1_2::MobBehaviorTable> {
+        self.mob_behavior_table.load_full()
+    }
+
+    fn track_villager_override(&self, entity: EntityId) {
+        self.overridden_villager_entities.rcu(|current| {
+            if current.contains(&entity) {
+                return Arc::clone(current);
+            }
+            let mut next = (**current).clone();
+            next.insert(entity);
+            Arc::new(next)
+        });
+    }
+
+    fn clear_villager_overrides(&self, entities: &[EntityId]) {
+        if entities.is_empty() {
+            return;
+        }
+        self.overridden_villager_entities.rcu(|current| {
+            let mut next = (**current).clone();
+            let previous_len = next.len();
+            for entity in entities {
+                next.remove(entity);
+            }
+            if next.len() == previous_len {
+                Arc::clone(current)
+            } else {
+                Arc::new(next)
+            }
+        });
+    }
+
+    fn overridden_villager_entities(&self) -> Arc<HashSet<EntityId>> {
+        self.overridden_villager_entities.load_full()
+    }
+
+    pub(crate) fn configure_villager_brain_profile(
+        &self,
+        profile: mc_entity::villager_26_1_2::VillagerBrainProfile,
+    ) -> Result<(), mc_entity::villager_26_1_2::VillagerBrainError> {
+        profile.validate()?;
+        self.villager_brain_profile.store(Arc::new(profile));
+        Ok(())
+    }
+
+    fn villager_brain_profile(&self) -> Arc<mc_entity::villager_26_1_2::VillagerBrainProfile> {
+        self.villager_brain_profile.load_full()
     }
 
     pub(in crate::play) fn loader_block_projection(

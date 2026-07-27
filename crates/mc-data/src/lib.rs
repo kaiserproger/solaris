@@ -49,6 +49,7 @@ pub mod identifier;
 pub mod item_components;
 pub mod items;
 pub mod loot;
+pub mod mob_behavior_26_1_2;
 pub mod recipes;
 pub mod tags;
 pub mod worldgen_features;

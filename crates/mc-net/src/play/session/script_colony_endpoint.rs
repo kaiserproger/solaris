@@ -23,9 +23,16 @@ impl SessionRegistry {
         goal: mc_entity::GoalState,
     ) -> Result<bool, RegionOwnerLaneError> {
         let owner = self.entities.handle.clone();
-        tokio::task::spawn_blocking(move || owner.apply_villager_binding_goal(token, goal))
-            .await
-            .map_err(|_| RegionOwnerLaneError::Closed)?
+        let applied =
+            tokio::task::spawn_blocking(move || owner.apply_villager_binding_goal(token, goal))
+                .await
+                .map_err(|_| RegionOwnerLaneError::Closed)??;
+        if let Some(entity) = applied {
+            self.track_villager_override(entity);
+            Ok(true)
+        } else {
+            Ok(false)
+        }
     }
 
     #[cfg(test)]

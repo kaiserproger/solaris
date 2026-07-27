@@ -768,8 +768,9 @@ const CREEPER_EXPLOSION_POWER: f32 = 3.0;
 const SKELETON_SHOT_PERIOD_TICKS: u64 = 40;
 const SKELETON_SHOT_RANGE: f64 = 16.0;
 const SKELETON_ARROW_SPEED: f64 = 1.6;
+#[cfg(test)]
 const HOSTILE_FOLLOW_SPEED: f64 = 1.25;
-const HOSTILE_WANDER_SPEED: f64 = 1.25;
+#[cfg(test)]
 const PASSIVE_WANDER_SPEED: f64 = 0.8;
 const MAX_PASSIVE_SPAWNS_PER_CHUNK: usize = 6;
 const MAX_HOSTILE_SPAWNS_PER_CHUNK: usize = 3;
@@ -916,6 +917,7 @@ pub(super) struct SettlementInhabitantSpawn {
     entity_type_name: String,
     position: Vec3,
     villager: mc_entity::VillagerData,
+    villager_brain: mc_entity::villager_26_1_2::VillagerBrainState,
 }
 
 #[derive(Debug, Clone, Copy)]

@@ -127,6 +127,9 @@ pub struct SettlementInhabitantMarker {
     pub villager_kind: String,
     pub profession: String,
     pub level: u8,
+    pub home: Option<[f64; 3]>,
+    pub job_site: Option<[f64; 3]>,
+    pub meeting_point: Option<[f64; 3]>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -591,7 +594,7 @@ impl Chunk {
         let elements = inhabitants
             .iter()
             .map(|inhabitant| {
-                Tag::Compound(vec![
+                let mut fields = vec![
                     ("Claim".into(), Tag::String(inhabitant.claim.clone())),
                     ("Entity".into(), Tag::String(inhabitant.entity_type.clone())),
                     ("X".into(), Tag::Double(inhabitant.position[0])),
@@ -606,7 +609,20 @@ impl Chunk {
                         Tag::String(inhabitant.profession.clone()),
                     ),
                     ("Level".into(), Tag::Int(i32::from(inhabitant.level))),
-                ])
+                ];
+                let mut push_position = |prefix: &str, position: Option<[f64; 3]>| {
+                    if let Some([x, y, z]) = position
+                        .filter(|position| position.iter().all(|component| component.is_finite()))
+                    {
+                        fields.push((format!("{prefix}X"), Tag::Double(x)));
+                        fields.push((format!("{prefix}Y"), Tag::Double(y)));
+                        fields.push((format!("{prefix}Z"), Tag::Double(z)));
+                    }
+                };
+                push_position("Home", inhabitant.home);
+                push_position("Job", inhabitant.job_site);
+                push_position("Meeting", inhabitant.meeting_point);
+                Tag::Compound(fields)
             })
             .collect();
         self.extras.push((
@@ -663,6 +679,13 @@ impl Chunk {
                         })
                         .filter(|value| (1..=5).contains(value))
                 });
+                let position = |prefix: &str| {
+                    Some([
+                        double(&format!("{prefix}X"))?,
+                        double(&format!("{prefix}Y"))?,
+                        double(&format!("{prefix}Z"))?,
+                    ])
+                };
                 Some(SettlementInhabitantMarker {
                     claim: string("Claim")?,
                     entity_type: string("Entity")?,
@@ -670,6 +693,9 @@ impl Chunk {
                     villager_kind: string("VillagerKind")?,
                     profession: string("Profession")?,
                     level: level?,
+                    home: position("Home"),
+                    job_site: position("Job"),
+                    meeting_point: position("Meeting"),
                 })
             })
             .collect()
@@ -1252,11 +1278,56 @@ mod tests {
             villager_kind: "plains".to_owned(),
             profession: "toolsmith".to_owned(),
             level: 1,
+            home: Some([72.5, 66.0, 8.5]),
+            job_site: Some([73.5, 66.0, 8.5]),
+            meeting_point: Some([72.5, 65.0, 8.5]),
         };
 
         chunk.set_settlement_inhabitants(std::slice::from_ref(&marker));
 
         assert_eq!(chunk.settlement_inhabitants(), vec![marker]);
+    }
+
+    #[test]
+    fn legacy_settlement_marker_without_pois_loads_with_empty_optional_positions() {
+        let mut chunk = Chunk::empty(ChunkPos { x: 4, z: 0 }, air(), plains());
+        chunk.extras.push((
+            SETTLEMENT_INHABITANTS_KEY.into(),
+            Tag::List(mc_nbt::ListTag {
+                element_type: mc_nbt::tag_type::COMPOUND,
+                elements: vec![Tag::Compound(vec![
+                    (
+                        "Claim".into(),
+                        Tag::String("settlement-prototype:resident@72,8".to_owned()),
+                    ),
+                    (
+                        "Entity".into(),
+                        Tag::String("minecraft:villager".to_owned()),
+                    ),
+                    ("X".into(), Tag::Double(72.5)),
+                    ("Y".into(), Tag::Double(66.0)),
+                    ("Z".into(), Tag::Double(8.5)),
+                    ("VillagerKind".into(), Tag::String("plains".to_owned())),
+                    ("Profession".into(), Tag::String("none".to_owned())),
+                    ("Level".into(), Tag::Int(1)),
+                ])],
+            }),
+        ));
+
+        assert_eq!(
+            chunk.settlement_inhabitants(),
+            vec![SettlementInhabitantMarker {
+                claim: "settlement-prototype:resident@72,8".to_owned(),
+                entity_type: "minecraft:villager".to_owned(),
+                position: [72.5, 66.0, 8.5],
+                villager_kind: "plains".to_owned(),
+                profession: "none".to_owned(),
+                level: 1,
+                home: None,
+                job_site: None,
+                meeting_point: None,
+            }]
+        );
     }
 
     #[test]

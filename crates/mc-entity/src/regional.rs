@@ -1202,7 +1202,7 @@ enum RegionalOwnerCommand {
     ApplyVillagerBindingGoal {
         token: String,
         goal: GoalState,
-        reply: std::sync::mpsc::Sender<Result<bool, RegionOwnerLaneError>>,
+        reply: std::sync::mpsc::Sender<Result<Option<EntityId>, RegionOwnerLaneError>>,
     },
     Status {
         reply: std::sync::mpsc::Sender<Result<RegionalOwnerStatus, RegionOwnerLaneError>>,
@@ -1592,7 +1592,7 @@ impl RegionalOwnerHandle {
         &self,
         token: String,
         goal: GoalState,
-    ) -> Result<bool, RegionOwnerLaneError> {
+    ) -> Result<Option<EntityId>, RegionOwnerLaneError> {
         let (reply, result) = channel();
         self.sender
             .send(RegionalOwnerCommand::ApplyVillagerBindingGoal { token, goal, reply })
@@ -3987,7 +3987,7 @@ impl RegionalOwnerCoordinator {
         &mut self,
         token: String,
         goal: GoalState,
-    ) -> Result<bool, RegionOwnerLaneError> {
+    ) -> Result<Option<EntityId>, RegionOwnerLaneError> {
         self.commit_state.ensure_committed_state()?;
         let current_tick = self.commit_state.lifecycle_epoch();
         let Some((entity, expires_at_tick)) = self
@@ -3995,25 +3995,67 @@ impl RegionalOwnerCoordinator {
             .get(&token)
             .map(|binding| (binding.entity, binding.expires_at_tick))
         else {
-            return Ok(false);
+            return Ok(None);
         };
         if current_tick >= expires_at_tick {
             self.remove_villager_binding(&token);
-            return Ok(false);
+            return Ok(None);
         }
 
         let Some(snapshot) = self.snapshot(entity)? else {
             self.remove_villager_binding(&token);
-            return Ok(false);
+            return Ok(None);
         };
         if snapshot.lifecycle != EntityLifecycle::Alive
             || snapshot.type_name != "minecraft:villager"
         {
             self.remove_villager_binding(&token);
-            return Ok(false);
+            return Ok(None);
         }
-
-        self.set_goal(entity, goal)
+        let villager = snapshot.retained.villager.unwrap_or_else(|| {
+            crate::VillagerData::new(
+                crate::VillagerKind::Plains,
+                crate::VillagerProfession::None,
+                1,
+            )
+        });
+        let override_order = match goal.clone() {
+            GoalState::Idle => crate::villager_26_1_2::VillagerBrainOverride::Hold,
+            GoalState::FollowPosition { target, speed } => {
+                crate::villager_26_1_2::VillagerBrainOverride::FollowPosition { target, speed }
+            }
+            GoalState::Wander {
+                speed,
+                period_ticks,
+            } => crate::villager_26_1_2::VillagerBrainOverride::Wander {
+                speed,
+                period_ticks,
+            },
+            GoalState::FollowTarget { .. } | GoalState::AquaticWander { .. } => return Ok(None),
+        };
+        let mut brain = snapshot.retained.villager_brain.clone().unwrap_or_else(|| {
+            crate::villager_26_1_2::VillagerBrainState::adult(
+                crate::villager_26_1_2::VillagerPoiSet {
+                    home: Some(snapshot.position),
+                    job_site: (villager.profession != crate::VillagerProfession::None)
+                        .then_some(snapshot.position),
+                    meeting_point: Some(snapshot.position),
+                },
+            )
+        });
+        if brain
+            .set_override(override_order, current_tick, expires_at_tick)
+            .is_err()
+        {
+            return Ok(None);
+        }
+        brain.activity = crate::villager_26_1_2::VillagerActivity::Controlled;
+        let mut next = snapshot.clone();
+        next.goal = goal;
+        next.retained.villager_brain = Some(brain);
+        Ok(self
+            .replace_snapshot_if_current(snapshot, next)?
+            .then_some(entity))
     }
 
     fn remove_villager_binding(&mut self, token: &str) {

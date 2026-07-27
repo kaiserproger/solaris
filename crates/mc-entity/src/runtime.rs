@@ -139,7 +139,7 @@ struct AiGoalState(GoalState);
 #[derive(Component, Default)]
 struct AiPathState(RetainedPathState);
 
-#[derive(Component, Clone, Copy)]
+#[derive(Component, Clone)]
 struct GameplayDecisionState {
     arrow_state: Option<crate::projectile_26_1_2::ArrowState>,
     last_damage_tick: Option<u64>,
@@ -150,6 +150,7 @@ struct GameplayDecisionState {
     item_pickup_owner_block: Option<crate::EntityItemPickupOwnerBlock>,
     primed_tnt: Option<crate::EntityPrimedTntState>,
     villager: Option<crate::VillagerData>,
+    villager_brain: Option<crate::villager_26_1_2::VillagerBrainState>,
 }
 
 #[derive(Component)]
@@ -379,7 +380,7 @@ impl EntityRuntime {
             entity,
             living: row.get::<LivingState>()?.state,
             lifecycle: row.get::<LifecycleState>()?.0,
-            gameplay: *row.get::<GameplayDecisionState>()?,
+            gameplay: row.get::<GameplayDecisionState>()?.clone(),
             effects: row.get::<ActiveEffectsState>().cloned(),
         })
     }
@@ -1263,6 +1264,7 @@ fn insert_snapshot_into_world(world: &mut World, snapshot: EntitySnapshot) -> bo
         item_pickup_owner_block,
         primed_tnt,
         villager,
+        villager_brain,
     } = retained;
     let living_state = living_state_from_snapshot(health, lifecycle, retained_living);
     if living_state.validate().is_err() {
@@ -1310,6 +1312,7 @@ fn insert_snapshot_into_world(world: &mut World, snapshot: EntitySnapshot) -> bo
             item_pickup_owner_block,
             primed_tnt,
             villager,
+            villager_brain,
         },
         PersistentState,
         VisibilityState,
@@ -1413,6 +1416,7 @@ fn restore_snapshot_in_world(world: &mut World, snapshot: EntitySnapshot) -> boo
         item_pickup_owner_block,
         primed_tnt,
         villager,
+        villager_brain,
     } = retained;
     let living_state = living_state_from_snapshot(health, lifecycle, retained_living);
     if living_state.validate().is_err() {
@@ -1454,6 +1458,7 @@ fn restore_snapshot_in_world(world: &mut World, snapshot: EntitySnapshot) -> boo
                 item_pickup_owner_block,
                 primed_tnt,
                 villager,
+                villager_brain,
             },
         ));
         replace_optional_component(&mut entity, active_effects);
@@ -1556,6 +1561,7 @@ fn snapshot_from_world(world: &World, id: EntityId) -> Option<EntitySnapshot> {
             item_pickup_owner_block: gameplay.item_pickup_owner_block,
             primed_tnt: gameplay.primed_tnt,
             villager: gameplay.villager,
+            villager_brain: gameplay.villager_brain.clone(),
         },
     })
 }
@@ -1617,6 +1623,7 @@ fn entity_view_from_world(world: &World, id: EntityId) -> Option<EntityView<'_>>
             item_pickup_owner_block: gameplay.item_pickup_owner_block,
             primed_tnt: gameplay.primed_tnt,
             villager: gameplay.villager,
+            villager_brain: gameplay.villager_brain.clone(),
         },
     })
 }

@@ -67,9 +67,10 @@ pub use play::{
 pub use runtime_tick_metrics::{RuntimeLatencyPercentiles, RuntimeTickPercentiles};
 pub use script::PluginStorageStartError;
 pub use server::{
-    BoundServer, CommandPermissionConfig, OutboundPressureHandle, OutboundPressureSnapshot,
-    RuntimeTelemetryHandle, RuntimeTelemetrySnapshot, SaveAllReport, SaveAllTimings, SaveHandle,
-    ServerConfig, ShutdownHandle, WorldHandle, bind, bind_with_extension, bind_with_scripts, run,
+    BoundServer, CommandPermissionConfig, EntityBehaviorHandle, OutboundPressureHandle,
+    OutboundPressureSnapshot, RuntimeTelemetryHandle, RuntimeTelemetrySnapshot, SaveAllReport,
+    SaveAllTimings, SaveHandle, ServerConfig, ShutdownHandle, WorldHandle, bind,
+    bind_with_extension, bind_with_scripts, run,
 };
 pub use session_auth::{
     MojangSessionVerifier, RsaIdentity, RsaIdentityError, SessionVerifier,
