@@ -1542,7 +1542,13 @@ impl BoundServer {
                         mutation.increment_chunk_inhabited_times(&inhabited_updates)
                     });
                 inhabited_time.restore(missing);
-                let entity_save_us = elapsed_us(started);
+                let inhabited_time_us = elapsed_us(started);
+                // `entity_save_us` is the synchronous save work executed inside this
+                // tick. It is intentionally zero: the request below is non-blocking,
+                // its tiny enqueue cost remains visible in total/unattributed tick time,
+                // and actual checkpoint I/O is reported by `SaveAllTimings` from the
+                // dedicated save worker.
+                let entity_save_us = 0;
                 if tick.is_multiple_of(simulation_policy.save_interval_ticks)
                     && entity_sessions.active_session_count() > 0
                 {
@@ -1713,6 +1719,7 @@ impl BoundServer {
                     entity_physics_us,
                     entity_dispatch_us,
                     campfire_tick_us,
+                    inhabited_time_us,
                     entity_save_us,
                     random_tick_us,
                     block_tick_us,
@@ -1795,6 +1802,10 @@ impl BoundServer {
                             campfire_tick_p95_us = percentiles.campfire_tick.p95_us,
                             campfire_tick_p99_us = percentiles.campfire_tick.p99_us,
                             campfire_tick_max_us = percentiles.campfire_tick.max_us,
+                            inhabited_time_p50_us = percentiles.inhabited_time.p50_us,
+                            inhabited_time_p95_us = percentiles.inhabited_time.p95_us,
+                            inhabited_time_p99_us = percentiles.inhabited_time.p99_us,
+                            inhabited_time_max_us = percentiles.inhabited_time.max_us,
                             entity_save_p50_us = percentiles.entity_save.p50_us,
                             entity_save_p95_us = percentiles.entity_save.p95_us,
                             entity_save_p99_us = percentiles.entity_save.p99_us,
@@ -1834,6 +1845,7 @@ impl BoundServer {
                             furnace_tick_us,
                             furnace_updated,
                             unattributed_tick_us,
+                            inhabited_time_us,
                             entity_save_us,
                             random_tick_us,
                             block_tick_us,
@@ -1953,6 +1965,7 @@ impl BoundServer {
                             furnace_tick_us,
                             furnace_updated,
                             unattributed_tick_us,
+                            inhabited_time_us,
                             entity_save_us,
                             random_tick_us,
                             block_tick_us,
@@ -3158,6 +3171,7 @@ fn runtime_attributed_tick_us(
         sample.entity_dispatch_us,
         sample.campfire_tick_us,
         furnace_tick_us,
+        sample.inhabited_time_us,
         sample.entity_save_us,
         sample.random_tick_us,
         sample.block_tick_us,
@@ -6415,6 +6429,7 @@ end
             entity_physics_us: 0,
             entity_dispatch_us: 0,
             campfire_tick_us: 0,
+            inhabited_time_us: 0,
             entity_save_us: 0,
             random_tick_us: 0,
             block_tick_us: 0,
@@ -6438,6 +6453,7 @@ end
                 entity_physics_us: 1_000,
                 entity_dispatch_us: 1_000,
                 campfire_tick_us: 10,
+                inhabited_time_us: 10,
                 entity_save_us: 10,
                 random_tick_us: 500,
                 block_tick_us: 100,
@@ -6454,6 +6470,7 @@ end
             entity_physics_us: 20_000,
             entity_dispatch_us: 10_000,
             campfire_tick_us: 10,
+            inhabited_time_us: 10,
             entity_save_us: 10,
             random_tick_us: 500,
             block_tick_us: 100,

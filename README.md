@@ -140,6 +140,15 @@ cargo clippy --workspace --all-targets -- -D warnings
 cargo fmt --all -- --check
 ```
 
+## Current performance evidence
+
+The latest bounded debug/release matrix is recorded in
+[`docs/performance/2026-07-27-benchmark-matrix.md`](docs/performance/2026-07-27-benchmark-matrix.md).
+The focused 20-client VD8 gate passes in both builds on the calibration host, but
+the frozen low/balanced/high duration and cgroup envelopes are still incomplete.
+The current O3 explosion-authority benchmark remains over its 50 ms p99 budget;
+see the matrix before making performance or readiness claims.
+
 ## Layout
 
 ```

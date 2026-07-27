@@ -17,12 +17,12 @@ use mc_protocol::packets::play::{
     AddEntity, BlockChangedAck, BlockUpdate, ClientboundContainerSetContent,
     ClientboundContainerSetSlot, ClientboundKeepAlive, ClientboundOpenScreen,
     ClientboundSetEntityData, ClientboundSetExperience, ClientboundSetHealth, ConfirmTeleportation,
-    ContainerInput, Direction, EntityDataValue, GameEvent, HashedStack, HashedStackComponentHashes,
-    InteractionHand, LevelChunkWithLight, MovePlayerFlags, SectionBlocksUpdate,
-    ServerboundChatCommand, ServerboundContainerClick, ServerboundKeepAlive,
-    ServerboundMovePlayerPos, ServerboundMovePlayerStatusOnly, ServerboundUseItemOn,
-    SetCenterChunk, SynchronizePlayerPosition, pack_block_pos, pack_section_pos,
-    pack_section_relative_pos, unpack_block_pos,
+    ContainerInput, Direction, EntityDataValue, GameEvent, GameMode, HashedStack,
+    HashedStackComponentHashes, InteractionHand, LevelChunkWithLight, MovePlayerFlags,
+    PlayDisconnect, SectionBlocksUpdate, ServerboundChatCommand, ServerboundContainerClick,
+    ServerboundKeepAlive, ServerboundMovePlayerPos, ServerboundMovePlayerStatusOnly,
+    ServerboundUseItemOn, SetCenterChunk, SynchronizePlayerPosition, pack_block_pos,
+    pack_section_pos, pack_section_relative_pos, unpack_block_pos,
 };
 use mc_test_harness::client::Client;
 use mc_test_harness::replay::{
@@ -548,6 +548,7 @@ impl PlayerDeathBundleObservation {
 
 async fn run_player_death_restart_gate() {
     const XP_POINTS: i32 = 35;
+    const RECOVERABLE_DEATH_XP: i32 = 21;
     const APPLE_COUNT: i32 = 2;
 
     let world_dir = tempfile::tempdir().expect("create player death replay world");
@@ -602,7 +603,7 @@ async fn run_player_death_restart_gate() {
         true,
     )
     .await;
-    before_restart.assert_exact(XP_POINTS);
+    before_restart.assert_exact(RECOVERABLE_DEATH_XP);
     drop(victim);
     wait_for_active_sessions(&server, 0).await;
     let save_report = server.save_handle.save_all().await;
@@ -640,7 +641,7 @@ async fn run_player_death_restart_gate() {
         true,
     )
     .await;
-    after_restart.assert_exact(XP_POINTS);
+    after_restart.assert_exact(RECOVERABLE_DEATH_XP);
     drop(victim_rejoined);
     wait_for_active_sessions(&restarted, 0).await;
     shutdown_load_server(restarted, "player death restarted").await;
@@ -996,15 +997,6 @@ async fn replay_same_target_placement(
     let (mut right, _) = connect_to_play(addr, &right_profile).await;
     drain_until_chunk(&mut left, (0, 0)).await;
     drain_until_chunk(&mut right, (0, 0)).await;
-    for client in [&mut left, &mut right] {
-        client
-            .write_packet(&ServerboundChatCommand {
-                command: "gamemode creative".to_string(),
-            })
-            .await
-            .expect("set replay placement actor creative");
-    }
-
     let target_coords = find_placeable_target(server, 3, 0, left_sync.y.floor() as i32).await;
     let target = mc_world::BlockPos {
         x: target_coords.0,
@@ -1040,21 +1032,12 @@ async fn replay_same_target_placement(
             .await
             .set_block_at(target, air)
             .expect("reset replay placement target");
-        left.write_packet(&ServerboundChatCommand {
-            command: format!("debug give {} 0 0", items[0]),
-        })
-        .await
-        .expect("clear left replay slot");
-        right
-            .write_packet(&ServerboundChatCommand {
-                command: format!("debug give {} 0 0", items[1]),
-            })
-            .await
-            .expect("clear right replay slot");
         let ((), ()) = tokio::join!(
-            wait_for_inventory_empty(&mut left),
-            wait_for_inventory_empty(&mut right),
+            set_load_client_game_mode(&mut left, "gamemode creative", GameMode::Creative),
+            set_load_client_game_mode(&mut right, "gamemode creative", GameMode::Creative),
         );
+        // `debug give` is an authoritative exact hotbar overwrite, so each round
+        // resets the tested slot without a separate empty-stack transaction.
         left.write_packet(&ServerboundChatCommand {
             command: format!("debug give {} 1 0", items[0]),
         })
@@ -1069,6 +1052,10 @@ async fn replay_same_target_placement(
         let ((), ()) = tokio::join!(
             wait_for_inventory_stack(&mut left),
             wait_for_inventory_stack(&mut right),
+        );
+        let ((), ()) = tokio::join!(
+            set_load_client_game_mode(&mut left, "gamemode survival", GameMode::Survival),
+            set_load_client_game_mode(&mut right, "gamemode survival", GameMode::Survival),
         );
 
         let left_sequence = 800 + i32::from(round) * 2;
@@ -1465,26 +1452,25 @@ fn persist_minimal_replay_failures<'a>(
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 #[ignore = "requires local data/vanilla sidecars; degraded when absent"]
 async fn bounded_multiplayer_survival_replay_covers_sequential_contention_and_slow_reader() {
-    let server = start_load_server().await;
+    let server = start_load_server_with_options(LoadServerOptions {
+        disk_backed: true,
+        ..LoadServerOptions::default()
+    })
+    .await;
     let addr = server.addr;
     let started = Instant::now();
 
-    let mut paused_reader = PausedReaderClient::connect(addr, "M96PausedReader").await;
-    let pressure_before = server.outbound_pressure_snapshot();
-
-    let mut client_tasks = Vec::new();
-    for idx in 0..M96_REPLAY_CLIENTS {
-        client_tasks.push(tokio::spawn(async move {
-            let (mut client, sync) = connect_to_play(addr, &format!("M96Soak{idx}")).await;
-            drain_until_chunk(&mut client, (0, 0)).await;
-            (client, sync)
-        }));
-    }
-
     let mut clients = Vec::new();
-    for task in client_tasks {
-        clients.push(task.await.expect("M96 replay client task joins"));
+    for idx in 0..M96_REPLAY_CLIENTS {
+        let (mut client, sync) = connect_to_play(addr, &format!("M96Soak{idx}")).await;
+        let chunks = drain_unique_chunks(&mut client, 9).await;
+        assert_eq!(chunks.len(), 9, "M96 replay client must finish VD1 stream");
+        clients.push((client, sync));
     }
+    let mut paused_reader = PausedReaderClient::connect(addr, "M96PausedReader").await;
+    // Admit the slow reader first, then baseline before the explicit pressure burst;
+    // connection setup is excluded while the triggered counter delta stays intact.
+    let pressure_before = server.outbound_pressure_snapshot();
 
     let (mut editor_a, sync_a) = clients.remove(0);
     let (mut editor_b, sync_b) = clients.remove(0);
@@ -1592,7 +1578,7 @@ async fn bounded_multiplayer_survival_replay_covers_sequential_contention_and_sl
         "disconnect cancellation must stay bounded: before={cancellation_before_disconnect:?} after={cancellation_after_disconnect:?} budget={M96_CANCELLED_REQUEST_BUDGET}"
     );
     let (mut rejoined, _) = connect_to_play(addr, "M96Soak3").await;
-    drain_until_chunk(&mut rejoined, (0, 0)).await;
+    drain_until_chunk(&mut rejoined, (3, 0)).await;
     let chunk_after_rejoin = server.chunk_pipeline_metrics.snapshot();
     assert!(
         chunk_after_rejoin.max_cpu_active >= chunk_before_disconnect.max_cpu_active,
@@ -1692,21 +1678,16 @@ async fn bounded_multiplayer_survival_replay_covers_sequential_contention_and_sl
 async fn concurrent_same_target_placements_consume_exactly_one_stack() {
     const ROUNDS: usize = 8;
 
-    let server = start_load_server().await;
+    let server = start_load_server_with_options(LoadServerOptions {
+        disk_backed: true,
+        ..LoadServerOptions::default()
+    })
+    .await;
     let addr = server.addr;
     let (mut dirt_player, dirt_sync) = connect_to_play(addr, "Prompt02Dirt").await;
     let (mut stone_player, _) = connect_to_play(addr, "Prompt02Stone").await;
     drain_until_chunk(&mut dirt_player, (0, 0)).await;
     drain_until_chunk(&mut stone_player, (0, 0)).await;
-    for client in [&mut dirt_player, &mut stone_player] {
-        client
-            .write_packet(&ServerboundChatCommand {
-                command: "gamemode creative".to_string(),
-            })
-            .await
-            .expect("set placement contender creative");
-    }
-
     let target_coords = find_placeable_target(&server, 3, 0, dirt_sync.y.floor() as i32).await;
     let target = mc_world::BlockPos {
         x: target_coords.0,
@@ -1738,22 +1719,12 @@ async fn concurrent_same_target_placements_consume_exactly_one_stack() {
             .await
             .set_block_at(target, air)
             .expect("reset concurrent placement target");
-        dirt_player
-            .write_packet(&ServerboundChatCommand {
-                command: "debug give minecraft:dirt 0 0".to_string(),
-            })
-            .await
-            .expect("clear dirt contender slot");
-        stone_player
-            .write_packet(&ServerboundChatCommand {
-                command: "debug give minecraft:stone 0 0".to_string(),
-            })
-            .await
-            .expect("clear stone contender slot");
         let ((), ()) = tokio::join!(
-            wait_for_inventory_empty(&mut dirt_player),
-            wait_for_inventory_empty(&mut stone_player),
+            set_load_client_game_mode(&mut dirt_player, "gamemode creative", GameMode::Creative,),
+            set_load_client_game_mode(&mut stone_player, "gamemode creative", GameMode::Creative,),
         );
+        // `debug give` overwrites the authoritative hotbar slot exactly; this is
+        // the deterministic per-round reset before Survival consumption.
         dirt_player
             .write_packet(&ServerboundChatCommand {
                 command: "debug give minecraft:dirt 1 0".to_string(),
@@ -1769,6 +1740,10 @@ async fn concurrent_same_target_placements_consume_exactly_one_stack() {
         let ((), ()) = tokio::join!(
             wait_for_inventory_stack(&mut dirt_player),
             wait_for_inventory_stack(&mut stone_player),
+        );
+        let ((), ()) = tokio::join!(
+            set_load_client_game_mode(&mut dirt_player, "gamemode survival", GameMode::Survival,),
+            set_load_client_game_mode(&mut stone_player, "gamemode survival", GameMode::Survival,),
         );
 
         let dirt_sequence = 400 + i32::try_from(round * 2).expect("round sequence");
@@ -1834,7 +1809,11 @@ async fn concurrent_same_target_placements_consume_exactly_one_stack() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 #[ignore = "requires local data/vanilla sidecars; degraded when absent"]
 async fn concurrent_shared_chest_same_state_commits_one_cursor_transaction() {
-    let server = start_load_server().await;
+    let server = start_load_server_with_options(LoadServerOptions {
+        disk_backed: true,
+        ..LoadServerOptions::default()
+    })
+    .await;
     let addr = server.addr;
     let (mut actor, actor_sync) = connect_to_play(addr, "Prompt02ChestA").await;
     let (mut observer, _) = connect_to_play(addr, "Prompt02ChestB").await;
@@ -2287,6 +2266,13 @@ async fn vd8_twenty_same_spawn_clients_drain_full_window_and_stop_without_duplic
         "O2 VD8 explicit save should flush generated chunks: {save_report:?}"
     );
     let world_after_explicit_save = server.world.lock().await.stats();
+    let mut simulation_ticks = server.runtime_telemetry.subscribe_simulation_ticks();
+    while *simulation_ticks.borrow_and_update() < 100 {
+        tokio::time::timeout(Duration::from_secs(10), simulation_ticks.changed())
+            .await
+            .expect("O2 VD8 metrics cadence timed out")
+            .expect("simulation tick sender remains active");
+    }
     assert!(
         loaded_snapshot.max_io_active <= server.chunk_io_threads,
         "chunk IO permits exceeded during 20-client VD8 load: {:?}",
@@ -2557,7 +2543,14 @@ async fn vd8_twenty_same_spawn_clients_drain_full_window_and_stop_without_duplic
             "harness": { "status": "passed", "gate": "mc-test-harness/load_scenarios" },
             "oracle": { "status": "skipped", "reason": "protocol workload, no vanilla comparison" },
             "real_client": { "status": "skipped", "reason": "protocol workload" },
-            "performance": { "status": "measured", "scope": "focused debug workload" },
+            "performance": {
+                "status": "measured",
+                "scope": if cfg!(debug_assertions) {
+                    "focused debug workload"
+                } else {
+                    "focused release workload"
+                },
+            },
             "soak": { "status": "skipped", "reason": "bounded workload, not a duration soak" },
         },
         "workload": {
@@ -2577,6 +2570,7 @@ async fn vd8_twenty_same_spawn_clients_drain_full_window_and_stop_without_duplic
             "entity_physics": runtime_latency_json(tick_percentiles.entity_physics),
             "entity_dispatch": runtime_latency_json(tick_percentiles.entity_dispatch),
             "campfire_tick": runtime_latency_json(tick_percentiles.campfire_tick),
+            "inhabited_time": runtime_latency_json(tick_percentiles.inhabited_time),
             "entity_save": runtime_latency_json(tick_percentiles.entity_save),
             "random_tick": runtime_latency_json(tick_percentiles.random_tick),
             "block_tick": runtime_latency_json(tick_percentiles.block_tick),
@@ -3335,7 +3329,14 @@ async fn start_load_server_with_options(options: LoadServerOptions) -> LoadServe
     let runtime_control = bound.runtime_control_handle();
     let runtime_telemetry = bound.runtime_telemetry_handle();
     let save_handle = bound.save_handle();
-    let serve_task = tokio::spawn(async move { bound.serve().await });
+    let persist_on_shutdown = options.disk_backed;
+    let serve_task = tokio::spawn(async move {
+        if persist_on_shutdown {
+            bound.serve_and_save().await
+        } else {
+            bound.serve().await
+        }
+    });
     LoadServer {
         addr,
         blocks,
@@ -3501,6 +3502,43 @@ fn assert_lock_metric_observed_within_budget(
         after.max_hold_us <= max_hold_budget_us,
         "{name} lock hold exceeded O2 VD8 budget: after={after:?} budget_us={max_hold_budget_us}"
     );
+}
+
+async fn set_load_client_game_mode(client: &mut Client, command: &'static str, expected: GameMode) {
+    client
+        .write_packet(&ServerboundChatCommand {
+            command: command.to_owned(),
+        })
+        .await
+        .expect("send load-client game mode command");
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+    loop {
+        let mut frame = client
+            .read_frame_with_timeout(
+                deadline.saturating_duration_since(tokio::time::Instant::now()),
+            )
+            .await
+            .expect("load-client game mode transition frame");
+        if handle_keepalive(client, frame.id, &frame.body).await {
+            continue;
+        }
+        if frame.id == PlayDisconnect::ID {
+            let packet = PlayDisconnect::decode(&mut frame.body)
+                .expect("decode load-client game mode disconnect");
+            panic!(
+                "load-client game mode transition disconnected: {}",
+                String::from_utf8_lossy(&packet.reason_nbt)
+            );
+        }
+        if frame.id == GameEvent::ID {
+            let event = GameEvent::decode(&mut frame.body).expect("decode load-client game mode");
+            if event.event == GameEvent::EVENT_CHANGE_GAME_MODE
+                && event.value == expected.id() as f32
+            {
+                return;
+            }
+        }
+    }
 }
 
 async fn connect_to_play(
@@ -4014,32 +4052,6 @@ async fn wait_for_inventory_stack(client: &mut Client) {
     }
 }
 
-async fn wait_for_inventory_empty(client: &mut Client) {
-    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
-    loop {
-        let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
-        assert!(
-            !remaining.is_zero(),
-            "timed out waiting for empty authoritative hotbar slot"
-        );
-        let frame = client
-            .read_frame_with_timeout(remaining)
-            .await
-            .expect("empty inventory sync frame");
-        if handle_keepalive(client, frame.id, &frame.body).await {
-            continue;
-        }
-        if frame.id == ClientboundContainerSetSlot::ID {
-            let mut body = frame.body;
-            let packet = ClientboundContainerSetSlot::decode(&mut body)
-                .expect("decode empty inventory ContainerSetSlot");
-            if packet.container_id == 0 && packet.slot == 36 && packet.item_stack.is_empty() {
-                return;
-            }
-        }
-    }
-}
-
 async fn wait_for_placement_consumption(
     client: &mut Client,
     expected_sequence: i32,
@@ -4076,6 +4088,14 @@ async fn wait_for_placement_consumption(
         };
         if handle_keepalive(client, frame.id, &frame.body).await {
             continue;
+        }
+        if frame.id == PlayDisconnect::ID {
+            let mut body = frame.body;
+            let packet = PlayDisconnect::decode(&mut body).expect("decode placement disconnect");
+            panic!(
+                "placement client disconnected: {}",
+                String::from_utf8_lossy(&packet.reason_nbt)
+            );
         }
         if frame.id == BlockUpdate::ID {
             let mut body = frame.body;

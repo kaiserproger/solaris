@@ -16,6 +16,9 @@ pub(crate) struct RuntimeTickSample {
     pub(crate) entity_physics_us: u64,
     pub(crate) entity_dispatch_us: u64,
     pub(crate) campfire_tick_us: u64,
+    pub(crate) inhabited_time_us: u64,
+    /// Synchronous entity-save work executed on the simulation tick. The current
+    /// architecture reports checkpoint I/O separately through `SaveAllTimings`.
     pub(crate) entity_save_us: u64,
     pub(crate) random_tick_us: u64,
     pub(crate) block_tick_us: u64,
@@ -46,6 +49,7 @@ pub struct RuntimeTickPercentiles {
     pub entity_physics: RuntimeLatencyPercentiles,
     pub entity_dispatch: RuntimeLatencyPercentiles,
     pub campfire_tick: RuntimeLatencyPercentiles,
+    pub inhabited_time: RuntimeLatencyPercentiles,
     pub entity_save: RuntimeLatencyPercentiles,
     pub random_tick: RuntimeLatencyPercentiles,
     pub block_tick: RuntimeLatencyPercentiles,
@@ -229,6 +233,7 @@ impl RuntimeTickMetricsWindow {
             entity_physics: Self::percentiles(samples, |sample| sample.entity_physics_us),
             entity_dispatch: Self::percentiles(samples, |sample| sample.entity_dispatch_us),
             campfire_tick: Self::percentiles(samples, |sample| sample.campfire_tick_us),
+            inhabited_time: Self::percentiles(samples, |sample| sample.inhabited_time_us),
             entity_save: Self::percentiles(samples, |sample| sample.entity_save_us),
             random_tick: Self::percentiles(samples, |sample| sample.random_tick_us),
             block_tick: Self::percentiles(samples, |sample| sample.block_tick_us),
@@ -279,10 +284,11 @@ mod tests {
             entity_physics_us: base_us + 6,
             entity_dispatch_us: base_us + 7,
             campfire_tick_us: base_us + 8,
-            entity_save_us: base_us + 9,
-            random_tick_us: base_us + 10,
-            block_tick_us: base_us + 11,
-            fluid_tick_us: base_us + 12,
+            inhabited_time_us: base_us + 9,
+            entity_save_us: base_us + 10,
+            random_tick_us: base_us + 11,
+            block_tick_us: base_us + 12,
+            fluid_tick_us: base_us + 13,
         }
     }
 
@@ -331,10 +337,11 @@ mod tests {
         assert_eq!(snapshot.entity_physics.p50_us, 106);
         assert_eq!(snapshot.entity_dispatch.p50_us, 107);
         assert_eq!(snapshot.campfire_tick.p50_us, 108);
-        assert_eq!(snapshot.entity_save.p50_us, 109);
-        assert_eq!(snapshot.random_tick.p50_us, 110);
-        assert_eq!(snapshot.block_tick.p50_us, 111);
-        assert_eq!(snapshot.fluid_tick.p50_us, 112);
+        assert_eq!(snapshot.inhabited_time.p50_us, 109);
+        assert_eq!(snapshot.entity_save.p50_us, 110);
+        assert_eq!(snapshot.random_tick.p50_us, 111);
+        assert_eq!(snapshot.block_tick.p50_us, 112);
+        assert_eq!(snapshot.fluid_tick.p50_us, 113);
     }
 
     #[test]

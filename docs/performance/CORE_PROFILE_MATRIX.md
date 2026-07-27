@@ -33,7 +33,7 @@ CPU and memory entries are harness/cgroup requirements, not TOML keys. Client/en
 | Profile | CPU quota | Memory limit | Clients | Initial VD / simulation distance | Active entity ceiling | Duration | Current evidence status |
 |---|---:|---:|---:|---:|---:|---:|---|
 | low | 2 vCPU | 4 GiB | 4 | 8 / 4 | 128 | 10 min | `degraded`: frozen, not run on the declared quota |
-| balanced | 6 physical / 12 logical CPUs | 8 GiB | 20 | 8 / 8 | 256 | 20 min | `degraded`: 4-client calibration passed; 20-client VD8 gate still required |
+| balanced | 6 physical / 12 logical CPUs | 8 GiB | 20 | 8 / 8 | 256 | 20 min | `degraded`: focused 20-client VD8 debug/release gates passed on 2026-07-27, but the exact 20-minute and 8 GiB envelope was not run |
 | high | 12 vCPU | 16 GiB | 20 | **32 / 8** | 512 | 20 min | `degraded`: VD32 runtime contract tested; end-to-end VD32 load not yet run |
 
 The entity ceiling counts non-item server entities at the measurement checkpoint. Item drops, XP orbs, projectiles, and primed TNT are reported separately so a transient burst cannot hide inside the mob count.
