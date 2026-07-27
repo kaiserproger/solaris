@@ -1390,9 +1390,12 @@ impl BoundServer {
                         tick,
                         work_budgets.entity_pathing_candidates,
                         simulation_policy.simulation_distance,
-                        entity_world_read
-                            .as_ref()
-                            .zip(entity_pathing_materials.as_deref()),
+                        simulation_owner.entity_world_context(
+                            entity_world_read.as_ref(),
+                            entity_pathing_materials.as_deref(),
+                            entity_config.blocks.as_ref(),
+                            entity_config.items.as_ref(),
+                        ),
                     )
                 };
                 let entity_goals_us = elapsed_us(started);

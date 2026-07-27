@@ -8,8 +8,7 @@ const MAX_OFFERS: usize = 32;
 const MAX_STACK_COUNT: i32 = 64;
 const MAX_RESTOCKS_PER_DAY: u8 = 2;
 const DAY_LENGTH_TICKS: i64 = 24_000;
-const SECOND_RESTOCK_DELAY_TICKS: i64 = 2_400;
-const RESTOCK_DAY_RESET_TICKS: i64 = 12_000;
+const RESTOCK_COOLDOWN_TICKS: i64 = 1_200;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub struct VillagerTradeCost {

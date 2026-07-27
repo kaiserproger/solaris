@@ -114,6 +114,59 @@ const VILLAGER_BRAIN_TICK_INTERVAL: u64 = 20;
 const VILLAGER_BRAIN_COMMIT_BATCH: usize = 64;
 const VILLAGER_RESTOCK_REACH_SQUARED: f64 = 4.0;
 
+#[derive(Clone, Copy)]
+struct VillagerProfessionContext<'a> {
+    world_read: &'a mc_world::WorldReadView,
+    blocks: &'a mc_world::BlockRegistry,
+    items: &'a mc_data::items::ItemRegistry,
+}
+
+#[derive(Default)]
+struct VillagerBrainTransitionReport {
+    #[cfg(test)]
+    applied: usize,
+    metadata_updates: Vec<EntitySnapshot>,
+}
+
+fn villager_job_site_block_pos(position: Vec3) -> mc_world::BlockPos {
+    mc_world::BlockPos {
+        x: position.x.floor() as i32,
+        y: position.y.floor() as i32,
+        z: position.z.floor() as i32,
+    }
+}
+
+fn supported_profession_assignment(
+    entity: &EntitySnapshot,
+    brain: &mc_entity::villager_26_1_2::VillagerBrainState,
+    context: VillagerProfessionContext<'_>,
+) -> Option<(
+    mc_entity::VillagerData,
+    mc_entity::villager_merchant_26_1_2::VillagerMerchantState,
+)> {
+    let villager = entity.retained.villager?;
+    if villager.profession != mc_entity::VillagerProfession::None
+        || villager.level != 1
+        || entity.retained.villager_merchant.is_some()
+        || brain.schedule != mc_entity::villager_26_1_2::VillagerScheduleKind::Adult
+    {
+        return None;
+    }
+    let job_site = brain.pois.job_site?;
+    let state = context
+        .world_read
+        .get_cached_block(villager_job_site_block_pos(job_site))?;
+    let block = &context.blocks.by_id(state)?.block.id;
+    match mc_data::villager_trades_26_1_2::supported_profession_for_job_site_26_1_2(block)? {
+        "toolsmith" => {
+            let mut assigned = villager;
+            assigned.profession = mc_entity::VillagerProfession::Toolsmith;
+            Some((assigned, toolsmith_merchant_state(context.items)?))
+        }
+        _ => None,
+    }
+}
+
 fn villager_schedule_boundary(
     profile: &mc_entity::villager_26_1_2::VillagerBrainProfile,
     schedule: mc_entity::villager_26_1_2::VillagerScheduleKind,
@@ -202,6 +255,7 @@ fn villager_can_restock_at_job_site(
     dx * dx + dy * dy + dz * dz <= VILLAGER_RESTOCK_REACH_SQUARED
 }
 
+#[cfg(test)]
 pub(super) fn apply_villager_brain_transitions(
     entities: &mut EntityStoreGuard<'_>,
     ids: &HashSet<EntityId>,
@@ -209,15 +263,35 @@ pub(super) fn apply_villager_brain_transitions(
     day_time: i64,
     profile: &mc_entity::villager_26_1_2::VillagerBrainProfile,
 ) -> usize {
+    apply_villager_brain_transitions_with_professions(
+        entities,
+        ids,
+        lifecycle_tick,
+        day_time,
+        profile,
+        None,
+    )
+    .applied
+}
+
+fn apply_villager_brain_transitions_with_professions(
+    entities: &mut EntityStoreGuard<'_>,
+    ids: &HashSet<EntityId>,
+    lifecycle_tick: u64,
+    day_time: i64,
+    profile: &mc_entity::villager_26_1_2::VillagerBrainProfile,
+    profession_context: Option<VillagerProfessionContext<'_>>,
+) -> VillagerBrainTransitionReport {
     if ids.is_empty() {
-        return 0;
+        return VillagerBrainTransitionReport::default();
     }
     let Ok(validated_profile) = profile.validated() else {
-        return 0;
+        return VillagerBrainTransitionReport::default();
     };
     let mut ordered = ids.iter().copied().collect::<Vec<_>>();
     ordered.sort_unstable();
     let mut transitions = Vec::new();
+    let mut expected_metadata = Vec::new();
     for id in ordered {
         let Some(expected) = entities.snapshot(id) else {
             continue;
@@ -244,6 +318,8 @@ pub(super) fn apply_villager_brain_transitions(
         let Ok(plan) = validated_profile.plan(&current, lifecycle_tick, day_time) else {
             continue;
         };
+        let profession_assignment = profession_context
+            .and_then(|context| supported_profession_assignment(&expected, &plan.state, context));
         let restocked_merchant =
             expected
                 .retained
@@ -257,6 +333,7 @@ pub(super) fn apply_villager_brain_transitions(
         if expected.goal == plan.goal
             && expected.retained.villager_brain.as_ref() == Some(&plan.state)
             && restocked_merchant.is_none()
+            && profession_assignment.is_none()
         {
             continue;
         }
@@ -266,9 +343,28 @@ pub(super) fn apply_villager_brain_transitions(
         if let Some(merchant) = restocked_merchant {
             next.retained.villager_merchant = Some(merchant);
         }
+        if let Some((assigned, merchant)) = profession_assignment {
+            next.retained.villager = Some(assigned);
+            next.retained.villager_merchant = Some(merchant.clone());
+            expected_metadata.push((next.id, assigned, merchant));
+        }
         transitions.push((expected, next));
     }
-    commit_villager_brain_transitions(entities, transitions)
+    let _applied = commit_villager_brain_transitions(entities, transitions);
+    let metadata_updates = expected_metadata
+        .into_iter()
+        .filter_map(|(id, expected_villager, expected_merchant)| {
+            let current = entities.snapshot(id)?;
+            (current.retained.villager == Some(expected_villager)
+                && current.retained.villager_merchant.as_ref() == Some(&expected_merchant))
+            .then_some(current)
+        })
+        .collect();
+    VillagerBrainTransitionReport {
+        #[cfg(test)]
+        applied: _applied,
+        metadata_updates,
+    }
 }
 
 pub(super) fn commit_villager_brain_transitions(
@@ -306,6 +402,41 @@ fn commit_villager_brain_transition_batch(
 }
 
 impl SessionRegistry {
+    fn publish_villager_metadata_updates(&self, expected: Vec<EntitySnapshot>) {
+        if expected.is_empty() {
+            return;
+        }
+        let current = self.current_expected_entity_snapshots(expected);
+        if current.is_empty() {
+            return;
+        }
+        let mut inner = self.lock_inner("publish villager profession metadata");
+        let mut dispatches = Vec::new();
+        for entity in current {
+            let projected = server_entity_snapshot_from(entity);
+            let entity_id = projected.id;
+            let changed = inner
+                .published_entity_snapshots
+                .get(&entity_id)
+                .is_none_or(|published| published.villager != projected.villager);
+            let Some(published) = inner.published_entity_snapshots.get_mut(&entity_id) else {
+                continue;
+            };
+            published.villager = projected.villager;
+            if !changed {
+                continue;
+            }
+            let recipients =
+                session_recipients(&inner, visible_entity_observers_locked(&inner, entity_id));
+            dispatches.extend(visibility_dispatches(recipients, || {
+                OutboundCommand::UpdateEntityData(projected.clone())
+            }));
+        }
+        record_entity_dispatches_locked(&mut inner, &dispatches);
+        drop(inner);
+        dispatch_visibility_commands(dispatches);
+    }
+
     pub(in crate::play) fn tick_entities_and_collect_physics_queries_owned(
         &self,
         _authority: &SimulationAuthority,
@@ -313,14 +444,15 @@ impl SessionRegistry {
         tick: u64,
         pathing_candidates_per_entity: usize,
         simulation_distance: i32,
-        pathing: Option<(&mc_world::WorldReadView, &mc_physics::BlockMaterialIds)>,
+        world: EntitySimulationWorldContext<'_>,
     ) -> Vec<EntityPhysicsQuery> {
         self.tick_entities_and_collect_physics_queries_core(
             Some(cpu_resources),
             tick,
             pathing_candidates_per_entity,
             simulation_distance,
-            pathing,
+            world.pathing(),
+            world.profession_context(),
         )
     }
 
@@ -334,6 +466,7 @@ impl SessionRegistry {
             tick,
             PathingBudget::DEFAULT.max_candidates_per_entity,
             DEFAULT_VIEW_DISTANCE,
+            None,
             None,
         )
     }
@@ -350,6 +483,7 @@ impl SessionRegistry {
             PathingBudget::DEFAULT.max_candidates_per_entity,
             simulation_distance,
             None,
+            None,
         )
     }
 
@@ -364,6 +498,7 @@ impl SessionRegistry {
             tick,
             pathing_candidates_per_entity,
             DEFAULT_VIEW_DISTANCE,
+            None,
             None,
         )
     }
@@ -381,6 +516,25 @@ impl SessionRegistry {
             PathingBudget::DEFAULT.max_candidates_per_entity,
             DEFAULT_VIEW_DISTANCE,
             Some((world_read, pathing_materials)),
+            None,
+        )
+    }
+
+    #[cfg(test)]
+    pub(crate) fn tick_entities_and_collect_physics_queries_with_profession_context(
+        &self,
+        tick: u64,
+        world_read: &mc_world::WorldReadView,
+        blocks: &mc_world::BlockRegistry,
+        items: &mc_data::items::ItemRegistry,
+    ) -> Vec<EntityPhysicsQuery> {
+        self.tick_entities_and_collect_physics_queries_core(
+            None,
+            tick,
+            PathingBudget::DEFAULT.max_candidates_per_entity,
+            DEFAULT_VIEW_DISTANCE,
+            None,
+            Some((world_read, blocks, items)),
         )
     }
 
@@ -391,6 +545,11 @@ impl SessionRegistry {
         pathing_candidates_per_entity: usize,
         simulation_distance: i32,
         pathing: Option<(&mc_world::WorldReadView, &mc_physics::BlockMaterialIds)>,
+        profession_context: Option<(
+            &mc_world::WorldReadView,
+            &mc_world::BlockRegistry,
+            &mc_data::items::ItemRegistry,
+        )>,
     ) -> Vec<EntityPhysicsQuery> {
         if !self.has_live_sessions() {
             self.clear_active_simulation_entities();
@@ -398,6 +557,12 @@ impl SessionRegistry {
         }
         let live_session_generation = self.live_session_generation.load(Ordering::Acquire);
         let (world_read, pathing_materials) = pathing.unzip();
+        let profession_context =
+            profession_context.map(|(world_read, blocks, items)| VillagerProfessionContext {
+                world_read,
+                blocks,
+                items,
+            });
         let (active_chunks, active_entity_candidates) =
             self.simulation_inputs.active_entity_candidates();
         let recipients = self.movement_recipients.load_full();
@@ -540,12 +705,16 @@ impl SessionRegistry {
                 active_villager_ids.insert(entity.id);
             }
         });
-        apply_villager_brain_transitions(
+        let VillagerBrainTransitionReport {
+            metadata_updates: villager_metadata_updates,
+            ..
+        } = apply_villager_brain_transitions_with_professions(
             &mut entities,
             &active_villager_ids,
             tick,
             villager_day_time,
             &villager_profile,
+            profession_context,
         );
         let cleared_overrides = overridden_villagers
             .iter()
@@ -568,6 +737,8 @@ impl SessionRegistry {
                 active_population_ids,
                 active_hostile_ids,
             );
+            drop(entities);
+            self.publish_villager_metadata_updates(villager_metadata_updates);
             return Vec::new();
         }
         let mob_behaviors = self.mob_behavior_table();
@@ -595,6 +766,7 @@ impl SessionRegistry {
         let prepared_goal_tick =
             entities.prepare_goal_tick_with_pathing_for_ids(tick, &goal_entity_ids);
         drop(entities);
+        self.publish_villager_metadata_updates(villager_metadata_updates);
         #[cfg(test)]
         self.pause_before_entity_goal_compute_for_test();
         let goal_budget = PathingBudget {

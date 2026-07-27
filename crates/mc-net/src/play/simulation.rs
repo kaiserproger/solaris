@@ -188,6 +188,45 @@ pub(crate) enum SimulationRequestError {
 #[derive(Debug)]
 pub(super) struct SimulationAuthority(());
 
+#[derive(Clone, Copy)]
+pub(crate) struct EntitySimulationWorldContext<'a> {
+    world_read: Option<&'a mc_world::WorldReadView>,
+    pathing_materials: Option<&'a mc_physics::BlockMaterialIds>,
+    blocks: Option<&'a mc_world::BlockRegistry>,
+    items: Option<&'a mc_data::items::ItemRegistry>,
+}
+
+impl<'a> EntitySimulationWorldContext<'a> {
+    #[cfg(test)]
+    pub(in crate::play) const fn empty() -> Self {
+        Self {
+            world_read: None,
+            pathing_materials: None,
+            blocks: None,
+            items: None,
+        }
+    }
+
+    pub(in crate::play) fn pathing(
+        self,
+    ) -> Option<(
+        &'a mc_world::WorldReadView,
+        &'a mc_physics::BlockMaterialIds,
+    )> {
+        self.world_read.zip(self.pathing_materials)
+    }
+
+    pub(in crate::play) fn profession_context(
+        self,
+    ) -> Option<(
+        &'a mc_world::WorldReadView,
+        &'a mc_world::BlockRegistry,
+        &'a mc_data::items::ItemRegistry,
+    )> {
+        Some((self.world_read?, self.blocks?, self.items?))
+    }
+}
+
 #[cfg(test)]
 impl SimulationAuthority {
     pub(super) fn for_test() -> Self {
@@ -3253,6 +3292,21 @@ impl SimulationOwner {
             .await
     }
 
+    pub(crate) fn entity_world_context<'a>(
+        &self,
+        world_read: Option<&'a mc_world::WorldReadView>,
+        pathing_materials: Option<&'a mc_physics::BlockMaterialIds>,
+        blocks: &'a mc_world::BlockRegistry,
+        items: &'a mc_data::items::ItemRegistry,
+    ) -> EntitySimulationWorldContext<'a> {
+        EntitySimulationWorldContext {
+            world_read,
+            pathing_materials,
+            blocks: Some(blocks),
+            items: Some(items),
+        }
+    }
+
     pub(crate) fn collect_entity_physics_queries(
         &self,
         sessions: &SessionRegistry,
@@ -3260,7 +3314,7 @@ impl SimulationOwner {
         tick: u64,
         pathing_candidates_per_entity: usize,
         simulation_distance: i32,
-        pathing: Option<(&mc_world::WorldReadView, &mc_physics::BlockMaterialIds)>,
+        world: EntitySimulationWorldContext<'_>,
     ) -> Vec<EntityPhysicsQuery> {
         sessions.tick_entities_and_collect_physics_queries_owned(
             &self.authority,
@@ -3268,7 +3322,7 @@ impl SimulationOwner {
             tick,
             pathing_candidates_per_entity,
             simulation_distance,
-            pathing,
+            world,
         )
     }
 

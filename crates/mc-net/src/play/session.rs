@@ -2,7 +2,7 @@ use super::combat::{ActiveShield, PlayerHurtResistance};
 use super::persistence::PlayerPersistedState;
 #[cfg(test)]
 use super::simulation::PlayerStateEvent;
-use super::simulation::SimulationAuthority;
+use super::simulation::{EntitySimulationWorldContext, SimulationAuthority};
 use super::*;
 #[cfg(test)]
 use mc_entity::RegionKey;

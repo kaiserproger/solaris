@@ -3813,7 +3813,7 @@ fn dense_simulation_cohort_keeps_the_full_active_breeding_population() {
         20,
         8,
         DEFAULT_VIEW_DISTANCE,
-        None,
+        EntitySimulationWorldContext::empty(),
     );
 
     assert_eq!(queries.len(), ENTITY_SIMULATION_UPDATES_PER_LANE_PER_TICK);

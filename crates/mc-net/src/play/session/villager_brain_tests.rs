@@ -1,5 +1,7 @@
-use std::collections::HashSet;
+use std::collections::{BTreeMap, HashSet};
+use std::sync::Arc;
 
+use mc_data::Identifier;
 use mc_entity::villager_26_1_2::{
     VillagerActivity, VillagerBrainProfile, VillagerBrainState, VillagerPoiSet,
     VillagerScheduleEntry, VillagerScheduleKind,
@@ -10,12 +12,17 @@ use mc_entity::villager_merchant_26_1_2::{
 use mc_entity::{
     EntityId, EntityItemStack, GoalState, Vec3, VillagerData, VillagerKind, VillagerProfession,
 };
+use mc_world::{BlockRegistry, BlockStateId, Chunk, ChunkPos};
+use tokio::sync::mpsc;
 
-use super::SessionRegistry;
+use crate::login::LoggedInProfile;
+use crate::play::{HerdSpawn, PlayerPose};
+
 use super::entity_simulation::{
     apply_villager_brain_transitions, commit_villager_brain_transitions,
     villager_brain_due_for_tick, villager_brain_probe_ids,
 };
+use super::{OutboundCommand, SessionRegistry, dispatch_visibility_commands};
 
 fn install_brain(registry: &SessionRegistry) -> mc_entity::EntityId {
     let position = Vec3::new(0.5, 64.0, 0.5);
@@ -34,6 +41,103 @@ fn install_brain(registry: &SessionRegistry) -> mc_entity::EntityId {
         meeting_point: Some(Vec3::new(4.5, 64.0, 4.5)),
     }));
     next.goal = GoalState::Idle;
+    assert!(entities.replace_snapshot_if_current(expected, next));
+    id
+}
+
+fn register_profession_observer(
+    registry: &SessionRegistry,
+) -> (u64, mpsc::Receiver<OutboundCommand>) {
+    let profile = LoggedInProfile {
+        uuid: crate::login::offline_uuid("ProfessionObserver"),
+        name: "ProfessionObserver".to_owned(),
+    };
+    let (tx, rx) = mpsc::channel(16);
+    let session = registry
+        .register(
+            &profile,
+            (0, 0),
+            2,
+            HashSet::new(),
+            tx,
+            PlayerPose::new(0.5, 64.0, 0.5),
+        )
+        .0;
+    assert!(registry.mark_loaded(session, (0, 0)).is_empty());
+    (session, rx)
+}
+
+fn profession_world(job_site_block: &str) -> (Arc<BlockRegistry>, mc_world::WorldReadView) {
+    let block = |name: &str, id: u32| mc_data::blocks::BlockReport {
+        id: Identifier::parse(name).unwrap(),
+        properties: BTreeMap::new(),
+        states: vec![mc_data::blocks::BlockStateReport {
+            id,
+            default: true,
+            properties: BTreeMap::new(),
+        }],
+    };
+    let blocks = Arc::new(
+        BlockRegistry::from_report(&[
+            block("minecraft:air", 0),
+            block("minecraft:smithing_table", 1),
+            block("minecraft:blast_furnace", 2),
+        ])
+        .unwrap(),
+    );
+    let mut world = mc_world::WorldStorage::in_memory(Arc::clone(&blocks));
+    let chunk_pos = ChunkPos { x: 0, z: 0 };
+    let mut chunk = Chunk::empty(
+        chunk_pos,
+        BlockStateId(0),
+        Identifier::parse("minecraft:plains").unwrap(),
+    );
+    let state = match job_site_block {
+        "minecraft:smithing_table" => 1,
+        "minecraft:blast_furnace" => 2,
+        _ => 0,
+    };
+    let _ = chunk.set_block(8, 64, 0, BlockStateId(state));
+    world.insert_generated_chunk(chunk_pos, chunk).unwrap();
+    (blocks, world.read_view())
+}
+
+fn install_unemployed_villager(registry: &SessionRegistry) -> mc_entity::EntityId {
+    let position = Vec3::new(8.5, 64.0, 0.5);
+    let dispatches = registry.ensure_chunk_herd_legacy_for_test(
+        (0, 0),
+        &[HerdSpawn {
+            chunk: (0, 0),
+            slot: 0,
+            entity_type_id: 119,
+            entity_type_name: "minecraft:villager".to_owned(),
+            position,
+            hostile: false,
+            sheep_color: None,
+        }],
+    );
+    let id = dispatches
+        .iter()
+        .find_map(|dispatch| match &dispatch.command {
+            OutboundCommand::SpawnEntity(snapshot) => Some(snapshot.id),
+            _ => None,
+        })
+        .expect("villager spawn dispatch");
+    dispatch_visibility_commands(dispatches);
+    let mut entities = registry.lock_entities("install unemployed villager fixture");
+    let expected = entities.snapshot(id).unwrap();
+    let mut next = expected.clone();
+    next.retained.villager = Some(VillagerData::new(
+        VillagerKind::Plains,
+        VillagerProfession::None,
+        1,
+    ));
+    next.retained.villager_brain = Some(VillagerBrainState::adult(VillagerPoiSet {
+        home: Some(position),
+        job_site: Some(position),
+        meeting_point: Some(position),
+    }));
+    next.retained.villager_merchant = None;
     assert!(entities.replace_snapshot_if_current(expected, next));
     id
 }
@@ -210,6 +314,105 @@ fn schedule_transitions_are_data_driven_and_do_not_write_unchanged_ticks() {
         meeting.retained.villager_brain.as_ref().unwrap().activity,
         VillagerActivity::Meet
     );
+}
+
+#[test]
+fn unemployed_adult_claims_smithing_table_and_publishes_toolsmith_metadata_once() {
+    let registry = SessionRegistry::new();
+    let (_session, mut outbound) = register_profession_observer(&registry);
+    let id = install_unemployed_villager(&registry);
+    let (blocks, world_read) = profession_world("minecraft:smithing_table");
+    let items = mc_data::items::solaris_required_items();
+    let due_tick = (20 - u64::from(id.0.unsigned_abs()) % 20) % 20;
+
+    let _ = registry.tick_entities_and_collect_physics_queries_with_profession_context(
+        due_tick,
+        &world_read,
+        &blocks,
+        &items,
+    );
+    let assigned = registry
+        .lock_entities("read assigned villager profession")
+        .snapshot(id)
+        .unwrap();
+    assert_eq!(
+        assigned.retained.villager.unwrap().profession,
+        VillagerProfession::Toolsmith
+    );
+    let merchant = assigned
+        .retained
+        .villager_merchant
+        .as_ref()
+        .expect("toolsmith merchant catalog");
+    assert_eq!(merchant.offers.len(), 5);
+    assert_eq!(merchant.xp, 0);
+
+    let mut metadata_updates = 0;
+    while let Ok(command) = outbound.try_recv() {
+        if matches!(
+            command,
+            OutboundCommand::UpdateEntityData(ref snapshot)
+                if snapshot.id == id
+                    && snapshot
+                        .villager
+                        .is_some_and(|villager| villager.profession == VillagerProfession::Toolsmith)
+        ) {
+            metadata_updates += 1;
+        }
+    }
+    assert_eq!(metadata_updates, 1);
+
+    let _ = registry.tick_entities_and_collect_physics_queries_with_profession_context(
+        due_tick + 20,
+        &world_read,
+        &blocks,
+        &items,
+    );
+    let mut repeated_update = false;
+    while let Ok(command) = outbound.try_recv() {
+        repeated_update |= matches!(
+            command,
+            OutboundCommand::UpdateEntityData(snapshot) if snapshot.id == id
+        );
+    }
+    assert!(
+        !repeated_update,
+        "stable profession must not republish unchanged metadata"
+    );
+}
+
+#[test]
+fn unsupported_job_site_keeps_villager_unemployed_without_merchant_state() {
+    let registry = SessionRegistry::new();
+    let (_session, mut outbound) = register_profession_observer(&registry);
+    let id = install_unemployed_villager(&registry);
+    let (blocks, world_read) = profession_world("minecraft:blast_furnace");
+    let items = mc_data::items::solaris_required_items();
+    let due_tick = (20 - u64::from(id.0.unsigned_abs()) % 20) % 20;
+
+    let _ = registry.tick_entities_and_collect_physics_queries_with_profession_context(
+        due_tick,
+        &world_read,
+        &blocks,
+        &items,
+    );
+    let unchanged = registry
+        .lock_entities("read unsupported job-site villager")
+        .snapshot(id)
+        .unwrap();
+    assert_eq!(
+        unchanged.retained.villager.unwrap().profession,
+        VillagerProfession::None
+    );
+    assert!(unchanged.retained.villager_merchant.is_none());
+    let mut metadata_update = false;
+    while let Ok(command) = outbound.try_recv() {
+        metadata_update |= matches!(
+            command,
+            OutboundCommand::UpdateEntityData(snapshot) if snapshot.id == id
+        );
+    }
+    assert!(!metadata_update);
 }
 
 #[test]

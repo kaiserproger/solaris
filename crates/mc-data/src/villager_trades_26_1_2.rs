@@ -6,6 +6,13 @@
 
 use crate::Identifier;
 
+pub const TOOLSMITH_JOB_SITE_26_1_2: &str = "minecraft:smithing_table";
+
+#[must_use]
+pub fn supported_profession_for_job_site_26_1_2(block: &Identifier) -> Option<&'static str> {
+    (block.as_str() == TOOLSMITH_JOB_SITE_26_1_2).then_some("toolsmith")
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct VillagerTradeCostSpec {
     pub item: Identifier,
@@ -110,5 +117,21 @@ mod tests {
                 && offer.xp == 1
                 && offer.price_multiplier == 0.2
         }));
+    }
+
+    #[test]
+    fn supported_job_site_mapping_is_exact_and_fail_closed() {
+        assert_eq!(
+            supported_profession_for_job_site_26_1_2(
+                &Identifier::parse("minecraft:smithing_table").unwrap()
+            ),
+            Some("toolsmith")
+        );
+        assert_eq!(
+            supported_profession_for_job_site_26_1_2(
+                &Identifier::parse("minecraft:blast_furnace").unwrap()
+            ),
+            None
+        );
     }
 }

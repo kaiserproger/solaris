@@ -442,6 +442,57 @@ fn checkpoint_round_trip_preserves_head_yaw_goal_and_vehicle_graph() {
 }
 
 #[test]
+fn assigned_toolsmith_profession_and_merchant_catalog_survive_checkpoint_restart() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut record = PersistedEntityRecord::from(snapshot(47, EntityLifecycle::Alive));
+    record.snapshot.type_id = 139;
+    record.snapshot.type_name = "minecraft:villager".into();
+    record.snapshot.item_stack = None;
+    record.snapshot.retained.villager = Some(mc_entity::VillagerData::new(
+        mc_entity::VillagerKind::Plains,
+        mc_entity::VillagerProfession::Toolsmith,
+        1,
+    ));
+    record.snapshot.retained.villager_brain =
+        Some(mc_entity::villager_26_1_2::VillagerBrainState::adult(
+            mc_entity::villager_26_1_2::VillagerPoiSet {
+                home: Some(Vec3::new(1.5, 64.0, 1.5)),
+                job_site: Some(Vec3::new(2.5, 64.0, 1.5)),
+                meeting_point: Some(Vec3::new(3.5, 64.0, 1.5)),
+            },
+        ));
+    record.snapshot.retained.villager_merchant = Some(
+        mc_entity::villager_merchant_26_1_2::VillagerMerchantState::new(vec![
+            mc_entity::villager_merchant_26_1_2::VillagerTradeOffer::new(
+                mc_entity::villager_merchant_26_1_2::VillagerTradeCost::new(1, 15),
+                EntityItemStack::new(1, 1),
+                16,
+                2,
+                0.05,
+            ),
+        ])
+        .unwrap(),
+    );
+
+    save_persisted_entity_records(
+        tmp.path(),
+        &items(),
+        &PersistedEntityCheckpoint::new(0, [record.clone()]),
+    )
+    .unwrap();
+    let loaded = load_persisted_entities(tmp.path(), &items(), &entity_types()).unwrap();
+
+    assert_eq!(loaded.records.len(), 1);
+    assert_eq!(loaded.records[0].snapshot, record.snapshot);
+    let retained = &loaded.records[0].snapshot.retained;
+    assert_eq!(
+        retained.villager.unwrap().profession,
+        mc_entity::VillagerProfession::Toolsmith
+    );
+    assert_eq!(retained.villager_merchant.as_ref().unwrap().offers.len(), 1);
+}
+
+#[test]
 fn checkpoint_load_requires_each_authoritative_projection_field() {
     for field in [
         ENTITY_HEAD_YAW_FIELD,
