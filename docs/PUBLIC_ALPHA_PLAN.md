@@ -58,8 +58,14 @@ streaming and memory baseline.
   diff but exhausted the 180-second limit without a verdict or actionable finding;
   no second reviewer was run. Final self-review then removed the imported-world
   dependency on the Solaris locator and added focused regressions.
-- [ ] Complete revision-10 drainage, vegetation, biome-distribution, rendered mosaic,
-  clean seed-`712816` owner playtest, and throughput gates.
+- [x] Replace uniform per-column vegetation with a seed/moisture density field,
+  sparse savanna acacia, treeless desert/snowy plains/ice spikes, and taiga/grove
+  spruce; enforce 32-seed biome/feature diversity metrics.
+- [x] Run one independent read-only vegetation-diff review session. It inspected the
+  production and external-test diff, then exhausted the 180-second limit without a
+  verdict or actionable finding; no second reviewer was run.
+- [ ] Complete revision-10 drainage, rendered height/biome/vegetation mosaics,
+  clean seed-`712816` owner playtest, restart, and release-host throughput gates.
 
 ## Observed baseline
 
@@ -133,13 +139,13 @@ Required change — worldgen revision 10:
    search on that position.
 4. [x] Make `tellus_like` explicit in the public starter config and make the public
    default match the advertised Earth-like Solaris world.
-5. Ensure seed participates in every macro field: continents, plate/ridge domains,
+5. [x] Ensure seed participates in every macro field: continents, plate/ridge domains,
    erosion, drainage, climate, biome selection, vegetation, ores and structures.
 6. Replace isolated noise peaks with coherent tectonic domains and long branching
    ranges. Keep smooth local slopes and bounded chunk-border steps.
 7. Replace zero-contour-only rivers with a coarse drainage field: downhill flow,
    accumulation, valley carving and coast connection.
-8. Replace per-column modulo decoration with coherent vegetation-density fields.
+8. [x] Replace per-column modulo decoration with coherent vegetation-density fields.
    Add biome-correct clusters, including sparse acacia in savanna, forest edges and
    treeless dry/cold regions where appropriate.
 9. Keep ordinary ores underground or exposed only through natural terrain/cave

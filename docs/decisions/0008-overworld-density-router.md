@@ -23,6 +23,16 @@ the network's final support/body-space scan is centered on the same published
 `WorldSpawn`. The public config default and `example.toml` now select
 `tellus_like`; `vanilla_like` remains an explicit compatibility profile.
 
+Surface vegetation consumes one deterministic 192-block regional field blended
+with the routed moisture value. Per-biome thresholds turn the existing exact
+column hash into sparse candidates inside coherent patches rather than uniform
+salt-and-pepper placement. Jungle, forest, taiga/grove, grassland, and savanna
+use different admission thresholds and spacing. Savannas resolve acacia blocks;
+desert, snowy plains, and ice spikes admit no trees. The field is skipped for
+non-vegetated columns so ocean and exposed-rock generation pay no extra noise
+cost. Multi-seed tests cover spatial coherence, biome dominance, feature
+fingerprints, acacia material/canopy, open-cold gaps, and existing tree support.
+
 Worldgen revision 9 removes the filled 3x3 upper leaf boxes left by revision 8.
 Oak and jungle trees retain a broad main canopy but use a connected,
 deterministically rotated irregular crown above it. This changes generated

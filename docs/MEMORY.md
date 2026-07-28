@@ -9,7 +9,7 @@ and is not startup context.
 
 - Date: 2026-07-28.
 - Branch: `main`.
-- Checkpoint base: `b5f3f25` (`fix(play): stage item pickup ownership`).
+- Checkpoint base: `b8fec9d` (`fix(worldgen): route spawn from seeded terrain`).
   The first owner-run public-alpha session remains the routing authority for the
   next stabilization release; its exact plan is `docs/PUBLIC_ALPHA_PLAN.md`.
 - The strong baseline must be preserved: seed `712816`, VD16 and one local player
@@ -35,9 +35,22 @@ and is not startup context.
   the complete `mc-server` package, and the five-seed real server/client spawn
   harness. `cargo test --workspace --quiet` printed every executable group green
   through the final worldgen group, then exceeded the 180-second wrapper limit;
-  workspace doc-tests pass separately (3/3). Drainage, vegetation,
-  biome-distribution, rendered 2048x2048 mosaics, clean owner playtest, and
-  throughput gates remain active work.
+  workspace doc-tests pass separately (3/3).
+- Revision-10 vegetation is now seed-driven and regionally coherent instead of
+  uniform per-column modulo noise. One 192-block density field combines regional
+  noise with routed moisture, then biome thresholds create forest edges, grassland
+  copses and sparse savanna cover. Savannas use acacia logs/leaves; deserts,
+  snowy plains and ice spikes are treeless, while taiga and grove retain spruce.
+  A 32-seed 8192x8192 metric requires distinct biome/feature fingerprints, at
+  least 12 land biomes in aggregate and no more than eight sufficiently-landed
+  seeds above 90% one land biome. `mc-worldgen` passes 110/110 and the external
+  worldgen harness passes 5/5. The narrow single-thread debug probe measured
+  23.2 chunks/s versus 23.0 before the non-vegetated-column optimization; it is
+  not the owner i5-12600 release throughput gate. The single read-only vegetation
+  reviewer inspected the production and external-test diff, then timed out at
+  180 seconds without a verdict or actionable finding; no second reviewer was run.
+  Drainage, rendered 2048x2048 mosaics, clean seed-`712816` owner playtest and
+  release throughput remain active.
 - The current P0 lock checkpoint removes the confirmed public-alpha defect.
   Production item-drop owner commits finish before short session publication.
   Item pickup plans from immutable snapshots, installs one runtime-only regional
@@ -566,9 +579,9 @@ two priorities unless it becomes a common-play blocker or corruption risk.
 2. Run the 200-action break/drop/pickup gate on the release candidate and require
    zero relevant M39 warnings, lock-hold p99 below 5 ms, and no item-path tick
    above 50 ms. The implementation and deterministic lock/race gates are green.
-3. Complete worldgen revision 10 beyond the now-landed fixture removal and natural
-   spawn routing: drainage, vegetation coherence, biome distribution, rendered
-   mosaics, seed-`712816` owner playtest, restart, and throughput evidence remain.
+3. Complete worldgen revision 10 beyond the now-landed spawn and vegetation work:
+   coarse drainage, rendered height/biome/vegetation mosaics, seed-`712816` owner
+   playtest, restart, and release-host throughput evidence remain.
 4. Replace one-shot chunk-herd materialization with bounded periodic friendly and
    hostile spawn attempts, independently configurable in ticks and observable in
    a no-operator survival session.

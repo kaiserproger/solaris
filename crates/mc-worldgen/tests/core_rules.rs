@@ -144,60 +144,71 @@ fn ocean_water_columns_contain_aquatic_vegetation_without_land_debris() {
 
 #[test]
 fn sampled_land_contains_tree_shapes() {
-    let (generator, registry, _) = generator();
+    let (_, registry, _) = generator();
     let air = default_state(&registry, "minecraft:air");
     let mut found_tree = false;
 
-    'chunks: for cx in -4..=4 {
-        for cz in -4..=4 {
-            let chunk = generator.generate(ChunkPos { x: cx, z: cz });
-            for lx in 2..=13u8 {
-                for lz in 2..=13u8 {
-                    let wx = cx * 16 + i32::from(lx);
-                    let wz = cz * 16 + i32::from(lz);
-                    let surface_y = generator.surface_height(wx, wz);
-                    for base_y in (surface_y + 1)..=(surface_y + 8).min(MAX_Y - 1) {
-                        let Some(base) = chunk.get_block(lx, base_y, lz) else {
-                            continue;
-                        };
-                        if !is_log(&registry, base) {
-                            continue;
-                        }
+    'chunks: for seed in [42, 0, 712_816, -11] {
+        let generator = TerrainGenerator::with_worldgen_mode(
+            seed,
+            Arc::clone(&registry),
+            WorldgenMode::TellusLike(TellusWorldgenSettings::default()),
+        );
+        let spawn = generator
+            .locate_safe_spawn()
+            .unwrap_or_else(|| panic!("seed {seed} has no natural spawn"));
+        let center = spawn.chunk();
+        for cx in (center.x - 8)..=(center.x + 8) {
+            for cz in (center.z - 8)..=(center.z + 8) {
+                let chunk = generator.generate(ChunkPos { x: cx, z: cz });
+                for lx in 2..=13u8 {
+                    for lz in 2..=13u8 {
+                        let wx = cx * 16 + i32::from(lx);
+                        let wz = cz * 16 + i32::from(lz);
+                        let surface_y = generator.surface_height(wx, wz);
+                        for base_y in (surface_y + 1)..=(surface_y + 8).min(MAX_Y - 1) {
+                            let Some(base) = chunk.get_block(lx, base_y, lz) else {
+                                continue;
+                            };
+                            if !is_log(&registry, base) {
+                                continue;
+                            }
 
-                        let trunk_height = (0..8)
-                            .take_while(|dy| {
-                                chunk
-                                    .get_block(lx, base_y + dy, lz)
-                                    .is_some_and(|state| is_log(&registry, state))
-                            })
-                            .count();
-                        if trunk_height < 3 {
-                            continue;
-                        }
-
-                        let canopy_y = base_y + trunk_height as i32;
-                        let has_canopy = (-2..=2).any(|dx| {
-                            (-2..=2).any(|dz| {
-                                (0..=2).any(|dy| {
-                                    let x = i32::from(lx) + dx;
-                                    let z = i32::from(lz) + dz;
-                                    if !(0..16).contains(&x) || !(0..16).contains(&z) {
-                                        return false;
-                                    }
+                            let trunk_height = (0..8)
+                                .take_while(|dy| {
                                     chunk
-                                        .get_block(x as u8, canopy_y + dy, z as u8)
-                                        .is_some_and(|state| is_leaves(&registry, state))
+                                        .get_block(lx, base_y + dy, lz)
+                                        .is_some_and(|state| is_log(&registry, state))
                                 })
-                            })
-                        });
-                        if has_canopy {
-                            assert_ne!(
-                                chunk.get_block(lx, base_y - 1, lz),
-                                Some(air),
-                                "tree trunk is unsupported at {wx},{base_y},{wz}"
-                            );
-                            found_tree = true;
-                            break 'chunks;
+                                .count();
+                            if trunk_height < 3 {
+                                continue;
+                            }
+
+                            let canopy_y = base_y + trunk_height as i32;
+                            let has_canopy = (-2..=2).any(|dx| {
+                                (-2..=2).any(|dz| {
+                                    (0..=2).any(|dy| {
+                                        let x = i32::from(lx) + dx;
+                                        let z = i32::from(lz) + dz;
+                                        if !(0..16).contains(&x) || !(0..16).contains(&z) {
+                                            return false;
+                                        }
+                                        chunk
+                                            .get_block(x as u8, canopy_y + dy, z as u8)
+                                            .is_some_and(|state| is_leaves(&registry, state))
+                                    })
+                                })
+                            });
+                            if has_canopy {
+                                assert_ne!(
+                                    chunk.get_block(lx, base_y - 1, lz),
+                                    Some(air),
+                                    "tree trunk is unsupported at {wx},{base_y},{wz}"
+                                );
+                                found_tree = true;
+                                break 'chunks;
+                            }
                         }
                     }
                 }

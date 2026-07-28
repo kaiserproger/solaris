@@ -2,7 +2,7 @@ use super::*;
 use mc_data::worldgen_ores::{HeightAnchor, OreFeature, OrePlacementCount, OreTarget};
 use mc_data::worldgen_structures::StructureSetFacts;
 use mc_world::chunk::{MAX_Y, MIN_Y, OVERWORLD_GEOMETRY};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashSet};
 
 pub(in crate::terrain) fn tiny_registry() -> Arc<BlockRegistry> {
     use mc_data::blocks::{BlockReport, BlockStateReport};
@@ -390,6 +390,24 @@ pub(in crate::terrain) fn tiny_registry() -> Arc<BlockRegistry> {
             properties: BTreeMap::new(),
             states: vec![BlockStateReport {
                 id: 42,
+                default: true,
+                properties: BTreeMap::new(),
+            }],
+        },
+        BlockReport {
+            id: Identifier::parse("minecraft:acacia_log").unwrap(),
+            properties: BTreeMap::new(),
+            states: vec![BlockStateReport {
+                id: 43,
+                default: true,
+                properties: BTreeMap::new(),
+            }],
+        },
+        BlockReport {
+            id: Identifier::parse("minecraft:acacia_leaves").unwrap(),
+            properties: BTreeMap::new(),
+            states: vec![BlockStateReport {
+                id: 44,
                 default: true,
                 properties: BTreeMap::new(),
             }],
@@ -1831,6 +1849,7 @@ fn surface_vegetation_density_is_moderate_and_biome_specific() {
         generator.decorations.forest_log,
         generator.decorations.cold_log,
         generator.decorations.jungle_log,
+        generator.decorations.acacia_log,
     ];
     let mut eligible = [0usize; 3];
     let mut decorated = [0usize; 3];
@@ -1890,6 +1909,287 @@ fn surface_vegetation_density_is_moderate_and_biome_specific() {
 }
 
 #[test]
+fn vegetation_density_changes_over_regions_instead_of_columns() {
+    let registry = tiny_registry();
+    let mut near_change = 0.0;
+    let mut regional_change = 0.0;
+    let mut comparisons = 0usize;
+
+    for seed in [-11, 0, 712_816] {
+        let generator = TerrainGenerator::with_worldgen_mode(
+            seed,
+            Arc::clone(&registry),
+            WorldgenMode::TellusLike(TellusWorldgenSettings::default()),
+        );
+        for z in (-2_048_i32..=2_048_i32).step_by(137) {
+            for x in (-2_048_i32..=2_048_i32).step_by(131) {
+                let centre = generator.plan_column(
+                    ChunkPos {
+                        x: x.div_euclid(16),
+                        z: z.div_euclid(16),
+                    },
+                    x.rem_euclid(16) as u8,
+                    z.rem_euclid(16) as u8,
+                );
+                let near = generator.plan_column(
+                    ChunkPos {
+                        x: (x + 8).div_euclid(16),
+                        z: z.div_euclid(16),
+                    },
+                    (x + 8).rem_euclid(16) as u8,
+                    z.rem_euclid(16) as u8,
+                );
+                let regional = generator.plan_column(
+                    ChunkPos {
+                        x: (x + 192).div_euclid(16),
+                        z: z.div_euclid(16),
+                    },
+                    (x + 192).rem_euclid(16) as u8,
+                    z.rem_euclid(16) as u8,
+                );
+                near_change += (centre.vegetation_density - near.vegetation_density).abs();
+                regional_change += (centre.vegetation_density - regional.vegetation_density).abs();
+                comparisons += 1;
+            }
+        }
+    }
+
+    assert!(comparisons > 2_000);
+    assert!(
+        near_change * 4.0 < regional_change,
+        "vegetation density is too noisy per column: near={near_change}, regional={regional_change}"
+    );
+}
+
+#[test]
+fn tellus_multi_seed_biome_and_feature_fingerprints_are_distinct_and_bounded() {
+    let registry = tiny_registry();
+    let seeds = [
+        0, 712_816, -1, 1, 2, 3, 5, 8, 13, 21, 34, 55, 89, 144, 233, 377, 610, 987, 1_597, 2_584,
+        4_181, 6_765, 10_946, 17_711, 28_657, 46_368, 75_025, 121_393, 196_418, 317_811, 514_229,
+        832_040,
+    ];
+    let mut fingerprints = HashSet::new();
+    let mut highly_dominated_seeds = 0usize;
+    let mut all_land_biomes = HashSet::new();
+
+    for seed in seeds {
+        let generator = TerrainGenerator::with_worldgen_mode(
+            seed,
+            Arc::clone(&registry),
+            WorldgenMode::TellusLike(TellusWorldgenSettings::default()),
+        );
+        let spawn = generator
+            .locate_safe_spawn()
+            .unwrap_or_else(|| panic!("seed {seed} has no natural spawn"));
+        let mut biome_counts = BTreeMap::<String, usize>::new();
+        let mut density_buckets = [0usize; 4];
+        let mut land_samples = 0usize;
+        let mut tree_candidates = 0usize;
+        let mut cover_candidates = 0usize;
+
+        for dz in (-4_096..=4_096).step_by(128) {
+            for dx in (-4_096..=4_096).step_by(128) {
+                let x = spawn.block_x + dx;
+                let z = spawn.block_z + dz;
+                let plan = generator.plan_column(
+                    ChunkPos {
+                        x: x.div_euclid(16),
+                        z: z.div_euclid(16),
+                    },
+                    x.rem_euclid(16) as u8,
+                    z.rem_euclid(16) as u8,
+                );
+                if land_biome_family(&generator, &plan.biome).is_some() {
+                    land_samples += 1;
+                    *biome_counts
+                        .entry(plan.biome.as_str().to_owned())
+                        .or_default() += 1;
+                    all_land_biomes.insert(plan.biome.as_str().to_owned());
+                }
+                let density_index = match plan.vegetation_density {
+                    value if value < -0.4 => 0,
+                    value if value < 0.0 => 1,
+                    value if value < 0.4 => 2,
+                    _ => 3,
+                };
+                density_buckets[density_index] += 1;
+                tree_candidates += usize::from(
+                    generator
+                        .tree_spacing_for_biome(&plan.biome)
+                        .is_some_and(|spacing| plan.hash.is_multiple_of(spacing))
+                        && generator.tree_density_allows(&plan),
+                );
+                cover_candidates += usize::from(
+                    generator.ground_cover_density_allows(&plan)
+                        && plan
+                            .hash
+                            .is_multiple_of(generator.plant_spacing_for_biome(&plan.biome).0),
+                );
+            }
+        }
+
+        assert!(land_samples >= 128, "seed {seed} sampled too little land");
+        let dominant = biome_counts.values().copied().max().unwrap_or(0);
+        if land_samples >= 512 {
+            highly_dominated_seeds += usize::from(dominant * 10 > land_samples * 9);
+        }
+        assert!(tree_candidates > 0, "seed {seed} has no tree candidates");
+        assert!(
+            cover_candidates > 0,
+            "seed {seed} has no ground-cover candidates"
+        );
+        let fingerprint = format!(
+            "{spawn:?}|{biome_counts:?}|{density_buckets:?}|{tree_candidates}|{cover_candidates}"
+        );
+        assert!(
+            fingerprints.insert(fingerprint),
+            "seed {seed} duplicated a biome/feature fingerprint"
+        );
+    }
+
+    assert_eq!(fingerprints.len(), seeds.len());
+    assert!(
+        highly_dominated_seeds <= 8,
+        "too many seeds are >90% one land biome: {highly_dominated_seeds}/{}",
+        seeds.len()
+    );
+    assert!(
+        all_land_biomes.len() >= 12,
+        "multi-seed sample reached only {} land biomes: {all_land_biomes:?}",
+        all_land_biomes.len()
+    );
+}
+
+#[test]
+fn tellus_savanna_generates_sparse_acacia_while_desert_remains_treeless() {
+    let registry = tiny_registry();
+    let seeds = [0, 712_816, -1, 17_711, 75_025, 196_418, 514_229, 832_040];
+    let mut savanna_columns = 0usize;
+    let mut desert_columns = 0usize;
+    let mut acacia_trees = 0usize;
+    let mut inspected_chunks = HashSet::new();
+
+    'seeds: for seed in seeds {
+        let generator = TerrainGenerator::with_worldgen_mode(
+            seed,
+            Arc::clone(&registry),
+            WorldgenMode::TellusLike(TellusWorldgenSettings::default()),
+        );
+        let spawn = generator
+            .locate_safe_spawn()
+            .unwrap_or_else(|| panic!("seed {seed} has no natural spawn"));
+        for dz in (-4_096..=4_096).step_by(29) {
+            for dx in (-4_096..=4_096).step_by(29) {
+                let x = spawn.block_x + dx;
+                let z = spawn.block_z + dz;
+                let pos = ChunkPos {
+                    x: x.div_euclid(16),
+                    z: z.div_euclid(16),
+                };
+                let lx = x.rem_euclid(16) as u8;
+                let lz = z.rem_euclid(16) as u8;
+                let plan = generator.plan_column(pos, lx, lz);
+                if plan.biome.path() == "desert" {
+                    desert_columns += 1;
+                    assert_eq!(generator.tree_spacing_for_biome(&plan.biome), None);
+                    continue;
+                }
+                if !TerrainGenerator::is_savanna(&plan.biome) {
+                    continue;
+                }
+                savanna_columns += 1;
+                let Some(spacing) = generator.tree_spacing_for_biome(&plan.biome) else {
+                    panic!("savanna must have sparse tree admission");
+                };
+                if !(2..=13).contains(&lx)
+                    || !(2..=13).contains(&lz)
+                    || !plan.hash.is_multiple_of(spacing)
+                    || !generator.tree_density_allows(&plan)
+                    || !generator.tree_site_is_stable(&plan)
+                    || !inspected_chunks.insert((seed, pos))
+                {
+                    continue;
+                }
+                let chunk = generator.generate(pos);
+                let acacia_log = generator.decorations.acacia_log.expect("acacia log state");
+                let acacia_leaves = generator
+                    .decorations
+                    .acacia_leaves
+                    .expect("acacia leaf state");
+                assert_eq!(
+                    chunk.get_block(lx, plan.height + 1, lz),
+                    Some(acacia_log),
+                    "savanna tree at {},{} did not use acacia",
+                    plan.wx,
+                    plan.wz
+                );
+                assert!(
+                    (plan.height + 3..=plan.height + 8).any(|y| {
+                        (-2..=2).any(|ox| {
+                            (-2..=2).any(|oz| {
+                                let tx = i32::from(lx) + ox;
+                                let tz = i32::from(lz) + oz;
+                                (0..16).contains(&tx)
+                                    && (0..16).contains(&tz)
+                                    && chunk.get_block(tx as u8, y, tz as u8) == Some(acacia_leaves)
+                            })
+                        })
+                    }),
+                    "savanna acacia at {},{} has no canopy",
+                    plan.wx,
+                    plan.wz
+                );
+                acacia_trees += 1;
+                if acacia_trees >= 3 && desert_columns >= 128 && savanna_columns >= 128 {
+                    break 'seeds;
+                }
+            }
+        }
+    }
+
+    assert!(
+        savanna_columns >= 128,
+        "sampled only {savanna_columns} savanna columns"
+    );
+    assert!(
+        desert_columns >= 128,
+        "sampled only {desert_columns} desert columns"
+    );
+    assert!(
+        acacia_trees >= 3,
+        "generated only {acacia_trees} acacia trees"
+    );
+}
+
+#[test]
+fn open_cold_biomes_are_treeless_while_taiga_and_grove_keep_spruce() {
+    let generator = TerrainGenerator::new(42, tiny_registry());
+    for name in ["minecraft:snowy_plains", "minecraft:ice_spikes"] {
+        let biome = Identifier::parse(name).unwrap();
+        assert_eq!(generator.tree_spacing_for_biome(&biome), None, "{name}");
+        assert!(!TerrainGenerator::is_cold_forest(&biome), "{name}");
+    }
+    for name in [
+        "minecraft:taiga",
+        "minecraft:snowy_taiga",
+        "minecraft:old_growth_pine_taiga",
+        "minecraft:old_growth_spruce_taiga",
+        "minecraft:grove",
+    ] {
+        let biome = Identifier::parse(name).unwrap();
+        assert!(generator.tree_spacing_for_biome(&biome).is_some(), "{name}");
+        assert_eq!(
+            generator
+                .tree_blocks_for_biome(&biome)
+                .map(|blocks| blocks.kind),
+            Some(TreeKind::Spruce),
+            "{name}"
+        );
+    }
+}
+
+#[test]
 fn generated_tree_trunks_start_on_the_planned_surface() {
     let registry = tiny_registry();
     let mut trees = 0usize;
@@ -1900,6 +2200,7 @@ fn generated_tree_trunks_start_on_the_planned_surface() {
             generator.decorations.forest_log,
             generator.decorations.cold_log,
             generator.decorations.jungle_log,
+            generator.decorations.acacia_log,
         ];
         for chunk_x in -3..=3 {
             for chunk_z in -3..=3 {
@@ -1954,10 +2255,12 @@ fn tree_species_have_distinct_tapered_canopy_profiles() {
     let birch = profile(TreeKind::Birch);
     let spruce = profile(TreeKind::Spruce);
     let jungle = profile(TreeKind::Jungle);
+    let acacia = profile(TreeKind::Acacia);
     assert_eq!(oak.last(), Some(&1));
     assert_eq!(birch.last(), Some(&0));
     assert_eq!(spruce.last(), Some(&0));
     assert_eq!(jungle.last(), Some(&1));
+    assert_eq!(acacia.last(), Some(&1));
     assert!(oak.iter().any(|radius| *radius > *oak.last().unwrap()));
     assert!(birch.iter().any(|radius| *radius > *birch.last().unwrap()));
     assert!(
@@ -1970,12 +2273,21 @@ fn tree_species_have_distinct_tapered_canopy_profiles() {
             .iter()
             .any(|radius| *radius > *jungle.last().unwrap())
     );
+    assert!(
+        acacia
+            .iter()
+            .any(|radius| *radius > *acacia.last().unwrap())
+    );
     assert_ne!(oak, birch);
     assert_ne!(oak, spruce);
     assert_ne!(oak, jungle);
+    assert_ne!(oak, acacia);
     assert_ne!(birch, spruce);
     assert_ne!(birch, jungle);
+    assert_ne!(birch, acacia);
     assert_ne!(spruce, jungle);
+    assert_ne!(spruce, acacia);
+    assert_ne!(jungle, acacia);
 }
 
 #[test]
@@ -1989,12 +2301,14 @@ fn generated_tree_canopies_narrow_above_the_main_crown() {
             generator.decorations.forest_log,
             generator.decorations.cold_log,
             generator.decorations.jungle_log,
+            generator.decorations.acacia_log,
         ];
         let leaves = [
             generator.decorations.oak_leaves,
             generator.decorations.forest_leaves,
             generator.decorations.cold_leaves,
             generator.decorations.jungle_leaves,
+            generator.decorations.acacia_leaves,
         ];
         for chunk_x in -3..=3 {
             for chunk_z in -3..=3 {

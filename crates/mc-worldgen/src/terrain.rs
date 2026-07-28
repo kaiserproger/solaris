@@ -23,6 +23,7 @@ use mc_world::{
     PackedBitArray, SettlementInhabitantMarker,
 };
 
+use crate::noise::fbm_2d;
 use crate::structures::{StructureRules, StructureTemplate};
 
 mod biome_rules;
@@ -65,6 +66,7 @@ const ORE_DIRECTIONS: [[i8; 3]; 6] = [
 const CAVE_SURFACE_CLEARANCE: i32 = 32;
 const DEEPSLATE_TOP_Y: i32 = 0;
 const DEEPSLATE_SOLID_Y: i32 = -8;
+const VEGETATION_REGION_SCALE: f64 = 192.0;
 const SPAWN_SEARCH_STEP_BLOCKS: i32 = 64;
 const SPAWN_SEARCH_MAX_RADIUS_BLOCKS: i32 = 8_192;
 const SPAWN_SITE_SAMPLE_RADIUS_BLOCKS: i32 = 8;
@@ -165,6 +167,7 @@ struct ColumnPlan {
     biome: Identifier,
     surface: BlockStateId,
     fill: BlockStateId,
+    vegetation_density: f64,
     hash: u64,
 }
 
@@ -178,6 +181,8 @@ struct DecorationBlocks {
     cold_leaves: Option<BlockStateId>,
     jungle_log: Option<BlockStateId>,
     jungle_leaves: Option<BlockStateId>,
+    acacia_log: Option<BlockStateId>,
+    acacia_leaves: Option<BlockStateId>,
     short_grass: Option<BlockStateId>,
     dandelion: Option<BlockStateId>,
     poppy: Option<BlockStateId>,
@@ -206,6 +211,10 @@ impl DecorationBlocks {
                 .or_else(|| optional_block(registry, "minecraft:oak_log")),
             jungle_leaves: optional_generated_leaves(registry, "minecraft:jungle_leaves")
                 .or_else(|| optional_generated_leaves(registry, "minecraft:oak_leaves")),
+            acacia_log: optional_block(registry, "minecraft:acacia_log")
+                .or_else(|| optional_block(registry, "minecraft:oak_log")),
+            acacia_leaves: optional_generated_leaves(registry, "minecraft:acacia_leaves")
+                .or_else(|| optional_generated_leaves(registry, "minecraft:oak_leaves")),
             short_grass: optional_block(registry, "minecraft:short_grass"),
             dandelion: optional_block(registry, "minecraft:dandelion"),
             poppy: optional_block(registry, "minecraft:poppy"),
@@ -225,6 +234,7 @@ enum TreeKind {
     Birch,
     Spruce,
     Jungle,
+    Acacia,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -255,6 +265,8 @@ fn tree_canopy_radius(kind: TreeKind, relative_y: i32) -> Option<i8> {
         (TreeKind::Spruce, 1) => Some(0),
         (TreeKind::Jungle, -2..=0) => Some(2),
         (TreeKind::Jungle, 1) => Some(1),
+        (TreeKind::Acacia, -1 | 0) => Some(2),
+        (TreeKind::Acacia, 1) => Some(1),
         _ => None,
     }
 }
@@ -722,6 +734,17 @@ impl TerrainGenerator {
         self.density_router().sample(world_x, world_z).ridges
     }
 
+    fn vegetation_density(&self, world_x: i32, world_z: i32, moisture: f64) -> f64 {
+        let regional = fbm_2d(
+            f64::from(world_x) / VEGETATION_REGION_SCALE,
+            f64::from(world_z) / VEGETATION_REGION_SCALE,
+            self.seed ^ 0x5645_4745,
+            2,
+            0.5,
+        );
+        (regional * 0.72 + moisture * 0.28).clamp(-1.0, 1.0)
+    }
+
     fn plan_column(&self, pos: ChunkPos, lx: u8, lz: u8) -> ColumnPlan {
         let wx = world_block_coordinate(pos.x, lx);
         let wz = world_block_coordinate(pos.z, lz);
@@ -732,6 +755,16 @@ impl TerrainGenerator {
             WorldgenMode::TellusLike(settings) => {
                 self.tellus_biome_for(wx, wz, height, settings, sample)
             }
+        };
+        let vegetation_density = if self.biomes.grassland.contains(&biome)
+            || self.biomes.temperate_forest.contains(&biome)
+            || self.biomes.jungle.contains(&biome)
+            || Self::is_cold_forest(&biome)
+            || Self::is_savanna(&biome)
+        {
+            self.vegetation_density(wx, wz, sample.moisture)
+        } else {
+            -1.0
         };
         let (sea_level, water_enabled) = match self.worldgen_mode {
             WorldgenMode::VanillaLike => (SEA_LEVEL, true),
@@ -763,6 +796,7 @@ impl TerrainGenerator {
             biome,
             surface,
             fill,
+            vegetation_density,
             hash: feature_hash(self.seed, wx, height, wz, 0xDEC0_0001),
         }
     }
@@ -1218,6 +1252,7 @@ impl TerrainGenerator {
 
                 let tree_spacing = self.tree_spacing_for_biome(biome);
                 if tree_spacing.is_some_and(|spacing| h.is_multiple_of(spacing))
+                    && self.tree_density_allows(plan)
                     && self.tree_site_is_stable(plan)
                     && self.place_tree(chunk, plan, self.tree_blocks_for_biome(biome), &mut touched)
                 {
@@ -1238,12 +1273,20 @@ impl TerrainGenerator {
                 }
                 if (self.biomes.grassland.contains(biome)
                     || self.biomes.temperate_forest.contains(biome)
-                    || self.biomes.jungle.contains(biome))
+                    || self.biomes.jungle.contains(biome)
+                    || Self::is_savanna(biome))
                     && (surface == self.grass_block || surface == self.podzol)
+                    && self.ground_cover_density_allows(plan)
                 {
                     let (grass_spacing, dandelion_spacing, poppy_spacing) =
                         self.plant_spacing_for_biome(biome);
-                    let plant = if h.is_multiple_of(1021) {
+                    let plant = if Self::is_savanna(biome) {
+                        if h.is_multiple_of(grass_spacing) {
+                            self.decorations.short_grass
+                        } else {
+                            None
+                        }
+                    } else if h.is_multiple_of(1021) {
                         self.decorations.pumpkin
                     } else if h.is_multiple_of(dandelion_spacing) {
                         self.decorations.dandelion
@@ -1304,22 +1347,66 @@ impl TerrainGenerator {
         true
     }
 
+    fn is_savanna(biome: &Identifier) -> bool {
+        biome.path().contains("savanna")
+    }
+
+    fn is_cold_forest(biome: &Identifier) -> bool {
+        biome.path().contains("taiga") || biome.path() == "grove"
+    }
+
+    fn tree_density_allows(&self, plan: &ColumnPlan) -> bool {
+        let threshold = if self.biomes.jungle.contains(&plan.biome) {
+            -0.55
+        } else if self.biomes.temperate_forest.contains(&plan.biome) {
+            -0.25
+        } else if Self::is_cold_forest(&plan.biome) {
+            -0.05
+        } else if Self::is_savanna(&plan.biome) {
+            0.28
+        } else if self.biomes.grassland.contains(&plan.biome) {
+            0.48
+        } else {
+            return false;
+        };
+        plan.vegetation_density >= threshold
+    }
+
+    fn ground_cover_density_allows(&self, plan: &ColumnPlan) -> bool {
+        let threshold = if self.biomes.jungle.contains(&plan.biome) {
+            -0.75
+        } else if self.biomes.temperate_forest.contains(&plan.biome) {
+            -0.55
+        } else if Self::is_savanna(&plan.biome) {
+            -0.05
+        } else if self.biomes.grassland.contains(&plan.biome) {
+            -0.35
+        } else {
+            return false;
+        };
+        plan.vegetation_density >= threshold
+    }
+
     fn tree_spacing_for_biome(&self, biome: &Identifier) -> Option<u64> {
         if self.biomes.jungle.contains(biome) {
-            Some(31)
+            Some(23)
         } else if self.biomes.temperate_forest.contains(biome) {
+            Some(37)
+        } else if Self::is_cold_forest(biome) {
             Some(47)
-        } else if self.biomes.cold.contains(biome) {
-            Some(53)
+        } else if Self::is_savanna(biome) {
+            Some(113)
         } else if self.biomes.grassland.contains(biome) {
-            Some(181)
+            Some(173)
         } else {
             None
         }
     }
 
     fn plant_spacing_for_biome(&self, biome: &Identifier) -> (u64, u64, u64) {
-        if self.biomes.jungle.contains(biome) {
+        if Self::is_savanna(biome) {
+            (31, 127, 137)
+        } else if self.biomes.jungle.contains(biome) {
             (17, 103, 109)
         } else if self.biomes.temperate_forest.contains(biome) {
             (29, 127, 137)
@@ -1348,6 +1435,7 @@ impl TerrainGenerator {
             TreeKind::Birch => 5 + (plan.hash % 2) as i32,
             TreeKind::Spruce => 5 + (plan.hash % 3) as i32,
             TreeKind::Jungle => 6 + (plan.hash % 2) as i32,
+            TreeKind::Acacia => 4 + (plan.hash % 3) as i32,
         };
         let Some(trunk_top_y) = checked_y_offset(base_y, trunk_height - 1) else {
             return false;
@@ -1402,13 +1490,19 @@ impl TerrainGenerator {
     }
 
     fn tree_blocks_for_biome(&self, biome: &Identifier) -> Option<TreeBlocks> {
-        let (kind, log, leaves) = if self.biomes.jungle.contains(biome) {
+        let (kind, log, leaves) = if Self::is_savanna(biome) {
+            (
+                TreeKind::Acacia,
+                self.decorations.acacia_log,
+                self.decorations.acacia_leaves,
+            )
+        } else if self.biomes.jungle.contains(biome) {
             (
                 TreeKind::Jungle,
                 self.decorations.jungle_log,
                 self.decorations.jungle_leaves,
             )
-        } else if self.biomes.cold.contains(biome) || biome.path().contains("taiga") {
+        } else if Self::is_cold_forest(biome) {
             (
                 TreeKind::Spruce,
                 self.decorations.cold_log,
@@ -1465,6 +1559,7 @@ impl TerrainGenerator {
                 TreeKind::Birch => 0xB17C,
                 TreeKind::Spruce => 0x5A9C,
                 TreeKind::Jungle => 0xA6E1,
+                TreeKind::Acacia => 0xACA1,
             };
             let rotation = feature_hash(self.seed, plan.wx, trunk_top_y, plan.wz, salt) as u8 & 3;
             return if relative_y > 0 {
@@ -1481,6 +1576,7 @@ impl TerrainGenerator {
             TreeKind::Birch => 0xB17C,
             TreeKind::Spruce => 0x5A9C,
             TreeKind::Jungle => 0xA6E1,
+            TreeKind::Acacia => 0xACA1,
         };
         !feature_hash(
             self.seed,

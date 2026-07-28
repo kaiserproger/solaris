@@ -513,13 +513,17 @@ hardening. An already-open lower-priority diff does not override this order.
   searches the actual seeded terrain for dry low-relief land; schema-3
   `solaris/world.json` persists that block position, startup generation and light
   center on its chunk, and fresh-player support/body-space search consumes the
-  same `WorldSpawn`. A 32-seed Tellus regression includes `0`, `712816`, and `-1`
-  and requires distinct local height fingerprints. `example.toml` and the config
-  default are now `tellus_like`; `playable.toml` uses
-  `.analysis/test-world-v10`. Existing revision-9 crown, cave, slope, shell, and
-  generated-world gates remain green. A fresh graphical revision-10 inspection,
-  2048x2048 height/biome/vegetation mosaics, drainage/vegetation quality work,
-  seed-`712816` owner playtest, and throughput comparison remain pending.
+  same `WorldSpawn`. Vegetation now combines routed moisture with one seed-driven
+  192-block density field; exact column hashes place trees/plants only inside those
+  coherent patches. Savannas receive sparse acacia, deserts/snowy plains/ice spikes
+  remain treeless, and taiga/grove retain spruce. A 32-seed Tellus regression
+  includes `0`, `712816`, and `-1`, samples 8192x8192 around each selected spawn,
+  requires unique biome/feature fingerprints and bounds repeated >90% single-biome
+  land dominance. `example.toml` and the config default are `tellus_like`;
+  `playable.toml` uses `.analysis/test-world-v10`. `mc-worldgen` is 110/110 and the
+  external worldgen harness is 5/5. A fresh graphical revision-10 inspection,
+  2048x2048 height/biome/vegetation mosaics, coarse drainage, seed-`712816` owner
+  playtest, restart, and release-host throughput comparison remain pending.
 
 - Hostile melee now keeps a zero-speed target-facing goal while in reach, so a
   stationary zombie stops without freezing its body/head rotation and publishes
