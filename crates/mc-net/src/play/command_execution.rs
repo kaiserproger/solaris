@@ -410,13 +410,15 @@ where
 }
 
 pub(super) fn clientbound_session_world_time(sessions: &SessionRegistry) -> ClientboundSetTime {
-    clientbound_world_time(sessions.world_time())
+    clientbound_world_time(sessions.simulation_tick(), sessions.world_time())
 }
 
-pub(super) fn clientbound_world_time(time: u64) -> ClientboundSetTime {
-    ClientboundSetTime {
-        game_time: i64::try_from(time).unwrap_or(i64::MAX),
-    }
+pub(super) fn clientbound_world_time(game_time: u64, world_time: u64) -> ClientboundSetTime {
+    ClientboundSetTime::overworld(
+        i64::try_from(game_time).unwrap_or(i64::MAX),
+        i64::try_from(world_time).unwrap_or(i64::MAX),
+        1.0,
+    )
 }
 
 pub(super) fn command_error_message(error: CommandError) -> &'static str {

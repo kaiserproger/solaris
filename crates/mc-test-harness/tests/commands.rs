@@ -2617,6 +2617,19 @@ async fn client_receives_continuing_world_time_updates() {
         second.game_time > first.game_time,
         "world time updates must advance"
     );
+    let first_overworld = first
+        .overworld_clock
+        .expect("first update must carry the overworld clock");
+    let second_overworld = second
+        .overworld_clock
+        .expect("second update must carry the overworld clock");
+    assert_eq!(first_overworld.partial_tick, 0.0);
+    assert_eq!(first_overworld.rate, 1.0);
+    assert_eq!(second_overworld.rate, 1.0);
+    assert!(
+        second_overworld.total_ticks > first_overworld.total_ticks,
+        "client-visible overworld clock must advance"
+    );
 }
 
 async fn next_system_chat_text(client: &mut Client) -> String {
@@ -2754,7 +2767,9 @@ async fn wait_for_admin_day_effects(client: &mut Client) {
             if frame.id == ClientboundSetTime::ID {
                 let packet = ClientboundSetTime::decode(&mut frame.body.clone())
                     .expect("decode admin-day SetTime");
-                saw_day |= packet.game_time == 1000;
+                saw_day |= packet
+                    .overworld_clock
+                    .is_some_and(|clock| clock.total_ticks == 1_000);
             } else if frame.id == ClientboundSystemChat::ID {
                 let packet = ClientboundSystemChat::decode(&mut frame.body.clone())
                     .expect("decode admin-day SystemChat");

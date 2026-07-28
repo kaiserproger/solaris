@@ -9,44 +9,37 @@ and is not startup context.
 
 - Date: 2026-07-28.
 - Branch: `main`.
-- Checkpoint base: `f0a8729` (`feat(play): add positive villager gossip`), after
-  `6082385` closed villager-kill witness gossip. All five vanilla gossip types now
-  share the retained pricing/decay/transfer authority; production zombie-villager
-  curing, Hero pricing, village population/defence and species-specific
-  `UnsupportedSpecial` attacks remain open gameplay work.
-- The active checkpoint prepares the first honest public alpha,
-  `v0.0.1-alpha.1`. Workspace package metadata and `Cargo.lock` use the prerelease
-  version and the real repository URL. README/release notes describe a public test
-  release without replacement-readiness, migration, full parity, production-fleet,
-  Windows or macOS claims.
-- The public starter config is local-only (`127.0.0.1`), VD8, balanced autoscale,
-  and an ordinary `world` directory. Its server policy/startup/cache expectations
-  have exact tests. A missing fresh world directory is documented as expected;
-  unsafe public offline mode and unusable/stale data paths remain blockers.
-- Tag releases require exact `v${workspace.package.version}`, package README,
-  `example.toml`, licenses and VERSION beside the binary, smoke the native archive,
-  and mark hyphenated tags as GitHub prereleases. Pinned release notes live at
-  `docs/releases/v0.0.1-alpha.1.md`; the complete publication/remaining-work plan
-  lives at `docs/PUBLIC_ALPHA_PLAN.md`.
-- Local release-candidate evidence is green: workspace strict Clippy, formatter,
-  code-health, locked release build, all-target test shards (including `mc-net`,
-  `mc-server`, `mc-test-harness`, `mc-world` benches and `mc-worldgen`),
-  `RUSTFLAGS=-D warnings` all-target compilation, Loader fixture/platform tests,
-  installer tests, release binary version/config check, and local archive smoke.
-  The monolithic all-target command exceeded the CodexPro wall-clock after green
-  completed shards; the equivalent package shards terminated successfully.
-- The independent read-only release-diff review found two documentation-only
-  closeout sequencing issues: the plan and memory must not claim a commit exists
-  before it is created. They were fixed by creating the release-preparation commit
-  before marking the local checkpoint complete; no second reviewer was run. The
-  reviewed release-preparation checkpoint is locally complete. Publication still
-  requires pushing `main`, green main CI, an immutable annotated tag push, green
-  release matrix, visible GitHub prerelease verification, published installer
-  smoke, and one post-release real 26.1.2 client join.
-- The performance baseline remains as recorded by `17fb424`: debug/release
-  20-client VD8 and bounded replay/soak gates pass; O3 explosion authority is
-  still above the frozen p99 budget, and exact low/high cgroups plus long soaks
-  remain open.
+- Checkpoint base: `1347df9` (`chore(release): prepare v0.0.1-alpha.1`). The
+  first owner-run public-alpha session is now the routing authority for the next
+  stabilization release; its exact plan is `docs/PUBLIC_ALPHA_PLAN.md`.
+- The strong baseline must be preserved: seed `712816`, VD16 and one local player
+  pre-generated 225 chunks at 929.473 chunks/s, streamed every requested chunk
+  without degradation or memory-pressure shedding, used roughly 300 MiB by owner
+  observation, and shut down with zero dirty chunks.
+- The current P0 clock checkpoint replaces the empty 26.1.2 clock-update map with
+  a typed overworld update: monotonic simulation tick remains packet `game_time`,
+  while persisted world time is the separate registry-id-0 clock at rate `1.0`.
+  Exact protocol, package, server, command and sleep gates pass. The graphical
+  client gate is host-blocked because this CodexPro environment has no display and
+  NeoForge exits with `glfwInit failed`; no rendered sun claim is made yet.
+- P0 production worldgen defect is confirmed: seed-driven noise exists, but a
+  384-block origin blend intentionally makes spawn similar across seeds; fixed
+  coordinates force exposed stone/iron and attempt one starter-tree anchor near
+  every generated origin. Revision 10 must remove those fixtures and select a safe
+  spawn from the generated seed-driven Earth-like terrain instead of deforming
+  terrain around `(0,0)`.
+- P0 lock defect is confirmed: item spawn/pickup synchronously waits on the
+  regional entity owner while `SessionRegistryInner` is held; pickup additionally
+  nests `PlayerPersistedState`. The owner log recorded 369 M39 warnings and six
+  55-81 ms ticks. Raising warning thresholds is not a fix.
+- P1 natural spawning remains a chunk-load materialization path with sparse
+  deterministic chunk admission, global category caps and no complete continuing
+  loaded-chunk spawn cycle. Add independent friendly/hostile attempt cadences,
+  bounded rotating loaded-chunk work, exact conditions and observable metrics.
+- Plugin deployment is already inferable from the manifest: no `[client]` bundles
+  is server-only; any bundle requires Solaris Loader on client and server. Surface
+  that derived classification in `--check`, startup logs and example documentation
+  instead of adding a second manually maintained flag.
 - The worktree may contain unrelated owner files and local artifacts. Inspect
   exact ownership before editing; never clean or stage them by accident.
 - Fresh-player spawn now chooses the nearest non-hazardous collidable support
@@ -543,21 +536,22 @@ two priorities unless it becomes a common-play blocker or corruption risk.
 
 ## Active Risks
 
-1. Run the requested 20-minute MCP survival session with subagent-made
-   decisions, no deterministic scenario runner, and no operator setup. Fix its
-   first common client-visible blocker before isolated parity or performance
-   work; an owner-played subjective-feel gate remains separately pending.
-2. Include the `d9c0804` fuel contract in that survival session; fix a concrete
-   common client-visible regression if one appears.
-3. If the session finds no common blocker, advance the production Lua plugin
-   API before returning to broad optimization work.
-4. Only after those priorities, continue reducing `simulation.rs` through
-   explicit ownership boundaries; avoid moves that retain `use super::*` or
-   duplicate authority.
-5. Then advance regional ownership/ECS only with exact CAS, WAL, publication, and
-   cross-region failure fences.
-6. Broaden playable progression by the Pareto rule before polishing rare parity
-   or save-error edges.
+1. Run the graphical 26.1.2 clock gate on a host with a working display: observe
+   at least 600 advancing overworld-clock ticks, one complete visual day and
+   restart. The exact wire/TCP implementation is already green.
+2. Remove blocking regional-owner waits from item drop/pickup session and player
+   lock scopes while preserving conservation, stale rejection and restart safety.
+3. Ship worldgen revision 10: remove fixed starter fixtures and origin terrain
+   deformation, add seed-driven safe-spawn selection, and make the procedural
+   Earth-like profile the honest public default.
+4. Replace one-shot chunk-herd materialization with bounded periodic friendly and
+   hostile spawn attempts, independently configurable in ticks and observable in
+   a no-operator survival session.
+5. Expose derived Lua plugin deployment requirements in `--check`, startup logs
+   and example docs: server-only or Solaris Loader required on both sides.
+6. Close `v0.0.2-alpha.1` only after the exact gates in
+   `docs/PUBLIC_ALPHA_PLAN.md`; do not substitute warning suppression, unit-only
+   seed checks or a merely uncommented `tellus_like` setting.
 
 ## Canonical Routes
 

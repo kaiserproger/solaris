@@ -834,12 +834,21 @@ fn clientbound_cooldown_id_and_layout_match_javap() {
 }
 
 #[test]
-fn clientbound_set_time_id_and_empty_clock_map_layout_match_javap() {
+fn clientbound_set_time_id_and_overworld_clock_layout_match_javap() {
     assert_eq!(ClientboundSetTime::ID, 0x71);
-    let packet = ClientboundSetTime { game_time: 6000 };
+    let packet = ClientboundSetTime::overworld(12_345, 6_000, 1.0);
     let mut buf = Vec::new();
     packet.encode(&mut buf).unwrap();
-    assert_eq!(buf, [6000_i64.to_be_bytes().as_slice(), &[0]].concat());
+    assert_eq!(
+        buf,
+        [
+            12_345_i64.to_be_bytes().as_slice(),
+            &[1, 0, 0xF0, 0x2E],
+            0.0_f32.to_be_bytes().as_slice(),
+            1.0_f32.to_be_bytes().as_slice(),
+        ]
+        .concat()
+    );
 
     let mut cursor: &[u8] = &buf;
     assert_eq!(ClientboundSetTime::decode(&mut cursor).unwrap(), packet);

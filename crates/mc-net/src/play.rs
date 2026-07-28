@@ -12677,8 +12677,12 @@ where
                         .await?;
                     }
                     Some(OutboundCommand::WorldTime { world_time }) => {
-                        write_packet(writer, &clientbound_world_time(world_time), compression)
-                            .await?;
+                        write_packet(
+                            writer,
+                            &clientbound_world_time(sessions.simulation_tick(), world_time),
+                            compression,
+                        )
+                        .await?;
                     }
                     Some(OutboundCommand::WakeFromBed { bed }) => {
                         if let Some(state) = interaction.as_deref_mut()

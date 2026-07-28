@@ -125,6 +125,11 @@ Negative:
   checks `LevelChunkSection.hasFluid()` before scanning entity overlap. Sending
   zero therefore disables all client-local water contact even when the block
   palette itself contains valid source-water states.
+- `ClientboundSetTime` publishes a monotonic `gameTime` plus the typed
+  `world_clock` map. Local 26.1.2 metadata proves registry-holder keys are VarInt
+  ids and each clock update is VarLong total ticks plus two floats. The exact
+  oracle fingerprint and client ticking boundary are recorded in
+  `docs/evidence/world-clock-26.1.2.md`.
 
 ## Notes
 

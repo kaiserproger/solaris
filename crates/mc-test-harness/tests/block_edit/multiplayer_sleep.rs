@@ -754,7 +754,7 @@ async fn wait_for_single_sleeper_wake(
             let mut body = frame.body;
             let packet =
                 ClientboundSetTime::decode(&mut body).expect("decode gamerule wake world time");
-            if packet.game_time == 24_000 {
+            if packet.overworld_clock.is_some_and(|clock| clock.total_ticks == 24_000) {
                 morning_publications += 1;
             }
         } else if frame.id == SynchronizePlayerPosition::ID {
@@ -794,9 +794,9 @@ async fn count_mornings_until_time_fence(client: &mut Client, fence_time: i64) -
             let mut body = frame.body;
             let packet =
                 ClientboundSetTime::decode(&mut body).expect("decode post-wake world time");
-            if packet.game_time == 24_000 {
+            if packet.overworld_clock.is_some_and(|clock| clock.total_ticks == 24_000) {
                 morning_publications += 1;
-            } else if packet.game_time == fence_time {
+            } else if packet.overworld_clock.is_some_and(|clock| clock.total_ticks == fence_time) {
                 return morning_publications;
             }
         }
@@ -841,7 +841,7 @@ async fn wait_for_exact_world_time(client: &mut Client, expected: i64) {
         if frame.id == ClientboundSetTime::ID {
             let mut body = frame.body;
             let packet = ClientboundSetTime::decode(&mut body).expect("decode SetTime");
-            if packet.game_time == expected {
+            if packet.overworld_clock.is_some_and(|clock| clock.total_ticks == expected) {
                 return;
             }
         }
@@ -896,7 +896,8 @@ async fn wait_for_sleeping_before_morning(client: &mut Client, expected_ack: Opt
             let mut body = frame.body;
             let packet = ClientboundSetTime::decode(&mut body).expect("decode waiting SetTime");
             assert_ne!(
-                packet.game_time, 24_000,
+                packet.overworld_clock.map(|clock| clock.total_ticks),
+                Some(24_000),
                 "one sleeping player must not satisfy a two-player quorum"
             );
         }
@@ -991,7 +992,7 @@ async fn wait_for_sleep_quorum_delivery(
         } else if frame.id == ClientboundSetTime::ID {
             let mut body = frame.body;
             let packet = ClientboundSetTime::decode(&mut body).expect("decode quorum SetTime");
-            if packet.game_time == 24_000 {
+            if packet.overworld_clock.is_some_and(|clock| clock.total_ticks == 24_000) {
                 saw_morning = true;
             }
         } else if frame.id == SynchronizePlayerPosition::ID {

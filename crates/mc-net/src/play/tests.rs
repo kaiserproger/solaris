@@ -309,12 +309,23 @@ fn survival_exhaustion_handles_extreme_input_in_bounded_work() {
 }
 
 #[test]
-fn clientbound_session_world_time_uses_current_tick_with_saturation() {
+fn clientbound_session_world_time_separates_monotonic_and_overworld_clocks() {
     let sessions = SessionRegistry::new();
     sessions.set_world_time(12_345);
-    assert_eq!(clientbound_session_world_time(&sessions).game_time, 12_345);
+    sessions.advance_world_time(7);
 
-    assert_eq!(clientbound_world_time(u64::MAX).game_time, i64::MAX);
+    let packet = clientbound_session_world_time(&sessions);
+    assert_eq!(packet.game_time, 7);
+    assert_eq!(
+        packet.overworld_clock,
+        Some(mc_protocol::packets::play::WorldClockUpdate {
+            total_ticks: 12_352,
+            partial_tick: 0.0,
+            rate: 1.0,
+        })
+    );
+
+    assert_eq!(clientbound_world_time(u64::MAX, 1).game_time, i64::MAX);
 }
 
 #[test]

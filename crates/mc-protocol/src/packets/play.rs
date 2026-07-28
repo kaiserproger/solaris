@@ -985,31 +985,126 @@ impl Packet for ClientboundCooldown {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+/// One 26.1.2 world-clock state carried by `ClientboundSetTime`.
+///
+/// `total_ticks` is a VarLong on the wire. The client advances it by
+/// `game_time_delta * rate`, carrying the fractional remainder in
+/// `partial_tick` until the next authoritative update.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct WorldClockUpdate {
+    pub total_ticks: i64,
+    pub partial_tick: f32,
+    pub rate: f32,
+}
+
+/// The embedded 26.1.2 `world_clock` registry is ordered as overworld then End.
+/// `WorldClock.STREAM_CODEC` therefore writes these holder ids as VarInts.
+pub const OVERWORLD_WORLD_CLOCK_ID: i32 = 0;
+pub const THE_END_WORLD_CLOCK_ID: i32 = 1;
+
+#[derive(Debug, Clone, Copy, PartialEq)]
 pub struct ClientboundSetTime {
     pub game_time: i64,
+    pub overworld_clock: Option<WorldClockUpdate>,
+    pub the_end_clock: Option<WorldClockUpdate>,
+}
+
+impl ClientboundSetTime {
+    #[must_use]
+    pub const fn overworld(game_time: i64, total_ticks: i64, rate: f32) -> Self {
+        Self {
+            game_time,
+            overworld_clock: Some(WorldClockUpdate {
+                total_ticks,
+                partial_tick: 0.0,
+                rate,
+            }),
+            the_end_clock: None,
+        }
+    }
 }
 
 impl Packet for ClientboundSetTime {
     // `.analysis/protocol-dump.txt` / `GameProtocols`: game
     // CLIENTBOUND_SET_TIME is clientbound registration index 113, wire id 0x71.
-    // 26.1's `ClientboundSetTimePacket` writes `long gameTime` followed by a
-    // map of clock updates. Solaris currently models only the game-time field;
-    // decode intentionally ignores the trailing clock-update payload.
+    // Local 26.1.2 `javap` evidence:
+    // - `long gameTime`;
+    // - VarInt-sized map;
+    // - `WorldClock.STREAM_CODEC`, a holder-registry VarInt id;
+    // - vanilla `ClockNetworkState`: VarLong totalTicks, float partialTick, float rate.
     const ID: i32 = 0x71;
 
     fn encode<B: BufMut>(&self, buf: &mut B) -> Result<(), CodecError> {
         buf.write_i64(self.game_time);
-        buf.write_varint(0);
+        let update_count =
+            i32::from(self.overworld_clock.is_some()) + i32::from(self.the_end_clock.is_some());
+        buf.write_varint(update_count);
+        if let Some(state) = self.overworld_clock {
+            buf.write_varint(OVERWORLD_WORLD_CLOCK_ID);
+            encode_clock_network_state(buf, state);
+        }
+        if let Some(state) = self.the_end_clock {
+            buf.write_varint(THE_END_WORLD_CLOCK_ID);
+            encode_clock_network_state(buf, state);
+        }
         Ok(())
     }
 
     fn decode<B: Buf>(buf: &mut B) -> Result<Self, CodecError> {
         let game_time = buf.read_i64()?;
-        let remaining = buf.remaining();
-        buf.advance(remaining);
-        Ok(Self { game_time })
+        let update_count = buf.read_varint()?;
+        if update_count < 0 {
+            return Err(CodecError::NegativeLength(update_count));
+        }
+        if update_count > 2 {
+            return Err(CodecError::NotSupported(
+                "more than two 26.1.2 world-clock updates",
+            ));
+        }
+        let mut overworld_clock = None;
+        let mut the_end_clock = None;
+        for _ in 0..update_count {
+            let clock_id = buf.read_varint()?;
+            let state = decode_clock_network_state(buf)?;
+            match clock_id {
+                OVERWORLD_WORLD_CLOCK_ID if overworld_clock.is_none() => {
+                    overworld_clock = Some(state);
+                }
+                THE_END_WORLD_CLOCK_ID if the_end_clock.is_none() => {
+                    the_end_clock = Some(state);
+                }
+                OVERWORLD_WORLD_CLOCK_ID | THE_END_WORLD_CLOCK_ID => {
+                    return Err(CodecError::NotSupported(
+                        "duplicate 26.1.2 world-clock update",
+                    ));
+                }
+                _ => {
+                    return Err(CodecError::NotSupported(
+                        "unknown 26.1.2 world-clock registry id",
+                    ));
+                }
+            }
+        }
+        Ok(Self {
+            game_time,
+            overworld_clock,
+            the_end_clock,
+        })
     }
+}
+
+fn encode_clock_network_state<B: BufMut>(buf: &mut B, state: WorldClockUpdate) {
+    buf.write_varlong(state.total_ticks);
+    buf.write_f32(state.partial_tick);
+    buf.write_f32(state.rate);
+}
+
+fn decode_clock_network_state<B: Buf>(buf: &mut B) -> Result<WorldClockUpdate, CodecError> {
+    Ok(WorldClockUpdate {
+        total_ticks: buf.read_varlong()?,
+        partial_tick: buf.read_f32()?,
+        rate: buf.read_f32()?,
+    })
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]

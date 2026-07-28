@@ -631,6 +631,12 @@ async fn play_state_entry_sends_login_and_spawn_burst() {
         "unexpected initial game_time={}",
         time.game_time
     );
+    let overworld = time
+        .overworld_clock
+        .expect("initial Set Time must carry the overworld clock");
+    assert!((0..=20).contains(&overworld.total_ticks));
+    assert_eq!(overworld.partial_tick, 0.0);
+    assert_eq!(overworld.rate, 1.0);
 
     let mut frame = read_one_frame(&mut stream, &mut rbuf, compression).await;
     assert_eq!(
@@ -1213,15 +1219,21 @@ async fn lua_plugin_loaded_from_disk_replies_to_join_and_chat_over_the_wire() {
             let mut frame = read_one_frame(&mut stream, &mut rbuf, compression).await;
             if frame.id == ClientboundSetTime::ID {
                 let time = ClientboundSetTime::decode(&mut frame.body).unwrap();
-                if time.game_time == 1_000 {
+                if time
+                    .overworld_clock
+                    .is_some_and(|clock| clock.total_ticks == 1_000)
+                {
                     return time;
                 }
             }
         }
     })
     .await
-    .expect("script time command did not publish game time within 2s");
-    assert_eq!(time.game_time, 1_000);
+    .expect("script time command did not publish overworld time within 2s");
+    assert_eq!(
+        time.overworld_clock.map(|clock| clock.total_ticks),
+        Some(1_000)
+    );
 
     drop(stream);
     shutdown.request();
