@@ -1823,16 +1823,16 @@ mod tests {
     }
 
     #[test]
-    fn high_end_startup_prepares_minimum_but_reserves_vd32_cache() {
+    fn public_alpha_startup_prepares_balanced_minimum_and_reserves_vd10_cache() {
         let config: mc_server::ServerConfig =
             toml::from_str(include_str!("../../../example.toml")).expect("parse example config");
 
-        assert_eq!(config.server.view_distance, 32);
-        assert_eq!(startup_spawn_view_distance(&config), 8);
-        assert_eq!(runtime_cache_view_distance(&config), 32);
-        assert_eq!(chunk_cache_size_for_view_distance(32), 4_761);
-        assert_eq!(spawn_window_positions(8).len(), 361);
-        assert_eq!(spawn_view_positions(8).len(), 289);
+        assert_eq!(config.server.view_distance, 8);
+        assert_eq!(startup_spawn_view_distance(&config), 6);
+        assert_eq!(runtime_cache_view_distance(&config), 10);
+        assert_eq!(chunk_cache_size_for_view_distance(10), 625);
+        assert_eq!(spawn_window_positions(6).len(), 225);
+        assert_eq!(spawn_view_positions(6).len(), 169);
     }
 
     #[test]

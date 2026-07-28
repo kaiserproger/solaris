@@ -1,4 +1,6 @@
+#[cfg(feature = "lua-runtime")]
 use std::sync::atomic::{AtomicU64, Ordering};
+#[cfg(feature = "lua-runtime")]
 use std::time::Duration;
 
 use super::*;

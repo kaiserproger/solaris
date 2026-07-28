@@ -17,8 +17,9 @@ cat > "$package/solaris" <<'EOF'
 printf 'solaris-installer-fixture\n'
 EOF
 chmod 0755 "$package/solaris"
+printf '[server]\nname = "installer-fixture"\n' > "$package/example.toml"
 
-tar -C "$package" -czf "$assets/$asset" solaris
+tar -C "$package" -czf "$assets/$asset" solaris example.toml
 (
   cd "$assets"
   sha256sum "$asset" > "${asset}.sha256"

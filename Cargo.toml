@@ -3,12 +3,12 @@ resolver = "2"
 members = ["crates/*"]
 
 [workspace.package]
-version = "0.0.1"
+version = "0.0.1-alpha.1"
 edition = "2024"
 rust-version = "1.94"
 license = "MIT OR Apache-2.0"
 authors = ["Solaris contributors"]
-repository = "https://github.com/example/solaris"
+repository = "https://github.com/kaiserproger/solaris"
 
 [workspace.dependencies]
 arc-swap = "1.7"

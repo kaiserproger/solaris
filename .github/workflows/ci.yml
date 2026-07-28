@@ -112,6 +112,14 @@ jobs:
       - uses: Swatinem/rust-cache@v2
         with:
           key: release-${{ matrix.target }}
+      - name: Validate release tag
+        env:
+          TAG: ${{ github.ref_name }}
+        run: |
+          set -euo pipefail
+          version="$(sed -n 's/^version = "\([^"]*\)"/\1/p' Cargo.toml | head -n 1)"
+          test -n "$version"
+          test "$TAG" = "v${version}"
       - name: Build server binary
         env:
           TARGET: ${{ matrix.target }}
@@ -125,13 +133,29 @@ jobs:
           package_dir="dist/package-${TARGET}"
           mkdir -p "$package_dir"
           install -m 0755 "target/${TARGET}/release/mc-server" "$package_dir/solaris"
-          install -m 0644 README.md LICENSE-APACHE LICENSE-MIT "$package_dir/"
+          install -m 0644 README.md example.toml LICENSE-APACHE LICENSE-MIT "$package_dir/"
           printf '%s\n' "$GITHUB_REF_NAME" > "$package_dir/VERSION"
           tar -C "$package_dir" -czf "dist/${asset}" \
-            solaris README.md LICENSE-APACHE LICENSE-MIT VERSION
+            solaris README.md example.toml LICENSE-APACHE LICENSE-MIT VERSION
           (
             cd dist
             sha256sum "$asset" > "${asset}.sha256"
+          )
+      - name: Smoke release asset
+        env:
+          TARGET: ${{ matrix.target }}
+          TAG: ${{ github.ref_name }}
+        run: |
+          set -euo pipefail
+          archive="dist/solaris-${TARGET}.tar.gz"
+          smoke_dir="dist/smoke-${TARGET}"
+          mkdir -p "$smoke_dir"
+          tar -xzf "$archive" -C "$smoke_dir"
+          test "$(cat "$smoke_dir/VERSION")" = "$TAG"
+          test "$("$smoke_dir/solaris" --version)" = "mc-server ${TAG#v}"
+          (
+            cd "$smoke_dir"
+            ./solaris --check --config example.toml >/dev/null
           )
       - uses: actions/upload-artifact@v4
         with:
@@ -150,6 +174,7 @@ jobs:
     permissions:
       contents: write
     steps:
+      - uses: actions/checkout@v4
       - uses: actions/download-artifact@v4
         with:
           pattern: solaris-*
@@ -161,12 +186,18 @@ jobs:
           TAG: ${{ github.ref_name }}
         run: |
           set -euo pipefail
+          release_args=(--repo "$GITHUB_REPOSITORY" --verify-tag --title "Solaris ${TAG}")
+          if [[ "$TAG" == *-* ]]; then
+            release_args+=(--prerelease)
+          fi
+          notes_file="docs/releases/${TAG}.md"
+          if [[ -f "$notes_file" ]]; then
+            release_args+=(--notes-file "$notes_file")
+          else
+            release_args+=(--generate-notes)
+          fi
           gh release view "$TAG" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1 || \
-            gh release create "$TAG" \
-              --repo "$GITHUB_REPOSITORY" \
-              --verify-tag \
-              --generate-notes \
-              --title "Solaris ${TAG}"
+            gh release create "$TAG" "${release_args[@]}"
           gh release upload "$TAG" \
             --repo "$GITHUB_REPOSITORY" \
             --clobber \

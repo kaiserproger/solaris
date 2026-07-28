@@ -7,38 +7,42 @@ and is not startup context.
 
 ## Current Checkpoint
 
-- Date: 2026-07-27.
+- Date: 2026-07-28.
 - Branch: `main`.
-- Checkpoint base: `6082385` (`feat(play): add villager kill gossip and stabilize tests`),
-  after `45a047d` (`feat(play): add villager gossip transfer`), `00168d6`
-  (`feat(play): add villager hurt gossip`) and `5fa3f2b` (`feat(play): add villager
-  trading reputation`). The old Loader cursor is not the active Solaris checkpoint.
-- `6082385` already closed player-caused villager death gossip: living indexed
-  villager witnesses within the victim's bounded follow-range cube receive exact
-  `MAJOR_NEGATIVE +25` through stale-fenced recursively split regional CAS batches.
-  Replayed or stale victims cannot duplicate the event. Documentation had not been
-  advanced and incorrectly still listed `VILLAGER_KILLED` as open.
-- The current closeout models the remaining vanilla `MINOR_POSITIVE` and
-  `MAJOR_POSITIVE` gossip fields. `ZOMBIE_VILLAGER_CURED` atomically adds `+25` and
-  `+20`; total reputation uses weights `+1` and `+5`; daily decay is `1` and `0`;
-  transfer decay is `5` and `20`. The persistent schema intentionally has no
-  compatibility defaults for these new alpha fields: older gossip snapshots fail
-  loading rather than being silently migrated.
-- Transfer now includes all five vanilla gossip types under the existing bounded
-  ten-draw Java-legacy `nextInt(bound)` shape. A capped `MINOR_POSITIVE 25` entry can
-  transfer as `20`; a capped `MAJOR_POSITIVE 20` entry decays to zero on transfer and
-  therefore everlasting cure memory does not propagate. The deterministic Solaris
-  seed boundary remains unchanged and bit-for-bit vanilla entry selection is not
-  claimed.
-- Positive values persist through the existing entity checkpoint and immediately
-  affect merchant special pricing through the shared weighted reputation authority.
-  Oracle paths and fingerprints are recorded in
-  `docs/evidence/villager-positive-gossip-26.1.2.md` and the transfer fact sheet.
-- Solaris still lacks zombie-villager curing/conversion gameplay, so no production
-  path emits `ZombieVillagerCured` yet. Conversion timing, ingredients/effects,
-  entity replacement, advancement/sound, Hero of the Village pricing, village
-  population/defence policy and species-specific `UnsupportedSpecial` attacks remain
-  open.
+- Checkpoint base: `f0a8729` (`feat(play): add positive villager gossip`), after
+  `6082385` closed villager-kill witness gossip. All five vanilla gossip types now
+  share the retained pricing/decay/transfer authority; production zombie-villager
+  curing, Hero pricing, village population/defence and species-specific
+  `UnsupportedSpecial` attacks remain open gameplay work.
+- The active checkpoint prepares the first honest public alpha,
+  `v0.0.1-alpha.1`. Workspace package metadata and `Cargo.lock` use the prerelease
+  version and the real repository URL. README/release notes describe a public test
+  release without replacement-readiness, migration, full parity, production-fleet,
+  Windows or macOS claims.
+- The public starter config is local-only (`127.0.0.1`), VD8, balanced autoscale,
+  and an ordinary `world` directory. Its server policy/startup/cache expectations
+  have exact tests. A missing fresh world directory is documented as expected;
+  unsafe public offline mode and unusable/stale data paths remain blockers.
+- Tag releases require exact `v${workspace.package.version}`, package README,
+  `example.toml`, licenses and VERSION beside the binary, smoke the native archive,
+  and mark hyphenated tags as GitHub prereleases. Pinned release notes live at
+  `docs/releases/v0.0.1-alpha.1.md`; the complete publication/remaining-work plan
+  lives at `docs/PUBLIC_ALPHA_PLAN.md`.
+- Local release-candidate evidence is green: workspace strict Clippy, formatter,
+  code-health, locked release build, all-target test shards (including `mc-net`,
+  `mc-server`, `mc-test-harness`, `mc-world` benches and `mc-worldgen`),
+  `RUSTFLAGS=-D warnings` all-target compilation, Loader fixture/platform tests,
+  installer tests, release binary version/config check, and local archive smoke.
+  The monolithic all-target command exceeded the CodexPro wall-clock after green
+  completed shards; the equivalent package shards terminated successfully.
+- The independent read-only release-diff review found two documentation-only
+  closeout sequencing issues: the plan and memory must not claim a commit exists
+  before it is created. They were fixed by creating the release-preparation commit
+  before marking the local checkpoint complete; no second reviewer was run. The
+  reviewed release-preparation checkpoint is locally complete. Publication still
+  requires pushing `main`, green main CI, an immutable annotated tag push, green
+  release matrix, visible GitHub prerelease verification, published installer
+  smoke, and one post-release real 26.1.2 client join.
 - The performance baseline remains as recorded by `17fb424`: debug/release
   20-client VD8 and bounded replay/soak gates pass; O3 explosion authority is
   still above the frozen p99 budget, and exact low/high cgroups plus long soaks

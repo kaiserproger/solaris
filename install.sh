@@ -94,7 +94,7 @@ declare -A seen_entries=()
 binary_entries=0
 while IFS= read -r entry; do
   case "$entry" in
-    solaris|README.md|LICENSE-APACHE|LICENSE-MIT|VERSION) ;;
+    solaris|README.md|example.toml|LICENSE-APACHE|LICENSE-MIT|VERSION) ;;
     /*|../*|*/../*|*/..) fail "unsafe path in release archive: $entry" ;;
     *) fail "unexpected path in release archive: $entry" ;;
   esac

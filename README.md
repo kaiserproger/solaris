@@ -6,13 +6,32 @@ Solaris is an authoritative server implementing the vanilla 26.1 Java protocol
 plus a custom protocol extension consumed by a Fabric/NeoForge client mod. See
 [`docs/PROJECT_SPEC.md`](docs/PROJECT_SPEC.md) for the full design document.
 
-**Status:** stabilization-alpha/private vanilla-near baseline in active
-development. Solaris is not release-ready. Validate compatibility and readiness
-against:
+**Status:** public alpha for Minecraft Java Edition 26.1.2. Solaris is suitable
+for testing, development servers, plugin experiments, and bounded multiplayer
+sessions. It is **not** a production-safe drop-in replacement for vanilla or an
+existing server fleet. Persistence schemas, plugin APIs, and client-extension
+contracts may break between alpha releases without migration support.
+
+The public alpha ships Linux x86_64 and AArch64 binaries. Windows and macOS have
+no prebuilt artifacts. Validate broader compatibility and replacement-readiness
+claims against:
 [docs/REPLACEMENT_READINESS.md](docs/REPLACEMENT_READINESS.md),
-[docs/VALIDATION_LEDGER.md](docs/VALIDATION_LEDGER.md),
-[docs/VALIDATION_COVERAGE_AUDIT.md](docs/VALIDATION_COVERAGE_AUDIT.md)
-before making compatibility or readiness claims.
+[docs/VALIDATION_LEDGER.md](docs/VALIDATION_LEDGER.md), and
+[docs/VALIDATION_COVERAGE_AUDIT.md](docs/VALIDATION_COVERAGE_AUDIT.md).
+
+### Alpha boundaries
+
+- Exact target: unmodified Minecraft Java Edition `26.1.2`.
+- Ordinary survival, persistence, multiplayer, mobs, merchant trading, and Lua
+  plugins are implemented far enough for public testing, not full vanilla parity.
+- Some species-specific mob attacks, village population/defence, zombie-villager
+  curing, Hero of the Village pricing, rare redstone/vehicle behavior, and broad
+  performance envelopes remain incomplete.
+- Existing Solaris worlds and plugins may require deletion or manual adaptation
+  after an alpha update. Backward compatibility is not promised before `1.0`.
+- Report reproducible bugs with the server version, config, client version, logs,
+  and the smallest reproduction. The remaining release path is tracked in
+  [`docs/PUBLIC_ALPHA_PLAN.md`](docs/PUBLIC_ALPHA_PLAN.md).
 
 ## Build
 
@@ -23,22 +42,24 @@ cargo build
 Use debug builds for development; release builds are reserved for CI/owner-run
 checks.
 
-## Install a tagged Linux build
+## Install the public alpha on Linux
 
 Tagged releases publish SHA-256-verified server archives for Linux x86_64 and
-AArch64. Solaris is still stabilization-alpha, so treat installed binaries as
-test builds rather than replacement-ready production releases.
-
-```sh
-curl -fsSL https://raw.githubusercontent.com/kaiserproger/solaris/main/install.sh | bash
-```
-
-The installer writes `solaris` to `$HOME/.local/bin` for a regular user and to
-`/usr/local/bin` when run as root. Override the destination or pin a release:
+AArch64. Prereleases are deliberately not resolved through GitHub's `latest`
+alias, so pin the alpha tag explicitly:
 
 ```sh
 curl -fsSL https://raw.githubusercontent.com/kaiserproger/solaris/main/install.sh | \
-  SOLARIS_INSTALL_DIR="$HOME/bin" SOLARIS_VERSION="v0.1.0" bash
+  SOLARIS_VERSION="v0.0.1-alpha.1" bash
+```
+
+The installer writes `solaris` to `$HOME/.local/bin` for a regular user and to
+`/usr/local/bin` when run as root. Override the destination while keeping the
+release pinned:
+
+```sh
+curl -fsSL https://raw.githubusercontent.com/kaiserproger/solaris/main/install.sh | \
+  SOLARIS_INSTALL_DIR="$HOME/bin" SOLARIS_VERSION="v0.0.1-alpha.1" bash
 ```
 
 The script downloads the matching GitHub release archive, verifies its published
@@ -116,11 +137,11 @@ cargo run --release --bin mc-server -- --check --config server-run.toml
 cargo run --release --bin mc-server -- --config server-run.toml
 ```
 
-The `--check` JSON includes `operator_warnings`. Treat non-empty warnings as
-deployment readiness blockers; for example, public binds with offline-mode auth
-or `allow_local_dev_operators` are not production-safe, and a missing or
-unusable `[data].world_dir` or stale `data.vanilla_data_dir` means chunk
-streaming, persistence, or data/protocol readiness is not ready.
+The `--check` JSON includes `operator_warnings`. Review every warning before
+serving. A fresh `world_dir_missing_on_disk` warning is expected when creating a
+new world and `serve` will create that directory. Public binds with offline-mode
+auth or `allow_local_dev_operators` are unsafe, while an unusable world path or
+stale `data.vanilla_data_dir` is a real persistence/data readiness blocker.
 
 Then connect a vanilla 26.1.2 PrismLauncher client to the configured address.
 
