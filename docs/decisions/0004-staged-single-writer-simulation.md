@@ -181,15 +181,39 @@ dynamic shapes only after the embedded collision table accepts the exact
 block-state fingerprint; unknown or altered states keep the conservative
 material fallback.
 
-The first Prompt 03B player transaction moves item-entity claim and inventory
-credit into one owner operation. The command validates the observed item
-identity, computes capacity from the registered player snapshot, and either
-commits the entity remainder/removal plus the complete updated inventory or
-does neither. The owner dispatches take/update/despawn visibility events before
-responding, so requester loss after application cannot lose the credit or its
-entity event. The connection only mirrors the returned inventory snapshot for
-wire encoding. Until all inventory actions migrate, a deliberately named
-legacy sync hands the connection-owned inventory mirror to the registered
+The first Prompt 03B player transaction originally moved item-entity claim and
+inventory credit into one session-owner operation. The first public-alpha run
+showed that the regional entity actor could spend 38-79 ms committing its
+journal while `SessionRegistryInner` and `PlayerPersistedState` were held. The
+production path is now a staged exact transaction instead:
+
+1. copy the current item snapshot, player position, and complete registered
+   inventory state without retaining either session or player guards;
+2. install a runtime-only owner claim token through a checkpoint-only regional
+   full-snapshot CAS; the stack itself remains unchanged;
+3. recheck the current session identity/range, release the session guard, and
+   commit the complete player inventory only if mode, survival state, inventory,
+   and selected slot still match the plan;
+4. resolve that token through one checkpoint-only owner command against the current
+   entity snapshot, preserving newer kinematics while applying the exact
+   remainder/removal;
+5. publish the immutable resolved entity result under one short session guard.
+
+A stale session or player plan resolves the same token back to an available full
+stack without overwriting newer motion. The regional owner treats the token as an
+exclusive item reservation: pickup, merge, remove, stack replacement, lifecycle
+replacement, and damage fail closed, while kinematics may continue and are preserved
+at resolution. Claim installation, rollback, and finalize do
+not append independent regional journal decisions: production saves capture both
+player and entity state through the simulation-owner `SaveBarrier`, and the direct
+snapshot path is used only after that owner has drained. A crash before the next
+barrier therefore replays both pre-pickup states; a completed barrier contains both
+post-pickup states. The runtime token is also omitted from serialized checkpoints.
+Visibility is emitted only after both resource commits. Requester loss after
+application still cannot lose the credit or its entity event. The connection only
+mirrors the returned inventory
+snapshot for wire encoding. Until all inventory actions migrate, a deliberately
+named legacy sync hands the connection-owned inventory mirror to the registered
 snapshot immediately before this transaction; it is transitional debt, not a
 claim that the full player aggregate is owner-controlled.
 

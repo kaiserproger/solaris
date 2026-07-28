@@ -2,19 +2,21 @@ use super::entity_lifecycle::{
     clear_removed_entity_tracking_locked, nearby_entity_candidate_ids_locked,
     track_entity_chunk_locked,
 };
+use super::entity_owner::EntityOwnerAccess;
 use super::interaction_geometry::{distance_sq, entity_aabb};
 use super::outbound::{OutboundCommand, SessionRecipient, VisibilityDispatch};
 use super::visibility::{despawn_entity_visibility_locked, ordered_session_recipient};
 use super::{
     ServerEntitySnapshot, SessionEntityGuards, SessionId, SessionRegistry, SessionRegistryInner,
-    initialize_entity_wire_state_locked, schedule_item_despawn_locked, server_entity_snapshot_from,
-    session_recipients, spawn_entity_visibility_from_snapshot_locked,
-    spawn_entity_visibility_locked, spawned_xp_observer_ids, visible_entity_observers_locked,
+    initialize_entity_wire_state_from_snapshot_locked, initialize_entity_wire_state_locked,
+    schedule_item_despawn_locked, server_entity_snapshot_from, session_recipients,
+    spawn_entity_visibility_from_snapshot_locked, spawn_entity_visibility_locked,
+    spawned_xp_observer_ids, visible_entity_observers_locked,
 };
 use crate::play::GameMode;
 use crate::play::campfire::PendingCampfireOutput;
 use crate::play::inventory::{PlayerInventory, can_stack, item_max_stack};
-use crate::play::persistence::XpState;
+use crate::play::persistence::{PlayerPersistedState, XpState};
 use crate::play::simulation::SimulationAuthority;
 use mc_entity::{
     EntityId, EntityItemPickupOwnerBlock, EntityItemStack, EntityLifecycle, EntitySnapshot,
@@ -22,7 +24,8 @@ use mc_entity::{
 };
 use mc_protocol::packets::play::ItemStack;
 use std::collections::HashSet;
-use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Mutex};
 use std::time::Instant;
 use tracing::warn;
 
@@ -30,6 +33,7 @@ pub(in crate::play) const ENTITY_PICKUP_RADIUS: f64 = 2.25;
 pub(in crate::play) const ITEM_PICKUP_DELAY_TICKS: u64 = 4;
 const ITEM_MERGE_RADIUS: f64 = 0.5;
 const PLAYER_ITEM_OWNER_PICKUP_BLOCK_TICKS: u64 = 100;
+static NEXT_ITEM_PICKUP_CLAIM: AtomicU64 = AtomicU64::new(1);
 
 #[cfg(test)]
 #[derive(Debug)]
@@ -52,6 +56,28 @@ struct ClaimedPickupParts {
     collector_entity_id: i32,
     snapshot: ServerEntitySnapshot,
     recipients: Vec<SessionRecipient>,
+}
+
+#[derive(Debug)]
+struct ItemEntityClaim {
+    entity_id: EntityId,
+    claim: u64,
+    position: Vec3,
+    original_stack: EntityItemStack,
+    remaining_stack: Option<EntityItemStack>,
+    picked: EntityItemStack,
+}
+
+#[derive(Debug)]
+struct ItemPickupPlayerPlan {
+    player_state: Arc<Mutex<PlayerPersistedState>>,
+    expected_game_mode: GameMode,
+    expected_survival: crate::play::SurvivalState,
+    expected_inventory: PlayerInventory,
+    expected_selected_hotbar_slot: u8,
+    updated_inventory: PlayerInventory,
+    changed_slots: Vec<(usize, ItemStack)>,
+    credited_count: i32,
 }
 
 #[cfg(test)]
@@ -148,8 +174,8 @@ impl SessionRegistry {
                             if entity.item_stack.is_none() {
                                 return true;
                             }
-                            let blocked =
-                                entity
+                            let blocked = entity.retained.item_pickup_claim.is_some()
+                                || entity
                                     .retained
                                     .item_pickup_owner_block
                                     .is_some_and(|block| {
@@ -265,8 +291,31 @@ impl SessionRegistry {
         position: Vec3,
         stack: EntityItemStack,
     ) -> Vec<VisibilityDispatch> {
-        let mut inner = self.lock_session_entities("spawn item drop");
-        spawn_item_drop_locked(&mut inner, entity_type_id, position, stack)
+        if stack.is_empty() {
+            return Vec::new();
+        }
+        let lifecycle_tick = self.simulation_tick();
+        let entity = item_drop_entity(entity_type_id, position, stack, lifecycle_tick);
+        let owner_started = Instant::now();
+        let snapshots = {
+            let mut entities = self.lock_entities("commit item drop");
+            entities.spawn_unique_batch([entity])
+        };
+        let owner_commit_us = owner_started.elapsed().as_micros() as u64;
+        assert_eq!(
+            snapshots.len(),
+            1,
+            "regional entity owner returned a partial successful item-drop spawn"
+        );
+        let publish_started = Instant::now();
+        let dispatches = self.publish_item_drop_snapshots(snapshots);
+        tracing::debug!(
+            owner_commit_us,
+            publish_us = publish_started.elapsed().as_micros() as u64,
+            dispatches = dispatches.len(),
+            "item drop transaction phases"
+        );
+        dispatches
     }
 
     pub(in crate::play) fn try_spawn_item_drop_batch_owned(
@@ -284,41 +333,65 @@ impl SessionRegistry {
             return Err(mc_entity::RegionOwnerLaneError::InvalidMutation);
         }
 
-        let mut inner = self.lock_session_entities("spawn item drop batch");
-        let lifecycle_tick = inner.entity_lifecycle_tick;
-        let ready_tick = lifecycle_tick.saturating_add(ITEM_PICKUP_DELAY_TICKS);
-        let entities = drops.iter().map(|(entity_type_id, position, stack)| {
-            let mut entity = SpawnEntity::new(*entity_type_id, "minecraft:item", *position);
-            entity.velocity = item_drop_velocity(*position, stack, lifecycle_tick);
-            entity.item_stack = Some(stack.clone());
-            entity.retained.spawn_tick = lifecycle_tick;
-            entity.retained.item_pickup_ready_tick = Some(ready_tick);
-            entity
+        let expected_count = drops.len();
+        let lifecycle_tick = self.simulation_tick();
+        let entities = drops.into_iter().map(|(entity_type_id, position, stack)| {
+            item_drop_entity(entity_type_id, position, stack, lifecycle_tick)
         });
-        let ids = inner.entities.try_spawn_batch(entities)?;
+        let owner_started = Instant::now();
+        let snapshots = {
+            let mut owner = self.lock_entities("commit item drop batch");
+            owner.try_spawn_unique_batch(entities)?
+        };
+        let owner_commit_us = owner_started.elapsed().as_micros() as u64;
         assert_eq!(
-            ids.len(),
-            drops.len(),
-            "regional entity owner returned a partial successful spawn batch"
+            snapshots.len(),
+            expected_count,
+            "regional entity owner returned a partial successful item-drop batch"
         );
+        let entity_count = snapshots.len();
+        let publish_started = Instant::now();
+        let dispatches = self.publish_item_drop_snapshots(snapshots);
+        tracing::debug!(
+            owner_commit_us,
+            publish_us = publish_started.elapsed().as_micros() as u64,
+            entity_count,
+            dispatches = dispatches.len(),
+            "item drop batch transaction phases"
+        );
+        Ok(dispatches)
+    }
 
+    fn publish_item_drop_snapshots(
+        &self,
+        snapshots: Vec<EntitySnapshot>,
+    ) -> Vec<VisibilityDispatch> {
+        let mut inner = self.lock_inner("publish item drop");
         let mut dispatches = Vec::new();
-        for (id, (entity_type_id, position, _)) in ids.into_iter().zip(drops) {
-            schedule_item_despawn_locked(&mut inner, id, lifecycle_tick);
-            inner
-                .item_pickup_ready
-                .entry(ready_tick)
-                .or_default()
-                .push(id);
+        for snapshot in snapshots {
+            let spawn_tick = snapshot.retained.spawn_tick;
+            let ready_tick = snapshot.retained.item_pickup_ready_tick;
+            let published = server_entity_snapshot_from(snapshot);
+            let entity_id = published.id;
+            schedule_item_despawn_locked(&mut inner, entity_id, spawn_tick);
+            if let Some(ready_tick) = ready_tick {
+                inner
+                    .item_pickup_ready
+                    .entry(ready_tick)
+                    .or_default()
+                    .push(entity_id);
+            }
             inner
                 .entity_type_aabbs
-                .entry(entity_type_id)
+                .entry(published.type_id)
                 .or_insert_with(|| entity_aabb("minecraft:item"));
-            track_entity_chunk_locked(&mut inner, id, position);
-            initialize_entity_wire_state_locked(&mut inner, id);
-            dispatches.extend(spawn_entity_visibility_locked(&mut inner, id));
+            track_entity_chunk_locked(&mut inner, entity_id, published.position);
+            initialize_entity_wire_state_from_snapshot_locked(&mut inner, &published);
+            dispatches.extend(spawn_entity_visibility_from_snapshot_locked(
+                &mut inner, published,
+            ));
         }
-        Ok(dispatches)
+        dispatches
     }
 
     pub(in crate::play) fn materialize_pending_campfire_outputs_owned(
@@ -473,39 +546,82 @@ impl SessionRegistry {
         if max_stack <= 0 {
             return None;
         }
-        let (parts, inventory, changed_slots) = {
-            let mut inner = self.lock_session_entities("credit item pickup");
-            let snapshot = inner.entities.snapshot(entity_id)?;
-            if snapshot.lifecycle != EntityLifecycle::Alive {
+        let lifecycle_tick = self.simulation_tick();
+        let snapshot = {
+            let entities = self.lock_entities("snapshot item pickup");
+            entities.snapshot(entity_id)?
+        };
+        let snapshot = if snapshot
+            .retained
+            .item_pickup_owner_block
+            .is_some_and(|block| lifecycle_tick >= block.expires_tick)
+        {
+            let mut normalized = snapshot.clone();
+            normalized.retained.item_pickup_owner_block = None;
+            let applied = {
+                let mut entities = self.lock_entities("clear expired item pickup owner block");
+                entities.replace_snapshot_if_current(snapshot, normalized.clone())
+            };
+            if !applied {
                 return None;
             }
-            let stack = snapshot.item_stack.clone()?;
-            if stack.count <= 0
-                || stack.item_id != expected_item_id
-                || stack.damage != expected_damage
-                || stack.enchantments != expected_enchantments
-            {
-                return None;
-            }
+            normalized
+        } else {
+            snapshot
+        };
+        let stack = snapshot.item_stack.clone()?;
+        if snapshot.lifecycle != EntityLifecycle::Alive
+            || stack.count <= 0
+            || stack.item_id != expected_item_id
+            || stack.damage != expected_damage
+            || stack.enchantments != expected_enchantments
+            || snapshot.retained.item_pickup_claim.is_some()
+            || snapshot
+                .retained
+                .item_pickup_ready_tick
+                .is_some_and(|ready_tick| lifecycle_tick < ready_tick)
+            || snapshot
+                .retained
+                .item_pickup_owner_block
+                .is_some_and(|block| {
+                    block.owner_session == collector_session && lifecycle_tick < block.expires_tick
+                })
+        {
+            return None;
+        }
+        let (player_state, planned_player_position) = {
+            let inner = self.lock_inner("plan item pickup session");
+            let session = inner.sessions.get(&collector_session)?;
             let player_state = inner.player_persistence.get(&collector_session).cloned()?;
+            (
+                player_state,
+                Vec3::new(session.pose.x, session.pose.y, session.pose.z),
+            )
+        };
+        if distance_sq(snapshot.position, planned_player_position)
+            > ENTITY_PICKUP_RADIUS * ENTITY_PICKUP_RADIUS
+        {
+            return None;
+        }
+        let plan = {
             let wait_started = Instant::now();
             let guard = player_state.lock().unwrap_or_else(|poisoned| {
                 warn!(
                     session_id = collector_session,
-                    "player persistence mutex was poisoned during item pickup; recovering state"
+                    "player persistence mutex was poisoned during item pickup planning; recovering state"
                 );
                 poisoned.into_inner()
             });
-            let mut player_state = crate::lock_metrics::timed_guard(
+            let player = crate::lock_metrics::timed_guard(
                 crate::lock_metrics::LockMetricKind::PlayerPersistence,
-                "credit item pickup",
+                "plan item pickup",
                 wait_started,
                 guard,
             );
-            if player_state.game_mode == GameMode::Spectator || player_state.survival.is_dead() {
+            if player.game_mode == GameMode::Spectator || player.survival.is_dead() {
                 return None;
             }
-            let mut inventory = player_state.inventory.clone();
+            let mut updated_inventory = player.inventory.clone();
             let probe = ItemStack {
                 item_id: stack.item_id,
                 count: stack.count,
@@ -514,10 +630,10 @@ impl SessionRegistry {
                 custom_name: stack.custom_name.as_deref().cloned(),
                 item_model: stack.item_model.as_deref().cloned().map(Arc::new),
             };
-            let (remaining, changed_slots) = inventory.merge_pickup_stack(
+            let (remaining, changed_slots) = updated_inventory.merge_pickup_stack(
                 probe,
                 max_stack,
-                player_state.selected_hotbar_slot,
+                player.selected_hotbar_slot,
             )?;
             let remaining_count = if remaining.is_empty() {
                 0
@@ -528,19 +644,147 @@ impl SessionRegistry {
             if credited_count <= 0 || changed_slots.is_empty() {
                 return None;
             }
-            #[cfg(test)]
-            self.pause_after_item_pickup_plan_for_test();
-            let parts =
-                claim_item_pickup_locked(&mut inner, snapshot, collector_session, credited_count)?;
-            debug_assert_eq!(parts.picked.count, credited_count);
-            player_state.replace_inventory(inventory.clone());
-            (parts, inventory, changed_slots)
+            ItemPickupPlayerPlan {
+                player_state: Arc::clone(&player_state),
+                expected_game_mode: player.game_mode,
+                expected_survival: player.survival,
+                expected_inventory: player.inventory.clone(),
+                expected_selected_hotbar_slot: player.selected_hotbar_slot,
+                updated_inventory,
+                changed_slots,
+                credited_count,
+            }
         };
+        #[cfg(test)]
+        self.pause_after_item_pickup_plan_for_test();
+        let owner_started = Instant::now();
+        let claim = {
+            let mut entities = self.lock_entities("claim item pickup entity");
+            #[cfg(test)]
+            self.pause_at_item_pickup_owner_boundary_for_test();
+            claim_item_entity(&mut entities, snapshot, plan.credited_count)?
+        };
+        #[cfg(test)]
+        self.pause_after_item_pickup_claim_for_test();
+        let owner_claim_us = owner_started.elapsed().as_micros() as u64;
+        let session_started = Instant::now();
+        let session_valid = {
+            let inner = self.lock_inner("validate item pickup session");
+            let current_player_state = inner.player_persistence.get(&collector_session);
+            inner
+                .sessions
+                .get(&collector_session)
+                .is_some_and(|session| {
+                    let current = Vec3::new(session.pose.x, session.pose.y, session.pose.z);
+                    distance_sq(claim.position, current)
+                        <= ENTITY_PICKUP_RADIUS * ENTITY_PICKUP_RADIUS
+                })
+                && current_player_state
+                    .is_some_and(|current| Arc::ptr_eq(current, &plan.player_state))
+        };
+        let session_validate_us = session_started.elapsed().as_micros() as u64;
+        if !session_valid {
+            let rolled_back = {
+                let mut entities = self.lock_entities("rollback rejected item pickup claim");
+                entities.resolve_item_pickup_claim(
+                    claim.entity_id,
+                    claim.claim,
+                    Some(claim.original_stack.clone()),
+                )
+            };
+            assert!(
+                matches!(
+                    rolled_back,
+                    Some(mc_entity::ItemPickupClaimResolution::Updated(_))
+                ),
+                "item pickup claim rollback must resolve the exact token"
+            );
+            return None;
+        }
+        let player_started = Instant::now();
+        let player_committed = {
+            let wait_started = Instant::now();
+            let guard = plan.player_state.lock().unwrap_or_else(|poisoned| {
+                warn!(
+                    session_id = collector_session,
+                    "player persistence mutex was poisoned during item pickup commit; recovering state"
+                );
+                poisoned.into_inner()
+            });
+            let mut player = crate::lock_metrics::timed_guard(
+                crate::lock_metrics::LockMetricKind::PlayerPersistence,
+                "credit item pickup",
+                wait_started,
+                guard,
+            );
+            if player.game_mode != plan.expected_game_mode
+                || player.survival != plan.expected_survival
+                || player.inventory.slots != plan.expected_inventory.slots
+                || player.selected_hotbar_slot != plan.expected_selected_hotbar_slot
+            {
+                false
+            } else {
+                player.replace_inventory(plan.updated_inventory.clone());
+                true
+            }
+        };
+        let player_commit_us = player_started.elapsed().as_micros() as u64;
+        if !player_committed {
+            let rolled_back = {
+                let mut entities = self.lock_entities("rollback rejected item pickup claim");
+                entities.resolve_item_pickup_claim(
+                    claim.entity_id,
+                    claim.claim,
+                    Some(claim.original_stack.clone()),
+                )
+            };
+            assert!(
+                matches!(
+                    rolled_back,
+                    Some(mc_entity::ItemPickupClaimResolution::Updated(_))
+                ),
+                "item pickup claim rollback must resolve the exact token"
+            );
+            return None;
+        }
+        let finalize_started = Instant::now();
+        let resolution = {
+            let mut entities = self.lock_entities("finalize item pickup claim");
+            entities.resolve_item_pickup_claim(
+                claim.entity_id,
+                claim.claim,
+                claim.remaining_stack.clone(),
+            )
+        }
+        .expect("committed player credit must retain its exact item claim");
+        let owner_finalize_us = finalize_started.elapsed().as_micros() as u64;
+        let publish_started = Instant::now();
+        let parts = {
+            let mut inner = self.lock_inner("publish item pickup");
+            publish_item_entity_claim_locked(
+                &mut inner,
+                resolution,
+                claim.picked.clone(),
+                collector_session,
+            )
+        };
+        let publish_us = publish_started.elapsed().as_micros() as u64;
         let (credited, dispatches) = into_claimed_pickup(entity_id, parts);
+        tracing::debug!(
+            entity_id = entity_id.0,
+            owner_claim_us,
+            owner_finalize_us,
+            session_validate_us,
+            player_commit_us,
+            publish_us,
+            credited_count = credited.count,
+            dispatches = dispatches.len(),
+            "item pickup transaction phases"
+        );
         Some(CreditedItemPickup {
             credited,
-            inventory,
-            changed_slots,
+            inventory: plan.updated_inventory,
+            changed_slots: plan.changed_slots,
             dispatches,
         })
     }
@@ -585,6 +829,70 @@ impl SessionRegistry {
     }
 
     #[cfg(test)]
+    pub(in crate::play) fn install_item_pickup_owner_probe_for_test(
+        &self,
+        reached: std::sync::mpsc::Sender<()>,
+        resume: std::sync::mpsc::Receiver<()>,
+    ) {
+        *self
+            .item_pickup_owner_probe
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) =
+            Some(super::EntityApplyReleaseProbe { reached, resume });
+    }
+
+    #[cfg(test)]
+    fn pause_at_item_pickup_owner_boundary_for_test(&self) {
+        let probe = self
+            .item_pickup_owner_probe
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .take();
+        if let Some(probe) = probe {
+            probe
+                .reached
+                .send(())
+                .expect("item pickup owner probe receiver");
+            probe
+                .resume
+                .recv()
+                .expect("item pickup owner probe release");
+        }
+    }
+
+    #[cfg(test)]
+    pub(in crate::play) fn install_item_pickup_claimed_probe_for_test(
+        &self,
+        reached: std::sync::mpsc::Sender<()>,
+        resume: std::sync::mpsc::Receiver<()>,
+    ) {
+        *self
+            .item_pickup_claimed_probe
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) =
+            Some(super::EntityApplyReleaseProbe { reached, resume });
+    }
+
+    #[cfg(test)]
+    fn pause_after_item_pickup_claim_for_test(&self) {
+        let probe = self
+            .item_pickup_claimed_probe
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .take();
+        if let Some(probe) = probe {
+            probe
+                .reached
+                .send(())
+                .expect("item pickup claimed probe receiver");
+            probe
+                .resume
+                .recv()
+                .expect("item pickup claimed probe release");
+        }
+    }
+
+    #[cfg(test)]
     pub(in crate::play) fn replace_item_stack_after_pickup_plan_for_test(
         &self,
         entity_id: EntityId,
@@ -600,6 +908,23 @@ impl SessionRegistry {
                 .handle
                 .set_item_stack_if_current(snapshot, Some(stack)),
         )
+    }
+
+    #[cfg(test)]
+    pub(in crate::play) fn move_claimed_item_for_test(
+        &self,
+        entity_id: EntityId,
+        position: Vec3,
+    ) -> bool {
+        let Some(snapshot) =
+            super::entity_owner::owner_result(self.entities.handle.snapshot(entity_id))
+        else {
+            return false;
+        };
+        if snapshot.retained.item_pickup_claim.is_none() {
+            return false;
+        }
+        super::entity_owner::owner_result(self.entities.handle.set_position(entity_id, position))
     }
 
     #[cfg(test)]
@@ -854,7 +1179,10 @@ pub(super) fn merge_item_entities_locked(
         let Some(ready) = inner.entities.snapshot(ready_id) else {
             continue;
         };
-        if ready.lifecycle != EntityLifecycle::Alive || ready.type_name != "minecraft:item" {
+        if ready.lifecycle != EntityLifecycle::Alive
+            || ready.type_name != "minecraft:item"
+            || ready.retained.item_pickup_claim.is_some()
+        {
             continue;
         }
         let Some(ready_stack) = ready.item_stack.as_ref() else {
@@ -876,6 +1204,7 @@ pub(super) fn merge_item_entities_locked(
             };
             if candidate.lifecycle != EntityLifecycle::Alive
                 || candidate.type_name != "minecraft:item"
+                || candidate.retained.item_pickup_claim.is_some()
                 || distance_sq(ready.position, candidate.position) > radius_sq
             {
                 continue;
@@ -1058,6 +1387,21 @@ fn spawn_item_drop_entity_locked_inner(
     Some(id)
 }
 
+fn item_drop_entity(
+    entity_type_id: i32,
+    position: Vec3,
+    stack: EntityItemStack,
+    lifecycle_tick: u64,
+) -> SpawnEntity {
+    let mut entity = SpawnEntity::new(entity_type_id, "minecraft:item", position);
+    entity.velocity = item_drop_velocity(position, &stack, lifecycle_tick);
+    entity.item_stack = Some(stack);
+    entity.retained.spawn_tick = lifecycle_tick;
+    entity.retained.item_pickup_ready_tick =
+        Some(lifecycle_tick.saturating_add(ITEM_PICKUP_DELAY_TICKS));
+    entity
+}
+
 fn item_drop_velocity(position: Vec3, stack: &EntityItemStack, simulation_tick: u64) -> Vec3 {
     let seed = position.x.to_bits()
         ^ position.y.to_bits().rotate_left(21)
@@ -1107,6 +1451,94 @@ fn collector_within_pickup_radius_locked(
     distance_sq(entity_position, player_position) <= ENTITY_PICKUP_RADIUS * ENTITY_PICKUP_RADIUS
 }
 
+fn claim_item_entity(
+    entities: &mut EntityOwnerAccess,
+    original: EntitySnapshot,
+    max_count: i32,
+) -> Option<ItemEntityClaim> {
+    if max_count <= 0
+        || original.lifecycle != EntityLifecycle::Alive
+        || original.retained.item_pickup_claim.is_some()
+    {
+        return None;
+    }
+    let original_stack = original.item_stack.clone()?;
+    if original_stack.count <= 0 {
+        return None;
+    }
+    let picked_count = original_stack.count.min(max_count);
+    let picked = EntityItemStack {
+        item_id: original_stack.item_id,
+        count: picked_count,
+        damage: original_stack.damage,
+        enchantments: original_stack.enchantments.clone(),
+        custom_name: original_stack.custom_name.clone(),
+        item_model: original_stack.item_model.clone(),
+    };
+    let remaining_count = original_stack.count - picked_count;
+    let remaining_stack = (remaining_count > 0).then(|| {
+        let mut remaining = original_stack.clone();
+        remaining.count = remaining_count;
+        remaining
+    });
+    let claim = NEXT_ITEM_PICKUP_CLAIM.fetch_add(1, Ordering::Relaxed);
+    let mut claimed = original.clone();
+    claimed.retained.item_pickup_claim = Some(claim);
+    if !entities.replace_snapshot_if_current_deferred_journal(original.clone(), claimed) {
+        return None;
+    }
+    Some(ItemEntityClaim {
+        entity_id: original.id,
+        claim,
+        position: original.position,
+        original_stack,
+        remaining_stack,
+        picked,
+    })
+}
+
+fn publish_item_entity_claim_locked(
+    inner: &mut SessionRegistryInner,
+    resolution: mc_entity::ItemPickupClaimResolution,
+    picked: EntityItemStack,
+    collector_session: SessionId,
+) -> ClaimedPickupParts {
+    match resolution {
+        mc_entity::ItemPickupClaimResolution::Updated(updated) => {
+            let published = server_entity_snapshot_from(updated.clone());
+            inner
+                .published_entity_snapshots
+                .insert(updated.id, published.clone());
+            let recipients =
+                session_recipients(inner, visible_entity_observers_locked(inner, updated.id));
+            inner.entity_dispatches.data += recipients.len() as u64;
+            ClaimedPickupParts {
+                picked,
+                update_entity: true,
+                collector_entity_id: 0,
+                snapshot: published,
+                recipients,
+            }
+        }
+        mc_entity::ItemPickupClaimResolution::Removed(mut removed) => {
+            removed.retained.item_pickup_claim = None;
+            let entity_id = removed.id;
+            let removed = server_entity_snapshot_from(removed);
+            clear_removed_entity_tracking_locked(inner, entity_id);
+            let (collector_entity_id, recipients) =
+                picked_entity_recipients_locked(inner, entity_id, collector_session);
+            ClaimedPickupParts {
+                picked,
+                update_entity: false,
+                collector_entity_id,
+                snapshot: removed,
+                recipients,
+            }
+        }
+    }
+}
+
+#[cfg(test)]
 fn claim_item_pickup_locked(
     inner: &mut SessionEntityGuards<'_>,
     snapshot: EntitySnapshot,
@@ -1289,18 +1721,22 @@ fn into_claimed_arrow(entity_id: EntityId, parts: ClaimedArrowParts) -> Vec<Visi
     )
 }
 
+#[cfg(test)]
 pub(super) fn item_pickup_ready_locked(
     inner: &SessionEntityGuards<'_>,
     entity_id: EntityId,
     lifecycle_tick: u64,
 ) -> bool {
-    inner
-        .entities
-        .snapshot(entity_id)
-        .and_then(|entity| entity.retained.item_pickup_ready_tick)
-        .is_none_or(|ready_tick| lifecycle_tick >= ready_tick)
+    inner.entities.snapshot(entity_id).is_some_and(|entity| {
+        entity.retained.item_pickup_claim.is_none()
+            && entity
+                .retained
+                .item_pickup_ready_tick
+                .is_none_or(|ready_tick| lifecycle_tick >= ready_tick)
+    })
 }
 
+#[cfg(test)]
 fn item_pickup_owner_blocked_locked(
     inner: &mut SessionEntityGuards<'_>,
     entity_id: EntityId,

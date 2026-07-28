@@ -398,11 +398,18 @@ the production server protocol range. Selected reads reject disagreement with
 coordinator location or UUID indexes.
 `SessionRegistry` owns this runtime directly without a
 `Mutex<RegionalEntityAuthority>`; direct and combined session guards carry a
-cloned owner handle rather than a borrowed store. Complete
-snapshot CAS protects partial pickup and removal. Split owner/session
-publication rechecks exact snapshots before updating the published projection,
-so delayed player push, breeding, grazing, or hostile-arrow output cannot
-overwrite a newer owner mutation. ID-filtered reads are grouped into one
+cloned owner handle rather than a borrowed store. Complete snapshot CAS protects
+partial pickup and removal. Production item-drop creation and item pickup never
+wait for that owner handle while a session or player-persistence guard is held:
+committed drop snapshots are published afterward, while pickup uses a runtime-only
+owner claim token, separate session/player validation, exact token resolution on
+the current snapshot, and only then short visibility publication. Claim install,
+rollback, and finalize are checkpoint-only owner mutations: the simulation
+`SaveBarrier` is the durable pairing point for player and entity state, and the
+direct snapshot path is used only after simulation-owner drain. Split
+owner/session publication rechecks exact snapshots before updating the published
+projection, so delayed player push, breeding, grazing, or hostile-arrow output
+cannot overwrite a newer owner mutation. ID-filtered reads are grouped into one
 request per lane, breeding uses owner-maintained indexes, UUID checks use the
 coordinator index, and physics reuses a batch-prefetched snapshot set.
 Owner lanes now support live scale-up and scale-down. At an idle owner-command

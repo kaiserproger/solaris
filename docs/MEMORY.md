@@ -9,9 +9,9 @@ and is not startup context.
 
 - Date: 2026-07-28.
 - Branch: `main`.
-- Checkpoint base: `1347df9` (`chore(release): prepare v0.0.1-alpha.1`). The
-  first owner-run public-alpha session is now the routing authority for the next
-  stabilization release; its exact plan is `docs/PUBLIC_ALPHA_PLAN.md`.
+- Checkpoint base: `6eabc1b` (`fix(protocol): publish 26.1.2 overworld clock`).
+  The first owner-run public-alpha session remains the routing authority for the
+  next stabilization release; its exact plan is `docs/PUBLIC_ALPHA_PLAN.md`.
 - The strong baseline must be preserved: seed `712816`, VD16 and one local player
   pre-generated 225 chunks at 929.473 chunks/s, streamed every requested chunk
   without degradation or memory-pressure shedding, used roughly 300 MiB by owner
@@ -28,10 +28,24 @@ and is not startup context.
   every generated origin. Revision 10 must remove those fixtures and select a safe
   spawn from the generated seed-driven Earth-like terrain instead of deforming
   terrain around `(0,0)`.
-- P0 lock defect is confirmed: item spawn/pickup synchronously waits on the
-  regional entity owner while `SessionRegistryInner` is held; pickup additionally
-  nests `PlayerPersistedState`. The owner log recorded 369 M39 warnings and six
-  55-81 ms ticks. Raising warning thresholds is not a fix.
+- The current P0 lock checkpoint removes the confirmed public-alpha defect.
+  Production item-drop owner commits finish before short session publication.
+  Item pickup plans from immutable snapshots, installs one runtime-only regional
+  claim token, validates session and player state without nested waits, and resolves
+  that token against the current entity snapshot so rollback preserves newer motion.
+  The regional owner blocks competing stack/remove/merge/lifecycle/damage mutations
+  during the claim while allowing kinematics. Claim install/rollback/finalize are
+  checkpoint-only; the simulation `SaveBarrier`
+  captures matching player and entity state, while the direct save path is only used
+  after owner drain. Debug phase timings cover owner claim/finalize, session, player,
+  and publication. Deterministic lock, checkpoint, and interleaving tests prove
+  progress, conservation, and crash consistency; `mc-net` passes 1827/1827. The
+  200-action release-candidate latency/M39 gate remains pending.
+- The single independent lock-diff review session exhausted its 180-second limit
+  without a verdict. It focused on the real risk that inverse full-snapshot rollback
+  could lose an interleaving motion update. No second reviewer was run; the reviewed
+  design was replaced by current-snapshot token resolution and checkpoint-only
+  durability, with dedicated regressions for both findings.
 - P1 natural spawning remains a chunk-load materialization path with sparse
   deterministic chunk admission, global category caps and no complete continuing
   loaded-chunk spawn cycle. Add independent friendly/hostile attempt cadences,
@@ -539,8 +553,9 @@ two priorities unless it becomes a common-play blocker or corruption risk.
 1. Run the graphical 26.1.2 clock gate on a host with a working display: observe
    at least 600 advancing overworld-clock ticks, one complete visual day and
    restart. The exact wire/TCP implementation is already green.
-2. Remove blocking regional-owner waits from item drop/pickup session and player
-   lock scopes while preserving conservation, stale rejection and restart safety.
+2. Run the 200-action break/drop/pickup gate on the release candidate and require
+   zero relevant M39 warnings, lock-hold p99 below 5 ms, and no item-path tick
+   above 50 ms. The implementation and deterministic lock/race gates are green.
 3. Ship worldgen revision 10: remove fixed starter fixtures and origin terrain
    deformation, add seed-driven safe-spawn selection, and make the procedural
    Earth-like profile the honest public default.

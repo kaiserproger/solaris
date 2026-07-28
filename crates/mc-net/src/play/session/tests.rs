@@ -245,6 +245,42 @@ struct FailOnceEntityCommitJournal {
     commits: Arc<AtomicUsize>,
 }
 
+struct BlockingItemStackCommitJournal {
+    item_id: u32,
+    count: i32,
+    entered: std::sync::mpsc::SyncSender<()>,
+    release: std::sync::mpsc::Receiver<()>,
+}
+
+impl mc_entity::RegionalDecisionJournal for BlockingItemStackCommitJournal {
+    fn record_commit(
+        &mut self,
+        decision: &mc_entity::RegionalCommitDecision,
+    ) -> Result<(), mc_entity::RegionalDecisionJournalError> {
+        if decision.upserts().iter().any(|snapshot| {
+            snapshot
+                .item_stack
+                .as_ref()
+                .is_some_and(|stack| stack.item_id == self.item_id && stack.count == self.count)
+        }) {
+            self.entered
+                .send(())
+                .expect("publish item-stack journal entry");
+            self.release
+                .recv()
+                .expect("release item-stack journal commit");
+        }
+        Ok(())
+    }
+
+    fn clear_commit(
+        &mut self,
+        _phase: mc_entity::RegionPhase,
+    ) -> Result<(), mc_entity::RegionalDecisionJournalError> {
+        Ok(())
+    }
+}
+
 impl mc_entity::RegionalDecisionJournal for FailOnceEntityCommitJournal {
     fn record_commit(
         &mut self,
@@ -4643,6 +4679,64 @@ fn committed_herd_batch_publication_preserves_visibility_order_and_indexes() {
     assert!(inner.sessions[&bob].visible_entities.contains(&west_id));
     assert!(!inner.sessions[&bob].visible_entities.contains(&east_id));
     assert_eq!(inner.entity_dispatches.spawn, 3);
+}
+
+#[test]
+fn item_drop_owner_commit_releases_session_lock() {
+    let (entered_tx, entered_rx) = std::sync::mpsc::sync_channel(0);
+    let (release_tx, release_rx) = std::sync::mpsc::sync_channel(0);
+    let registry = Arc::new(SessionRegistry::new_with_entity_owner_journal(
+        1,
+        Box::new(BlockingItemStackCommitJournal {
+            item_id: 42,
+            count: 3,
+            entered: entered_tx,
+            release: release_rx,
+        }),
+    ));
+    let session = register_test_session(&registry, "ItemDropLockAlice");
+    let drop_registry = Arc::clone(&registry);
+    let drop = std::thread::spawn(move || {
+        drop_registry.spawn_item_drop_owned(
+            &SimulationAuthority::for_test(),
+            1,
+            Vec3::new(0.5, 64.0, 0.5),
+            EntityItemStack::new(42, 3),
+        )
+    });
+
+    entered_rx
+        .recv_timeout(Duration::from_secs(1))
+        .expect("item-drop regional commit entered");
+    assert!(
+        registry.inner.try_lock().is_ok(),
+        "regional item-drop wait must not hold the session registry"
+    );
+    let load_registry = Arc::clone(&registry);
+    let (loaded_tx, loaded_rx) = std::sync::mpsc::channel();
+    let load = std::thread::spawn(move || {
+        let dispatches = load_registry.mark_loaded(session, (0, 0));
+        loaded_tx.send(()).expect("publish mark-loaded completion");
+        dispatches
+    });
+    loaded_rx
+        .recv_timeout(Duration::from_secs(1))
+        .expect("session registry must progress during regional item-drop wait");
+
+    release_tx
+        .send(())
+        .expect("release item-drop regional commit");
+    assert!(load.join().expect("mark-loaded worker").is_empty());
+    let dispatches = drop.join().expect("item-drop worker");
+    assert_eq!(dispatches.len(), 1);
+    assert!(matches!(
+        &dispatches[0].command,
+        OutboundCommand::SpawnEntity(snapshot)
+            if snapshot.item_stack.as_ref().is_some_and(|stack| stack.count == 3)
+    ));
+    registry.advance_world_time(ITEM_PICKUP_DELAY_TICKS);
+    let entities = registry.nearby_item_entities(Vec3::new(0.5, 64.0, 0.5), 2.25);
+    assert_eq!(entities.len(), 1);
 }
 
 #[test]

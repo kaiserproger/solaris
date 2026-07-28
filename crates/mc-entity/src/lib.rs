@@ -37,10 +37,10 @@ mod entity_scale_26_1_2_tests;
 pub use entity_scale_26_1_2::{EntityScale26_1_2, EntityScaleError};
 pub use regional::VillagerBindingClaim;
 pub use regional::{
-    REGION_SIZE_CHUNKS, RegionEntityStoreError, RegionEpoch, RegionKey, RegionLease,
-    RegionOwnerBatch, RegionOwnerCompletion, RegionOwnerLaneError, RegionOwnerLaneStartError,
-    RegionOwnerMutation, RegionOwnership, RegionOwnershipError, RegionPhase,
-    RegionalCommitDecision, RegionalDecisionJournal, RegionalDecisionJournalError,
+    ItemPickupClaimResolution, REGION_SIZE_CHUNKS, RegionEntityStoreError, RegionEpoch, RegionKey,
+    RegionLease, RegionOwnerBatch, RegionOwnerCompletion, RegionOwnerLaneError,
+    RegionOwnerLaneStartError, RegionOwnerMutation, RegionOwnership, RegionOwnershipError,
+    RegionPhase, RegionalCommitDecision, RegionalDecisionJournal, RegionalDecisionJournalError,
     RegionalEntityAuthority, RegionalEntityStore, RegionalKinematicsApply,
     RegionalOwnerCoordinator, RegionalOwnerCutoverError, RegionalOwnerHandle, RegionalOwnerLane,
     RegionalOwnerRuntime, RegionalOwnerRuntimeShutdownError, RegionalOwnerSaveSnapshot,
@@ -449,6 +449,10 @@ pub struct EntityRetainedState {
     pub spawn_tick: u64,
     pub item_pickup_ready_tick: Option<u64>,
     pub item_pickup_owner_block: Option<EntityItemPickupOwnerBlock>,
+    /// Runtime-only cross-owner pickup reservation. Checkpoints intentionally
+    /// omit it so an interrupted transaction restarts from the unchanged item.
+    #[serde(skip)]
+    pub item_pickup_claim: Option<u64>,
     pub primed_tnt: Option<EntityPrimedTntState>,
     #[serde(default)]
     pub villager: Option<VillagerData>,

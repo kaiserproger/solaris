@@ -483,6 +483,7 @@ impl EntityOwnerAccess {
         applied
     }
 
+    #[cfg(test)]
     pub(super) fn set_item_stack_if_current(
         &mut self,
         expected: EntitySnapshot,
@@ -492,6 +493,20 @@ impl EntityOwnerAccess {
         let applied = owner_result(self.handle.set_item_stack_if_current(expected, stack));
         self.invalidate(id);
         applied
+    }
+
+    pub(super) fn resolve_item_pickup_claim(
+        &mut self,
+        entity: EntityId,
+        claim: u64,
+        stack: Option<EntityItemStack>,
+    ) -> Option<mc_entity::ItemPickupClaimResolution> {
+        let resolved = owner_result(
+            self.handle
+                .resolve_item_pickup_claim_deferred_journal(entity, claim, stack),
+        );
+        self.invalidate(entity);
+        resolved
     }
 
     pub(super) fn set_velocity(&mut self, id: EntityId, velocity: Vec3) -> bool {
@@ -569,6 +584,22 @@ impl EntityOwnerAccess {
         #[cfg(test)]
         self.record_owner_request();
         let applied = owner_result(self.handle.replace_snapshot_if_current(expected, next));
+        self.invalidate(id);
+        applied
+    }
+
+    pub(super) fn replace_snapshot_if_current_deferred_journal(
+        &mut self,
+        expected: EntitySnapshot,
+        next: EntitySnapshot,
+    ) -> bool {
+        let id = expected.id;
+        #[cfg(test)]
+        self.record_owner_request();
+        let applied = owner_result(
+            self.handle
+                .replace_snapshot_if_current_deferred_journal(expected, next),
+        );
         self.invalidate(id);
         applied
     }

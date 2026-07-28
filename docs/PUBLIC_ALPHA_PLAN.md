@@ -29,7 +29,24 @@ streaming and memory baseline.
   claim is made from this environment.
 - [ ] Observe at least 600 advancing client clock ticks and one complete
   24,000-tick visual cycle on a graphical host.
-- [ ] Continue with the item drop/pickup lock-boundary checkpoint.
+- [x] Split production item-drop owner commit from session publication.
+- [x] Stage production item pickup across immutable planning, an owner-owned runtime
+  claim token, independent session/player validation, exact owner resolution, and
+  short visibility publication.
+- [x] Roll back stale player/session plans through the same owner claim token without
+  inventory mutation, entity publication, or overwriting newer motion.
+- [x] Keep pickup claim/finalize mutations checkpoint-only so the common simulation
+  `SaveBarrier` captures matching player and entity state; no standalone pickup
+  journal append can outlive the corresponding inventory state.
+- [x] Prove blocked regional item-drop and pickup commits leave the session registry
+  available; pickup also leaves player persistence available.
+- [x] Preserve item-drop and pickup behavior across the complete `mc-net` suite.
+- [x] Run one independent read-only lock-diff review session. It timed out after
+  180 seconds without a verdict, after concentrating on unsafe inverse-CAS rollback;
+  no second reviewer was run. The exposed risk was removed with token resolution,
+  motion-preserving rollback, and checkpoint-only durability regressions.
+- [ ] Run the 200-action break/drop/pickup latency and M39-warning gate on the
+  release candidate.
 
 ## Observed baseline
 
@@ -133,36 +150,41 @@ Acceptance:
   from the recorded 929 chunks/s baseline, unless a measured quality gain is
   explicitly accepted.
 
-### P0 — Item drop/pickup waits on the regional entity owner while holding global locks
+### P0 — Item drop/pickup lock boundary (implementation complete; runtime gate pending)
 
-`lock_session_entities()` acquires the timed `SessionRegistryInner` guard. Item
-spawn then calls the synchronous regional-owner `spawn()` path, which sends a
-command and blocks on `result.recv()`. Item pickup performs synchronous snapshot
-and CAS/remove/update owner calls while the session lock is held and while the
-player-persistence lock is nested inside it.
-
-The log signature matches this exactly: session and player-persistence holds have
-nearly identical timestamps and 38-43 ms averages, while chunk-recipient readers
-occasionally wait behind them.
+`v0.0.1-alpha.1` called the synchronous regional entity owner while holding the
+timed `SessionRegistryInner` guard. Pickup additionally nested the
+player-persistence mutex. The owner log signature matched this exactly: the two
+hold classes shared 38-43 ms averages and chunk-recipient readers occasionally
+waited behind them.
 
 Required change:
 
-1. Add phase metrics around regional-owner request queueing, response wait,
-   publication and inventory commit to preserve proof of the cause.
-2. Never call a blocking `RegionalOwnerHandle` request while holding
-   `SessionRegistryInner` or `PlayerPersistedState`.
-3. Split item-drop creation into an owner commit followed by a short publication
-   lock; publication consumes the immutable committed snapshot.
-4. Convert pickup into a staged revision-fenced transaction:
-   - plan inventory credit from an immutable player revision;
-   - reserve/claim the exact item snapshot through owner CAS;
-   - commit the player inventory through a matching revision CAS;
-   - compensate/retry on a stale player or entity revision without duplication or
-     loss.
-5. Preserve partial pickup, disconnect races, competing collectors, full inventory,
-   item merge, persistence and event ordering.
-6. Add a code-health/architecture tripwire preventing new synchronous owner waits
-   under these timed guards where it can be expressed structurally.
+1. [x] Add debug phase timings around regional-owner commit, session validation,
+   player commit, and publication.
+2. [x] Never call a blocking `RegionalOwnerHandle` request while holding
+   `SessionRegistryInner` or `PlayerPersistedState` in production drop/pickup.
+3. [x] Split item-drop creation into an owner commit followed by a short
+   publication lock consuming the immutable committed snapshot.
+4. [x] Convert pickup into a staged owner-token transaction:
+   - plan inventory credit from an immutable player snapshot;
+   - install one runtime-only claim token through exact regional snapshot CAS while
+     leaving the authoritative stack unchanged; the regional owner then rejects
+     competing stack changes, removal, merge, lifecycle replacement, and damage while
+     still allowing kinematics;
+   - recheck session identity/range, release the session guard, then commit the
+     complete matching player state;
+   - atomically resolve the token against the current entity snapshot, applying the
+     remainder/removal on success or restoring availability on stale player/session
+     state without overwriting newer motion.
+5. [x] Keep claim installation, rollback, and finalize as checkpoint-only owner
+   mutations. Production saves enter through the simulation `SaveBarrier`, while the
+   only direct snapshot path is after simulation-owner drain, so player and entity
+   state cannot be durably split by an in-flight pickup.
+6. [x] Preserve partial pickup, disconnect/requester-loss races, competing
+   collectors, full inventory, item merge, persistence, and event ordering.
+7. [x] Add deterministic lock-release, checkpoint, and interleaving regressions so a
+   future synchronous owner wait or split durable pickup fails the focused suite.
 
 Acceptance:
 

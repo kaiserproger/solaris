@@ -1694,10 +1694,11 @@ impl SessionRegistry {
                     .get(&step.id)
                     .is_some_and(|motion| motion.is_item)
                     && inner.entities.snapshot(step.id).is_some_and(|entity| {
-                        entity
-                            .retained
-                            .item_pickup_ready_tick
-                            .is_none_or(|ready_tick| ready_tick < lifecycle_tick)
+                        entity.retained.item_pickup_claim.is_none()
+                            && entity
+                                .retained
+                                .item_pickup_ready_tick
+                                .is_none_or(|ready_tick| ready_tick < lifecycle_tick)
                     })
             })
             .map(|step| step.id)

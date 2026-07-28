@@ -9226,6 +9226,247 @@ mod tests {
     }
 
     #[test]
+    fn item_pickup_owner_wait_releases_session_and_player_locks() {
+        let (entered_tx, entered_rx) = std::sync::mpsc::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        let registry = Arc::new(SessionRegistry::new());
+        let (session, mut outbound) =
+            register_test_session_with_outbound(&registry, "PickupLockAlice");
+        assert!(registry.mark_loaded(session, (0, 0)).is_empty());
+        let mut inventory = PlayerInventory::empty();
+        for slot in 9..=44 {
+            inventory.slots[slot] = ItemStack::new(42, 64);
+        }
+        inventory.slots[PlayerInventory::HOTBAR_BASE] = ItemStack::new(42, 63);
+        let player_state = register_test_player_state(&registry, session, inventory);
+        let (item, _) = seed_claim_entities_published(&registry, &mut outbound);
+        registry.install_item_pickup_owner_probe_for_test(entered_tx, release_rx);
+        let (handle, mut owner) = simulation_channel_with_capacity(1);
+        let response = handle
+            .for_session(session)
+            .enqueue(SimulationCommand::PickupItemIntoInventory {
+                entity_id: item,
+                collector_session: session,
+                expected_item_id: 42,
+                expected_damage: None,
+                expected_enchantments: Vec::new(),
+                max_stack: 64,
+            })
+            .expect("pickup command fits");
+        let owner_registry = Arc::clone(&registry);
+        let owner_thread = std::thread::spawn(move || owner.process_tick(&owner_registry, 1));
+
+        entered_rx
+            .recv_timeout(std::time::Duration::from_secs(1))
+            .expect("item pickup owner boundary reached");
+        assert!(
+            player_state.try_lock().is_ok(),
+            "regional item pickup wait must not hold player persistence"
+        );
+        let progress_registry = Arc::clone(&registry);
+        let (progress_tx, progress_rx) = std::sync::mpsc::channel();
+        let progress = std::thread::spawn(move || {
+            let dispatches = progress_registry.mark_loaded(session, (1, 0));
+            progress_tx.send(()).expect("publish session progress");
+            dispatches
+        });
+        progress_rx
+            .recv_timeout(std::time::Duration::from_secs(1))
+            .expect("session registry must progress during regional item pickup wait");
+
+        release_tx.send(()).expect("release regional item pickup");
+        assert_eq!(owner_thread.join().expect("owner worker").processed, 1);
+        assert!(progress.join().expect("session progress worker").is_empty());
+        let SimulationResponse::ItemPickupCredit(Some(outcome)) =
+            response.blocking_recv().unwrap().unwrap()
+        else {
+            panic!("pickup credit response kind changed");
+        };
+        assert_eq!(outcome.credited.count, 1);
+        assert_eq!(
+            player_state.lock().unwrap().inventory.slots[PlayerInventory::HOTBAR_BASE],
+            ItemStack::new(42, 64)
+        );
+    }
+
+    #[test]
+    fn item_pickup_claim_and_finalize_are_checkpoint_only() {
+        let commits = Arc::new(AtomicUsize::new(0));
+        let registry = SessionRegistry::new_with_entity_owner_journal(
+            1,
+            Box::new(FailOnceEntityCommitJournal {
+                failure: None,
+                commits: Arc::clone(&commits),
+            }),
+        );
+        let (session, mut outbound) =
+            register_test_session_with_outbound(&registry, "PickupCheckpointOnly");
+        assert!(registry.mark_loaded(session, (0, 0)).is_empty());
+        let mut inventory = PlayerInventory::empty();
+        for slot in 9..=44 {
+            inventory.slots[slot] = ItemStack::new(42, 64);
+        }
+        inventory.slots[PlayerInventory::HOTBAR_BASE] = ItemStack::new(42, 63);
+        let player_state = register_test_player_state(&registry, session, inventory);
+        let (item, _) = seed_claim_entities_published(&registry, &mut outbound);
+        let durable_before = commits.load(Ordering::Relaxed);
+        let (handle, mut owner) = simulation_channel_with_capacity(1);
+        let response = handle
+            .for_session(session)
+            .enqueue(SimulationCommand::PickupItemIntoInventory {
+                entity_id: item,
+                collector_session: session,
+                expected_item_id: 42,
+                expected_damage: None,
+                expected_enchantments: Vec::new(),
+                max_stack: 64,
+            })
+            .expect("pickup command fits");
+
+        assert_eq!(owner.process_tick(&registry, 1).processed, 1);
+        let SimulationResponse::ItemPickupCredit(Some(outcome)) =
+            response.blocking_recv().unwrap().unwrap()
+        else {
+            panic!("pickup credit response kind changed");
+        };
+
+        assert_eq!(outcome.credited.count, 1);
+        assert_eq!(commits.load(Ordering::Relaxed), durable_before);
+        assert_eq!(
+            player_state.lock().unwrap().inventory.slots[PlayerInventory::HOTBAR_BASE],
+            ItemStack::new(42, 64)
+        );
+        let remaining = registry.nearby_item_entities(Vec3::new(0.5, 64.0, 0.5), 2.25);
+        assert_eq!(remaining.len(), 1);
+        assert_eq!(remaining[0].id, item);
+        assert_eq!(remaining[0].item_stack.as_ref().unwrap().count, 2);
+
+        let checkpoint = registry.persisted_entity_save_snapshot().0;
+        let saved_item = checkpoint
+            .records
+            .iter()
+            .find(|record| record.snapshot.id == item)
+            .expect("save barrier captures the remaining item");
+        assert_eq!(saved_item.snapshot.item_stack.as_ref().unwrap().count, 2);
+        assert_eq!(saved_item.snapshot.retained.item_pickup_claim, None);
+        let saved_players = registry.persisted_player_states();
+        assert_eq!(saved_players.len(), 1);
+        assert_eq!(
+            saved_players[0].1.inventory.slots[PlayerInventory::HOTBAR_BASE],
+            ItemStack::new(42, 64)
+        );
+        assert_eq!(commits.load(Ordering::Relaxed), durable_before);
+    }
+
+    #[test]
+    fn stale_player_rollback_preserves_motion_after_item_claim() {
+        let (claimed_tx, claimed_rx) = std::sync::mpsc::channel();
+        let (resume_tx, resume_rx) = std::sync::mpsc::channel();
+        let registry = Arc::new(SessionRegistry::new());
+        let (session, mut outbound) =
+            register_test_session_with_outbound(&registry, "PickupRollbackMotion");
+        assert!(registry.mark_loaded(session, (0, 0)).is_empty());
+        let mut inventory = PlayerInventory::empty();
+        for slot in 9..=44 {
+            inventory.slots[slot] = ItemStack::new(42, 64);
+        }
+        inventory.slots[PlayerInventory::HOTBAR_BASE] = ItemStack::new(42, 63);
+        let player_state = register_test_player_state(&registry, session, inventory);
+        let (item, _) = seed_claim_entities_published(&registry, &mut outbound);
+        registry.install_item_pickup_claimed_probe_for_test(claimed_tx, resume_rx);
+        let (handle, mut owner) = simulation_channel_with_capacity(1);
+        let response = handle
+            .for_session(session)
+            .enqueue(SimulationCommand::PickupItemIntoInventory {
+                entity_id: item,
+                collector_session: session,
+                expected_item_id: 42,
+                expected_damage: None,
+                expected_enchantments: Vec::new(),
+                max_stack: 64,
+            })
+            .expect("pickup command fits");
+        let owner_registry = Arc::clone(&registry);
+        let owner_thread = std::thread::spawn(move || owner.process_tick(&owner_registry, 1));
+
+        claimed_rx
+            .recv_timeout(std::time::Duration::from_secs(1))
+            .expect("pickup installs its owner claim");
+        let moved_position = Vec3::new(1.25, 64.5, 0.75);
+        assert!(registry.move_claimed_item_for_test(item, moved_position));
+        player_state.lock().unwrap().inventory.slots[9] = ItemStack::new(7, 1);
+        resume_tx.send(()).expect("release claimed pickup");
+
+        assert_eq!(owner_thread.join().expect("owner worker").processed, 1);
+        assert!(matches!(
+            response.blocking_recv().unwrap().unwrap(),
+            SimulationResponse::ItemPickupCredit(None)
+        ));
+        let remaining = registry.nearby_item_entities(moved_position, 0.25);
+        assert_eq!(remaining.len(), 1);
+        assert_eq!(remaining[0].id, item);
+        assert_eq!(remaining[0].position, moved_position);
+        assert_eq!(remaining[0].item_stack.as_ref().unwrap().count, 3);
+        assert!(outbound.try_recv().is_err());
+    }
+
+    #[test]
+    fn stale_player_inventory_after_pickup_plan_restores_entity_without_publication() {
+        let registry = Arc::new(SessionRegistry::new());
+        let (session, mut outbound) =
+            register_test_session_with_outbound(&registry, "StalePickupPlayerInventory");
+        assert!(registry.mark_loaded(session, (0, 0)).is_empty());
+        let mut inventory = PlayerInventory::empty();
+        for slot in 9..=44 {
+            inventory.slots[slot] = ItemStack::new(42, 64);
+        }
+        inventory.slots[PlayerInventory::HOTBAR_BASE] = ItemStack::new(42, 63);
+        let player_state = register_test_player_state(&registry, session, inventory.clone());
+        let (item, _) = seed_claim_entities_published(&registry, &mut outbound);
+        let (plan_reached_tx, plan_reached_rx) = std::sync::mpsc::channel();
+        let (resume_tx, resume_rx) = std::sync::mpsc::channel();
+        registry.install_item_pickup_plan_probe_for_test(plan_reached_tx, resume_rx);
+        let (handle, mut owner) = simulation_channel_with_capacity(1);
+        let response = handle
+            .for_session(session)
+            .enqueue(SimulationCommand::PickupItemIntoInventory {
+                entity_id: item,
+                collector_session: session,
+                expected_item_id: 42,
+                expected_damage: None,
+                expected_enchantments: Vec::new(),
+                max_stack: 64,
+            })
+            .expect("pickup command fits");
+        let owner_registry = Arc::clone(&registry);
+        let owner_thread = std::thread::spawn(move || owner.process_tick(&owner_registry, 1));
+
+        plan_reached_rx
+            .recv_timeout(std::time::Duration::from_secs(1))
+            .expect("pickup reaches player/entity claim boundary");
+        player_state.lock().unwrap().inventory.slots[9] = ItemStack::new(7, 1);
+        resume_tx.send(()).expect("release pickup owner claim");
+        assert_eq!(owner_thread.join().expect("owner worker").processed, 1);
+        assert!(matches!(
+            response.blocking_recv().unwrap().unwrap(),
+            SimulationResponse::ItemPickupCredit(None)
+        ));
+
+        let persisted = player_state.lock().unwrap();
+        assert_eq!(persisted.inventory.slots[9], ItemStack::new(7, 1));
+        assert_eq!(
+            persisted.inventory.slots[PlayerInventory::HOTBAR_BASE],
+            ItemStack::new(42, 63)
+        );
+        drop(persisted);
+        let remaining = registry.nearby_item_entities(Vec3::new(0.5, 64.0, 0.5), 2.25);
+        assert_eq!(remaining.len(), 1);
+        assert_eq!(remaining[0].id, item);
+        assert_eq!(remaining[0].item_stack.as_ref().unwrap().count, 3);
+        assert!(outbound.try_recv().is_err());
+    }
+
+    #[test]
     fn item_pickup_credit_is_conservative_under_partial_capacity() {
         let registry = SessionRegistry::new();
         let (session, mut outbound) =

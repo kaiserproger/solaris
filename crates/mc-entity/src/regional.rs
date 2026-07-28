@@ -1133,6 +1133,12 @@ pub struct RegionalOwnerStatus {
     pub lane_count: usize,
 }
 
+#[derive(Debug, Clone, PartialEq)]
+pub enum ItemPickupClaimResolution {
+    Updated(EntitySnapshot),
+    Removed(EntitySnapshot),
+}
+
 #[derive(Debug, Clone)]
 pub struct VersionedEntitySnapshots {
     authority: RegionalAuthorityId,
@@ -1251,6 +1257,7 @@ enum RegionalOwnerCommand {
     ReplaceSnapshotIfCurrent {
         expected: Box<EntitySnapshot>,
         next: Box<EntitySnapshot>,
+        defer_journal: bool,
         reply: std::sync::mpsc::Sender<Result<bool, RegionOwnerLaneError>>,
     },
     ReplaceSnapshotsIfCurrent {
@@ -1287,6 +1294,15 @@ enum RegionalOwnerCommand {
         expected: Box<EntitySnapshot>,
         item_stack: Option<EntityItemStack>,
         reply: std::sync::mpsc::Sender<Result<bool, RegionOwnerLaneError>>,
+    },
+    ResolveItemPickupClaim {
+        entity: EntityId,
+        claim: u64,
+        item_stack: Option<EntityItemStack>,
+        defer_journal: bool,
+        reply: std::sync::mpsc::Sender<
+            Result<Option<ItemPickupClaimResolution>, RegionOwnerLaneError>,
+        >,
     },
     SetPosition {
         entity: EntityId,
@@ -1390,9 +1406,9 @@ impl RegionalOwnerCommand {
                     .flat_map(|(entity, goal)| std::iter::once(*entity).chain(goal_reference(goal)))
                     .collect(),
             )),
-            Self::SetItemStack { entity, .. } | Self::Damage { entity, .. } => {
-                Some(RegionalOwnerLaneScope::Entities(vec![*entity]))
-            }
+            Self::SetItemStack { entity, .. }
+            | Self::ResolveItemPickupClaim { entity, .. }
+            | Self::Damage { entity, .. } => Some(RegionalOwnerLaneScope::Entities(vec![*entity])),
             Self::SetItemStackIfCurrent { expected, .. }
             | Self::DamageIfCurrent { expected, .. }
             | Self::ApplyEffectIfCurrent { expected, .. } => {
@@ -1434,6 +1450,7 @@ impl RegionalOwnerCommand {
                 | Self::SetGoals { .. }
                 | Self::SetItemStack { .. }
                 | Self::SetItemStackIfCurrent { .. }
+                | Self::ResolveItemPickupClaim { .. }
                 | Self::SetPosition { .. }
                 | Self::SetVelocities { .. }
                 | Self::ApplyKinematicsIfCurrent { .. }
@@ -2015,11 +2032,29 @@ impl RegionalOwnerHandle {
         expected: EntitySnapshot,
         next: EntitySnapshot,
     ) -> Result<bool, RegionOwnerLaneError> {
+        self.replace_snapshot_if_current_inner(expected, next, true)
+    }
+
+    pub fn replace_snapshot_if_current_deferred_journal(
+        &self,
+        expected: EntitySnapshot,
+        next: EntitySnapshot,
+    ) -> Result<bool, RegionOwnerLaneError> {
+        self.replace_snapshot_if_current_inner(expected, next, false)
+    }
+
+    fn replace_snapshot_if_current_inner(
+        &self,
+        expected: EntitySnapshot,
+        next: EntitySnapshot,
+        journal_commit: bool,
+    ) -> Result<bool, RegionOwnerLaneError> {
         let (reply, result) = channel();
         self.sender
             .send(RegionalOwnerCommand::ReplaceSnapshotIfCurrent {
                 expected: Box::new(expected),
                 next: Box::new(next),
+                defer_journal: !journal_commit,
                 reply,
             })
             .map_err(|_| RegionOwnerLaneError::Closed)?;
@@ -2225,6 +2260,9 @@ impl RegionalOwnerHandle {
         expected: EntitySnapshot,
         item_stack: Option<EntityItemStack>,
     ) -> Result<bool, RegionOwnerLaneError> {
+        if expected.retained.item_pickup_claim.is_some() {
+            return Ok(false);
+        }
         if let Some(result) =
             self.try_commit_cached_snapshot_mutation(expected.clone(), |expected| {
                 RegionOwnerMutation::SetItemStackIfCurrent {
@@ -2241,6 +2279,44 @@ impl RegionalOwnerHandle {
             .send(RegionalOwnerCommand::SetItemStackIfCurrent {
                 expected: Box::new(expected),
                 item_stack,
+                reply,
+            })
+            .map_err(|_| RegionOwnerLaneError::Closed)?;
+        result.recv().map_err(|_| RegionOwnerLaneError::Closed)?
+    }
+
+    pub fn resolve_item_pickup_claim(
+        &self,
+        entity: EntityId,
+        claim: u64,
+        item_stack: Option<EntityItemStack>,
+    ) -> Result<Option<ItemPickupClaimResolution>, RegionOwnerLaneError> {
+        self.resolve_item_pickup_claim_inner(entity, claim, item_stack, true)
+    }
+
+    pub fn resolve_item_pickup_claim_deferred_journal(
+        &self,
+        entity: EntityId,
+        claim: u64,
+        item_stack: Option<EntityItemStack>,
+    ) -> Result<Option<ItemPickupClaimResolution>, RegionOwnerLaneError> {
+        self.resolve_item_pickup_claim_inner(entity, claim, item_stack, false)
+    }
+
+    fn resolve_item_pickup_claim_inner(
+        &self,
+        entity: EntityId,
+        claim: u64,
+        item_stack: Option<EntityItemStack>,
+        journal_commit: bool,
+    ) -> Result<Option<ItemPickupClaimResolution>, RegionOwnerLaneError> {
+        let (reply, result) = channel();
+        self.sender
+            .send(RegionalOwnerCommand::ResolveItemPickupClaim {
+                entity,
+                claim,
+                item_stack,
+                defer_journal: !journal_commit,
                 reply,
             })
             .map_err(|_| RegionOwnerLaneError::Closed)?;
@@ -2651,6 +2727,9 @@ impl RegionalOwnerHandle {
     ) -> Result<Option<EntityDamage>, RegionOwnerLaneError> {
         if !request.is_valid() {
             return Err(RegionOwnerLaneError::InvalidMutation);
+        }
+        if expected.retained.item_pickup_claim.is_some() {
+            return Ok(None);
         }
         if let Some(result) =
             self.try_commit_cached_snapshot_mutation(expected.clone(), |expected| {
@@ -3193,9 +3272,11 @@ fn run_regional_owner_runtime(
             RegionalOwnerCommand::ReplaceSnapshotIfCurrent {
                 expected,
                 next,
+                defer_journal,
                 reply,
             } => {
-                let result = coordinator.replace_snapshot_if_current(*expected, *next);
+                let result =
+                    coordinator.replace_snapshot_if_current_inner(*expected, *next, !defer_journal);
                 if matches!(&result, Ok(true)) {
                     selected_read_routes
                         .write()
@@ -3268,6 +3349,24 @@ fn run_regional_owner_runtime(
                 reply,
             } => {
                 let _ = reply.send(coordinator.set_item_stack_if_current(*expected, item_stack));
+            }
+            RegionalOwnerCommand::ResolveItemPickupClaim {
+                entity,
+                claim,
+                item_stack,
+                defer_journal,
+                reply,
+            } => {
+                let result = coordinator.resolve_item_pickup_claim_inner(
+                    entity,
+                    claim,
+                    item_stack,
+                    !defer_journal,
+                );
+                if matches!(&result, Ok(Some(_))) {
+                    invalidate_selected_read_routes(&selected_read_routes, [entity]);
+                }
+                let _ = reply.send(result);
             }
             RegionalOwnerCommand::SetPosition {
                 entity,
@@ -4525,6 +4624,9 @@ impl RegionalOwnerCoordinator {
             .ok_or(RegionOwnerLaneError::WrongLane)?
             .snapshot(lease, entity)?
             .ok_or(RegionOwnerLaneError::UnknownEntity)?;
+        if snapshot.retained.item_pickup_claim.is_some() {
+            return Ok(None);
+        }
         let (_, sequence) = self.commit_state.reserve_sequences(1)?;
         let mutations = BTreeMap::from([(
             lease.lane,
@@ -4545,6 +4647,9 @@ impl RegionalOwnerCoordinator {
         &mut self,
         expected: EntitySnapshot,
     ) -> Result<Option<EntitySnapshot>, RegionOwnerLaneError> {
+        if expected.retained.item_pickup_claim.is_some() {
+            return Ok(None);
+        }
         let Some(key) = RegionKey::from_position(expected.position) else {
             return Err(RegionOwnerLaneError::InvalidMutation);
         };
@@ -4588,9 +4693,27 @@ impl RegionalOwnerCoordinator {
         expected: EntitySnapshot,
         next: EntitySnapshot,
     ) -> Result<bool, RegionOwnerLaneError> {
+        self.replace_snapshot_if_current_inner(expected, next, true)
+    }
+
+    fn replace_snapshot_if_current_inner(
+        &mut self,
+        expected: EntitySnapshot,
+        next: EntitySnapshot,
+        journal_commit: bool,
+    ) -> Result<bool, RegionOwnerLaneError> {
         let entity_id = expected.id;
         if expected.id != next.id || expected.uuid != next.uuid {
             return Err(RegionOwnerLaneError::InvalidMutation);
+        }
+        if expected.retained.item_pickup_claim.is_some()
+            && (next.retained.item_pickup_claim != expected.retained.item_pickup_claim
+                || next.item_stack != expected.item_stack
+                || next.lifecycle != expected.lifecycle
+                || next.type_id != expected.type_id
+                || next.type_name != expected.type_name)
+        {
+            return Ok(false);
         }
         let Some(source) = RegionKey::from_position(expected.position) else {
             return Err(RegionOwnerLaneError::InvalidMutation);
@@ -4648,8 +4771,8 @@ impl RegionalOwnerCoordinator {
                 }],
             );
         }
-        match self.execute_mutations(mutations, sequence) {
-            Ok(()) => {
+        match self.execute_mutations_with_stats(mutations, sequence, journal_commit) {
+            Ok(_) => {
                 self.locations.insert(entity_id, target);
                 self.vehicle_passengers = vehicle_passengers;
                 self.passenger_vehicles = passenger_vehicles;
@@ -4669,6 +4792,8 @@ impl RegionalOwnerCoordinator {
         if survivor_expected.id == consumed_expected.id
             || survivor_expected.id != survivor_next.id
             || survivor_expected.uuid != survivor_next.uuid
+            || survivor_expected.retained.item_pickup_claim.is_some()
+            || consumed_expected.retained.item_pickup_claim.is_some()
             || survivor_expected.type_name != "minecraft:item"
             || survivor_next.type_name != "minecraft:item"
             || consumed_expected.type_name != "minecraft:item"
@@ -4762,6 +4887,15 @@ impl RegionalOwnerCoordinator {
                 || !next.velocity.is_finite()
             {
                 return Err(RegionOwnerLaneError::InvalidMutation);
+            }
+            if expected.retained.item_pickup_claim.is_some()
+                && (next.retained.item_pickup_claim != expected.retained.item_pickup_claim
+                    || next.item_stack != expected.item_stack
+                    || next.lifecycle != expected.lifecycle
+                    || next.type_id != expected.type_id
+                    || next.type_name != expected.type_name)
+            {
+                return Ok(false);
             }
             let Some(source) = RegionKey::from_position(expected.position) else {
                 return Err(RegionOwnerLaneError::InvalidMutation);
@@ -5176,6 +5310,9 @@ impl RegionalOwnerCoordinator {
         expected: EntitySnapshot,
         item_stack: Option<EntityItemStack>,
     ) -> Result<bool, RegionOwnerLaneError> {
+        if expected.retained.item_pickup_claim.is_some() {
+            return Ok(false);
+        }
         let Some(key) = RegionKey::from_position(expected.position) else {
             return Err(RegionOwnerLaneError::InvalidMutation);
         };
@@ -5201,6 +5338,80 @@ impl RegionalOwnerCoordinator {
         match self.execute_mutations(mutations, sequence) {
             Ok(()) => Ok(true),
             Err(RegionOwnerLaneError::InvalidMutation) => Ok(false),
+            Err(error) => Err(error),
+        }
+    }
+
+    pub fn resolve_item_pickup_claim(
+        &mut self,
+        entity: EntityId,
+        claim: u64,
+        item_stack: Option<EntityItemStack>,
+    ) -> Result<Option<ItemPickupClaimResolution>, RegionOwnerLaneError> {
+        self.resolve_item_pickup_claim_inner(entity, claim, item_stack, true)
+    }
+
+    fn resolve_item_pickup_claim_inner(
+        &mut self,
+        entity: EntityId,
+        claim: u64,
+        item_stack: Option<EntityItemStack>,
+        journal_commit: bool,
+    ) -> Result<Option<ItemPickupClaimResolution>, RegionOwnerLaneError> {
+        let Some(current) = self.snapshot(entity)? else {
+            return Ok(None);
+        };
+        if current.retained.item_pickup_claim != Some(claim) {
+            return Ok(None);
+        }
+        let Some(key) = RegionKey::from_position(current.position) else {
+            return Err(RegionOwnerLaneError::InvalidMutation);
+        };
+        if self.locations.get(&entity).copied() != Some(key)
+            || self.in_flight_transfers.contains_key(&entity)
+        {
+            return Ok(None);
+        }
+        let lease = self
+            .ownership
+            .lease(key)
+            .ok_or(RegionOwnerLaneError::StaleLease)?;
+        let (_, sequence) = self.commit_state.reserve_sequences(1)?;
+        let (mutation, resolution) = if let Some(item_stack) = item_stack {
+            let mut next = current.clone();
+            next.item_stack = Some(item_stack);
+            next.retained.item_pickup_claim = None;
+            (
+                RegionOwnerMutation::ReplaceSnapshotIfCurrent {
+                    expected: Box::new(current),
+                    next: Box::new(next.clone()),
+                },
+                ItemPickupClaimResolution::Updated(next),
+            )
+        } else {
+            (
+                RegionOwnerMutation::RemoveIfCurrent(Box::new(current.clone())),
+                ItemPickupClaimResolution::Removed(current),
+            )
+        };
+        let mutations = BTreeMap::from([(
+            lease.lane,
+            vec![SequencedRegionMutation {
+                sequence,
+                lease,
+                mutation,
+            }],
+        )]);
+        match self.execute_mutations_with_stats(mutations, sequence, journal_commit) {
+            Ok(_) => {
+                if let ItemPickupClaimResolution::Removed(removed) = &resolution {
+                    self.remove_vehicle_links(removed);
+                    self.locations.remove(&removed.id);
+                    self.uuids.remove(&removed.uuid);
+                }
+                Ok(Some(resolution))
+            }
+            Err(RegionOwnerLaneError::InvalidMutation) => Ok(None),
             Err(error) => Err(error),
         }
     }
@@ -5546,6 +5757,9 @@ impl RegionalOwnerCoordinator {
     ) -> Result<Option<EntityDamage>, RegionOwnerLaneError> {
         if !request.is_valid() {
             return Err(RegionOwnerLaneError::InvalidMutation);
+        }
+        if expected.retained.item_pickup_claim.is_some() {
+            return Ok(None);
         }
         let Some(key) = RegionKey::from_position(expected.position) else {
             return Err(RegionOwnerLaneError::InvalidMutation);
@@ -14557,6 +14771,55 @@ mod tests {
                 .set_item_stack_if_current(current_item, Some(crate::EntityItemStack::new(7, 2)),)
                 .expect("fresh item CAS")
         );
+        let current_item = handle
+            .snapshot(item)
+            .expect("claim item read")
+            .expect("claim item snapshot");
+        let mut claimed_item = current_item.clone();
+        claimed_item.retained.item_pickup_claim = Some(77);
+        assert!(
+            handle
+                .replace_snapshot_if_current(current_item, claimed_item)
+                .expect("install item pickup claim")
+        );
+        assert!(
+            !handle
+                .set_item_stack(item, Some(crate::EntityItemStack::new(7, 1)))
+                .expect("claimed item stack mutation is rejected")
+        );
+        assert_eq!(
+            handle
+                .remove(item)
+                .expect("claimed item removal is rejected"),
+            None
+        );
+        let claimed_item = handle
+            .snapshot(item)
+            .expect("claimed item read")
+            .expect("claimed item snapshot");
+        let mut forged_claim_resolution = claimed_item.clone();
+        forged_claim_resolution.item_stack = Some(crate::EntityItemStack::new(7, 1));
+        assert!(
+            !handle
+                .replace_snapshot_if_current(claimed_item, forged_claim_resolution)
+                .expect("claimed item full-snapshot overwrite is rejected")
+        );
+        let moved_position = Vec3::new(2.75, 64.25, 0.5);
+        assert!(
+            handle
+                .set_position(item, moved_position)
+                .expect("move claimed item")
+        );
+        let resolved = handle
+            .resolve_item_pickup_claim(item, 77, Some(crate::EntityItemStack::new(7, 4)))
+            .expect("resolve item pickup claim")
+            .expect("matching item pickup claim");
+        let super::ItemPickupClaimResolution::Updated(resolved) = resolved else {
+            panic!("partial item pickup claim must update the entity");
+        };
+        assert_eq!(resolved.position, moved_position);
+        assert_eq!(resolved.item_stack, Some(crate::EntityItemStack::new(7, 4)));
+        assert_eq!(resolved.retained.item_pickup_claim, None);
 
         let mut vehicle = SpawnEntity::vehicle(
             VehicleKind::Boat,

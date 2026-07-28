@@ -581,6 +581,10 @@ pub(crate) struct SessionRegistry {
     #[cfg(test)]
     item_pickup_plan_probe: Mutex<Option<ItemPickupPlanProbe>>,
     #[cfg(test)]
+    item_pickup_owner_probe: Mutex<Option<EntityApplyReleaseProbe>>,
+    #[cfg(test)]
+    item_pickup_claimed_probe: Mutex<Option<EntityApplyReleaseProbe>>,
+    #[cfg(test)]
     server_container_dispatch_probe: Mutex<Option<ServerContainerDispatchProbe>>,
     #[cfg(test)]
     server_relight_compute_probe: Mutex<Option<ServerRelightComputeProbe>>,
@@ -884,6 +888,10 @@ impl SessionRegistry {
             pickup_snapshot_probe: Mutex::new(None),
             #[cfg(test)]
             item_pickup_plan_probe: Mutex::new(None),
+            #[cfg(test)]
+            item_pickup_owner_probe: Mutex::new(None),
+            #[cfg(test)]
+            item_pickup_claimed_probe: Mutex::new(None),
             #[cfg(test)]
             server_container_dispatch_probe: Mutex::new(None),
             #[cfg(test)]
@@ -1983,6 +1991,18 @@ fn despawn_expired_items_locked(inner: &mut SessionEntityGuards<'_>) -> Vec<Visi
         .filter_map(|entity_id| {
             let entity = inner.entities.snapshot(entity_id)?;
             entity.item_stack.as_ref()?;
+            if entity.retained.item_pickup_claim.is_some() {
+                let retry_tick = current_tick.saturating_add(1);
+                inner
+                    .item_despawn_deadline_by_id
+                    .insert(entity_id, retry_tick);
+                inner
+                    .item_despawn_deadlines
+                    .entry(retry_tick)
+                    .or_default()
+                    .push_back(entity_id);
+                return None;
+            }
             let deadline = entity
                 .retained
                 .spawn_tick
