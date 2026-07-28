@@ -5,7 +5,7 @@ use std::path::{Path, PathBuf};
 use anyhow::{Context, Result, bail};
 use mc_server::ServerConfig;
 
-pub(crate) const WORLD_CONTRACT_SCHEMA: u32 = 2;
+pub(crate) const WORLD_CONTRACT_SCHEMA: u32 = 3;
 const WORLD_CONTRACT_FILE: &str = "world.json";
 
 #[derive(Debug, serde::Deserialize, serde::Serialize)]
@@ -19,6 +19,10 @@ pub(crate) struct PersistedWorldContract {
     pub(crate) settlement_profile: String,
     pub(crate) min_y: i32,
     pub(crate) height: i32,
+    #[serde(default)]
+    pub(crate) spawn_block_x: i32,
+    #[serde(default)]
+    pub(crate) spawn_block_z: i32,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -95,6 +99,7 @@ pub(crate) fn world_contract_path(world_dir: &Path) -> PathBuf {
     world_dir.join("solaris").join(WORLD_CONTRACT_FILE)
 }
 
+#[cfg(test)]
 pub(crate) fn ensure_world_contract(
     world_dir: &Path,
     configured: mc_world::ChunkGeometry,
@@ -102,6 +107,42 @@ pub(crate) fn ensure_world_contract(
     mode: &str,
     ore_profile: &str,
     settlement_profile: &str,
+) -> Result<WorldSource> {
+    ensure_world_contract_with_spawn(
+        world_dir,
+        configured,
+        seed,
+        mode,
+        ore_profile,
+        settlement_profile,
+        mc_world::WorldSpawn::default(),
+    )
+}
+
+pub(crate) fn world_requires_solaris_spawn(world_dir: &Path) -> Result<bool> {
+    match std::fs::metadata(world_contract_path(world_dir)) {
+        Ok(metadata) => return Ok(metadata.is_file()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => {
+            return Err(error).with_context(|| {
+                format!(
+                    "reading persisted world contract metadata for {}",
+                    world_dir.display()
+                )
+            });
+        }
+    }
+    Ok(!world_contains_anvil_data(world_dir)?)
+}
+
+pub(crate) fn ensure_world_contract_with_spawn(
+    world_dir: &Path,
+    configured: mc_world::ChunkGeometry,
+    seed: i64,
+    mode: &str,
+    ore_profile: &str,
+    settlement_profile: &str,
+    spawn: mc_world::WorldSpawn,
 ) -> Result<WorldSource> {
     let path = world_contract_path(world_dir);
     match std::fs::read(&path) {
@@ -121,20 +162,26 @@ pub(crate) fn ensure_world_contract(
                 || persisted.mode != mode
                 || persisted.ore_profile != ore_profile
                 || persisted.settlement_profile != settlement_profile
+                || persisted.spawn_block_x != spawn.block_x
+                || persisted.spawn_block_z != spawn.block_z
             {
                 bail!(
-                    "persisted worldgen revision={} seed={} mode={} ore_profile={} settlement_profile={} in {} does not match configured revision={} seed={} mode={} ore_profile={} settlement_profile={}; use a fresh world_dir",
+                    "persisted worldgen revision={} seed={} mode={} ore_profile={} settlement_profile={} spawn=({}, {}) in {} does not match configured revision={} seed={} mode={} ore_profile={} settlement_profile={} spawn=({}, {}); use a fresh world_dir",
                     persisted.worldgen_revision,
                     persisted.seed,
                     persisted.mode,
                     persisted.ore_profile,
                     persisted.settlement_profile,
+                    persisted.spawn_block_x,
+                    persisted.spawn_block_z,
                     path.display(),
                     mc_worldgen::WORLDGEN_REVISION,
                     seed,
                     mode,
                     ore_profile,
                     settlement_profile,
+                    spawn.block_x,
+                    spawn.block_z,
                 );
             }
             let stored = mc_world::ChunkGeometry::new(persisted.min_y, persisted.height)
@@ -174,6 +221,7 @@ pub(crate) fn ensure_world_contract(
                 mode,
                 ore_profile,
                 settlement_profile,
+                spawn,
             )?;
             Ok(WorldSource::SolarisGenerated)
         }
@@ -223,6 +271,7 @@ fn write_world_contract(
     mode: &str,
     ore_profile: &str,
     settlement_profile: &str,
+    spawn: mc_world::WorldSpawn,
 ) -> Result<()> {
     let parent = path
         .parent()
@@ -238,6 +287,8 @@ fn write_world_contract(
         settlement_profile: settlement_profile.to_owned(),
         min_y: geometry.min_y(),
         height: geometry.height(),
+        spawn_block_x: spawn.block_x,
+        spawn_block_z: spawn.block_z,
     };
     let bytes =
         serde_json::to_vec_pretty(&metadata).context("encoding persisted world contract")?;

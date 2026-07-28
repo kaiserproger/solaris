@@ -724,6 +724,37 @@ async fn spawn_position_reads_published_chunk_while_world_writer_is_held() {
 }
 
 #[tokio::test]
+async fn spawn_position_uses_published_nonzero_world_spawn() {
+    let blocks = Arc::new(fluid_test_registry());
+    let spawn = mc_world::WorldSpawn::new(160, -80);
+    let position = spawn.chunk();
+    let mut world = mc_world::WorldStorage::in_memory(Arc::clone(&blocks)).with_spawn(spawn);
+    let mut chunk = Chunk::empty(
+        position,
+        mc_world::BlockStateId(0),
+        Identifier::parse("minecraft:plains").unwrap(),
+    );
+    chunk.set_block(0, 64, 0, mc_world::BlockStateId(1));
+    chunk
+        .highest_opaque
+        .set(0, 0, (64 - mc_world::MIN_Y + 1) as u32);
+    world.commit_chunk_snapshot(position, chunk).unwrap();
+    let world_read = world.read_view();
+    let config = simulation_tick_test_config(
+        blocks,
+        world,
+        RandomTickPolicy::default(),
+        Arc::new(fluid_test_facts()),
+    );
+
+    assert_eq!(world_read.spawn(), spawn);
+    assert_eq!(
+        spawn_position(&config, Some(&world_read)),
+        (160.5, 66.0, -79.5)
+    );
+}
+
+#[tokio::test]
 async fn spawn_position_chooses_nearest_dry_column_instead_of_origin_water() {
     let blocks = Arc::new(fluid_test_registry());
     let mut world = mc_world::WorldStorage::in_memory(Arc::clone(&blocks));

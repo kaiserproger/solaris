@@ -15,11 +15,13 @@ use mc_server::ServerConfig;
 mod startup_validation;
 
 #[cfg(test)]
+use startup_validation::ensure_world_contract;
+#[cfg(test)]
 use startup_validation::{PersistedWorldContract, WORLD_CONTRACT_SCHEMA, world_contract_path};
 use startup_validation::{
-    WorldSource, ensure_world_contract, has_non_directory_ancestor, is_public_bind_ip,
+    WorldSource, ensure_world_contract_with_spawn, has_non_directory_ancestor, is_public_bind_ip,
     required_world_dir, validate_runtime_config, validate_vanilla_sidecar_version,
-    world_region_root_is_blocked,
+    world_region_root_is_blocked, world_requires_solaris_spawn,
 };
 
 const SHUTDOWN_DRAIN_TIMEOUT: Duration = Duration::from_secs(6);
@@ -487,15 +489,6 @@ async fn serve(path: &Path) -> Result<()> {
         .as_ref()
         .map(mc_script::LuaSettlementPlan::contract_name)
         .unwrap_or_else(|| "vanilla".to_owned());
-    let world_source = ensure_world_contract(
-        world_dir,
-        configured_geometry,
-        cfg.data.seed,
-        worldgen_mode.contract_name(),
-        ore_profile_name,
-        &settlement_contract,
-    )?;
-
     let protocol_data = load_effective_protocol_data(cfg.data.vanilla_data_dir.as_deref())?;
     let data = protocol_data.data;
     tracing::info!(
@@ -590,6 +583,35 @@ async fn serve(path: &Path) -> Result<()> {
         structure_rules,
         plugin_ore_profile,
     )?;
+    let configured_spawn = if world_requires_solaris_spawn(world_dir)? {
+        let located = terrain_generator
+            .locate_safe_spawn()
+            .context("finding a bounded natural spawn in generated terrain")?;
+        mc_world::WorldSpawn::new(located.block_x, located.block_z)
+    } else {
+        mc_world::WorldSpawn::default()
+    };
+    let world_source = ensure_world_contract_with_spawn(
+        world_dir,
+        configured_geometry,
+        cfg.data.seed,
+        worldgen_mode.contract_name(),
+        ore_profile_name,
+        &settlement_contract,
+        configured_spawn,
+    )?;
+    let world_spawn = match world_source {
+        WorldSource::SolarisGenerated => configured_spawn,
+        WorldSource::ExistingVanilla => mc_world::WorldSpawn::default(),
+    };
+    tracing::info!(
+        block_x = world_spawn.block_x,
+        block_z = world_spawn.block_z,
+        chunk_x = world_spawn.chunk().x,
+        chunk_z = world_spawn.chunk().z,
+        source = ?world_source,
+        "world spawn centre resolved",
+    );
     let item_facts_source = load_effective_item_facts(cfg.data.vanilla_data_dir.as_deref())?;
     let item_facts = Arc::new(item_facts_source.table);
     tracing::info!(
@@ -625,7 +647,9 @@ async fn serve(path: &Path) -> Result<()> {
                 let startup_workers =
                     startup_chunk_worker_threads(chunk_pipeline.chunk_worker_threads);
                 let startup_light_workers = startup_light_bake_worker_threads(startup_workers);
-                let mut storage = storage.with_item_registry(Arc::clone(&items));
+                let mut storage = storage
+                    .with_item_registry(Arc::clone(&items))
+                    .with_spawn(world_spawn);
                 if world_source == WorldSource::SolarisGenerated {
                     let generator: Arc<dyn mc_world::ChunkGenerator> =
                         Arc::clone(&terrain_generator) as Arc<dyn mc_world::ChunkGenerator>;
@@ -1006,7 +1030,7 @@ fn generate_spawn_window(
     block_light: Option<&mc_data::block_light::BlockLightTable>,
 ) -> Result<usize> {
     let view_distance = view_distance.max(0);
-    let positions = spawn_window_positions(view_distance);
+    let positions = spawn_window_positions_at(storage.spawn().chunk(), view_distance);
     let total = positions.len();
     if total == 0 {
         return Ok(0);
@@ -1143,7 +1167,7 @@ fn generate_spawn_window(
 
 fn warm_spawn_window(storage: &mut mc_world::WorldStorage, view_distance: i32) -> Result<usize> {
     let mut warmed = 0usize;
-    for pos in spawn_window_positions(view_distance) {
+    for pos in spawn_window_positions_at(storage.spawn().chunk(), view_distance) {
         if storage
             .get_chunk(pos)
             .with_context(|| format!("warming spawn chunk ({}, {})", pos.x, pos.z))?
@@ -1188,7 +1212,7 @@ fn bake_spawn_window_light(
     view_distance: i32,
     worker_threads: usize,
 ) -> Result<usize> {
-    let positions = spawn_view_positions(view_distance);
+    let positions = spawn_view_positions_at(storage.spawn().chunk(), view_distance);
     bake_spawn_window_light_for_positions(
         storage,
         block_light,
@@ -1205,7 +1229,7 @@ fn bake_missing_spawn_window_light(
     worker_threads: usize,
 ) -> Result<usize> {
     let mut missing = Vec::new();
-    for pos in spawn_view_positions(view_distance) {
+    for pos in spawn_view_positions_at(storage.spawn().chunk(), view_distance) {
         let Some(chunk) = storage.cached_chunk_snapshot(pos) else {
             bail!(
                 "missing warmed spawn chunk ({}, {}) while checking baked light",
@@ -1238,7 +1262,7 @@ fn bake_spawn_window_light_for_positions(
         return Ok(0);
     }
     let mut snapshots: HashMap<mc_world::ChunkPos, Arc<mc_world::Chunk>> = HashMap::new();
-    for pos in spawn_window_positions(view_distance) {
+    for pos in spawn_window_positions_at(storage.spawn().chunk(), view_distance) {
         let Some(chunk) = storage.cached_chunk_snapshot(pos) else {
             bail!(
                 "missing generated chunk ({}, {}) while baking spawn light",
@@ -1338,25 +1362,47 @@ fn bake_spawn_window_light_for_positions(
     Ok(total)
 }
 
+#[cfg(test)]
 fn spawn_view_positions(view_distance: i32) -> Vec<mc_world::ChunkPos> {
+    spawn_view_positions_at(mc_world::ChunkPos { x: 0, z: 0 }, view_distance)
+}
+
+fn spawn_view_positions_at(
+    center: mc_world::ChunkPos,
+    view_distance: i32,
+) -> Vec<mc_world::ChunkPos> {
     let radius = view_distance.max(0);
     let width = radius as usize * 2 + 1;
     let mut positions = Vec::with_capacity(width * width);
     for z in -radius..=radius {
         for x in -radius..=radius {
-            positions.push(mc_world::ChunkPos { x, z });
+            positions.push(mc_world::ChunkPos {
+                x: center.x + x,
+                z: center.z + z,
+            });
         }
     }
     positions
 }
 
+#[cfg(test)]
 fn spawn_window_positions(view_distance: i32) -> Vec<mc_world::ChunkPos> {
+    spawn_window_positions_at(mc_world::ChunkPos { x: 0, z: 0 }, view_distance)
+}
+
+fn spawn_window_positions_at(
+    center: mc_world::ChunkPos,
+    view_distance: i32,
+) -> Vec<mc_world::ChunkPos> {
     let radius = view_distance.max(0) + 1;
     let width = radius as usize * 2 + 1;
     let mut positions = Vec::with_capacity(width * width);
     for z in -radius..=radius {
         for x in -radius..=radius {
-            positions.push(mc_world::ChunkPos { x, z });
+            positions.push(mc_world::ChunkPos {
+                x: center.x + x,
+                z: center.z + z,
+            });
         }
     }
     positions
@@ -1833,6 +1879,13 @@ mod tests {
         assert_eq!(chunk_cache_size_for_view_distance(10), 625);
         assert_eq!(spawn_window_positions(6).len(), 225);
         assert_eq!(spawn_view_positions(6).len(), 169);
+        let center = mc_world::ChunkPos { x: 7, z: -3 };
+        let centered_window = spawn_window_positions_at(center, 6);
+        let centered_view = spawn_view_positions_at(center, 6);
+        assert_eq!(centered_window.len(), 225);
+        assert_eq!(centered_view.len(), 169);
+        assert!(centered_window.contains(&mc_world::ChunkPos { x: 14, z: 4 }));
+        assert!(centered_view.contains(&center));
     }
 
     #[test]
@@ -1925,6 +1978,9 @@ mod tests {
         assert_eq!(persisted.settlement_profile, "vanilla");
         assert_eq!(persisted.min_y, 0);
         assert_eq!(persisted.height, 256);
+        assert_eq!(persisted.spawn_block_x, 0);
+        assert_eq!(persisted.spawn_block_z, 0);
+        assert!(world_requires_solaris_spawn(world.path()).unwrap());
 
         let error = ensure_world_contract(
             world.path(),
@@ -1940,6 +1996,80 @@ mod tests {
         assert!(message.contains("world contract geometry"), "{message}");
         assert!(message.contains("0..256"), "{message}");
         assert!(message.contains("-64..320"), "{message}");
+    }
+
+    #[test]
+    fn world_contract_schema_two_is_rejected_cleanly_before_spawn_validation() {
+        let world = tempfile::tempdir().unwrap();
+        let contract_dir = world.path().join("solaris");
+        std::fs::create_dir_all(&contract_dir).unwrap();
+        let legacy = serde_json::json!({
+            "schema": 2,
+            "worldgen_revision": mc_worldgen::WORLDGEN_REVISION,
+            "seed": 712816,
+            "mode": "tellus_like",
+            "ore_profile": "vanilla",
+            "settlement_profile": "vanilla",
+            "min_y": -64,
+            "height": 384
+        });
+        std::fs::write(
+            world_contract_path(world.path()),
+            serde_json::to_vec_pretty(&legacy).unwrap(),
+        )
+        .unwrap();
+
+        let error = ensure_world_contract_with_spawn(
+            world.path(),
+            mc_world::OVERWORLD_GEOMETRY,
+            712816,
+            "tellus_like",
+            "vanilla",
+            "vanilla",
+            mc_world::WorldSpawn::new(320, -192),
+        )
+        .unwrap_err();
+        let message = error.to_string();
+        assert!(message.contains("unsupported persisted world contract schema 2"));
+        assert!(!message.contains("missing field"));
+    }
+
+    #[test]
+    fn world_contract_persists_and_rejects_changed_spawn() {
+        let world = tempfile::tempdir().unwrap();
+        let geometry = mc_world::ChunkGeometry::new(-64, 384).unwrap();
+        let spawn = mc_world::WorldSpawn::new(320, -192);
+
+        assert_eq!(
+            ensure_world_contract_with_spawn(
+                world.path(),
+                geometry,
+                712_816,
+                "tellus_like",
+                "vanilla",
+                "vanilla",
+                spawn,
+            )
+            .unwrap(),
+            WorldSource::SolarisGenerated,
+        );
+        let bytes = std::fs::read(world_contract_path(world.path())).unwrap();
+        let persisted: PersistedWorldContract = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(persisted.spawn_block_x, spawn.block_x);
+        assert_eq!(persisted.spawn_block_z, spawn.block_z);
+
+        let error = ensure_world_contract_with_spawn(
+            world.path(),
+            geometry,
+            712_816,
+            "tellus_like",
+            "vanilla",
+            "vanilla",
+            mc_world::WorldSpawn::new(384, -192),
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains("spawn=(320, -192)"));
+        assert!(error.to_string().contains("spawn=(384, -192)"));
     }
 
     #[test]
@@ -1986,6 +2116,7 @@ mod tests {
         .unwrap();
 
         let geometry = mc_world::ChunkGeometry::new(0, 256).unwrap();
+        assert!(!world_requires_solaris_spawn(world.path()).unwrap());
         assert_eq!(
             ensure_world_contract(
                 world.path(),
@@ -3155,7 +3286,10 @@ mod tests {
             }],
         }];
         let registry = Arc::new(mc_world::BlockRegistry::from_report(&report).unwrap());
-        let mut storage = mc_world::WorldStorage::in_memory_with_capacity(registry, 32);
+        let spawn = mc_world::WorldSpawn::new(160, -80);
+        let center = spawn.chunk();
+        let mut storage =
+            mc_world::WorldStorage::in_memory_with_capacity(registry, 32).with_spawn(spawn);
         let active = Arc::new(AtomicUsize::new(0));
         let max_active = Arc::new(AtomicUsize::new(0));
         let generator = Arc::new(StubGen {
@@ -3171,6 +3305,18 @@ mod tests {
         );
         assert_eq!(storage.cache_len(), 25);
         assert_eq!(storage.dirty_count(), 25);
+        for position in spawn_window_positions_at(center, 1) {
+            assert!(
+                storage.cached_chunk_snapshot(position).is_some(),
+                "spawn-centred chunk {position:?} should be resident"
+            );
+        }
+        assert!(
+            storage
+                .cached_chunk_snapshot(mc_world::ChunkPos { x: 0, z: 0 })
+                .is_none(),
+            "nonzero spawn generation must not silently materialize origin"
+        );
         assert!(
             max_active.load(Ordering::SeqCst) > 1,
             "startup pre-generation should use worker threads"

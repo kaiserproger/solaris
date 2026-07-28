@@ -130,6 +130,27 @@ impl Drop for ResidentPublishGuard<'_> {
     }
 }
 
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct WorldSpawn {
+    pub block_x: i32,
+    pub block_z: i32,
+}
+
+impl WorldSpawn {
+    #[must_use]
+    pub const fn new(block_x: i32, block_z: i32) -> Self {
+        Self { block_x, block_z }
+    }
+
+    #[must_use]
+    pub const fn chunk(self) -> ChunkPos {
+        ChunkPos {
+            x: self.block_x.div_euclid(16),
+            z: self.block_z.div_euclid(16),
+        }
+    }
+}
+
 #[derive(Clone)]
 pub struct WorldReadView {
     chunks: Arc<[PublishedChunkShard; READ_VIEW_SHARD_COUNT]>,
@@ -140,6 +161,7 @@ pub struct WorldReadView {
     dirty_saturated: Arc<AtomicBool>,
     dirty_high_water_notifier: Arc<RwLock<Option<DirtyHighWaterNotifier>>>,
     publication: Arc<ResidentPublicationState>,
+    spawn: Arc<RwLock<WorldSpawn>>,
 }
 
 #[derive(Clone, Default)]
@@ -187,11 +209,27 @@ impl WorldReadView {
             dirty_saturated: Arc::new(AtomicBool::new(false)),
             dirty_high_water_notifier: Arc::new(RwLock::new(None)),
             publication: Arc::new(ResidentPublicationState::new()),
+            spawn: Arc::new(RwLock::new(WorldSpawn::default())),
         }
     }
 
     pub(crate) fn publication_state(&self) -> Arc<ResidentPublicationState> {
         Arc::clone(&self.publication)
+    }
+
+    #[must_use]
+    pub fn spawn(&self) -> WorldSpawn {
+        *self
+            .spawn
+            .read()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+
+    pub(crate) fn set_spawn(&self, spawn: WorldSpawn) {
+        *self
+            .spawn
+            .write()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = spawn;
     }
 
     #[must_use]

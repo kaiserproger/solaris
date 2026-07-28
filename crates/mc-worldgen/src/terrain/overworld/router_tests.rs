@@ -17,7 +17,6 @@ fn tellus_temperature_uses_latitude_and_surface_altitude() {
 fn terrain_is_deterministic_bounded_and_continuous() {
     for seed in -16..16 {
         let router = OverworldRouter::new(seed, OVERWORLD_GEOMETRY, WorldgenMode::VanillaLike);
-        assert!(router.sample(0, 0).surface_y >= SEA_LEVEL + 3);
         for z in (-2_048..=2_048).step_by(97) {
             for x in (-2_048..=2_048).step_by(31) {
                 let current = router.sample(x, z).surface_y;
@@ -131,26 +130,18 @@ fn landforms_do_not_create_isolated_craters() {
 }
 
 #[test]
-fn spawn_window_is_dry_walkable_land_across_seed_grid() {
-    for seed in -8..8 {
-        let router = OverworldRouter::new(seed, OVERWORLD_GEOMETRY, WorldgenMode::VanillaLike);
-        for z in -96..=96 {
-            for x in -96..=96 {
-                let height = router.sample(x, z).surface_y;
-                assert!(
-                    height >= SEA_LEVEL + 3,
-                    "seed {seed} has wet spawn terrain at ({x},{z}): {height}"
-                );
-                for (nx, nz) in [(x + 1, z), (x, z + 1)] {
-                    let neighbour = router.sample(nx, nz).surface_y;
-                    assert!(
-                        (height - neighbour).abs() <= 3,
-                        "seed {seed} has an impassable spawn step at ({x},{z}): {height} -> {neighbour}"
-                    );
-                }
-            }
-        }
-    }
+fn origin_terrain_is_not_normalized_across_seeds() {
+    let heights = (-16..16)
+        .map(|seed| {
+            OverworldRouter::new(seed, OVERWORLD_GEOMETRY, WorldgenMode::VanillaLike)
+                .sample(0, 0)
+                .surface_y
+        })
+        .collect::<std::collections::HashSet<_>>();
+    assert!(
+        heights.len() >= 8,
+        "origin terrain still looks normalized across seeds: {heights:?}"
+    );
 }
 
 #[test]

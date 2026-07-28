@@ -28,8 +28,13 @@ pub(super) fn spawn_position(
     world_read: Option<&mc_world::WorldReadView>,
 ) -> (f64, f64, f64) {
     safe_spawn_position(config, world_read).unwrap_or_else(|| {
+        let spawn = world_read.map_or_else(mc_world::WorldSpawn::default, |view| view.spawn());
         let y = adaptive_spawn_y(config, world_read).unwrap_or(DEFAULT_SPAWN_Y);
-        (SPAWN_X, y, SPAWN_Z)
+        (
+            f64::from(spawn.block_x) + 0.5,
+            y,
+            f64::from(spawn.block_z) + 0.5,
+        )
     })
 }
 
@@ -41,25 +46,33 @@ fn safe_spawn_position(
     world_read: Option<&mc_world::WorldReadView>,
 ) -> Option<(f64, f64, f64)> {
     let world_read = world_read?;
+    let spawn = world_read.spawn();
+    let center = spawn.chunk();
     let chunk_radius = SPAWN_SEARCH_RADIUS_CHUNKS;
     let mut positions = Vec::with_capacity(((chunk_radius * 2 + 1).pow(2)) as usize);
     for chunk_z in -chunk_radius..=chunk_radius {
         for chunk_x in -chunk_radius..=chunk_radius {
             positions.push(ChunkPos {
-                x: chunk_x,
-                z: chunk_z,
+                x: center.x + chunk_x,
+                z: center.z + chunk_z,
             });
         }
     }
     let snapshot = world_read.snapshot_chunks(&positions);
     let mut best: Option<(i64, i32, i32, i32)> = None;
 
-    for z in -SPAWN_SEARCH_RADIUS_BLOCKS..=SPAWN_SEARCH_RADIUS_BLOCKS {
-        for x in -SPAWN_SEARCH_RADIUS_BLOCKS..=SPAWN_SEARCH_RADIUS_BLOCKS {
-            let distance_squared = i64::from(x) * i64::from(x) + i64::from(z) * i64::from(z);
+    for dz in -SPAWN_SEARCH_RADIUS_BLOCKS..=SPAWN_SEARCH_RADIUS_BLOCKS {
+        for dx in -SPAWN_SEARCH_RADIUS_BLOCKS..=SPAWN_SEARCH_RADIUS_BLOCKS {
+            let distance_squared = i64::from(dx) * i64::from(dx) + i64::from(dz) * i64::from(dz);
             if best.is_some_and(|(best_distance, ..)| best_distance <= distance_squared) {
                 continue;
             }
+            let Some(x) = spawn.block_x.checked_add(dx) else {
+                continue;
+            };
+            let Some(z) = spawn.block_z.checked_add(dz) else {
+                continue;
+            };
             let Some(y) = safe_spawn_y(config, &snapshot, x, z) else {
                 continue;
             };
@@ -144,14 +157,22 @@ fn adaptive_spawn_y(
     config: &ServerConfig,
     world_read: Option<&mc_world::WorldReadView>,
 ) -> Option<f64> {
-    let chunk = world_read?
-        .snapshot_chunks(&[ChunkPos { x: 0, z: 0 }])
-        .chunk(ChunkPos { x: 0, z: 0 })?;
-    if let Some(top) = chunk.highest_opaque_y(0, 0) {
+    let world_read = world_read?;
+    let spawn = world_read.spawn();
+    let position = spawn.chunk();
+    let chunk = world_read.snapshot_chunks(&[position]).chunk(position)?;
+    let local_x = spawn.block_x.rem_euclid(16) as u8;
+    let local_z = spawn.block_z.rem_euclid(16) as u8;
+    if let Some(top) = chunk.highest_opaque_y(local_x, local_z) {
         return Some((top + 2) as f64);
     }
     let mut chunk = chunk.as_ref().clone();
-    spawn_y_from_chunk(&mut chunk, config.block_light.as_deref())
+    if let Some(table) = config.block_light.as_deref() {
+        chunk.rebuild_highest_opaque(table);
+    }
+    chunk
+        .highest_opaque_y(local_x, local_z)
+        .map(|top| f64::from(top + 2))
 }
 
 pub(crate) async fn prepare_spawn_chunk(
@@ -161,15 +182,16 @@ pub(crate) async fn prepare_spawn_chunk(
     let Some(world) = config.world.as_ref() else {
         return Ok(());
     };
-    let position = ChunkPos { x: 0, z: 0 };
-    let (plan, generator) = {
+    let (position, plan, generator) = {
         let storage = crate::lock_metrics::timed_guard(
             crate::lock_metrics::LockMetricKind::WorldStorage,
             "spawn chunk plan",
             Instant::now(),
             world.lock().await,
         );
+        let position = storage.spawn().chunk();
         (
+            position,
             storage.plan_chunk_snapshot_without_generation(position),
             storage.generator(),
         )
@@ -220,6 +242,7 @@ pub(crate) async fn prepare_spawn_chunk(
         .map_err(|error| error.to_string())
 }
 
+#[cfg(test)]
 pub(super) fn spawn_y_from_chunk(
     chunk: &mut Chunk,
     table: Option<&BlockLightTable>,

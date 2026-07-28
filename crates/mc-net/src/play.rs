@@ -578,6 +578,7 @@ const ENTITY_GOAL_UPDATES_PER_TICK: usize = 512;
 const ENTITY_SIMULATION_UPDATES_PER_LANE_PER_TICK: usize = 256;
 const TELEPORT_RESEND_DELAY_TICKS: u64 = 20;
 
+#[cfg(test)]
 const SPAWN_X: f64 = 0.5;
 // The bundled test world uses vanilla's flat-preset surface: bedrock
 // at Y=-64, dirt at Y=-63..-62, grass at Y=-61. Spawn one block
@@ -586,6 +587,7 @@ const SPAWN_X: f64 = 0.5;
 // enough to land before the client picked up physics; M4's slower
 // debug-mode burst exposed the latent bug.)
 const DEFAULT_SPAWN_Y: f64 = -59.0;
+#[cfg(test)]
 const SPAWN_Z: f64 = 0.5;
 const DEFAULT_SEA_LEVEL: i32 = 63;
 const PLAYER_ENTITY_TYPE_ID: i32 = 155;

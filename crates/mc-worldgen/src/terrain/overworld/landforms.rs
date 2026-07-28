@@ -17,7 +17,6 @@ const MOUNTAIN_DETAIL_LONG_SCALE: f64 = 520.0;
 const MOUNTAIN_DETAIL_CROSS_SCALE: f64 = 210.0;
 const RIVER_SCALE: f64 = 1_850.0;
 const RIVER_DETAIL_SCALE: f64 = 610.0;
-const SPAWN_LAND_RADIUS: f64 = 384.0;
 
 pub(super) fn sample(router: OverworldRouter, block_x: i32, block_z: i32) -> TerrainSample {
     let settings = router.settings();
@@ -61,9 +60,7 @@ pub(super) fn sample(router: OverworldRouter, block_x: i32, block_z: i32) -> Ter
         3,
         0.5,
     );
-    let raw_continentalness = continent_macro * 0.82 + continent_detail * 0.18;
-    let spawn_weight = 1.0 - smootherstep((x.hypot(z) / SPAWN_LAND_RADIUS).clamp(0.0, 1.0));
-    let continentalness = lerp(raw_continentalness, 0.34, spawn_weight);
+    let continentalness = continent_macro * 0.82 + continent_detail * 0.18;
     let land = smootherstep(remap(continentalness, -0.20, 0.09));
 
     let erosion = normalized(fbm_2d(
@@ -121,8 +118,7 @@ pub(super) fn sample(router: OverworldRouter, block_x: i32, block_z: i32) -> Ter
         .powi(5)
         .max(ridge_b.clamp(0.0, 1.0).powi(6) * 0.72);
     let mountain_domain = smootherstep(remap(continentalness, 0.10, 0.46))
-        * smootherstep(remap(1.0 - erosion, 0.30, 0.78))
-        * (1.0 - spawn_weight);
+        * smootherstep(remap(1.0 - erosion, 0.30, 0.78));
     let ridges = ridge_shape * mountain_domain;
 
     let ocean_scale = settings.map_or(1.0, |value| value.oceanic_height_scale.max(0.0));
@@ -139,13 +135,8 @@ pub(super) fn sample(router: OverworldRouter, block_x: i32, block_z: i32) -> Ter
     let mountain_relief = ridges * (mountain_height + mountain_detail * 36.0 * land_scale);
     let mut height = lerp(ocean_floor, rolling_land + mountain_relief, land);
 
-    // Keep the deterministic spawn region dry even when broad relief happens
-    // to dip below sea level for a particular seed.
-    let spawn_floor = sea + 7.0;
-    height = height.max(lerp(height, spawn_floor, spawn_weight));
-
-    // A warped zero contour forms continuous valleys. Mountains and the safe
-    // spawn plateau suppress it before it can become a local sink.
+    // A warped zero contour forms continuous valleys. Mountain relief suppresses
+    // it before it can become a local sink.
     let river_field = fbm_2d(
         wx / (RIVER_SCALE * scale),
         wz / (RIVER_SCALE * scale),
@@ -159,11 +150,11 @@ pub(super) fn sample(router: OverworldRouter, block_x: i32, block_z: i32) -> Ter
         2,
         0.45,
     ) * 0.11;
-    let river_distance = river_field.abs().max(spawn_weight * 0.15);
+    let river_distance = river_field.abs();
     let river_channel = 1.0 - smootherstep(remap(river_distance, 0.020, 0.078));
     let low_relief = 1.0 - smootherstep(remap(ridges, 0.025, 0.16));
     let inland = smootherstep(remap(continentalness, -0.02, 0.18));
-    let river_weight = river_channel * inland * low_relief * (1.0 - spawn_weight);
+    let river_weight = river_channel * inland * low_relief;
     let river_floor = sea - 3.0 + detail.abs() * 0.55;
     height = lerp(height, river_floor, river_weight);
 

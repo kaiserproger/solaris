@@ -1,7 +1,7 @@
 # ADR 0008 - Overworld generation pipeline
 
 **Date:** 2026-07-22
-**Status:** Accepted, worldgen revision 9
+**Status:** Accepted, worldgen revision 10
 
 ## Context
 
@@ -12,6 +12,16 @@ height or decoration fix can remove. Tree placement also accepted any non-fluid
 block as support instead of the surface planned for that column.
 
 ## Decision
+
+Worldgen revision 10 removes every production starter fixture and every
+origin-based terrain deformation. Fixed surface stone/iron, the forced tree
+anchor, dry-land blending, mountain suppression, and river suppression around
+`(0,0)` are gone. A bounded deterministic locator searches the actual seeded
+terrain for dry, low-relief inland land. Its block coordinates are persisted in
+world-contract schema 3, startup generation/light are centered on its chunk, and
+the network's final support/body-space scan is centered on the same published
+`WorldSpawn`. The public config default and `example.toml` now select
+`tellus_like`; `vanilla_like` remains an explicit compatibility profile.
 
 Worldgen revision 9 removes the filled 3x3 upper leaf boxes left by revision 8.
 Oak and jungle trees retain a broad main canopy but use a connected,
@@ -51,15 +61,15 @@ The revision-6 router replaced the revision-5 router instead of tuning it.
 `terrain::overworld::landforms` owns a new coordinate field: domain-warped
 continents establish shelves and land, erosion and uplands shape broad relief,
 and two differently oriented ridge fields form long branching mountain ranges.
-River valleys use warped zero contours, are suppressed in mountains and the safe
-spawn plateau, and become river biomes only after their valley is substantially
-carved. Broad coordinate scales and a tested three-block adjacent-column slope
+River valleys use warped zero contours, are suppressed only by mountain relief,
+and become river biomes only after their valley is substantially carved. Broad
+coordinate scales and a tested three-block adjacent-column slope
 budget keep interior columns and chunk borders continuous. A separate
 sampled four-block neighbourhood invariant detects isolated terrain craters.
 
-Spawn land and river suppression are smooth field constraints, not later block
-rewrites. River availability is part of the returned field, so biome routing
-cannot label an uncarved coast as a river.
+No spawn-specific terrain constraint remains. River availability is part of the
+returned field, so biome routing cannot label an uncarved coast as a river; spawn
+selection consumes the finished field without changing it.
 
 `terrain::overworld::caves` independently owns underground shape as the
 vertically bounded intersection of two anisotropic 3D tunnel fields. Carvers
@@ -76,12 +86,12 @@ support.
 Generation remains stateless and coordinate-derived. Parallel generation of the
 same chunk or neighbouring chunks in any order produces identical output. Every
 new Solaris world persists `solaris/world.json` with schema, worldgen revision,
-seed, mode, ore profile, settlement profile, and geometry. A mismatched contract
-is rejected before Anvil open.
+seed, mode, ore profile, settlement profile, geometry, and selected spawn block
+coordinates. A mismatched contract is rejected before Anvil open.
 An existing unversioned Anvil world is treated as a vanilla import and opens
 without Solaris fallback generation, so missing chunks cannot mix both terrain
 authorities. Existing worlds are never rewritten. The local playable profile
-uses `.analysis/test-world-v9`.
+uses `.analysis/test-world-v10`.
 
 Anvil root metadata belongs to the chunk serialization boundary, not a concrete
 terrain generator. The encoder emits one `DataVersion`, `LastUpdate`, and

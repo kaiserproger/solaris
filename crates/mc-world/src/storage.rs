@@ -43,7 +43,7 @@ pub use dirty_flush::{
 pub(crate) use read_view::ResidentPublicationState;
 pub use read_view::{
     ChunkDiskLoadPlan, ChunkPrepareSource, ChunkSnapshot, ChunkSnapshotPlan, ChunkSourceView,
-    DirtyHighWaterNotifier, ScheduledTickView, WorldReadSnapshot, WorldReadView,
+    DirtyHighWaterNotifier, ScheduledTickView, WorldReadSnapshot, WorldReadView, WorldSpawn,
 };
 
 const REGION_AXIS_CHUNKS: i32 = 32;
@@ -304,6 +304,17 @@ impl WorldStorage {
         self.generator_available.store(true, Ordering::Release);
         self.generator = Some(generator);
         self
+    }
+
+    #[must_use]
+    pub fn with_spawn(self, spawn: WorldSpawn) -> Self {
+        self.read_view.set_spawn(spawn);
+        self
+    }
+
+    #[must_use]
+    pub fn spawn(&self) -> WorldSpawn {
+        self.read_view.spawn()
     }
 
     #[must_use]

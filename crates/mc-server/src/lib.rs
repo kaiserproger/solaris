@@ -132,8 +132,8 @@ impl DataSection {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
 #[serde(rename_all = "snake_case")]
 pub enum WorldgenMode {
-    #[default]
     VanillaLike,
+    #[default]
     TellusLike,
 }
 
@@ -593,7 +593,7 @@ mod tests {
         assert_eq!(cfg.network.port, 25565);
         assert_eq!(
             cfg.data.world_dir,
-            Some(std::path::PathBuf::from(".analysis/test-world-v9"))
+            Some(std::path::PathBuf::from(".analysis/test-world-v10"))
         );
         assert_eq!(
             cfg.data.vanilla_data_dir,
@@ -646,7 +646,7 @@ mod tests {
         assert_eq!(cfg.simulation.save_interval_ticks, 20);
         assert!(cfg.simulation.spawn_monsters);
         assert!(cfg.data.vanilla_data_dir.is_none());
-        assert_eq!(cfg.data.worldgen_mode, WorldgenMode::VanillaLike);
+        assert_eq!(cfg.data.worldgen_mode, WorldgenMode::TellusLike);
         assert_eq!(
             cfg.data.chunk_geometry().unwrap(),
             mc_world::OVERWORLD_GEOMETRY
@@ -821,7 +821,7 @@ mod tests {
     }
 
     #[test]
-    fn parses_tellus_like_worldgen_config_without_changing_defaults() {
+    fn parses_explicit_tellus_like_worldgen_config() {
         let toml_src = r#"
             [server]
             name = "S"

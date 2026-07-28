@@ -507,27 +507,19 @@ hardening. An already-open lower-priority diff does not override this order.
   or 401s, moved from z=0.598 to z=9.956, and remained in play at full health.
   The current-build 20-minute autonomous survival session remains pending.
 
-- Worldgen revision 9 keeps the revision-6 cave stage and revision-8 landforms:
-  domain-warped continents, shaped branching mountain ranges, and warped
-  river-valley contours that become river biomes only after substantial carving.
-  Tests cover a dry walkable 193x193 spawn window across a seed grid, full
-  sampled cave volumes, chunk-border slopes, isolated-crater rejection, surface
-  shells, exact tree support, spawn resources, extreme vertical geometry, and
-  wire-level generated world use.
-  Fresh Solaris worlds persist revision/seed/mode/ore-profile/geometry in
-  `solaris/world.json`; revision 9 also replaces filled square upper leaf
-  layers with connected irregular oak/jungle crowns. Unversioned vanilla Anvil
-  worlds open without Solaris fallback generation, so terrain authorities
-  cannot mix. `playable.toml` now
-  uses `.analysis/test-world-v9` with seed `0` and `tellus_like`; the earlier
-  revision-8 profile and seed `918273645` received bounded fresh-client
-  inspection. A fresh revision-9 pass measured an isolated six-leaf raised
-  crown, 8.84% decorated columns in a 31x31 spawn sample, and empty collision
-  for 24 generated grass/flower samples. Existing exact-table gates cover all
-  states of seven sapling species, eight crop/stem families, both oak-door
-  planes, and the runtime torch/campfire pair. The separate seed-918273645 pass
-  rendered the long snow range at `(-78080,215,-28928)`; exact coordinates and
-  artifacts are recorded in the owner playtest queue.
+- Worldgen revision 10 removes the production-only spawn fixtures inherited by
+  revision 9: no fixed tree, stone, surface iron, dry-origin blend, mountain
+  suppression, or river suppression remains. A deterministic bounded locator
+  searches the actual seeded terrain for dry low-relief land; schema-3
+  `solaris/world.json` persists that block position, startup generation and light
+  center on its chunk, and fresh-player support/body-space search consumes the
+  same `WorldSpawn`. A 32-seed Tellus regression includes `0`, `712816`, and `-1`
+  and requires distinct local height fingerprints. `example.toml` and the config
+  default are now `tellus_like`; `playable.toml` uses
+  `.analysis/test-world-v10`. Existing revision-9 crown, cave, slope, shell, and
+  generated-world gates remain green. A fresh graphical revision-10 inspection,
+  2048x2048 height/biome/vegetation mosaics, drainage/vegetation quality work,
+  seed-`712816` owner playtest, and throughput comparison remain pending.
 
 - Hostile melee now keeps a zero-speed target-facing goal while in reach, so a
   stationary zombie stops without freezing its body/head rotation and publishes

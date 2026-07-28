@@ -542,8 +542,6 @@ fn try_with_rules_reports_missing_required_block() {
 #[test]
 fn try_with_rules_allows_missing_optional_blocks_when_required_resources_exist() {
     let registry = required_only_registry();
-    let iron_ore = try_resolve_block(registry.as_ref(), "minecraft:iron_ore")
-        .expect("required-only registry should include iron ore");
     let generator = TerrainGenerator::try_with_rules(
         42,
         registry,
@@ -552,7 +550,6 @@ fn try_with_rules_allows_missing_optional_blocks_when_required_resources_exist()
     )
     .expect("optional terrain blocks should use fallbacks");
 
-    assert_eq!(generator.iron_ore, iron_ore);
     assert_eq!(generator.sand, generator.stone);
     assert_eq!(generator.red_sand, generator.stone);
     assert_eq!(generator.gravel, generator.stone);

@@ -32,7 +32,8 @@ pub use resident::{
 pub use section::{ChunkSection, PackedBitArray, SECTION_DIM, SECTION_VOLUME};
 pub use storage::{
     ChunkDiskLoadPlan, ChunkPrepareSource, ChunkSnapshot, ChunkSnapshotPlan, ChunkSourceView,
-    DirtyFlushPlan, ScheduledTickView, WorldError, WorldReadSnapshot, WorldReadView, WorldStorage,
+    DirtyFlushPlan, ScheduledTickView, WorldError, WorldReadSnapshot, WorldReadView, WorldSpawn,
+    WorldStorage,
 };
 
 /// Crate version, exposed so other crates and the binary can report it.

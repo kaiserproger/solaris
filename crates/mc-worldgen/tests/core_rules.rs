@@ -1,4 +1,4 @@
-use std::collections::{BTreeSet, HashMap};
+use std::collections::{BTreeSet, HashMap, HashSet};
 use std::sync::Arc;
 
 use mc_data::Identifier;
@@ -9,7 +9,8 @@ use mc_world::{
     BlockRegistry, BlockStateId, Chunk, ChunkGenerator, ChunkPos, MAX_Y, OVERWORLD_GEOMETRY,
 };
 use mc_worldgen::{
-    BiomeRules, BiomeScope, OreRule, OreRules, OreSpacing, TerrainGenerator, YRange,
+    BiomeRules, BiomeScope, OreRule, OreRules, OreSpacing, TellusWorldgenSettings,
+    TerrainGenerator, WorldgenMode, YRange,
 };
 
 fn generator() -> (TerrainGenerator, Arc<BlockRegistry>, BiomeRules) {
@@ -263,107 +264,45 @@ fn generated_tree_trunks_are_supported_by_stable_terrain() {
 }
 
 #[test]
-fn default_seed_spawn_window_contains_basic_playable_resources() {
+fn seed_driven_spawn_locator_finds_distinct_natural_land() {
     let registry = Arc::new(
         BlockRegistry::from_report(&mc_data::blocks::solaris_required_blocks_report()).unwrap(),
     );
-    let generator = TerrainGenerator::try_with_biome_rules(
-        0,
-        Arc::clone(&registry),
-        BiomeRules::vanilla_overworld(),
-    )
-    .unwrap();
-    let air = default_state(&registry, "minecraft:air");
-    let stone = default_state(&registry, "minecraft:stone");
-    let iron_ore = default_state(&registry, "minecraft:iron_ore");
-    let deepslate_iron_ore = default_state(&registry, "minecraft:deepslate_iron_ore");
-    let mut found_tree = false;
-    let mut found_shallow_stone = false;
-    let mut found_exposed_stone = false;
-    let mut starter_stone_count = 0;
-    let mut exposed_iron_count = 0;
+    let seeds = [
+        0, 712_816, -1, 1, 2, 3, 5, 8, 13, 21, 34, 55, 89, 144, 233, 377, 610, 987, 1_597, 2_584,
+        4_181, 6_765, 10_946, 17_711, 28_657, 46_368, 75_025, 121_393, 196_418, 317_811, 514_229,
+        832_040,
+    ];
+    let mut fingerprints = HashSet::new();
 
-    for cx in -4..=4 {
-        for cz in -4..=4 {
-            let chunk = generator.generate(ChunkPos { x: cx, z: cz });
-            for lx in 2..=13u8 {
-                for lz in 2..=13u8 {
-                    let wx = cx * 16 + i32::from(lx);
-                    let wz = cz * 16 + i32::from(lz);
-                    if (wx * wx + wz * wz) > 64 * 64 {
-                        continue;
-                    }
-                    let surface_y = generator.surface_height(wx, wz);
-                    for y in (surface_y - 8).max(mc_world::MIN_Y)..=surface_y {
-                        found_shallow_stone |= chunk.get_block(lx, y, lz) == Some(stone);
-                        let exposed_stone = chunk.get_block(lx, y, lz) == Some(stone)
-                            && y + 1 < MAX_Y
-                            && chunk.get_block(lx, y + 1, lz).unwrap_or(air) == air;
-                        found_exposed_stone |= exposed_stone;
-                        if exposed_stone && (8..=11).contains(&wx) && (4..=8).contains(&wz) {
-                            starter_stone_count += 1;
-                        }
-                        if matches!(
-                            chunk.get_block(lx, y, lz),
-                            Some(state) if state == iron_ore || state == deepslate_iron_ore
-                        ) && y + 1 < MAX_Y
-                            && chunk.get_block(lx, y + 1, lz).unwrap_or(air) == air
-                        {
-                            exposed_iron_count += 1;
-                        }
-                    }
-                    for base_y in (surface_y + 1)..=(surface_y + 8).min(MAX_Y - 1) {
-                        let Some(base) = chunk.get_block(lx, base_y, lz) else {
-                            continue;
-                        };
-                        if !is_log(&registry, base) {
-                            continue;
-                        }
+    for seed in seeds {
+        let generator = TerrainGenerator::try_with_biome_rules(
+            seed,
+            Arc::clone(&registry),
+            BiomeRules::vanilla_overworld(),
+        )
+        .unwrap()
+        .with_mode(WorldgenMode::TellusLike(TellusWorldgenSettings::default()));
+        let spawn = generator
+            .locate_safe_spawn()
+            .unwrap_or_else(|| panic!("seed {seed} has no bounded natural spawn"));
+        assert!(spawn.block_x.abs() <= 8_192 && spawn.block_z.abs() <= 8_192);
+        assert!(spawn.surface_y >= mc_worldgen::terrain::SEA_LEVEL + 4);
 
-                        let trunk_height = (0..8)
-                            .take_while(|dy| {
-                                chunk
-                                    .get_block(lx, base_y + dy, lz)
-                                    .is_some_and(|state| is_log(&registry, state))
-                            })
-                            .count();
-                        if trunk_height >= 3 {
-                            found_tree = true;
-                        }
-                    }
-                    if found_tree
-                        && found_shallow_stone
-                        && found_exposed_stone
-                        && starter_stone_count >= 11
-                        && exposed_iron_count >= 10
-                    {
-                        return;
-                    }
-                }
+        let mut heights = Vec::new();
+        for dz in [-8, 0, 8] {
+            for dx in [-8, 0, 8] {
+                heights.push(generator.surface_height(spawn.block_x + dx, spawn.block_z + dz));
             }
         }
+        let minimum = *heights.iter().min().unwrap();
+        let maximum = *heights.iter().max().unwrap();
+        assert!(
+            maximum - minimum <= 3,
+            "seed {seed} locator selected excessive relief at {spawn:?}: {heights:?}"
+        );
+        assert!(fingerprints.insert((spawn.block_x, spawn.block_z, heights)));
     }
-
-    assert!(
-        found_tree,
-        "default playable seed should spawn with a harvestable tree within 64 blocks"
-    );
-    assert!(
-        found_shallow_stone,
-        "default playable seed should spawn with shallow stone within 64 blocks"
-    );
-    assert!(
-        found_exposed_stone,
-        "default playable seed should spawn with exposed mineable stone within 64 blocks"
-    );
-    assert!(
-        starter_stone_count >= 11,
-        "default playable seed should spawn with at least eleven exposed near-side starter stone blocks for wooden-pickaxe progression; found {starter_stone_count}"
-    );
-    assert!(
-        exposed_iron_count >= 10,
-        "default playable seed should spawn with at least ten exposed mineable iron ore blocks within 64 blocks for armor-tier progression retries; found {exposed_iron_count}"
-    );
 }
 
 #[test]

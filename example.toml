@@ -41,7 +41,7 @@ world_dir = "world"
 # world_dir, preventing hard chunk borders between unrelated terrain fields.
 seed = 0
 # Optional Earth-scale terrain profile. Changing it requires a fresh world_dir.
-# worldgen_mode = "tellus_like"
+worldgen_mode = "tellus_like"
 
 [simulation]
 # Random block ticks per active chunk per game tick. Set to 0 to disable

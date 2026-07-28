@@ -47,6 +47,19 @@ streaming and memory baseline.
   motion-preserving rollback, and checkpoint-only durability regressions.
 - [ ] Run the 200-action break/drop/pickup latency and M39-warning gate on the
   release candidate.
+- [x] Advance generated worlds to revision 10 and remove the fixed tree, stone,
+  surface-iron, dry-origin, mountain-suppression, and river-suppression fixtures.
+- [x] Locate and persist a natural seed-driven spawn, then center startup generation,
+  light, spawn chunk preparation, and player support search on it.
+- [x] Make `tellus_like` the explicit public configuration and default mode.
+- [x] Preserve unversioned Anvil imports without invoking Solaris spawn selection;
+  imported worlds retain the origin fallback and no Solaris contract is written.
+- [x] Run one independent read-only worldgen-diff review session. It read the scoped
+  diff but exhausted the 180-second limit without a verdict or actionable finding;
+  no second reviewer was run. Final self-review then removed the imported-world
+  dependency on the Solaris locator and added focused regressions.
+- [ ] Complete revision-10 drainage, vegetation, biome-distribution, rendered mosaic,
+  clean seed-`712816` owner playtest, and throughput gates.
 
 ## Observed baseline
 
@@ -111,13 +124,14 @@ code and is not natural ore generation.
 
 Required change — worldgen revision 10:
 
-1. Remove every fixed spawn tree, stone and iron fixture from production.
-2. Remove origin-based terrain deformation. Do not change terrain to make spawn
+1. [x] Remove every fixed spawn tree, stone and iron fixture from production.
+2. [x] Remove origin-based terrain deformation. Do not change terrain to make spawn
    safe.
-3. Add a deterministic seed-driven spawn locator that searches the generated
-   terrain for a bounded safe land position, persists it, and pre-generates around
-   that position.
-4. Make `tellus_like` explicit in the public starter config and make the public
+3. [x] Add a deterministic seed-driven spawn locator that searches the generated
+   terrain for a bounded safe land position, persists it in schema 3, and centers
+   pre-generation, light baking, spawn-chunk preparation, and final player support
+   search on that position.
+4. [x] Make `tellus_like` explicit in the public starter config and make the public
    default match the advertised Earth-like Solaris world.
 5. Ensure seed participates in every macro field: continents, plate/ridge domains,
    erosion, drainage, climate, biome selection, vegetation, ores and structures.
@@ -130,7 +144,8 @@ Required change — worldgen revision 10:
    treeless dry/cold regions where appropriate.
 9. Keep ordinary ores underground or exposed only through natural terrain/cave
    intersection. Geological deposits remain an optional plugin-owned profile.
-10. Persist revision/mode/seed and require a fresh world when any of them changes.
+10. [x] Persist schema/revision/mode/seed/geometry/profiles and the selected spawn;
+    require a fresh Solaris world when any contract field changes.
 
 This release targets a procedural Earth-like/Tellus-inspired world, not a literal
 geographic Earth replica. Real DEM, land-cover and OSM inputs remain a separate

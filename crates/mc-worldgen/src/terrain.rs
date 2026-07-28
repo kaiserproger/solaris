@@ -65,6 +65,27 @@ const ORE_DIRECTIONS: [[i8; 3]; 6] = [
 const CAVE_SURFACE_CLEARANCE: i32 = 32;
 const DEEPSLATE_TOP_Y: i32 = 0;
 const DEEPSLATE_SOLID_Y: i32 = -8;
+const SPAWN_SEARCH_STEP_BLOCKS: i32 = 64;
+const SPAWN_SEARCH_MAX_RADIUS_BLOCKS: i32 = 8_192;
+const SPAWN_SITE_SAMPLE_RADIUS_BLOCKS: i32 = 8;
+const SPAWN_SITE_MAX_RELIEF: i32 = 3;
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct SpawnLocation {
+    pub block_x: i32,
+    pub surface_y: i32,
+    pub block_z: i32,
+}
+
+impl SpawnLocation {
+    #[must_use]
+    pub const fn chunk(self) -> ChunkPos {
+        ChunkPos {
+            x: self.block_x.div_euclid(16),
+            z: self.block_z.div_euclid(16),
+        }
+    }
+}
 
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct TellusWorldgenSettings {
@@ -123,7 +144,6 @@ pub struct TerrainGenerator {
     podzol: BlockStateId,
     snow_block: BlockStateId,
     deepslate: BlockStateId,
-    iron_ore: BlockStateId,
     water: BlockStateId,
     biomes: BiomeRules,
     ores: OreRules,
@@ -386,7 +406,6 @@ impl TerrainGenerator {
             podzol: resolve_block_or(registry.as_ref(), "minecraft:podzol", stone),
             snow_block: resolve_block_or(registry.as_ref(), "minecraft:snow_block", stone),
             deepslate: resolve_block_or(registry.as_ref(), "minecraft:deepslate", stone),
-            iron_ore: try_resolve_block(registry.as_ref(), "minecraft:iron_ore")?,
             water: resolve_block_or(registry.as_ref(), "minecraft:water", air),
             biomes,
             ores,
@@ -431,6 +450,88 @@ impl TerrainGenerator {
     #[must_use]
     pub fn surface_height(&self, world_x: i32, world_z: i32) -> i32 {
         self.density_router().sample(world_x, world_z).surface_y
+    }
+
+    /// Find a deterministic natural spawn centre without modifying terrain.
+    ///
+    /// The search walks expanding 64-block rings around the origin and accepts
+    /// only dry, low-relief inland terrain away from river centres and strong
+    /// mountain ridges. The network layer performs the final block-level support
+    /// and body-space check inside the prepared window.
+    #[must_use]
+    pub fn locate_safe_spawn(&self) -> Option<SpawnLocation> {
+        let max_ring = SPAWN_SEARCH_MAX_RADIUS_BLOCKS / SPAWN_SEARCH_STEP_BLOCKS;
+        for ring in 0..=max_ring {
+            if ring == 0 {
+                if let Some(spawn) = self.spawn_candidate(0, 0) {
+                    return Some(spawn);
+                }
+                continue;
+            }
+            let radius = ring * SPAWN_SEARCH_STEP_BLOCKS;
+            for offset in -ring..=ring {
+                let coordinate = offset * SPAWN_SEARCH_STEP_BLOCKS;
+                for (x, z) in [(coordinate, -radius), (coordinate, radius)] {
+                    if let Some(spawn) = self.spawn_candidate(x, z) {
+                        return Some(spawn);
+                    }
+                }
+            }
+            for offset in (-ring + 1)..ring {
+                let coordinate = offset * SPAWN_SEARCH_STEP_BLOCKS;
+                for (x, z) in [(-radius, coordinate), (radius, coordinate)] {
+                    if let Some(spawn) = self.spawn_candidate(x, z) {
+                        return Some(spawn);
+                    }
+                }
+            }
+        }
+        None
+    }
+
+    fn spawn_candidate(&self, block_x: i32, block_z: i32) -> Option<SpawnLocation> {
+        let router = self.density_router();
+        let centre = router.sample(block_x, block_z);
+        let sea_level = match self.worldgen_mode {
+            WorldgenMode::VanillaLike => SEA_LEVEL,
+            WorldgenMode::TellusLike(settings) => settings.sea_level,
+        };
+        if centre.surface_y < sea_level + 4
+            || centre.continentalness < 0.02
+            || centre.river < 0.08
+            || centre.ridges > 0.24
+        {
+            return None;
+        }
+
+        let mut minimum = centre.surface_y;
+        let mut maximum = centre.surface_y;
+        for dz in [
+            -SPAWN_SITE_SAMPLE_RADIUS_BLOCKS,
+            0,
+            SPAWN_SITE_SAMPLE_RADIUS_BLOCKS,
+        ] {
+            for dx in [
+                -SPAWN_SITE_SAMPLE_RADIUS_BLOCKS,
+                0,
+                SPAWN_SITE_SAMPLE_RADIUS_BLOCKS,
+            ] {
+                let sample = router.sample(block_x.checked_add(dx)?, block_z.checked_add(dz)?);
+                if sample.surface_y < sea_level + 3 || sample.river < 0.04 {
+                    return None;
+                }
+                minimum = minimum.min(sample.surface_y);
+                maximum = maximum.max(sample.surface_y);
+            }
+        }
+        if maximum - minimum > SPAWN_SITE_MAX_RELIEF {
+            return None;
+        }
+        Some(SpawnLocation {
+            block_x,
+            surface_y: centre.surface_y,
+            block_z,
+        })
     }
 
     fn density_router(&self) -> OverworldRouter {
@@ -641,11 +742,6 @@ impl TerrainGenerator {
             surface = self.snow_block;
             fill = self.stone;
         }
-        if self.is_spawn_iron_outcrop(wx, height, wz) {
-            surface = self.iron_ore;
-        } else if self.is_spawn_stone_outcrop(wx, height, wz) {
-            surface = self.stone;
-        }
         let top_non_air = if water_enabled && (height < sea_level || self.biomes.is_river(&biome)) {
             let inclusive_top = checked_y_offset(self.geometry.max_y(), -1).unwrap_or(height);
             sea_level.clamp(height, inclusive_top)
@@ -669,18 +765,6 @@ impl TerrainGenerator {
             fill,
             hash: feature_hash(self.seed, wx, height, wz, 0xDEC0_0001),
         }
-    }
-
-    fn is_spawn_stone_outcrop(&self, wx: i32, height: i32, wz: i32) -> bool {
-        height > SEA_LEVEL + BEACH_HEIGHT_ABOVE_SEA
-            && (8..=11).contains(&wx)
-            && (4..=8).contains(&wz)
-    }
-
-    fn is_spawn_iron_outcrop(&self, wx: i32, height: i32, wz: i32) -> bool {
-        height > SEA_LEVEL + BEACH_HEIGHT_ABOVE_SEA
-            && (11..=13).contains(&wx)
-            && (4..=8).contains(&wz)
     }
 
     fn fill_column(&self, chunk: &mut Chunk, plan: &ColumnPlan) {
@@ -1132,12 +1216,8 @@ impl TerrainGenerator {
                     continue;
                 }
 
-                if self.is_spawn_stone_outcrop(plan.wx, height, plan.wz) {
-                    continue;
-                }
                 let tree_spacing = self.tree_spacing_for_biome(biome);
-                if ((tree_spacing.is_some_and(|spacing| h.is_multiple_of(spacing)))
-                    || self.is_spawn_tree_anchor(plan))
+                if tree_spacing.is_some_and(|spacing| h.is_multiple_of(spacing))
                     && self.tree_site_is_stable(plan)
                     && self.place_tree(chunk, plan, self.tree_blocks_for_biome(biome), &mut touched)
                 {
@@ -1222,12 +1302,6 @@ impl TerrainGenerator {
             }
         }
         true
-    }
-
-    fn is_spawn_tree_anchor(&self, plan: &ColumnPlan) -> bool {
-        plan.wx == -8
-            && plan.wz == -8
-            && (plan.surface == self.grass_block || plan.surface == self.podzol)
     }
 
     fn tree_spacing_for_biome(&self, biome: &Identifier) -> Option<u64> {

@@ -9,7 +9,7 @@ and is not startup context.
 
 - Date: 2026-07-28.
 - Branch: `main`.
-- Checkpoint base: `6eabc1b` (`fix(protocol): publish 26.1.2 overworld clock`).
+- Checkpoint base: `b5f3f25` (`fix(play): stage item pickup ownership`).
   The first owner-run public-alpha session remains the routing authority for the
   next stabilization release; its exact plan is `docs/PUBLIC_ALPHA_PLAN.md`.
 - The strong baseline must be preserved: seed `712816`, VD16 and one local player
@@ -22,12 +22,22 @@ and is not startup context.
   Exact protocol, package, server, command and sleep gates pass. The graphical
   client gate is host-blocked because this CodexPro environment has no display and
   NeoForge exits with `glfwInit failed`; no rendered sun claim is made yet.
-- P0 production worldgen defect is confirmed: seed-driven noise exists, but a
-  384-block origin blend intentionally makes spawn similar across seeds; fixed
-  coordinates force exposed stone/iron and attempt one starter-tree anchor near
-  every generated origin. Revision 10 must remove those fixtures and select a safe
-  spawn from the generated seed-driven Earth-like terrain instead of deforming
-  terrain around `(0,0)`.
+- Worldgen revision 10 now removes the 384-block origin blend, forced stone/iron
+  outcrops, and starter-tree anchor. A bounded 32-seed Tellus gate, including seed
+  `712816`, finds distinct dry low-relief terrain; schema 3 persists the selected
+  spawn and startup generation/light plus final player support search use it. The
+  public default and `example.toml` are `tellus_like`, and the playable world moved
+  to `.analysis/test-world-v10`. Unversioned Anvil imports skip Solaris spawn
+  selection, retain the origin fallback, and do not gain a Solaris contract. The
+  single read-only worldgen reviewer consumed the diff but timed out at 180 seconds
+  without a verdict or actionable finding; no second reviewer was run. Final gates
+  pass for `mc-world` 229/229, `mc-worldgen` 94/94 plus 12/12, `mc-net` 1828/1828,
+  the complete `mc-server` package, and the five-seed real server/client spawn
+  harness. `cargo test --workspace --quiet` printed every executable group green
+  through the final worldgen group, then exceeded the 180-second wrapper limit;
+  workspace doc-tests pass separately (3/3). Drainage, vegetation,
+  biome-distribution, rendered 2048x2048 mosaics, clean owner playtest, and
+  throughput gates remain active work.
 - The current P0 lock checkpoint removes the confirmed public-alpha defect.
   Production item-drop owner commits finish before short session publication.
   Item pickup plans from immutable snapshots, installs one runtime-only regional
@@ -556,9 +566,9 @@ two priorities unless it becomes a common-play blocker or corruption risk.
 2. Run the 200-action break/drop/pickup gate on the release candidate and require
    zero relevant M39 warnings, lock-hold p99 below 5 ms, and no item-path tick
    above 50 ms. The implementation and deterministic lock/race gates are green.
-3. Ship worldgen revision 10: remove fixed starter fixtures and origin terrain
-   deformation, add seed-driven safe-spawn selection, and make the procedural
-   Earth-like profile the honest public default.
+3. Complete worldgen revision 10 beyond the now-landed fixture removal and natural
+   spawn routing: drainage, vegetation coherence, biome distribution, rendered
+   mosaics, seed-`712816` owner playtest, restart, and throughput evidence remain.
 4. Replace one-shot chunk-herd materialization with bounded periodic friendly and
    hostile spawn attempts, independently configurable in ticks and observable in
    a no-operator survival session.

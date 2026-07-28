@@ -25,8 +25,8 @@ allow_local_dev_operators = false
 directory = "plugins"
 
 [data]
-# Worldgen v9 persists revision, seed, mode, ore/settlement profiles, and geometry.
-world_dir = ".analysis/test-world-v9"
+# Worldgen v10 persists revision, seed, mode, ore/settlement profiles, geometry, and spawn.
+world_dir = ".analysis/test-world-v10"
 vanilla_data_dir = "data/vanilla"
 seed = 0
 worldgen_mode = "tellus_like"

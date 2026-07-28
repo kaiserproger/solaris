@@ -125,13 +125,19 @@ async fn fresh_seed_server_spawn_is_dry_with_clear_body_space_inner() {
         .into_iter()
         .enumerate()
     {
-        let generator = Arc::new(mc_worldgen::TerrainGenerator::new(
+        let generator = Arc::new(mc_worldgen::TerrainGenerator::with_worldgen_mode(
             seed,
             Arc::clone(&blocks),
+            mc_worldgen::WorldgenMode::TellusLike(mc_worldgen::TellusWorldgenSettings::default()),
         ));
+        let located_spawn = generator
+            .locate_safe_spawn()
+            .unwrap_or_else(|| panic!("seed {seed} has no bounded natural spawn"));
+        let spawn = mc_world::WorldSpawn::new(located_spawn.block_x, located_spawn.block_z);
         let storage = mc_world::WorldStorage::in_memory_with_capacity(Arc::clone(&blocks), 25)
             .with_item_registry(Arc::clone(&items))
-            .with_generator(generator as Arc<dyn ChunkGenerator>);
+            .with_spawn(spawn)
+            .with_generator(Arc::clone(&generator) as Arc<dyn ChunkGenerator>);
         let world = Arc::new(tokio::sync::Mutex::new(storage));
         let shutdown = mc_net::ShutdownHandle::default();
         let config = mc_net::ServerConfig {

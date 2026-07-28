@@ -8,6 +8,12 @@ use crate::chunk::{
 use mc_data::Identifier;
 
 #[test]
+fn world_spawn_uses_euclidean_chunks_for_negative_coordinates() {
+    assert_eq!(WorldSpawn::new(-1, -17).chunk(), ChunkPos { x: -1, z: -2 });
+    assert_eq!(WorldSpawn::new(16, 31).chunk(), ChunkPos { x: 1, z: 1 });
+}
+
+#[test]
 fn consistent_reader_waits_for_publication_writer_unlock() {
     let publication = Arc::new(ResidentPublicationState::new());
     let transaction = publication.transaction();
