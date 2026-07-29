@@ -1301,18 +1301,16 @@ impl BoundServer {
                         Some(beetroot),
                         Some(villager),
                         Some(item),
-                    ) => {
-                        Some((
-                            mc_entity::villager_population_26_1_2::VillagerFoodItemIds {
-                                bread,
-                                potato,
-                                carrot,
-                                beetroot,
-                            },
-                            villager,
-                            item,
-                        ))
-                    }
+                    ) => Some((
+                        mc_entity::villager_population_26_1_2::VillagerFoodItemIds {
+                            bread,
+                            potato,
+                            carrot,
+                            beetroot,
+                        },
+                        villager,
+                        item,
+                    )),
                     _ => None,
                 }
             };
@@ -1646,7 +1644,8 @@ impl BoundServer {
                     );
                     animal_breeding_us = elapsed_us(started);
                 }
-                if let Some((food_items, villager_type_id, item_type_id)) = villager_population_ids {
+                if let Some((food_items, villager_type_id, item_type_id)) = villager_population_ids
+                {
                     simulation_owner.tick_villager_population(
                         &entity_sessions,
                         tick,

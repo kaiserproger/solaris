@@ -2139,12 +2139,7 @@ pub(crate) fn save_persisted_entity_records(
     let mut elements = Vec::new();
     for record in &checkpoint.records {
         validate_entity_numeric_state(&path, &record.snapshot)?;
-        validate_entity_temporal_state(
-            &path,
-            items,
-            checkpoint.lifecycle_clock,
-            &record.snapshot,
-        )?;
+        validate_entity_temporal_state(&path, items, checkpoint.lifecycle_clock, &record.snapshot)?;
         elements.push(entity_tag(&path, items, record)?);
     }
     let root = Tag::Compound(vec![
@@ -3105,10 +3100,12 @@ mod tests {
         let mut pending = adult.clone();
         let partner = uuid::Uuid::from_u128(77);
         let population = pending.retained.villager_population.as_mut().unwrap();
-        assert!(population
-            .add_to_inventory(mc_entity::EntityItemStack::new(food_items.bread, 3), 64)
-            .unwrap()
-            .is_none());
+        assert!(
+            population
+                .add_to_inventory(mc_entity::EntityItemStack::new(food_items.bread, 3), 64)
+                .unwrap()
+                .is_none()
+        );
         population
             .start_pending_birth(partner, 100, 0, false, food_items)
             .unwrap();
@@ -3150,11 +3147,19 @@ mod tests {
             .inventory
             .add_stack(mc_entity::EntityItemStack::new(999, 1), 64)
             .unwrap();
-        assert!(!villager_population_state_is_valid(&items, 100, &invalid_item));
+        assert!(!villager_population_state_is_valid(
+            &items,
+            100,
+            &invalid_item
+        ));
 
         let mut missing_brain = adult;
         missing_brain.retained.villager_brain = None;
-        assert!(!villager_population_state_is_valid(&items, 100, &missing_brain));
+        assert!(!villager_population_state_is_valid(
+            &items,
+            100,
+            &missing_brain
+        ));
     }
 
     #[test]

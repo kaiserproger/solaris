@@ -11,6 +11,9 @@ repository.workspace = true
 [lints]
 workspace = true
 
+[features]
+load-bench = ["mc-script/lua-runtime"]
+
 [dependencies]
 arc-swap = { workspace = true }
 mc-data = { path = "../mc-data" }

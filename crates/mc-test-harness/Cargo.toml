@@ -45,7 +45,7 @@ tempfile = "3"
 [dev-dependencies]
 flate2 = { workspace = true }
 mc-entity = { path = "../mc-entity" }
-mc-net = { path = "../mc-net" }
+mc-net = { path = "../mc-net", features = ["load-bench"] }
 mc-script = { path = "../mc-script", features = ["lua-runtime"] }
 mc-world = { path = "../mc-world" }
 mc-worldgen = { path = "../mc-worldgen" }

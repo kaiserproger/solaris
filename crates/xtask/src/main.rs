@@ -1065,7 +1065,7 @@ const MC_NET_OWNERSHIP: &[OwnershipRule] = &[
         parent_file: "crates/mc-net/src/play/session.rs",
         mod_declaration: "mod player_pose_authority;",
         definition_file: "crates/mc-net/src/play/session/player_pose_authority.rs",
-        definition_anchor: "pub(super) fn plan_entities_from_player_locked",
+        definition_anchor: "pub(super) fn plan_entities_from_player_candidate_geometry_locked",
     },
     OwnershipRule {
         name: "player body push stale fence",

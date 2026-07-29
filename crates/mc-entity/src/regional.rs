@@ -5574,12 +5574,9 @@ impl RegionalOwnerCoordinator {
         let throw_length = distance_squared.sqrt();
         let expected_velocity = if throw_length > 0.0 {
             Vec3::new(
-                dx / throw_length
-                    * crate::villager_population_26_1_2::VILLAGER_ITEM_THROW_SPEED,
-                dy / throw_length
-                    * crate::villager_population_26_1_2::VILLAGER_ITEM_THROW_SPEED,
-                dz / throw_length
-                    * crate::villager_population_26_1_2::VILLAGER_ITEM_THROW_SPEED,
+                dx / throw_length * crate::villager_population_26_1_2::VILLAGER_ITEM_THROW_SPEED,
+                dy / throw_length * crate::villager_population_26_1_2::VILLAGER_ITEM_THROW_SPEED,
+                dz / throw_length * crate::villager_population_26_1_2::VILLAGER_ITEM_THROW_SPEED,
             )
         } else {
             Vec3::new(0.0, 0.0, 0.0)
@@ -5620,8 +5617,7 @@ impl RegionalOwnerCoordinator {
             || self.snapshot(donor_expected.id)?.as_ref() != Some(&donor_expected)
             || self.snapshot(recipient.id)?.as_ref() != Some(&recipient)
             || [donor_expected.id, recipient.id].iter().any(|id| {
-                self.passenger_vehicles.contains_key(id)
-                    || self.vehicle_passengers.contains_key(id)
+                self.passenger_vehicles.contains_key(id) || self.vehicle_passengers.contains_key(id)
             })
         {
             return Ok(None);
@@ -18437,23 +18433,26 @@ mod tests {
     fn villager_inventory_pickup_atomically_moves_exact_stack_and_keeps_remainder() {
         let journal = Arc::new(Mutex::new(TestDecisionJournalState::default()));
         let mut coordinator = population_coordinator(Some(Arc::clone(&journal)));
-        let mut villager_spawn =
-            parity_population_villager(Vec3::new(0.5, 64.0, 0.5), None);
+        let mut villager_spawn = parity_population_villager(Vec3::new(0.5, 64.0, 0.5), None);
         let population = villager_spawn
             .retained
             .villager_population
             .as_mut()
             .expect("villager population");
         for item_id in 100..107 {
-            assert!(population
-                .add_to_inventory(EntityItemStack::new(item_id, 64), 64)
-                .unwrap()
-                .is_none());
+            assert!(
+                population
+                    .add_to_inventory(EntityItemStack::new(item_id, 64), 64)
+                    .unwrap()
+                    .is_none()
+            );
         }
-        assert!(population
-            .add_to_inventory(EntityItemStack::new(POPULATION_FOOD.carrot, 60), 64)
-            .unwrap()
-            .is_none());
+        assert!(
+            population
+                .add_to_inventory(EntityItemStack::new(POPULATION_FOOD.carrot, 60), 64)
+                .unwrap()
+                .is_none()
+        );
         let villager = coordinator.spawn(villager_spawn).expect("villager");
         let item = coordinator
             .spawn(parity_item(

@@ -48,6 +48,8 @@ mod interaction_geometry;
 #[cfg(test)]
 #[path = "session/interaction_geometry_tests.rs"]
 mod interaction_geometry_tests;
+#[cfg(feature = "load-bench")]
+mod load_bench;
 mod movement_publication;
 mod outbound;
 #[cfg(test)]

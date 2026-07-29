@@ -59,6 +59,26 @@ const O2_VD8_ENTITY_PHYSICS_MAX_BUDGET_US: u64 = 50_000;
 const O2_VD8_QUEUE_EMPTY_STOP_BUDGET: usize = 100_000;
 const O2_VD8_CHUNK_PREPARE_HOLD_COUNT_BUDGET: u64 = (O2_VD8_WINDOW_CHUNKS as u64) * 16;
 const O2_VD8_CHUNK_RESULT_QUEUE_SIZE: usize = 64;
+const ENTITY_SCALE_DEFAULT_CLIENTS: usize = 60;
+const ENTITY_SCALE_DEFAULT_REGIONS: usize = 16;
+const ENTITY_SCALE_DEFAULT_ENTITIES_PER_REGION: usize = 2_500;
+const ENTITY_SCALE_DEFAULT_WARMUP_TICKS: u64 = 200;
+const ENTITY_SCALE_DEFAULT_MEASURE_TICKS: u64 = 1_200;
+const ENTITY_SCALE_REGION_SIZE_BLOCKS: i32 = 128;
+
+fn entity_scale_env_usize(name: &str, default: usize) -> usize {
+    std::env::var(name)
+        .ok()
+        .and_then(|value| value.parse().ok())
+        .unwrap_or(default)
+}
+
+fn entity_scale_env_u64(name: &str, default: u64) -> u64 {
+    std::env::var(name)
+        .ok()
+        .and_then(|value| value.parse().ok())
+        .unwrap_or(default)
+}
 
 fn parse_cpu_list(value: &str) -> Option<Vec<usize>> {
     let mut cpus = std::collections::BTreeSet::new();
@@ -4198,7 +4218,7 @@ async fn start_load_server_with_options(options: LoadServerOptions) -> LoadServe
     } else {
         mc_world::WorldStorage::in_memory_with_capacity(Arc::clone(&blocks), chunk_capacity)
     }
-    .with_generator(generator)
+    .with_generator(Arc::clone(&generator) as Arc<dyn mc_world::ChunkGenerator>)
     .with_item_registry(Arc::clone(&items));
     let world = Arc::new(tokio::sync::Mutex::new(storage));
     let tags = Arc::new(mc_data::tags::load(&vanilla_dir, &data).expect("tags load"));
@@ -4300,6 +4320,7 @@ async fn start_load_server_with_options(options: LoadServerOptions) -> LoadServe
     let outbound_pressure = bound.outbound_pressure_handle();
     let runtime_control = bound.runtime_control_handle();
     let runtime_telemetry = bound.runtime_telemetry_handle();
+    let load_bench = bound.load_bench_handle();
     let save_handle = bound.save_handle();
     let persist_on_shutdown = options.disk_backed;
     let serve_task = tokio::spawn(async move {

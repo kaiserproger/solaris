@@ -4,9 +4,8 @@ use mc_entity::villager_26_1_2::{
     VillagerBrainProfile, VillagerBrainState, VillagerPoiSet, VillagerScheduleKind,
 };
 use mc_entity::villager_population_26_1_2::{
-    VILLAGER_COURTSHIP_DISTANCE_SQUARED, VILLAGER_HOME_SEARCH_RADIUS,
-    VILLAGER_INTERACTION_RANGE, VillagerFoodItemIds, VillagerPopulationState,
-    deterministic_villager_child_uuid,
+    VILLAGER_COURTSHIP_DISTANCE_SQUARED, VILLAGER_HOME_SEARCH_RADIUS, VILLAGER_INTERACTION_RANGE,
+    VillagerFoodItemIds, VillagerPopulationState, deterministic_villager_child_uuid,
 };
 use mc_entity::{
     EntityId, EntityLifecycle, EntitySnapshot, SpawnEntity, Vec3, VillagerData, VillagerKind,
@@ -438,12 +437,9 @@ fn share_one_villager_food_stack_locked(
             let length = distance_squared(donor.position, recipient.position).sqrt();
             let velocity = if length > 0.0 {
                 Vec3::new(
-                    dx / length
-                        * mc_entity::villager_population_26_1_2::VILLAGER_ITEM_THROW_SPEED,
-                    dy / length
-                        * mc_entity::villager_population_26_1_2::VILLAGER_ITEM_THROW_SPEED,
-                    dz / length
-                        * mc_entity::villager_population_26_1_2::VILLAGER_ITEM_THROW_SPEED,
+                    dx / length * mc_entity::villager_population_26_1_2::VILLAGER_ITEM_THROW_SPEED,
+                    dy / length * mc_entity::villager_population_26_1_2::VILLAGER_ITEM_THROW_SPEED,
+                    dz / length * mc_entity::villager_population_26_1_2::VILLAGER_ITEM_THROW_SPEED,
                 )
             } else {
                 Vec3::new(0.0, 0.0, 0.0)
@@ -650,11 +646,14 @@ fn finish_due_villager_births_locked(
                 abort_villager_courtship_locked(inner, &pair);
                 continue;
             }
-            if inner.entities.commit_villager_no_bed_if_current(mc_entity::VillagerNoBedCommit {
-                parents: [(first.clone(), first_next), (second.clone(), second_next)],
-                current_tick,
-                food_items,
-            }) {
+            if inner
+                .entities
+                .commit_villager_no_bed_if_current(mc_entity::VillagerNoBedCommit {
+                    parents: [(first.clone(), first_next), (second.clone(), second_next)],
+                    current_tick,
+                    food_items,
+                })
+            {
                 let mut events =
                     entity_event_dispatches_locked(inner, first.id, VILLAGER_ANGRY_EVENT);
                 events.extend(entity_event_dispatches_locked(
@@ -860,10 +859,7 @@ fn drain_due_villager_birth_pairs_locked(
     pairs
 }
 
-fn reciprocal_pending_birth(
-    first: &EntitySnapshot,
-    second: &EntitySnapshot,
-) -> Option<(u64, u64)> {
+fn reciprocal_pending_birth(first: &EntitySnapshot, second: &EntitySnapshot) -> Option<(u64, u64)> {
     if first.lifecycle != EntityLifecycle::Alive
         || second.lifecycle != EntityLifecycle::Alive
         || first.type_name != "minecraft:villager"

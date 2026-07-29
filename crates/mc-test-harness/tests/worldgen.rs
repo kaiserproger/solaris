@@ -1181,8 +1181,8 @@ async fn drop_carrots_and_wait_for_villager_food_share_birth(
                 birth_events.insert(event.entity_id);
             }
         } else if frame.id == AddEntity::ID {
-            let entity = AddEntity::decode(&mut frame.body)
-                .expect("decode generated population AddEntity");
+            let entity =
+                AddEntity::decode(&mut frame.body).expect("decode generated population AddEntity");
             if entity.entity_type_id == villager_type_id && !parent_ids.contains(&entity.entity_id)
             {
                 match &child {
