@@ -458,6 +458,8 @@ pub struct EntityRetainedState {
     pub item_pickup_claim: Option<u64>,
     pub primed_tnt: Option<EntityPrimedTntState>,
     #[serde(default)]
+    pub crossbow_attack: Option<EntityCrossbowAttackState>,
+    #[serde(default)]
     pub villager: Option<VillagerData>,
     #[serde(default)]
     pub villager_brain: Option<villager_26_1_2::VillagerBrainState>,
@@ -469,6 +471,34 @@ pub struct EntityRetainedState {
     pub villager_population: Option<villager_population_26_1_2::VillagerPopulationState>,
     #[serde(default)]
     pub zombie_villager_conversion: Option<zombie_villager_26_1_2::ZombieVillagerConversionState>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum EntityCrossbowAttackPhase {
+    Aiming,
+    Charging,
+    Charged,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct EntityCrossbowAttackState {
+    pub phase: EntityCrossbowAttackPhase,
+    pub deadline_tick: u64,
+}
+
+impl EntityCrossbowAttackState {
+    #[must_use]
+    pub const fn new(phase: EntityCrossbowAttackPhase, deadline_tick: u64) -> Self {
+        Self {
+            phase,
+            deadline_tick,
+        }
+    }
+
+    #[must_use]
+    pub const fn is_charging(self) -> bool {
+        matches!(self.phase, EntityCrossbowAttackPhase::Charging)
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]

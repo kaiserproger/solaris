@@ -4,8 +4,9 @@ use std::sync::atomic::Ordering;
 
 use mc_data::mob_behavior_26_1_2::{MobBehaviorTable, MobCombatPolicy};
 use mc_entity::{
-    AttributeKind, EntityId, EntityLifecycle, EntityPrimedTntState, EntitySimulationProjection,
-    EntitySnapshot, GoalState, Rotation, SpawnEntity, Vec3,
+    AttributeKind, EntityCrossbowAttackPhase, EntityCrossbowAttackState, EntityId, EntityLifecycle,
+    EntityPrimedTntState, EntitySimulationProjection, EntitySnapshot, GoalState, Rotation,
+    SpawnEntity, Vec3,
 };
 use mc_world::BlockStateId;
 
@@ -34,13 +35,24 @@ use super::visibility::{
     session_recipients, spawn_entity_visibility_from_snapshot_locked, visibility_dispatches,
     visible_entity_observers_locked,
 };
-use super::{SessionRegistry, apply_entity_facts, is_hostile_entity};
+use super::{
+    SessionRegistry, apply_entity_facts, is_hostile_entity, record_entity_dispatches_locked,
+};
+
+// Exact 26.1.2 defaults from RangedCrossbowAttackGoal/CrossbowItem in the local client jar.
+const PILLAGER_CROSSBOW_RANGE: f64 = 8.0;
+const PILLAGER_AIM_VISIBLE_TICKS: u64 = 5;
+const PILLAGER_CROSSBOW_CHARGE_TICKS: u64 = 25;
+const PILLAGER_CROSSBOW_ATTACK_DELAY_MIN_TICKS: u64 = 20;
+const PILLAGER_CROSSBOW_ATTACK_DELAY_SPAN_TICKS: u64 = 20;
+const PLAYER_CROSSBOW_TARGET_Y_OFFSET: f64 = 0.6;
 
 struct HostileAttackTickEntity {
     id: EntityId,
     kind: HostileAttackKind,
     position: Vec3,
     rotation: Rotation,
+    crossbow_attack: Option<EntityCrossbowAttackState>,
 }
 
 struct HostileTargetTickSession {
@@ -58,15 +70,25 @@ struct PlannedCreeperFuse {
 enum HostileAttackKind {
     Creeper,
     Skeleton,
+    Crossbow,
     Melee { attack_damage: f32 },
 }
 
-struct PlannedSkeletonAttack {
+#[derive(Debug, Clone)]
+struct PlannedArrowAttack {
     hostile_id: EntityId,
     arrow_entity_type_id: i32,
     position: Vec3,
     velocity: Vec3,
     rotation: Rotation,
+    animate_shooter: bool,
+}
+
+struct PlannedCrossbowTransition {
+    hostile_id: EntityId,
+    expected: Option<EntityCrossbowAttackState>,
+    next: Option<EntityCrossbowAttackState>,
+    shot: Option<PlannedArrowAttack>,
 }
 
 struct PlannedMeleeAttack {
@@ -78,6 +100,126 @@ struct PlannedMeleeAttack {
 struct SpawnedHostileArrow {
     hostile_id: EntityId,
     snapshot: EntitySnapshot,
+    animate_shooter: bool,
+}
+
+fn deterministic_crossbow_delay_ticks(entity_id: EntityId, tick: u64) -> u64 {
+    let mixed = u64::from(entity_id.0.unsigned_abs()).wrapping_mul(0x9E37_79B9_7F4A_7C15)
+        ^ tick.rotate_left(17);
+    PILLAGER_CROSSBOW_ATTACK_DELAY_MIN_TICKS + mixed % PILLAGER_CROSSBOW_ATTACK_DELAY_SPAN_TICKS
+}
+
+fn plan_hostile_arrow(
+    hostile: &HostileAttackTickEntity,
+    target_position: Vec3,
+    arrow_entity_type_id: i32,
+    crossbow: bool,
+) -> Option<PlannedArrowAttack> {
+    let shooter_eye = Vec3::new(
+        hostile.position.x,
+        hostile.position.y + 1.5,
+        hostile.position.z,
+    );
+    let dx = target_position.x - shooter_eye.x;
+    let dz = target_position.z - shooter_eye.z;
+    let horizontal_distance = dx.hypot(dz);
+    let dy = if crossbow {
+        target_position.y + PLAYER_CROSSBOW_TARGET_Y_OFFSET - shooter_eye.y
+            + horizontal_distance * 0.2
+    } else {
+        target_position.y + 1.0 - shooter_eye.y
+    };
+    let length = (dx * dx + dy * dy + dz * dz).sqrt();
+    if length <= f64::EPSILON {
+        return None;
+    }
+    let direction = Vec3::new(dx / length, dy / length, dz / length);
+    let velocity = Vec3::new(
+        direction.x * SKELETON_ARROW_SPEED,
+        direction.y * SKELETON_ARROW_SPEED,
+        direction.z * SKELETON_ARROW_SPEED,
+    );
+    let position = Vec3::new(
+        shooter_eye.x + direction.x * 0.7,
+        shooter_eye.y + direction.y * 0.7,
+        shooter_eye.z + direction.z * 0.7,
+    );
+    let horizontal = velocity.x.hypot(velocity.z);
+    let yaw = velocity.z.atan2(velocity.x).to_degrees() as f32 - 90.0;
+    let pitch = (-velocity.y).atan2(horizontal).to_degrees() as f32;
+    Some(PlannedArrowAttack {
+        hostile_id: hostile.id,
+        arrow_entity_type_id,
+        position,
+        velocity,
+        rotation: Rotation {
+            yaw,
+            pitch,
+            head_yaw: yaw,
+        },
+        animate_shooter: !crossbow,
+    })
+}
+
+fn plan_crossbow_transition(
+    hostile: &HostileAttackTickEntity,
+    target: Option<(f64, Vec3)>,
+    arrow_entity_type_id: Option<i32>,
+    tick: u64,
+) -> Option<PlannedCrossbowTransition> {
+    let expected = hostile.crossbow_attack;
+    let in_attack_range =
+        target.is_some_and(|(distance, _)| distance <= PILLAGER_CROSSBOW_RANGE.powi(2));
+    let (next, shot) = match expected {
+        None if in_attack_range => (
+            Some(EntityCrossbowAttackState::new(
+                EntityCrossbowAttackPhase::Aiming,
+                tick.saturating_add(PILLAGER_AIM_VISIBLE_TICKS.saturating_sub(1)),
+            )),
+            None,
+        ),
+        None => return None,
+        Some(_) if target.is_none() => (None, None),
+        Some(state) if state.phase == EntityCrossbowAttackPhase::Aiming => {
+            if !in_attack_range || tick < state.deadline_tick {
+                return None;
+            }
+            (
+                Some(EntityCrossbowAttackState::new(
+                    EntityCrossbowAttackPhase::Charging,
+                    tick.saturating_add(PILLAGER_CROSSBOW_CHARGE_TICKS),
+                )),
+                None,
+            )
+        }
+        Some(state) if state.phase == EntityCrossbowAttackPhase::Charging => {
+            if tick < state.deadline_tick {
+                return None;
+            }
+            (
+                Some(EntityCrossbowAttackState::new(
+                    EntityCrossbowAttackPhase::Charged,
+                    tick.saturating_add(deterministic_crossbow_delay_ticks(hostile.id, tick)),
+                )),
+                None,
+            )
+        }
+        Some(state) => {
+            if tick < state.deadline_tick {
+                return None;
+            }
+            let arrow_entity_type_id = arrow_entity_type_id?;
+            let (_, target_position) = target?;
+            let shot = plan_hostile_arrow(hostile, target_position, arrow_entity_type_id, true)?;
+            (None, Some(shot))
+        }
+    };
+    Some(PlannedCrossbowTransition {
+        hostile_id: hostile.id,
+        expected,
+        next,
+        shot,
+    })
 }
 
 #[cfg(test)]
@@ -221,6 +363,7 @@ impl SessionRegistry {
                 let kind = match profile.combat {
                     MobCombatPolicy::CreeperFuse => HostileAttackKind::Creeper,
                     MobCombatPolicy::Arrow => HostileAttackKind::Skeleton,
+                    MobCombatPolicy::Crossbow => HostileAttackKind::Crossbow,
                     MobCombatPolicy::Melee => HostileAttackKind::Melee {
                         attack_damage: entity
                             .attributes
@@ -230,7 +373,7 @@ impl SessionRegistry {
                     MobCombatPolicy::None | MobCombatPolicy::UnsupportedSpecial => return,
                 };
                 let period = match kind {
-                    HostileAttackKind::Creeper => 1,
+                    HostileAttackKind::Creeper | HostileAttackKind::Crossbow => 1,
                     HostileAttackKind::Skeleton => SKELETON_SHOT_PERIOD_TICKS,
                     HostileAttackKind::Melee { .. } => HOSTILE_MELEE_PERIOD_TICKS,
                 };
@@ -243,6 +386,7 @@ impl SessionRegistry {
                     kind,
                     position: entity.position,
                     rotation: entity.rotation,
+                    crossbow_attack: entity.retained.crossbow_attack,
                 });
             });
         }
@@ -270,7 +414,8 @@ impl SessionRegistry {
         let arrow_entity_type_id = (arrow_entity_type_id >= 0).then_some(arrow_entity_type_id);
 
         let mut creeper_fuses = Vec::new();
-        let mut skeleton_attacks = Vec::new();
+        let mut arrow_attacks = Vec::new();
+        let mut crossbow_transitions = Vec::new();
         let mut melee_attacks = Vec::new();
         for hostile in hostiles {
             match hostile.kind {
@@ -303,51 +448,29 @@ impl SessionRegistry {
                     let Some((_, target_position)) = target else {
                         continue;
                     };
-
-                    let shooter_eye = Vec3::new(
-                        hostile.position.x,
-                        hostile.position.y + 1.5,
-                        hostile.position.z,
-                    );
-                    let target_eye = Vec3::new(
-                        target_position.x,
-                        target_position.y + 1.0,
-                        target_position.z,
-                    );
-                    let delta = Vec3::new(
-                        target_eye.x - shooter_eye.x,
-                        target_eye.y - shooter_eye.y,
-                        target_eye.z - shooter_eye.z,
-                    );
-                    let length = (delta.x * delta.x + delta.y * delta.y + delta.z * delta.z).sqrt();
-                    if length <= f64::EPSILON {
-                        continue;
+                    if let Some(attack) =
+                        plan_hostile_arrow(&hostile, target_position, arrow_entity_type_id, false)
+                    {
+                        arrow_attacks.push(attack);
                     }
-                    let direction = Vec3::new(delta.x / length, delta.y / length, delta.z / length);
-                    let velocity = Vec3::new(
-                        direction.x * SKELETON_ARROW_SPEED,
-                        direction.y * SKELETON_ARROW_SPEED,
-                        direction.z * SKELETON_ARROW_SPEED,
-                    );
-                    let position = Vec3::new(
-                        shooter_eye.x + direction.x * 0.7,
-                        shooter_eye.y + direction.y * 0.7,
-                        shooter_eye.z + direction.z * 0.7,
-                    );
-                    let horizontal = velocity.x.hypot(velocity.z);
-                    let yaw = velocity.z.atan2(velocity.x).to_degrees() as f32 - 90.0;
-                    let pitch = (-velocity.y).atan2(horizontal).to_degrees() as f32;
-                    skeleton_attacks.push(PlannedSkeletonAttack {
-                        hostile_id: hostile.id,
-                        arrow_entity_type_id,
-                        position,
-                        velocity,
-                        rotation: Rotation {
-                            yaw,
-                            pitch,
-                            head_yaw: yaw,
-                        },
-                    });
+                }
+                HostileAttackKind::Crossbow => {
+                    let target = targets
+                        .iter()
+                        .filter_map(|target| {
+                            target.visible_entities.contains(&hostile.id).then(|| {
+                                (
+                                    distance_sq(hostile.position, target.position),
+                                    target.position,
+                                )
+                            })
+                        })
+                        .min_by(|left, right| left.0.total_cmp(&right.0));
+                    if let Some(transition) =
+                        plan_crossbow_transition(&hostile, target, arrow_entity_type_id, tick)
+                    {
+                        crossbow_transitions.push(transition);
+                    }
                 }
                 HostileAttackKind::Melee {
                     attack_damage: amount,
@@ -439,36 +562,106 @@ impl SessionRegistry {
             }
             ignitions
         };
-        if skeleton_attacks.is_empty() && melee_attacks.is_empty() {
-            return (creeper_ignitions, Vec::new());
+        let (crossbow_state_updates, committed_crossbow_attacks) =
+            if crossbow_transitions.is_empty() {
+                (Vec::new(), Vec::new())
+            } else {
+                let crossbow_ids = crossbow_transitions
+                    .iter()
+                    .map(|transition| transition.hostile_id)
+                    .collect::<HashSet<_>>();
+                let mut entities = self.lock_entities("commit hostile crossbow states");
+                entities.prefetch(&crossbow_ids);
+                let mut updates = Vec::new();
+                let mut attacks = Vec::new();
+                for transition in crossbow_transitions {
+                    let Some(expected) = entities.snapshot(transition.hostile_id) else {
+                        continue;
+                    };
+                    if expected.lifecycle != EntityLifecycle::Alive
+                        || expected.type_name != "minecraft:pillager"
+                        || expected.retained.crossbow_attack != transition.expected
+                    {
+                        continue;
+                    }
+                    let previous_charging = transition
+                        .expected
+                        .is_some_and(EntityCrossbowAttackState::is_charging);
+                    let next_charging = transition
+                        .next
+                        .is_some_and(EntityCrossbowAttackState::is_charging);
+                    let mut next = expected.clone();
+                    next.retained.crossbow_attack = transition.next;
+                    if !entities.replace_snapshot_if_current(expected, next.clone()) {
+                        continue;
+                    }
+                    if previous_charging != next_charging {
+                        updates.push(next);
+                    }
+                    if let Some(attack) = transition.shot {
+                        attacks.push(attack);
+                    }
+                }
+                (updates, attacks)
+            };
+        arrow_attacks.extend(committed_crossbow_attacks);
+
+        let crossbow_state_updates = if crossbow_state_updates.is_empty() {
+            Vec::new()
+        } else {
+            self.current_expected_entity_snapshots(crossbow_state_updates)
+        };
+        let mut dispatches = Vec::new();
+        if !crossbow_state_updates.is_empty() {
+            let mut inner = self.lock_inner("publish hostile crossbow state");
+            for entity in crossbow_state_updates {
+                let published = server_entity_snapshot_from(entity);
+                let entity_id = published.id;
+                inner
+                    .published_entity_snapshots
+                    .insert(entity_id, published.clone());
+                let recipients =
+                    session_recipients(&inner, visible_entity_observers_locked(&inner, entity_id));
+                let updates = visibility_dispatches(recipients, || {
+                    OutboundCommand::UpdateEntityData(published.clone())
+                });
+                record_entity_dispatches_locked(&mut inner, &updates);
+                dispatches.extend(updates);
+            }
         }
 
-        let spawned_arrows = if skeleton_attacks.is_empty() {
+        if arrow_attacks.is_empty() && melee_attacks.is_empty() {
+            return (creeper_ignitions, dispatches);
+        }
+
+        let spawned_arrows = if arrow_attacks.is_empty() {
             Vec::new()
         } else {
             let mut entities = self.lock_entities("spawn hostile arrows ECS");
-            let (hostile_ids, arrows): (Vec<_>, Vec<_>) = skeleton_attacks
-                .into_iter()
-                .map(|attack| {
-                    let mut arrow = SpawnEntity::new(
-                        attack.arrow_entity_type_id,
-                        "minecraft:arrow",
-                        attack.position,
-                    );
-                    arrow.retained.spawn_tick = tick;
-                    arrow.velocity = attack.velocity;
-                    arrow.rotation = attack.rotation;
-                    arrow.on_ground = false;
-                    apply_entity_facts(&mut arrow);
-                    (attack.hostile_id, arrow)
-                })
-                .unzip();
+            let mut hostile_sources = Vec::with_capacity(arrow_attacks.len());
+            let mut arrows = Vec::with_capacity(arrow_attacks.len());
+            for attack in arrow_attacks {
+                let mut arrow = SpawnEntity::new(
+                    attack.arrow_entity_type_id,
+                    "minecraft:arrow",
+                    attack.position,
+                );
+                arrow.retained.spawn_tick = tick;
+                arrow.velocity = attack.velocity;
+                arrow.rotation = attack.rotation;
+                arrow.on_ground = false;
+                apply_entity_facts(&mut arrow);
+                hostile_sources.push((attack.hostile_id, attack.animate_shooter));
+                arrows.push(arrow);
+            }
             let arrow_ids = entities.spawn_batch(arrows);
             let arrow_id_set = arrow_ids.iter().copied().collect::<HashSet<_>>();
             entities.prefetch(&arrow_id_set);
             let mut spawned = Vec::with_capacity(arrow_ids.len());
             let mut transaction = Vec::with_capacity(arrow_ids.len());
-            for (hostile_id, arrow_id) in hostile_ids.into_iter().zip(arrow_ids) {
+            for ((hostile_id, animate_shooter), arrow_id) in
+                hostile_sources.into_iter().zip(arrow_ids)
+            {
                 let Some(expected) = entities.snapshot(arrow_id) else {
                     continue;
                 };
@@ -486,6 +679,7 @@ impl SessionRegistry {
                 spawned.push(SpawnedHostileArrow {
                     hostile_id,
                     snapshot: next,
+                    animate_shooter,
                 });
             }
             assert!(
@@ -498,19 +692,22 @@ impl SessionRegistry {
         self.pause_between_hostile_entity_and_session_commit_for_test();
 
         let mut attacks = 0;
-        let mut dispatches = Vec::new();
-        let hostile_by_arrow = spawned_arrows
+        let source_by_arrow = spawned_arrows
             .iter()
-            .map(|arrow| (arrow.snapshot.id, arrow.hostile_id))
+            .map(|arrow| (arrow.snapshot.id, (arrow.hostile_id, arrow.animate_shooter)))
             .collect::<HashMap<_, _>>();
         let spawned_arrows = self
             .current_expected_entity_snapshots(
                 spawned_arrows.into_iter().map(|arrow| arrow.snapshot),
             )
             .into_iter()
-            .map(|snapshot| SpawnedHostileArrow {
-                hostile_id: hostile_by_arrow[&snapshot.id],
-                snapshot,
+            .map(|snapshot| {
+                let (hostile_id, animate_shooter) = source_by_arrow[&snapshot.id];
+                SpawnedHostileArrow {
+                    hostile_id,
+                    snapshot,
+                    animate_shooter,
+                }
             })
             .collect::<Vec<_>>();
         if !spawned_arrows.is_empty() {
@@ -529,15 +726,17 @@ impl SessionRegistry {
                 dispatches.extend(spawn_entity_visibility_from_snapshot_locked(
                     &mut inner, snapshot,
                 ));
-                let animation_recipients = session_recipients(
-                    &inner,
-                    visible_entity_observers_locked(&inner, arrow.hostile_id),
-                );
-                dispatches.extend(visibility_dispatches(animation_recipients, || {
-                    OutboundCommand::AnimatePlayer {
-                        entity_id: arrow.hostile_id.0,
-                    }
-                }));
+                if arrow.animate_shooter {
+                    let animation_recipients = session_recipients(
+                        &inner,
+                        visible_entity_observers_locked(&inner, arrow.hostile_id),
+                    );
+                    dispatches.extend(visibility_dispatches(animation_recipients, || {
+                        OutboundCommand::AnimatePlayer {
+                            entity_id: arrow.hostile_id.0,
+                        }
+                    }));
+                }
                 attacks += 1;
             }
         }
@@ -732,7 +931,9 @@ fn hostile_target_candidate_from_projection(
         follow_range: entity.follow_range,
         uses_ranged_attack: matches!(
             profile.combat,
-            MobCombatPolicy::Arrow | MobCombatPolicy::UnsupportedSpecial
+            MobCombatPolicy::Arrow
+                | MobCombatPolicy::Crossbow
+                | MobCombatPolicy::UnsupportedSpecial
         ),
         is_creeper: profile.combat == MobCombatPolicy::CreeperFuse,
         fuse_active: entity.primed_tnt,
@@ -834,7 +1035,9 @@ pub(super) fn update_hostile_targets(
                 .unwrap_or(16.0),
             uses_ranged_attack: matches!(
                 profile.combat,
-                MobCombatPolicy::Arrow | MobCombatPolicy::UnsupportedSpecial
+                MobCombatPolicy::Arrow
+                    | MobCombatPolicy::Crossbow
+                    | MobCombatPolicy::UnsupportedSpecial
             ),
             is_creeper: profile.combat == MobCombatPolicy::CreeperFuse,
             fuse_active: entity.retained.primed_tnt.is_some(),

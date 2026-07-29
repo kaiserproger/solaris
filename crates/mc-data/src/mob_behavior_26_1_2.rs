@@ -30,6 +30,7 @@ pub enum MobCombatPolicy {
     None,
     Melee,
     Arrow,
+    Crossbow,
     CreeperFuse,
     UnsupportedSpecial,
 }
@@ -202,7 +203,7 @@ fn combat_policy(name: &'static str, hostile: bool) -> (MobCombatPolicy, Option<
         "minecraft:ender_dragon" => (MobCombatPolicy::UnsupportedSpecial, Some("dragon_boss")),
         "minecraft:evoker" => (MobCombatPolicy::UnsupportedSpecial, Some("evoker_spell")),
         "minecraft:ghast" => (MobCombatPolicy::UnsupportedSpecial, Some("large_fireball")),
-        "minecraft:pillager" => (MobCombatPolicy::UnsupportedSpecial, Some("crossbow")),
+        "minecraft:pillager" => (MobCombatPolicy::Crossbow, None),
         "minecraft:shulker" => (MobCombatPolicy::UnsupportedSpecial, Some("shulker_bullet")),
         "minecraft:warden" => (MobCombatPolicy::UnsupportedSpecial, Some("sonic_boom")),
         "minecraft:witch" => (MobCombatPolicy::UnsupportedSpecial, Some("thrown_potion")),
@@ -245,6 +246,17 @@ mod tests {
         assert_eq!(
             table.get_by_name("minecraft:creeper").unwrap().combat,
             MobCombatPolicy::CreeperFuse
+        );
+        assert_eq!(
+            table.get_by_name("minecraft:pillager").unwrap().combat,
+            MobCombatPolicy::Crossbow
+        );
+        assert_eq!(
+            table
+                .get_by_name("minecraft:pillager")
+                .unwrap()
+                .special_attack,
+            None
         );
         assert_eq!(
             table.get_by_name("minecraft:villager").unwrap().movement,

@@ -264,6 +264,8 @@ fn physics_motion_publication_preserves_non_kinematic_state() {
         animal: None,
         villager: None,
         villager_baby: false,
+        main_hand_item: None,
+        crossbow_charging: false,
     };
     let motion = EntityMotionState {
         id: snapshot.id,

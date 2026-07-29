@@ -7,11 +7,22 @@ and is not startup context.
 
 ## Current Checkpoint
 
-- Date: 2026-07-28.
+- Date: 2026-07-29.
 - Branch: `main`.
-- Checkpoint base: `b8fec9d` (`fix(worldgen): route spawn from seeded terrain`).
+- Checkpoint base: `4902a3d` (`feat(plugins): move colony policy into Luau`).
   The first owner-run public-alpha session remains the routing authority for the
   next stabilization release; its exact plan is `docs/PUBLIC_ALPHA_PLAN.md`.
+- The future full Luau addon platform is frozen in
+  `docs/LUAU_ADDON_API_1_0_SPEC.md`; its 145-task decomposition is in
+  `docs/LUAU_ADDON_API_1_0_TASKS.md`. Only the two documentation tasks are
+  complete and all 143 runtime tasks remain `BLOCKED-VP` until scoped vanilla
+  parity and explicit owner activation.
+- Pillager crossbow combat is the latest bounded parity slice. Pillagers now
+  project the canonical 26.1.2 crossbow, retain aim/charge/charged deadlines,
+  publish charging metadata and fire one owner-attributed arrow after the exact
+  local 5/25/20–39 tick sequence. Mutable mob equipment, raids and broader
+  village defence remain open; the next cursor is an iron-golem spawning/combat
+  slice.
 - The strong baseline must be preserved: seed `712816`, VD16 and one local player
   pre-generated 225 chunks at 929.473 chunks/s, streamed every requested chunk
   without degradation or memory-pressure shedding, used roughly 300 MiB by owner

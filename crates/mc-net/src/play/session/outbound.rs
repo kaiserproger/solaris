@@ -53,6 +53,8 @@ pub(in crate::play) struct ServerEntitySnapshot {
     pub(in crate::play) animal: Option<mc_entity::AnimalBreedingState>,
     pub(in crate::play) villager: Option<mc_entity::VillagerData>,
     pub(in crate::play) villager_baby: bool,
+    pub(in crate::play) main_hand_item: Option<EntityItemStack>,
+    pub(in crate::play) crossbow_charging: bool,
 }
 
 #[derive(Debug, Clone, Copy)]

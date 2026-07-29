@@ -1930,11 +1930,13 @@ current special-case growth under a larger name.
 # 7. Current development cursor
 
 The next active engineering task remains outside this backlog and is owned by
-[`playable/ACTIVE.md`](playable/ACTIVE.md):
+[`playable/ACTIVE.md`](playable/ACTIVE.md). Pillager crossbow combat is closed as
+a focused species-specific parity slice; it did not activate any API 1.0 task.
+The current cursor is:
 
-1. continue village defence;
-2. replace the next supported `UnsupportedSpecial` mob profile with its real
-   species-specific attack path, or keep it visibly unsupported;
+1. continue village defence with one bounded iron-golem spawning/combat slice;
+2. then continue raids or the next reachable `UnsupportedSpecial` profile with
+   its real species-specific path, otherwise keep it visibly unsupported;
 3. add the exact authoritative and client-visible evidence required by the
    existing vanilla-parity workflow;
 4. repeat the vanilla-parity queue before activating any task above.

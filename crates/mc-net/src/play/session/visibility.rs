@@ -1,8 +1,12 @@
 use std::collections::{HashMap, HashSet};
 use std::hash::Hash;
-use std::sync::Arc;
+use std::sync::{Arc, LazyLock};
 
-use mc_entity::{EntityId, EntityLifecycle, EntityMotionState, EntitySnapshot, Rotation, Vec3};
+use mc_data::Identifier;
+use mc_entity::{
+    EntityCrossbowAttackState, EntityId, EntityItemStack, EntityLifecycle, EntityMotionState,
+    EntitySnapshot, Rotation, Vec3,
+};
 use mc_protocol::packets::play::MoveEntityPosRot;
 
 use crate::play::PlayerPose;
@@ -268,6 +272,11 @@ pub(in crate::play) fn server_entity_snapshot_from(entity: EntitySnapshot) -> Se
     .is_some_and(|contract| {
         contract.behavior.archetype == mc_data::entity_types::EntityArchetype::Living
     });
+    let main_hand_item = default_main_hand_item_26_1_2(&entity.type_name);
+    let crossbow_charging = entity
+        .retained
+        .crossbow_attack
+        .is_some_and(EntityCrossbowAttackState::is_charging);
     ServerEntitySnapshot {
         id: entity.id,
         uuid: entity.uuid,
@@ -288,7 +297,22 @@ pub(in crate::play) fn server_entity_snapshot_from(entity: EntitySnapshot) -> Se
             .villager_population
             .as_ref()
             .is_some_and(|population| population.age_ticks < 0),
+        main_hand_item,
+        crossbow_charging,
     }
+}
+
+fn default_main_hand_item_26_1_2(entity_type: &str) -> Option<EntityItemStack> {
+    // Solaris has no mutable mob-equipment path yet; a supported 26.1.2 pillager therefore
+    // projects the canonical crossbow assigned by Pillager.finalizeSpawn.
+    static CROSSBOW_ITEM_ID: LazyLock<u32> = LazyLock::new(|| {
+        let crossbow = Identifier::parse("minecraft:crossbow").expect("canonical crossbow id");
+        mc_data::items::solaris_required_items()
+            .id_of(&crossbow)
+            .expect("embedded 26.1.2 item registry contains crossbow")
+    });
+
+    (entity_type == "minecraft:pillager").then(|| EntityItemStack::new(*CROSSBOW_ITEM_ID, 1))
 }
 
 pub(super) fn spawned_xp_observer_ids(dispatches: &[VisibilityDispatch]) -> Vec<SessionId> {

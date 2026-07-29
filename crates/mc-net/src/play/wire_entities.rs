@@ -3,9 +3,13 @@ use bytes::{Buf, BufMut};
 use mc_protocol::CodecError;
 use mc_protocol::codec::{ReadMc, WriteMc};
 use mc_protocol::packets::play::{
+    ClientboundSetEntityEquipment, EntityEquipment, EquipmentSlot,
     LIVING_ENTITY_DATA_HEALTH_INDEX_26_1_2, MoveEntityPos, SetEntityMotion,
     VILLAGER_ENTITY_DATA_INDEX,
 };
+
+// Entity 0..7, LivingEntity 8..14, Mob 15, Raider 16, Pillager charging flag 17.
+const PILLAGER_ENTITY_DATA_CHARGING_CROSSBOW_INDEX_26_1_2: u8 = 17;
 
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub(in crate::play) enum ServerEntityWireMove {
@@ -277,7 +281,44 @@ where
     )
     .await?;
     send_entity_pairing_data(writer, compression, entity).await?;
+    send_entity_equipment(writer, compression, entity).await?;
     send_entity_move(writer, compression, entity).await
+}
+
+async fn send_entity_equipment<W>(
+    writer: &mut W,
+    compression: Compression,
+    entity: &ServerEntitySnapshot,
+) -> Result<(), ConnectionError>
+where
+    W: AsyncWriteExt + Unpin,
+{
+    let Some(stack) = entity.main_hand_item.as_ref() else {
+        return Ok(());
+    };
+    write_packet(
+        writer,
+        &ClientboundSetEntityEquipment {
+            entity_id: entity.id.0,
+            equipment: vec![EntityEquipment {
+                slot: EquipmentSlot::MainHand,
+                item: wire_entity_item_stack(stack),
+            }],
+        },
+        compression,
+    )
+    .await
+}
+
+fn wire_entity_item_stack(stack: &EntityItemStack) -> ItemStack {
+    ItemStack {
+        item_id: stack.item_id,
+        count: stack.count,
+        damage: stack.damage,
+        enchantments: stack.enchantments.clone(),
+        custom_name: stack.custom_name.as_deref().cloned(),
+        item_model: stack.item_model.as_deref().cloned().map(Arc::new),
+    }
 }
 
 pub(super) async fn send_entity_pairing_data<W>(
@@ -336,6 +377,12 @@ where
         }
         values.push(villager_entity_data(villager));
     }
+    if entity.type_name == "minecraft:pillager" && entity.crossbow_charging {
+        values.push(EntityDataValue::Boolean {
+            index: PILLAGER_ENTITY_DATA_CHARGING_CROSSBOW_INDEX_26_1_2,
+            value: true,
+        });
+    }
     if values.is_empty() {
         return Ok(());
     }
@@ -390,6 +437,12 @@ where
             value: entity.villager_baby,
         });
         values.push(villager_entity_data(villager));
+    }
+    if entity.type_name == "minecraft:pillager" {
+        values.push(EntityDataValue::Boolean {
+            index: PILLAGER_ENTITY_DATA_CHARGING_CROSSBOW_INDEX_26_1_2,
+            value: entity.crossbow_charging,
+        });
     }
     if values.is_empty() {
         return Ok(());
@@ -655,6 +708,80 @@ mod tests {
         assert!((movement.z + 0.125).abs() < 1.0e-12);
     }
 
+    fn pillager_snapshot(charging: bool) -> ServerEntitySnapshot {
+        ServerEntitySnapshot {
+            id: EntityId(43),
+            uuid: uuid::Uuid::from_u128(43),
+            type_id: 114,
+            type_name: "minecraft:pillager".to_owned(),
+            position: Vec3::new(1.5, 64.0, 1.5),
+            rotation: Rotation::ZERO,
+            velocity: Vec3::ZERO,
+            on_ground: true,
+            health: Some(24.0),
+            item_stack: None,
+            experience_value: None,
+            block_state: None,
+            animal: None,
+            villager: None,
+            villager_baby: false,
+            main_hand_item: Some(EntityItemStack::new(321, 1)),
+            crossbow_charging: charging,
+        }
+    }
+
+    #[tokio::test]
+    async fn pillager_equipment_encodes_crossbow_in_main_hand() {
+        let entity = pillager_snapshot(false);
+        let mut writer = Vec::new();
+
+        send_entity_equipment(&mut writer, Compression::Disabled, &entity)
+            .await
+            .unwrap();
+
+        let mut bytes = BytesMut::from(writer.as_slice());
+        let mut frame = mc_protocol::frame::try_decode_frame(&mut bytes, Compression::Disabled)
+            .unwrap()
+            .expect("set entity equipment frame");
+        assert_eq!(frame.id, ClientboundSetEntityEquipment::ID);
+        let packet = ClientboundSetEntityEquipment::decode(&mut frame.body).unwrap();
+        assert_eq!(packet.entity_id, entity.id.0);
+        assert_eq!(packet.equipment.len(), 1);
+        assert_eq!(packet.equipment[0].slot, EquipmentSlot::MainHand);
+        assert_eq!(packet.equipment[0].item.item_id, 321);
+        assert_eq!(packet.equipment[0].item.count, 1);
+        assert!(bytes.is_empty());
+    }
+
+    #[tokio::test]
+    async fn pillager_metadata_encodes_crossbow_charging_transitions() {
+        for charging in [true, false] {
+            let entity = pillager_snapshot(charging);
+            let mut writer = Vec::new();
+
+            send_entity_data(&mut writer, Compression::Disabled, &entity)
+                .await
+                .unwrap();
+
+            let mut bytes = BytesMut::from(writer.as_slice());
+            let mut frame = mc_protocol::frame::try_decode_frame(&mut bytes, Compression::Disabled)
+                .unwrap()
+                .expect("set entity data frame");
+            assert_eq!(frame.id, ClientboundSetEntityData::ID);
+            let packet = ClientboundSetEntityData::decode(&mut frame.body).unwrap();
+            assert_eq!(packet.entity_id, entity.id.0);
+            assert!(packet.values.iter().any(|value| {
+                matches!(
+                    value,
+                    EntityDataValue::Boolean { index, value }
+                        if *index == PILLAGER_ENTITY_DATA_CHARGING_CROSSBOW_INDEX_26_1_2
+                            && *value == charging
+                )
+            }));
+            assert!(bytes.is_empty());
+        }
+    }
+
     #[tokio::test]
     async fn sheep_spawn_metadata_encodes_authoritative_color() {
         let entity = ServerEntitySnapshot {
@@ -675,6 +802,8 @@ mod tests {
             )),
             villager: None,
             villager_baby: false,
+            main_hand_item: None,
+            crossbow_charging: false,
         };
         let mut writer = Vec::new();
 

@@ -1839,6 +1839,243 @@ fn hostile_candidate_scan_does_not_hold_session_registry() {
 }
 
 #[test]
+fn pillager_crossbow_charges_then_spawns_one_owned_arrow() {
+    let registry = SessionRegistry::new();
+    registry.configure_arrow_kill_rewards(
+        Some(2),
+        Some(3),
+        Some(77),
+        Arc::new(ItemRegistry::from_report(&[])),
+        Arc::new(mc_data::item_components::ItemFactsTable::default()),
+        Arc::new(mc_data::loot::LootTables::default()),
+    );
+    let player = register_test_session(&registry, "PillagerCrossbowAlice");
+    assert!(registry.mark_loaded(player, (0, 0)).is_empty());
+    registry.spawn_command_entity(
+        &SimulationAuthority::for_test(),
+        114,
+        "minecraft:pillager".to_owned(),
+        Vec3::new(0.5, 64.0, 6.5),
+    );
+    let pillager_id = registry
+        .persisted_entity_records()
+        .into_iter()
+        .find(|record| record.snapshot.type_name == "minecraft:pillager")
+        .expect("spawned pillager")
+        .snapshot
+        .id;
+    let pillager = registry
+        .lock_entities("project pillager default equipment")
+        .snapshot(pillager_id)
+        .expect("pillager remains authoritative");
+    let projected = super::visibility::server_entity_snapshot_from(pillager);
+    let crossbow = mc_data::Identifier::parse("minecraft:crossbow").unwrap();
+    let expected_crossbow_id = mc_data::items::solaris_required_items()
+        .id_of(&crossbow)
+        .expect("embedded item registry contains crossbow");
+    assert_eq!(
+        projected
+            .main_hand_item
+            .as_ref()
+            .map(|stack| (stack.item_id, stack.count)),
+        Some((expected_crossbow_id, 1))
+    );
+
+    let (attacks, dispatches) = registry.tick_hostile_attacks(
+        &SimulationAuthority::for_test(),
+        1,
+        mc_world::BlockStateId(0),
+    );
+    assert_eq!(attacks, 0);
+    assert!(dispatches.is_empty());
+    let aiming = registry
+        .lock_entities("read pillager aiming state")
+        .snapshot(pillager_id)
+        .expect("pillager remains authoritative")
+        .retained
+        .crossbow_attack
+        .expect("pillager starts aiming");
+    assert_eq!(aiming.phase, mc_entity::EntityCrossbowAttackPhase::Aiming);
+    assert_eq!(aiming.deadline_tick, 5);
+
+    let (attacks, dispatches) = registry.tick_hostile_attacks(
+        &SimulationAuthority::for_test(),
+        aiming.deadline_tick,
+        mc_world::BlockStateId(0),
+    );
+    assert_eq!(attacks, 0);
+    let charging = registry
+        .lock_entities("read pillager charging state")
+        .snapshot(pillager_id)
+        .expect("pillager remains authoritative")
+        .retained
+        .crossbow_attack
+        .expect("pillager starts charging");
+    assert_eq!(
+        charging.phase,
+        mc_entity::EntityCrossbowAttackPhase::Charging
+    );
+    assert_eq!(charging.deadline_tick, 30);
+    assert!(dispatches.iter().any(|dispatch| {
+        matches!(
+            &dispatch.command,
+            OutboundCommand::UpdateEntityData(snapshot)
+                if snapshot.id == pillager_id && snapshot.crossbow_charging
+        )
+    }));
+
+    let (attacks, dispatches) = registry.tick_hostile_attacks(
+        &SimulationAuthority::for_test(),
+        charging.deadline_tick,
+        mc_world::BlockStateId(0),
+    );
+    assert_eq!(attacks, 0);
+    let charged = registry
+        .lock_entities("read pillager charged state")
+        .snapshot(pillager_id)
+        .expect("pillager remains authoritative")
+        .retained
+        .crossbow_attack
+        .expect("pillager holds a charged crossbow");
+    assert_eq!(charged.phase, mc_entity::EntityCrossbowAttackPhase::Charged);
+    assert!((50..=69).contains(&charged.deadline_tick));
+    assert!(dispatches.iter().any(|dispatch| {
+        matches!(
+            &dispatch.command,
+            OutboundCommand::UpdateEntityData(snapshot)
+                if snapshot.id == pillager_id && !snapshot.crossbow_charging
+        )
+    }));
+
+    let (attacks, dispatches) = registry.tick_hostile_attacks(
+        &SimulationAuthority::for_test(),
+        charged.deadline_tick,
+        mc_world::BlockStateId(0),
+    );
+    assert_eq!(attacks, 1);
+    assert!(
+        registry
+            .lock_entities("read fired pillager state")
+            .snapshot(pillager_id)
+            .expect("pillager remains authoritative")
+            .retained
+            .crossbow_attack
+            .is_none()
+    );
+    assert!(!dispatches.iter().any(|dispatch| {
+        matches!(
+            dispatch.command,
+            OutboundCommand::AnimatePlayer { entity_id } if entity_id == pillager_id.0
+        )
+    }));
+    let arrow = registry
+        .lock_entities("read pillager arrow")
+        .snapshots()
+        .find(|snapshot| snapshot.type_name == "minecraft:arrow")
+        .expect("pillager shot creates an authoritative arrow");
+    let owner = arrow
+        .retained
+        .arrow_state
+        .expect("pillager arrow retains projectile state")
+        .projectile
+        .owner
+        .expect("pillager arrow retains its shooter");
+    assert_eq!(owner.raw(), u128::from(pillager_id.0 as u32));
+
+    let (repeat_attacks, _) = registry.tick_hostile_attacks(
+        &SimulationAuthority::for_test(),
+        charged.deadline_tick.saturating_add(1),
+        mc_world::BlockStateId(0),
+    );
+    assert_eq!(repeat_attacks, 0);
+}
+
+#[test]
+fn pillager_crossbow_cancels_when_target_becomes_non_targetable() {
+    let registry = SessionRegistry::new();
+    registry.configure_arrow_kill_rewards(
+        Some(2),
+        Some(3),
+        Some(77),
+        Arc::new(ItemRegistry::from_report(&[])),
+        Arc::new(mc_data::item_components::ItemFactsTable::default()),
+        Arc::new(mc_data::loot::LootTables::default()),
+    );
+    let player = register_test_session(&registry, "PillagerCrossbowGone");
+    assert!(registry.mark_loaded(player, (0, 0)).is_empty());
+    registry.spawn_command_entity(
+        &SimulationAuthority::for_test(),
+        114,
+        "minecraft:pillager".to_owned(),
+        Vec3::new(0.5, 64.0, 6.5),
+    );
+    let pillager_id = registry
+        .persisted_entity_records()
+        .into_iter()
+        .find(|record| record.snapshot.type_name == "minecraft:pillager")
+        .expect("spawned pillager")
+        .snapshot
+        .id;
+
+    assert_eq!(
+        registry
+            .tick_hostile_attacks(
+                &SimulationAuthority::for_test(),
+                1,
+                mc_world::BlockStateId(0),
+            )
+            .0,
+        0
+    );
+    assert_eq!(
+        registry
+            .tick_hostile_attacks(
+                &SimulationAuthority::for_test(),
+                5,
+                mc_world::BlockStateId(0),
+            )
+            .0,
+        0
+    );
+    assert!(
+        registry
+            .lock_entities("verify pillager began charging")
+            .snapshot(pillager_id)
+            .expect("pillager remains authoritative")
+            .retained
+            .crossbow_attack
+            .is_some_and(mc_entity::EntityCrossbowAttackState::is_charging)
+    );
+
+    {
+        let mut inner = registry.lock_inner("make pillager target non-targetable");
+        inner.spectator_sessions.insert(player);
+        inner.publish_combat_target(player);
+    }
+    let (attacks, _) = registry.tick_hostile_attacks(
+        &SimulationAuthority::for_test(),
+        6,
+        mc_world::BlockStateId(0),
+    );
+    assert_eq!(attacks, 0);
+    assert!(
+        registry
+            .lock_entities("verify pillager cancelled missing target")
+            .snapshot(pillager_id)
+            .expect("pillager remains authoritative")
+            .retained
+            .crossbow_attack
+            .is_none()
+    );
+    assert!(
+        registry
+            .lock_entities("verify cancelled pillager spawned no arrow")
+            .snapshots()
+            .all(|snapshot| snapshot.type_name != "minecraft:arrow")
+    );
+}
+
+#[test]
 fn hostile_commit_releases_both_locks_before_arrow_publication() {
     let registry = Arc::new(SessionRegistry::new());
     registry.configure_arrow_kill_rewards(
