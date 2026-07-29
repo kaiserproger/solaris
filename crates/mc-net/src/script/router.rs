@@ -1,12 +1,12 @@
 use mc_script::{AdmittedScriptCommand, ScriptCommand, ScriptPluginStorageFailure};
 use tracing::{debug, warn};
 
-use super::colony::{ColonyAdapterError, PluginColonyAdapter};
 use super::events::{TargetedEventDelivery, deliver_required_targeted_event};
 use super::inventory::{InventoryAdapterError, PluginInventoryAdapter};
 use super::player_query::{PlayerQueryAdapterError, PluginPlayerQueryAdapter};
 use super::storage::{PluginStorageHandle, storage_failure_event};
 use super::teleport::{PluginTeleportAdapter, TeleportAdapterError};
+use super::villager::{PluginVillagerAdapter, VillagerAdapterError};
 use super::zone::PluginZoneAdapter;
 use crate::RuntimeControlHandle;
 use crate::chunk_pipeline::ChunkPipelineResources;
@@ -37,7 +37,7 @@ pub(crate) struct ScriptRouter {
     inventories: PluginInventoryAdapter,
     storage: Option<PluginStorageHandle>,
     zones: PluginZoneAdapter,
-    colonies: PluginColonyAdapter,
+    villagers: PluginVillagerAdapter,
     teleports: PluginTeleportAdapter,
     player_queries: PluginPlayerQueryAdapter,
 }
@@ -55,7 +55,7 @@ impl ScriptRouter {
         zones: PluginZoneAdapter,
     ) -> Self {
         let inventories = PluginInventoryAdapter::new(scripts.clone());
-        let colonies = PluginColonyAdapter::new(scripts.clone());
+        let villagers = PluginVillagerAdapter::new(scripts.clone());
         let teleports = PluginTeleportAdapter::new(scripts.clone());
         let player_queries = PluginPlayerQueryAdapter::new(scripts.clone());
         Self {
@@ -63,7 +63,7 @@ impl ScriptRouter {
             inventories,
             storage,
             zones,
-            colonies,
+            villagers,
             teleports,
             player_queries,
         }
@@ -136,9 +136,8 @@ impl ScriptRouter {
             | ScriptCommand::GrantLoaderBlockItem { .. }
             | ScriptCommand::UpsertZone { .. }
             | ScriptCommand::RemoveZone { .. }
-            | ScriptCommand::UpsertColony { .. }
             | ScriptCommand::RequestVillagerBinding { .. }
-            | ScriptCommand::SetVillagerOrder { .. }
+            | ScriptCommand::SetVillagerGoal { .. }
             | ScriptCommand::TeleportPlayer { .. }
             | ScriptCommand::ListOnlinePlayers { .. } => {
                 debug!("unattested privileged script command rejected");
@@ -337,10 +336,10 @@ impl ScriptRouter {
                 }
                 ScriptRouterExit::Continue
             }
-            ScriptCommand::UpsertColony { .. }
-            | ScriptCommand::RequestVillagerBinding { .. }
-            | ScriptCommand::SetVillagerOrder { .. } => {
-                self.route_colony_admitted(admitted, context.sessions).await
+            ScriptCommand::RequestVillagerBinding { .. }
+            | ScriptCommand::SetVillagerGoal { .. } => {
+                self.route_villager_admitted(admitted, context.sessions)
+                    .await
             }
             ScriptCommand::TeleportPlayer { .. } => {
                 match self
@@ -385,33 +384,32 @@ impl ScriptRouter {
         }
     }
 
-    pub(super) async fn route_colony_admitted(
+    pub(super) async fn route_villager_admitted(
         &self,
         admitted: AdmittedScriptCommand,
         sessions: &play::SessionRegistry,
     ) -> ScriptRouterExit {
         let result = match admitted.request() {
-            ScriptCommand::UpsertColony { .. } => self.colonies.route_admitted(admitted).await,
             ScriptCommand::RequestVillagerBinding { .. } => {
-                self.colonies
+                self.villagers
                     .route_binding_admitted(admitted, sessions)
                     .await
             }
-            ScriptCommand::SetVillagerOrder { .. } => {
-                self.colonies.route_order_admitted(admitted, sessions).await
+            ScriptCommand::SetVillagerGoal { .. } => {
+                self.villagers.route_goal_admitted(admitted, sessions).await
             }
-            _ => Err(ColonyAdapterError::WrongCommand),
+            _ => Err(VillagerAdapterError::WrongCommand),
         };
         match result {
             Ok(_) => ScriptRouterExit::Continue,
             Err(
-                ColonyAdapterError::PublicationClosed
-                | ColonyAdapterError::BindingOwner(_)
-                | ColonyAdapterError::TokenUnavailable
-                | ColonyAdapterError::InvalidResult(_),
+                VillagerAdapterError::PublicationClosed
+                | VillagerAdapterError::BindingOwner(_)
+                | VillagerAdapterError::TokenUnavailable
+                | VillagerAdapterError::InvalidResult(_),
             ) => ScriptRouterExit::Stop,
             Err(error) => {
-                warn!(?error, "admitted colony command rejected");
+                warn!(?error, "admitted villager command rejected");
                 ScriptRouterExit::Continue
             }
         }

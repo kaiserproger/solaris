@@ -319,7 +319,7 @@ configuration skips only that plugin before it can claim command roots.
 | `inventory_storage_transactions` | `inventory_storage_transaction` |
 | `player_inventory` | `inventory_transaction` |
 | `zones` | `upsert_zone`, `upsert_protected_zone`, `remove_zone`, owned zone entry/exit events |
-| `colonies` | `upsert_colony`, `bind_nearest_villager`, `set_villager_order` |
+| `villagers` | `bind_nearest_villager`, `set_villager_idle`, `move_villager_to` |
 | `player_teleport` | `teleport_player` |
 | `player_queries` | `list_online_players` |
 
@@ -361,9 +361,8 @@ targeted event does not need a broad subscription to reach its owner.
 | `zone.command_result` | `on_zone_command_result` | `zone_id`, `accepted` |
 | `player.teleport_result` | `on_player_teleport_result` | `request_id`, `player_id`, `x`, `y`, `z`, `committed`, `failure` |
 | `player.online_result` | `on_player_online_result` | `request_id`, `players`, `truncated` |
-| `colony.record_result` | `on_colony_record_result` | `request_id`, `colony_id`, `accepted` |
-| `colony.villager_binding_result` | `on_colony_villager_binding_result` | `request_id`, `colony_id`, `binding_token`, `binding_expires_at_tick` |
-| `colony.villager_order_result` | `on_colony_villager_order_result` | `request_id`, `colony_id`, `order`, `accepted` |
+| `villager.binding_result` | `on_villager_binding_result` | `request_id`, `binding_token`, `binding_expires_at_tick`, `failure` |
+| `villager.goal_result` | `on_villager_goal_result` | `request_id`, `goal`, `accepted`, `failure`, optional `x`, `y`, `z`, `speed` |
 
 A gameplay-event player snapshot contains `player_id`, `uuid`, `username`,
 `operator`, `x`, `y`, and `z`, captured by the server at publication. The
@@ -809,75 +808,55 @@ teleport-result events come from separate producers and have no relative-order
 guarantee; plugins must correlate the teleport result by `request_id` instead
 of using a zone event as its completion fence.
 
-Colonies are bounded records, not world/entity access:
+Villager control is an engine primitive, not a Rust-owned colony model:
 
 ```luau
-solaris.upsert_colony("register-colony", "starter-colony", "Starter Colony",
-    "minecraft:overworld", 0, 64, 0)
-solaris.bind_nearest_villager("bind-player-7", "starter-colony", 0, 64, 0, 16)
-solaris.set_villager_order("send-home", "starter-colony", binding_token, "home")
+solaris.bind_nearest_villager("bind-player-7", 0, 64, 0, 16)
+solaris.move_villager_to("send-home", binding_token, 0, 64, 0, 0.3)
+solaris.set_villager_idle("hold-position", binding_token)
 ```
 
-Colony ids follow the 64-byte id rule and names are at most 128 bytes. A binding
-search radius must be finite, positive, and no greater than 64. The result token
-is ephemeral; it is not an entity id, pointer, or durable villager capability.
-`set_villager_order` accepts only `home` and `hold`. `home` uses the current
-owned colony home and `hold` stops horizontal goal movement. Plugins cannot
-choose arbitrary coordinates or speeds. There is deliberately no Luau API for
-roles, general goals, pathing internals, memory, inventory, or direct entity
-mutation.
+Request and binding ids follow the 64-byte script-id rule. A binding search
+radius must be finite, positive, and no greater than 64. A movement target must
+use finite bounded coordinates and a finite speed in `(0, 4]`. The result token
+is ephemeral; it is not an entity id, pointer, durable capability, region key,
+or ECS reference.
 
-Colony records are scoped by the host-attached plugin id and kept in a bounded
-in-memory registry. The process admits at most 4,096 records and 256 records per
-plugin. Replacing an owned record remains possible at capacity. A new record
-beyond either bound returns `colony.record_result` with `accepted = false` and
-does not mutate the registry. While event publication remains open, every
-admitted upsert returns its correlated result only to the owning plugin; queue
-closure or shutdown stops the router instead of fabricating delivery. The
-registry is not durable, so plugins that need restart continuity must persist
-their intent through plugin storage.
+`bind_nearest_villager` asks the regional entity owner to atomically claim the
+nearest alive exact `minecraft:villager` inside the radius. No session snapshot
+scan is used. A successful claim returns a random 128-bit lowercase hexadecimal
+token and its simulation-tick expiry. The targeted result uses `failure =
+"not_found"` when no eligible villager exists and `failure = "busy"` for
+transient owner/capacity pressure. A closed or failed owner or result-queue
+closure stops the router instead of fabricating delivery. A claim committed
+before publication failure remains reserved until its normal simulation-tick
+expiry.
 
-`bind_nearest_villager` requires a colony record owned by the admitted plugin.
-The current single-world adapter accepts only `minecraft:overworld` colonies;
-other dimensions return an unsuccessful targeted result without querying or
-mutating entity ownership. Eligible requests run on a blocking endpoint outside
-the async router worker, then ask the regional entity owner for an atomic claim.
-No session snapshot scan is used. A successful claim returns a random 128-bit
-lowercase hexadecimal token and its simulation-tick expiry. An absent villager
-returns an unsuccessful targeted result. Invalid coordinates, a random token
-collision, transient owner busy state, or global claim-capacity exhaustion also
-return an unsuccessful result without shutting down the server. A closed or
-failed owner, token generation failure, or result-queue closure stops the router
-instead of fabricating delivery. A claim committed before publication failure
-or forced task cancellation remains reserved until its normal simulation-tick
-expiry; normal cooperative shutdown drains the active route.
+The adapter retains only the mapping from each token to its host-attested plugin
+owner and exact simulation-tick expiry. It contains no colony id, home, role,
+order, settlement record, or other domain state. Expired entries are purged from
+the pushed simulation tick; no wall-clock timer or polling loop is involved. A
+foreign plugin receives `failure = "binding_unavailable"` and cannot consume or
+invalidate the owner's token.
 
-The colony adapter retains a bounded mapping from each binding token to its
-owning plugin, colony, and exact simulation-tick expiry. Expired entries are
-purged from the current simulation tick; no wall-clock timer or polling loop is
-involved. A foreign plugin receives `accepted = false` and cannot consume or
-invalidate the owner's token. An owned `home` order resolves the colony's
-current home and installs a server-owned follow-position goal at speed `0.3`;
-`hold` installs the idle goal. Both mutations run through the blocking endpoint
-and the journaled regional entity owner. Missing, expired, removed, non-villager,
-or otherwise stale bindings return `accepted = false`. A broken owner or journal
-stops routing. If result publication closes after the owner commits the goal,
-the committed goal remains in effect; the router stops instead of pretending the
-mutation was rejected. Temporary owner pressure also returns `accepted = false`,
-but retains the unexpired token so the plugin may retry. Changing the colony to
-another dimension rejects the order before owner mutation.
+`move_villager_to` installs a validated follow-position goal and
+`set_villager_idle` installs the idle goal through the journaled regional entity
+owner. Missing, expired, removed, non-villager, or otherwise stale bindings
+return `failure = "binding_unavailable"`; temporary owner pressure returns
+`failure = "busy"` while retaining the unexpired token. If result publication
+closes after the owner commits the goal, the committed goal remains in effect
+and the router stops instead of pretending the mutation was rejected.
 
-The shipped colony scaffold retains an accepted token only in Luau memory for
-the active player session and reuses it for later `home` or `hold` updates.
-It reports `Applied villager order ...` only after the targeted owner result is
-accepted. If a cached token is rejected, the scaffold clears it and performs
-one fresh binding attempt; a result from that attempt is never recursively
-retried. Plugin storage records the bounded role and order intent, not the
-ephemeral token or a fabricated entity-mutation result; `/colony status` labels
-that field as stored intent. Disconnect cleanup drops the Luau-side token, while
-the regional owner keeps its claim only until the documented simulation-tick
-expiry. Durable entity handles, general roles, and work-order execution remain
-outside API `0.6.0`.
+The shipped colony scaffold owns all colony vocabulary in Luau. Its
+`config.toml` defines colony identity, display name, dimension, home, zone,
+roles, accepted orders, limits, and home speed. Plugin storage owns the durable
+colony metadata and per-player role/order intent. Rust receives only the generic
+zone plus villager binding/goal requests. The plugin maps its `home` order to
+`move_villager_to` and `hold` to `set_villager_idle`, retains an accepted token
+only in Luau memory, retries one typed transient/stale failure, and clears its
+session state on disconnect. Durable entity handles, pathing internals, villager
+inventory/memory access, and complete colony gameplay remain outside API
+`0.6.0`.
 
 ## Isolation And Limits
 

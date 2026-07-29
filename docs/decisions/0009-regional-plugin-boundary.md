@@ -104,8 +104,13 @@ default and cannot weaken per-plugin FIFO ordering.
 thread, bounded immutable DTOs, capability-gated command batches, targeted
 result events, instruction and memory limits, and generic typed protected
 zones. `mc-net` already has production adapters for storage, zones, menus,
-player inventory transactions, teleports, colonies, and villager bindings.
-Entity spawn and villager work enter simulation/regional owners; menu,
+player inventory transactions, teleports, and opaque villager bindings/goals.
+Colony identity, homes, roles, orders, limits, and persistence are not Rust
+runtime concepts: the shipped Luau plugin owns them and maps its vocabulary to
+bounded `idle`/`follow_position` engine goals. The adapter retains only the
+host-attested plugin owner and simulation-tick expiry of an opaque binding; no
+entity id, region key, ECS reference, or pathing handle crosses the boundary.
+Entity spawn and villager goals enter simulation/regional owners; menu,
 teleport, and standalone player-inventory commands enter the exact ordered
 session lane. Standalone inventory transactions now plan against live
 session-owner state and update its durable mirror before publishing a result,

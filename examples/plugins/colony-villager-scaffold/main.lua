@@ -1,49 +1,117 @@
 --!strict
 
--- Script API 0.6 acceptance fixture.
---
--- Production supports colony registration, ephemeral villager binding, and
--- home/hold orders through the regional entity owner. Roles remain plugin
--- metadata; API 0.6 exposes no durable entity handle, inventory, or arbitrary
--- villager memory access.
+-- Colony identity, roles, orders, home policy, and durable intent live in Luau.
+-- Rust exposes only bounded storage, zones, an opaque villager binding, and
+-- generic idle/follow-position goals through the regional entity owner.
+
+local raw_config: any = solaris.config()
+local colony_config: any = raw_config.colony
+local villager_config: any = raw_config.villagers
+local limits_config: any = raw_config.limits
+if colony_config == nil
+    or colony_config.home == nil
+    or colony_config.zone == nil
+    or villager_config == nil
+    or limits_config == nil
+then
+    error("colony-villager-scaffold requires config.toml")
+end
 
 local config: any = {
     colony = {
-        id = "starter-colony",
-        name = "Starter Colony",
-        dimension = "minecraft:overworld",
-        home = { x = 0, y = 64, z = 0 },
+        id = colony_config.id,
+        name = colony_config.name,
+        dimension = colony_config.dimension,
+        home = {
+            x = colony_config.home.x,
+            y = colony_config.home.y,
+            z = colony_config.home.z,
+        },
     },
     zone = {
-        id = "starter-colony-zone",
-        minimum = { x = -16, y = 50, z = -16 },
-        maximum = { x = 16, y = 100, z = 16 },
+        id = colony_config.zone.id,
+        minimum = {
+            x = colony_config.zone.min_x,
+            y = colony_config.zone.min_y,
+            z = colony_config.zone.min_z,
+        },
+        maximum = {
+            x = colony_config.zone.max_x,
+            y = colony_config.zone.max_y,
+            z = colony_config.zone.max_z,
+        },
     },
-    binding_radius = 16,
-    default_role = "worker",
-    default_order = "home",
-    roles = { "worker", "builder", "farmer", "guard" },
-    orders = { "home", "hold" },
-    max_active_players = 64,
+    binding_radius = villager_config.binding_radius,
+    home_speed = villager_config.home_speed,
+    default_role = villager_config.default_role,
+    default_order = villager_config.default_order,
+    roles = villager_config.roles,
+    orders = villager_config.orders,
+    max_pending_requests = limits_config.max_pending_requests,
+    max_active_players = limits_config.max_active_players,
     max_generation = 999999,
 }
+
+local function valid_text(value: any, maximum: number): boolean
+    return type(value) == "string"
+        and #value > 0
+        and #value <= maximum
+        and string.find(value, "|", 1, true) == nil
+end
+
+local function valid_number(value: any): boolean
+    return type(value) == "number" and value == value and math.abs(value) < math.huge
+end
+
+if not valid_text(config.colony.id, 128)
+    or not valid_text(config.colony.name, 128)
+    or not valid_text(config.colony.dimension, 256)
+    or not valid_text(config.zone.id, 128)
+    or not valid_number(config.colony.home.x)
+    or not valid_number(config.colony.home.y)
+    or not valid_number(config.colony.home.z)
+    or not valid_number(config.binding_radius)
+    or config.binding_radius <= 0
+    or config.binding_radius > 64
+    or not valid_number(config.home_speed)
+    or config.home_speed <= 0
+    or config.home_speed > 4
+    or type(config.roles) ~= "table"
+    or type(config.orders) ~= "table"
+    or type(config.max_pending_requests) ~= "number"
+    or config.max_pending_requests < 1
+    or config.max_pending_requests > 128
+    or type(config.max_active_players) ~= "number"
+    or config.max_active_players < 1
+    or config.max_active_players > 256
+then
+    error("invalid colony-villager-scaffold config")
+end
 
 local role_allowed: any = {}
 local order_allowed: any = {}
 for _, role in ipairs(config.roles) do
+    if not valid_text(role, 64) then
+        error("invalid configured colony role")
+    end
     role_allowed[role] = true
 end
 for _, order in ipairs(config.orders) do
+    if order ~= "home" and order ~= "hold" then
+        error("configured orders must be home or hold")
+    end
     order_allowed[order] = true
 end
+if not role_allowed[config.default_role] or not order_allowed[config.default_order] then
+    error("default colony role/order must be declared")
+end
 
-local colony_request_pending = false
-local colony_outcome: string = "not_started"
+local startup_state: string = "starting"
 local pending_gets: any = {}
 local pending_get_by_player: any = {}
 local pending_cas: any = {}
 local pending_bindings: any = {}
-local pending_orders: any = {}
+local pending_goals: any = {}
 local active_bindings: any = {}
 local records: any = {}
 local zone_seen: any = {}
@@ -58,17 +126,37 @@ local function table_size(values: any): number
     return count
 end
 
-local function binding_key(uuid: string): string
-    return "villager:" .. uuid
+local function pending_count(): number
+    return table_size(pending_gets)
+        + table_size(pending_cas)
+        + table_size(pending_bindings)
+        + table_size(pending_goals)
 end
 
-local function colony_key()
+local function member_key(uuid: string): string
+    return "member:" .. uuid
+end
+
+local function metadata_key(): string
     return "colony:" .. config.colony.id
+end
+
+local function metadata_value(): string
+    local home = config.colony.home
+    return table.concat({
+        "v1",
+        config.colony.id,
+        config.colony.name,
+        config.colony.dimension,
+        tostring(home.x),
+        tostring(home.y),
+        tostring(home.z),
+    }, "|")
 end
 
 local function encode_record(record: any): string
     return table.concat({
-        "v1",
+        "v2",
         record.status,
         record.role,
         record.order,
@@ -82,7 +170,7 @@ local function decode_record(value: any): (any, string?)
     end
     local status, role, order, generation = string.match(
         value,
-        "^v1|([a-z_]+)|([a-z_]+)|([a-z_]+)|(%d+)$"
+        "^v2|([a-z_]+)|([a-z_]+)|([a-z_]+)|(%d+)$"
     )
     local generation_number = tonumber(generation)
     if (status ~= "recruiting" and status ~= "active" and status ~= "rejected")
@@ -131,23 +219,28 @@ local function send_notice(player_id: number)
     end
 end
 
-local function publish_colony_ready()
-    colony_outcome = "ready"
-    last_batch = { kind = "message" }
-    solaris.broadcast("Colony plugin ready.")
-end
-
-local function action_request_id(prefix: string, player_id: number, version: any): string
+local function request_id(prefix: string, player_id: number?, version: any): string
     return prefix
-        .. "-" .. tostring(player_id)
+        .. "-" .. tostring(player_id or 0)
         .. "-" .. (version == nil and "new" or tostring(version))
 end
 
-local function queue_get(player_id: number?, uuid: string?, action: string, argument: string?, request_id: string, key: string): boolean
+local function queue_get(
+    player_id: number?,
+    uuid: string?,
+    action: string,
+    argument: string?,
+    id: string,
+    key: string
+): boolean
+    if pending_count() >= config.max_pending_requests then
+        remember_notice(player_id, "Colony request rejected: pending-request limit reached.")
+        return false
+    end
     if player_id ~= nil and pending_get_by_player[player_id] ~= nil then
         return false
     end
-    pending_gets[request_id] = {
+    pending_gets[id] = {
         player_id = player_id,
         uuid = uuid,
         action = action,
@@ -155,59 +248,72 @@ local function queue_get(player_id: number?, uuid: string?, action: string, argu
         key = key,
     }
     if player_id ~= nil then
-        pending_get_by_player[player_id] = request_id
+        pending_get_by_player[player_id] = id
     end
-    last_batch = { kind = "get", request_id = request_id, player_id = player_id }
-    solaris.storage_get(request_id, key)
+    last_batch = { kind = "get", request_id = id, player_id = player_id }
+    solaris.storage_get(id, key)
     return true
 end
 
-local function queue_cas(player_id: number?, uuid: string?, key: string, expected_version: any, next_record: any, after: any, prefix: string)
-    local request_id = action_request_id(prefix, player_id or 0, expected_version)
-    pending_cas[request_id] = {
+local function queue_cas(
+    player_id: number?,
+    uuid: string?,
+    key: string,
+    expected_version: any,
+    value: string,
+    next_record: any,
+    after: any,
+    prefix: string
+): boolean
+    if pending_count() >= config.max_pending_requests then
+        remember_notice(player_id, "Colony update rejected: pending-request limit reached.")
+        return false
+    end
+    local id = request_id(prefix, player_id, expected_version)
+    pending_cas[id] = {
         player_id = player_id,
         uuid = uuid,
         key = key,
-        expected_version = expected_version,
         next_record = next_record,
         after = after,
     }
-    last_batch = { kind = "cas", request_id = request_id, player_id = player_id }
-    solaris.storage_cas(request_id, key, expected_version, encode_record(next_record))
+    last_batch = { kind = "cas", request_id = id, player_id = player_id }
+    solaris.storage_cas(id, key, expected_version, value)
+    return true
 end
 
-local function queue_binding(player_id: number, uuid: string, key: string, version: any, record: any, x: number, y: number, z: number, purpose: string)
-    local request_id = action_request_id("bind", player_id, version)
-    pending_bindings[request_id] = {
-        player_id = player_id,
-        uuid = uuid,
-        key = key,
-        version = version,
-        record = record,
-        purpose = purpose,
-    }
-    last_batch = { kind = "binding", request_id = request_id, player_id = player_id }
-    solaris.bind_nearest_villager(
-        request_id,
-        config.colony.id,
-        x,
-        y,
-        z,
-        config.binding_radius
-    )
+local function queue_binding(pending: any): boolean
+    if pending_count() >= config.max_pending_requests then
+        remember_notice(pending.player_id, "Villager binding rejected: pending-request limit reached.")
+        return false
+    end
+    local id = request_id("bind", pending.player_id, pending.version)
+    pending_bindings[id] = pending
+    last_batch = { kind = "binding", request_id = id, player_id = pending.player_id }
+    solaris.bind_nearest_villager(id, pending.x, pending.y, pending.z, config.binding_radius)
+    return true
 end
 
-local function queue_order(pending: any, binding_token: string)
-    local request_id = action_request_id("order", pending.player_id, pending.version)
-    pending.binding_token = binding_token
-    pending_orders[request_id] = pending
-    last_batch = { kind = "order", request_id = request_id, player_id = pending.player_id }
-    solaris.set_villager_order(
-        request_id,
-        config.colony.id,
-        binding_token,
-        pending.record.order
-    )
+local function expected_goal(order: string): string
+    return order == "home" and "follow_position" or "idle"
+end
+
+local function queue_goal(pending: any, lease_id: string): boolean
+    if pending_count() >= config.max_pending_requests then
+        remember_notice(pending.player_id, "Villager goal rejected: pending-request limit reached.")
+        return false
+    end
+    local id = request_id("goal", pending.player_id, pending.version)
+    pending.lease_id = lease_id
+    pending_goals[id] = pending
+    last_batch = { kind = "goal", request_id = id, player_id = pending.player_id }
+    if pending.record.order == "home" then
+        local home = config.colony.home
+        solaris.move_villager_to(id, lease_id, home.x, home.y, home.z, config.home_speed)
+    else
+        solaris.set_villager_idle(id, lease_id)
+    end
+    return true
 end
 
 local function split_arguments(arguments: string): any
@@ -222,26 +328,22 @@ local function split_arguments(arguments: string): any
 end
 
 local function status_message(record: any): string
-    if colony_outcome == "record_pending" then
-        return "Colony unavailable: waiting for colony.record_result from UpsertColony."
-    end
-    if colony_outcome == "record_rejected" then
-        return "Colony unavailable: UpsertColony was rejected."
-    end
-    if colony_outcome ~= "ready" then
-        return "Colony unavailable: state=" .. colony_outcome .. "."
+    if startup_state ~= "ready" then
+        return "Colony unavailable: state=" .. startup_state .. "."
     end
     if record == nil then
-        return "No villager is recruited for this player."
+        return config.colony.name .. ": no villager is recruited for this player."
     end
-    if record.status == "recruiting" then
-        return "Recruitment pending: waiting for colony.villager_binding_result from RequestVillagerBinding."
-    end
-    if record.status == "rejected" then
-        return "Recruitment rejected or unavailable; API 0.6 does not distinguish the cause."
-    end
-    return "Recruited villager: role metadata=" .. record.role
-        .. ", stored order intent=" .. record.order .. "."
+    return config.colony.name
+        .. ": status=" .. record.status
+        .. ", role=" .. record.role
+        .. ", order=" .. record.order
+        .. ", generation=" .. tostring(record.generation) .. "."
+end
+
+local function queue_goal_for_record(pending: any, lease_id: string)
+    pending.binding_expires_at_tick = pending.binding_expires_at_tick or 0
+    queue_goal(pending, lease_id)
 end
 
 local function handle_player_state(pending: any, value: any, version: any)
@@ -262,8 +364,7 @@ local function handle_player_state(pending: any, value: any, version: any)
         send_message(player_id, status_message(record))
         return
     end
-
-    if colony_outcome ~= "ready" then
+    if startup_state ~= "ready" then
         send_message(player_id, status_message(record))
         return
     end
@@ -278,20 +379,6 @@ local function handle_player_state(pending: any, value: any, version: any)
             send_message(player_id, "Recruitment rejected: unsupported role.")
             return
         end
-        if record ~= nil and record.status == "recruiting" then
-            queue_binding(
-                player_id,
-                pending.uuid,
-                pending.key,
-                version,
-                record,
-                pending.x,
-                pending.y,
-                pending.z,
-                "recruit"
-            )
-            return
-        end
         local next_record = {
             status = "recruiting",
             role = role,
@@ -303,13 +390,9 @@ local function handle_player_state(pending: any, value: any, version: any)
             pending.uuid,
             pending.key,
             version,
+            encode_record(next_record),
             next_record,
-            {
-                kind = "bind",
-                x = pending.x,
-                y = pending.y,
-                z = pending.z,
-            },
+            { kind = "bind", x = pending.x, y = pending.y, z = pending.z },
             "recruit"
         )
         return
@@ -319,7 +402,6 @@ local function handle_player_state(pending: any, value: any, version: any)
         send_message(player_id, "Update rejected: recruit an active villager first.")
         return
     end
-
     local next_record = copy_record(record)
     next_record.generation = next_record.generation + 1
     if next_record.generation > config.max_generation then
@@ -327,16 +409,8 @@ local function handle_player_state(pending: any, value: any, version: any)
         return
     end
     if pending.action == "role" then
-        if not role_allowed[pending.argument] then
-            send_message(player_id, "Role rejected: expected worker, builder, farmer, or guard.")
-            return
-        end
         next_record.role = pending.argument
     elseif pending.action == "order" then
-        if not order_allowed[pending.argument] then
-            send_message(player_id, "Order rejected: expected home or hold.")
-            return
-        end
         next_record.order = pending.argument
     else
         send_message(player_id, "Colony command rejected: unsupported action.")
@@ -347,14 +421,10 @@ local function handle_player_state(pending: any, value: any, version: any)
         pending.uuid,
         pending.key,
         version,
+        encode_record(next_record),
         next_record,
         pending.action == "order"
-            and {
-                kind = "apply_order",
-                x = pending.x,
-                y = pending.y,
-                z = pending.z,
-            }
+            and { kind = "apply_order", x = pending.x, y = pending.y, z = pending.z }
             or { kind = "updated", field = pending.action },
         pending.action
     )
@@ -366,19 +436,19 @@ local function clear_player(player_id: number)
         pending_gets[get_id] = nil
         pending_get_by_player[player_id] = nil
     end
-    for request_id, pending in pairs(pending_cas) do
+    for id, pending in pairs(pending_cas) do
         if pending.player_id == player_id then
-            pending_cas[request_id] = nil
+            pending_cas[id] = nil
         end
     end
-    for request_id, pending in pairs(pending_bindings) do
+    for id, pending in pairs(pending_bindings) do
         if pending.player_id == player_id then
-            pending_bindings[request_id] = nil
+            pending_bindings[id] = nil
         end
     end
-    for request_id, pending in pairs(pending_orders) do
+    for id, pending in pairs(pending_goals) do
         if pending.player_id == player_id then
-            pending_orders[request_id] = nil
+            pending_goals[id] = nil
         end
     end
     active_bindings[player_id] = nil
@@ -388,18 +458,8 @@ local function clear_player(player_id: number)
 end
 
 function on_server_started(_event: any)
-    colony_request_pending = true
-    colony_outcome = "record_pending"
+    startup_state = "metadata_pending"
     last_batch = { kind = "startup" }
-    solaris.upsert_colony(
-        "register-starter-colony",
-        config.colony.id,
-        config.colony.name,
-        config.colony.dimension,
-        config.colony.home.x,
-        config.colony.home.y,
-        config.colony.home.z
-    )
     solaris.upsert_zone(
         config.zone.id,
         config.colony.dimension,
@@ -410,29 +470,13 @@ function on_server_started(_event: any)
         config.zone.maximum.y,
         config.zone.maximum.z
     )
+    queue_get(nil, nil, "metadata", nil, "load-colony-metadata", metadata_key())
 end
 
 function on_player_joined(event: any)
-    if colony_outcome == "ready" then
-        send_message(event.player_id, "Colony plugin ready.")
+    if startup_state == "ready" then
+        send_message(event.player_id, config.colony.name .. " plugin ready.")
     end
-end
-
-function on_colony_record_result(event: any)
-    last_batch = nil
-    if not colony_request_pending
-        or event.request_id ~= "register-starter-colony"
-        or event.colony_id ~= config.colony.id
-    then
-        return
-    end
-    colony_request_pending = false
-    if not event.accepted then
-        colony_outcome = "record_rejected"
-        return
-    end
-    colony_outcome = "record_accepted"
-    queue_get(nil, nil, "colony_record", nil, "load-colony-record", colony_key())
 end
 
 function on_player_zone_entered(event: any)
@@ -442,7 +486,7 @@ function on_player_zone_entered(event: any)
     end
     zone_seen[event.player_id] = event.uuid
     send_notice(event.player_id)
-    send_message(event.player_id, "Starter Colony: use /colony status or /colony recruit [role].")
+    send_message(event.player_id, config.colony.name .. ": use /colony status or /colony recruit [role].")
 end
 
 function on_player_command(event: any)
@@ -467,7 +511,7 @@ function on_player_command(event: any)
             return
         end
     end
-    for _, pending in pairs(pending_orders) do
+    for _, pending in pairs(pending_goals) do
         if pending.player_id == event.player_id then
             send_message(event.player_id, "Colony request rejected: another request is pending.")
             return
@@ -482,7 +526,7 @@ function on_player_command(event: any)
 
     local arguments = split_arguments(event.arguments)
     if arguments == nil or #arguments > 2 then
-        send_message(event.player_id, "Usage: /colony status|recruit [role]|role <role>|order <order>.")
+        send_message(event.player_id, "Usage: /colony status|recruit [role]|role <role>|order <home|hold>.")
         return
     end
     local action = arguments[1] or "status"
@@ -497,17 +541,9 @@ function on_player_command(event: any)
         return
     end
 
-    local request_id = "state-" .. tostring(event.player_id)
-    local queued = queue_get(
-        event.player_id,
-        event.uuid,
-        action,
-        argument,
-        request_id,
-        binding_key(event.uuid)
-    )
-    if queued then
-        local pending = pending_gets[request_id]
+    local id = "state-" .. tostring(event.player_id)
+    if queue_get(event.player_id, event.uuid, action, argument, id, member_key(event.uuid)) then
+        local pending = pending_gets[id]
         pending.x = event.x
         pending.y = event.y
         pending.z = event.z
@@ -525,35 +561,40 @@ function on_plugin_storage_get_result(event: any)
         pending_get_by_player[pending.player_id] = nil
     end
     if event.key ~= pending.key then
-        if pending.action == "colony_record" then
-            colony_outcome = "storage_result_mismatch"
+        if pending.action == "metadata" then
+            startup_state = "metadata_result_mismatch"
         else
             send_message(pending.player_id, "Colony storage result rejected: correlation mismatch.")
         end
         return
     end
     if event.failure ~= nil then
-        if pending.action == "colony_record" then
-            colony_outcome = "storage_" .. event.failure
+        if pending.action == "metadata" then
+            startup_state = "storage_" .. event.failure
         else
             send_message(pending.player_id, "Colony storage unavailable: " .. event.failure .. ".")
         end
         return
     end
 
-    if pending.action == "colony_record" then
+    if pending.action == "metadata" then
+        local expected = metadata_value()
         if event.value == nil then
-            local record = {
-                status = "active",
-                role = config.default_role,
-                order = config.default_order,
-                generation = 1,
-            }
-            queue_cas(nil, nil, pending.key, event.version, record, { kind = "colony_record" }, "persist-colony")
-        elseif event.value == "v1|active|worker|home|1" then
-            publish_colony_ready()
+            queue_cas(
+                nil,
+                nil,
+                pending.key,
+                event.version,
+                expected,
+                nil,
+                { kind = "metadata" },
+                "persist-colony"
+            )
+        elseif event.value == expected then
+            startup_state = "ready"
+            solaris.broadcast(config.colony.name .. " plugin ready.")
         else
-            colony_outcome = "invalid_colony_record"
+            startup_state = "metadata_config_mismatch"
         end
         return
     end
@@ -569,8 +610,8 @@ function on_plugin_storage_cas_result(event: any)
     end
     pending_cas[event.request_id] = nil
     if event.key ~= pending.key then
-        if pending.after.kind == "colony_record" then
-            colony_outcome = "storage_result_mismatch"
+        if pending.after.kind == "metadata" then
+            startup_state = "metadata_result_mismatch"
         else
             records[pending.player_id] = nil
             send_message(pending.player_id, "Colony update rejected: storage result mismatch.")
@@ -578,24 +619,25 @@ function on_plugin_storage_cas_result(event: any)
         return
     end
     if event.failure ~= nil then
-        if pending.after.kind == "colony_record" then
-            colony_outcome = "storage_" .. event.failure
+        if pending.after.kind == "metadata" then
+            startup_state = "storage_" .. event.failure
         else
             send_message(pending.player_id, "Colony update unavailable: " .. event.failure .. ".")
         end
         return
     end
     if not event.applied or event.version == nil then
-        if pending.after.kind == "colony_record" then
-            colony_outcome = "stale_colony_record"
+        if pending.after.kind == "metadata" then
+            startup_state = "stale_metadata"
         else
             records[pending.player_id] = nil
             send_message(pending.player_id, "Colony update rejected: stale storage revision.")
         end
         return
     end
-    if pending.after.kind == "colony_record" then
-        publish_colony_ready()
+    if pending.after.kind == "metadata" then
+        startup_state = "ready"
+        solaris.broadcast(config.colony.name .. " plugin ready.")
         return
     end
 
@@ -606,33 +648,35 @@ function on_plugin_storage_cas_result(event: any)
         value = pending.next_record,
     }
     if pending.after.kind == "bind" then
-        queue_binding(
-            pending.player_id,
-            pending.uuid,
-            pending.key,
-            event.version,
-            pending.next_record,
-            pending.after.x,
-            pending.after.y,
-            pending.after.z,
-            "recruit"
-        )
+        queue_binding({
+            player_id = pending.player_id,
+            uuid = pending.uuid,
+            key = pending.key,
+            version = event.version,
+            record = pending.next_record,
+            purpose = "recruit",
+            retry_binding = false,
+            x = pending.after.x,
+            y = pending.after.y,
+            z = pending.after.z,
+        })
     elseif pending.after.kind == "apply_order" then
         local binding = active_bindings[pending.player_id]
         if binding == nil then
-            queue_binding(
-                pending.player_id,
-                pending.uuid,
-                pending.key,
-                event.version,
-                pending.next_record,
-                pending.after.x,
-                pending.after.y,
-                pending.after.z,
-                "apply_order"
-            )
+            queue_binding({
+                player_id = pending.player_id,
+                uuid = pending.uuid,
+                key = pending.key,
+                version = event.version,
+                record = pending.next_record,
+                purpose = "apply_order",
+                retry_binding = false,
+                x = pending.after.x,
+                y = pending.after.y,
+                z = pending.after.z,
+            })
         else
-            queue_order({
+            queue_goal_for_record({
                 player_id = pending.player_id,
                 uuid = pending.uuid,
                 key = pending.key,
@@ -644,145 +688,119 @@ function on_plugin_storage_cas_result(event: any)
                 x = pending.after.x,
                 y = pending.after.y,
                 z = pending.after.z,
-            }, binding.token)
+            }, binding.lease_id)
         end
     elseif pending.after.kind == "updated" then
-        send_message(pending.player_id, "Stored " .. pending.after.field .. " intent.")
+        send_message(pending.player_id, "Stored " .. pending.after.field .. " intent in Luau storage.")
     elseif pending.after.kind == "binding_complete" then
-        send_message(pending.player_id, "Villager recruitment recorded durably.")
+        send_message(pending.player_id, "Villager recruitment recorded durably by the Luau plugin.")
     elseif pending.after.kind == "binding_rejected" then
-        send_message(
-            pending.player_id,
-            "Villager binding rejected or unavailable; API 0.6 does not distinguish the cause."
-        )
+        send_message(pending.player_id, "Villager binding failed: " .. pending.after.failure .. ".")
     end
 end
 
-function on_colony_villager_binding_result(event: any)
+function on_villager_binding_result(event: any)
     last_batch = nil
     local pending = pending_bindings[event.request_id]
     if pending == nil then
         return
     end
     pending_bindings[event.request_id] = nil
-    if event.colony_id ~= config.colony.id then
-        send_message(pending.player_id, "Binding result rejected: colony mismatch.")
-        return
-    end
     if (event.binding_token == nil) ~= (event.binding_expires_at_tick == nil) then
-        send_message(pending.player_id, "Binding result rejected: incomplete token lease.")
+        send_message(pending.player_id, "Binding result rejected: incomplete lease.")
         return
     end
-
     if event.binding_token == nil then
+        local failure = event.failure or "not_found"
+        if failure == "busy" and not pending.retry_binding then
+            pending.retry_binding = true
+            queue_binding(pending)
+            return
+        end
         if pending.purpose == "apply_order" then
-            send_message(
-                pending.player_id,
-                "Stored order intent, but no villager was available to apply it."
-            )
+            send_message(pending.player_id, "Stored order intent, but binding failed: " .. failure .. ".")
             return
         end
         local next_record = copy_record(pending.record)
-        next_record.generation = next_record.generation + 1
-        if next_record.generation > config.max_generation then
-            send_message(pending.player_id, "Binding result rejected: generation limit reached.")
-            return
-        end
         next_record.status = "rejected"
+        next_record.generation = next_record.generation + 1
         queue_cas(
             pending.player_id,
             pending.uuid,
             pending.key,
             pending.version,
+            encode_record(next_record),
             next_record,
-            { kind = "binding_rejected" },
+            { kind = "binding_rejected", failure = failure },
             "reject"
         )
-    else
-        pending.binding_expires_at_tick = event.binding_expires_at_tick
-        pending.retry_binding = false
-        queue_order(pending, event.binding_token)
+        return
     end
+    pending.binding_expires_at_tick = event.binding_expires_at_tick
+    pending.retry_binding = false
+    queue_goal_for_record(pending, event.binding_token)
 end
 
-function on_colony_villager_order_result(event: any)
+function on_villager_goal_result(event: any)
     last_batch = nil
-    local pending = pending_orders[event.request_id]
+    local pending = pending_goals[event.request_id]
     if pending == nil then
         return
     end
-    pending_orders[event.request_id] = nil
-    if event.colony_id ~= config.colony.id or event.order ~= pending.record.order then
-        send_message(pending.player_id, "Villager order result rejected: correlation mismatch.")
+    pending_goals[event.request_id] = nil
+    if event.goal ~= expected_goal(pending.record.order) then
+        send_message(pending.player_id, "Villager goal result rejected: correlation mismatch.")
         return
     end
 
-    if pending.purpose == "apply_order" then
-        if event.accepted then
-            active_bindings[pending.player_id] = {
-                token = pending.binding_token,
-                expires_at_tick = pending.binding_expires_at_tick,
-            }
-        else
-            active_bindings[pending.player_id] = nil
-            if pending.retry_binding then
-                queue_binding(
-                    pending.player_id,
-                    pending.uuid,
-                    pending.key,
-                    pending.version,
-                    pending.record,
-                    pending.x,
-                    pending.y,
-                    pending.z,
-                    "apply_order"
-                )
-                return
-            end
-        end
-        send_message(
-            pending.player_id,
-            event.accepted
-                and ("Applied villager order " .. pending.record.order .. ".")
-                or ("Stored order intent, but villager order "
-                    .. pending.record.order .. " was rejected.")
-        )
-        return
-    end
-
-    local next_record = copy_record(pending.record)
-    next_record.generation = next_record.generation + 1
-    if next_record.generation > config.max_generation then
-        send_message(pending.player_id, "Villager order result rejected: generation limit reached.")
-        return
-    end
     if event.accepted then
         active_bindings[pending.player_id] = {
-            token = pending.binding_token,
+            lease_id = pending.lease_id,
             expires_at_tick = pending.binding_expires_at_tick,
         }
-        next_record.status = "active"
-        queue_cas(
-            pending.player_id,
-            pending.uuid,
-            pending.key,
-            pending.version,
-            next_record,
-            { kind = "binding_complete" },
-            "activate"
-        )
-    else
-        active_bindings[pending.player_id] = nil
+        if pending.purpose == "recruit" then
+            local next_record = copy_record(pending.record)
+            next_record.status = "active"
+            next_record.generation = next_record.generation + 1
+            queue_cas(
+                pending.player_id,
+                pending.uuid,
+                pending.key,
+                pending.version,
+                encode_record(next_record),
+                next_record,
+                { kind = "binding_complete" },
+                "activate"
+            )
+        else
+            send_message(pending.player_id, "Applied Luau order " .. pending.record.order .. ".")
+        end
+        return
+    end
+
+    active_bindings[pending.player_id] = nil
+    local failure = event.failure or "binding_unavailable"
+    if failure == "binding_unavailable" and pending.retry_binding then
+        pending.retry_binding = false
+        queue_binding(pending)
+        return
+    end
+    if pending.purpose == "recruit" then
+        local next_record = copy_record(pending.record)
         next_record.status = "rejected"
+        next_record.generation = next_record.generation + 1
         queue_cas(
             pending.player_id,
             pending.uuid,
             pending.key,
             pending.version,
+            encode_record(next_record),
             next_record,
-            { kind = "binding_rejected" },
+            { kind = "binding_rejected", failure = failure },
             "reject"
         )
+    else
+        send_message(pending.player_id, "Stored order intent, but goal failed: " .. failure .. ".")
     end
 end
 
@@ -798,15 +816,14 @@ function on_command_batch_rejected(result: any)
         return
     end
     if batch.kind == "startup" then
-        colony_request_pending = false
-        colony_outcome = "startup_" .. result.reason
+        startup_state = "startup_" .. result.reason
     elseif batch.kind == "get" then
         local pending = pending_gets[batch.request_id]
         pending_gets[batch.request_id] = nil
         if batch.player_id ~= nil then
             pending_get_by_player[batch.player_id] = nil
-        elseif pending ~= nil and pending.action == "colony_record" then
-            colony_outcome = "storage_" .. result.reason
+        elseif pending ~= nil and pending.action == "metadata" then
+            startup_state = "storage_" .. result.reason
         end
         remember_notice(batch.player_id, "Colony read rejected: " .. result.reason .. ".")
     elseif batch.kind == "cas" then
@@ -815,9 +832,9 @@ function on_command_batch_rejected(result: any)
     elseif batch.kind == "binding" then
         pending_bindings[batch.request_id] = nil
         remember_notice(batch.player_id, "Villager binding request rejected: " .. result.reason .. ".")
-    elseif batch.kind == "order" then
-        pending_orders[batch.request_id] = nil
-        remember_notice(batch.player_id, "Villager order rejected: " .. result.reason .. ".")
+    elseif batch.kind == "goal" then
+        pending_goals[batch.request_id] = nil
+        remember_notice(batch.player_id, "Villager goal request rejected: " .. result.reason .. ".")
     elseif batch.kind == "message" then
         remember_notice(batch.player_id, "Colony response rejected: " .. result.reason .. ".")
     end

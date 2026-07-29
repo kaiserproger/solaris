@@ -1119,25 +1119,20 @@ hardening. An already-open lower-priority diff does not override this order.
   labels `owned 0 -> 1 -> 0`, and both plugin messages. A stale slot click after
   closing the menu was rejected before packet dispatch. This is focused plugin
   gameplay evidence, not a broad survival or readiness gate.
-- Admitted Lua colony upserts now reach a bounded owner-scoped production
-  registry and publish a correlated `colony.record_result` only to the owning
-  plugin. Villager binding now validates colony ownership and the current
-  overworld dimension, then uses the bounded regional-owner query to install an
-  atomic 600-tick opaque claim without scanning session snapshots. Missing,
-  foreign, out-of-dimension, capacity-exhausted, and no-villager requests return
-  a targeted empty result; broken owner availability remains fatal. Unit
-  coverage includes the real Lua admission path, and a TCP client wire gate
-  observes colony upsert. Records remain in-memory and plugin storage is the
-  durable intent source.
-- The first production villager-order slice accepts only `home` and `hold` for
-  an owner-scoped, unexpired binding token. It routes the mutation through the
-  regional entity owner, validates that the live entity is still a villager,
-  journals the goal, and publishes a correlated result only to the owning
-  plugin. Unit coverage includes stale, removed, foreign-owner, publication-
-  close, and owner-failure paths. A disk-backed Lua wire test proves bind ->
-  home order -> targeted result through an ordinary joined client. General
-  roles, work orders, and direct path or memory control remain deliberately
-  absent.
+- Colony identity, homes, roles, orders, limits, and durable member intent now
+  live entirely in the shipped strict Luau plugin and its `config.toml`/plugin
+  storage. The former Rust colony registry, colony DTOs, `upsert_colony`, and the
+  hard-coded `home`/`hold` order vocabulary are deleted. Rust exposes only a
+  generic `villagers` capability: an owner-scoped 600-tick opaque binding to the
+  nearest live villager plus bounded `idle` and `follow_position` goals through
+  the journaled regional entity owner. Typed targeted failures distinguish
+  `not_found`, transient `busy`, and `binding_unavailable`; no entity id, region,
+  ECS reference, or pathing handle crosses the plugin boundary. The colony
+  plugin maps `home` to a configured movement target and `hold` to idle, owns
+  retries and disconnect cleanup, and persists only its domain state. Focused
+  `mc-script`, villager-router, raw TCP goal, and shipped-plugin disk-backed wire
+  gates pass. General villager memory/inventory access and a complete colony
+  game remain intentionally outside API `0.6.0`.
 - Restart evidence now requires the stopped server process to exit with status
   0. A recorded interrupt without a clean exit can no longer pass validation.
 - Multi-entity physics dispatch no longer sends one cached owner mutation per

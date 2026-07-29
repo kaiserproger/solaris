@@ -78,7 +78,6 @@ mod script_loader_interaction_endpoint;
 #[cfg(test)]
 mod script_loader_interaction_endpoint_tests;
 pub(super) use script_loader_interaction_endpoint::route_client_loader_interaction;
-mod script_colony_endpoint;
 mod script_commit_events;
 mod script_entity_interaction;
 #[cfg(test)]
@@ -101,6 +100,7 @@ mod script_player_query_endpoint_tests;
 mod script_teleport_endpoint;
 #[cfg(test)]
 mod script_teleport_endpoint_tests;
+mod script_villager_endpoint;
 mod session_lifecycle;
 mod settlement_authority;
 pub(super) use settlement_authority::toolsmith_merchant_state;

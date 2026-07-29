@@ -23,15 +23,14 @@ use crate::{
     MAX_ONLINE_PLAYER_QUERY_LIMIT, MAX_SCRIPT_CHAT_MESSAGE_BYTES, MAX_SCRIPT_CONSOLE_COMMAND_BYTES,
     MAX_SCRIPT_DISCONNECT_REASON_BYTES, PlayerCommandRegistrationError, RuntimeContext,
     RuntimeError, RuntimeResult, ScriptApiVersion, ScriptAxisAlignedZone,
-    ScriptBatchSubmissionError, ScriptBoundary, ScriptColonyRecord, ScriptColonyRecordRequest,
-    ScriptCommand, ScriptDtoError, ScriptEvent, ScriptEventKind, ScriptHostEndpoint,
-    ScriptInventoryMenu, ScriptInventoryMenuItem, ScriptInventoryMenuSlot,
-    ScriptInventoryResourceDelta, ScriptInventoryStorageTransaction, ScriptOnlinePlayersRequest,
-    ScriptPlayerId, ScriptPlayerInventoryTransaction, ScriptPlayerTeleportRequest,
-    ScriptPluginManifest, ScriptPluginStorageCompareAndSwapRequest,
+    ScriptBatchSubmissionError, ScriptBoundary, ScriptCommand, ScriptDtoError, ScriptEvent,
+    ScriptEventKind, ScriptHostEndpoint, ScriptInventoryMenu, ScriptInventoryMenuItem,
+    ScriptInventoryMenuSlot, ScriptInventoryResourceDelta, ScriptInventoryStorageTransaction,
+    ScriptOnlinePlayersRequest, ScriptPlayerId, ScriptPlayerInventoryTransaction,
+    ScriptPlayerTeleportRequest, ScriptPluginManifest, ScriptPluginStorageCompareAndSwapRequest,
     ScriptPluginStorageDeleteRequest, ScriptPluginStorageGetRequest, ScriptPosition, ScriptRuntime,
-    ScriptStorageMutation, ScriptVillagerBindingRequest, ScriptVillagerOrder,
-    ScriptVillagerOrderRequest, ScriptZoneProtection, ValidatedScriptPluginManifest,
+    ScriptStorageMutation, ScriptVillagerBindingRequest, ScriptVillagerGoal,
+    ScriptVillagerGoalRequest, ScriptZoneProtection, ValidatedScriptPluginManifest,
     script_boundary_pair,
 };
 
@@ -1688,7 +1687,7 @@ fn declare_disk_capability(
         "inventory_storage_transactions" => Ok(manifest.declare_inventory_storage_transactions()),
         "player_inventory" => Ok(manifest.declare_player_inventory()),
         "zones" => Ok(manifest.declare_zones()),
-        "colonies" => Ok(manifest.declare_colonies()),
+        "villagers" => Ok(manifest.declare_villagers()),
         "player_teleport" => Ok(manifest.declare_player_teleport()),
         "player_queries" => Ok(manifest.declare_player_queries()),
         _ => Err(format!("unknown plugin capability {capability:?}")),
@@ -2644,63 +2643,16 @@ fn install_solaris_api(
             )
         })?,
     )?;
-    let upsert_colony_invocation = Arc::clone(&invocation);
-    api.set(
-        "upsert_colony",
-        lua.create_function(
-            move |_,
-                  (request_id, colony_id, name, dimension, x, y, z): (
-                LuaString,
-                LuaString,
-                LuaString,
-                LuaString,
-                f64,
-                f64,
-                f64,
-            )| {
-                let request_id = bounded_script_id(request_id, "request_id")?;
-                let colony_id = bounded_script_id(colony_id, "colony_id")?;
-                let name =
-                    bounded_lua_string(name, "colony_name", crate::MAX_COLONY_NAME_BYTES, false)?;
-                let dimension = bounded_lua_string(
-                    dimension,
-                    "dimension",
-                    crate::MAX_SCRIPT_RESOURCE_ID_BYTES,
-                    false,
-                )?;
-                let home = ScriptPosition::try_new(x, y, z)
-                    .ok_or_else(|| lua_input_error("colony_home", "invalid"))?;
-                let record = ScriptColonyRecord::try_new(&colony_id, name, &dimension, home)
-                    .map_err(dto_error)?;
-                let request =
-                    ScriptColonyRecordRequest::try_new(request_id, record).map_err(dto_error)?;
-                push_command(
-                    &upsert_colony_invocation,
-                    ScriptCommand::UpsertColony { request },
-                )
-            },
-        )?,
-    )?;
     let bind_villager_invocation = Arc::clone(&invocation);
     api.set(
         "bind_nearest_villager",
         lua.create_function(
-            move |_,
-                  (request_id, colony_id, x, y, z, radius): (
-                LuaString,
-                LuaString,
-                f64,
-                f64,
-                f64,
-                f64,
-            )| {
+            move |_, (request_id, x, y, z, radius): (LuaString, f64, f64, f64, f64)| {
                 let request_id = bounded_script_id(request_id, "request_id")?;
-                let colony_id = bounded_script_id(colony_id, "colony_id")?;
                 let center = ScriptPosition::try_new(x, y, z)
                     .ok_or_else(|| lua_input_error("villager_center", "invalid"))?;
-                let request =
-                    ScriptVillagerBindingRequest::try_new(&request_id, &colony_id, center, radius)
-                        .map_err(dto_error)?;
+                let request = ScriptVillagerBindingRequest::try_new(request_id, center, radius)
+                    .map_err(dto_error)?;
                 push_command(
                     &bind_villager_invocation,
                     ScriptCommand::RequestVillagerBinding { request },
@@ -2708,35 +2660,49 @@ fn install_solaris_api(
             },
         )?,
     )?;
-    let set_villager_order_invocation = Arc::clone(&invocation);
+    let set_villager_idle_invocation = Arc::clone(&invocation);
     api.set(
-        "set_villager_order",
+        "set_villager_idle",
         lua.create_function(
-            move |_,
-                  (request_id, colony_id, binding_token, order): (
-                LuaString,
-                LuaString,
-                LuaString,
-                LuaString,
-            )| {
+            move |_, (request_id, binding_token): (LuaString, LuaString)| {
                 let request_id = bounded_script_id(request_id, "request_id")?;
-                let colony_id = bounded_script_id(colony_id, "colony_id")?;
                 let binding_token = bounded_script_id(binding_token, "binding_token")?;
-                let order = match order.as_bytes().as_ref() {
-                    b"home" => ScriptVillagerOrder::Home,
-                    b"hold" => ScriptVillagerOrder::Hold,
-                    _ => return Err(lua_input_error("order", "invalid")),
-                };
-                let request = ScriptVillagerOrderRequest::try_new(
+                let request = ScriptVillagerGoalRequest::try_new(
                     request_id,
-                    colony_id,
                     binding_token,
-                    order,
+                    ScriptVillagerGoal::idle(),
                 )
                 .map_err(dto_error)?;
                 push_command(
-                    &set_villager_order_invocation,
-                    ScriptCommand::SetVillagerOrder { request },
+                    &set_villager_idle_invocation,
+                    ScriptCommand::SetVillagerGoal { request },
+                )
+            },
+        )?,
+    )?;
+    let move_villager_invocation = Arc::clone(&invocation);
+    api.set(
+        "move_villager_to",
+        lua.create_function(
+            move |_,
+                  (request_id, binding_token, x, y, z, speed): (
+                LuaString,
+                LuaString,
+                f64,
+                f64,
+                f64,
+                f64,
+            )| {
+                let request_id = bounded_script_id(request_id, "request_id")?;
+                let binding_token = bounded_script_id(binding_token, "binding_token")?;
+                let target = ScriptPosition::try_new(x, y, z)
+                    .ok_or_else(|| lua_input_error("villager_target", "invalid"))?;
+                let goal = ScriptVillagerGoal::follow_position(target, speed).map_err(dto_error)?;
+                let request = ScriptVillagerGoalRequest::try_new(request_id, binding_token, goal)
+                    .map_err(dto_error)?;
+                push_command(
+                    &move_villager_invocation,
+                    ScriptCommand::SetVillagerGoal { request },
                 )
             },
         )?,
@@ -3402,22 +3368,12 @@ fn event_table(lua: &Lua, event: &ScriptEvent) -> mlua::Result<Table> {
             }
             table.set("players", snapshots)?;
         }
-        ScriptEventKind::ColonyRecordResult {
+        ScriptEventKind::VillagerBindingResult {
             request_id,
-            colony_id,
-            accepted,
-        } => {
-            table.set("request_id", request_id.as_str())?;
-            table.set("colony_id", colony_id.as_str())?;
-            table.set("accepted", *accepted)?;
-        }
-        ScriptEventKind::ColonyVillagerBindingResult {
-            request_id,
-            colony_id,
             binding,
+            failure,
         } => {
             table.set("request_id", request_id.as_str())?;
-            table.set("colony_id", colony_id.as_str())?;
             match binding {
                 Some(binding) => {
                     table.set("binding_token", binding.token())?;
@@ -3428,17 +3384,23 @@ fn event_table(lua: &Lua, event: &ScriptEvent) -> mlua::Result<Table> {
                     table.set("binding_expires_at_tick", mlua::Value::Nil)?;
                 }
             }
+            table.set("failure", failure.map(|failure| failure.as_str()))?;
         }
-        ScriptEventKind::ColonyVillagerOrderResult {
+        ScriptEventKind::VillagerGoalResult {
             request_id,
-            colony_id,
-            order,
-            accepted,
+            goal,
+            failure,
         } => {
             table.set("request_id", request_id.as_str())?;
-            table.set("colony_id", colony_id.as_str())?;
-            table.set("order", order.as_str())?;
-            table.set("accepted", *accepted)?;
+            table.set("goal", goal.kind())?;
+            table.set("accepted", failure.is_none())?;
+            table.set("failure", failure.map(|failure| failure.as_str()))?;
+            if let Some(target) = goal.target() {
+                table.set("x", target.x())?;
+                table.set("y", target.y())?;
+                table.set("z", target.z())?;
+            }
+            table.set("speed", goal.speed())?;
         }
         ScriptEventKind::LoaderInteraction {
             player_id,
@@ -3495,9 +3457,8 @@ fn handler_name(event: &ScriptEvent) -> &'static str {
         ScriptEventKind::ZoneCommandResult { .. } => "on_zone_command_result",
         ScriptEventKind::PlayerTeleportResult { .. } => "on_player_teleport_result",
         ScriptEventKind::OnlinePlayersResult { .. } => "on_player_online_result",
-        ScriptEventKind::ColonyRecordResult { .. } => "on_colony_record_result",
-        ScriptEventKind::ColonyVillagerBindingResult { .. } => "on_colony_villager_binding_result",
-        ScriptEventKind::ColonyVillagerOrderResult { .. } => "on_colony_villager_order_result",
+        ScriptEventKind::VillagerBindingResult { .. } => "on_villager_binding_result",
+        ScriptEventKind::VillagerGoalResult { .. } => "on_villager_goal_result",
         ScriptEventKind::LoaderInteraction { .. } => "on_loader_interaction",
     }
 }
@@ -4559,7 +4520,7 @@ mod tests {
                 .declare_inventory_menus()
                 .declare_inventory_storage_transactions()
                 .declare_zones()
-                .declare_colonies()
+                .declare_villagers()
                 .validate()
                 .unwrap();
         let cases = [
@@ -4674,29 +4635,24 @@ mod tests {
                 "zone_id:too_long",
             ),
             (
-                "upsert_colony.request_id",
-                "solaris.upsert_colony(string.rep('x', 65), 'starter', 'Starter', 'minecraft:overworld', 0, 64, 0)",
-                "request_id:too_long",
-            ),
-            (
-                "upsert_colony.id",
-                "solaris.upsert_colony('record', string.rep('x', 65), 'Starter', 'minecraft:overworld', 0, 64, 0)",
-                "colony_id:too_long",
-            ),
-            (
-                "upsert_colony.name",
-                "solaris.upsert_colony('record', 'starter', string.rep('x', 129), 'minecraft:overworld', 0, 64, 0)",
-                "colony_name:too_long",
-            ),
-            (
                 "bind_nearest_villager.request_id",
-                "solaris.bind_nearest_villager(string.rep('x', 65), 'starter', 0, 64, 0, 16)",
+                "solaris.bind_nearest_villager(string.rep('x', 65), 0, 64, 0, 16)",
                 "request_id:too_long",
             ),
             (
-                "bind_nearest_villager.colony_id",
-                "solaris.bind_nearest_villager('bind', string.rep('x', 65), 0, 64, 0, 16)",
-                "colony_id:too_long",
+                "set_villager_idle.request_id",
+                "solaris.set_villager_idle(string.rep('x', 65), 'binding-1')",
+                "request_id:too_long",
+            ),
+            (
+                "set_villager_idle.binding",
+                "solaris.set_villager_idle('idle', string.rep('x', 65))",
+                "binding_token:too_long",
+            ),
+            (
+                "move_villager_to.binding",
+                "solaris.move_villager_to('move', string.rep('x', 65), 0, 64, 0, 0.3)",
+                "binding_token:too_long",
             ),
         ];
         let controls = RuntimeControls::unrestricted();
@@ -5173,7 +5129,7 @@ mod tests {
         .declare_inventory_menus()
         .declare_inventory_storage_transactions()
         .declare_zones()
-        .declare_colonies()
+        .declare_villagers()
         .validate()
         .unwrap();
         let mut runtime = LuaScriptRuntime::from_source(
@@ -5193,8 +5149,8 @@ mod tests {
                     })
                     solaris.upsert_zone("shop", "minecraft:overworld", 0, 60, 0, 8, 80, 8)
                     solaris.remove_zone("shop")
-                    solaris.upsert_colony("record", "starter", "Starter", "minecraft:overworld", 0, 64, 0)
-                    solaris.bind_nearest_villager("bind", "starter", 0, 64, 0, 16)
+                    solaris.bind_nearest_villager("bind", 0, 64, 0, 16)
+                    solaris.set_villager_idle("idle", "binding-1")
                 end
             "#,
             LuaRuntimeLimits::default(),
@@ -5217,8 +5173,8 @@ mod tests {
                 ScriptCommand::InventoryStorageTransaction { .. },
                 ScriptCommand::UpsertZone { .. },
                 ScriptCommand::RemoveZone { .. },
-                ScriptCommand::UpsertColony { .. },
                 ScriptCommand::RequestVillagerBinding { .. },
+                ScriptCommand::SetVillagerGoal { .. },
             ]
         ));
 
@@ -5250,19 +5206,20 @@ mod tests {
     }
 
     #[test]
-    fn lua_villager_order_api_emits_only_valid_colony_commands() {
-        let manifest = ScriptPluginManifest::new("orders", "Orders", "0.1.0", SCRIPT_API_VERSION)
-            .subscribe_event("server.tick")
-            .declare_colonies()
-            .validate()
-            .unwrap();
+    fn lua_villager_goal_api_emits_only_engine_goal_commands() {
+        let manifest =
+            ScriptPluginManifest::new("settlement", "Settlement", "0.1.0", SCRIPT_API_VERSION)
+                .subscribe_event("server.tick")
+                .declare_villagers()
+                .validate()
+                .unwrap();
         let controls = RuntimeControls::unrestricted();
         let mut runtime = LuaScriptRuntime::from_source(
             manifest,
             r#"
                 function on_server_tick(_event)
-                    solaris.set_villager_order("home-1", "starter", "binding-1", "home")
-                    solaris.set_villager_order("hold-1", "starter", "binding-2", "hold")
+                    solaris.move_villager_to("move-1", "binding-1", 8.5, 64, -3.5, 0.3)
+                    solaris.set_villager_idle("idle-1", "binding-2")
                 end
             "#,
             LuaRuntimeLimits::default(),
@@ -5278,47 +5235,46 @@ mod tests {
         assert!(matches!(
             batch.commands(),
             [
-                ScriptCommand::SetVillagerOrder { request: home },
-                ScriptCommand::SetVillagerOrder { request: hold },
-            ] if home.order() == crate::ScriptVillagerOrder::Home
-                && hold.order() == crate::ScriptVillagerOrder::Hold
-                && home.binding_token() == "binding-1"
-                && hold.binding_token() == "binding-2"
+                ScriptCommand::SetVillagerGoal { request: moving },
+                ScriptCommand::SetVillagerGoal { request: idle },
+            ] if moving.goal().kind() == "follow_position"
+                && moving.goal().target() == ScriptPosition::try_new(8.5, 64.0, -3.5)
+                && moving.goal().speed() == Some(0.3)
+                && idle.goal().kind() == "idle"
+                && moving.binding_token() == "binding-1"
+                && idle.binding_token() == "binding-2"
         ));
     }
 
     #[test]
-    fn lua_villager_order_rejections_are_synchronous_and_emit_no_command() {
+    fn lua_villager_goal_rejections_are_synchronous_and_emit_no_command() {
         let controls = RuntimeControls::unrestricted();
         let cases = [
             (
                 true,
-                "solaris.set_villager_order('order', 'starter', 'binding-1', 'wander')",
+                "solaris.move_villager_to(string.rep('x', 65), 'binding-1', 0, 64, 0, 0.3)",
             ),
             (
                 true,
-                "solaris.set_villager_order(string.rep('x', 65), 'starter', 'binding-1', 'home')",
+                "solaris.move_villager_to('move', string.rep('x', 65), 0, 64, 0, 0.3)",
             ),
             (
                 true,
-                "solaris.set_villager_order('order', string.rep('x', 65), 'binding-1', 'home')",
+                "solaris.move_villager_to('move', 'binding-1', 0, 64, 0, 0)",
             ),
             (
                 true,
-                "solaris.set_villager_order('order', 'starter', string.rep('x', 65), 'home')",
+                "solaris.move_villager_to('move', 'binding-1', 0, 64, 0, 4.1)",
             ),
-            (
-                false,
-                "solaris.set_villager_order('order', 'starter', 'binding-1', 'hold')",
-            ),
+            (false, "solaris.set_villager_idle('idle', 'binding-1')"),
         ];
 
-        for (declare_colonies, call) in cases {
+        for (declare_villagers, call) in cases {
             let mut manifest =
-                ScriptPluginManifest::new("orders", "Orders", "0.1.0", SCRIPT_API_VERSION)
+                ScriptPluginManifest::new("settlement", "Settlement", "0.1.0", SCRIPT_API_VERSION)
                     .subscribe_event("server.tick");
-            if declare_colonies {
-                manifest = manifest.declare_colonies();
+            if declare_villagers {
+                manifest = manifest.declare_villagers();
             }
             let source = format!(
                 "function on_server_tick(_event) local accepted = pcall(function() {call} end); assert(not accepted) end"
@@ -5343,29 +5299,34 @@ mod tests {
     }
 
     #[test]
-    fn lua_villager_order_result_uses_targeted_callback_and_exact_fields() {
-        let manifest = ScriptPluginManifest::new("orders", "Orders", "0.1.0", SCRIPT_API_VERSION)
-            .subscribe_event("colony.villager_order_result")
-            .validate()
-            .unwrap();
+    fn lua_villager_goal_result_uses_targeted_callback_and_exact_fields() {
+        let manifest =
+            ScriptPluginManifest::new("settlement", "Settlement", "0.1.0", SCRIPT_API_VERSION)
+                .subscribe_event("villager.goal_result")
+                .validate()
+                .unwrap();
         let mut runtime = LuaScriptRuntime::from_source(
             manifest,
             r#"
-                function on_colony_villager_order_result(event)
-                    solaris.broadcast(event.request_id .. ":" .. event.colony_id .. ":" .. event.order .. ":" .. tostring(event.accepted))
+                function on_villager_goal_result(event)
+                    solaris.broadcast(event.request_id .. ":" .. event.goal .. ":" .. tostring(event.accepted) .. ":" .. tostring(event.failure))
                 end
             "#,
             LuaRuntimeLimits::default(),
         )
         .unwrap();
-        let request = crate::ScriptVillagerOrderRequest::try_new(
-            "order-1",
-            "starter",
+        let request = crate::ScriptVillagerGoalRequest::try_new(
+            "goal-1",
             "binding-1",
-            crate::ScriptVillagerOrder::Home,
+            crate::ScriptVillagerGoal::idle(),
         )
         .unwrap();
-        let event = ScriptEvent::colony_villager_order_result("orders", &request, false).unwrap();
+        let event = ScriptEvent::villager_goal_result(
+            "settlement",
+            &request,
+            Some(crate::ScriptVillagerGoalFailure::BindingUnavailable),
+        )
+        .unwrap();
         let controls = RuntimeControls::unrestricted();
         let batch = runtime
             .handle_event(
@@ -5376,7 +5337,7 @@ mod tests {
         assert_eq!(
             batch.commands(),
             &[ScriptCommand::BroadcastChatMessage {
-                message: "order-1:starter:home:false".to_owned(),
+                message: "goal-1:idle:false:binding_unavailable".to_owned(),
             }]
         );
     }

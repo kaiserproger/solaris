@@ -462,11 +462,12 @@ two priorities unless it becomes a common-play blocker or corruption risk.
 - Lua API 0.6 has bounded DTO/files/batches, optional bounded startup-only TOML
   configuration with fresh Lua copies, push-driven bounded simulation timers,
   one-shot host admission, an attested `mc-net` router, and durable plugin
-  storage. Production adapters now
-  cover menus, inventory/storage transactions, zones, same-dimension player
-  teleports, colony records, ephemeral villager binding, owner-scoped
-  `home`/`hold` orders through journaled regional goals, and required
-  post-commit `player.block_broken` and `player.block_placed` events.
+  storage. Production adapters now cover menus, inventory/storage transactions,
+  zones, same-dimension player teleports, opaque ephemeral villager bindings,
+  bounded `idle`/`follow_position` goals through journaled regional ownership,
+  and required post-commit `player.block_broken` and `player.block_placed`
+  events. Colony records, homes, roles, order vocabulary, limits, and durable
+  member intent are Luau/plugin-storage state rather than Rust runtime concepts.
   `player.item_crafted` now covers committed 2x2,
   3x3, and recipe-book crafts with aggregate max-craft counts and required
   queue admission. `player.item_picked_up` now reports exact authoritative
@@ -499,11 +500,14 @@ two priorities unless it becomes a common-play blocker or corruption risk.
   fields and rejected retries. Block DTOs expose player pose separately from
   integer block coordinates. The consolidated item-currency economy now has a
   production wire gate for zone activation, buy, insufficient-funds rejection,
-  unchanged ledger, and refund. The exact shipped colony scaffold has a
-  production wire gate for durable recruit, `home`, later accepted `hold`, and
-  removed-villager recovery. It retains the active binding token in Lua memory,
-  retries one rejected cached token through a fresh binding, and reports an
-  applied order only after the targeted owner result. The Lua API also has a
+  unchanged ledger, and refund. The exact shipped colony scaffold now reads its
+  complete bounded domain configuration, persists colony metadata plus member
+  role/order intent in plugin storage, maps `home` to a configured movement goal
+  and `hold` to idle, and has a production wire gate for durable recruit, later
+  order application, and removed-villager recovery. It retains the opaque token
+  only in Luau memory, retries one typed rejected/stale binding, and reports an
+  applied order only after the targeted regional-owner result. The Lua API also
+  has a
   capability-gated `list_online_players` query. It returns a
   targeted, sorted, bounded point-in-time identity/pose/dimension snapshot and
   marks truncation; closed session owners are excluded and no live handles are

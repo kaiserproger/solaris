@@ -100,11 +100,11 @@ pub const MAX_INVENTORY_RESOURCE_DELTA: i16 = 64;
 /// Maximum byte length of a server-rendered inventory menu title.
 pub const MAX_INVENTORY_MENU_TITLE_BYTES: usize = 128;
 
-/// Maximum byte length of a colony display name.
-pub const MAX_COLONY_NAME_BYTES: usize = 128;
-
 /// Maximum search radius for an ephemeral villager binding request.
 pub const MAX_VILLAGER_BINDING_RADIUS: f64 = 64.0;
+
+/// Maximum movement speed exposed through a bound-villager goal request.
+pub const MAX_VILLAGER_GOAL_SPEED: f64 = 4.0;
 
 /// Maximum absolute horizontal coordinate accepted from Lua.
 pub const SCRIPT_HORIZONTAL_COORDINATE_LIMIT: f64 = 30_000_000.0;
@@ -1125,89 +1125,17 @@ impl ScriptPlayerInventoryFailure {
     }
 }
 
-/// Server-owned colony record requested by a plugin.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct ScriptColonyRecord {
-    id: String,
-    name: String,
-    dimension: String,
-    home: ScriptPosition,
-}
-
-impl ScriptColonyRecord {
-    pub fn try_new(
-        id: impl AsRef<str>,
-        name: impl AsRef<str>,
-        dimension: impl AsRef<str>,
-        home: ScriptPosition,
-    ) -> Result<Self, ScriptDtoError> {
-        let name = name.as_ref();
-        validate_bounded_nonempty("colony name", name, MAX_COLONY_NAME_BYTES)?;
-        Ok(Self {
-            id: validate_script_id(id.as_ref())?,
-            name: name.to_owned(),
-            dimension: validate_contract_resource_id(dimension.as_ref())?,
-            home,
-        })
-    }
-
-    pub fn id(&self) -> &str {
-        &self.id
-    }
-
-    pub fn name(&self) -> &str {
-        &self.name
-    }
-
-    pub fn dimension(&self) -> &str {
-        &self.dimension
-    }
-
-    pub const fn home(&self) -> ScriptPosition {
-        self.home
-    }
-}
-
-/// Validated colony record request used to correlate its targeted result.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct ScriptColonyRecordRequest {
-    request_id: String,
-    record: ScriptColonyRecord,
-}
-
-impl ScriptColonyRecordRequest {
-    pub fn try_new(
-        request_id: impl AsRef<str>,
-        record: ScriptColonyRecord,
-    ) -> Result<Self, ScriptDtoError> {
-        Ok(Self {
-            request_id: validate_script_id(request_id.as_ref())?,
-            record,
-        })
-    }
-
-    pub fn request_id(&self) -> &str {
-        &self.request_id
-    }
-
-    pub fn record(&self) -> &ScriptColonyRecord {
-        &self.record
-    }
-}
-
-/// Bounded request for the server to bind one nearby villager to a colony.
+/// Bounded request for the server to bind one nearby villager.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ScriptVillagerBindingRequest {
-    id: String,
-    colony_id: String,
+    request_id: String,
     center: ScriptPosition,
     radius_bits: u64,
 }
 
 impl ScriptVillagerBindingRequest {
     pub fn try_new(
-        id: impl AsRef<str>,
-        colony_id: impl AsRef<str>,
+        request_id: impl AsRef<str>,
         center: ScriptPosition,
         radius: f64,
     ) -> Result<Self, ScriptDtoError> {
@@ -1215,19 +1143,14 @@ impl ScriptVillagerBindingRequest {
             return Err(ScriptDtoError::InvalidBounds);
         }
         Ok(Self {
-            id: validate_script_id(id.as_ref())?,
-            colony_id: validate_script_id(colony_id.as_ref())?,
+            request_id: validate_script_id(request_id.as_ref())?,
             center,
             radius_bits: radius.to_bits(),
         })
     }
 
-    pub fn id(&self) -> &str {
-        &self.id
-    }
-
-    pub fn colony_id(&self) -> &str {
-        &self.colony_id
+    pub fn request_id(&self) -> &str {
+        &self.request_id
     }
 
     pub const fn center(&self) -> ScriptPosition {
@@ -1263,44 +1186,87 @@ impl ScriptVillagerBinding {
     }
 }
 
-/// Closed set of server-owned orders a plugin may issue to a bound villager.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+/// Exact engine goal requested for an opaque bound villager.
+#[derive(Debug, Clone, PartialEq, Eq)]
 #[non_exhaustive]
-pub enum ScriptVillagerOrder {
-    Home,
-    Hold,
+pub enum ScriptVillagerGoal {
+    Idle,
+    FollowPosition {
+        target: ScriptPosition,
+        speed_bits: u64,
+    },
 }
 
-impl ScriptVillagerOrder {
-    pub const fn as_str(self) -> &'static str {
+impl ScriptVillagerGoal {
+    pub const fn idle() -> Self {
+        Self::Idle
+    }
+
+    pub fn follow_position(target: ScriptPosition, speed: f64) -> Result<Self, ScriptDtoError> {
+        if !speed.is_finite() || speed <= 0.0 || speed > MAX_VILLAGER_GOAL_SPEED {
+            return Err(ScriptDtoError::InvalidBounds);
+        }
+        Ok(Self::FollowPosition {
+            target,
+            speed_bits: speed.to_bits(),
+        })
+    }
+
+    pub const fn kind(&self) -> &'static str {
         match self {
-            Self::Home => "home",
-            Self::Hold => "hold",
+            Self::Idle => "idle",
+            Self::FollowPosition { .. } => "follow_position",
+        }
+    }
+
+    pub const fn target(&self) -> Option<ScriptPosition> {
+        match self {
+            Self::Idle => None,
+            Self::FollowPosition { target, .. } => Some(*target),
+        }
+    }
+
+    pub fn speed(&self) -> Option<f64> {
+        match self {
+            Self::Idle => None,
+            Self::FollowPosition { speed_bits, .. } => Some(f64::from_bits(*speed_bits)),
+        }
+    }
+
+    pub fn validate(&self) -> Result<(), ScriptDtoError> {
+        match self {
+            Self::Idle => Ok(()),
+            Self::FollowPosition { target, speed_bits } => {
+                let speed = f64::from_bits(*speed_bits);
+                ScriptPosition::try_new(target.x(), target.y(), target.z())
+                    .ok_or(ScriptDtoError::InvalidBounds)?;
+                if !speed.is_finite() || speed <= 0.0 || speed > MAX_VILLAGER_GOAL_SPEED {
+                    return Err(ScriptDtoError::InvalidBounds);
+                }
+                Ok(())
+            }
         }
     }
 }
 
-/// Bounded request to apply one order through a server-issued villager binding.
+/// Bounded request to apply one engine goal through a server-issued villager binding.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct ScriptVillagerOrderRequest {
+pub struct ScriptVillagerGoalRequest {
     request_id: String,
-    colony_id: String,
     binding_token: String,
-    order: ScriptVillagerOrder,
+    goal: ScriptVillagerGoal,
 }
 
-impl ScriptVillagerOrderRequest {
+impl ScriptVillagerGoalRequest {
     pub fn try_new(
         request_id: impl AsRef<str>,
-        colony_id: impl AsRef<str>,
         binding_token: impl AsRef<str>,
-        order: ScriptVillagerOrder,
+        goal: ScriptVillagerGoal,
     ) -> Result<Self, ScriptDtoError> {
         Ok(Self {
             request_id: validate_script_id(request_id.as_ref())?,
-            colony_id: validate_script_id(colony_id.as_ref())?,
             binding_token: validate_script_id(binding_token.as_ref())?,
-            order,
+            goal,
         })
     }
 
@@ -1308,16 +1274,44 @@ impl ScriptVillagerOrderRequest {
         &self.request_id
     }
 
-    pub fn colony_id(&self) -> &str {
-        &self.colony_id
-    }
-
     pub fn binding_token(&self) -> &str {
         &self.binding_token
     }
 
-    pub const fn order(&self) -> ScriptVillagerOrder {
-        self.order
+    pub const fn goal(&self) -> &ScriptVillagerGoal {
+        &self.goal
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum ScriptVillagerBindingFailure {
+    NotFound,
+    Busy,
+}
+
+impl ScriptVillagerBindingFailure {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::NotFound => "not_found",
+            Self::Busy => "busy",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum ScriptVillagerGoalFailure {
+    BindingUnavailable,
+    Busy,
+}
+
+impl ScriptVillagerGoalFailure {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::BindingUnavailable => "binding_unavailable",
+            Self::Busy => "busy",
+        }
     }
 }
 
@@ -1958,51 +1952,38 @@ impl ScriptEvent {
         })
     }
 
-    /// Build a targeted server-owned colony record completion event.
-    pub(crate) fn colony_record_result(
-        target_plugin_id: impl AsRef<str>,
-        request: &ScriptColonyRecordRequest,
-        accepted: bool,
-    ) -> Result<Self, ScriptDtoError> {
-        Ok(Self {
-            target_plugin_id: Some(validate_target_plugin_id(target_plugin_id.as_ref())?),
-            kind: ScriptEventKind::ColonyRecordResult {
-                request_id: request.request_id().to_owned(),
-                colony_id: request.record().id().to_owned(),
-                accepted,
-            },
-        })
-    }
-
     /// Build a targeted ephemeral villager-binding result without exposing an entity reference.
-    pub(crate) fn colony_villager_binding_result(
+    pub(crate) fn villager_binding_result(
         target_plugin_id: impl AsRef<str>,
         request: &ScriptVillagerBindingRequest,
         binding: Option<ScriptVillagerBinding>,
+        failure: Option<ScriptVillagerBindingFailure>,
     ) -> Result<Self, ScriptDtoError> {
+        if binding.is_some() == failure.is_some() {
+            return Err(ScriptDtoError::InvalidBounds);
+        }
         Ok(Self {
             target_plugin_id: Some(validate_target_plugin_id(target_plugin_id.as_ref())?),
-            kind: ScriptEventKind::ColonyVillagerBindingResult {
-                request_id: request.id().to_owned(),
-                colony_id: request.colony_id().to_owned(),
+            kind: ScriptEventKind::VillagerBindingResult {
+                request_id: request.request_id().to_owned(),
                 binding,
+                failure,
             },
         })
     }
 
-    /// Build a targeted result for one admitted villager order.
-    pub(crate) fn colony_villager_order_result(
+    /// Build a targeted result for one admitted bound-villager goal.
+    pub(crate) fn villager_goal_result(
         target_plugin_id: impl AsRef<str>,
-        request: &ScriptVillagerOrderRequest,
-        accepted: bool,
+        request: &ScriptVillagerGoalRequest,
+        failure: Option<ScriptVillagerGoalFailure>,
     ) -> Result<Self, ScriptDtoError> {
         Ok(Self {
             target_plugin_id: Some(validate_target_plugin_id(target_plugin_id.as_ref())?),
-            kind: ScriptEventKind::ColonyVillagerOrderResult {
+            kind: ScriptEventKind::VillagerGoalResult {
                 request_id: request.request_id().to_owned(),
-                colony_id: request.colony_id().to_owned(),
-                order: request.order(),
-                accepted,
+                goal: request.goal().clone(),
+                failure,
             },
         })
     }
@@ -2083,9 +2064,8 @@ impl ScriptEvent {
             ScriptEventKind::ZoneCommandResult { .. } => "zone.command_result",
             ScriptEventKind::PlayerTeleportResult { .. } => "player.teleport_result",
             ScriptEventKind::OnlinePlayersResult { .. } => "player.online_result",
-            ScriptEventKind::ColonyRecordResult { .. } => "colony.record_result",
-            ScriptEventKind::ColonyVillagerBindingResult { .. } => "colony.villager_binding_result",
-            ScriptEventKind::ColonyVillagerOrderResult { .. } => "colony.villager_order_result",
+            ScriptEventKind::VillagerBindingResult { .. } => "villager.binding_result",
+            ScriptEventKind::VillagerGoalResult { .. } => "villager.goal_result",
             ScriptEventKind::LoaderInteraction { .. } => "loader.interaction",
         }
     }
@@ -2317,23 +2297,25 @@ impl ScriptEvent {
                 }
                 Ok(())
             }
-            ScriptEventKind::ColonyRecordResult {
+            ScriptEventKind::VillagerBindingResult {
                 request_id,
-                colony_id,
-                ..
-            }
-            | ScriptEventKind::ColonyVillagerBindingResult {
-                request_id,
-                colony_id,
-                ..
-            }
-            | ScriptEventKind::ColonyVillagerOrderResult {
-                request_id,
-                colony_id,
-                ..
+                binding,
+                failure,
             } => {
                 validate_script_id(request_id)?;
-                validate_script_id(colony_id).map(drop)
+                if binding.is_some() == failure.is_some() {
+                    return Err(ScriptDtoError::InvalidBounds);
+                }
+                if let Some(binding) = binding {
+                    validate_script_id(binding.token())?;
+                }
+                Ok(())
+            }
+            ScriptEventKind::VillagerGoalResult {
+                request_id, goal, ..
+            } => {
+                validate_script_id(request_id)?;
+                goal.validate()
             }
             ScriptEventKind::LoaderInteraction {
                 interaction_id,
@@ -2509,21 +2491,15 @@ pub enum ScriptEventKind {
         players: Vec<ScriptOnlinePlayerSnapshot>,
         truncated: bool,
     },
-    ColonyRecordResult {
+    VillagerBindingResult {
         request_id: String,
-        colony_id: String,
-        accepted: bool,
-    },
-    ColonyVillagerBindingResult {
-        request_id: String,
-        colony_id: String,
         binding: Option<ScriptVillagerBinding>,
+        failure: Option<ScriptVillagerBindingFailure>,
     },
-    ColonyVillagerOrderResult {
+    VillagerGoalResult {
         request_id: String,
-        colony_id: String,
-        order: ScriptVillagerOrder,
-        accepted: bool,
+        goal: ScriptVillagerGoal,
+        failure: Option<ScriptVillagerGoalFailure>,
     },
     LoaderInteraction {
         player_id: ScriptPlayerId,
@@ -2605,14 +2581,11 @@ pub enum ScriptCommand {
     RemoveZone {
         zone_id: String,
     },
-    UpsertColony {
-        request: ScriptColonyRecordRequest,
-    },
     RequestVillagerBinding {
         request: ScriptVillagerBindingRequest,
     },
-    SetVillagerOrder {
-        request: ScriptVillagerOrderRequest,
+    SetVillagerGoal {
+        request: ScriptVillagerGoalRequest,
     },
     TeleportPlayer {
         request: ScriptPlayerTeleportRequest,
@@ -2942,37 +2915,29 @@ impl AdmittedScriptCommand {
         ScriptEvent::player_inventory_transaction_result(&self.plugin_id, transaction, failure)
     }
 
-    pub fn colony_record_result(self, accepted: bool) -> Result<ScriptEvent, ScriptDtoError> {
-        let ScriptCommand::UpsertColony { request } = self.request.as_ref() else {
-            return Err(ScriptDtoError::InconsistentResult {
-                field: "colony record admission",
-            });
-        };
-        ScriptEvent::colony_record_result(&self.plugin_id, request, accepted)
-    }
-
-    pub fn colony_villager_binding_result(
+    pub fn villager_binding_result(
         self,
         binding: Option<ScriptVillagerBinding>,
+        failure: Option<ScriptVillagerBindingFailure>,
     ) -> Result<ScriptEvent, ScriptDtoError> {
         let ScriptCommand::RequestVillagerBinding { request } = self.request.as_ref() else {
             return Err(ScriptDtoError::InconsistentResult {
                 field: "villager binding admission",
             });
         };
-        ScriptEvent::colony_villager_binding_result(&self.plugin_id, request, binding)
+        ScriptEvent::villager_binding_result(&self.plugin_id, request, binding, failure)
     }
 
-    pub fn colony_villager_order_result(
+    pub fn villager_goal_result(
         self,
-        accepted: bool,
+        failure: Option<ScriptVillagerGoalFailure>,
     ) -> Result<ScriptEvent, ScriptDtoError> {
-        let ScriptCommand::SetVillagerOrder { request } = self.request.as_ref() else {
+        let ScriptCommand::SetVillagerGoal { request } = self.request.as_ref() else {
             return Err(ScriptDtoError::InconsistentResult {
-                field: "villager order admission",
+                field: "villager goal admission",
             });
         };
-        ScriptEvent::colony_villager_order_result(&self.plugin_id, request, accepted)
+        ScriptEvent::villager_goal_result(&self.plugin_id, request, failure)
     }
 
     pub fn player_teleport_result(
@@ -3099,9 +3064,9 @@ impl ScriptCommand {
             Self::UpsertZone { .. } | Self::RemoveZone { .. } => {
                 Some(RequiredCommandCapability::Zones)
             }
-            Self::UpsertColony { .. }
-            | Self::RequestVillagerBinding { .. }
-            | Self::SetVillagerOrder { .. } => Some(RequiredCommandCapability::Colonies),
+            Self::RequestVillagerBinding { .. } | Self::SetVillagerGoal { .. } => {
+                Some(RequiredCommandCapability::Villagers)
+            }
             Self::TeleportPlayer { .. } => Some(RequiredCommandCapability::PlayerTeleport),
             Self::ListOnlinePlayers { .. } => Some(RequiredCommandCapability::PlayerQueries),
         }
@@ -3210,21 +3175,18 @@ impl ScriptCommand {
                 .map(drop)
             }
             Self::RemoveZone { zone_id } => validate_script_id(zone_id).map(drop),
-            Self::UpsertColony { request } => {
-                ScriptColonyRecordRequest::try_new(request.request_id(), request.record().clone())
-                    .map(drop)
-            }
-            Self::RequestVillagerBinding { request } => {
-                validate_script_id(request.id())?;
-                validate_script_id(request.colony_id())?;
-                Ok(())
-            }
-            Self::SetVillagerOrder { request } => ScriptVillagerOrderRequest::try_new(
+            Self::RequestVillagerBinding { request } => ScriptVillagerBindingRequest::try_new(
                 request.request_id(),
-                request.colony_id(),
-                request.binding_token(),
-                request.order(),
+                request.center(),
+                request.radius(),
             )
+            .map(drop),
+            Self::SetVillagerGoal { request } => ScriptVillagerGoalRequest::try_new(
+                request.request_id(),
+                request.binding_token(),
+                request.goal().clone(),
+            )
+            .and_then(|request| request.goal().validate())
             .map(drop),
             Self::TeleportPlayer { request } => ScriptPlayerTeleportRequest::try_new(
                 request.request_id(),
@@ -3917,7 +3879,7 @@ pub enum ScriptCommandCapability {
     InventoryStorageTransactions,
     PlayerInventory,
     Zones,
-    Colonies,
+    Villagers,
     PlayerTeleport,
     PlayerQueries,
 }
@@ -3933,7 +3895,7 @@ pub enum ScriptCommandCapabilityKind {
     InventoryStorageTransactions,
     PlayerInventory,
     Zones,
-    Colonies,
+    Villagers,
     PlayerTeleport,
     PlayerQueries,
 }
@@ -3948,7 +3910,7 @@ impl ScriptCommandCapabilityKind {
             Self::InventoryStorageTransactions => "inventory_storage_transactions",
             Self::PlayerInventory => "player_inventory",
             Self::Zones => "zones",
-            Self::Colonies => "colonies",
+            Self::Villagers => "villagers",
             Self::PlayerTeleport => "player_teleport",
             Self::PlayerQueries => "player_queries",
         }
@@ -3963,7 +3925,7 @@ impl ScriptCommandCapabilityKind {
             Self::InventoryStorageTransactions => "inventory storage transaction",
             Self::PlayerInventory => "player inventory transaction",
             Self::Zones => "zone",
-            Self::Colonies => "colony",
+            Self::Villagers => "villager",
             Self::PlayerTeleport => "player teleport",
             Self::PlayerQueries => "player query",
         }
@@ -3979,7 +3941,7 @@ enum RequiredCommandCapability<'a> {
     InventoryStorageTransactions,
     PlayerInventory,
     Zones,
-    Colonies,
+    Villagers,
     PlayerTeleport,
     PlayerQueries,
 }
@@ -3996,7 +3958,7 @@ impl RequiredCommandCapability<'_> {
             }
             Self::PlayerInventory => ScriptCommandCapabilityKind::PlayerInventory,
             Self::Zones => ScriptCommandCapabilityKind::Zones,
-            Self::Colonies => ScriptCommandCapabilityKind::Colonies,
+            Self::Villagers => ScriptCommandCapabilityKind::Villagers,
             Self::PlayerTeleport => ScriptCommandCapabilityKind::PlayerTeleport,
             Self::PlayerQueries => ScriptCommandCapabilityKind::PlayerQueries,
         }
@@ -4242,9 +4204,9 @@ impl ScriptPluginManifest {
         self
     }
 
-    /// Declare access to server-owned colony records and villager binding requests.
-    pub fn declare_colonies(mut self) -> Self {
-        self.push_capability(ScriptCommandCapability::Colonies);
+    /// Declare access to opaque villager bindings and bounded goal requests.
+    pub fn declare_villagers(mut self) -> Self {
+        self.push_capability(ScriptCommandCapability::Villagers);
         self
     }
 
@@ -4583,7 +4545,7 @@ impl ScriptPluginManifest {
                 | ScriptCommandCapability::InventoryStorageTransactions
                 | ScriptCommandCapability::PlayerInventory
                 | ScriptCommandCapability::Zones
-                | ScriptCommandCapability::Colonies
+                | ScriptCommandCapability::Villagers
                 | ScriptCommandCapability::PlayerTeleport
                 | ScriptCommandCapability::PlayerQueries => {
                     if normalized_capabilities.contains(capability) {
@@ -4732,8 +4694,8 @@ impl ValidatedScriptPluginManifest {
                 ScriptCommandCapability::Zones => {
                     capabilities = capabilities.allow_zones();
                 }
-                ScriptCommandCapability::Colonies => {
-                    capabilities = capabilities.allow_colonies();
+                ScriptCommandCapability::Villagers => {
+                    capabilities = capabilities.allow_villagers();
                 }
                 ScriptCommandCapability::PlayerTeleport => {
                     capabilities = capabilities.allow_player_teleport();
@@ -4887,7 +4849,7 @@ pub struct CommandCapabilities {
     inventory_storage_transactions: bool,
     player_inventory: bool,
     zones: bool,
-    colonies: bool,
+    villagers: bool,
     player_teleport: bool,
     player_queries: bool,
 }
@@ -4955,8 +4917,8 @@ impl CommandCapabilities {
     }
 
     #[cfg(any(test, feature = "lua-runtime"))]
-    pub(crate) fn allow_colonies(mut self) -> Self {
-        self.colonies = true;
+    pub(crate) fn allow_villagers(mut self) -> Self {
+        self.villagers = true;
         self
     }
 
@@ -4989,7 +4951,7 @@ impl CommandCapabilities {
             }
             RequiredCommandCapability::PlayerInventory => self.player_inventory,
             RequiredCommandCapability::Zones => self.zones,
-            RequiredCommandCapability::Colonies => self.colonies,
+            RequiredCommandCapability::Villagers => self.villagers,
             RequiredCommandCapability::PlayerTeleport => self.player_teleport,
             RequiredCommandCapability::PlayerQueries => self.player_queries,
         }
@@ -5130,9 +5092,8 @@ fn is_supported_event_name(event_name: &str) -> bool {
             | "player.zone_exited"
             | "zone.command_result"
             | "player.teleport_result"
-            | "colony.record_result"
-            | "colony.villager_binding_result"
-            | "colony.villager_order_result"
+            | "villager.binding_result"
+            | "villager.goal_result"
     )
 }
 
@@ -6038,8 +5999,8 @@ mod tests {
             "player.zone_exited",
             "zone.command_result",
             "player.teleport_result",
-            "colony.record_result",
-            "colony.villager_binding_result",
+            "villager.binding_result",
+            "villager.goal_result",
         ] {
             assert!(is_supported_event_name(event_name), "missing {event_name}");
         }
@@ -6891,7 +6852,6 @@ mod tests {
         assert!(matches!(
             ScriptVillagerBindingRequest::try_new(
                 "bind",
-                "colony",
                 ScriptPosition::try_new(0.0, 64.0, 0.0).unwrap(),
                 MAX_VILLAGER_BINDING_RADIUS + 1.0,
             ),
@@ -6957,17 +6917,24 @@ mod tests {
             ScriptEvent::plugin_storage_delete_result("owner", &delete, true, None),
             Err(ScriptDtoError::InconsistentResult { .. })
         ));
-        let colony_record = ScriptColonyRecord::try_new(
-            "colony",
-            "Colony",
-            "minecraft:overworld",
+        let binding_request = ScriptVillagerBindingRequest::try_new(
+            "bind",
             ScriptPosition::try_new(0.0, 64.0, 0.0).unwrap(),
+            16.0,
         )
         .unwrap();
-        let colony = ScriptColonyRecordRequest::try_new("record", colony_record).unwrap();
         assert!(matches!(
-            ScriptEvent::colony_record_result("invalid owner", &colony, false),
+            ScriptEvent::villager_binding_result(
+                "invalid owner",
+                &binding_request,
+                None,
+                Some(ScriptVillagerBindingFailure::NotFound),
+            ),
             Err(ScriptDtoError::InvalidId { .. })
+        ));
+        assert!(matches!(
+            ScriptEvent::villager_binding_result("owner", &binding_request, None, None),
+            Err(ScriptDtoError::InvalidBounds)
         ));
 
         let event =
@@ -6987,57 +6954,50 @@ mod tests {
     }
 
     #[test]
-    fn villager_order_requests_are_bounded_and_preserve_the_closed_order_set() {
-        let home = ScriptVillagerOrderRequest::try_new(
-            "order-home",
-            "starter",
+    fn villager_goal_requests_are_bounded_and_keep_domain_vocabulary_out_of_rust() {
+        let idle = ScriptVillagerGoalRequest::try_new(
+            "goal-idle",
             "binding-1",
-            ScriptVillagerOrder::Home,
+            ScriptVillagerGoal::idle(),
         )
         .unwrap();
-        assert_eq!(home.request_id(), "order-home");
-        assert_eq!(home.colony_id(), "starter");
-        assert_eq!(home.binding_token(), "binding-1");
-        assert_eq!(home.order(), ScriptVillagerOrder::Home);
-        assert_eq!(home.order().as_str(), "home");
-        assert_eq!(ScriptVillagerOrder::Hold.as_str(), "hold");
+        assert_eq!(idle.request_id(), "goal-idle");
+        assert_eq!(idle.binding_token(), "binding-1");
+        assert_eq!(idle.goal().kind(), "idle");
+        assert_eq!(idle.goal().target(), None);
+        assert_eq!(idle.goal().speed(), None);
 
+        let target = ScriptPosition::try_new(8.5, 64.0, -3.5).unwrap();
+        let moving = ScriptVillagerGoalRequest::try_new(
+            "goal-home",
+            "binding-2",
+            ScriptVillagerGoal::follow_position(target, 0.3).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(moving.goal().kind(), "follow_position");
+        assert_eq!(moving.goal().target(), Some(target));
+        assert_eq!(moving.goal().speed(), Some(0.3));
+
+        assert!(matches!(
+            ScriptVillagerGoal::follow_position(target, 0.0),
+            Err(ScriptDtoError::InvalidBounds)
+        ));
+        assert!(matches!(
+            ScriptVillagerGoal::follow_position(target, MAX_VILLAGER_GOAL_SPEED + 0.1),
+            Err(ScriptDtoError::InvalidBounds)
+        ));
         for rejected in [
-            ScriptVillagerOrderRequest::try_new(
-                "Order",
-                "starter",
-                "binding-1",
-                ScriptVillagerOrder::Hold,
-            ),
-            ScriptVillagerOrderRequest::try_new(
-                "order",
-                "Starter",
-                "binding-1",
-                ScriptVillagerOrder::Hold,
-            ),
-            ScriptVillagerOrderRequest::try_new(
-                "order",
-                "starter",
-                "Binding-1",
-                ScriptVillagerOrder::Hold,
-            ),
-            ScriptVillagerOrderRequest::try_new(
-                "x".repeat(MAX_SCRIPT_ID_BYTES + 1),
-                "starter",
-                "binding-1",
-                ScriptVillagerOrder::Hold,
-            ),
-            ScriptVillagerOrderRequest::try_new(
-                "order",
+            ScriptVillagerGoalRequest::try_new("Goal", "binding-1", ScriptVillagerGoal::idle()),
+            ScriptVillagerGoalRequest::try_new("goal", "Binding-1", ScriptVillagerGoal::idle()),
+            ScriptVillagerGoalRequest::try_new(
                 "x".repeat(MAX_SCRIPT_ID_BYTES + 1),
                 "binding-1",
-                ScriptVillagerOrder::Hold,
+                ScriptVillagerGoal::idle(),
             ),
-            ScriptVillagerOrderRequest::try_new(
-                "order",
-                "starter",
+            ScriptVillagerGoalRequest::try_new(
+                "goal",
                 "x".repeat(MAX_SCRIPT_ID_BYTES + 1),
-                ScriptVillagerOrder::Hold,
+                ScriptVillagerGoal::idle(),
             ),
         ] {
             assert!(matches!(
@@ -7274,24 +7234,21 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn admitted_villager_order_builds_one_targeted_result() {
+    async fn admitted_villager_goal_builds_one_targeted_result() {
         let (boundary, endpoint) = script_boundary_pair(nonzero(1), nonzero(1));
-        let manifest = ScriptPluginManifest::new("colony", "Colony", "0.1.0", SCRIPT_API_VERSION)
-            .declare_colonies()
-            .validate()
-            .unwrap();
+        let manifest =
+            ScriptPluginManifest::new("settlement", "Settlement", "0.1.0", SCRIPT_API_VERSION)
+                .declare_villagers()
+                .validate()
+                .unwrap();
         let admission = HostCommandAdmission::from_manifest(&manifest);
-        let request = ScriptVillagerOrderRequest::try_new(
-            "order-1",
-            "starter",
-            "binding-1",
-            ScriptVillagerOrder::Hold,
-        )
-        .unwrap();
-        let command = ScriptCommand::SetVillagerOrder { request };
+        let request =
+            ScriptVillagerGoalRequest::try_new("goal-1", "binding-1", ScriptVillagerGoal::idle())
+                .unwrap();
+        let command = ScriptCommand::SetVillagerGoal { request };
         assert_eq!(
             command.required_capability_kind(),
-            Some(ScriptCommandCapabilityKind::Colonies)
+            Some(ScriptCommandCapabilityKind::Villagers)
         );
         let mut batch = CommandBatch::new(nonzero(1));
         batch
@@ -7302,28 +7259,26 @@ mod tests {
         let raw = boundary.recv_command().await.unwrap();
         assert!(matches!(raw, ScriptCommand::HostAttached { .. }));
         let admitted = boundary.accept_host_command(raw).unwrap();
-        let result = admitted.colony_villager_order_result(true).unwrap();
-        assert_eq!(result.target_plugin_id(), Some("colony"));
-        assert_eq!(result.event_name(), "colony.villager_order_result");
+        let result = admitted.villager_goal_result(None).unwrap();
+        assert_eq!(result.target_plugin_id(), Some("settlement"));
+        assert_eq!(result.event_name(), "villager.goal_result");
         assert!(matches!(
             result.kind(),
-            ScriptEventKind::ColonyVillagerOrderResult {
+            ScriptEventKind::VillagerGoalResult {
                 request_id,
-                colony_id,
-                order: ScriptVillagerOrder::Hold,
-                accepted: true,
-            } if request_id == "order-1" && colony_id == "starter"
+                goal: ScriptVillagerGoal::Idle,
+                failure: None,
+            } if request_id == "goal-1"
         ));
     }
 
     #[test]
-    fn villager_order_requires_declared_colonies_capability() {
-        let command = ScriptCommand::SetVillagerOrder {
-            request: ScriptVillagerOrderRequest::try_new(
-                "order-1",
-                "starter",
+    fn villager_goal_requires_declared_villagers_capability() {
+        let command = ScriptCommand::SetVillagerGoal {
+            request: ScriptVillagerGoalRequest::try_new(
+                "goal-1",
                 "binding-1",
-                ScriptVillagerOrder::Home,
+                ScriptVillagerGoal::idle(),
             )
             .unwrap(),
         };
@@ -7331,7 +7286,7 @@ mod tests {
         assert_eq!(
             batch.try_push_authorized(command, &CommandCapabilities::default()),
             Err(CommandBatchError::PermissionDenied {
-                capability: ScriptCommandCapabilityKind::Colonies,
+                capability: ScriptCommandCapabilityKind::Villagers,
             })
         );
         assert!(batch.commands().is_empty());

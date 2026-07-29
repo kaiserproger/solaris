@@ -1032,23 +1032,31 @@ async fn shipped_colony_scaffold_recruits_and_applies_updated_order_over_wire() 
     .await;
 
     send_command(&mut client, "colony status").await;
-    wait_for_system_chat(&mut client, "No villager is recruited for this player.").await;
+    wait_for_system_chat(
+        &mut client,
+        "Starter Colony: no villager is recruited for this player.",
+    )
+    .await;
 
     send_command(&mut client, "colony recruit worker").await;
-    wait_for_system_chat(&mut client, "Villager recruitment recorded durably.").await;
+    wait_for_system_chat(
+        &mut client,
+        "Villager recruitment recorded durably by the Luau plugin.",
+    )
+    .await;
     send_command(&mut client, "colony status").await;
     wait_for_system_chat(
         &mut client,
-        "Recruited villager: role metadata=worker, stored order intent=home.",
+        "Starter Colony: status=active, role=worker, order=home, generation=2.",
     )
     .await;
 
     send_command(&mut client, "colony order hold").await;
-    wait_for_system_chat(&mut client, "Applied villager order hold.").await;
+    wait_for_system_chat(&mut client, "Applied Luau order hold.").await;
     send_command(&mut client, "colony status").await;
     wait_for_system_chat(
         &mut client,
-        "Recruited villager: role metadata=worker, stored order intent=hold.",
+        "Starter Colony: status=active, role=worker, order=hold, generation=3.",
     )
     .await;
 
@@ -1071,7 +1079,7 @@ async fn shipped_colony_scaffold_recruits_and_applies_updated_order_over_wire() 
     send_command(&mut client, "colony order home").await;
     wait_for_system_chat(
         &mut client,
-        "Stored order intent, but no villager was available to apply it.",
+        "Stored order intent, but binding failed: not_found.",
     )
     .await;
 
@@ -1519,7 +1527,7 @@ async fn wait_for_colony_startup(
                     .expect("decode colony startup chat");
                 match literal_text_component_text(&chat.content_nbt).as_str() {
                     "fixture-villager-ready" => fixture_ready = true,
-                    "Colony plugin ready." => colony_ready = true,
+                    "Starter Colony plugin ready." => colony_ready = true,
                     _ => {}
                 }
             }

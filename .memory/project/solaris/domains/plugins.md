@@ -11,7 +11,15 @@ Ownership:
 - Focused play/session endpoint modules own mutations requiring a connected
   player or authoritative simulation turn.
 - `examples/plugins/` are shipped consumers. Their real behavior is exercised
-  through `crates/mc-test-harness/tests/plugin_*.rs`.
+  through `crates/mc-test-harness/tests/plugin_*.rs`. The current audit is
+  `docs/EXAMPLE_PLUGIN_AUDIT.md`: economy, claims, and roster are complete only
+  for their stated bounded scopes; the colony example is a partial domain
+  plugin; geological mines and settlement remain declarative selectors needing
+  more open startup data schemas.
+- Rust owns mechanics and authority, not plugin vocabulary. Colony identity,
+  homes, roles, orders, limits, and persistence live in Luau. The `villagers`
+  capability exposes only an opaque expiring binding and bounded
+  `idle`/`follow_position` goals through the regional owner.
 
 Stable contract rules:
 

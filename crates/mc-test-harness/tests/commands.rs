@@ -1537,124 +1537,19 @@ async fn lua_zone_membership_events_reach_only_the_owner_from_normal_player_move
 }
 
 #[tokio::test]
-async fn lua_colony_upsert_reaches_the_owning_plugin_with_correlated_result() {
-    let plugins = tempfile::tempdir().expect("plugin tempdir");
-    let plugin = plugins.path().join("colony-owner");
-    std::fs::create_dir(&plugin).expect("create plugin directory");
-    std::fs::write(
-        plugin.join("plugin.toml"),
-        r#"
-            id = "colony-owner"
-            name = "Colony Owner"
-            version = "0.1.0"
-            api = "0.6.0"
-            events = ["player.joined"]
-            capabilities = ["colonies"]
-        "#,
-    )
-    .expect("write plugin manifest");
-    std::fs::write(
-        plugin.join("main.lua"),
-        r#"
-            local joined_player = nil
-
-            function on_player_joined(event: any)
-                joined_player = event.player_id
-                solaris.upsert_colony(
-                    "register-starter",
-                    "starter",
-                    "Starter Colony",
-                    "minecraft:alpha",
-                    3,
-                    -59,
-                    1
-                )
-            end
-
-            function on_colony_record_result(event: any)
-                solaris.send_message(
-                    joined_player,
-                    "colony-result:" .. event.request_id .. ":" .. event.colony_id .. ":" .. tostring(event.accepted)
-                )
-            end
-        "#,
-    )
-    .expect("write plugin source");
-    let (boundary, host) = mc_script::start_lua_host(mc_script::LuaHostConfig::new(plugins.path()))
-        .expect("start Lua host");
-    assert_eq!(host.loaded_plugins(), 1);
-
-    let shutdown = mc_net::ShutdownHandle::default();
-    let cfg = mc_net::ServerConfig {
-        bind_address: "127.0.0.1:0".parse().unwrap(),
-        motd: "Lua colony wire test".into(),
-        max_players: 1,
-        view_distance: 2,
-        data: Arc::new(mc_data::testing::stub()),
-        blocks: Arc::new(mc_world::BlockRegistry::from_report(&[]).unwrap()),
-        world: None,
-        tags: Arc::new(mc_data::tags::TagsData::default()),
-        recipes: Arc::new(Vec::new()),
-        loot: Arc::new(mc_data::loot::LootTables::default()),
-        block_light: None,
-        items: Arc::new(mc_data::items::ItemRegistry::default()),
-        item_facts: Arc::new(mc_data::item_components::ItemFactsTable::default()),
-        block_facts: Arc::new(mc_data::block_facts::BlockFactsTable::default()),
-        entity_types: Arc::new(mc_data::entity_types::solaris_required_entity_types()),
-        biome_spawns: Arc::new(mc_data::biomes::BiomeSpawnRules::default()),
-        chunk_pipeline: mc_net::ChunkPipelinePolicy::default(),
-        random_tick: mc_net::RandomTickPolicy::default(),
-        command_permissions: mc_net::CommandPermissionConfig::new(Vec::<String>::new(), false),
-        loader_manifest: None,
-        shutdown: shutdown.clone(),
-    };
-    let bound = mc_net::bind_with_scripts(cfg, boundary)
-        .await
-        .expect("bind scripted server");
-    let addr = bound.local_addr().expect("local_addr");
-    let server = tokio::spawn(async move { bound.serve().await });
-
-    let mut client = Client::connect(addr).await.expect("client connect");
-    let _ = client
-        .drive_login(addr, "ColonyPlayer")
-        .await
-        .expect("login");
-    client.drive_configuration().await.expect("configuration");
-    let _ = client.read_play_login().await.expect("play entry");
-    let _: ClientboundCommands = client.read_typed().await.expect("Commands");
-    let _: SynchronizePlayerPosition = client.read_typed().await.expect("SyncPlayerPos");
-    assert_eq!(
-        next_system_chat_text(&mut client).await,
-        "colony-result:register-starter:starter:true"
-    );
-
-    drop(client);
-    shutdown.request();
-    tokio::time::timeout(Duration::from_secs(5), server)
-        .await
-        .expect("server shutdown timeout")
-        .expect("server task")
-        .expect("server result");
-    tokio::task::spawn_blocking(move || host.join())
-        .await
-        .expect("Lua host join task")
-        .expect("Lua host thread");
-}
-
-#[tokio::test]
-async fn lua_villager_order_reaches_the_regional_owner_and_returns_targeted_result() {
+async fn lua_villager_goal_reaches_the_regional_owner_and_returns_targeted_result() {
     let plugins = tempfile::tempdir().expect("plugin tempdir");
     let plugin = plugins.path().join("colony-orders");
     std::fs::create_dir(&plugin).expect("create plugin directory");
     std::fs::write(
         plugin.join("plugin.toml"),
         r#"
-            id = "colony-orders"
-            name = "Colony Orders"
+            id = "villager-goals"
+            name = "Villager Goals"
             version = "0.1.0"
             api = "0.6.0"
-            events = ["player.joined"]
-            capabilities = ["colonies"]
+            events = ["player.joined", "server.tick"]
+            capabilities = ["villagers"]
             spawn_entities = ["minecraft:villager"]
         "#,
     )
@@ -1663,44 +1558,33 @@ async fn lua_villager_order_reaches_the_regional_owner_and_returns_targeted_resu
         plugin.join("main.lua"),
         r#"
             local joined_player = nil
+            local bind_on_tick = false
 
             function on_player_joined(event: any)
                 joined_player = event.player_id
-                solaris.upsert_colony(
-                    "register",
-                    "starter",
-                    "Starter Colony",
-                    "minecraft:overworld",
-                    8,
-                    -59,
-                    2
-                )
                 solaris.spawn_entity(event.player_id, "minecraft:villager", 1, -59, 1)
+                bind_on_tick = true
             end
 
-            function on_colony_record_result(event: any)
-                if event.request_id == "register" and event.accepted then
-                    solaris.bind_nearest_villager("bind", "starter", 0, -59, 0, 16)
+            function on_server_tick(_event: any)
+                if bind_on_tick then
+                    bind_on_tick = false
+                    solaris.bind_nearest_villager("bind", 0, -59, 0, 16)
                 end
             end
 
-            function on_colony_villager_binding_result(event: any)
+            function on_villager_binding_result(event: any)
                 if event.binding_token == nil then
-                    solaris.send_message(joined_player, "villager-binding:false")
+                    solaris.send_message(joined_player, "villager-binding:" .. tostring(event.failure))
                     return
                 end
-                solaris.set_villager_order(
-                    "home",
-                    "starter",
-                    event.binding_token,
-                    "home"
-                )
+                solaris.move_villager_to("move", event.binding_token, 8, -59, 2, 0.3)
             end
 
-            function on_colony_villager_order_result(event: any)
+            function on_villager_goal_result(event: any)
                 solaris.send_message(
                     joined_player,
-                    "villager-order:" .. event.request_id .. ":" .. event.order .. ":" .. tostring(event.accepted)
+                    "villager-goal:" .. event.request_id .. ":" .. event.goal .. ":" .. tostring(event.accepted)
                 )
             end
         "#,
@@ -1713,7 +1597,7 @@ async fn lua_villager_order_reaches_the_regional_owner_and_returns_targeted_resu
     let shutdown = mc_net::ShutdownHandle::default();
     let cfg = mc_net::ServerConfig {
         bind_address: "127.0.0.1:0".parse().unwrap(),
-        motd: "Lua villager order wire test".into(),
+        motd: "Lua villager goal wire test".into(),
         max_players: 1,
         view_distance: 2,
         data: Arc::new(mc_data::testing::stub()),
@@ -1742,7 +1626,7 @@ async fn lua_villager_order_reaches_the_regional_owner_and_returns_targeted_resu
 
     let mut client = Client::connect(addr).await.expect("client connect");
     let _ = client
-        .drive_login(addr, "ColonyOrder")
+        .drive_login(addr, "VillagerGoal")
         .await
         .expect("login");
     client.drive_configuration().await.expect("configuration");
@@ -1751,7 +1635,7 @@ async fn lua_villager_order_reaches_the_regional_owner_and_returns_targeted_resu
     let _: SynchronizePlayerPosition = client.read_typed().await.expect("SyncPlayerPos");
     assert_eq!(
         next_system_chat_text(&mut client).await,
-        "villager-order:home:home:true"
+        "villager-goal:move:follow_position:true"
     );
 
     drop(client);
