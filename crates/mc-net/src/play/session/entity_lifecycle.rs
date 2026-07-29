@@ -95,7 +95,14 @@ impl SessionRegistry {
     ) -> Vec<VisibilityDispatch> {
         self.synchronize_entity_lifecycle_epoch(current_tick);
         let mut inner = self.lock_session_entities("tick dying entities");
-        finish_dying_entities_locked(&mut inner, current_tick)
+        let mut dispatches = finish_dying_entities_locked(&mut inner, current_tick);
+        dispatches.extend(
+            super::zombie_villager::finish_due_zombie_villager_conversions_locked(
+                &mut inner,
+                current_tick,
+            ),
+        );
+        dispatches
     }
 }
 
@@ -306,6 +313,9 @@ pub(super) fn clear_removed_entity_tracking_locked(
     entity_id: EntityId,
 ) {
     inner.item_despawn_deadline_by_id.remove(&entity_id);
+    inner
+        .zombie_villager_conversion_deadline_by_id
+        .remove(&entity_id);
     if let Some(deadline) = inner.primed_tnt_deadline_by_id.remove(&entity_id) {
         let remove_bucket = inner
             .primed_tnt_deadlines

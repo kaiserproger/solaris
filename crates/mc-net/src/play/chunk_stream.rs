@@ -2183,6 +2183,27 @@ impl ChunkStreamState {
                             })
                             .collect()
                     });
+                let settlement_vacant_homes = self
+                    .world_read
+                    .as_ref()
+                    .and_then(|world_read| {
+                        world_read
+                            .snapshot_chunks(&[ChunkPos { x: cx, z: cz }])
+                            .chunk(ChunkPos { x: cx, z: cz })
+                    })
+                    .map_or_else(Vec::new, |chunk| chunk.settlement_vacant_homes());
+                for home in settlement_vacant_homes {
+                    let [x, y, z] = home.position;
+                    if !self
+                        .sessions
+                        .register_settlement_vacant_home(home.claim.clone(), Vec3::new(x, y, z))
+                    {
+                        warn!(
+                            claim = home.claim,
+                            cx, cz, "settlement vacant-home marker rejected"
+                        );
+                    }
+                }
                 if let Some(simulation) = self.simulation.as_ref() {
                     if !settlement_spawns.is_empty()
                         && let Err(error) =

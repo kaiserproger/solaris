@@ -1,24 +1,26 @@
+--!strict
+
 -- Shipped item-currency economy for Script API 0.6.
 --
 -- The catalog mutates currency, purchased items, and its ledger only after the
 -- server accepts one inventory/storage transaction.
 
-local config = solaris.config()
+local config: any = solaris.config()
 local shop_id = "economy"
 local menu_prefix = "economy"
 local max_active_players = 64
 local max_purchases_per_item = 999999
 local max_ledger_entries = 64
 
-local pending_reads = {}
-local pending_read_by_player = {}
-local pending_transactions = {}
-local ledgers = {}
-local active_menus = {}
-local deferred_notices = {}
-local last_batch = nil
+local pending_reads: any = {}
+local pending_read_by_player: any = {}
+local pending_transactions: any = {}
+local ledgers: any = {}
+local active_menus: any = {}
+local deferred_notices: any = {}
+local last_batch: any = nil
 
-local function table_size(values)
+local function table_size(values: any): number
     local count = 0
     for _ in pairs(values) do
         count = count + 1
@@ -27,23 +29,23 @@ local function table_size(values)
 end
 
 local function validate_config()
-    local function bounded_string(value, name, max_bytes)
+    local function bounded_string(value: any, name: string, max_bytes: number)
         assert(type(value) == "string" and #value > 0, name .. " must be a string")
         assert(#value <= max_bytes, name .. " is too long")
     end
 
-    local function resource_id(value, name)
+    local function resource_id(value: any, name: string)
         bounded_string(value, name, 128)
         assert(string.match(value, "^[a-z0-9_.-]+:[a-z0-9_./-]+$") ~= nil,
             name .. " must be a namespaced resource id")
     end
 
-    local function bounded_integer(value, name, minimum, maximum)
-        assert(math.type(value) == "integer", name .. " must be an integer")
+    local function bounded_integer(value: any, name: string, minimum: number, maximum: number)
+        assert(type(value) == "number" and value % 1 == 0, name .. " must be an integer")
         assert(value >= minimum and value <= maximum, name .. " is out of range")
     end
 
-    local function finite_number(value, name)
+    local function finite_number(value: any, name: string)
         assert(type(value) == "number" and value == value
             and value ~= math.huge and value ~= -math.huge, name .. " must be finite")
     end
@@ -94,11 +96,11 @@ end
 
 validate_config()
 
-local function ledger_key(uuid)
+local function ledger_key(uuid: string): string
     return "shop:" .. shop_id .. ":" .. uuid
 end
 
-local function copy_records(source)
+local function copy_records(source: any): any
     local records = {}
     for id, record in pairs(source) do
         records[id] = {
@@ -112,14 +114,14 @@ local function copy_records(source)
     return records
 end
 
-local function record_matches_item(record, item)
+local function record_matches_item(record: any, item: any): boolean
     return record.resource == item.resource
         and record.item_count == item.count
         and record.price == item.price
         and record.currency_resource == config.currency.resource
 end
 
-local function encode_records(records)
+local function encode_records(records: any): string
     local ids = {}
     for id in pairs(records) do
         ids[#ids + 1] = id
@@ -140,7 +142,7 @@ local function encode_records(records)
     return "v2|" .. table.concat(encoded, ";")
 end
 
-local function decode_records(value)
+local function decode_records(value: any): any
     if value == nil then
         return {}
     end
@@ -196,32 +198,32 @@ local function decode_records(value)
     return records
 end
 
-local function currency_name(amount)
+local function currency_name(amount: number): string
     if amount == 1 then
         return config.currency.singular
     end
     return config.currency.plural
 end
 
-local function menu_id_for(version)
+local function menu_id_for(version: any): string
     if version == nil then
         return menu_prefix .. "-new"
     end
     return menu_prefix .. "-v" .. tostring(version)
 end
 
-local function remember_notice(player_id, message)
+local function remember_notice(player_id: number, message: string)
     deferred_notices[player_id] = message
 end
 
-local function send_message(player_id, message)
+local function send_message(player_id: number, message: string)
     if last_batch == nil then
         last_batch = { kind = "message", player_id = player_id }
     end
     solaris.send_message(player_id, message)
 end
 
-local function queue_read(player_id, uuid, request_id, key)
+local function queue_read(player_id: number, uuid: string, request_id: string, key: string): boolean
     if pending_read_by_player[player_id] ~= nil then
         return false
     end
@@ -237,7 +239,7 @@ local function queue_read(player_id, uuid, request_id, key)
     return true
 end
 
-local function player_has_pending_transaction(player_id)
+local function player_has_pending_transaction(player_id: number): boolean
     for _, pending in pairs(pending_transactions) do
         if pending.player_id == player_id then
             return true
@@ -246,7 +248,7 @@ local function player_has_pending_transaction(player_id)
     return false
 end
 
-local function request_catalog(event, request_prefix)
+local function request_catalog(event: any, request_prefix: string)
     if active_menus[event.player_id] ~= nil
         or pending_read_by_player[event.player_id] ~= nil
         or player_has_pending_transaction(event.player_id)
@@ -273,7 +275,7 @@ local function request_catalog(event, request_prefix)
     )
 end
 
-local function open_catalog(player_id)
+local function open_catalog(player_id: number)
     local ledger = ledgers[player_id]
     if ledger == nil then
         return
@@ -309,7 +311,7 @@ local function open_catalog(player_id)
     )
 end
 
-local function clear_player(player_id)
+local function clear_player(player_id: number)
     local read_id = pending_read_by_player[player_id]
     if read_id ~= nil then
         pending_reads[read_id] = nil
@@ -325,7 +327,7 @@ local function clear_player(player_id)
     deferred_notices[player_id] = nil
 end
 
-function on_server_started(_event)
+function on_server_started(_event: any)
     last_batch = { kind = "zone_registration" }
     local zone = config.zone
     solaris.upsert_zone(
@@ -340,7 +342,7 @@ function on_server_started(_event)
     )
 end
 
-function on_player_command(event)
+function on_player_command(event: any)
     last_batch = nil
     if event.root ~= "economy" then
         return
@@ -353,7 +355,7 @@ function on_player_command(event)
     request_catalog(event, "command")
 end
 
-function on_player_zone_entered(event)
+function on_player_zone_entered(event: any)
     last_batch = nil
     if event.zone_id ~= config.zone.id then
         return
@@ -361,7 +363,7 @@ function on_player_zone_entered(event)
     request_catalog(event, "enter")
 end
 
-function on_player_zone_exited(event)
+function on_player_zone_exited(event: any)
     last_batch = nil
     if event.zone_id ~= config.zone.id then
         return
@@ -380,7 +382,7 @@ function on_player_zone_exited(event)
     end
 end
 
-function on_plugin_storage_get_result(event)
+function on_plugin_storage_get_result(event: any)
     last_batch = nil
     local pending = pending_reads[event.request_id]
     if pending == nil then
@@ -415,7 +417,7 @@ function on_plugin_storage_get_result(event)
     open_catalog(pending.player_id)
 end
 
-function on_inventory_menu_clicked(event)
+function on_inventory_menu_clicked(event: any)
     last_batch = nil
     local ledger = ledgers[event.player_id]
     if ledger == nil or active_menus[event.player_id] ~= event.menu_id then
@@ -526,7 +528,7 @@ function on_inventory_menu_clicked(event)
     )
 end
 
-function on_inventory_storage_transaction_result(event)
+function on_inventory_storage_transaction_result(event: any)
     last_batch = nil
     local pending = pending_transactions[event.request_id]
     if pending == nil then
@@ -557,12 +559,12 @@ function on_inventory_storage_transaction_result(event)
     )
 end
 
-function on_player_left(event)
+function on_player_left(event: any)
     last_batch = nil
     clear_player(event.player_id)
 end
 
-function on_command_batch_rejected(result)
+function on_command_batch_rejected(result: any)
     local batch = last_batch
     last_batch = nil
     if batch == nil then

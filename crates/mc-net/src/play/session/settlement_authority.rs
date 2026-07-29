@@ -57,6 +57,8 @@ fn settlement_candidate(
     entity.uuid = Some(settlement_uuid(&spawn.claim));
     entity.retained.spawn_tick = lifecycle_tick;
     entity.retained.villager = Some(spawn.villager);
+    entity.retained.villager_population =
+        Some(mc_entity::villager_population_26_1_2::VillagerPopulationState::adult());
     entity.retained.villager_brain = Some(spawn.villager_brain.clone());
     entity.retained.villager_merchant = spawn.villager_merchant.clone();
     apply_entity_facts(&mut entity);

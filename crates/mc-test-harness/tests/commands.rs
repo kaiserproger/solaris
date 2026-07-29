@@ -230,13 +230,13 @@ async fn lua_0_6_player_command_reaches_the_server_chat_adapter() {
     std::fs::write(
         plugin.join("main.lua"),
         r#"
-            joined_player_id = 0
+            local joined_player_id = 0
 
-            function on_player_joined(event)
+            function on_player_joined(event: any)
                 joined_player_id = event.player_id
             end
 
-            function on_player_command(event)
+            function on_player_command(event: any)
                 solaris.send_message(
                     event.player_id,
                     "joined:" .. joined_player_id .. ":" .. event.root .. ":" .. event.username .. ":" .. event.arguments
@@ -362,7 +362,7 @@ async fn lua_gameplay_events_follow_authoritative_commits() {
     std::fs::write(
         plugin.join("main.lua"),
         r#"
-            function on_player_block_broken(event)
+            function on_player_block_broken(event: any)
                 solaris.send_message(
                     event.player_id,
                     "block-broken:" .. event.block_id
@@ -375,7 +375,7 @@ async fn lua_gameplay_events_follow_authoritative_commits() {
                 )
             end
 
-            function on_player_block_placed(event)
+            function on_player_block_placed(event: any)
                 solaris.send_message(
                     event.player_id,
                     "block-placed:" .. event.block_id
@@ -388,7 +388,7 @@ async fn lua_gameplay_events_follow_authoritative_commits() {
                 )
             end
 
-            function on_player_item_crafted(event)
+            function on_player_item_crafted(event: any)
                 solaris.send_message(
                     event.player_id,
                     "item-crafted:" .. event.item_id
@@ -401,7 +401,7 @@ async fn lua_gameplay_events_follow_authoritative_commits() {
                 )
             end
 
-            function on_player_item_picked_up(event)
+            function on_player_item_picked_up(event: any)
                 solaris.send_message(
                     event.player_id,
                     "item-picked-up:" .. event.item_id
@@ -413,7 +413,7 @@ async fn lua_gameplay_events_follow_authoritative_commits() {
                 )
             end
 
-            function on_player_died(event)
+            function on_player_died(event: any)
                 solaris.send_message(
                     event.player_id,
                     "player-died:" .. event.game_mode
@@ -422,7 +422,7 @@ async fn lua_gameplay_events_follow_authoritative_commits() {
                 )
             end
 
-            function on_player_command(event)
+            function on_player_command(event: any)
                 solaris.send_message(event.player_id, "block-fence:" .. event.arguments)
             end
         "#,
@@ -1370,16 +1370,16 @@ async fn lua_zone_membership_events_reach_only_the_owner_from_normal_player_move
     std::fs::write(
         plugin.join("main.lua"),
         r#"
-            function on_player_joined(event)
+            function on_player_joined(event: any)
                 solaris.upsert_zone("market", "minecraft:alpha", 2, -60, 0, 4, -58, 2)
                 solaris.send_message(event.player_id, "zone-ready")
             end
 
-            function on_player_zone_entered(event)
+            function on_player_zone_entered(event: any)
                 solaris.send_message(event.player_id, "entered:" .. event.zone_id .. ":" .. event.username)
             end
 
-            function on_player_zone_exited(event)
+            function on_player_zone_exited(event: any)
                 if event.x ~= 5 or event.y ~= -59 or event.z ~= 1 then
                     solaris.send_message(event.player_id, "bad-exit-context")
                     return
@@ -1405,11 +1405,11 @@ async fn lua_zone_membership_events_reach_only_the_owner_from_normal_player_move
     std::fs::write(
         observer.join("main.lua"),
         r#"
-            function on_player_zone_entered(event)
+            function on_player_zone_entered(event: any)
                 solaris.send_message(event.player_id, "leaked-entry")
             end
 
-            function on_player_zone_exited(event)
+            function on_player_zone_exited(event: any)
                 solaris.send_message(event.player_id, "leaked-exit")
             end
         "#,
@@ -1558,7 +1558,7 @@ async fn lua_colony_upsert_reaches_the_owning_plugin_with_correlated_result() {
         r#"
             local joined_player = nil
 
-            function on_player_joined(event)
+            function on_player_joined(event: any)
                 joined_player = event.player_id
                 solaris.upsert_colony(
                     "register-starter",
@@ -1571,7 +1571,7 @@ async fn lua_colony_upsert_reaches_the_owning_plugin_with_correlated_result() {
                 )
             end
 
-            function on_colony_record_result(event)
+            function on_colony_record_result(event: any)
                 solaris.send_message(
                     joined_player,
                     "colony-result:" .. event.request_id .. ":" .. event.colony_id .. ":" .. tostring(event.accepted)
@@ -1664,7 +1664,7 @@ async fn lua_villager_order_reaches_the_regional_owner_and_returns_targeted_resu
         r#"
             local joined_player = nil
 
-            function on_player_joined(event)
+            function on_player_joined(event: any)
                 joined_player = event.player_id
                 solaris.upsert_colony(
                     "register",
@@ -1678,13 +1678,13 @@ async fn lua_villager_order_reaches_the_regional_owner_and_returns_targeted_resu
                 solaris.spawn_entity(event.player_id, "minecraft:villager", 1, -59, 1)
             end
 
-            function on_colony_record_result(event)
+            function on_colony_record_result(event: any)
                 if event.request_id == "register" and event.accepted then
                     solaris.bind_nearest_villager("bind", "starter", 0, -59, 0, 16)
                 end
             end
 
-            function on_colony_villager_binding_result(event)
+            function on_colony_villager_binding_result(event: any)
                 if event.binding_token == nil then
                     solaris.send_message(joined_player, "villager-binding:false")
                     return
@@ -1697,7 +1697,7 @@ async fn lua_villager_order_reaches_the_regional_owner_and_returns_targeted_resu
                 )
             end
 
-            function on_colony_villager_order_result(event)
+            function on_colony_villager_order_result(event: any)
                 solaris.send_message(
                     joined_player,
                     "villager-order:" .. event.request_id .. ":" .. event.order .. ":" .. tostring(event.accepted)
@@ -1787,14 +1787,14 @@ async fn lua_inventory_menu_opens_on_the_client_and_routes_click_to_its_owner() 
     std::fs::write(
         plugin.join("main.lua"),
         r#"
-            function on_player_joined(event)
+            function on_player_joined(event: any)
                 solaris.send_message(event.player_id, "menu-command-ready")
                 solaris.open_inventory_menu(event.player_id, "market", "Market", {
                     {slot = 0, resource = "minecraft:apple", count = 1}
                 })
             end
 
-            function on_inventory_menu_clicked(event)
+            function on_inventory_menu_clicked(event: any)
                 solaris.send_message(
                     event.player_id,
                     "clicked:" .. event.menu_id .. ":" .. event.slot .. ":" .. event.click
@@ -1820,11 +1820,11 @@ async fn lua_inventory_menu_opens_on_the_client_and_routes_click_to_its_owner() 
     std::fs::write(
         observer.join("main.lua"),
         r#"
-            function on_inventory_menu_clicked(event)
+            function on_inventory_menu_clicked(event: any)
                 solaris.send_message(event.player_id, "leaked-menu-click")
             end
 
-            function on_player_command(event)
+            function on_player_command(event: any)
                 solaris.send_message(event.player_id, "observer-fence")
             end
         "#,
@@ -2016,15 +2016,15 @@ async fn lua_inventory_storage_transaction_commits_and_rejects_stale_storage_ato
     std::fs::write(
         plugin.join("main.lua"),
         r#"
-            player_id = nil
-            currency_key = nil
+            local player_id: number = 0
+            local currency_key: string = ""
 
-            function on_player_joined(event)
+            function on_player_joined(event: any)
                 player_id = event.player_id
                 currency_key = "currency:" .. event.player_id
             end
 
-            function on_plugin_storage_cas_result(event)
+            function on_plugin_storage_cas_result(event: any)
                 if event.request_id == "seed" then
                     solaris.inventory_storage_transaction(
                         player_id,
@@ -2040,7 +2040,7 @@ async fn lua_inventory_storage_transaction_commits_and_rejects_stale_storage_ato
                 end
             end
 
-            function on_player_command(event)
+            function on_player_command(event: any)
                 if event.root == "purchase" then
                     player_id = event.player_id
                     currency_key = "currency:" .. event.player_id
@@ -2049,7 +2049,7 @@ async fn lua_inventory_storage_transaction_commits_and_rejects_stale_storage_ato
                 end
             end
 
-            function on_inventory_storage_transaction_result(event)
+            function on_inventory_storage_transaction_result(event: any)
                 solaris.send_message(
                     player_id,
                     "tx-result:" .. event.request_id .. ":" .. tostring(event.committed)
@@ -2089,11 +2089,11 @@ async fn lua_inventory_storage_transaction_commits_and_rejects_stale_storage_ato
     std::fs::write(
         observer.join("main.lua"),
         r#"
-            function on_inventory_storage_transaction_result(event)
+            function on_inventory_storage_transaction_result(event: any)
                 solaris.send_message(1, "leaked-result:" .. event.request_id)
             end
 
-            function on_player_command(event)
+            function on_player_command(event: any)
                 if event.root == "transaction-fence" then
                     solaris.send_message(event.player_id, "transaction-fence")
                 end
@@ -2326,7 +2326,7 @@ async fn lua_operator_command_is_hidden_from_non_operators_and_routes_for_operat
     std::fs::write(
         plugin.join("main.lua"),
         r#"
-            function on_player_command(event)
+            function on_player_command(event: any)
                 solaris.run_console("time set day")
                 solaris.send_message(event.player_id, "admin-day:" .. event.username)
             end

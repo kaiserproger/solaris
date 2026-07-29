@@ -118,6 +118,39 @@ fn effect_only_mutation_invalidates_full_snapshot_cas() {
 }
 
 #[test]
+fn type_change_requires_explicit_conversion_cas() {
+    let runtime = super::RegionalOwnerRuntime::from_store(super::RegionalEntityStore::new(), 1)
+        .expect("regional owner runtime");
+    let handle = runtime.handle();
+    let id = handle
+        .spawn(cow(Vec3::new(0.5, 64.0, 0.5)))
+        .expect("spawn conversion target");
+    let expected = handle.snapshot(id).unwrap().unwrap();
+    let mut converted = expected.clone();
+    converted.type_id = 119;
+    converted.type_name = "minecraft:villager".to_owned();
+
+    assert!(matches!(
+        handle.replace_snapshot_if_current(expected.clone(), converted.clone()),
+        Err(super::RegionOwnerLaneError::InvalidMutation)
+    ));
+    assert_eq!(handle.snapshot(id).unwrap(), Some(expected.clone()));
+    assert!(
+        handle
+            .convert_snapshot_if_current(expected.clone(), converted.clone())
+            .unwrap()
+    );
+    assert_eq!(handle.snapshot(id).unwrap(), Some(converted.clone()));
+    assert!(
+        !handle
+            .convert_snapshot_if_current(expected, converted)
+            .unwrap()
+    );
+
+    runtime.shutdown().expect("regional owner shutdown");
+}
+
+#[test]
 fn regional_owner_effect_rollback_restores_active_effect_checkpoint() {
     let lease = super::RegionLease {
         key: RegionKey::new(1, 0),
@@ -837,6 +870,53 @@ fn persistent_owner_lane_rollback_restores_removed_snapshot() {
             sequence: 1,
             lease,
             mutation: super::RegionOwnerMutation::RemoveEntity(entity),
+        }],
+    })
+    .expect("prepare")
+    .recv()
+    .expect("prepare completion")
+    .expect("prepared phase");
+    lane.commit(phase)
+        .expect("commit")
+        .recv()
+        .expect("commit completion")
+        .expect("committed phase");
+    lane.rollback(phase)
+        .expect("rollback")
+        .recv()
+        .expect("rollback completion")
+        .expect("rolled back phase");
+
+    let stores = lane.shutdown().expect("clean owner shutdown");
+    assert_eq!(stores[&lease.key].snapshot(entity), Some(expected));
+}
+
+#[test]
+fn persistent_owner_lane_conversion_rollback_restores_original_type() {
+    let lease = super::RegionLease {
+        key: RegionKey::new(0, 0),
+        epoch: RegionEpoch::INITIAL,
+        lane: 0,
+    };
+    let mut store = EntityStore::new();
+    let entity = store.spawn(cow(Vec3::new(0.5, 64.0, 0.5)));
+    let expected = store.snapshot(entity).expect("spawned snapshot");
+    let mut converted = expected.clone();
+    converted.type_id = 119;
+    converted.type_name = "minecraft:villager".to_owned();
+    let lane = super::RegionalOwnerLane::spawn(0, [(lease, store)]).expect("owner lane");
+    let phase = super::RegionPhase(1);
+    lane.prepare(super::RegionOwnerBatch {
+        phase,
+        sequence_watermark: 1,
+        mutations: vec![super::SequencedRegionMutation {
+            sequence: 1,
+            lease,
+            mutation: super::RegionOwnerMutation::ReplaceSnapshotIfCurrent {
+                expected: Box::new(expected.clone()),
+                next: Box::new(converted),
+                allow_type_change: true,
+            },
         }],
     })
     .expect("prepare")

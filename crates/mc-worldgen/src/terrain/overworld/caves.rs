@@ -19,7 +19,7 @@ pub(super) fn contains(router: OverworldRouter, x: i32, y: i32, z: i32, surface_
             })
 }
 
-fn raw(router: OverworldRouter, x: i32, y: i32, z: i32) -> bool {
+pub(super) fn raw(router: OverworldRouter, x: i32, y: i32, z: i32) -> bool {
     let x = f64::from(x);
     let y = f64::from(y);
     let z = f64::from(z);

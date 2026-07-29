@@ -154,6 +154,9 @@ struct GameplayDecisionState {
     villager_brain: Option<crate::villager_26_1_2::VillagerBrainState>,
     villager_gossip: Option<crate::villager_gossip_26_1_2::VillagerGossipState>,
     villager_merchant: Option<crate::villager_merchant_26_1_2::VillagerMerchantState>,
+    villager_population: Option<crate::villager_population_26_1_2::VillagerPopulationState>,
+    zombie_villager_conversion:
+        Option<crate::zombie_villager_26_1_2::ZombieVillagerConversionState>,
 }
 
 #[derive(Component)]
@@ -358,7 +361,11 @@ impl EntityRuntime {
     }
 
     pub(crate) fn restore_snapshot_in_place(&mut self, snapshot: EntitySnapshot) -> bool {
-        restore_snapshot_in_world(&mut self.world, snapshot)
+        restore_snapshot_in_world(&mut self.world, snapshot, false)
+    }
+
+    pub(crate) fn convert_snapshot_in_place(&mut self, snapshot: EntitySnapshot) -> bool {
+        restore_snapshot_in_world(&mut self.world, snapshot, true)
     }
 
     #[must_use]
@@ -1271,6 +1278,8 @@ fn insert_snapshot_into_world(world: &mut World, snapshot: EntitySnapshot) -> bo
         villager_brain,
         villager_gossip,
         villager_merchant,
+        villager_population,
+        zombie_villager_conversion,
     } = retained;
     let living_state = living_state_from_snapshot(health, lifecycle, retained_living);
     if living_state.validate().is_err() {
@@ -1322,6 +1331,8 @@ fn insert_snapshot_into_world(world: &mut World, snapshot: EntitySnapshot) -> bo
             villager_brain,
             villager_gossip,
             villager_merchant,
+            villager_population,
+            zombie_villager_conversion,
         },
         PersistentState,
         VisibilityState,
@@ -1365,7 +1376,11 @@ fn insert_snapshot_into_world(world: &mut World, snapshot: EntitySnapshot) -> bo
     true
 }
 
-fn restore_snapshot_in_world(world: &mut World, snapshot: EntitySnapshot) -> bool {
+fn restore_snapshot_in_world(
+    world: &mut World,
+    snapshot: EntitySnapshot,
+    allow_type_change: bool,
+) -> bool {
     let Some(&ecs_entity) = world.resource::<RuntimeEntityIndex>().0.get(&snapshot.id) else {
         return false;
     };
@@ -1378,7 +1393,7 @@ fn restore_snapshot_in_world(world: &mut World, snapshot: EntitySnapshot) -> boo
     let type_matches = current.get::<EntityTypeState>().is_some_and(|entity_type| {
         entity_type.protocol_id == snapshot.type_id && entity_type.name == snapshot.type_name
     });
-    if !identity_matches || !type_matches {
+    if !identity_matches || (!allow_type_change && !type_matches) {
         return false;
     }
 
@@ -1391,11 +1406,12 @@ fn restore_snapshot_in_world(world: &mut World, snapshot: EntitySnapshot) -> boo
         && snapshot
             .animal
             .is_some_and(|animal| animal.sheep_wool.is_some());
+    let is_projectile = snapshot.type_name == "minecraft:arrow";
     let EntitySnapshot {
         id,
         uuid: _,
-        type_id: _,
-        type_name: _,
+        type_id,
+        type_name,
         position,
         rotation,
         velocity,
@@ -1429,6 +1445,8 @@ fn restore_snapshot_in_world(world: &mut World, snapshot: EntitySnapshot) -> boo
         villager_brain,
         villager_gossip,
         villager_merchant,
+        villager_population,
+        zombie_villager_conversion,
     } = retained;
     let living_state = living_state_from_snapshot(health, lifecycle, retained_living);
     if living_state.validate().is_err() {
@@ -1447,6 +1465,10 @@ fn restore_snapshot_in_world(world: &mut World, snapshot: EntitySnapshot) -> boo
             return false;
         };
         entity.insert((
+            EntityTypeState {
+                protocol_id: type_id,
+                name: type_name,
+            },
             TransformState { position, rotation },
             MotionState {
                 velocity,
@@ -1474,12 +1496,15 @@ fn restore_snapshot_in_world(world: &mut World, snapshot: EntitySnapshot) -> boo
                 villager_brain,
                 villager_gossip,
                 villager_merchant,
+                villager_population,
+                zombie_villager_conversion,
             },
         ));
         replace_optional_component(&mut entity, active_effects);
         replace_optional_component(&mut entity, item_stack.map(ItemStackState));
         replace_optional_component(&mut entity, experience_value.map(ExperienceState));
         replace_optional_component(&mut entity, block_state.map(FallingBlockState));
+        replace_optional_component(&mut entity, is_projectile.then_some(ProjectileState));
         replace_optional_component(
             &mut entity,
             vehicle
@@ -1580,6 +1605,8 @@ fn snapshot_from_world(world: &World, id: EntityId) -> Option<EntitySnapshot> {
             villager_brain: gameplay.villager_brain.clone(),
             villager_gossip: gameplay.villager_gossip.clone(),
             villager_merchant: gameplay.villager_merchant.clone(),
+            villager_population: gameplay.villager_population.clone(),
+            zombie_villager_conversion: gameplay.zombie_villager_conversion,
         },
     })
 }
@@ -1645,6 +1672,8 @@ fn entity_view_from_world(world: &World, id: EntityId) -> Option<EntityView<'_>>
             villager_brain: gameplay.villager_brain.clone(),
             villager_gossip: gameplay.villager_gossip.clone(),
             villager_merchant: gameplay.villager_merchant.clone(),
+            villager_population: gameplay.villager_population.clone(),
+            zombie_villager_conversion: gameplay.zombie_villager_conversion,
         },
     })
 }

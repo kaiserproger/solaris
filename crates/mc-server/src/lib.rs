@@ -186,12 +186,39 @@ pub struct SimulationSection {
     pub spawn_monsters: bool,
 }
 
-/// Optional directory containing server-side Lua plugins.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum BundledPlugin {
+    BasicEconomy,
+    ColonyVillagerScaffold,
+    GeologicalMines,
+    LandClaims,
+    OnlineRoster,
+    SettlementPrototype,
+}
+
+impl BundledPlugin {
+    #[must_use]
+    pub const fn id(self) -> &'static str {
+        match self {
+            Self::BasicEconomy => "basic-economy",
+            Self::ColonyVillagerScaffold => "colony-villager-scaffold",
+            Self::GeologicalMines => "geological-mines",
+            Self::LandClaims => "land-claims",
+            Self::OnlineRoster => "online-roster",
+            Self::SettlementPrototype => "settlement-prototype",
+        }
+    }
+}
+
+/// Optional external and server-bundled Luau plugins.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct PluginSection {
     #[serde(default)]
     pub directory: Option<PathBuf>,
+    #[serde(default)]
+    pub bundled: Vec<BundledPlugin>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -593,7 +620,7 @@ mod tests {
         assert_eq!(cfg.network.port, 25565);
         assert_eq!(
             cfg.data.world_dir,
-            Some(std::path::PathBuf::from(".analysis/test-world-v10"))
+            Some(std::path::PathBuf::from(".analysis/test-world-v11"))
         );
         assert_eq!(
             cfg.data.vanilla_data_dir,
@@ -723,10 +750,15 @@ mod tests {
 
             [plugins]
             directory = "plugins"
+            bundled = ["basic-economy", "online-roster"]
         "#;
         let cfg: ServerConfig = toml::from_str(toml_src).expect("parse");
 
         assert_eq!(cfg.plugins.directory, Some(PathBuf::from("plugins")));
+        assert_eq!(
+            cfg.plugins.bundled,
+            [BundledPlugin::BasicEconomy, BundledPlugin::OnlineRoster]
+        );
     }
 
     #[test]

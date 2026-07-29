@@ -1213,6 +1213,14 @@ impl SessionRegistry {
         }
         inner.entity_lifecycle_tick = lifecycle_clock;
         inner.settlement_spawn_claims = settlement_claims;
+        let restored_snapshots = records
+            .iter()
+            .map(|record| record.snapshot.clone())
+            .collect::<Vec<_>>();
+        super::villager_population::rebuild_villager_population_indexes_locked(
+            &mut inner,
+            &restored_snapshots,
+        );
         if current_clock != lifecycle_clock {
             self.entity_lifecycle_tick
                 .store(lifecycle_clock, Ordering::Release);
@@ -1238,6 +1246,7 @@ impl SessionRegistry {
             }
             update_breeding_tick_tracking_locked(&mut inner, entity_id, entity.animal);
             schedule_entity_death_locked(&mut inner, &entity);
+            super::zombie_villager::schedule_zombie_villager_conversion_locked(&mut inner, &entity);
             schedule_primed_tnt_deadline_locked(
                 &mut inner,
                 entity_id,

@@ -8,6 +8,7 @@ use mc_world::chunk::ChunkGeometry;
 use super::{SEA_LEVEL, TellusWorldgenSettings, WorldgenMode};
 
 mod caves;
+mod drainage;
 mod landforms;
 
 const CAVE_SURFACE_CLEARANCE: i32 = 32;
@@ -50,6 +51,10 @@ impl OverworldRouter {
 
     pub(in crate::terrain) fn is_cave(self, x: i32, y: i32, z: i32, surface_y: i32) -> bool {
         caves::contains(self, x, y, z, surface_y)
+    }
+
+    pub(in crate::terrain) fn raw_cave(self, x: i32, y: i32, z: i32) -> bool {
+        caves::raw(self, x, y, z)
     }
 
     #[cfg(test)]

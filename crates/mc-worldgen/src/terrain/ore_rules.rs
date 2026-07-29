@@ -572,6 +572,10 @@ impl BiomeScope {
         Self::Only(biomes)
     }
 
+    pub(super) const fn is_any(&self) -> bool {
+        matches!(self, Self::Any)
+    }
+
     pub(super) fn matches(&self, biome: &Identifier) -> bool {
         match self {
             Self::Any => true,

@@ -145,8 +145,10 @@ stale `data.vanilla_data_dir` is a real persistence/data readiness blocker.
 
 Then connect a vanilla 26.1.2 PrismLauncher client to the configured address.
 
-Server-side Lua plugins are loaded from the configured `[plugins].directory`.
-See [`docs/PLUGINS.md`](docs/PLUGINS.md) for the package format and API.
+Server-side plugins run as sandboxed strict Luau. External packages are loaded
+from `[plugins].directory`; server-embedded examples are enabled explicitly with
+`[plugins].bundled`. See [`docs/PLUGINS.md`](docs/PLUGINS.md) for the package
+format, bundled ids, type-checking rules, and API.
 
 For agent-driven real-client checks, the reusable NeoForge client mod embeds a
 loopback MCP server with structured world observation and input controls. See

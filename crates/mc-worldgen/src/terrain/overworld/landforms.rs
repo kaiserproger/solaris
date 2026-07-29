@@ -1,6 +1,6 @@
 use crate::noise::fbm_2d;
 
-use super::{OverworldRouter, TerrainSample};
+use super::{OverworldRouter, TerrainSample, drainage};
 
 const CONTINENT_SCALE: f64 = 3_600.0;
 const CONTINENT_DETAIL_SCALE: f64 = 1_250.0;
@@ -15,8 +15,6 @@ const MOUNTAIN_SCALE_A: f64 = 2_200.0;
 const MOUNTAIN_SCALE_B: f64 = 1_550.0;
 const MOUNTAIN_DETAIL_LONG_SCALE: f64 = 520.0;
 const MOUNTAIN_DETAIL_CROSS_SCALE: f64 = 210.0;
-const RIVER_SCALE: f64 = 1_850.0;
-const RIVER_DETAIL_SCALE: f64 = 610.0;
 
 pub(super) fn sample(router: OverworldRouter, block_x: i32, block_z: i32) -> TerrainSample {
     let settings = router.settings();
@@ -135,27 +133,20 @@ pub(super) fn sample(router: OverworldRouter, block_x: i32, block_z: i32) -> Ter
     let mountain_relief = ridges * (mountain_height + mountain_detail * 36.0 * land_scale);
     let mut height = lerp(ocean_floor, rolling_land + mountain_relief, land);
 
-    // A warped zero contour forms continuous valleys. Mountain relief suppresses
-    // it before it can become a local sink.
-    let river_field = fbm_2d(
-        wx / (RIVER_SCALE * scale),
-        wz / (RIVER_SCALE * scale),
-        router.seed ^ 0x5249_5641,
-        3,
-        0.5,
-    ) + fbm_2d(
-        x / (RIVER_DETAIL_SCALE * scale),
-        z / (RIVER_DETAIL_SCALE * scale),
-        router.seed ^ 0x5249_5642,
-        2,
-        0.45,
-    ) * 0.11;
-    let river_distance = river_field.abs();
-    let river_channel = 1.0 - smootherstep(remap(river_distance, 0.020, 0.078));
+    // Coarse drainage cells choose one acyclic downhill branch, accumulate local
+    // upstream runoff, and expose the distance to the resulting segment network.
+    // Keep carving alive through the coast band so channels meet the ocean rather
+    // than disappearing at the old inland mask boundary.
+    let drainage = if continentalness > -0.48 && ridges < 0.18 {
+        drainage::sample(router.seed, block_x, block_z, scale)
+    } else {
+        drainage::DrainageSample::default()
+    };
     let low_relief = 1.0 - smootherstep(remap(ridges, 0.025, 0.16));
-    let inland = smootherstep(remap(continentalness, -0.02, 0.18));
-    let river_weight = river_channel * inland * low_relief;
-    let river_floor = sea - 3.0 + detail.abs() * 0.55;
+    let coast_connection = 1.0 - smootherstep(remap(-continentalness, 0.18, 0.48));
+    let river_weight = drainage.channel_weight * coast_connection * low_relief;
+    let channel_depth = (2.4 + drainage.accumulation * 0.12).clamp(2.4, 4.4);
+    let river_floor = sea - channel_depth + detail.abs() * 0.45;
     height = lerp(height, river_floor, river_weight);
 
     let temperature = temperature(router, x, height, z);
@@ -171,9 +162,9 @@ pub(super) fn sample(router: OverworldRouter, block_x: i32, block_z: i32) -> Ter
         surface_y: router.clamp_height(height),
         continentalness,
         ridges,
-        // Biome routing sees a river only after the valley is substantially
-        // carved; shallow shoulders remain their surrounding land biome.
-        river: river_distance.max((1.0 - river_weight) * 0.16),
+        // Biome routing sees a river only after the accumulated channel is
+        // substantially carved; shallow shoulders remain surrounding land.
+        river: drainage.river_distance.max((1.0 - river_weight) * 0.10),
         temperature,
         moisture,
     }

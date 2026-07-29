@@ -288,6 +288,11 @@ pub(in crate::play) fn server_entity_snapshot_from(entity: EntitySnapshot) -> Se
         block_state: entity.block_state,
         animal: entity.animal,
         villager: entity.retained.villager,
+        villager_baby: entity
+            .retained
+            .villager_population
+            .as_ref()
+            .is_some_and(|population| population.age_ticks < 0),
     }
 }
 

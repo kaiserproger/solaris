@@ -137,7 +137,7 @@ async fn lua_handler_receives_exact_payload() {
                 assert(event.z == -2.25)
                 assert(event.dimension == "minecraft:overworld")
                 assert(event.item_id == "minecraft:arrow")
-                assert(math.type(event.count) == "integer" and event.count == 12)
+                assert(type(event.count) == "number" and event.count % 1 == 0 and event.count == 12)
                 assert(event.source == "arrow")
                 assert(event.game_mode == "adventure")
                 solaris.send_message(event.player_id, "item-picked-up")

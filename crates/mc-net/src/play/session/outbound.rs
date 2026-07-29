@@ -52,6 +52,7 @@ pub(in crate::play) struct ServerEntitySnapshot {
     pub(in crate::play) block_state: Option<u32>,
     pub(in crate::play) animal: Option<mc_entity::AnimalBreedingState>,
     pub(in crate::play) villager: Option<mc_entity::VillagerData>,
+    pub(in crate::play) villager_baby: bool,
 }
 
 #[derive(Debug, Clone, Copy)]

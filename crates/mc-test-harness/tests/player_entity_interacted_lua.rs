@@ -33,12 +33,14 @@ async fn accepted_entity_interactions_reach_lua_with_exact_authoritative_snapsho
     std::fs::write(
         plugin.join("main.lua"),
         r#"
-            local spawn_count = 0
-            local accepted_x = nil
-            local accepted_y = nil
-            local accepted_z = nil
+            --!strict
 
-            function on_player_entity_interacted(event)
+            local spawn_count = 0
+            local accepted_x: number? = nil
+            local accepted_y: number? = nil
+            local accepted_z: number? = nil
+
+            function on_player_entity_interacted(event: any)
                 local expected = {
                     name = true, player_id = true, context_verified = true,
                     uuid = true, username = true, operator = true,
@@ -72,7 +74,7 @@ async fn accepted_entity_interactions_reach_lua_with_exact_authoritative_snapsho
                 ))
             end
 
-            function on_player_command(event)
+            function on_player_command(event: any)
                 if event.root == "spawn-interaction-target" then
                     spawn_count = spawn_count + 1
                     if spawn_count == 1 then

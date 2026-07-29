@@ -113,7 +113,9 @@ mod villager_brain_tests;
 mod villager_merchant_authority;
 #[cfg(test)]
 mod villager_merchant_tests;
+mod villager_population;
 mod visibility;
+mod zombie_villager;
 
 pub(super) fn prewarm_canonical_pathing_state_facts() -> usize {
     pathing::prewarm_canonical_pathing_state_facts()
@@ -393,12 +395,18 @@ struct SessionRegistryInner {
     arrow_tick_scratch: projectiles::ArrowTickScratch,
     spawned_entity_chunks: HashSet<(i32, i32)>,
     settlement_spawn_claims: BTreeSet<String>,
+    settlement_vacant_homes: BTreeMap<String, Vec3>,
+    settlement_claimed_homes: BTreeSet<String>,
+    villager_birth_deadlines: BTreeMap<u64, VecDeque<[EntityId; 2]>>,
+    villager_birth_deadline_by_parent: HashMap<EntityId, u64>,
     pending_hostile_spawns: BTreeMap<(i32, i32), Vec<HerdSpawn>>,
     item_pickup_ready: BTreeMap<u64, Vec<EntityId>>,
     item_despawn_deadlines: BTreeMap<u64, VecDeque<EntityId>>,
     item_despawn_deadline_by_id: HashMap<EntityId, u64>,
     dying_entity_deadlines: BTreeMap<u64, VecDeque<EntityId>>,
     dying_entity_deadline_by_id: HashMap<EntityId, u64>,
+    zombie_villager_conversion_deadlines: BTreeMap<u64, VecDeque<EntityId>>,
+    zombie_villager_conversion_deadline_by_id: HashMap<EntityId, u64>,
     primed_tnt_deadlines: BTreeMap<u64, BTreeSet<EntityId>>,
     primed_tnt_deadline_by_id: HashMap<EntityId, u64>,
     last_primed_tnt_claim_tick: Option<u64>,

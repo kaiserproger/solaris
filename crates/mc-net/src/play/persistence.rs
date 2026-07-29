@@ -1848,7 +1848,7 @@ pub(crate) fn load_persisted_entities(
             &mut snapshot.velocity,
         )?;
         validate_entity_numeric_state(&path, &snapshot)?;
-        validate_entity_temporal_state(&path, lifecycle_tick, &snapshot)?;
+        validate_entity_temporal_state(&path, items, lifecycle_tick, &snapshot)?;
         if !entity_uuids.insert(snapshot.uuid) {
             return Err(PlayerPersistenceError::DuplicateEntityUuid {
                 path,
@@ -1884,10 +1884,13 @@ pub(crate) fn load_persisted_entities(
 
 fn validate_entity_temporal_state(
     path: &Path,
+    items: &ItemRegistry,
     lifecycle_tick: u64,
     snapshot: &EntitySnapshot,
 ) -> Result<(), PlayerPersistenceError> {
-    if !entity_temporal_state_is_valid(lifecycle_tick, snapshot) {
+    if !entity_temporal_state_is_valid(lifecycle_tick, snapshot)
+        || !villager_population_item_state_is_valid(items, snapshot)
+    {
         return Err(PlayerPersistenceError::InvalidValue {
             path: path.to_path_buf(),
             field: ENTITY_RETAINED_STATE_FIELD,
@@ -1918,6 +1921,143 @@ fn entity_temporal_state_is_valid(lifecycle_tick: u64, snapshot: &EntitySnapshot
             .is_some_and(|remaining| {
                 remaining == 0 || remaining > super::session::SHEEP_GRAZING_ANIMATION_TICKS
             })
+        && zombie_villager_conversion_state_is_valid(snapshot)
+        && villager_population_temporal_state_is_valid(lifecycle_tick, snapshot)
+}
+
+fn zombie_villager_conversion_state_is_valid(snapshot: &EntitySnapshot) -> bool {
+    let Some(conversion) = snapshot.retained.zombie_villager_conversion else {
+        return true;
+    };
+    if snapshot.lifecycle != EntityLifecycle::Alive
+        || snapshot.type_name != "minecraft:zombie_villager"
+        || conversion.completes_tick > i64::MAX as u64
+        || conversion.completes_tick < snapshot.retained.spawn_tick
+    {
+        return false;
+    }
+    let Some(active_effects) = snapshot.retained.active_effects.as_ref() else {
+        return false;
+    };
+    let strength = mc_entity::zombie_villager_26_1_2::STRENGTH_EFFECT_ID;
+    let weakness = mc_entity::zombie_villager_26_1_2::WEAKNESS_EFFECT_ID;
+    let has_strength = active_effects
+        .effects
+        .chains
+        .iter()
+        .any(|chain| chain.current.id == strength && chain.current.has_remaining_duration());
+    let has_weakness = active_effects
+        .effects
+        .chains
+        .iter()
+        .any(|chain| chain.current.id == weakness)
+        || active_effects.action_order.contains(&weakness);
+    let action_order_has_strength = active_effects.action_order.contains(&strength);
+    has_strength && action_order_has_strength && !has_weakness
+}
+
+fn villager_population_temporal_state_is_valid(
+    lifecycle_tick: u64,
+    snapshot: &EntitySnapshot,
+) -> bool {
+    let Some(population) = snapshot.retained.villager_population.as_ref() else {
+        return true;
+    };
+    let Some(brain) = snapshot.retained.villager_brain.as_ref() else {
+        return false;
+    };
+    let inventory_shape_valid = population.inventory.slots().iter().all(|slot| {
+        slot.as_ref()
+            .is_none_or(|stack| (1..=64).contains(&stack.count))
+    });
+    if snapshot.lifecycle != EntityLifecycle::Alive
+        || snapshot.type_name != "minecraft:villager"
+        || snapshot.retained.villager.is_none()
+        || !(-24_000..=6_000).contains(&population.age_ticks)
+        || population.food_level > 15
+        || !inventory_shape_valid
+        || population
+            .claimed_home
+            .as_ref()
+            .is_some_and(String::is_empty)
+        || (population.age_ticks < 0 && population.claimed_home.is_none())
+    {
+        return false;
+    }
+    let schedule_matches_age = if population.age_ticks < 0 {
+        brain.schedule == mc_entity::villager_26_1_2::VillagerScheduleKind::Baby
+    } else {
+        brain.schedule == mc_entity::villager_26_1_2::VillagerScheduleKind::Adult
+    };
+    if !schedule_matches_age {
+        return false;
+    }
+    let Some(pending) = population.pending_birth.as_ref() else {
+        return true;
+    };
+    let Some(duration) = pending.ready_tick.checked_sub(pending.started_tick) else {
+        return false;
+    };
+    population.age_ticks == 0
+        && pending.partner_uuid != snapshot.uuid
+        && pending.started_tick <= lifecycle_tick
+        && (u64::from(mc_entity::villager_population_26_1_2::VILLAGER_BIRTH_DELAY_MIN_TICKS)
+            ..=u64::from(
+                mc_entity::villager_population_26_1_2::VILLAGER_BIRTH_DELAY_MIN_TICKS
+                    + mc_entity::villager_population_26_1_2::VILLAGER_BIRTH_DELAY_RANDOM_BOUND
+                    - 1,
+            ))
+            .contains(&duration)
+}
+
+fn villager_population_item_state_is_valid(
+    items: &ItemRegistry,
+    snapshot: &EntitySnapshot,
+) -> bool {
+    let Some(population) = snapshot.retained.villager_population.as_ref() else {
+        return true;
+    };
+    if population.inventory.slots().iter().any(|slot| {
+        slot.as_ref()
+            .is_some_and(|stack| items.name_of(stack.item_id).is_none())
+    }) {
+        return false;
+    }
+    let Some(pending) = population.pending_birth.as_ref() else {
+        return true;
+    };
+    let Some(food_items) = villager_food_item_ids(items) else {
+        return false;
+    };
+    pending.partner_uuid != snapshot.uuid
+        && population.total_food_points(food_items)
+            >= mc_entity::villager_population_26_1_2::VILLAGER_BREEDING_WILLINGNESS_POINTS
+}
+
+#[cfg(test)]
+fn villager_population_state_is_valid(
+    items: &ItemRegistry,
+    lifecycle_tick: u64,
+    snapshot: &EntitySnapshot,
+) -> bool {
+    villager_population_temporal_state_is_valid(lifecycle_tick, snapshot)
+        && villager_population_item_state_is_valid(items, snapshot)
+}
+
+fn villager_food_item_ids(
+    items: &ItemRegistry,
+) -> Option<mc_entity::villager_population_26_1_2::VillagerFoodItemIds> {
+    let item_id = |name: &str| {
+        mc_data::Identifier::parse(name)
+            .ok()
+            .and_then(|id| items.id_of(&id))
+    };
+    Some(mc_entity::villager_population_26_1_2::VillagerFoodItemIds {
+        bread: item_id("minecraft:bread")?,
+        potato: item_id("minecraft:potato")?,
+        carrot: item_id("minecraft:carrot")?,
+        beetroot: item_id("minecraft:beetroot")?,
+    })
 }
 
 fn persisted_entity_type_is_aquatic(type_name: &str) -> bool {
@@ -1999,7 +2139,12 @@ pub(crate) fn save_persisted_entity_records(
     let mut elements = Vec::new();
     for record in &checkpoint.records {
         validate_entity_numeric_state(&path, &record.snapshot)?;
-        validate_entity_temporal_state(&path, checkpoint.lifecycle_clock, &record.snapshot)?;
+        validate_entity_temporal_state(
+            &path,
+            items,
+            checkpoint.lifecycle_clock,
+            &record.snapshot,
+        )?;
         elements.push(entity_tag(&path, items, record)?);
     }
     let root = Tag::Compound(vec![
@@ -2896,12 +3041,120 @@ mod tests {
                 id: mc_data::Identifier::parse("minecraft:iron_pickaxe").unwrap(),
                 protocol_id: 2,
             },
+            mc_data::items::ItemReport {
+                id: mc_data::Identifier::parse("minecraft:bread").unwrap(),
+                protocol_id: 3,
+            },
+            mc_data::items::ItemReport {
+                id: mc_data::Identifier::parse("minecraft:potato").unwrap(),
+                protocol_id: 4,
+            },
+            mc_data::items::ItemReport {
+                id: mc_data::Identifier::parse("minecraft:carrot").unwrap(),
+                protocol_id: 5,
+            },
+            mc_data::items::ItemReport {
+                id: mc_data::Identifier::parse("minecraft:beetroot").unwrap(),
+                protocol_id: 6,
+            },
         ];
         ItemRegistry::from_report(&reports)
     }
 
     fn entity_types() -> EntityTypeRegistry {
         mc_data::entity_types::solaris_required_entity_types()
+    }
+
+    #[test]
+    fn villager_population_persistence_validation_is_fail_closed() {
+        let items = items();
+        let food_items = villager_food_item_ids(&items).expect("food registry ids");
+        let mut spawn = SpawnEntity::new(119, "minecraft:villager", Vec3::new(0.5, 64.0, 0.5));
+        spawn.retained.villager = Some(mc_entity::VillagerData::new(
+            mc_entity::VillagerKind::Plains,
+            mc_entity::VillagerProfession::None,
+            1,
+        ));
+        spawn.retained.villager_brain =
+            Some(mc_entity::villager_26_1_2::VillagerBrainState::adult(
+                mc_entity::villager_26_1_2::VillagerPoiSet::default(),
+            ));
+        spawn.retained.villager_population =
+            Some(mc_entity::villager_population_26_1_2::VillagerPopulationState::adult());
+        let mut store = EntityStore::new();
+        let id = store.spawn(spawn);
+        let adult = store.snapshot(id).expect("adult villager snapshot");
+        assert!(villager_population_state_is_valid(&items, 100, &adult));
+
+        let mut baby = adult.clone();
+        baby.retained.villager_population = Some(
+            mc_entity::villager_population_26_1_2::VillagerPopulationState::baby(
+                "settlement:baby-home".to_owned(),
+            ),
+        );
+        baby.retained.villager_brain.as_mut().unwrap().schedule =
+            mc_entity::villager_26_1_2::VillagerScheduleKind::Baby;
+        assert!(villager_population_state_is_valid(&items, 100, &baby));
+        baby.retained
+            .villager_population
+            .as_mut()
+            .unwrap()
+            .claimed_home = None;
+        assert!(!villager_population_state_is_valid(&items, 100, &baby));
+
+        let mut pending = adult.clone();
+        let partner = uuid::Uuid::from_u128(77);
+        let population = pending.retained.villager_population.as_mut().unwrap();
+        assert!(population
+            .add_to_inventory(mc_entity::EntityItemStack::new(food_items.bread, 3), 64)
+            .unwrap()
+            .is_none());
+        population
+            .start_pending_birth(partner, 100, 0, false, food_items)
+            .unwrap();
+        assert!(villager_population_state_is_valid(&items, 100, &pending));
+
+        let mut future = pending.clone();
+        let future_pending = future
+            .retained
+            .villager_population
+            .as_mut()
+            .unwrap()
+            .pending_birth
+            .as_mut()
+            .unwrap();
+        future_pending.started_tick = 101;
+        future_pending.ready_tick = 376;
+        assert!(!villager_population_state_is_valid(&items, 100, &future));
+
+        for duration in [274_u64, 325] {
+            let mut malformed = pending.clone();
+            let malformed_pending = malformed
+                .retained
+                .villager_population
+                .as_mut()
+                .unwrap()
+                .pending_birth
+                .as_mut()
+                .unwrap();
+            malformed_pending.ready_tick = malformed_pending.started_tick + duration;
+            assert!(!villager_population_state_is_valid(&items, 100, &malformed));
+        }
+
+        let mut invalid_item = pending.clone();
+        invalid_item
+            .retained
+            .villager_population
+            .as_mut()
+            .unwrap()
+            .inventory
+            .add_stack(mc_entity::EntityItemStack::new(999, 1), 64)
+            .unwrap();
+        assert!(!villager_population_state_is_valid(&items, 100, &invalid_item));
+
+        let mut missing_brain = adult;
+        missing_brain.retained.villager_brain = None;
+        assert!(!villager_population_state_is_valid(&items, 100, &missing_brain));
     }
 
     #[test]

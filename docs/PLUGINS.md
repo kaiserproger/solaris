@@ -1,7 +1,7 @@
-# Lua Plugins
+# Luau Plugins
 
-Solaris exposes one Lua plugin contract: API `0.6.0`. A manifest requesting any
-other version is rejected. There is no legacy manifest or Lua API compatibility
+Solaris exposes one Luau plugin contract: API `0.6.0`. A manifest requesting any
+other version is rejected. There is no legacy manifest or Luau API compatibility
 path.
 
 `mc-net` provides the `0.6.0` plugin-storage, zone, inventory-menu,
@@ -20,8 +20,30 @@ plugins/
 `-- basic-economy/
     |-- config.toml     # optional operator configuration
     |-- plugin.toml
-    `-- main.lua
+    `-- main.lua        # strict Luau source
 ```
+
+Every source is parsed and type-checked as `--!strict` Luau before it may claim
+commands or receive events, even when the file omits the directive. The shipped
+sources include `--!strict` explicitly. Solaris supplies a type-check-only
+`solaris` host prelude, rejects diagnostics, then executes the accepted source in
+one sandboxed Luau VM with bounded memory and interrupt fuel. A normal invalid
+plugin is skipped; a plugin declaring startup worldgen or client content fails
+server startup instead of silently changing the world/client contract.
+
+External and server-embedded plugins can be selected together:
+
+```toml
+[plugins]
+directory = "plugins" # optional external root
+bundled = ["basic-economy", "online-roster"]
+```
+
+The available bundled ids are `basic-economy`, `colony-villager-scaffold`,
+`geological-mines`, `land-claims`, `online-roster`, and
+`settlement-prototype`. They are disabled unless explicitly listed. Duplicate
+plugin ids across either source fail startup before command, Loader, or worldgen
+metadata can diverge. Ore and settlement ownership conflicts remain fail-fast.
 
 ```toml
 id = "basic-economy"
@@ -84,14 +106,14 @@ declaring the same profile kind fail startup instead of relying on directory
 order. The ore profile and canonical settlement plan (owner plus every ordered
 descriptor) are persisted in `solaris/world.json`; changing either requires a
 fresh world directory so old and new chunks cannot mix authorities.
-Declarations are resolved before pre-generation and give Lua no chunk,
-generator, lock, or worker handle. An invalid/empty declaration or missing Lua
+Declarations are resolved before pre-generation and give Luau no chunk,
+generator, lock, or worker handle. An invalid/empty declaration or missing Luau
 source fails startup. Unversioned vanilla Anvil imports reject plugin worldgen
 profiles because Solaris does not generate missing chunks in imports.
 
 The deterministic startup plan now covers per-building selection and roles,
 inhabitant selection, job assignment, and bounded plugin-owned extension
-records without giving Lua mutable worldgen callbacks. The plan is validated
+records without giving Luau mutable worldgen callbacks. The plan is validated
 before generation and its selected building parts directly determine the
 composite template. Solaris extracts the templates' vanilla villager jigsaw
 slots and persists the planned inhabitants as typed chunk markers. When such a
@@ -199,7 +221,7 @@ sends `solaris:loader/interaction` only if the screen definition and originating
 connection are still current. Solaris accepts the bounded action only from that
 player's exact Loader-acknowledged Play session, requires an owner bundle with
 `interactions` plus `send_interactions`, and targets only that owner plugin's
-Lua `on_loader_interaction(event)` handler. The event fields are `player_id`,
+Luau `on_loader_interaction(event)` handler. The event fields are `player_id`,
 `interaction_id`, and `payload`. Client payloads remain untrusted plugin input;
 the namespace fence prevents one bundle from addressing another plugin.
 
@@ -269,20 +291,20 @@ capabilities, 64 permissions, and 128 player or operator command roots.
 
 `config.toml` is optional. The loader reads it once during discovery, before
 the plugin registers commands or receives events. A missing file becomes an
-empty table. `solaris.config()` returns a new recursive Lua table on every
+empty table. `solaris.config()` returns a new recursive Luau table on every
 call, so a plugin may mutate its local copy without changing later reads. Disk
 changes after startup do not change the loaded snapshot; live reload,
 environment interpolation, default merging, and cross-plugin reads are not
 part of API `0.6.0`.
 
-```lua
+```luau
 local config = solaris.config()
 assert(config.currency.resource == "minecraft:emerald")
 assert(config.catalog[1].price == 3)
 ```
 
 Accepted TOML values are strings, signed 64-bit integers, finite floats,
-booleans, arrays, and tables. Arrays become one-based Lua tables. TOML dates
+booleans, arrays, and tables. Arrays become one-based Luau tables. TOML dates
 and times are rejected. The file is capped at 64 KiB; nesting at 8 container
 levels; every table or array at 128 entries; keys at 128 UTF-8 bytes; and
 strings at 4096 UTF-8 bytes. Validation is eager and recursive. An invalid
@@ -301,7 +323,7 @@ configuration skips only that plugin before it can claim command roots.
 | `player_teleport` | `teleport_player` |
 | `player_queries` | `list_online_players` |
 
-An undeclared privileged call fails synchronously in Lua before it enters the
+An undeclared privileged call fails synchronously in Luau before it enters the
 bounded command batch. Unknown capabilities reject the plugin during discovery.
 
 ## Events
@@ -311,7 +333,7 @@ snapshots. `player.command` and every result/owner event below are targeted: the
 host routes them to exactly the owning plugin and never broadcasts them. A
 targeted event does not need a broad subscription to reach its owner.
 
-| Event | Lua handler | Fields |
+| Event | Luau handler | Fields |
 | --- | --- | --- |
 | `server.started` | `on_server_started` | `name` |
 | `server.stopping` | `on_server_stopping` | `name`, `reason` |
@@ -409,7 +431,7 @@ reachable, alive, server-owned living entity for a live non-Spectator player;
 `off_hand`; `game_mode` is `survival`, `creative`, or `adventure`. Missing,
 nonliving, dying, dead, unreachable, or non-finite interactions publish
 nothing. The normal feed, shear, or unsupported-interaction path completes
-first, including fallible inventory writes; only then may required Lua queue
+first, including fallible inventory writes; only then may required Luau queue
 admission wait for capacity. Queue closure cannot roll back or reject the
 already completed vanilla path. Plugins may use this event to open an NPC menu
 or start a dialogue, but must not infer feeding, shearing, trading, or another
@@ -421,7 +443,7 @@ XP reset. The common fall, contact block, starvation, hostile, projectile, PvP,
 and operator damage paths use that transition. The owner snapshots the event
 into the shared committed-gameplay push outbox before any fallible client
 write. One async worker forwards immutable death and direct-melee-kill events
-into the bounded Lua queue, so victim disconnects, stale connection mirrors,
+into the bounded Luau queue, so victim disconnects, stale connection mirrors,
 and packet-write failures cannot erase or rewrite an accepted death. Nonlethal
 or shield-blocked damage, stale owner state,
 unsupported Creative/Spectator damage, repeated damage against an already-dead
@@ -447,7 +469,7 @@ Do not use `server.tick` as a completion fence for a committed gameplay event.
 
 Plugins schedule one-shot host-local callbacks in simulation ticks:
 
-```lua
+```luau
 local scheduled_tick = solaris.schedule_timer("catalog-refresh", 20)
 local removed = solaris.cancel_timer("catalog-refresh")
 
@@ -461,7 +483,7 @@ end
 `delay_ticks` must be an integer from 1 through 630,720,000. Each plugin may
 retain at most 256 pending timers. Scheduling an existing id replaces its
 deadline without consuming another slot; cancellation returns `true` only when
-that id was pending. Timer changes are staged with the current Lua handler and
+that id was pending. Timer changes are staged with the current Luau handler and
 commit only when it returns successfully.
 
 `on_plugin_timer` is host-local and does not require `plugin.timer` or
@@ -484,7 +506,7 @@ not roll those timer changes back.
 
 The existing bounded presentation commands remain available:
 
-```lua
+```luau
 solaris.send_message(player_id, text)
 solaris.broadcast(text)
 solaris.disconnect(player_id, reason)
@@ -496,7 +518,7 @@ solaris.grant_loader_block_item(player_id, block_id, count)
 
 Plugins with `player_queries` may request one bounded point-in-time snapshot:
 
-```lua
+```luau
 solaris.list_online_players("catalog-viewers", 64)
 ```
 
@@ -508,10 +530,10 @@ sessions existed than fit the requested limit. Sessions whose outbound owner is
 already closed are excluded. The values are immutable snapshots, not handles;
 plugins must issue another query when they need a newer view.
 
-Storage is scoped by the host-attached plugin identity. Lua does not pass a
+Storage is scoped by the host-attached plugin identity. Luau does not pass a
 plugin id and cannot forge one:
 
-```lua
+```luau
 solaris.storage_get(request_id, key)
 solaris.storage_cas(request_id, key, expected_version, value)
 solaris.storage_delete(request_id, key, expected_version)
@@ -551,7 +573,7 @@ compaction writes a synced temporary journal, renames it atomically, then syncs
 the parent directory.
 
 With a persistent world configured, malformed journal data or plugin-storage
-startup I/O fails the server bind with the typed storage startup error; Lua is
+startup I/O fails the server bind with the typed storage startup error; Luau is
 not left live with storage silently disabled. Without a persistent world,
 non-storage plugin behavior remains available and every admitted storage request
 receives the targeted `unavailable` result. A definite durability failure closes
@@ -567,7 +589,7 @@ The inventory adapter owns menus after admission. Plugins describe fixed
 display slots but do not receive container, slot-stack, NBT, or click-packet
 state:
 
-```lua
+```luau
 solaris.open_inventory_menu(player_id, menu_id, title, {
     { slot = 0, resource = "minecraft:apple", count = 1, label = "Apple" },
 })
@@ -582,8 +604,8 @@ state, empty/player-inventory slots, unsupported click modes, and forged
 container ids with an authoritative content resync; focused classifier tests
 cover those reject branches. Accepted fixed-slot clicks publish
 `inventory.menu.clicked` only to the plugin that opened the menu. A wire test
-covers Lua admission, exact title/item/count content, stale-state rejection, a
-normal predicted client click, targeted Lua delivery, a second subscribed
+covers Luau admission, exact title/item/count content, stale-state rejection, a
+normal predicted client click, targeted Luau delivery, a second subscribed
 plugin proving non-delivery, and the owning plugin response.
 
 The transaction adapter treats each inventory/storage request as one runtime
@@ -594,7 +616,7 @@ inventory and hotbar slots participate. Unknown resources, insufficient items,
 full output inventory, a disconnected player, stale storage versions, and
 storage quota failures reject the whole request without changing either side.
 
-```lua
+```luau
 solaris.inventory_storage_transaction(player_id, request_id,
     { { resource = "minecraft:apple", delta = 1 } },
     { { operation = "cas", key = "coins:player", expected_version = 4, value = "7" } }
@@ -623,7 +645,7 @@ in the durable transaction record.
 The separate player-inventory API performs one atomic main-inventory and
 hotbar mutation without touching plugin storage:
 
-```lua
+```luau
 solaris.inventory_transaction(player_id, request_id, {
     { resource = "minecraft:emerald", delta = -2 },
     { resource = "minecraft:apple", delta = 4 },
@@ -632,7 +654,7 @@ solaris.inventory_transaction(player_id, request_id, {
 
 The delta list must contain 1 to 16 unique resources. A positive delta grants
 the item and a negative delta removes it; zero and magnitudes above 64 are
-rejected at the Lua boundary. Only slots 9 through 44 participate. The session
+rejected at the Luau boundary. Only slots 9 through 44 participate. The session
 owner resolves and plans every delta against one canonical player-state
 snapshot before replacing the inventory, so unknown resources, insufficient
 input, and a full output inventory cannot leave a partial mutation. A successful
@@ -650,7 +672,7 @@ crash transaction with plugin records.
 
 Zones are axis-aligned definitions, scoped by the host-attached plugin id:
 
-```lua
+```luau
 solaris.upsert_zone("catalog-square", "minecraft:overworld", -8, 60, -8, 8, 100, 8)
 solaris.remove_zone("catalog-square")
 ```
@@ -679,7 +701,7 @@ admission limits, not operator-configured worker percentages.
 
 ## Ownership Routing
 
-Lua commands never contain region keys, leases, epochs, locks, sockets, or
+Luau commands never contain region keys, leases, epochs, locks, sockets, or
 worker handles. The server resolves ownership after admitting the bounded DTO:
 
 - entity spawn enters the simulation owner;
@@ -697,7 +719,7 @@ session gate, so compound planning cannot overtake an earlier owner command. The
 compound `inventory_storage_transaction` remains a separate typed coordinator
 with an internal player-lifetime fence because its durable storage mutation and
 inventory mutation must never publish separately. Neither path exposes its
-coordination mechanism to Lua. There is no generic mutable-world transaction or
+coordination mechanism to Luau. There is no generic mutable-world transaction or
 coroutine suspension API.
 
 ## Shipped Economy And Claims
@@ -723,7 +745,7 @@ plugin is restricted to the current single-dimension runtime.
 Protection is a generic `zones` capability, not knowledge of this shipped
 plugin in the Rust server. Any plugin may register an actor-or-operator policy:
 
-```lua
+```luau
 solaris.upsert_protected_zone(
     "home", "minecraft:overworld", owner_uuid,
     min_x, min_y, min_z, max_x, max_y, max_z
@@ -758,7 +780,7 @@ moving-block animation are not part of this baseline.
 
 Player teleports are same-dimension authoritative mutations:
 
-```lua
+```luau
 solaris.teleport_player("warp-home", player_id, 40, 70, 1)
 ```
 
@@ -789,7 +811,7 @@ of using a zone event as its completion fence.
 
 Colonies are bounded records, not world/entity access:
 
-```lua
+```luau
 solaris.upsert_colony("register-colony", "starter-colony", "Starter Colony",
     "minecraft:overworld", 0, 64, 0)
 solaris.bind_nearest_villager("bind-player-7", "starter-colony", 0, 64, 0, 16)
@@ -801,7 +823,7 @@ search radius must be finite, positive, and no greater than 64. The result token
 is ephemeral; it is not an entity id, pointer, or durable villager capability.
 `set_villager_order` accepts only `home` and `hold`. `home` uses the current
 owned colony home and `hold` stops horizontal goal movement. Plugins cannot
-choose arbitrary coordinates or speeds. There is deliberately no Lua API for
+choose arbitrary coordinates or speeds. There is deliberately no Luau API for
 roles, general goals, pathing internals, memory, inventory, or direct entity
 mutation.
 
@@ -845,21 +867,21 @@ mutation was rejected. Temporary owner pressure also returns `accepted = false`,
 but retains the unexpired token so the plugin may retry. Changing the colony to
 another dimension rejects the order before owner mutation.
 
-The shipped colony scaffold retains an accepted token only in Lua memory for
+The shipped colony scaffold retains an accepted token only in Luau memory for
 the active player session and reuses it for later `home` or `hold` updates.
 It reports `Applied villager order ...` only after the targeted owner result is
 accepted. If a cached token is rejected, the scaffold clears it and performs
 one fresh binding attempt; a result from that attempt is never recursively
 retried. Plugin storage records the bounded role and order intent, not the
 ephemeral token or a fabricated entity-mutation result; `/colony status` labels
-that field as stored intent. Disconnect cleanup drops the Lua-side token, while
+that field as stored intent. Disconnect cleanup drops the Luau-side token, while
 the regional owner keeps its claim only until the documented simulation-tick
 expiry. Durable entity handles, general roles, and work-order execution remain
 outside API `0.6.0`.
 
 ## Isolation And Limits
 
-Each plugin has one Lua VM on the dedicated host thread with a 16 MiB memory
+Each plugin has one Luau VM on the dedicated host thread with a 16 MiB memory
 limit, 100,000 instructions per load or handler, and at most 32 commands per
 event. Event and command queues are bounded and nonblocking. One invocation's
 command batch enters the host queue atomically or not at all. On queue
@@ -876,7 +898,7 @@ so commands emitted by the accepted stopping event are not lost. A shutdown
 timeout may report a stuck host as failure, but elapsed time is never treated as
 successful drain evidence.
 
-The host wraps every Lua-emitted command in a bounded, one-shot admission ticket
+The host wraps every Luau-emitted command in a bounded, one-shot admission ticket
 before it crosses the script boundary. A production router must use this exact
 sequence:
 
@@ -894,7 +916,7 @@ sequence:
 A ticket records the exact plugin and exact request. A cloned ticket can be
 accepted once, request substitution consumes and rejects it, and public code
 cannot construct an arbitrary targeted result. Directly matching and trusting
-the fields of `HostAttached` is not an adapter API. Lua exposes no filesystem,
+the fields of `HostAttached` is not an adapter API. Luau exposes no filesystem,
 network, process, debug, paths, locks, NBT, sessions, or entity pointers.
 
 See [the contract examples](../examples/plugins/) for the configurable
@@ -903,12 +925,12 @@ intentionally limited colony/villager scaffold.
 
 `crates/mc-test-harness/tests/plugin_examples.rs` copies those exact shipped
 files into an isolated plugin directory and runs them through the production
-Lua host, server router, storage actor, regional owner, and wire client. The
+Luau host, server router, storage actor, regional owner, and wire client. The
 catalog gate proves zone entry, menu contents, atomic purchase, insufficient
 funds rejection, unchanged ledger, and refund. The same wire client invokes the
 shipped `/who` command and proves that a fresh authoritative online-player
 result becomes a server-owned inventory menu with the connected player's name
-and dimension. A focused Lua test proves that command-batch rejection releases
+and dimension. A focused Luau test proves that command-batch rejection releases
 the requester's pending slot and that the longest valid dimension cannot exceed
 the menu-label bound. The colony gate proves command
 registration, durable recruitment, initial `home`, a later accepted `hold`, and
@@ -919,7 +941,7 @@ timeouts only fail missing packets. These are integration checks of the
 examples; they are not vanilla-oracle or broad plugin-ecosystem readiness
 evidence.
 
-The same suite routes the exact economy and claim Lua files through the real
+The same suite routes the exact economy and claim Luau files through the real
 host. It proves zone and command entry, atomic item-currency purchase and
 refund, durable claim CAS and zone registration, then uses two real wire
 clients to prove a stranger cannot break or place inside the owner's claimed

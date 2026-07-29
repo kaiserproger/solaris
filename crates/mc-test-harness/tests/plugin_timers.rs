@@ -27,18 +27,22 @@ async fn lua_timer_is_pushed_by_simulation_ticks_without_tick_subscription() {
     std::fs::write(
         plugin.join("main.lua"),
         r#"
-            local waiting_player = nil
+            --!strict
 
-            function on_player_command(event)
+            local waiting_player: number? = nil
+
+            function on_player_command(event: any)
                 waiting_player = event.player_id
                 local scheduled = solaris.schedule_timer("wire", 2)
                 assert(scheduled >= 2)
             end
 
-            function on_plugin_timer(event)
+            function on_plugin_timer(event: any)
                 assert(event.timer_id == "wire")
                 assert(event.fired_tick >= event.scheduled_tick)
-                solaris.send_message(waiting_player, "timer-fired")
+                local player_id = waiting_player
+                assert(player_id ~= nil)
+                solaris.send_message(player_id, "timer-fired")
                 waiting_player = nil
             end
         "#,

@@ -29,6 +29,8 @@ pub mod synced_data_26_1_2;
 pub mod villager_26_1_2;
 pub mod villager_gossip_26_1_2;
 pub mod villager_merchant_26_1_2;
+pub mod villager_population_26_1_2;
+pub mod zombie_villager_26_1_2;
 
 #[cfg(test)]
 #[path = "entity_scale_26_1_2_tests.rs"]
@@ -46,7 +48,8 @@ pub use regional::{
     RegionalOwnerRuntime, RegionalOwnerRuntimeShutdownError, RegionalOwnerSaveSnapshot,
     RegionalOwnerShutdownError, RegionalOwnerStatus, RegionalPreparedGoalTick,
     RegionalResolvedGoalTick, SequencedRegionMutation, TransferApply, TransferDecision, TransferId,
-    VersionedEntitySnapshots,
+    VersionedEntitySnapshots, VillagerBirthCommit, VillagerCourtshipCommit,
+    VillagerFoodShareCommit, VillagerInventoryPickupCommit, VillagerNoBedCommit,
 };
 
 pub use runtime::{
@@ -462,6 +465,10 @@ pub struct EntityRetainedState {
     pub villager_gossip: Option<villager_gossip_26_1_2::VillagerGossipState>,
     #[serde(default)]
     pub villager_merchant: Option<villager_merchant_26_1_2::VillagerMerchantState>,
+    #[serde(default)]
+    pub villager_population: Option<villager_population_26_1_2::VillagerPopulationState>,
+    #[serde(default)]
+    pub zombie_villager_conversion: Option<zombie_villager_26_1_2::ZombieVillagerConversionState>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -1166,6 +1173,10 @@ impl EntityStore {
 
     pub(crate) fn restore_snapshot_in_place(&mut self, snapshot: EntitySnapshot) -> bool {
         self.runtime.restore_snapshot_in_place(snapshot)
+    }
+
+    pub(crate) fn convert_snapshot_in_place(&mut self, snapshot: EntitySnapshot) -> bool {
+        self.runtime.convert_snapshot_in_place(snapshot)
     }
 
     pub(crate) fn effect_checkpoint(

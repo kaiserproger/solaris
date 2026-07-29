@@ -1,12 +1,14 @@
+--!strict
+
 -- Displays a fresh server-authoritative player list in an inventory menu.
 
 local query_limit = 54
 local next_request = 0
-local pending_by_request = {}
-local pending_by_player = {}
-local last_batch = nil
+local pending_by_request: any = {}
+local pending_by_player: any = {}
+local last_batch: any = nil
 
-local function clear_player(player_id)
+local function clear_player(player_id: number)
     local request_id = pending_by_player[player_id]
     if request_id ~= nil then
         pending_by_player[player_id] = nil
@@ -14,7 +16,7 @@ local function clear_player(player_id)
     end
 end
 
-function on_player_command(event)
+function on_player_command(event: any)
     last_batch = nil
     if event.root ~= "who" or pending_by_player[event.player_id] ~= nil then
         return
@@ -34,7 +36,7 @@ function on_player_command(event)
     solaris.list_online_players(request_id, query_limit)
 end
 
-function on_player_online_result(event)
+function on_player_online_result(event: any)
     last_batch = nil
     local pending = pending_by_request[event.request_id]
     if pending == nil then
@@ -44,8 +46,9 @@ function on_player_online_result(event)
     pending_by_request[event.request_id] = nil
     pending_by_player[player_id] = nil
 
-    local slots = {}
-    for index, player in ipairs(event.players) do
+    local slots: any = {}
+    for index, raw_player in ipairs(event.players) do
+        local player: any = raw_player
         local dimension_limit = 128 - #player.username - 3
         slots[index] = {
             slot = index - 1,
@@ -66,12 +69,12 @@ function on_player_online_result(event)
     end
 end
 
-function on_player_left(event)
+function on_player_left(event: any)
     last_batch = nil
     clear_player(event.player_id)
 end
 
-function on_command_batch_rejected(_result)
+function on_command_batch_rejected(_result: any)
     local batch = last_batch
     last_batch = nil
     if batch ~= nil and batch.kind == "query" then

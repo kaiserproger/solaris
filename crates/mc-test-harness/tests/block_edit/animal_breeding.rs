@@ -1,4 +1,94 @@
 #[tokio::test]
+async fn zombie_villager_cure_starts_from_golden_apple_interaction_over_wire() {
+    let data = embedded_play_data();
+    let golden_apple_item_id = embedded_item_id(&data, "minecraft:golden_apple");
+    let zombie_villager_type = mc_data::entity_types::solaris_required_entity_types()
+        .id_of(&mc_data::Identifier::parse("minecraft:zombie_villager").unwrap())
+        .and_then(|id| i32::try_from(id).ok())
+        .expect("embedded zombie villager entity type");
+    let cfg = embedded_playable_config(&data, embedded_world(&data), "zombie villager cure wire");
+    let bound = mc_net::bind(cfg).await.expect("bind");
+    let effect_handle = bound.entity_effect_handle();
+    let addr = bound.local_addr().expect("local_addr");
+    tokio::spawn(async move {
+        let _ = bound.serve().await;
+    });
+
+    let (mut client, sync) = connect_to_play(addr, "ZVCureWire").await;
+    drain_until_chunk(&mut client, (0, 0)).await;
+    client
+        .write_packet(&ServerboundChatCommand {
+            command: "debug give minecraft:golden_apple 1 0".to_owned(),
+        })
+        .await
+        .expect("give golden apple");
+    wait_for_slot_stack(&mut client, golden_apple_item_id, 1).await;
+
+    let zombie_id = summon_wire_animal(
+        &mut client,
+        "minecraft:zombie_villager",
+        zombie_villager_type,
+        (sync.x, sync.y, sync.z + 1.0),
+    )
+    .await;
+    let weakness = mc_entity::effects_26_1_2::EffectInstance::new(
+        mc_entity::zombie_villager_26_1_2::WEAKNESS_EFFECT_ID,
+        mc_entity::effects_26_1_2::EffectKind::CallerOwned,
+        600,
+        0,
+        mc_entity::effects_26_1_2::EffectFlags::default(),
+    );
+    assert!(matches!(
+        effect_handle
+            .apply(
+                mc_entity::EntityId(zombie_id),
+                mc_entity::EntityEffectOperation::Add(weakness),
+                mc_entity::runtime_26_1_2::TargetKind::NonPlayer,
+            )
+            .await
+            .expect("apply Weakness through production owner"),
+        mc_entity::EntityEffectResult::Applied(_)
+    ));
+
+    client
+        .write_packet(&ServerboundInteract {
+            entity_id: zombie_id,
+            hand: InteractionHand::MainHand,
+            location: EntityVec3::ZERO,
+            using_secondary_action: false,
+        })
+        .await
+        .expect("interact with weak zombie villager");
+
+    let mut saw_cure_event = false;
+    let mut saw_apple_debit = false;
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
+    while !saw_cure_event || !saw_apple_debit {
+        let frame = client
+            .read_frame_with_timeout(
+                deadline.saturating_duration_since(tokio::time::Instant::now()),
+            )
+            .await
+            .expect("zombie villager cure start result");
+        if handle_keepalive(&mut client, frame.id, &frame.body).await {
+            continue;
+        }
+        if frame.id == EntityEvent::ID {
+            let mut body = frame.body;
+            let packet = EntityEvent::decode(&mut body).expect("decode cure entity event");
+            saw_cure_event |= packet.entity_id == zombie_id && packet.event_id == 16;
+        } else if frame.id == ClientboundContainerSetSlot::ID {
+            let mut body = frame.body;
+            let packet = ClientboundContainerSetSlot::decode(&mut body)
+                .expect("decode golden apple debit");
+            saw_apple_debit |= packet.container_id == 0
+                && packet.slot == 36
+                && packet.item_stack.is_empty();
+        }
+    }
+}
+
+#[tokio::test]
 async fn embedded_cows_breed_from_two_wheat_interactions_over_wire() {
     embedded_animals_breed_from_two_food_interactions_over_wire(
         "minecraft:cow",

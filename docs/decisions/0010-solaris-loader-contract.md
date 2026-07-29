@@ -101,7 +101,7 @@ those actions and send one raw Play payload only while the exact definition and
 originating connection remain active. The server accepts that channel only from
 the same Play session that completed Loader acknowledgement, requires the
 owner's `interactions` plus `send_interactions` declaration, and publishes a
-required targeted `loader.interaction` event solely to that Lua owner. The
+required targeted `loader.interaction` event solely to that Luau owner. The
 plugin receives the client payload as untrusted data.
 
 The item-presentation slice adds up to 128 owner-namespaced item declarations.
@@ -141,7 +141,7 @@ exact session's acknowledged carrier id.
 Projected chunk frames bypass the cross-session prepared-frame cache, so one
 client's runtime id cannot leak to another.
 
-The owning host-attested Lua plugin may call
+The owning host-attested Luau plugin may call
 `solaris.place_loader_block(block_id, x, y, z)` for its exact verified block
 identity. The server rejects unattested, foreign-owner, unknown, and
 out-of-height requests, then commits the canonical state through the existing

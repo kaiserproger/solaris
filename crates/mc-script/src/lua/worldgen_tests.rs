@@ -54,6 +54,28 @@ api = "0.6.0"
 }
 
 #[test]
+fn duplicate_plugin_ids_fail_before_runtime_metadata_can_diverge() {
+    let plugins = TempPlugins::new();
+    write_plugin(plugins.path(), "first", "");
+    write_plugin(plugins.path(), "second", "");
+    fs::write(
+        plugins.path().join("second/plugin.toml"),
+        r#"id = "first"
+name = "Duplicate First"
+version = "0.1.0"
+api = "0.6.0"
+"#,
+    )
+    .unwrap();
+
+    let error = prepare_lua_plugins(LuaHostConfig::new(plugins.path())).unwrap_err();
+    assert!(matches!(
+        error,
+        LuaHostError::PluginIdConflict { id } if id == "first"
+    ));
+}
+
+#[test]
 fn shipped_geological_plugin_selects_the_startup_ore_profile() {
     let plugins = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../examples/plugins");
     let prepared = prepare_lua_plugins(LuaHostConfig::new(plugins)).unwrap();

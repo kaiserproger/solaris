@@ -145,6 +145,80 @@ fn origin_terrain_is_not_normalized_across_seeds() {
 }
 
 #[test]
+fn accumulated_drainage_paths_stay_downhill_and_reach_coast() {
+    let seeds = [0, 712_816, -1, 34, 91, 233];
+    let cell_blocks = drainage::configured_cell_blocks(1.0);
+    let mut starts = 0usize;
+    let mut coast_connections = 0usize;
+    let mut persistent_connections = 0usize;
+
+    for seed in seeds {
+        let router = OverworldRouter::new(
+            seed,
+            OVERWORLD_GEOMETRY,
+            WorldgenMode::TellusLike(TellusWorldgenSettings::default()),
+        );
+        let mut seed_starts = 0usize;
+        'cells: for z in -40..=40 {
+            for x in -40..=40 {
+                let start = drainage::DrainageCell { x, z };
+                if !drainage::active_cell(seed, start) {
+                    continue;
+                }
+                let (center_x, center_z) = drainage::cell_center(start, cell_blocks);
+                let terrain = router.sample(center_x as i32, center_z as i32);
+                if terrain.continentalness < 0.12 || terrain.ridges > 0.12 {
+                    continue;
+                }
+
+                starts += 1;
+                seed_starts += 1;
+                let mut current = start;
+                let mut active_steps = 0usize;
+                let mut reached_coast = false;
+                for _ in 0..128 {
+                    active_steps += usize::from(drainage::active_cell(seed, current));
+                    let (block_x, block_z) = drainage::cell_center(current, cell_blocks);
+                    let terrain = router.sample(block_x as i32, block_z as i32);
+                    if terrain.continentalness <= -0.08 {
+                        reached_coast = true;
+                        break;
+                    }
+                    let next = drainage::downstream(seed, current);
+                    assert!(
+                        drainage::hydraulic_rank(seed, next)
+                            > drainage::hydraulic_rank(seed, current),
+                        "seed {seed} drainage failed downhill rank at {current:?} -> {next:?}"
+                    );
+                    current = next;
+                }
+                if reached_coast {
+                    coast_connections += 1;
+                    persistent_connections += usize::from(active_steps >= 8);
+                }
+                if seed_starts >= 4 {
+                    break 'cells;
+                }
+            }
+        }
+        assert!(
+            seed_starts >= 2,
+            "seed {seed} exposed only {seed_starts} active inland drainage starts"
+        );
+    }
+
+    assert!(starts >= seeds.len() * 2);
+    assert!(
+        coast_connections * 4 >= starts * 3,
+        "too few accumulated paths reached coast: {coast_connections}/{starts}"
+    );
+    assert!(
+        persistent_connections * 4 >= coast_connections * 3,
+        "coast paths lost their active channel too early: {persistent_connections}/{coast_connections}"
+    );
+}
+
+#[test]
 fn caves_never_open_the_surface_shell_across_seed_grid() {
     for seed in -16..16 {
         let router = OverworldRouter::new(seed, OVERWORLD_GEOMETRY, WorldgenMode::VanillaLike);

@@ -211,7 +211,7 @@ cursor with one next action. Revalidate it after restart.
 Apply Pareto delivery in this owner-defined order:
 
 1. common vanilla-client gameplay and multiplayer behavior;
-2. production Lua plugin API and gameplay adapters;
+2. production Luau plugin API and gameplay adapters;
 3. measured optimization, regional ownership, ECS, and autoscaling;
 4. rare error interleavings and uncommon parity edges.
 

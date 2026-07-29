@@ -233,7 +233,9 @@ fn write_owner_plugin(root: &std::path::Path) {
     std::fs::write(
         owner.join("main.lua"),
         r#"
-            function on_player_command(event)
+            --!strict
+
+            function on_player_command(event: any)
                 if event.root == "kitgrant" then
                     solaris.inventory_transaction(event.player_id, "grant", {
                         { resource = "minecraft:emerald", delta = 3 },
@@ -261,7 +263,7 @@ fn write_owner_plugin(root: &std::path::Path) {
                 end
             end
 
-            function on_player_inventory_transaction_result(event)
+            function on_player_inventory_transaction_result(event: any)
                 solaris.send_message(
                     event.player_id,
                     "inventory:" .. event.request_id .. ":" .. tostring(event.committed)
@@ -290,7 +292,7 @@ fn write_observer_plugin(root: &std::path::Path) {
     std::fs::write(
         observer.join("main.lua"),
         r#"
-            function on_player_inventory_transaction_result(event)
+            function on_player_inventory_transaction_result(event: any)
                 solaris.send_message(event.player_id, "leaked-inventory-result")
             end
         "#,

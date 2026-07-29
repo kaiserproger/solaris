@@ -35,7 +35,9 @@ async fn player_entity_killed_reaches_lua_once_after_the_lethal_melee_commit() {
     std::fs::write(
         plugin.join("main.lua"),
         r#"
-            function on_player_entity_killed(event)
+            --!strict
+
+            function on_player_entity_killed(event: any)
                 local expected = {
                     name = true, player_id = true, context_verified = true,
                     uuid = true, username = true, operator = true,
@@ -68,7 +70,7 @@ async fn player_entity_killed_reaches_lua_once_after_the_lethal_melee_commit() {
                 ))
             end
 
-            function on_player_command(event)
+            function on_player_command(event: any)
                 if event.root == "spawn-kill-target" then
                     solaris.spawn_entity(
                         event.player_id,

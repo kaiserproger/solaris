@@ -45,6 +45,7 @@ pub enum RegionOwnerMutation {
     ReplaceSnapshotIfCurrent {
         expected: Box<EntitySnapshot>,
         next: Box<EntitySnapshot>,
+        allow_type_change: bool,
     },
     SetKinematicsIfCurrent {
         expected: Box<EntitySnapshot>,
@@ -267,6 +268,7 @@ enum RegionOwnerUndo {
     Snapshot {
         lease: RegionLease,
         snapshot: Box<EntitySnapshot>,
+        allow_type_change: bool,
     },
     GoalBatch {
         lease: RegionLease,
@@ -1352,9 +1354,21 @@ fn prepare_region_owner_batch(
                     return Err(RegionOwnerLaneError::InvalidMutation);
                 }
             }
-            RegionOwnerMutation::ReplaceSnapshotIfCurrent { expected, next } => {
+            RegionOwnerMutation::ReplaceSnapshotIfCurrent {
+                expected,
+                next,
+                allow_type_change,
+            } => {
+                let type_change_valid = if *allow_type_change {
+                    expected.type_id != next.type_id
+                        && expected.type_name != next.type_name
+                        && expected.position == next.position
+                } else {
+                    expected.type_id == next.type_id && expected.type_name == next.type_name
+                };
                 if expected.id != next.id
                     || expected.uuid != next.uuid
+                    || !type_change_valid
                     || RegionKey::from_position(next.position) != Some(mutation.lease.key)
                     || store.snapshot(expected.id).as_ref() != Some(expected.as_ref())
                 {
@@ -1574,6 +1588,7 @@ fn apply_prepared_region_owner_batch(
                     undo.push(RegionOwnerUndo::Snapshot {
                         lease: mutation.lease,
                         snapshot: expected,
+                        allow_type_change: false,
                     });
                 }
                 applied
@@ -1598,12 +1613,21 @@ fn apply_prepared_region_owner_batch(
                 });
                 store.set_item_stack(entity, item_stack)
             }
-            RegionOwnerMutation::ReplaceSnapshotIfCurrent { expected, next } => {
+            RegionOwnerMutation::ReplaceSnapshotIfCurrent {
+                expected,
+                next,
+                allow_type_change,
+            } => {
                 undo.push(RegionOwnerUndo::Snapshot {
                     lease: mutation.lease,
                     snapshot: expected,
+                    allow_type_change,
                 });
-                store.restore_snapshot_in_place(*next)
+                if allow_type_change {
+                    store.convert_snapshot_in_place(*next)
+                } else {
+                    store.restore_snapshot_in_place(*next)
+                }
             }
             RegionOwnerMutation::SetKinematicsIfCurrent { expected, state } => {
                 undo.push(RegionOwnerUndo::Kinematics {
@@ -1919,12 +1943,21 @@ fn rollback_region_owner_undo(
                 }
                 continue;
             }
-            RegionOwnerUndo::Snapshot { lease, snapshot } => {
+            RegionOwnerUndo::Snapshot {
+                lease,
+                snapshot,
+                allow_type_change,
+            } => {
                 let store = &mut regions
                     .get_mut(&lease.key)
                     .ok_or(RegionOwnerLaneError::UnknownRegion)?
                     .1;
-                if !store.restore_snapshot_in_place(*snapshot) {
+                let restored = if allow_type_change {
+                    store.convert_snapshot_in_place(*snapshot)
+                } else {
+                    store.restore_snapshot_in_place(*snapshot)
+                };
+                if !restored {
                     return Err(RegionOwnerLaneError::InvalidMutation);
                 }
                 continue;

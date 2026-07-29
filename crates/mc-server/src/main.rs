@@ -51,6 +51,87 @@ fn load_config(path: &Path) -> Result<ServerConfig> {
     toml::from_str(&raw).with_context(|| format!("parsing config file {}", path.display()))
 }
 
+fn bundled_luau_plugin(plugin: mc_server::BundledPlugin) -> mc_script::BundledLuauPlugin {
+    match plugin {
+        mc_server::BundledPlugin::BasicEconomy => mc_script::BundledLuauPlugin::new(
+            "basic-economy",
+            include_str!("../../../examples/plugins/basic-economy/plugin.toml"),
+            include_str!("../../../examples/plugins/basic-economy/main.lua"),
+        )
+        .with_config(include_str!(
+            "../../../examples/plugins/basic-economy/config.toml"
+        )),
+        mc_server::BundledPlugin::ColonyVillagerScaffold => mc_script::BundledLuauPlugin::new(
+            "colony-villager-scaffold",
+            include_str!("../../../examples/plugins/colony-villager-scaffold/plugin.toml"),
+            include_str!("../../../examples/plugins/colony-villager-scaffold/main.lua"),
+        ),
+        mc_server::BundledPlugin::GeologicalMines => mc_script::BundledLuauPlugin::new(
+            "geological-mines",
+            include_str!("../../../examples/plugins/geological-mines/plugin.toml"),
+            include_str!("../../../examples/plugins/geological-mines/main.lua"),
+        ),
+        mc_server::BundledPlugin::LandClaims => mc_script::BundledLuauPlugin::new(
+            "land-claims",
+            include_str!("../../../examples/plugins/land-claims/plugin.toml"),
+            include_str!("../../../examples/plugins/land-claims/main.lua"),
+        )
+        .with_config(include_str!(
+            "../../../examples/plugins/land-claims/config.toml"
+        )),
+        mc_server::BundledPlugin::OnlineRoster => mc_script::BundledLuauPlugin::new(
+            "online-roster",
+            include_str!("../../../examples/plugins/online-roster/plugin.toml"),
+            include_str!("../../../examples/plugins/online-roster/main.lua"),
+        ),
+        mc_server::BundledPlugin::SettlementPrototype => mc_script::BundledLuauPlugin::new(
+            "settlement-prototype",
+            include_str!("../../../examples/plugins/settlement-prototype/plugin.toml"),
+            include_str!("../../../examples/plugins/settlement-prototype/main.lua"),
+        ),
+    }
+}
+
+fn prepare_configured_luau_plugins(
+    config: &ServerConfig,
+) -> Result<Option<mc_script::PreparedLuaPlugins>> {
+    let mut prepared = config
+        .plugins
+        .directory
+        .as_deref()
+        .map(|directory| {
+            mc_script::prepare_lua_plugins(mc_script::LuaHostConfig::new(directory)).with_context(
+                || {
+                    format!(
+                        "preparing external Luau plugins from {}",
+                        directory.display()
+                    )
+                },
+            )
+        })
+        .transpose()?;
+
+    if !config.plugins.bundled.is_empty() {
+        let packages = config
+            .plugins
+            .bundled
+            .iter()
+            .copied()
+            .map(bundled_luau_plugin)
+            .collect::<Vec<_>>();
+        let bundled = mc_script::prepare_bundled_luau_plugins(&packages)
+            .context("preparing server-bundled Luau plugins")?;
+        prepared = Some(match prepared {
+            Some(external) => external
+                .merge(bundled)
+                .context("merging external and server-bundled Luau plugins")?,
+            None => bundled,
+        });
+    }
+
+    Ok(prepared)
+}
+
 fn check_config(path: &Path) -> Result<()> {
     let cfg = load_config(path)?;
     let _ip: IpAddr = cfg.network.bind_address.parse().with_context(|| {
@@ -60,6 +141,7 @@ fn check_config(path: &Path) -> Result<()> {
         )
     })?;
     validate_runtime_config(&cfg)?;
+    let _prepared_plugins = prepare_configured_luau_plugins(&cfg)?;
     let effective = EffectiveConfig::from(&cfg);
     let rendered = serde_json::to_string_pretty(&effective).context("rendering config as JSON")?;
     println!("{rendered}");
@@ -467,14 +549,7 @@ async fn serve(path: &Path) -> Result<()> {
     let configured_geometry = cfg.data.chunk_geometry().map_err(anyhow::Error::msg)?;
     let world_dir = required_world_dir(&cfg)?;
     let worldgen_mode = cfg.data.worldgen_mode.to_worldgen();
-    let mut prepared_plugins = if let Some(directory) = cfg.plugins.directory.as_deref() {
-        Some(
-            mc_script::prepare_lua_plugins(mc_script::LuaHostConfig::new(directory))
-                .with_context(|| format!("preparing Lua plugins from {}", directory.display()))?,
-        )
-    } else {
-        None
-    };
+    let mut prepared_plugins = prepare_configured_luau_plugins(&cfg)?;
     let plugin_ore_profile = prepared_plugins
         .as_ref()
         .and_then(mc_script::PreparedLuaPlugins::worldgen_ore_profile);
@@ -803,17 +878,13 @@ async fn serve(path: &Path) -> Result<()> {
 
     let shutdown_handle = net.shutdown.clone();
     let (bound, lua_host) = if let Some(prepared) = prepared_plugins.take() {
-        let directory = cfg
-            .plugins
-            .directory
-            .as_deref()
-            .expect("prepared plugins have a configured directory");
         let (boundary, host) = mc_script::start_prepared_lua_host(prepared)
-            .with_context(|| format!("starting Lua plugins from {}", directory.display()))?;
+            .context("starting configured Luau plugins")?;
         tracing::info!(
-            directory = %directory.display(),
+            external_directory = ?cfg.plugins.directory.as_deref(),
+            bundled = cfg.plugins.bundled.len(),
             loaded = host.loaded_plugins(),
-            "Lua plugin host started"
+            "Luau plugin host started"
         );
         match mc_net::bind_with_scripts(net, boundary).await {
             Ok(bound) => (bound, Some(host)),
@@ -864,9 +935,9 @@ async fn run_bound_server(
 async fn join_lua_host(host: mc_script::LuaHost) -> Result<()> {
     let result = tokio::task::spawn_blocking(move || host.join())
         .await
-        .context("joining Lua host task")?;
+        .context("joining Luau host task")?;
     if result.is_err() {
-        bail!("Lua host thread panicked");
+        bail!("Luau host thread panicked");
     }
     Ok(())
 }
@@ -1814,6 +1885,41 @@ mod tests {
             })
             .collect::<Vec<_>>();
         Arc::new(mc_world::BlockRegistry::from_report(&report).unwrap())
+    }
+
+    #[test]
+    fn bundled_luau_plugins_prepare_runtime_and_worldgen_profiles() {
+        let config: ServerConfig = toml::from_str(
+            r#"
+                [server]
+                name = "Bundled"
+                motd = "Bundled plugins"
+
+                [network]
+                bind_address = "127.0.0.1"
+                port = 25565
+
+                [plugins]
+                bundled = ["online-roster", "geological-mines", "settlement-prototype"]
+            "#,
+        )
+        .unwrap();
+
+        let prepared = prepare_configured_luau_plugins(&config)
+            .unwrap()
+            .expect("bundled plugins should prepare a host");
+        assert_eq!(
+            prepared.worldgen_ore_profile(),
+            Some(mc_script::LuaWorldgenOreProfile::GeologicalDeposits)
+        );
+        assert_eq!(
+            prepared.worldgen_settlement_profile(),
+            Some(mc_script::LuaWorldgenSettlementProfile::PlainsVillagePrototype)
+        );
+        let (boundary, host) = mc_script::start_prepared_lua_host(prepared).unwrap();
+        assert_eq!(host.loaded_plugins(), 3);
+        drop(boundary);
+        host.join().unwrap();
     }
 
     #[test]

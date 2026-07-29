@@ -222,6 +222,46 @@ pub struct RegionalCommitDecision {
     removed: Vec<EntityId>,
 }
 
+#[derive(Debug, Clone, PartialEq)]
+pub struct VillagerInventoryPickupCommit {
+    pub villager: (EntitySnapshot, EntitySnapshot),
+    pub item: (EntitySnapshot, Option<EntitySnapshot>),
+    pub item_max_stack_size: i32,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct VillagerFoodShareCommit {
+    pub donor: (EntitySnapshot, EntitySnapshot),
+    pub recipient: EntitySnapshot,
+    pub thrown_item: SpawnEntity,
+    pub food_items: crate::villager_population_26_1_2::VillagerFoodItemIds,
+    pub item_max_stack_size: i32,
+    pub current_tick: u64,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct VillagerCourtshipCommit {
+    pub parents: [(EntitySnapshot, EntitySnapshot); 2],
+    pub current_tick: u64,
+    pub food_items: crate::villager_population_26_1_2::VillagerFoodItemIds,
+    pub deterministic_seed: u64,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct VillagerNoBedCommit {
+    pub parents: [(EntitySnapshot, EntitySnapshot); 2],
+    pub current_tick: u64,
+    pub food_items: crate::villager_population_26_1_2::VillagerFoodItemIds,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct VillagerBirthCommit {
+    pub parents: [(EntitySnapshot, EntitySnapshot); 2],
+    pub child: SpawnEntity,
+    pub current_tick: u64,
+    pub food_items: crate::villager_population_26_1_2::VillagerFoodItemIds,
+}
+
 impl RegionalCommitDecision {
     pub fn from_parts(
         phase: RegionPhase,
@@ -1258,6 +1298,7 @@ enum RegionalOwnerCommand {
         expected: Box<EntitySnapshot>,
         next: Box<EntitySnapshot>,
         defer_journal: bool,
+        allow_type_change: bool,
         reply: std::sync::mpsc::Sender<Result<bool, RegionOwnerLaneError>>,
     },
     ReplaceSnapshotsIfCurrent {
@@ -1268,6 +1309,26 @@ enum RegionalOwnerCommand {
         survivor_expected: Box<EntitySnapshot>,
         survivor_next: Box<EntitySnapshot>,
         consumed_expected: Box<EntitySnapshot>,
+        reply: std::sync::mpsc::Sender<Result<bool, RegionOwnerLaneError>>,
+    },
+    CommitVillagerInventoryPickupIfCurrent {
+        commit: Box<VillagerInventoryPickupCommit>,
+        reply: std::sync::mpsc::Sender<Result<bool, RegionOwnerLaneError>>,
+    },
+    CommitVillagerFoodShareIfCurrent {
+        commit: Box<VillagerFoodShareCommit>,
+        reply: std::sync::mpsc::Sender<Result<Option<EntitySnapshot>, RegionOwnerLaneError>>,
+    },
+    CommitVillagerBirthIfCurrent {
+        commit: Box<VillagerBirthCommit>,
+        reply: std::sync::mpsc::Sender<Result<Option<EntitySnapshot>, RegionOwnerLaneError>>,
+    },
+    CommitVillagerCourtshipIfCurrent {
+        commit: Box<VillagerCourtshipCommit>,
+        reply: std::sync::mpsc::Sender<Result<bool, RegionOwnerLaneError>>,
+    },
+    CommitVillagerNoBedIfCurrent {
+        commit: Box<VillagerNoBedCommit>,
         reply: std::sync::mpsc::Sender<Result<bool, RegionOwnerLaneError>>,
     },
     SetAnimalStatesIfCurrent {
@@ -2032,7 +2093,7 @@ impl RegionalOwnerHandle {
         expected: EntitySnapshot,
         next: EntitySnapshot,
     ) -> Result<bool, RegionOwnerLaneError> {
-        self.replace_snapshot_if_current_inner(expected, next, true)
+        self.replace_snapshot_if_current_inner(expected, next, true, false)
     }
 
     pub fn replace_snapshot_if_current_deferred_journal(
@@ -2040,7 +2101,15 @@ impl RegionalOwnerHandle {
         expected: EntitySnapshot,
         next: EntitySnapshot,
     ) -> Result<bool, RegionOwnerLaneError> {
-        self.replace_snapshot_if_current_inner(expected, next, false)
+        self.replace_snapshot_if_current_inner(expected, next, false, false)
+    }
+
+    pub fn convert_snapshot_if_current(
+        &self,
+        expected: EntitySnapshot,
+        next: EntitySnapshot,
+    ) -> Result<bool, RegionOwnerLaneError> {
+        self.replace_snapshot_if_current_inner(expected, next, true, true)
     }
 
     fn replace_snapshot_if_current_inner(
@@ -2048,6 +2117,7 @@ impl RegionalOwnerHandle {
         expected: EntitySnapshot,
         next: EntitySnapshot,
         journal_commit: bool,
+        allow_type_change: bool,
     ) -> Result<bool, RegionOwnerLaneError> {
         let (reply, result) = channel();
         self.sender
@@ -2055,6 +2125,7 @@ impl RegionalOwnerHandle {
                 expected: Box::new(expected),
                 next: Box::new(next),
                 defer_journal: !journal_commit,
+                allow_type_change,
                 reply,
             })
             .map_err(|_| RegionOwnerLaneError::Closed)?;
@@ -2088,6 +2159,78 @@ impl RegionalOwnerHandle {
                 survivor_expected: Box::new(survivor_expected),
                 survivor_next: Box::new(survivor_next),
                 consumed_expected: Box::new(consumed_expected),
+                reply,
+            })
+            .map_err(|_| RegionOwnerLaneError::Closed)?;
+        result.recv().map_err(|_| RegionOwnerLaneError::Closed)?
+    }
+
+    pub fn commit_villager_birth_if_current(
+        &self,
+        commit: VillagerBirthCommit,
+    ) -> Result<Option<EntitySnapshot>, RegionOwnerLaneError> {
+        let (reply, result) = channel();
+        self.sender
+            .send(RegionalOwnerCommand::CommitVillagerBirthIfCurrent {
+                commit: Box::new(commit),
+                reply,
+            })
+            .map_err(|_| RegionOwnerLaneError::Closed)?;
+        result.recv().map_err(|_| RegionOwnerLaneError::Closed)?
+    }
+
+    pub fn commit_villager_inventory_pickup_if_current(
+        &self,
+        commit: VillagerInventoryPickupCommit,
+    ) -> Result<bool, RegionOwnerLaneError> {
+        let (reply, result) = channel();
+        self.sender
+            .send(
+                RegionalOwnerCommand::CommitVillagerInventoryPickupIfCurrent {
+                    commit: Box::new(commit),
+                    reply,
+                },
+            )
+            .map_err(|_| RegionOwnerLaneError::Closed)?;
+        result.recv().map_err(|_| RegionOwnerLaneError::Closed)?
+    }
+
+    pub fn commit_villager_food_share_if_current(
+        &self,
+        commit: VillagerFoodShareCommit,
+    ) -> Result<Option<EntitySnapshot>, RegionOwnerLaneError> {
+        let (reply, result) = channel();
+        self.sender
+            .send(RegionalOwnerCommand::CommitVillagerFoodShareIfCurrent {
+                commit: Box::new(commit),
+                reply,
+            })
+            .map_err(|_| RegionOwnerLaneError::Closed)?;
+        result.recv().map_err(|_| RegionOwnerLaneError::Closed)?
+    }
+
+    pub fn commit_villager_courtship_if_current(
+        &self,
+        commit: VillagerCourtshipCommit,
+    ) -> Result<bool, RegionOwnerLaneError> {
+        let (reply, result) = channel();
+        self.sender
+            .send(RegionalOwnerCommand::CommitVillagerCourtshipIfCurrent {
+                commit: Box::new(commit),
+                reply,
+            })
+            .map_err(|_| RegionOwnerLaneError::Closed)?;
+        result.recv().map_err(|_| RegionOwnerLaneError::Closed)?
+    }
+
+    pub fn commit_villager_no_bed_if_current(
+        &self,
+        commit: VillagerNoBedCommit,
+    ) -> Result<bool, RegionOwnerLaneError> {
+        let (reply, result) = channel();
+        self.sender
+            .send(RegionalOwnerCommand::CommitVillagerNoBedIfCurrent {
+                commit: Box::new(commit),
                 reply,
             })
             .map_err(|_| RegionOwnerLaneError::Closed)?;
@@ -3273,10 +3416,15 @@ fn run_regional_owner_runtime(
                 expected,
                 next,
                 defer_journal,
+                allow_type_change,
                 reply,
             } => {
-                let result =
-                    coordinator.replace_snapshot_if_current_inner(*expected, *next, !defer_journal);
+                let result = coordinator.replace_snapshot_if_current_inner(
+                    *expected,
+                    *next,
+                    !defer_journal,
+                    allow_type_change,
+                );
                 if matches!(&result, Ok(true)) {
                     selected_read_routes
                         .write()
@@ -3306,6 +3454,56 @@ fn run_regional_owner_runtime(
                     *survivor_next,
                     *consumed_expected,
                 );
+                if matches!(&result, Ok(true)) {
+                    selected_read_routes
+                        .write()
+                        .unwrap_or_else(|poisoned| poisoned.into_inner())
+                        .clear();
+                }
+                let _ = reply.send(result);
+            }
+            RegionalOwnerCommand::CommitVillagerBirthIfCurrent { commit, reply } => {
+                let result = coordinator.commit_villager_birth_if_current(*commit);
+                if matches!(&result, Ok(Some(_))) {
+                    selected_read_routes
+                        .write()
+                        .unwrap_or_else(|poisoned| poisoned.into_inner())
+                        .clear();
+                }
+                let _ = reply.send(result);
+            }
+            RegionalOwnerCommand::CommitVillagerInventoryPickupIfCurrent { commit, reply } => {
+                let result = coordinator.commit_villager_inventory_pickup_if_current(*commit);
+                if matches!(&result, Ok(true)) {
+                    selected_read_routes
+                        .write()
+                        .unwrap_or_else(|poisoned| poisoned.into_inner())
+                        .clear();
+                }
+                let _ = reply.send(result);
+            }
+            RegionalOwnerCommand::CommitVillagerFoodShareIfCurrent { commit, reply } => {
+                let result = coordinator.commit_villager_food_share_if_current(*commit);
+                if matches!(&result, Ok(Some(_))) {
+                    selected_read_routes
+                        .write()
+                        .unwrap_or_else(|poisoned| poisoned.into_inner())
+                        .clear();
+                }
+                let _ = reply.send(result);
+            }
+            RegionalOwnerCommand::CommitVillagerCourtshipIfCurrent { commit, reply } => {
+                let result = coordinator.commit_villager_courtship_if_current(*commit);
+                if matches!(&result, Ok(true)) {
+                    selected_read_routes
+                        .write()
+                        .unwrap_or_else(|poisoned| poisoned.into_inner())
+                        .clear();
+                }
+                let _ = reply.send(result);
+            }
+            RegionalOwnerCommand::CommitVillagerNoBedIfCurrent { commit, reply } => {
+                let result = coordinator.commit_villager_no_bed_if_current(*commit);
                 if matches!(&result, Ok(true)) {
                     selected_read_routes
                         .write()
@@ -4693,7 +4891,15 @@ impl RegionalOwnerCoordinator {
         expected: EntitySnapshot,
         next: EntitySnapshot,
     ) -> Result<bool, RegionOwnerLaneError> {
-        self.replace_snapshot_if_current_inner(expected, next, true)
+        self.replace_snapshot_if_current_inner(expected, next, true, false)
+    }
+
+    pub fn convert_snapshot_if_current(
+        &mut self,
+        expected: EntitySnapshot,
+        next: EntitySnapshot,
+    ) -> Result<bool, RegionOwnerLaneError> {
+        self.replace_snapshot_if_current_inner(expected, next, true, true)
     }
 
     fn replace_snapshot_if_current_inner(
@@ -4701,9 +4907,17 @@ impl RegionalOwnerCoordinator {
         expected: EntitySnapshot,
         next: EntitySnapshot,
         journal_commit: bool,
+        allow_type_change: bool,
     ) -> Result<bool, RegionOwnerLaneError> {
         let entity_id = expected.id;
-        if expected.id != next.id || expected.uuid != next.uuid {
+        let type_change_valid = if allow_type_change {
+            expected.type_id != next.type_id
+                && expected.type_name != next.type_name
+                && expected.position == next.position
+        } else {
+            expected.type_id == next.type_id && expected.type_name == next.type_name
+        };
+        if expected.id != next.id || expected.uuid != next.uuid || !type_change_valid {
             return Err(RegionOwnerLaneError::InvalidMutation);
         }
         if expected.retained.item_pickup_claim.is_some()
@@ -4746,6 +4960,7 @@ impl RegionalOwnerCoordinator {
                     mutation: RegionOwnerMutation::ReplaceSnapshotIfCurrent {
                         expected: Box::new(expected),
                         next: Box::new(next),
+                        allow_type_change,
                     },
                 }],
             );
@@ -4846,6 +5061,7 @@ impl RegionalOwnerCoordinator {
                 mutation: RegionOwnerMutation::ReplaceSnapshotIfCurrent {
                     expected: Box::new(survivor_expected),
                     next: Box::new(survivor_next),
+                    allow_type_change: false,
                 },
             });
         mutations
@@ -4863,6 +5079,812 @@ impl RegionalOwnerCoordinator {
                 Ok(true)
             }
             Err(RegionOwnerLaneError::InvalidMutation) => Ok(false),
+            Err(error) => Err(error),
+        }
+    }
+
+    pub fn commit_villager_inventory_pickup_if_current(
+        &mut self,
+        commit: VillagerInventoryPickupCommit,
+    ) -> Result<bool, RegionOwnerLaneError> {
+        let VillagerInventoryPickupCommit {
+            villager: (villager_expected, villager_next),
+            item: (item_expected, item_next),
+            item_max_stack_size,
+        } = commit;
+        let item_stack = item_expected
+            .item_stack
+            .as_ref()
+            .ok_or(RegionOwnerLaneError::InvalidMutation)?;
+        if villager_expected.type_name != "minecraft:villager"
+            || villager_expected.lifecycle != EntityLifecycle::Alive
+            || villager_next.lifecycle != EntityLifecycle::Alive
+            || item_expected.type_name != "minecraft:item"
+            || item_expected.lifecycle != EntityLifecycle::Alive
+            || item_next
+                .as_ref()
+                .is_some_and(|next| next.lifecycle != EntityLifecycle::Alive)
+            || villager_expected.id == item_expected.id
+            || villager_expected.uuid == item_expected.uuid
+            || villager_expected.id != villager_next.id
+            || villager_expected.uuid != villager_next.uuid
+            || villager_expected.type_id != villager_next.type_id
+            || villager_expected.position != villager_next.position
+            || villager_expected.vehicle.is_some()
+            || villager_next.vehicle.is_some()
+            || item_expected.vehicle.is_some()
+            || item_next
+                .as_ref()
+                .is_some_and(|next| next.vehicle.is_some())
+            || villager_expected.retained.item_pickup_claim.is_some()
+            || villager_next.retained.item_pickup_claim.is_some()
+            || item_expected.retained.item_pickup_claim.is_some()
+            || item_next
+                .as_ref()
+                .is_some_and(|next| next.retained.item_pickup_claim.is_some())
+            || item_max_stack_size <= 0
+        {
+            return Err(RegionOwnerLaneError::InvalidMutation);
+        }
+
+        let villager_min_x = villager_expected.position.x - 1.3;
+        let villager_max_x = villager_expected.position.x + 1.3;
+        let villager_min_y = villager_expected.position.y;
+        let villager_max_y = villager_expected.position.y + 1.95;
+        let villager_min_z = villager_expected.position.z - 1.3;
+        let villager_max_z = villager_expected.position.z + 1.3;
+        let item_min_x = item_expected.position.x - 0.125;
+        let item_max_x = item_expected.position.x + 0.125;
+        let item_min_y = item_expected.position.y;
+        let item_max_y = item_expected.position.y + 0.25;
+        let item_min_z = item_expected.position.z - 0.125;
+        let item_max_z = item_expected.position.z + 0.125;
+        if !villager_expected.position.is_finite()
+            || !item_expected.position.is_finite()
+            || item_max_x < villager_min_x
+            || item_min_x > villager_max_x
+            || item_max_y < villager_min_y
+            || item_min_y > villager_max_y
+            || item_max_z < villager_min_z
+            || item_min_z > villager_max_z
+        {
+            return Err(RegionOwnerLaneError::InvalidMutation);
+        }
+
+        let mut derived_population = villager_expected
+            .retained
+            .villager_population
+            .clone()
+            .ok_or(RegionOwnerLaneError::InvalidMutation)?;
+        let remainder = derived_population
+            .add_to_inventory(item_stack.clone(), item_max_stack_size)
+            .map_err(|_| RegionOwnerLaneError::InvalidMutation)?;
+        let mut derived_villager_next = villager_expected.clone();
+        derived_villager_next.retained.villager_population = Some(derived_population);
+        let derived_item_next = remainder.map(|remainder| {
+            let mut next = item_expected.clone();
+            next.item_stack = Some(remainder);
+            next
+        });
+        if villager_next != derived_villager_next || item_next != derived_item_next {
+            return Err(RegionOwnerLaneError::InvalidMutation);
+        }
+
+        let villager_key = RegionKey::from_position(villager_expected.position)
+            .ok_or(RegionOwnerLaneError::InvalidMutation)?;
+        let item_key = RegionKey::from_position(item_expected.position)
+            .ok_or(RegionOwnerLaneError::InvalidMutation)?;
+        if self.locations.get(&villager_expected.id).copied() != Some(villager_key)
+            || self.locations.get(&item_expected.id).copied() != Some(item_key)
+            || self.in_flight_transfers.contains_key(&villager_expected.id)
+            || self.in_flight_transfers.contains_key(&item_expected.id)
+            || self.snapshot(villager_expected.id)?.as_ref() != Some(&villager_expected)
+            || self.snapshot(item_expected.id)?.as_ref() != Some(&item_expected)
+        {
+            return Ok(false);
+        }
+        if [villager_expected.id, item_expected.id].iter().any(|id| {
+            self.passenger_vehicles.contains_key(id) || self.vehicle_passengers.contains_key(id)
+        }) {
+            return Err(RegionOwnerLaneError::InvalidMutation);
+        }
+
+        let (first_sequence, sequence_watermark) = self.commit_state.reserve_sequences(2)?;
+        let mut mutations = BTreeMap::<usize, Vec<SequencedRegionMutation>>::new();
+        let villager_lease = self
+            .ownership
+            .lease(villager_key)
+            .ok_or(RegionOwnerLaneError::StaleLease)?;
+        mutations
+            .entry(villager_lease.lane)
+            .or_default()
+            .push(SequencedRegionMutation {
+                sequence: first_sequence + 1,
+                lease: villager_lease,
+                mutation: RegionOwnerMutation::ReplaceSnapshotIfCurrent {
+                    expected: Box::new(villager_expected),
+                    next: Box::new(villager_next),
+                    allow_type_change: false,
+                },
+            });
+        let item_lease = self
+            .ownership
+            .lease(item_key)
+            .ok_or(RegionOwnerLaneError::StaleLease)?;
+        let item_was_removed = item_next.is_none();
+        let (item_id, item_uuid) = (item_expected.id, item_expected.uuid);
+        let item_mutation = match item_next {
+            Some(next) => RegionOwnerMutation::ReplaceSnapshotIfCurrent {
+                expected: Box::new(item_expected),
+                next: Box::new(next),
+                allow_type_change: false,
+            },
+            None => RegionOwnerMutation::RemoveIfCurrent(Box::new(item_expected)),
+        };
+        mutations
+            .entry(item_lease.lane)
+            .or_default()
+            .push(SequencedRegionMutation {
+                sequence: sequence_watermark,
+                lease: item_lease,
+                mutation: item_mutation,
+            });
+
+        match self.execute_mutations(mutations, sequence_watermark) {
+            Ok(()) => {
+                if item_was_removed {
+                    self.locations.remove(&item_id);
+                    self.uuids.remove(&item_uuid);
+                }
+                Ok(true)
+            }
+            Err(
+                RegionOwnerLaneError::InvalidMutation
+                | RegionOwnerLaneError::StaleLease
+                | RegionOwnerLaneError::UnknownEntity,
+            ) => Ok(false),
+            Err(error) => Err(error),
+        }
+    }
+
+    pub fn commit_villager_food_share_if_current(
+        &mut self,
+        commit: VillagerFoodShareCommit,
+    ) -> Result<Option<EntitySnapshot>, RegionOwnerLaneError> {
+        let VillagerFoodShareCommit {
+            donor: (donor_expected, donor_next),
+            recipient,
+            thrown_item,
+            food_items,
+            item_max_stack_size,
+            current_tick,
+        } = commit;
+        if donor_expected.id == recipient.id
+            || donor_expected.uuid == recipient.uuid
+            || donor_expected.type_name != "minecraft:villager"
+            || recipient.type_name != "minecraft:villager"
+            || donor_expected.lifecycle != EntityLifecycle::Alive
+            || donor_next.lifecycle != EntityLifecycle::Alive
+            || recipient.lifecycle != EntityLifecycle::Alive
+            || donor_expected.id != donor_next.id
+            || donor_expected.uuid != donor_next.uuid
+            || donor_expected.type_id != donor_next.type_id
+            || donor_expected.position != donor_next.position
+            || donor_expected.vehicle.is_some()
+            || donor_next.vehicle.is_some()
+            || recipient.vehicle.is_some()
+            || donor_expected.retained.item_pickup_claim.is_some()
+            || donor_next.retained.item_pickup_claim.is_some()
+            || recipient.retained.item_pickup_claim.is_some()
+            || item_max_stack_size <= 0
+        {
+            return Err(RegionOwnerLaneError::InvalidMutation);
+        }
+        let dx = recipient.position.x - donor_expected.position.x;
+        let dy = recipient.position.y - donor_expected.position.y;
+        let dz = recipient.position.z - donor_expected.position.z;
+        let distance_squared = dx.mul_add(dx, dy.mul_add(dy, dz * dz));
+        if !distance_squared.is_finite()
+            || distance_squared
+                > crate::villager_population_26_1_2::VILLAGER_COURTSHIP_DISTANCE_SQUARED
+        {
+            return Err(RegionOwnerLaneError::InvalidMutation);
+        }
+        let recipient_population = recipient
+            .retained
+            .villager_population
+            .as_ref()
+            .ok_or(RegionOwnerLaneError::InvalidMutation)?;
+        if !recipient_population.wants_more_food(food_items) {
+            return Err(RegionOwnerLaneError::InvalidMutation);
+        }
+        let mut derived_population = donor_expected
+            .retained
+            .villager_population
+            .clone()
+            .ok_or(RegionOwnerLaneError::InvalidMutation)?;
+        let shared = derived_population
+            .inventory
+            .extract_food_share(food_items, item_max_stack_size)
+            .ok_or(RegionOwnerLaneError::InvalidMutation)?;
+        let mut derived_donor_next = donor_expected.clone();
+        derived_donor_next.retained.villager_population = Some(derived_population);
+        if donor_next != derived_donor_next {
+            return Err(RegionOwnerLaneError::InvalidMutation);
+        }
+
+        let thrown_uuid = thrown_item
+            .uuid
+            .ok_or(RegionOwnerLaneError::InvalidMutation)?;
+        if self.uuids.contains_key(&thrown_uuid) {
+            return Ok(None);
+        }
+        let throw_length = distance_squared.sqrt();
+        let expected_velocity = if throw_length > 0.0 {
+            Vec3::new(
+                dx / throw_length
+                    * crate::villager_population_26_1_2::VILLAGER_ITEM_THROW_SPEED,
+                dy / throw_length
+                    * crate::villager_population_26_1_2::VILLAGER_ITEM_THROW_SPEED,
+                dz / throw_length
+                    * crate::villager_population_26_1_2::VILLAGER_ITEM_THROW_SPEED,
+            )
+        } else {
+            Vec3::new(0.0, 0.0, 0.0)
+        };
+        let expected_position = Vec3::new(
+            donor_expected.position.x,
+            donor_expected.position.y
+                + crate::villager_population_26_1_2::VILLAGER_ITEM_THROW_Y_OFFSET,
+            donor_expected.position.z,
+        );
+        if thrown_item.type_name != "minecraft:item"
+            || thrown_item.position != expected_position
+            || thrown_item.velocity != expected_velocity
+            || thrown_item.item_stack.as_ref() != Some(&shared)
+            || thrown_item.vehicle.is_some()
+            || thrown_item.retained.spawn_tick != current_tick
+            || thrown_item.retained.item_pickup_ready_tick
+                != current_tick.checked_add(
+                    crate::villager_population_26_1_2::VILLAGER_ITEM_THROW_PICKUP_DELAY_TICKS,
+                )
+            || thrown_item.retained.item_pickup_owner_block.is_some()
+            || !thrown_item.position.is_finite()
+            || !thrown_item.velocity.is_finite()
+        {
+            return Err(RegionOwnerLaneError::InvalidMutation);
+        }
+
+        let donor_key = RegionKey::from_position(donor_expected.position)
+            .ok_or(RegionOwnerLaneError::InvalidMutation)?;
+        let recipient_key = RegionKey::from_position(recipient.position)
+            .ok_or(RegionOwnerLaneError::InvalidMutation)?;
+        let thrown_key = RegionKey::from_position(thrown_item.position)
+            .ok_or(RegionOwnerLaneError::InvalidMutation)?;
+        if self.locations.get(&donor_expected.id).copied() != Some(donor_key)
+            || self.locations.get(&recipient.id).copied() != Some(recipient_key)
+            || self.in_flight_transfers.contains_key(&donor_expected.id)
+            || self.in_flight_transfers.contains_key(&recipient.id)
+            || self.snapshot(donor_expected.id)?.as_ref() != Some(&donor_expected)
+            || self.snapshot(recipient.id)?.as_ref() != Some(&recipient)
+            || [donor_expected.id, recipient.id].iter().any(|id| {
+                self.passenger_vehicles.contains_key(id)
+                    || self.vehicle_passengers.contains_key(id)
+            })
+        {
+            return Ok(None);
+        }
+        self.ensure_region(thrown_key)?;
+        let mut child_id_cursor = self.next_id;
+        let thrown_id = loop {
+            child_id_cursor = child_id_cursor
+                .max(0)
+                .checked_add(1)
+                .ok_or(RegionOwnerLaneError::InvalidMutation)?;
+            let candidate = EntityId(child_id_cursor);
+            if !self.locations.contains_key(&candidate) {
+                break candidate;
+            }
+        };
+        let thrown_snapshot = snapshot_from_spawn(thrown_id, thrown_uuid, thrown_item);
+        if self.locations.contains_key(&thrown_snapshot.id)
+            || self.uuids.contains_key(&thrown_snapshot.uuid)
+        {
+            return Ok(None);
+        }
+
+        let (first_sequence, sequence_watermark) = self.commit_state.reserve_sequences(2)?;
+        let donor_lease = self
+            .ownership
+            .lease(donor_key)
+            .ok_or(RegionOwnerLaneError::StaleLease)?;
+        let thrown_lease = self
+            .ownership
+            .lease(thrown_key)
+            .ok_or(RegionOwnerLaneError::StaleLease)?;
+        let mut mutations = BTreeMap::<usize, Vec<SequencedRegionMutation>>::new();
+        mutations
+            .entry(donor_lease.lane)
+            .or_default()
+            .push(SequencedRegionMutation {
+                sequence: first_sequence + 1,
+                lease: donor_lease,
+                mutation: RegionOwnerMutation::ReplaceSnapshotIfCurrent {
+                    expected: Box::new(donor_expected),
+                    next: Box::new(donor_next),
+                    allow_type_change: false,
+                },
+            });
+        mutations
+            .entry(thrown_lease.lane)
+            .or_default()
+            .push(SequencedRegionMutation {
+                sequence: sequence_watermark,
+                lease: thrown_lease,
+                mutation: RegionOwnerMutation::InsertSnapshot(Box::new(thrown_snapshot.clone())),
+            });
+        match self.execute_mutations(mutations, sequence_watermark) {
+            Ok(()) => {
+                self.next_id = thrown_snapshot.id.0;
+                self.locations.insert(thrown_snapshot.id, thrown_key);
+                self.uuids.insert(thrown_snapshot.uuid, thrown_snapshot.id);
+                Ok(Some(thrown_snapshot))
+            }
+            Err(
+                RegionOwnerLaneError::InvalidMutation
+                | RegionOwnerLaneError::StaleLease
+                | RegionOwnerLaneError::UnknownEntity,
+            ) => Ok(None),
+            Err(error) => Err(error),
+        }
+    }
+
+    pub fn commit_villager_courtship_if_current(
+        &mut self,
+        commit: VillagerCourtshipCommit,
+    ) -> Result<bool, RegionOwnerLaneError> {
+        let VillagerCourtshipCommit {
+            parents,
+            current_tick,
+            food_items,
+            deterministic_seed,
+        } = commit;
+        let dx = parents[0].0.position.x - parents[1].0.position.x;
+        let dy = parents[0].0.position.y - parents[1].0.position.y;
+        let dz = parents[0].0.position.z - parents[1].0.position.z;
+        let distance_squared = dx.mul_add(dx, dy.mul_add(dy, dz * dz));
+        if parents[0].0.id == parents[1].0.id
+            || parents[0].0.uuid == parents[1].0.uuid
+            || !distance_squared.is_finite()
+            || distance_squared > 64.0
+        {
+            return Err(RegionOwnerLaneError::InvalidMutation);
+        }
+
+        let mut expected_ids = HashSet::with_capacity(2);
+        let mut expected_uuids = HashSet::with_capacity(2);
+        let mut parent_locations = Vec::with_capacity(2);
+        for (index, (expected, next)) in parents.iter().enumerate() {
+            if expected.type_name != "minecraft:villager"
+                || expected.lifecycle != EntityLifecycle::Alive
+                || next.lifecycle != EntityLifecycle::Alive
+                || expected.id != next.id
+                || expected.uuid != next.uuid
+                || expected.type_id != next.type_id
+                || expected.position != next.position
+                || expected.vehicle.is_some()
+                || next.vehicle.is_some()
+                || expected.retained.item_pickup_claim.is_some()
+                || next.retained.item_pickup_claim.is_some()
+                || !expected_ids.insert(expected.id)
+                || !expected_uuids.insert(expected.uuid)
+            {
+                return Err(RegionOwnerLaneError::InvalidMutation);
+            }
+            let mut derived_population = expected
+                .retained
+                .villager_population
+                .clone()
+                .ok_or(RegionOwnerLaneError::InvalidMutation)?;
+            derived_population
+                .start_pending_birth(
+                    parents[1 - index].0.uuid,
+                    current_tick,
+                    deterministic_seed,
+                    false,
+                    food_items,
+                )
+                .map_err(|_| RegionOwnerLaneError::InvalidMutation)?;
+            let mut derived_next = expected.clone();
+            derived_next.retained.villager_population = Some(derived_population);
+            if *next != derived_next {
+                return Err(RegionOwnerLaneError::InvalidMutation);
+            }
+            let Some(key) = RegionKey::from_position(expected.position) else {
+                return Err(RegionOwnerLaneError::InvalidMutation);
+            };
+            if self.locations.get(&expected.id).copied() != Some(key)
+                || self.in_flight_transfers.contains_key(&expected.id)
+                || self.snapshot(expected.id)?.as_ref() != Some(expected)
+            {
+                return Ok(false);
+            }
+            parent_locations.push(key);
+        }
+        if expected_ids.iter().any(|id| {
+            self.passenger_vehicles.contains_key(id) || self.vehicle_passengers.contains_key(id)
+        }) {
+            return Err(RegionOwnerLaneError::InvalidMutation);
+        }
+
+        let (first_sequence, sequence_watermark) = self.commit_state.reserve_sequences(2)?;
+        let mut sequence = first_sequence;
+        let mut mutations = BTreeMap::<usize, Vec<SequencedRegionMutation>>::new();
+        for ((expected, next), key) in parents.into_iter().zip(parent_locations) {
+            sequence += 1;
+            let lease = self
+                .ownership
+                .lease(key)
+                .ok_or(RegionOwnerLaneError::StaleLease)?;
+            mutations
+                .entry(lease.lane)
+                .or_default()
+                .push(SequencedRegionMutation {
+                    sequence,
+                    lease,
+                    mutation: RegionOwnerMutation::ReplaceSnapshotIfCurrent {
+                        expected: Box::new(expected),
+                        next: Box::new(next),
+                        allow_type_change: false,
+                    },
+                });
+        }
+        debug_assert_eq!(sequence, sequence_watermark);
+
+        match self.execute_mutations(mutations, sequence_watermark) {
+            Ok(()) => Ok(true),
+            Err(
+                RegionOwnerLaneError::InvalidMutation
+                | RegionOwnerLaneError::StaleLease
+                | RegionOwnerLaneError::UnknownEntity,
+            ) => Ok(false),
+            Err(error) => Err(error),
+        }
+    }
+
+    pub fn commit_villager_no_bed_if_current(
+        &mut self,
+        commit: VillagerNoBedCommit,
+    ) -> Result<bool, RegionOwnerLaneError> {
+        let VillagerNoBedCommit {
+            parents,
+            current_tick,
+            food_items,
+        } = commit;
+        let first_population = parents[0]
+            .0
+            .retained
+            .villager_population
+            .as_ref()
+            .ok_or(RegionOwnerLaneError::InvalidMutation)?;
+        let second_population = parents[1]
+            .0
+            .retained
+            .villager_population
+            .as_ref()
+            .ok_or(RegionOwnerLaneError::InvalidMutation)?;
+        let first_pending = first_population
+            .pending_birth
+            .as_ref()
+            .ok_or(RegionOwnerLaneError::InvalidMutation)?;
+        let second_pending = second_population
+            .pending_birth
+            .as_ref()
+            .ok_or(RegionOwnerLaneError::InvalidMutation)?;
+        let dx = parents[0].0.position.x - parents[1].0.position.x;
+        let dy = parents[0].0.position.y - parents[1].0.position.y;
+        let dz = parents[0].0.position.z - parents[1].0.position.z;
+        let distance_squared = dx.mul_add(dx, dy.mul_add(dy, dz * dz));
+        if parents[0].0.id == parents[1].0.id
+            || parents[0].0.uuid == parents[1].0.uuid
+            || !distance_squared.is_finite()
+            || distance_squared
+                > crate::villager_population_26_1_2::VILLAGER_COURTSHIP_DISTANCE_SQUARED
+            || first_pending.partner_uuid != parents[1].0.uuid
+            || second_pending.partner_uuid != parents[0].0.uuid
+            || first_pending.started_tick != second_pending.started_tick
+            || first_pending.ready_tick != second_pending.ready_tick
+            || current_tick < first_pending.ready_tick
+        {
+            return Err(RegionOwnerLaneError::InvalidMutation);
+        }
+
+        let mut expected_ids = HashSet::with_capacity(2);
+        let mut expected_uuids = HashSet::with_capacity(2);
+        let mut parent_locations = Vec::with_capacity(2);
+        for (expected, next) in &parents {
+            if expected.type_name != "minecraft:villager"
+                || expected.lifecycle != EntityLifecycle::Alive
+                || next.lifecycle != EntityLifecycle::Alive
+                || expected.id != next.id
+                || expected.uuid != next.uuid
+                || expected.type_id != next.type_id
+                || expected.position != next.position
+                || expected.vehicle.is_some()
+                || next.vehicle.is_some()
+                || expected.retained.item_pickup_claim.is_some()
+                || next.retained.item_pickup_claim.is_some()
+                || !expected_ids.insert(expected.id)
+                || !expected_uuids.insert(expected.uuid)
+            {
+                return Err(RegionOwnerLaneError::InvalidMutation);
+            }
+            let mut derived_population = expected
+                .retained
+                .villager_population
+                .clone()
+                .ok_or(RegionOwnerLaneError::InvalidMutation)?;
+            derived_population
+                .finish_courtship_without_child(current_tick, food_items)
+                .map_err(|_| RegionOwnerLaneError::InvalidMutation)?;
+            let mut derived_next = expected.clone();
+            derived_next.retained.villager_population = Some(derived_population);
+            if *next != derived_next {
+                return Err(RegionOwnerLaneError::InvalidMutation);
+            }
+            let key = RegionKey::from_position(expected.position)
+                .ok_or(RegionOwnerLaneError::InvalidMutation)?;
+            if self.locations.get(&expected.id).copied() != Some(key)
+                || self.in_flight_transfers.contains_key(&expected.id)
+                || self.snapshot(expected.id)?.as_ref() != Some(expected)
+            {
+                return Ok(false);
+            }
+            parent_locations.push(key);
+        }
+        if expected_ids.iter().any(|id| {
+            self.passenger_vehicles.contains_key(id) || self.vehicle_passengers.contains_key(id)
+        }) {
+            return Err(RegionOwnerLaneError::InvalidMutation);
+        }
+
+        let (first_sequence, sequence_watermark) = self.commit_state.reserve_sequences(2)?;
+        let mut sequence = first_sequence;
+        let mut mutations = BTreeMap::<usize, Vec<SequencedRegionMutation>>::new();
+        for ((expected, next), key) in parents.into_iter().zip(parent_locations) {
+            sequence += 1;
+            let lease = self
+                .ownership
+                .lease(key)
+                .ok_or(RegionOwnerLaneError::StaleLease)?;
+            mutations
+                .entry(lease.lane)
+                .or_default()
+                .push(SequencedRegionMutation {
+                    sequence,
+                    lease,
+                    mutation: RegionOwnerMutation::ReplaceSnapshotIfCurrent {
+                        expected: Box::new(expected),
+                        next: Box::new(next),
+                        allow_type_change: false,
+                    },
+                });
+        }
+        debug_assert_eq!(sequence, sequence_watermark);
+        match self.execute_mutations(mutations, sequence_watermark) {
+            Ok(()) => Ok(true),
+            Err(
+                RegionOwnerLaneError::InvalidMutation
+                | RegionOwnerLaneError::StaleLease
+                | RegionOwnerLaneError::UnknownEntity,
+            ) => Ok(false),
+            Err(error) => Err(error),
+        }
+    }
+
+    pub fn commit_villager_birth_if_current(
+        &mut self,
+        commit: VillagerBirthCommit,
+    ) -> Result<Option<EntitySnapshot>, RegionOwnerLaneError> {
+        let VillagerBirthCommit {
+            parents,
+            child,
+            current_tick,
+            food_items,
+        } = commit;
+        let child_uuid = child.uuid.ok_or(RegionOwnerLaneError::InvalidMutation)?;
+        let mut child_id_cursor = self.next_id;
+        let child_id = loop {
+            child_id_cursor = child_id_cursor
+                .max(0)
+                .checked_add(1)
+                .ok_or(RegionOwnerLaneError::InvalidMutation)?;
+            let candidate = EntityId(child_id_cursor);
+            if !self.locations.contains_key(&candidate) {
+                break candidate;
+            }
+        };
+        let child = snapshot_from_spawn(child_id, child_uuid, child);
+        let first_population = parents[0]
+            .0
+            .retained
+            .villager_population
+            .as_ref()
+            .ok_or(RegionOwnerLaneError::InvalidMutation)?;
+        let second_population = parents[1]
+            .0
+            .retained
+            .villager_population
+            .as_ref()
+            .ok_or(RegionOwnerLaneError::InvalidMutation)?;
+        let first_pending = first_population
+            .pending_birth
+            .as_ref()
+            .ok_or(RegionOwnerLaneError::InvalidMutation)?;
+        let second_pending = second_population
+            .pending_birth
+            .as_ref()
+            .ok_or(RegionOwnerLaneError::InvalidMutation)?;
+        let child_population = child
+            .retained
+            .villager_population
+            .as_ref()
+            .ok_or(RegionOwnerLaneError::InvalidMutation)?;
+        let claimed_home = child_population
+            .claimed_home
+            .as_deref()
+            .filter(|home| !home.is_empty())
+            .ok_or(RegionOwnerLaneError::InvalidMutation)?;
+        let expected_child_uuid =
+            crate::villager_population_26_1_2::deterministic_villager_child_uuid(
+                parents[0].0.uuid,
+                parents[1].0.uuid,
+                claimed_home,
+                first_pending.started_tick,
+            );
+        let dx = parents[0].0.position.x - parents[1].0.position.x;
+        let dy = parents[0].0.position.y - parents[1].0.position.y;
+        let dz = parents[0].0.position.z - parents[1].0.position.z;
+        let distance_squared = dx.mul_add(dx, dy.mul_add(dy, dz * dz));
+        if parents[0].0.id == parents[1].0.id
+            || parents[0].0.uuid == parents[1].0.uuid
+            || !distance_squared.is_finite()
+            || distance_squared > 5.0
+            || first_pending.partner_uuid != parents[1].0.uuid
+            || second_pending.partner_uuid != parents[0].0.uuid
+            || first_pending.started_tick != second_pending.started_tick
+            || first_pending.ready_tick != second_pending.ready_tick
+            || current_tick < first_pending.ready_tick
+            || child_uuid != expected_child_uuid
+            || child.type_name != "minecraft:villager"
+            || child.vehicle.is_some()
+            || child.retained.item_pickup_claim.is_some()
+            || child_population.age_ticks
+                != crate::villager_population_26_1_2::VILLAGER_BABY_START_AGE_TICKS
+            || child_population.food_level != 0
+            || child_population
+                .inventory
+                .slots()
+                .iter()
+                .any(Option::is_some)
+            || child_population.pending_birth.is_some()
+            || !child.rotation.is_finite()
+            || !child.velocity.is_finite()
+        {
+            return Err(RegionOwnerLaneError::InvalidMutation);
+        }
+
+        let mut expected_ids = HashSet::with_capacity(2);
+        let mut expected_uuids = HashSet::with_capacity(2);
+        let mut parent_locations = Vec::with_capacity(2);
+        for (expected, next) in &parents {
+            if expected.type_name != "minecraft:villager"
+                || expected.lifecycle != EntityLifecycle::Alive
+                || next.lifecycle != EntityLifecycle::Alive
+                || expected.id != next.id
+                || expected.uuid != next.uuid
+                || expected.type_id != next.type_id
+                || expected.position != next.position
+                || expected.vehicle.is_some()
+                || next.vehicle.is_some()
+                || expected.retained.item_pickup_claim.is_some()
+                || next.retained.item_pickup_claim.is_some()
+                || !expected_ids.insert(expected.id)
+                || !expected_uuids.insert(expected.uuid)
+            {
+                return Err(RegionOwnerLaneError::InvalidMutation);
+            }
+            let mut derived_population = expected
+                .retained
+                .villager_population
+                .clone()
+                .ok_or(RegionOwnerLaneError::InvalidMutation)?;
+            derived_population
+                .finish_successful_birth(current_tick, food_items)
+                .map_err(|_| RegionOwnerLaneError::InvalidMutation)?;
+            let mut derived_next = expected.clone();
+            derived_next.retained.villager_population = Some(derived_population);
+            if *next != derived_next {
+                return Err(RegionOwnerLaneError::InvalidMutation);
+            }
+            let Some(key) = RegionKey::from_position(expected.position) else {
+                return Err(RegionOwnerLaneError::InvalidMutation);
+            };
+            if self.locations.get(&expected.id).copied() != Some(key)
+                || self.in_flight_transfers.contains_key(&expected.id)
+                || self.snapshot(expected.id)?.as_ref() != Some(expected)
+            {
+                return Ok(None);
+            }
+            parent_locations.push(key);
+        }
+
+        let Some(child_key) = RegionKey::from_position(child.position) else {
+            return Err(RegionOwnerLaneError::InvalidMutation);
+        };
+        if expected_ids.contains(&child.id)
+            || expected_uuids.contains(&child.uuid)
+            || self.locations.contains_key(&child.id)
+            || self.uuids.contains_key(&child.uuid)
+            || self.passenger_vehicles.contains_key(&child.id)
+            || self.vehicle_passengers.contains_key(&child.id)
+            || expected_ids.iter().any(|id| {
+                self.passenger_vehicles.contains_key(id) || self.vehicle_passengers.contains_key(id)
+            })
+        {
+            return Err(RegionOwnerLaneError::InvalidMutation);
+        }
+        self.ensure_region(child_key)?;
+
+        let (first_sequence, sequence_watermark) = self.commit_state.reserve_sequences(3)?;
+        let mut sequence = first_sequence;
+        let mut mutations = BTreeMap::<usize, Vec<SequencedRegionMutation>>::new();
+        for ((expected, next), key) in parents.into_iter().zip(parent_locations) {
+            sequence += 1;
+            let lease = self
+                .ownership
+                .lease(key)
+                .ok_or(RegionOwnerLaneError::StaleLease)?;
+            mutations
+                .entry(lease.lane)
+                .or_default()
+                .push(SequencedRegionMutation {
+                    sequence,
+                    lease,
+                    mutation: RegionOwnerMutation::ReplaceSnapshotIfCurrent {
+                        expected: Box::new(expected),
+                        next: Box::new(next),
+                        allow_type_change: false,
+                    },
+                });
+        }
+        sequence += 1;
+        let child_lease = self
+            .ownership
+            .lease(child_key)
+            .ok_or(RegionOwnerLaneError::StaleLease)?;
+        mutations
+            .entry(child_lease.lane)
+            .or_default()
+            .push(SequencedRegionMutation {
+                sequence,
+                lease: child_lease,
+                mutation: RegionOwnerMutation::InsertSnapshot(Box::new(child.clone())),
+            });
+        debug_assert_eq!(sequence, sequence_watermark);
+
+        match self.execute_mutations(mutations, sequence_watermark) {
+            Ok(()) => {
+                self.next_id = child.id.0;
+                self.locations.insert(child.id, child_key);
+                self.uuids.insert(child.uuid, child.id);
+                Ok(Some(child))
+            }
+            Err(
+                RegionOwnerLaneError::InvalidMutation
+                | RegionOwnerLaneError::StaleLease
+                | RegionOwnerLaneError::UnknownEntity,
+            ) => Ok(None),
             Err(error) => Err(error),
         }
     }
@@ -4942,6 +5964,7 @@ impl RegionalOwnerCoordinator {
                         mutation: RegionOwnerMutation::ReplaceSnapshotIfCurrent {
                             expected: Box::new(expected),
                             next: Box::new(next),
+                            allow_type_change: false,
                         },
                     });
                 continue;
@@ -5385,6 +6408,7 @@ impl RegionalOwnerCoordinator {
                 RegionOwnerMutation::ReplaceSnapshotIfCurrent {
                     expected: Box::new(current),
                     next: Box::new(next.clone()),
+                    allow_type_change: false,
                 },
                 ItemPickupClaimResolution::Updated(next),
             )
@@ -8469,8 +9493,9 @@ mod tests {
     };
     use crate::{
         AnimalBreedingState, EntityActiveEffectsState, EntityDamageRequest, EntityId,
-        EntityKinematics, EntityStore, GoalState, GoalTickStats, PathingBudget, PathingProbe,
-        PathingProbeResult, Rotation, SheepColor, SpawnEntity, Vec3, VehicleKind, VehicleState,
+        EntityItemStack, EntityKinematics, EntitySnapshot, EntityStore, GoalState, GoalTickStats,
+        PathingBudget, PathingProbe, PathingProbeResult, Rotation, SheepColor, SpawnEntity, Vec3,
+        VehicleKind, VehicleState,
     };
     use uuid::Uuid;
 
@@ -15725,5 +16750,1043 @@ mod tests {
 
         let recovered = authority.spawn(cow(Vec3::new(2.5, 64.0, 0.5)));
         assert!(authority.contains(recovered));
+    }
+
+    #[cfg(any())]
+    mod bread_only_legacy_population_tests {
+        use super::*;
+
+        fn population_villager(position: Vec3) -> SpawnEntity {
+            let mut villager = SpawnEntity::new(119, "minecraft:villager", position);
+            villager.retained.villager_population =
+                Some(crate::villager_population_26_1_2::VillagerPopulationState::adult());
+            villager
+        }
+
+        fn bread_item(position: Vec3, count: i32) -> SpawnEntity {
+            let mut item = SpawnEntity::new(55, "minecraft:item", position);
+            item.item_stack = Some(EntityItemStack::new(7, count));
+            item
+        }
+
+        fn villager_courtship_commit(
+            coordinator: &mut super::RegionalOwnerCoordinator,
+            parents: [EntityId; 2],
+            bread_items: [EntityId; 2],
+        ) -> super::VillagerCourtshipCommit {
+            let parent_expected = parents.map(|id| {
+                coordinator
+                    .snapshot(id)
+                    .expect("parent read")
+                    .expect("parent snapshot")
+            });
+            let mut parent_next = parent_expected.clone();
+            for index in 0..2 {
+                let partner_uuid = parent_expected[1 - index].uuid;
+                let population = parent_next[index]
+                    .retained
+                    .villager_population
+                    .as_mut()
+                    .expect("villager population");
+                population.add_bread(3).expect("three bread");
+                population
+                    .start_pending_birth(
+                        partner_uuid,
+                        "settlement:vacant-home".to_owned(),
+                        10,
+                        0,
+                        false,
+                    )
+                    .expect("pending birth");
+            }
+            let first_bread = coordinator
+                .snapshot(bread_items[0])
+                .expect("first bread read")
+                .expect("first bread snapshot");
+            let second_bread = coordinator
+                .snapshot(bread_items[1])
+                .expect("second bread read")
+                .expect("second bread snapshot");
+            let mut second_bread_next = second_bread.clone();
+            second_bread_next.item_stack = Some(EntityItemStack::new(7, 1));
+
+            super::VillagerCourtshipCommit {
+                parents: [
+                    (parent_expected[0].clone(), parent_next[0].clone()),
+                    (parent_expected[1].clone(), parent_next[1].clone()),
+                ],
+                bread_items: vec![(first_bread, None), (second_bread, Some(second_bread_next))],
+                current_tick: 10,
+                bread_item_id: 7,
+                home_claim: "settlement:vacant-home".to_owned(),
+                deterministic_seed: 0,
+            }
+        }
+
+        fn villager_birth_commit(
+            coordinator: &mut super::RegionalOwnerCoordinator,
+            parents: [EntityId; 2],
+            child_id: EntityId,
+        ) -> super::VillagerBirthCommit {
+            let parent_expected = parents.map(|id| {
+                coordinator
+                    .snapshot(id)
+                    .expect("parent read")
+                    .expect("pending parent snapshot")
+            });
+            let parent_next = parent_expected.clone().map(|mut snapshot| {
+                let population = snapshot
+                    .retained
+                    .villager_population
+                    .as_mut()
+                    .expect("villager population");
+                population
+                    .finish_parent_birth("settlement:vacant-home", 285)
+                    .expect("due parent birth");
+                snapshot
+            });
+            let mut child = SpawnEntity::new(
+                parent_expected[0].type_id,
+                "minecraft:villager",
+                Vec3::new(128.0, 64.0, 0.5),
+            );
+            child.uuid = Some(Uuid::from_u128(child_id.0 as u128 + 10_000));
+            child.retained.villager = parent_expected[0].retained.villager;
+            child.position = Vec3::new(128.0, 64.0, 0.5);
+            child.retained.villager_population = Some(
+                crate::villager_population_26_1_2::VillagerPopulationState::baby(
+                    "settlement:vacant-home".to_owned(),
+                ),
+            );
+
+            super::VillagerBirthCommit {
+                parents: [
+                    (parent_expected[0].clone(), parent_next[0].clone()),
+                    (parent_expected[1].clone(), parent_next[1].clone()),
+                ],
+                child,
+                current_tick: 285,
+            }
+        }
+
+        fn seeded_courtship_coordinator(
+            journal: Option<Arc<Mutex<TestDecisionJournalState>>>,
+        ) -> (
+            super::RegionalOwnerCoordinator,
+            [EntityId; 2],
+            [EntityId; 2],
+        ) {
+            let mut coordinator = match journal {
+                Some(journal) => super::RegionalOwnerCoordinator::from_store_with_journal(
+                    RegionalEntityStore::new(),
+                    2,
+                    Box::new(TestDecisionJournal(journal)),
+                )
+                .expect("journaled owner coordinator"),
+                None => super::RegionalOwnerCoordinator::from_store(RegionalEntityStore::new(), 2)
+                    .expect("owner coordinator"),
+            };
+            let parents = [
+                coordinator
+                    .spawn(population_villager(Vec3::new(127.5, 64.0, 0.5)))
+                    .expect("west parent"),
+                coordinator
+                    .spawn(population_villager(Vec3::new(128.5, 64.0, 0.5)))
+                    .expect("east parent"),
+            ];
+            let bread_items = [
+                coordinator
+                    .spawn(bread_item(Vec3::new(127.75, 64.0, 0.5), 3))
+                    .expect("west bread"),
+                coordinator
+                    .spawn(bread_item(Vec3::new(128.25, 64.0, 0.5), 4))
+                    .expect("east bread"),
+            ];
+            (coordinator, parents, bread_items)
+        }
+
+        fn seeded_birth_coordinator(
+            journal: Option<Arc<Mutex<TestDecisionJournalState>>>,
+        ) -> (super::RegionalOwnerCoordinator, [EntityId; 2]) {
+            let (mut coordinator, parents, bread_items) = seeded_courtship_coordinator(journal);
+            let courtship = villager_courtship_commit(&mut coordinator, parents, bread_items);
+            assert!(
+                coordinator
+                    .commit_villager_courtship_if_current(courtship)
+                    .expect("seed courtship")
+            );
+            (coordinator, parents)
+        }
+
+        fn member_snapshots(
+            coordinator: &mut super::RegionalOwnerCoordinator,
+            ids: impl IntoIterator<Item = EntityId>,
+        ) -> Vec<(EntityId, crate::EntitySnapshot)> {
+            ids.into_iter()
+                .map(|id| {
+                    (
+                        id,
+                        coordinator
+                            .snapshot(id)
+                            .expect("member read")
+                            .expect("member snapshot"),
+                    )
+                })
+                .collect()
+        }
+
+        fn assert_members_unchanged(
+            coordinator: &mut super::RegionalOwnerCoordinator,
+            before: Vec<(EntityId, crate::EntitySnapshot)>,
+        ) {
+            for (id, expected) in before {
+                assert_eq!(
+                    coordinator
+                        .snapshot(id)
+                        .expect("post-commit read")
+                        .expect("member conserved"),
+                    expected
+                );
+            }
+        }
+
+        #[test]
+        fn villager_courtship_atomically_consumes_bread_and_persists_reciprocal_pending_state() {
+            let journal = Arc::new(Mutex::new(TestDecisionJournalState::default()));
+            let (mut coordinator, parents, bread_items) =
+                seeded_courtship_coordinator(Some(Arc::clone(&journal)));
+            let commit = villager_courtship_commit(&mut coordinator, parents, bread_items);
+
+            assert!(
+                coordinator
+                    .commit_villager_courtship_if_current(commit)
+                    .expect("courtship commit")
+            );
+            for parent in parents {
+                let population = coordinator
+                    .snapshot(parent)
+                    .expect("parent read")
+                    .expect("parent remains")
+                    .retained
+                    .villager_population
+                    .expect("parent population");
+                assert_eq!(population.food_points, 12);
+                let pending = population.pending_birth.expect("pending birth");
+                assert_eq!(pending.started_tick, 10);
+                assert_eq!(pending.ready_tick, 285);
+                assert_eq!(pending.home_claim, "settlement:vacant-home");
+            }
+            assert!(
+                coordinator
+                    .snapshot(bread_items[0])
+                    .expect("removed bread read")
+                    .is_none()
+            );
+            assert_eq!(
+                coordinator
+                    .snapshot(bread_items[1])
+                    .expect("remaining bread read")
+                    .expect("remaining bread")
+                    .item_stack,
+                Some(EntityItemStack::new(7, 1))
+            );
+            let state = journal.lock().expect("journal state");
+            let decision = state.commits.last().expect("courtship decision");
+            assert!(
+                decision
+                    .upserts()
+                    .iter()
+                    .filter(|snapshot| {
+                        snapshot
+                            .retained
+                            .villager_population
+                            .as_ref()
+                            .is_some_and(|population| population.food_points == 12)
+                    })
+                    .count()
+                    == 2
+            );
+            assert!(decision.removed().contains(&bread_items[0]));
+        }
+
+        #[test]
+        fn villager_courtship_rejects_stale_parent_or_item_without_partial_mutation() {
+            for stale_parent in [true, false] {
+                let (mut coordinator, parents, bread_items) = seeded_courtship_coordinator(None);
+                let commit = villager_courtship_commit(&mut coordinator, parents, bread_items);
+                let stale_id = if stale_parent {
+                    parents[0]
+                } else {
+                    bread_items[0]
+                };
+                coordinator
+                    .set_velocities([(stale_id, Vec3::new(0.25, 0.0, 0.0))])
+                    .expect("make courtship member stale");
+                let before =
+                    member_snapshots(&mut coordinator, parents.into_iter().chain(bread_items));
+
+                assert!(
+                    !coordinator
+                        .commit_villager_courtship_if_current(commit)
+                        .expect("stale courtship is a rejected compare")
+                );
+                assert_members_unchanged(&mut coordinator, before);
+            }
+        }
+
+        #[test]
+        fn villager_courtship_rejects_malformed_food_parent_home_distance_and_lifecycle_inputs() {
+            for case in 0..9 {
+                let (mut coordinator, parents, bread_items) = seeded_courtship_coordinator(None);
+                let mut commit = villager_courtship_commit(&mut coordinator, parents, bread_items);
+                match case {
+                    0 => commit.bread_item_id = 8,
+                    1 => {
+                        commit.bread_items[1]
+                            .1
+                            .as_mut()
+                            .expect("remaining bread")
+                            .item_stack = Some(EntityItemStack::new(7, 2));
+                    }
+                    2 => commit.bread_items[1].1 = None,
+                    3 => {
+                        commit.bread_items[1]
+                            .1
+                            .as_mut()
+                            .expect("remaining bread")
+                            .retained
+                            .spawn_tick += 1;
+                    }
+                    4 => {
+                        commit.parents[0]
+                            .0
+                            .retained
+                            .villager_population
+                            .as_mut()
+                            .expect("adult population")
+                            .age_ticks = 1;
+                    }
+                    5 => commit.home_claim.clear(),
+                    6 => {
+                        let far = Vec3::new(256.0, 64.0, 0.5);
+                        commit.parents[1].0.position = far;
+                        commit.parents[1].1.position = far;
+                    }
+                    7 => {
+                        let far = Vec3::new(64.0, 64.0, 0.5);
+                        commit.bread_items[0].0.position = far;
+                    }
+                    8 => commit.bread_items[0].0.lifecycle = EntityLifecycle::Despawning,
+                    _ => unreachable!(),
+                }
+                let before =
+                    member_snapshots(&mut coordinator, parents.into_iter().chain(bread_items));
+                assert_eq!(
+                    coordinator.commit_villager_courtship_if_current(commit),
+                    Err(super::RegionOwnerLaneError::InvalidMutation)
+                );
+                assert_members_unchanged(&mut coordinator, before);
+            }
+        }
+
+        #[test]
+        fn villager_courtship_safe_journal_failure_rolls_back_parents_and_items() {
+            let journal = Arc::new(Mutex::new(TestDecisionJournalState::default()));
+            let (mut coordinator, parents, bread_items) =
+                seeded_courtship_coordinator(Some(Arc::clone(&journal)));
+            let commit = villager_courtship_commit(&mut coordinator, parents, bread_items);
+            let before = member_snapshots(&mut coordinator, parents.into_iter().chain(bread_items));
+            journal.lock().expect("journal state").fail_record = true;
+
+            assert_eq!(
+                coordinator.commit_villager_courtship_if_current(commit),
+                Err(super::RegionOwnerLaneError::Journal)
+            );
+            assert_members_unchanged(&mut coordinator, before);
+        }
+
+        #[test]
+        fn villager_birth_atomically_finishes_parents_and_inserts_claimed_child() {
+            let journal = Arc::new(Mutex::new(TestDecisionJournalState::default()));
+            let (mut coordinator, parents) = seeded_birth_coordinator(Some(Arc::clone(&journal)));
+            let commit = villager_birth_commit(&mut coordinator, parents, EntityId(900));
+            let replay = commit.clone();
+            let child_uuid = commit.child.uuid.expect("stable child uuid");
+            let next_id_before = coordinator.next_id;
+
+            let committed_child = coordinator
+                .commit_villager_birth_if_current(commit)
+                .expect("birth commit")
+                .expect("authoritative child");
+            assert_eq!(committed_child.id, EntityId(next_id_before + 1));
+            assert_eq!(committed_child.uuid, child_uuid);
+            for parent in parents {
+                let population = coordinator
+                    .snapshot(parent)
+                    .expect("parent read")
+                    .expect("parent remains")
+                    .retained
+                    .villager_population
+                    .expect("parent population");
+                assert_eq!(population.food_points, 0);
+                assert_eq!(
+                    population.age_ticks,
+                    crate::villager_population_26_1_2::VILLAGER_PARENT_COOLDOWN_TICKS
+                );
+                assert!(population.pending_birth.is_none());
+            }
+            let child = coordinator
+                .snapshot(committed_child.id)
+                .expect("child read")
+                .expect("child inserted");
+            assert_eq!(child, committed_child);
+            assert_eq!(
+                child
+                    .retained
+                    .villager_population
+                    .expect("child population")
+                    .claimed_home
+                    .as_deref(),
+                Some("settlement:vacant-home")
+            );
+            let next_id_after_birth = coordinator.next_id;
+            assert!(
+                coordinator
+                    .commit_villager_birth_if_current(replay)
+                    .expect("birth replay is a rejected compare")
+                    .is_none()
+            );
+            assert_eq!(coordinator.next_id, next_id_after_birth);
+            let state = journal.lock().expect("journal state");
+            let decision = state.commits.last().expect("birth decision");
+            assert!(
+                decision
+                    .upserts()
+                    .iter()
+                    .any(|snapshot| snapshot.id == committed_child.id)
+            );
+        }
+
+        #[test]
+        fn villager_birth_rejects_stale_parent_without_partial_mutation() {
+            let (mut coordinator, parents) = seeded_birth_coordinator(None);
+            let commit = villager_birth_commit(&mut coordinator, parents, EntityId(901));
+            let child_uuid = commit.child.uuid.expect("stable child uuid");
+            let next_id_before = coordinator.next_id;
+            coordinator
+                .set_velocities([(parents[0], Vec3::new(0.25, 0.0, 0.0))])
+                .expect("make parent stale");
+            let before = member_snapshots(&mut coordinator, parents);
+
+            assert!(
+                coordinator
+                    .commit_villager_birth_if_current(commit)
+                    .expect("stale birth compare")
+                    .is_none()
+            );
+            assert_members_unchanged(&mut coordinator, before);
+            assert_eq!(coordinator.next_id, next_id_before);
+            assert!(!coordinator.uuids.contains_key(&child_uuid));
+        }
+
+        #[test]
+        fn villager_birth_safe_journal_failure_rolls_back_parents_and_child() {
+            let journal = Arc::new(Mutex::new(TestDecisionJournalState::default()));
+            let (mut coordinator, parents) = seeded_birth_coordinator(Some(Arc::clone(&journal)));
+            let commit = villager_birth_commit(&mut coordinator, parents, EntityId(902));
+            let child_uuid = commit.child.uuid.expect("stable child uuid");
+            let next_id_before = coordinator.next_id;
+            let before = member_snapshots(&mut coordinator, parents);
+            journal.lock().expect("journal state").fail_record = true;
+
+            assert_eq!(
+                coordinator.commit_villager_birth_if_current(commit),
+                Err(super::RegionOwnerLaneError::Journal)
+            );
+            assert_members_unchanged(&mut coordinator, before);
+            assert_eq!(coordinator.next_id, next_id_before);
+            assert!(!coordinator.uuids.contains_key(&child_uuid));
+        }
+
+        #[test]
+        fn villager_birth_rejects_not_due_nonreciprocal_and_malformed_child() {
+            for case in 0..5 {
+                let (mut coordinator, parents) = seeded_birth_coordinator(None);
+                let mut commit =
+                    villager_birth_commit(&mut coordinator, parents, EntityId(910 + case));
+                match case {
+                    0 => commit.current_tick = 284,
+                    1 => {
+                        commit.parents[0]
+                            .0
+                            .retained
+                            .villager_population
+                            .as_mut()
+                            .expect("parent population")
+                            .pending_birth
+                            .as_mut()
+                            .expect("pending birth")
+                            .partner_uuid = Uuid::from_u128(999_999);
+                    }
+                    2 => {
+                        commit
+                            .child
+                            .retained
+                            .villager_population
+                            .as_mut()
+                            .expect("child population")
+                            .claimed_home = Some("settlement:wrong-home".to_owned());
+                    }
+                    3 => commit.child.uuid = None,
+                    4 => commit.child.uuid = Some(commit.parents[0].0.uuid),
+                    _ => unreachable!(),
+                }
+                let next_id_before = coordinator.next_id;
+                let uuids_before = coordinator.uuids.clone();
+                let before = member_snapshots(&mut coordinator, parents);
+                assert_eq!(
+                    coordinator.commit_villager_birth_if_current(commit),
+                    Err(super::RegionOwnerLaneError::InvalidMutation)
+                );
+                assert_members_unchanged(&mut coordinator, before);
+                assert_eq!(coordinator.next_id, next_id_before);
+                assert_eq!(coordinator.uuids, uuids_before);
+            }
+        }
+    }
+
+    const POPULATION_FOOD: crate::villager_population_26_1_2::VillagerFoodItemIds =
+        crate::villager_population_26_1_2::VillagerFoodItemIds {
+            bread: 7,
+            potato: 8,
+            carrot: 9,
+            beetroot: 10,
+        };
+
+    fn parity_population_villager(position: Vec3, food: Option<(u32, i32)>) -> SpawnEntity {
+        let mut villager = SpawnEntity::new(119, "minecraft:villager", position);
+        let mut population = crate::villager_population_26_1_2::VillagerPopulationState::adult();
+        if let Some((item_id, count)) = food {
+            assert!(
+                population
+                    .add_to_inventory(EntityItemStack::new(item_id, count), 64)
+                    .expect("seed villager inventory")
+                    .is_none()
+            );
+        }
+        villager.retained.villager_population = Some(population);
+        villager
+    }
+
+    fn parity_item(position: Vec3, item_id: u32, count: i32) -> SpawnEntity {
+        let mut item = SpawnEntity::new(55, "minecraft:item", position);
+        item.item_stack = Some(EntityItemStack::new(item_id, count));
+        item
+    }
+
+    fn population_coordinator(
+        journal: Option<Arc<Mutex<TestDecisionJournalState>>>,
+    ) -> super::RegionalOwnerCoordinator {
+        match journal {
+            Some(journal) => super::RegionalOwnerCoordinator::from_store_with_journal(
+                RegionalEntityStore::new(),
+                2,
+                Box::new(TestDecisionJournal(journal)),
+            )
+            .expect("journaled population coordinator"),
+            None => super::RegionalOwnerCoordinator::from_store(RegionalEntityStore::new(), 2)
+                .expect("population coordinator"),
+        }
+    }
+
+    fn parity_courtship_commit(
+        coordinator: &mut super::RegionalOwnerCoordinator,
+        parents: [EntityId; 2],
+    ) -> super::VillagerCourtshipCommit {
+        let expected = parents.map(|id| {
+            coordinator
+                .snapshot(id)
+                .expect("parent read")
+                .expect("parent snapshot")
+        });
+        let mut next = expected.clone();
+        for index in 0..2 {
+            next[index]
+                .retained
+                .villager_population
+                .as_mut()
+                .expect("parent population")
+                .start_pending_birth(expected[1 - index].uuid, 10, 0, false, POPULATION_FOOD)
+                .expect("start reciprocal courtship");
+        }
+        super::VillagerCourtshipCommit {
+            parents: [
+                (expected[0].clone(), next[0].clone()),
+                (expected[1].clone(), next[1].clone()),
+            ],
+            current_tick: 10,
+            food_items: POPULATION_FOOD,
+            deterministic_seed: 0,
+        }
+    }
+
+    fn pending_population_coordinator(
+        journal: Option<Arc<Mutex<TestDecisionJournalState>>>,
+    ) -> (super::RegionalOwnerCoordinator, [EntityId; 2]) {
+        let mut coordinator = population_coordinator(journal);
+        let parents = [
+            coordinator
+                .spawn(parity_population_villager(
+                    Vec3::new(0.5, 64.0, 0.5),
+                    Some((POPULATION_FOOD.bread, 3)),
+                ))
+                .expect("first parent"),
+            coordinator
+                .spawn(parity_population_villager(
+                    Vec3::new(1.5, 64.0, 0.5),
+                    Some((POPULATION_FOOD.potato, 12)),
+                ))
+                .expect("second parent"),
+        ];
+        let commit = parity_courtship_commit(&mut coordinator, parents);
+        assert!(
+            coordinator
+                .commit_villager_courtship_if_current(commit)
+                .expect("seed courtship")
+        );
+        (coordinator, parents)
+    }
+
+    fn parity_no_bed_commit(
+        coordinator: &mut super::RegionalOwnerCoordinator,
+        parents: [EntityId; 2],
+    ) -> super::VillagerNoBedCommit {
+        let expected = parents.map(|id| {
+            coordinator
+                .snapshot(id)
+                .expect("parent read")
+                .expect("pending parent")
+        });
+        let next = expected.clone().map(|mut snapshot| {
+            snapshot
+                .retained
+                .villager_population
+                .as_mut()
+                .expect("pending population")
+                .finish_courtship_without_child(285, POPULATION_FOOD)
+                .expect("finish no-bed courtship");
+            snapshot
+        });
+        super::VillagerNoBedCommit {
+            parents: [
+                (expected[0].clone(), next[0].clone()),
+                (expected[1].clone(), next[1].clone()),
+            ],
+            current_tick: 285,
+            food_items: POPULATION_FOOD,
+        }
+    }
+
+    fn parity_birth_commit(
+        coordinator: &mut super::RegionalOwnerCoordinator,
+        parents: [EntityId; 2],
+        home: &str,
+    ) -> super::VillagerBirthCommit {
+        let expected = parents.map(|id| {
+            coordinator
+                .snapshot(id)
+                .expect("parent read")
+                .expect("pending parent")
+        });
+        let next = expected.clone().map(|mut snapshot| {
+            snapshot
+                .retained
+                .villager_population
+                .as_mut()
+                .expect("pending population")
+                .finish_successful_birth(285, POPULATION_FOOD)
+                .expect("finish successful birth");
+            snapshot
+        });
+        let started_tick = expected[0]
+            .retained
+            .villager_population
+            .as_ref()
+            .and_then(|population| population.pending_birth.as_ref())
+            .expect("pending birth")
+            .started_tick;
+        let mut child = SpawnEntity::new(119, "minecraft:villager", expected[0].position);
+        child.uuid = Some(
+            crate::villager_population_26_1_2::deterministic_villager_child_uuid(
+                expected[0].uuid,
+                expected[1].uuid,
+                home,
+                started_tick,
+            ),
+        );
+        child.retained.villager_population =
+            Some(crate::villager_population_26_1_2::VillagerPopulationState::baby(home.to_owned()));
+        super::VillagerBirthCommit {
+            parents: [
+                (expected[0].clone(), next[0].clone()),
+                (expected[1].clone(), next[1].clone()),
+            ],
+            child,
+            current_tick: 285,
+            food_items: POPULATION_FOOD,
+        }
+    }
+
+    fn parity_snapshots(
+        coordinator: &mut super::RegionalOwnerCoordinator,
+        ids: impl IntoIterator<Item = EntityId>,
+    ) -> Vec<(EntityId, EntitySnapshot)> {
+        ids.into_iter()
+            .map(|id| {
+                (
+                    id,
+                    coordinator
+                        .snapshot(id)
+                        .expect("snapshot read")
+                        .expect("snapshot exists"),
+                )
+            })
+            .collect()
+    }
+
+    fn assert_parity_snapshots(
+        coordinator: &mut super::RegionalOwnerCoordinator,
+        expected: Vec<(EntityId, EntitySnapshot)>,
+    ) {
+        for (id, snapshot) in expected {
+            assert_eq!(
+                coordinator
+                    .snapshot(id)
+                    .expect("post-state read")
+                    .expect("entity remains"),
+                snapshot
+            );
+        }
+    }
+
+    #[test]
+    fn villager_inventory_pickup_atomically_moves_exact_stack_and_keeps_remainder() {
+        let journal = Arc::new(Mutex::new(TestDecisionJournalState::default()));
+        let mut coordinator = population_coordinator(Some(Arc::clone(&journal)));
+        let mut villager_spawn =
+            parity_population_villager(Vec3::new(0.5, 64.0, 0.5), None);
+        let population = villager_spawn
+            .retained
+            .villager_population
+            .as_mut()
+            .expect("villager population");
+        for item_id in 100..107 {
+            assert!(population
+                .add_to_inventory(EntityItemStack::new(item_id, 64), 64)
+                .unwrap()
+                .is_none());
+        }
+        assert!(population
+            .add_to_inventory(EntityItemStack::new(POPULATION_FOOD.carrot, 60), 64)
+            .unwrap()
+            .is_none());
+        let villager = coordinator.spawn(villager_spawn).expect("villager");
+        let item = coordinator
+            .spawn(parity_item(
+                Vec3::new(0.75, 64.0, 0.5),
+                POPULATION_FOOD.carrot,
+                10,
+            ))
+            .expect("food item");
+        let villager_expected = coordinator.snapshot(villager).unwrap().unwrap();
+        let item_expected = coordinator.snapshot(item).unwrap().unwrap();
+        let mut villager_next = villager_expected.clone();
+        let remainder = villager_next
+            .retained
+            .villager_population
+            .as_mut()
+            .unwrap()
+            .add_to_inventory(item_expected.item_stack.clone().unwrap(), 64)
+            .unwrap();
+        let mut item_next = item_expected.clone();
+        item_next.item_stack = remainder;
+        assert!(
+            coordinator
+                .commit_villager_inventory_pickup_if_current(super::VillagerInventoryPickupCommit {
+                    villager: (villager_expected, villager_next),
+                    item: (item_expected, Some(item_next)),
+                    item_max_stack_size: 64,
+                },)
+                .expect("pickup commit")
+        );
+        let population = coordinator
+            .snapshot(villager)
+            .unwrap()
+            .unwrap()
+            .retained
+            .villager_population
+            .unwrap();
+        assert_eq!(population.inventory.count_item(POPULATION_FOOD.carrot), 64);
+        assert_eq!(
+            coordinator
+                .snapshot(item)
+                .unwrap()
+                .unwrap()
+                .item_stack
+                .unwrap()
+                .count,
+            6
+        );
+        let decision = journal
+            .lock()
+            .unwrap()
+            .commits
+            .last()
+            .cloned()
+            .expect("pickup decision");
+        assert_eq!(decision.upserts().len(), 2);
+        assert!(decision.removed().is_empty());
+    }
+
+    #[test]
+    fn villager_inventory_pickup_rejects_stale_or_out_of_reach_without_partial_mutation() {
+        for stale in [false, true] {
+            let mut coordinator = population_coordinator(None);
+            let villager = coordinator
+                .spawn(parity_population_villager(Vec3::new(0.5, 64.0, 0.5), None))
+                .unwrap();
+            let item_position = if stale {
+                Vec3::new(0.75, 64.0, 0.5)
+            } else {
+                Vec3::new(4.0, 64.0, 0.5)
+            };
+            let item = coordinator
+                .spawn(parity_item(item_position, POPULATION_FOOD.bread, 3))
+                .unwrap();
+            let villager_expected = coordinator.snapshot(villager).unwrap().unwrap();
+            let item_expected = coordinator.snapshot(item).unwrap().unwrap();
+            let mut villager_next = villager_expected.clone();
+            let remainder = villager_next
+                .retained
+                .villager_population
+                .as_mut()
+                .unwrap()
+                .add_to_inventory(item_expected.item_stack.clone().unwrap(), 64)
+                .unwrap();
+            let item_next = remainder.map(|stack| {
+                let mut next = item_expected.clone();
+                next.item_stack = Some(stack);
+                next
+            });
+            let commit = super::VillagerInventoryPickupCommit {
+                villager: (villager_expected, villager_next),
+                item: (item_expected, item_next),
+                item_max_stack_size: 64,
+            };
+            if stale {
+                coordinator
+                    .set_velocities([(item, Vec3::new(0.1, 0.0, 0.0))])
+                    .unwrap();
+                let before = parity_snapshots(&mut coordinator, [villager, item]);
+                assert!(
+                    !coordinator
+                        .commit_villager_inventory_pickup_if_current(commit)
+                        .unwrap()
+                );
+                assert_parity_snapshots(&mut coordinator, before);
+            } else {
+                let before = parity_snapshots(&mut coordinator, [villager, item]);
+                assert_eq!(
+                    coordinator.commit_villager_inventory_pickup_if_current(commit),
+                    Err(super::RegionOwnerLaneError::InvalidMutation)
+                );
+                assert_parity_snapshots(&mut coordinator, before);
+            }
+        }
+    }
+
+    #[test]
+    fn villager_courtship_sets_reciprocal_target_without_consuming_inventory_food() {
+        let journal = Arc::new(Mutex::new(TestDecisionJournalState::default()));
+        let mut coordinator = population_coordinator(Some(Arc::clone(&journal)));
+        let parents = [
+            coordinator
+                .spawn(parity_population_villager(
+                    Vec3::new(0.5, 64.0, 0.5),
+                    Some((POPULATION_FOOD.bread, 3)),
+                ))
+                .unwrap(),
+            coordinator
+                .spawn(parity_population_villager(
+                    Vec3::new(1.5, 64.0, 0.5),
+                    Some((POPULATION_FOOD.carrot, 12)),
+                ))
+                .unwrap(),
+        ];
+        let commit = parity_courtship_commit(&mut coordinator, parents);
+        assert!(
+            coordinator
+                .commit_villager_courtship_if_current(commit)
+                .unwrap()
+        );
+        for (index, parent) in parents.into_iter().enumerate() {
+            let snapshot = coordinator.snapshot(parent).unwrap().unwrap();
+            let population = snapshot.retained.villager_population.unwrap();
+            assert_eq!(population.food_level, 0);
+            assert_eq!(
+                population.inventory.food_points(POPULATION_FOOD),
+                if index == 0 { 12 } else { 12 }
+            );
+            let pending = population.pending_birth.unwrap();
+            assert_eq!(pending.started_tick, 10);
+            assert_eq!(pending.ready_tick, 285);
+        }
+        assert_eq!(
+            journal
+                .lock()
+                .unwrap()
+                .commits
+                .last()
+                .unwrap()
+                .upserts()
+                .len(),
+            2
+        );
+    }
+
+    #[test]
+    fn villager_no_bed_digests_food_without_child_or_parent_cooldown() {
+        let journal = Arc::new(Mutex::new(TestDecisionJournalState::default()));
+        let (mut coordinator, parents) = pending_population_coordinator(Some(Arc::clone(&journal)));
+        let commit = parity_no_bed_commit(&mut coordinator, parents);
+        assert!(
+            coordinator
+                .commit_villager_no_bed_if_current(commit)
+                .unwrap()
+        );
+        for parent in parents {
+            let population = coordinator
+                .snapshot(parent)
+                .unwrap()
+                .unwrap()
+                .retained
+                .villager_population
+                .unwrap();
+            assert_eq!(population.food_level, 0);
+            assert_eq!(population.inventory.food_points(POPULATION_FOOD), 0);
+            assert_eq!(population.age_ticks, 0);
+            assert!(population.pending_birth.is_none());
+        }
+        assert_eq!(
+            journal
+                .lock()
+                .unwrap()
+                .commits
+                .last()
+                .unwrap()
+                .upserts()
+                .len(),
+            2
+        );
+    }
+
+    #[test]
+    fn villager_no_bed_journal_failure_rolls_back_both_parents() {
+        let journal = Arc::new(Mutex::new(TestDecisionJournalState::default()));
+        let (mut coordinator, parents) = pending_population_coordinator(Some(Arc::clone(&journal)));
+        let commit = parity_no_bed_commit(&mut coordinator, parents);
+        let before = parity_snapshots(&mut coordinator, parents);
+        journal.lock().unwrap().fail_record = true;
+        assert_eq!(
+            coordinator.commit_villager_no_bed_if_current(commit),
+            Err(super::RegionOwnerLaneError::Journal)
+        );
+        assert_parity_snapshots(&mut coordinator, before);
+    }
+
+    #[test]
+    fn villager_birth_digests_food_sets_cooldowns_and_is_replay_safe() {
+        let journal = Arc::new(Mutex::new(TestDecisionJournalState::default()));
+        let (mut coordinator, parents) = pending_population_coordinator(Some(Arc::clone(&journal)));
+        let commit = parity_birth_commit(&mut coordinator, parents, "home:child");
+        let replay = commit.clone();
+        let next_id = coordinator.next_id + 1;
+        let child = coordinator
+            .commit_villager_birth_if_current(commit)
+            .unwrap()
+            .expect("child commit");
+        assert_eq!(child.id, EntityId(next_id));
+        assert_eq!(
+            child
+                .retained
+                .villager_population
+                .as_ref()
+                .unwrap()
+                .claimed_home
+                .as_deref(),
+            Some("home:child")
+        );
+        for parent in parents {
+            let population = coordinator
+                .snapshot(parent)
+                .unwrap()
+                .unwrap()
+                .retained
+                .villager_population
+                .unwrap();
+            assert_eq!(population.food_level, 0);
+            assert_eq!(population.inventory.food_points(POPULATION_FOOD), 0);
+            assert_eq!(
+                population.age_ticks,
+                crate::villager_population_26_1_2::VILLAGER_PARENT_COOLDOWN_TICKS
+            );
+            assert!(population.pending_birth.is_none());
+        }
+        let next_id_after = coordinator.next_id;
+        assert!(
+            coordinator
+                .commit_villager_birth_if_current(replay)
+                .unwrap()
+                .is_none()
+        );
+        assert_eq!(coordinator.next_id, next_id_after);
+        assert!(
+            journal
+                .lock()
+                .unwrap()
+                .commits
+                .last()
+                .unwrap()
+                .upserts()
+                .iter()
+                .any(|snapshot| snapshot.id == child.id)
+        );
+    }
+
+    #[test]
+    fn villager_birth_rejects_stale_or_wrong_child_identity_without_allocation() {
+        for wrong_uuid in [false, true] {
+            let (mut coordinator, parents) = pending_population_coordinator(None);
+            let mut commit = parity_birth_commit(&mut coordinator, parents, "home:child");
+            let next_id_before = coordinator.next_id;
+            if wrong_uuid {
+                commit.child.uuid = Some(Uuid::from_u128(999));
+                assert_eq!(
+                    coordinator.commit_villager_birth_if_current(commit),
+                    Err(super::RegionOwnerLaneError::InvalidMutation)
+                );
+            } else {
+                coordinator
+                    .set_velocities([(parents[0], Vec3::new(0.1, 0.0, 0.0))])
+                    .unwrap();
+                assert!(
+                    coordinator
+                        .commit_villager_birth_if_current(commit)
+                        .unwrap()
+                        .is_none()
+                );
+            }
+            assert_eq!(coordinator.next_id, next_id_before);
+        }
     }
 }

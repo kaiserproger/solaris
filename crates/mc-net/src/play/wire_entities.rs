@@ -328,6 +328,12 @@ where
         }
     }
     if let Some(villager) = entity.villager {
+        if entity.villager_baby {
+            values.push(EntityDataValue::Boolean {
+                index: AGEABLE_ENTITY_DATA_BABY_INDEX,
+                value: true,
+            });
+        }
         values.push(villager_entity_data(villager));
     }
     if values.is_empty() {
@@ -379,6 +385,10 @@ where
         }
     }
     if let Some(villager) = entity.villager {
+        values.push(EntityDataValue::Boolean {
+            index: AGEABLE_ENTITY_DATA_BABY_INDEX,
+            value: entity.villager_baby,
+        });
         values.push(villager_entity_data(villager));
     }
     if values.is_empty() {
@@ -664,6 +674,7 @@ mod tests {
                 mc_entity::SheepColor::Brown,
             )),
             villager: None,
+            villager_baby: false,
         };
         let mut writer = Vec::new();
 

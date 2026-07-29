@@ -30,12 +30,14 @@ async fn lua_player_teleport_commits_through_the_session_owner_and_reports_exact
     std::fs::write(
         owner.join("main.lua"),
         r#"
-            function on_player_joined(event)
+            --!strict
+
+            function on_player_joined(event: any)
                 solaris.upsert_zone("destination", "minecraft:alpha", 39, -60, 0, 41, -58, 2)
                 solaris.teleport_player("initial", event.player_id, 40, -59, 1)
             end
 
-            function on_player_command(event)
+            function on_player_command(event: any)
                 if event.root == "warp" then
                     solaris.teleport_player("warp", event.player_id, 40, -59, 1)
                 elseif event.root == "where" then
@@ -46,11 +48,11 @@ async fn lua_player_teleport_commits_through_the_session_owner_and_reports_exact
                 end
             end
 
-            function on_player_zone_entered(event)
+            function on_player_zone_entered(event: any)
                 solaris.send_message(event.player_id, "zone:" .. event.zone_id)
             end
 
-            function on_player_teleport_result(event)
+            function on_player_teleport_result(event: any)
                 solaris.send_message(
                     event.player_id,
                     "teleport:" .. event.request_id .. ":" .. tostring(event.committed) .. ":" .. tostring(event.failure)
@@ -76,7 +78,7 @@ async fn lua_player_teleport_commits_through_the_session_owner_and_reports_exact
     std::fs::write(
         observer.join("main.lua"),
         r#"
-            function on_player_teleport_result(event)
+            function on_player_teleport_result(event: any)
                 solaris.send_message(event.player_id, "leaked-teleport-result")
             end
         "#,
@@ -130,7 +132,7 @@ async fn lua_player_teleport_commits_through_the_session_owner_and_reports_exact
         client.read_typed().await.expect("initial SyncPlayerPos");
     assert_eq!(
         next_system_chat_text(&mut client).await,
-        "teleport:initial:false:teleport_pending:40.0:-59.0:1.0"
+        "teleport:initial:false:teleport_pending:40:-59:1"
     );
     client
         .write_packet(&ConfirmTeleportation {
@@ -147,14 +149,14 @@ async fn lua_player_teleport_commits_through_the_session_owner_and_reports_exact
     messages.sort();
     assert_eq!(
         messages,
-        ["teleport:warp:true:nil:40.0:-59.0:1.0", "zone:destination"],
+        ["teleport:warp:true:nil:40:-59:1", "zone:destination"],
         "zone transition and owner result must be exact and non-leaking"
     );
 
     send_plugin_command(&mut client, "warp").await;
     assert_eq!(
         next_system_chat_text(&mut client).await,
-        "teleport:warp:false:teleport_pending:40.0:-59.0:1.0"
+        "teleport:warp:false:teleport_pending:40:-59:1"
     );
     client
         .write_packet(&ConfirmTeleportation {
@@ -163,10 +165,7 @@ async fn lua_player_teleport_commits_through_the_session_owner_and_reports_exact
         .await
         .expect("ack plugin teleport");
     send_plugin_command(&mut client, "where").await;
-    assert_eq!(
-        next_system_chat_text(&mut client).await,
-        "where:40.0:-59.0:1.0"
-    );
+    assert_eq!(next_system_chat_text(&mut client).await, "where:40:-59:1");
 
     drop(client);
     shutdown.request();

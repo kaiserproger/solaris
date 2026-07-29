@@ -729,7 +729,7 @@ mod tests {
         assert!(rules.templates()[0].size()[0] > 16);
         assert!(rules.templates()[0].size()[2] > 16);
         assert!(rules.templates()[0].blocks().len() > 200);
-        assert!(!rules.templates()[0].villager_markers().is_empty());
+        assert_eq!(rules.templates()[0].villager_markers().len(), 4);
         assert_eq!(rules.grid_chunks(), 34);
         assert_eq!(rules.separation_chunks(), 8);
         assert_eq!(rules.salt(), 10_387_312);

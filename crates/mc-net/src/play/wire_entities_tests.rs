@@ -14,9 +14,9 @@ use mc_entity::{
 use mc_protocol::Packet;
 use mc_protocol::frame::{Compression, try_decode_frame};
 use mc_protocol::packets::play::{
-    ClientboundSetEntityData, EntityDataValue, EntityPositionSync, EntityVec3,
-    ITEM_ENTITY_DATA_ITEM_INDEX, ItemStack, LIVING_ENTITY_DATA_HEALTH_INDEX_26_1_2, MoveEntityPos,
-    MoveEntityPosRot, PositionMoveRotation, RotateHead, SetEntityMotion,
+    AGEABLE_ENTITY_DATA_BABY_INDEX, ClientboundSetEntityData, EntityDataValue, EntityPositionSync,
+    EntityVec3, ITEM_ENTITY_DATA_ITEM_INDEX, ItemStack, LIVING_ENTITY_DATA_HEALTH_INDEX_26_1_2,
+    MoveEntityPos, MoveEntityPosRot, PositionMoveRotation, RotateHead, SetEntityMotion,
 };
 use std::collections::HashSet;
 
@@ -48,6 +48,7 @@ fn entity_snapshot(type_id: i32, type_name: &str) -> ServerEntitySnapshot {
         block_state: None,
         animal: None,
         villager: None,
+        villager_baby: false,
     }
 }
 
@@ -273,6 +274,59 @@ async fn pairing_emits_plains_toolsmith_villager_data() {
             profession: 13,
             level: 1,
         }]
+    );
+}
+
+#[tokio::test]
+async fn villager_pairing_and_maturation_publish_exact_baby_boolean() {
+    let mut snapshot = entity_snapshot(120, "minecraft:villager");
+    snapshot.villager = Some(VillagerData::new(
+        VillagerKind::Plains,
+        VillagerProfession::None,
+        1,
+    ));
+    snapshot.villager_baby = true;
+    let mut pairing = Vec::new();
+
+    send_entity_pairing_data(&mut pairing, Compression::Disabled, &snapshot)
+        .await
+        .unwrap();
+
+    assert_eq!(
+        decode_entity_data(&pairing)[0].values,
+        vec![
+            EntityDataValue::Boolean {
+                index: AGEABLE_ENTITY_DATA_BABY_INDEX,
+                value: true,
+            },
+            EntityDataValue::VillagerData {
+                index: 19,
+                villager_type: 2,
+                profession: 0,
+                level: 1,
+            },
+        ]
+    );
+
+    snapshot.villager_baby = false;
+    let mut incremental = Vec::new();
+    super::wire_entities::send_entity_data(&mut incremental, Compression::Disabled, &snapshot)
+        .await
+        .unwrap();
+    assert_eq!(
+        decode_entity_data(&incremental)[0].values,
+        vec![
+            EntityDataValue::Boolean {
+                index: AGEABLE_ENTITY_DATA_BABY_INDEX,
+                value: false,
+            },
+            EntityDataValue::VillagerData {
+                index: 19,
+                villager_type: 2,
+                profession: 0,
+                level: 1,
+            },
+        ]
     );
 }
 

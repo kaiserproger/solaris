@@ -118,6 +118,7 @@ pub struct BlockPos {
 }
 
 const SETTLEMENT_INHABITANTS_KEY: &str = "SolarisSettlementInhabitants";
+const SETTLEMENT_VACANT_HOMES_KEY: &str = "SolarisSettlementVacantHomes";
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct SettlementInhabitantMarker {
@@ -130,6 +131,12 @@ pub struct SettlementInhabitantMarker {
     pub home: Option<[f64; 3]>,
     pub job_site: Option<[f64; 3]>,
     pub meeting_point: Option<[f64; 3]>,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct SettlementVacantHomeMarker {
+    pub claim: String,
+    pub position: [f64; 3],
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -696,6 +703,80 @@ impl Chunk {
                     home: position("Home"),
                     job_site: position("Job"),
                     meeting_point: position("Meeting"),
+                })
+            })
+            .collect()
+    }
+
+    pub fn set_settlement_vacant_homes(&mut self, homes: &[SettlementVacantHomeMarker]) {
+        self.extras
+            .retain(|(key, _)| key != SETTLEMENT_VACANT_HOMES_KEY);
+        let elements = homes
+            .iter()
+            .filter(|home| {
+                !home.claim.is_empty()
+                    && home.position.iter().all(|component| component.is_finite())
+            })
+            .map(|home| {
+                Tag::Compound(vec![
+                    ("Claim".into(), Tag::String(home.claim.clone())),
+                    ("X".into(), Tag::Double(home.position[0])),
+                    ("Y".into(), Tag::Double(home.position[1])),
+                    ("Z".into(), Tag::Double(home.position[2])),
+                ])
+            })
+            .collect::<Vec<_>>();
+        if elements.is_empty() {
+            return;
+        }
+        self.extras.push((
+            SETTLEMENT_VACANT_HOMES_KEY.into(),
+            Tag::List(mc_nbt::ListTag {
+                element_type: mc_nbt::tag_type::COMPOUND,
+                elements,
+            }),
+        ));
+    }
+
+    #[must_use]
+    pub fn settlement_vacant_homes(&self) -> Vec<SettlementVacantHomeMarker> {
+        let Some(Tag::List(list)) = self
+            .extras
+            .iter()
+            .find(|(key, _)| key == SETTLEMENT_VACANT_HOMES_KEY)
+            .map(|(_, value)| value)
+        else {
+            return Vec::new();
+        };
+        list.elements
+            .iter()
+            .filter_map(|entry| {
+                let Tag::Compound(fields) = entry else {
+                    return None;
+                };
+                let string = |name: &str| {
+                    fields.iter().find_map(|(key, value)| {
+                        (key == name)
+                            .then_some(value)
+                            .and_then(|value| match value {
+                                Tag::String(value) if !value.is_empty() => Some(value.clone()),
+                                _ => None,
+                            })
+                    })
+                };
+                let double = |name: &str| {
+                    fields.iter().find_map(|(key, value)| {
+                        (key == name)
+                            .then_some(value)
+                            .and_then(|value| match value {
+                                Tag::Double(value) if value.is_finite() => Some(*value),
+                                _ => None,
+                            })
+                    })
+                };
+                Some(SettlementVacantHomeMarker {
+                    claim: string("Claim")?,
+                    position: [double("X")?, double("Y")?, double("Z")?],
                 })
             })
             .collect()
@@ -1286,6 +1367,29 @@ mod tests {
         chunk.set_settlement_inhabitants(std::slice::from_ref(&marker));
 
         assert_eq!(chunk.settlement_inhabitants(), vec![marker]);
+    }
+
+    #[test]
+    fn settlement_vacant_home_markers_round_trip_and_filter_invalid_entries() {
+        let mut chunk = Chunk::empty(ChunkPos { x: 4, z: 0 }, air(), plains());
+        let valid = SettlementVacantHomeMarker {
+            claim: "settlement-prototype:vacant-home-0@72,8".to_owned(),
+            position: [74.5, 66.0, 8.5],
+        };
+        let empty_claim = SettlementVacantHomeMarker {
+            claim: String::new(),
+            position: [75.5, 66.0, 8.5],
+        };
+        let nonfinite = SettlementVacantHomeMarker {
+            claim: "settlement-prototype:invalid@72,8".to_owned(),
+            position: [f64::NAN, 66.0, 8.5],
+        };
+
+        chunk.set_settlement_vacant_homes(&[valid.clone(), empty_claim, nonfinite]);
+
+        assert_eq!(chunk.settlement_vacant_homes(), vec![valid]);
+        chunk.set_settlement_vacant_homes(&[]);
+        assert!(chunk.settlement_vacant_homes().is_empty());
     }
 
     #[test]

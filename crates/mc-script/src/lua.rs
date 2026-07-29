@@ -8,7 +8,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread;
 
-use mlua::{Function, HookTriggers, Lua, LuaOptions, LuaString, StdLib, Table, Value, VmState};
+use mlua::{Function, Lua, LuaOptions, LuaString, StdLib, Table, Value, VmState};
 use serde::Deserialize;
 use sha2::{Digest, Sha256};
 use tracing::{info, warn};
@@ -40,7 +40,7 @@ const COMMAND_QUEUE_CAPACITY: usize = 256;
 const COMMANDS_PER_EVENT: usize = 32;
 const MEMORY_BYTES_PER_PLUGIN: usize = 16 * 1024 * 1024;
 const INSTRUCTIONS_PER_EVENT: u64 = 100_000;
-const HOOK_INSTRUCTION_STEP: u32 = 1_000;
+const LUAU_INTERRUPT_FUEL_COST: u64 = 2;
 const MAX_PLUGIN_MANIFEST_BYTES: usize = 64 * 1024;
 const MAX_PLUGIN_CONFIG_BYTES: usize = 64 * 1024;
 const MAX_PLUGIN_CONFIG_DEPTH: usize = 8;
@@ -63,8 +63,40 @@ const MAX_CLIENT_BUNDLE_BYTES: u64 = 64 * 1024 * 1024;
 const MAX_PENDING_PLUGIN_TIMERS: usize = 256;
 const MAX_PLUGIN_TIMER_CALLBACKS_PER_TICK: usize = 8;
 const MAX_PLUGIN_TIMER_DELAY_TICKS: u64 = 630_720_000;
+const SOLARIS_LUAU_PRELUDE: &str = "local solaris: any = nil :: any\n";
 
-/// Filesystem configuration for the built-in Lua plugin host.
+/// One server-embedded Luau plugin package.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct BundledLuauPlugin {
+    directory_name: &'static str,
+    manifest: &'static str,
+    config: Option<&'static str>,
+    source: &'static str,
+}
+
+impl BundledLuauPlugin {
+    #[must_use]
+    pub const fn new(
+        directory_name: &'static str,
+        manifest: &'static str,
+        source: &'static str,
+    ) -> Self {
+        Self {
+            directory_name,
+            manifest,
+            config: None,
+            source,
+        }
+    }
+
+    #[must_use]
+    pub const fn with_config(mut self, config: &'static str) -> Self {
+        self.config = Some(config);
+        self
+    }
+}
+
+/// Filesystem configuration for the built-in Luau plugin host.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct LuaHostConfig {
     plugins_dir: PathBuf,
@@ -82,7 +114,7 @@ impl LuaHostConfig {
     }
 }
 
-/// Startup error for the Lua host itself. Individual broken plugins are skipped.
+/// Startup error for the Luau host itself. Individual broken plugins are skipped.
 #[derive(Debug)]
 #[non_exhaustive]
 pub enum LuaHostError {
@@ -94,6 +126,9 @@ pub enum LuaHostError {
         message: String,
     },
     StartupChannelClosed,
+    PluginIdConflict {
+        id: String,
+    },
     WorldgenConflict {
         kind: &'static str,
         first: String,
@@ -110,9 +145,12 @@ impl fmt::Display for LuaHostError {
         match self {
             Self::Io { path, message } => write!(formatter, "{}: {message}", path.display()),
             Self::ThreadSpawn { message } => {
-                write!(formatter, "starting Lua host thread: {message}")
+                write!(formatter, "starting Luau host thread: {message}")
             }
-            Self::StartupChannelClosed => formatter.write_str("Lua host startup channel closed"),
+            Self::StartupChannelClosed => formatter.write_str("Luau host startup channel closed"),
+            Self::PluginIdConflict { id } => {
+                write!(formatter, "plugin id {id:?} is declared more than once")
+            }
             Self::WorldgenConflict {
                 kind,
                 first,
@@ -570,6 +608,11 @@ impl PreparedLuaPlugins {
     pub fn client_bundles(&self) -> &[LuaClientBundle] {
         &self.client_bundles
     }
+
+    pub fn merge(mut self, other: Self) -> Result<Self, LuaHostError> {
+        self.sources.extend(other.sources);
+        prepare_plugin_sources(self.sources)
+    }
 }
 
 impl LuaHost {
@@ -582,7 +625,7 @@ impl LuaHost {
     }
 }
 
-/// Start one dedicated host thread for all Lua plugins in the configured directory.
+/// Start one dedicated host thread for all Luau plugins in the configured directory.
 pub fn start_lua_host(config: LuaHostConfig) -> Result<(ScriptBoundary, LuaHost), LuaHostError> {
     start_prepared_lua_host(prepare_lua_plugins(config)?)
 }
@@ -592,13 +635,65 @@ pub fn prepare_lua_plugins(config: LuaHostConfig) -> Result<PreparedLuaPlugins, 
         path: config.plugins_dir().to_path_buf(),
         message: error.to_string(),
     })?;
-    let sources = discover_plugins(config.plugins_dir())?;
+    prepare_plugin_sources(discover_plugins(config.plugins_dir())?)
+}
+
+pub fn prepare_bundled_luau_plugins(
+    plugins: &[BundledLuauPlugin],
+) -> Result<PreparedLuaPlugins, LuaHostError> {
+    if plugins.is_empty() {
+        return prepare_plugin_sources(Vec::new());
+    }
+    let staging = tempfile::tempdir().map_err(|error| LuaHostError::Io {
+        path: std::env::temp_dir(),
+        message: format!("creating bundled Luau plugin staging directory: {error}"),
+    })?;
+    for plugin in plugins {
+        validate_settlement_descriptor_id(plugin.directory_name, "bundled plugin directory")
+            .map_err(|message| LuaHostError::InvalidStartupPlugin {
+                path: PathBuf::from(plugin.directory_name),
+                message,
+            })?;
+        let directory = staging.path().join(plugin.directory_name);
+        fs::create_dir(&directory).map_err(|error| LuaHostError::Io {
+            path: directory.clone(),
+            message: error.to_string(),
+        })?;
+        for (name, contents) in [
+            ("plugin.toml", plugin.manifest),
+            ("main.lua", plugin.source),
+        ] {
+            let path = directory.join(name);
+            fs::write(&path, contents).map_err(|error| LuaHostError::Io {
+                path,
+                message: error.to_string(),
+            })?;
+        }
+        if let Some(config) = plugin.config {
+            let path = directory.join("config.toml");
+            fs::write(&path, config).map_err(|error| LuaHostError::Io {
+                path,
+                message: error.to_string(),
+            })?;
+        }
+    }
+    prepare_lua_plugins(LuaHostConfig::new(staging.path()))
+}
+
+fn prepare_plugin_sources(sources: Vec<PluginSource>) -> Result<PreparedLuaPlugins, LuaHostError> {
     let mut selected_ore = None;
     let mut ore_owner = None;
     let mut selected_settlement = None;
     let mut settlement_owner = None;
     let mut client_bundles = Vec::new();
+    let mut plugin_ids = HashSet::new();
     for source in &sources {
+        let plugin_id = source.manifest.plugin_id();
+        if !plugin_ids.insert(plugin_id) {
+            return Err(LuaHostError::PluginIdConflict {
+                id: plugin_id.to_owned(),
+            });
+        }
         if let Some(profile) = source.worldgen_ore_profile {
             if let Some(first) = ore_owner {
                 return Err(LuaHostError::WorldgenConflict {
@@ -640,7 +735,7 @@ pub fn start_prepared_lua_host(
     );
     let (startup_tx, startup_rx) = std::sync::mpsc::sync_channel(1);
     let thread = thread::Builder::new()
-        .name("solaris-lua-host".to_owned())
+        .name("solaris-luau-host".to_owned())
         .spawn(move || run_lua_host(endpoint, prepared.sources, startup_tx))
         .map_err(|error| LuaHostError::ThreadSpawn {
             message: error.to_string(),
@@ -1027,6 +1122,13 @@ fn read_plugin_source(directory: &Path) -> Result<PluginSource, PluginSourceErro
     let source_path = directory.join("main.lua");
     let source = read_utf8_file_limited(&source_path, MAX_PLUGIN_SOURCE_BYTES)
         .map_err(|error| PluginSourceError::new(error, startup_contract_declared))?;
+    let strict_source = format!("--!strict\n{SOLARIS_LUAU_PRELUDE}\n{source}");
+    luaur::check(&strict_source).map_err(|error| {
+        PluginSourceError::new(
+            format!("Luau type check failed: {error:?}"),
+            startup_contract_declared,
+        )
+    })?;
     Ok(PluginSource {
         manifest,
         config,
@@ -1888,6 +1990,7 @@ impl LuaScriptRuntime {
         let invocation = Arc::new(Mutex::new(None));
         let capabilities = Arc::new(manifest.to_command_capabilities());
         install_solaris_api(&lua, Arc::clone(&invocation), config).map_err(lua_error)?;
+        lua.sandbox(true).map_err(lua_error)?;
         run_with_instruction_budget(&lua, limits.instructions_per_event, || {
             lua.load(source).set_name(manifest.plugin_id()).exec()
         })
@@ -2028,7 +2131,7 @@ impl ScriptRuntime for LuaScriptRuntime {
         });
         install_instruction_budget_hook(&self.lua, budget).map_err(runtime_error)?;
         let result = self.dispatch_event(event, context);
-        self.lua.remove_hook();
+        self.lua.remove_interrupt();
         result
     }
 }
@@ -2992,26 +3095,21 @@ fn run_with_instruction_budget<T>(
 ) -> mlua::Result<T> {
     install_instruction_budget_hook(lua, budget)?;
     let result = run();
-    lua.remove_hook();
+    lua.remove_interrupt();
     result
 }
 
 fn install_instruction_budget_hook(lua: &Lua, budget: NonZeroU64) -> mlua::Result<()> {
     let consumed = Arc::new(AtomicU64::new(0));
-    let hook_consumed = Arc::clone(&consumed);
-    let step =
-        u64::from(HOOK_INSTRUCTION_STEP.min(u32::try_from(budget.get()).unwrap_or(u32::MAX)));
-    lua.set_hook(
-        HookTriggers::new()
-            .every_nth_instruction(u32::try_from(step).expect("instruction hook step fits u32")),
-        move |_, _| {
-            let total = hook_consumed.fetch_add(step, Ordering::Relaxed) + step;
-            if total >= budget.get() {
-                return Err(mlua::Error::runtime("instruction budget exceeded"));
-            }
-            Ok(VmState::Continue)
-        },
-    )?;
+    let interrupt_consumed = Arc::clone(&consumed);
+    lua.set_interrupt(move |_| {
+        let total = interrupt_consumed.fetch_add(LUAU_INTERRUPT_FUEL_COST, Ordering::Relaxed)
+            + LUAU_INTERRUPT_FUEL_COST;
+        if total >= budget.get() {
+            return Err(mlua::Error::runtime("instruction budget exceeded"));
+        }
+        Ok(VmState::Continue)
+    });
     Ok(())
 }
 
@@ -3860,7 +3958,7 @@ mod tests {
             64.0,
             -2.25,
         );
-        let expected_context = "true:123e4567-e89b-12d3-a456-426614174000:Alex:true:1.5:64.0:-2.25";
+        let expected_context = "true:123e4567-e89b-12d3-a456-426614174000:Alex:true:1.5:64:-2.25";
 
         for (event, expected) in [
             (
@@ -3932,9 +4030,9 @@ mod tests {
                     assert(event.player_z == -2.25)
                     assert(event.dimension == "minecraft:the_nether")
                     assert(event.block_id == "minecraft:ancient_debris")
-                    assert(math.type(event.x) == "integer" and event.x == -3)
-                    assert(math.type(event.y) == "integer" and event.y == 15)
-                    assert(math.type(event.z) == "integer" and event.z == 27)
+                    assert(type(event.x) == "number" and event.x % 1 == 0 and event.x == -3)
+                    assert(type(event.y) == "number" and event.y % 1 == 0 and event.y == 15)
+                    assert(type(event.z) == "number" and event.z % 1 == 0 and event.z == 27)
                     assert(event.game_mode == "creative")
                     solaris.send_message(event.player_id, "block-broken")
                 end
@@ -4007,9 +4105,9 @@ mod tests {
                     assert(event.player_z == -2.25)
                     assert(event.dimension == "minecraft:the_end")
                     assert(event.block_id == "minecraft:obsidian")
-                    assert(math.type(event.x) == "integer" and event.x == -3)
-                    assert(math.type(event.y) == "integer" and event.y == 15)
-                    assert(math.type(event.z) == "integer" and event.z == 27)
+                    assert(type(event.x) == "number" and event.x % 1 == 0 and event.x == -3)
+                    assert(type(event.y) == "number" and event.y % 1 == 0 and event.y == 15)
+                    assert(type(event.z) == "number" and event.z % 1 == 0 and event.z == 27)
                     assert(event.game_mode == "creative")
                     solaris.send_message(event.player_id, "block-placed")
                 end
@@ -4083,8 +4181,8 @@ mod tests {
                     assert(event.z == -2.25)
                     assert(event.dimension == "minecraft:overworld")
                     assert(event.item_id == "minecraft:oak_planks")
-                    assert(math.type(event.count) == "integer" and event.count == 12)
-                    assert(math.type(event.craft_count) == "integer" and event.craft_count == 3)
+                    assert(type(event.count) == "number" and event.count % 1 == 0 and event.count == 12)
+                    assert(type(event.craft_count) == "number" and event.craft_count % 1 == 0 and event.craft_count == 3)
                     assert(event.source == "crafting_table")
                     assert(event.game_mode == "adventure")
                     solaris.send_message(event.player_id, "item-crafted")
@@ -5352,7 +5450,9 @@ mod tests {
             ("basic-economy", 1_usize),
             ("colony-villager-scaffold", 2_usize),
             ("geological-mines", 0_usize),
+            ("land-claims", 1_usize),
             ("online-roster", 0_usize),
+            ("settlement-prototype", 0_usize),
         ] {
             let source = read_plugin_source(&examples.join(name)).unwrap();
             assert_eq!(source.manifest.requested_api_version(), SCRIPT_API_VERSION);

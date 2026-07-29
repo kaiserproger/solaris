@@ -411,7 +411,7 @@ fn basic_economy_rejects_fail_late_config_shapes_during_plugin_load() {
         .and_then(|items| items.first_mut())
         .and_then(toml::Value::as_table_mut)
         .unwrap()
-        .insert("count".to_owned(), toml::Value::Float(2.0));
+        .insert("count".to_owned(), toml::Value::Float(2.5));
     let error = match LuaPlugin::new(float_count) {
         Ok(_) => panic!("floating catalog count loaded"),
         Err(error) => error,

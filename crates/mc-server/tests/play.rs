@@ -1116,17 +1116,19 @@ async fn lua_plugin_loaded_from_disk_replies_to_join_and_chat_over_the_wire() {
     std::fs::write(
         plugin.join("main.lua"),
         r#"
-            local function context(event)
+            --!strict
+
+            local function context(event: any): string
                 return tostring(event.context_verified) .. ":" .. event.uuid .. ":" ..
                     event.username .. ":" .. tostring(event.operator) .. ":" ..
                     event.x .. ":" .. event.y .. ":" .. event.z
             end
 
-            function on_player_joined(event)
+            function on_player_joined(event: any)
                 solaris.send_message(event.player_id, "joined:" .. context(event))
             end
 
-            function on_player_chat(event)
+            function on_player_chat(event: any)
                 if event.message == "ping" then
                     solaris.send_message(event.player_id, "chat:" .. context(event))
                 elseif event.message == "day" then
@@ -1155,7 +1157,7 @@ async fn lua_plugin_loaded_from_disk_replies_to_join_and_chat_over_the_wire() {
         &mut rbuf,
         compression,
         &format!(
-            "joined:true:{}:LuaPlayer:true:0.5:-59.0:0.5",
+            "joined:true:{}:LuaPlayer:true:0.5:-59:0.5",
             mc_net::offline_uuid("LuaPlayer")
         ),
     )
@@ -1193,7 +1195,7 @@ async fn lua_plugin_loaded_from_disk_replies_to_join_and_chat_over_the_wire() {
         &mut rbuf,
         compression,
         &format!(
-            "chat:true:{}:LuaPlayer:true:12.25:70.0:-4.5",
+            "chat:true:{}:LuaPlayer:true:12.25:70:-4.5",
             mc_net::offline_uuid("LuaPlayer")
         ),
     )
@@ -1268,7 +1270,9 @@ async fn lua_disk_plugin_spawns_allowlisted_entity_over_the_wire() {
     std::fs::write(
         plugin.join("main.lua"),
         r#"
-            function on_player_command(event)
+            --!strict
+
+            function on_player_command(event: any)
                 solaris.spawn_entity(
                     event.player_id,
                     "minecraft:pig",
@@ -1377,7 +1381,9 @@ async fn lua_player_command_context_distinguishes_operator_and_exposes_identity_
     std::fs::write(
         plugin.join("main.lua"),
         r#"
-            function on_player_command(event)
+            --!strict
+
+            function on_player_command(event: any)
                 local role = event.operator and "operator" or "member"
                 solaris.send_message(
                     event.player_id,
@@ -1427,7 +1433,7 @@ async fn lua_player_command_context_distinguishes_operator_and_exposes_identity_
         &mut member,
         &mut member_buf,
         member_compression,
-        "member:false:a01e3843-e521-3998-958a-f459800e4d11:Player:12.25:70.0:-4.5",
+        "member:false:a01e3843-e521-3998-958a-f459800e4d11:Player:12.25:70:-4.5",
     )
     .await;
     assert!(!member_reply.overlay);
@@ -1460,7 +1466,7 @@ async fn lua_player_command_context_distinguishes_operator_and_exposes_identity_
         &mut operator,
         &mut operator_buf,
         operator_compression,
-        "operator:true:0c2d537c-394b-30e2-a44a-1c42856286cb:OpPlayer:-8.0:65.5:21.75",
+        "operator:true:0c2d537c-394b-30e2-a44a-1c42856286cb:OpPlayer:-8:65.5:21.75",
     )
     .await;
     assert!(!operator_reply.overlay);

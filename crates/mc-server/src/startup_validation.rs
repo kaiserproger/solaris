@@ -1,3 +1,4 @@
+use std::collections::BTreeSet;
 use std::io::Write;
 use std::net::IpAddr;
 use std::path::{Path, PathBuf};
@@ -88,6 +89,15 @@ pub(crate) fn validate_runtime_config(config: &ServerConfig) -> Result<()> {
     }
     if config.simulation.save_interval_ticks == 0 {
         bail!("simulation.save_interval_ticks must be greater than 0");
+    }
+    let mut bundled_plugins = BTreeSet::new();
+    for plugin in &config.plugins.bundled {
+        if !bundled_plugins.insert(plugin.id()) {
+            bail!(
+                "plugins.bundled contains duplicate plugin {:?}",
+                plugin.id()
+            );
+        }
     }
     if let Some(vanilla_data_dir) = config.data.vanilla_data_dir.as_deref() {
         validate_vanilla_sidecar_version(vanilla_data_dir)?;

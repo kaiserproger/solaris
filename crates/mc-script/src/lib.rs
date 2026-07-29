@@ -1,10 +1,10 @@
 //! # mc-script
 //!
-//! Safe script runtime contracts and the built-in Lua plugin host.
+//! Safe script runtime contracts and the built-in Luau plugin host.
 //!
 //! Immutable event snapshots enter runtimes and bounded command batches leave
-//! them. The optional `lua-runtime` feature adds an isolated Lua VM per plugin on
-//! one dedicated host thread, with fixed memory and instruction limits.
+//! them. The optional `lua-runtime` feature adds an isolated Luau VM per plugin on
+//! one dedicated host thread, with fixed memory and execution-fuel limits.
 
 use std::collections::BTreeMap;
 use std::fmt;
@@ -39,12 +39,12 @@ mod tick_delivery_tests;
 
 #[cfg(feature = "lua-runtime")]
 pub use lua::{
-    LuaClientBundle, LuaClientContentKind, LuaClientLoader, LuaClientPermission, LuaHost,
-    LuaHostConfig, LuaHostError, LuaSettlementBuilding, LuaSettlementBuildingRole,
+    BundledLuauPlugin, LuaClientBundle, LuaClientContentKind, LuaClientLoader, LuaClientPermission,
+    LuaHost, LuaHostConfig, LuaHostError, LuaSettlementBuilding, LuaSettlementBuildingRole,
     LuaSettlementBuildingTemplate, LuaSettlementExtension, LuaSettlementInhabitant,
     LuaSettlementInhabitantKind, LuaSettlementJob, LuaSettlementPlan, LuaWorldgenOreProfile,
-    LuaWorldgenSettlementProfile, PreparedLuaPlugins, prepare_lua_plugins, start_lua_host,
-    start_prepared_lua_host,
+    LuaWorldgenSettlementProfile, PreparedLuaPlugins, prepare_bundled_luau_plugins,
+    prepare_lua_plugins, start_lua_host, start_prepared_lua_host,
 };
 
 /// Crate version, exposed so other crates and the binary can report it.

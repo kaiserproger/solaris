@@ -398,13 +398,15 @@ capabilities = ["storage"]
     std::fs::write(
         plugin.join("main.lua"),
         r#"
-function on_server_started(_event)
+--!strict
+
+function on_server_started(_event: any)
     solaris.storage_cas("first", "key:first", nil, "1")
     solaris.storage_cas("second", "key:second", nil, "2")
     solaris.storage_cas("third", "key:third", nil, "3")
 end
 
-function on_plugin_storage_cas_result(event)
+function on_plugin_storage_cas_result(event: any)
     solaris.broadcast(event.request_id .. ":" .. event.failure)
 end
 "#,
@@ -475,13 +477,15 @@ capabilities = ["storage"]
     std::fs::write(
         plugin.join("main.lua"),
         r#"
-function on_server_started(_event)
+--!strict
+
+function on_server_started(_event: any)
     solaris.storage_cas("first", "key:first", nil, "1")
     solaris.storage_cas("second", "key:second", nil, "2")
     solaris.storage_cas("third", "key:third", nil, "3")
 end
 
-function on_plugin_storage_cas_result(event)
+function on_plugin_storage_cas_result(event: any)
     if event.failure then
         solaris.broadcast(event.request_id .. ":" .. event.failure)
     else
@@ -574,7 +578,9 @@ capabilities = ["storage"]
     std::fs::write(
         plugin.join("main.lua"),
         r#"
-function on_server_started(_event)
+--!strict
+
+function on_server_started(_event: any)
     solaris.storage_cas("commit-one", "balance", nil, "7")
 end
 "#,
@@ -660,11 +666,13 @@ capabilities = ["storage"]
     std::fs::write(
         plugin.join("main.lua"),
         r#"
-function on_server_started(_event)
+--!strict
+
+function on_server_started(_event: any)
     solaris.storage_get("read", "balance")
 end
 
-function on_plugin_storage_get_result(event)
+function on_plugin_storage_get_result(event: any)
     solaris.broadcast(event.request_id .. ":" .. event.failure)
 end
 "#,
@@ -718,7 +726,9 @@ capabilities = ["inventory_storage_transactions"]
     std::fs::write(
         plugin.join("main.lua"),
         r#"
-function on_server_started(_event)
+--!strict
+
+function on_server_started(_event: any)
     solaris.inventory_storage_transaction(
         1,
         "purchase",
@@ -727,7 +737,7 @@ function on_server_started(_event)
     )
 end
 
-function on_inventory_storage_transaction_result(event)
+function on_inventory_storage_transaction_result(event: any)
     solaris.broadcast(event.request_id .. ":" .. tostring(event.committed))
 end
 "#,

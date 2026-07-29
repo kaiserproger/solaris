@@ -236,6 +236,7 @@ use simulation::{
     ActiveShieldTransition, AnimalFeedPlan, AnimalFeedTargets, AuthoritativePlayerStateSnapshot,
     BowReleasePlan, CommittedPlayerPose, FoodUsePlan, MerchantTradeDestination, MerchantTradePlan,
     PlayerSurvivalCommitOutcome, PlayerSurvivalPlan, SelectedItemDropPlan, SheepShearPlan,
+    ZombieVillagerCurePlan,
 };
 pub use simulation::{EntityEffectHandle, EntityEffectRequestError};
 
@@ -6449,6 +6450,42 @@ where
         .items
         .name_of(expected_held.item_id)
         .is_some_and(|item| item.as_str() == "minecraft:shears");
+    let held_is_golden_apple = state
+        .items
+        .name_of(expected_held.item_id)
+        .is_some_and(|item| item.as_str() == "minecraft:golden_apple");
+    if held_is_golden_apple {
+        let committed = match state
+            .simulation
+            .commit_zombie_villager_cure(ZombieVillagerCurePlan {
+                entity_id: EntityId(packet.entity_id),
+                held_slot,
+                golden_apple_item_id: expected_held.item_id,
+                expected_held,
+            })
+            .await
+        {
+            Ok(Some(committed)) => committed,
+            Ok(None) => {
+                debug!(
+                    entity_id = packet.entity_id,
+                    "zombie villager cure rejected"
+                );
+                return Ok(());
+            }
+            Err(error) => {
+                debug!(
+                    ?error,
+                    entity_id = packet.entity_id,
+                    "zombie villager cure request rejected"
+                );
+                return Ok(());
+            }
+        };
+        state.inventory = committed.inventory;
+        write_inventory_slot_updates(state, writer, committed.changed_slots).await?;
+        return Ok(());
+    }
     if held_is_shears {
         let Some(plan) = sheep_shear_plan(state, packet.entity_id, held_slot, expected_held) else {
             debug!(

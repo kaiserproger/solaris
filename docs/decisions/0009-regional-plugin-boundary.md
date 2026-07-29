@@ -6,7 +6,7 @@
 ## Problem
 
 Solaris is moving mutable world and entity simulation to regional single-writer
-owners. Exposing that ownership model to Lua would force every plugin author to
+owners. Exposing that ownership model to Luau would force every plugin author to
 handle migration, concurrency, stale references, and cross-region commit. A
 globally mutable lock-free world would avoid visible regions only by moving the
 same consistency problem into atomics and retries.
@@ -19,7 +19,7 @@ Use a hybrid ownership model:
   other state whose authority follows world position;
 - global actor services own non-spatial state such as plugin storage, economy,
   permissions, claim definitions, and plugin lifecycle;
-- each Lua plugin has isolated state and serial handler semantics; the current
+- each Luau plugin has isolated state and serial handler semantics; the current
   runtime multiplexes those states on one shared host thread;
 - the stable plugin boundary contains owned immutable events, bounded command
   batches, targeted completion events, and typed transactions;
@@ -43,7 +43,7 @@ teleports, and entity mutations, use typed host transactions. The host owns
 routing, prepare/commit, rejection, and compensation. A plugin receives one
 committed or rejected result and does not implement regional two-phase commit.
 
-Hot admission rules such as land-claim build permission must not call Lua while
+Hot admission rules such as land-claim build permission must not call Luau while
 holding a region tick. Their owner service publishes an immutable versioned
 policy index for local reads. Updating a rule changes that publication; normal
 block admission remains local to the region.
@@ -56,7 +56,7 @@ id convention; the plugin owns claim meaning and persistence.
 Startup world generation follows the same boundary in declarative form. A
 settlement-profile owner may publish one bounded immutable plan of known
 building templates and roles, inhabitants, jobs, and plugin-scoped extension
-ids. Startup validates and materializes that plan before generation; Lua never
+ids. Startup validates and materializes that plan before generation; Luau never
 receives a generator, chunk, region, or mutable-world handle. Entity
 materialization enters a dedicated system-owned simulation command with
 persisted villager type, profession, and level state. Its durable
@@ -90,7 +90,7 @@ default and cannot weaken per-plugin FIFO ordering.
 
 - Plugin authors write serial handlers and typed commands without locks or
   region awareness.
-- Slow Lua cannot stall a region tick; queue and instruction limits isolate the
+- Slow Luau cannot stall a region tick; queue and instruction limits isolate the
   plugin.
 - Economy and claims do not become spatial simulation state merely to fit the
   regional scheduler.
@@ -100,7 +100,7 @@ default and cannot weaken per-plugin FIFO ordering.
 
 ## Current implementation status
 
-`mc-script` already provides isolated Lua states multiplexed by one serial host
+`mc-script` already provides isolated Luau states multiplexed by one serial host
 thread, bounded immutable DTOs, capability-gated command batches, targeted
 result events, instruction and memory limits, and generic typed protected
 zones. `mc-net` already has production adapters for storage, zones, menus,

@@ -1090,6 +1090,48 @@ impl BoundServer {
                     (None, None)
                 };
             let mut tick = 0_u64;
+            let villager_population_ids = {
+                let item_id = |name: &str| {
+                    Identifier::parse(name)
+                        .ok()
+                        .and_then(|id| entity_config.items.id_of(&id))
+                };
+                let entity_type_id = |name: &str| {
+                    Identifier::parse(name)
+                        .ok()
+                        .and_then(|id| entity_config.entity_types.id_of(&id))
+                        .and_then(|id| i32::try_from(id).ok())
+                };
+                match (
+                    item_id("minecraft:bread"),
+                    item_id("minecraft:potato"),
+                    item_id("minecraft:carrot"),
+                    item_id("minecraft:beetroot"),
+                    entity_type_id("minecraft:villager"),
+                    entity_type_id("minecraft:item"),
+                ) {
+                    (
+                        Some(bread),
+                        Some(potato),
+                        Some(carrot),
+                        Some(beetroot),
+                        Some(villager),
+                        Some(item),
+                    ) => {
+                        Some((
+                            mc_entity::villager_population_26_1_2::VillagerFoodItemIds {
+                                bread,
+                                potato,
+                                carrot,
+                                beetroot,
+                            },
+                            villager,
+                            item,
+                        ))
+                    }
+                    _ => None,
+                }
+            };
             let mut session_empty_generation = entity_sessions.session_empty_generation();
             let mut player_save_generation = entity_sessions.player_save_generation();
             let mut simulation_command_window = SimulationCommandTelemetryWindow::default();
@@ -1413,6 +1455,16 @@ impl BoundServer {
                         ANIMAL_BREEDING_TICK_INTERVAL_TICKS,
                     );
                     animal_breeding_us = elapsed_us(started);
+                }
+                if let Some((food_items, villager_type_id, item_type_id)) = villager_population_ids {
+                    simulation_owner.tick_villager_population(
+                        &entity_sessions,
+                        tick,
+                        food_items,
+                        villager_type_id,
+                        item_type_id,
+                        1,
+                    );
                 }
                 let entity_query_count = queries.len();
                 let (steps, entity_physics_us, entity_dispatch_us) = if physics_was_in_flight {

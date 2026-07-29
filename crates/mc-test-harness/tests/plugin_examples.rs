@@ -1202,11 +1202,13 @@ fn write_villager_fixture_plugin(destination_root: &Path) {
     std::fs::write(
         destination.join("main.lua"),
         r#"
-            local last_tick = 0
-            local cooldown_player = nil
-            local cooldown_target = nil
+            --!strict
 
-            function on_player_joined(event)
+            local last_tick = 0
+            local cooldown_player: number? = nil
+            local cooldown_target: number? = nil
+
+            function on_player_joined(event: any)
                 solaris.spawn_entity(
                     event.player_id,
                     "minecraft:villager",
@@ -1217,15 +1219,18 @@ fn write_villager_fixture_plugin(destination_root: &Path) {
                 solaris.send_message(event.player_id, "fixture-villager-ready")
             end
 
-            function on_player_command(event)
+            function on_player_command(event: any)
                 cooldown_player = event.player_id
                 cooldown_target = last_tick + 7
             end
 
-            function on_server_tick(event)
+            function on_server_tick(event: any)
                 last_tick = event.tick
                 if cooldown_target ~= nil and event.tick >= cooldown_target then
-                    solaris.send_message(cooldown_player, "fixture-attack-ready")
+                    local player_id = cooldown_player
+                    if player_id ~= nil then
+                        solaris.send_message(player_id, "fixture-attack-ready")
+                    end
                     cooldown_player = nil
                     cooldown_target = nil
                 end

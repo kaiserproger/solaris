@@ -1,3 +1,5 @@
+--!strict
+
 -- Script API 0.6 acceptance fixture.
 --
 -- Production supports colony registration, ephemeral villager binding, and
@@ -5,7 +7,7 @@
 -- metadata; API 0.6 exposes no durable entity handle, inventory, or arbitrary
 -- villager memory access.
 
-local config = {
+local config: any = {
     colony = {
         id = "starter-colony",
         name = "Starter Colony",
@@ -26,8 +28,8 @@ local config = {
     max_generation = 999999,
 }
 
-local role_allowed = {}
-local order_allowed = {}
+local role_allowed: any = {}
+local order_allowed: any = {}
 for _, role in ipairs(config.roles) do
     role_allowed[role] = true
 end
@@ -36,19 +38,19 @@ for _, order in ipairs(config.orders) do
 end
 
 local colony_request_pending = false
-local colony_outcome = "not_started"
-local pending_gets = {}
-local pending_get_by_player = {}
-local pending_cas = {}
-local pending_bindings = {}
-local pending_orders = {}
-local active_bindings = {}
-local records = {}
-local zone_seen = {}
-local deferred_notices = {}
-local last_batch = nil
+local colony_outcome: string = "not_started"
+local pending_gets: any = {}
+local pending_get_by_player: any = {}
+local pending_cas: any = {}
+local pending_bindings: any = {}
+local pending_orders: any = {}
+local active_bindings: any = {}
+local records: any = {}
+local zone_seen: any = {}
+local deferred_notices: any = {}
+local last_batch: any = nil
 
-local function table_size(values)
+local function table_size(values: any): number
     local count = 0
     for _ in pairs(values) do
         count = count + 1
@@ -56,7 +58,7 @@ local function table_size(values)
     return count
 end
 
-local function binding_key(uuid)
+local function binding_key(uuid: string): string
     return "villager:" .. uuid
 end
 
@@ -64,7 +66,7 @@ local function colony_key()
     return "colony:" .. config.colony.id
 end
 
-local function encode_record(record)
+local function encode_record(record: any): string
     return table.concat({
         "v1",
         record.status,
@@ -74,7 +76,7 @@ local function encode_record(record)
     }, "|")
 end
 
-local function decode_record(value)
+local function decode_record(value: any): (any, string?)
     if value == nil then
         return nil, nil
     end
@@ -82,12 +84,12 @@ local function decode_record(value)
         value,
         "^v1|([a-z_]+)|([a-z_]+)|([a-z_]+)|(%d+)$"
     )
-    generation = tonumber(generation)
+    local generation_number = tonumber(generation)
     if (status ~= "recruiting" and status ~= "active" and status ~= "rejected")
         or not role_allowed[role]
         or not order_allowed[order]
-        or generation == nil
-        or generation > config.max_generation
+        or generation_number == nil
+        or generation_number > config.max_generation
     then
         return nil, "invalid"
     end
@@ -95,11 +97,11 @@ local function decode_record(value)
         status = status,
         role = role,
         order = order,
-        generation = generation,
+        generation = generation_number,
     }, nil
 end
 
-local function copy_record(record)
+local function copy_record(record: any): any
     return {
         status = record.status,
         role = record.role,
@@ -108,20 +110,20 @@ local function copy_record(record)
     }
 end
 
-local function remember_notice(player_id, message)
+local function remember_notice(player_id: number?, message: string)
     if player_id ~= nil then
         deferred_notices[player_id] = message
     end
 end
 
-local function send_message(player_id, message)
+local function send_message(player_id: number, message: string)
     if last_batch == nil then
         last_batch = { kind = "message", player_id = player_id }
     end
     solaris.send_message(player_id, message)
 end
 
-local function send_notice(player_id)
+local function send_notice(player_id: number)
     local notice = deferred_notices[player_id]
     if notice ~= nil then
         deferred_notices[player_id] = nil
@@ -135,13 +137,13 @@ local function publish_colony_ready()
     solaris.broadcast("Colony plugin ready.")
 end
 
-local function action_request_id(prefix, player_id, version)
+local function action_request_id(prefix: string, player_id: number, version: any): string
     return prefix
         .. "-" .. tostring(player_id)
         .. "-" .. (version == nil and "new" or tostring(version))
 end
 
-local function queue_get(player_id, uuid, action, argument, request_id, key)
+local function queue_get(player_id: number?, uuid: string?, action: string, argument: string?, request_id: string, key: string): boolean
     if player_id ~= nil and pending_get_by_player[player_id] ~= nil then
         return false
     end
@@ -160,7 +162,7 @@ local function queue_get(player_id, uuid, action, argument, request_id, key)
     return true
 end
 
-local function queue_cas(player_id, uuid, key, expected_version, next_record, after, prefix)
+local function queue_cas(player_id: number?, uuid: string?, key: string, expected_version: any, next_record: any, after: any, prefix: string)
     local request_id = action_request_id(prefix, player_id or 0, expected_version)
     pending_cas[request_id] = {
         player_id = player_id,
@@ -174,7 +176,7 @@ local function queue_cas(player_id, uuid, key, expected_version, next_record, af
     solaris.storage_cas(request_id, key, expected_version, encode_record(next_record))
 end
 
-local function queue_binding(player_id, uuid, key, version, record, x, y, z, purpose)
+local function queue_binding(player_id: number, uuid: string, key: string, version: any, record: any, x: number, y: number, z: number, purpose: string)
     local request_id = action_request_id("bind", player_id, version)
     pending_bindings[request_id] = {
         player_id = player_id,
@@ -195,7 +197,7 @@ local function queue_binding(player_id, uuid, key, version, record, x, y, z, pur
     )
 end
 
-local function queue_order(pending, binding_token)
+local function queue_order(pending: any, binding_token: string)
     local request_id = action_request_id("order", pending.player_id, pending.version)
     pending.binding_token = binding_token
     pending_orders[request_id] = pending
@@ -208,7 +210,7 @@ local function queue_order(pending, binding_token)
     )
 end
 
-local function split_arguments(arguments)
+local function split_arguments(arguments: string): any
     local values = {}
     for value in string.gmatch(arguments, "%S+") do
         if #values == 3 then
@@ -219,7 +221,7 @@ local function split_arguments(arguments)
     return values
 end
 
-local function status_message(record)
+local function status_message(record: any): string
     if colony_outcome == "record_pending" then
         return "Colony unavailable: waiting for colony.record_result from UpsertColony."
     end
@@ -242,7 +244,7 @@ local function status_message(record)
         .. ", stored order intent=" .. record.order .. "."
 end
 
-local function handle_player_state(pending, value, version)
+local function handle_player_state(pending: any, value: any, version: any)
     local player_id = pending.player_id
     local record, decode_error = decode_record(value)
     if decode_error ~= nil then
@@ -358,7 +360,7 @@ local function handle_player_state(pending, value, version)
     )
 end
 
-local function clear_player(player_id)
+local function clear_player(player_id: number)
     local get_id = pending_get_by_player[player_id]
     if get_id ~= nil then
         pending_gets[get_id] = nil
@@ -385,7 +387,7 @@ local function clear_player(player_id)
     deferred_notices[player_id] = nil
 end
 
-function on_server_started(_event)
+function on_server_started(_event: any)
     colony_request_pending = true
     colony_outcome = "record_pending"
     last_batch = { kind = "startup" }
@@ -410,13 +412,13 @@ function on_server_started(_event)
     )
 end
 
-function on_player_joined(event)
+function on_player_joined(event: any)
     if colony_outcome == "ready" then
         send_message(event.player_id, "Colony plugin ready.")
     end
 end
 
-function on_colony_record_result(event)
+function on_colony_record_result(event: any)
     last_batch = nil
     if not colony_request_pending
         or event.request_id ~= "register-starter-colony"
@@ -433,7 +435,7 @@ function on_colony_record_result(event)
     queue_get(nil, nil, "colony_record", nil, "load-colony-record", colony_key())
 end
 
-function on_player_zone_entered(event)
+function on_player_zone_entered(event: any)
     last_batch = nil
     if event.zone_id ~= config.zone.id or zone_seen[event.player_id] == event.uuid then
         return
@@ -443,7 +445,7 @@ function on_player_zone_entered(event)
     send_message(event.player_id, "Starter Colony: use /colony status or /colony recruit [role].")
 end
 
-function on_player_command(event)
+function on_player_command(event: any)
     last_batch = nil
     if event.root ~= "colony" then
         return
@@ -512,7 +514,7 @@ function on_player_command(event)
     end
 end
 
-function on_plugin_storage_get_result(event)
+function on_plugin_storage_get_result(event: any)
     last_batch = nil
     local pending = pending_gets[event.request_id]
     if pending == nil then
@@ -559,7 +561,7 @@ function on_plugin_storage_get_result(event)
     handle_player_state(pending, event.value, event.version)
 end
 
-function on_plugin_storage_cas_result(event)
+function on_plugin_storage_cas_result(event: any)
     last_batch = nil
     local pending = pending_cas[event.request_id]
     if pending == nil then
@@ -656,7 +658,7 @@ function on_plugin_storage_cas_result(event)
     end
 end
 
-function on_colony_villager_binding_result(event)
+function on_colony_villager_binding_result(event: any)
     last_batch = nil
     local pending = pending_bindings[event.request_id]
     if pending == nil then
@@ -703,7 +705,7 @@ function on_colony_villager_binding_result(event)
     end
 end
 
-function on_colony_villager_order_result(event)
+function on_colony_villager_order_result(event: any)
     last_batch = nil
     local pending = pending_orders[event.request_id]
     if pending == nil then
@@ -784,12 +786,12 @@ function on_colony_villager_order_result(event)
     end
 end
 
-function on_player_left(event)
+function on_player_left(event: any)
     last_batch = nil
     clear_player(event.player_id)
 end
 
-function on_command_batch_rejected(result)
+function on_command_batch_rejected(result: any)
     local batch = last_batch
     last_batch = nil
     if batch == nil then

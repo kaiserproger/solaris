@@ -588,6 +588,19 @@ impl EntityOwnerAccess {
         applied
     }
 
+    pub(super) fn convert_snapshot_if_current(
+        &mut self,
+        expected: EntitySnapshot,
+        next: EntitySnapshot,
+    ) -> bool {
+        let id = expected.id;
+        #[cfg(test)]
+        self.record_owner_request();
+        let applied = owner_result(self.handle.convert_snapshot_if_current(expected, next));
+        self.invalidate(id);
+        applied
+    }
+
     pub(super) fn replace_snapshot_if_current_deferred_journal(
         &mut self,
         expected: EntitySnapshot,
@@ -645,6 +658,104 @@ impl EntityOwnerAccess {
             self.invalidate(consumed_id);
         }
         applied
+    }
+
+    pub(super) fn commit_villager_inventory_pickup_if_current(
+        &mut self,
+        commit: mc_entity::VillagerInventoryPickupCommit,
+    ) -> bool {
+        let villager_id = commit.villager.0.id;
+        let item_id = commit.item.0.id;
+        let item_removed = commit.item.1.is_none();
+        #[cfg(test)]
+        self.record_owner_request();
+        let applied = owner_result(
+            self.handle
+                .commit_villager_inventory_pickup_if_current(commit),
+        );
+        self.invalidate(villager_id);
+        self.invalidate(item_id);
+        if applied && item_removed {
+            self.observation.record_entity_remove();
+            self.snapshots.borrow_mut().insert(item_id, None);
+        }
+        applied
+    }
+
+    pub(super) fn commit_villager_food_share_if_current(
+        &mut self,
+        commit: mc_entity::VillagerFoodShareCommit,
+    ) -> Option<EntitySnapshot> {
+        let donor_id = commit.donor.0.id;
+        let recipient_id = commit.recipient.id;
+        #[cfg(test)]
+        self.record_owner_request();
+        let thrown = owner_result(self.handle.commit_villager_food_share_if_current(commit));
+        self.invalidate(donor_id);
+        self.invalidate(recipient_id);
+        if let Some(thrown) = &thrown {
+            self.observation.record_entity_inserts(1);
+            self.invalidate(thrown.id);
+        }
+        thrown
+    }
+
+    pub(super) fn commit_villager_courtship_if_current(
+        &mut self,
+        commit: mc_entity::VillagerCourtshipCommit,
+    ) -> bool {
+        let parent_ids = commit
+            .parents
+            .iter()
+            .map(|(expected, _)| expected.id)
+            .collect::<Vec<_>>();
+        #[cfg(test)]
+        self.record_owner_request();
+        let applied = owner_result(self.handle.commit_villager_courtship_if_current(commit));
+        for id in parent_ids {
+            self.invalidate(id);
+        }
+        applied
+    }
+
+    pub(super) fn commit_villager_no_bed_if_current(
+        &mut self,
+        commit: mc_entity::VillagerNoBedCommit,
+    ) -> bool {
+        let parent_ids = commit
+            .parents
+            .iter()
+            .map(|(expected, _)| expected.id)
+            .collect::<Vec<_>>();
+        #[cfg(test)]
+        self.record_owner_request();
+        let applied = owner_result(self.handle.commit_villager_no_bed_if_current(commit));
+        for id in parent_ids {
+            self.invalidate(id);
+        }
+        applied
+    }
+
+    pub(super) fn commit_villager_birth_if_current(
+        &mut self,
+        commit: mc_entity::VillagerBirthCommit,
+    ) -> Option<EntitySnapshot> {
+        let parent_ids = commit
+            .parents
+            .iter()
+            .map(|(expected, _)| expected.id)
+            .collect::<Vec<_>>();
+        #[cfg(test)]
+        self.record_owner_request();
+        let child = owner_result(self.handle.commit_villager_birth_if_current(commit));
+        for id in parent_ids {
+            self.invalidate(id);
+        }
+        if let Some(child) = &child {
+            self.observation.record_entity_inserts(1);
+            self.invalidate(child.id);
+        }
+        child
     }
 
     pub(super) fn apply_kinematics_authoritative(

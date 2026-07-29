@@ -18,14 +18,15 @@ use std::time::Duration;
 
 use mc_protocol::packets::Packet;
 use mc_protocol::packets::play::{
-    AddEntity, ClientboundCommands, ClientboundContainerSetContent, ClientboundContainerSetSlot,
-    ClientboundKeepAlive, ClientboundMerchantOffers, ClientboundOpenScreen,
-    ClientboundSetEntityData, ClientboundSystemChat, ConfirmTeleportation, ContainerInput,
-    Direction, EntityDataValue, EntityVec3, GameEvent, HashedStack, InteractionHand,
-    LevelChunkWithLight, MovePlayerFlags, ServerboundAttack, ServerboundChatCommand,
-    ServerboundContainerClick, ServerboundContainerClose, ServerboundInteract,
-    ServerboundKeepAlive, ServerboundMovePlayerPosRot, ServerboundMovePlayerStatusOnly,
-    ServerboundSelectTrade, ServerboundUseItemOn, SetCenterChunk, SetDefaultSpawnPosition,
+    AGEABLE_ENTITY_DATA_BABY_INDEX, AddEntity, ClientboundCommands, ClientboundContainerSetContent,
+    ClientboundContainerSetSlot, ClientboundKeepAlive, ClientboundMerchantOffers,
+    ClientboundOpenScreen, ClientboundSetEntityData, ClientboundSystemChat, ConfirmTeleportation,
+    ContainerInput, Direction, EntityDataValue, EntityEvent, EntityVec3, GameEvent, HashedStack,
+    InteractionHand, LevelChunkWithLight, MovePlayerFlags, PlayerActionKind, ServerboundAttack,
+    ServerboundChatCommand, ServerboundContainerClick, ServerboundContainerClose,
+    ServerboundInteract, ServerboundKeepAlive, ServerboundMovePlayerPosRot,
+    ServerboundMovePlayerStatusOnly, ServerboundPlayerAction, ServerboundSelectTrade,
+    ServerboundSetCarriedItem, ServerboundUseItemOn, SetCenterChunk, SetDefaultSpawnPosition,
     SynchronizePlayerPosition, pack_block_pos,
 };
 use mc_test_harness::client::Client;
@@ -398,15 +399,18 @@ async fn generated_playable_ruin_chest_loot_moves_to_inventory_and_survives_rest
         .expect("restarted ruin server exits cleanly");
 }
 
-fn ruin_server_config(
+fn ruin_server_config<G>(
     report: &[mc_data::blocks::BlockReport],
     blocks: Arc<mc_world::BlockRegistry>,
     items: Arc<mc_data::items::ItemRegistry>,
-    generator: Arc<mc_worldgen::TerrainGenerator>,
+    generator: Arc<G>,
     world_dir: &std::path::Path,
     shutdown: mc_net::ShutdownHandle,
     motd: &str,
-) -> mc_net::ServerConfig {
+) -> mc_net::ServerConfig
+where
+    G: ChunkGenerator + 'static,
+{
     std::fs::create_dir_all(world_dir.join("region")).expect("create ruin region directory");
     let world = mc_world::WorldStorage::open_with_capacity(world_dir, Arc::clone(&blocks), 49)
         .expect("open ruin disk world")
@@ -745,22 +749,33 @@ async fn generated_village_villager_wire_and_restart_are_stable_inner() {
         Arc::new(mc_worldgen::TerrainGenerator::new(0, Arc::clone(&blocks)).with_structures(rules));
 
     let mut markers = Vec::new();
+    let mut vacant_homes = Vec::new();
     for chunk_x in 3..=5 {
         for chunk_z in -1..=1 {
-            markers.extend(
-                generator
-                    .generate(mc_world::ChunkPos {
-                        x: chunk_x,
-                        z: chunk_z,
-                    })
-                    .settlement_inhabitants(),
-            );
+            let chunk = generator.generate(mc_world::ChunkPos {
+                x: chunk_x,
+                z: chunk_z,
+            });
+            markers.extend(chunk.settlement_inhabitants());
+            vacant_homes.extend(chunk.settlement_vacant_homes());
         }
     }
     assert_eq!(
         markers.len(),
         1,
         "one planned inhabitant must yield one marker"
+    );
+    assert_eq!(
+        vacant_homes.len(),
+        1,
+        "the first unused villager slot must yield one bounded vacant home"
+    );
+    assert!(!vacant_homes[0].claim.is_empty());
+    assert!(
+        vacant_homes[0]
+            .position
+            .iter()
+            .all(|component| component.is_finite())
     );
     let marker = markers.remove(0);
     assert!(marker.home.is_some());
@@ -792,6 +807,433 @@ async fn generated_village_villager_wire_and_restart_are_stable_inner() {
     assert_eq!(first.merchant_uses, 1);
     assert_eq!(second.merchant_uses, 1);
     assert_eq!(second.merchant_xp, 2);
+}
+
+struct PopulationFixtureGenerator {
+    inner: Arc<mc_worldgen::TerrainGenerator>,
+}
+
+impl ChunkGenerator for PopulationFixtureGenerator {
+    fn generate(&self, pos: mc_world::ChunkPos) -> mc_world::Chunk {
+        let mut chunk = self.inner.generate(pos);
+        let mut inhabitants = chunk.settlement_inhabitants();
+        if inhabitants.len() >= 2 {
+            inhabitants.sort_by(|left, right| left.claim.cmp(&right.claim));
+            let anchor = inhabitants[0].position;
+            inhabitants[0].home = Some(anchor);
+            inhabitants[1].position = [anchor[0] + 1.0, anchor[1], anchor[2]];
+            inhabitants[1].home = Some(anchor);
+            chunk.set_settlement_inhabitants(&inhabitants);
+        }
+        chunk
+    }
+}
+
+#[test]
+fn generated_village_food_share_birth_wire_and_restart_are_stable() {
+    let test = std::thread::Builder::new()
+        .name("generated_village_food_share_birth_wire_and_restart_are_stable".to_owned())
+        .stack_size(4 * 1024 * 1024)
+        .spawn(|| {
+            tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .expect("build generated village population runtime")
+                .block_on(generated_village_food_share_birth_wire_and_restart_are_stable_inner());
+        })
+        .expect("spawn generated village population thread");
+    if let Err(panic) = test.join() {
+        std::panic::resume_unwind(panic);
+    }
+}
+
+async fn generated_village_food_share_birth_wire_and_restart_are_stable_inner() {
+    let manifest = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+    let vanilla_dir = manifest.join("../../data/vanilla");
+    let required = [
+        vanilla_dir
+            .join("data/minecraft/structure/village/plains/town_centers/plains_fountain_01.nbt"),
+        vanilla_dir.join("data/minecraft/structure/village/plains/houses/plains_small_house_1.nbt"),
+    ];
+    if required.iter().any(|path| !path.is_file())
+        || !vanilla_dir.join("data/minecraft/worldgen").is_dir()
+    {
+        eprintln!("skipping generated village population gate: vanilla sidecars are missing");
+        return;
+    }
+
+    let report = mc_data::blocks::solaris_required_blocks_report();
+    let blocks = Arc::new(mc_world::BlockRegistry::from_report(&report).expect("block registry"));
+    let items = Arc::new(mc_data::items::solaris_required_items());
+    let rules = mc_worldgen::StructureRules::plains_village_prototype_with_plan(
+        &vanilla_dir,
+        &blocks,
+        &[
+            mc_worldgen::PlainsVillagePrototypePart::Fountain,
+            mc_worldgen::PlainsVillagePrototypePart::SmallHouse,
+        ],
+        vec![
+            mc_worldgen::StructureInhabitant {
+                id: "population-parent-a".to_owned(),
+                entity_type: "minecraft:villager".to_owned(),
+                villager_kind: "plains".to_owned(),
+                profession: "none".to_owned(),
+                level: 1,
+            },
+            mc_worldgen::StructureInhabitant {
+                id: "population-parent-b".to_owned(),
+                entity_type: "minecraft:villager".to_owned(),
+                villager_kind: "plains".to_owned(),
+                profession: "none".to_owned(),
+                level: 1,
+            },
+        ],
+    )
+    .expect("load fixed village population prototype")
+    .with_fixed_center((72, 8));
+    let generator = Arc::new(PopulationFixtureGenerator {
+        inner: Arc::new(
+            mc_worldgen::TerrainGenerator::new(0, Arc::clone(&blocks)).with_structures(rules),
+        ),
+    });
+
+    let mut markers = Vec::new();
+    let mut vacant_homes = Vec::new();
+    for chunk_x in 3..=5 {
+        for chunk_z in -1..=1 {
+            let chunk = generator.generate(mc_world::ChunkPos {
+                x: chunk_x,
+                z: chunk_z,
+            });
+            markers.extend(chunk.settlement_inhabitants());
+            vacant_homes.extend(chunk.settlement_vacant_homes());
+        }
+    }
+    assert_eq!(markers.len(), 2, "population fixture needs two parents");
+    assert_eq!(
+        vacant_homes.len(),
+        1,
+        "population fixture needs one vacant home"
+    );
+    let parent_distance_squared = marker_distance_squared(&markers[0], &markers[1]);
+    assert!(
+        parent_distance_squared <= 26.0,
+        "fountain parents must start within one ordinary movement step of the exact breeding radius: {parent_distance_squared}; markers={markers:?}; vacant={vacant_homes:?}"
+    );
+    let midpoint = [
+        (markers[0].position[0] + markers[1].position[0]) * 0.5,
+        (markers[0].position[1] + markers[1].position[1]) * 0.5,
+        (markers[0].position[2] + markers[1].position[2]) * 0.5,
+    ];
+
+    let villager_type_id = mc_data::entity_types::solaris_required_entity_types()
+        .id_of(&mc_data::Identifier::parse("minecraft:villager").unwrap())
+        .and_then(|id| i32::try_from(id).ok())
+        .expect("villager entity type");
+    let carrot_id = ruin_item_id(&items, "minecraft:carrot");
+    let world_dir = tempfile::tempdir().expect("generated village population disk world");
+
+    let shutdown = mc_net::ShutdownHandle::default();
+    let bound = mc_net::bind(ruin_server_config(
+        &report,
+        Arc::clone(&blocks),
+        Arc::clone(&items),
+        Arc::clone(&generator),
+        world_dir.path(),
+        shutdown.clone(),
+        "generated village population first run",
+    ))
+    .await
+    .expect("bind village population server");
+    let addr = bound
+        .local_addr()
+        .expect("village population server address");
+    let serve = tokio::spawn(async move { bound.serve().await });
+    let mut client = connect_ruin_client(addr, "VillagePopGate").await;
+    let parents = observe_villager_population(&mut client, midpoint, villager_type_id, 2).await;
+    let parent_ids = parents
+        .values()
+        .map(|entity| entity.entity_id)
+        .collect::<std::collections::HashSet<_>>();
+    let parent_uuids = parents
+        .keys()
+        .copied()
+        .collect::<std::collections::BTreeSet<_>>();
+    let child = drop_carrots_and_wait_for_villager_food_share_birth(
+        &mut client,
+        &parent_ids,
+        villager_type_id,
+        carrot_id,
+        midpoint,
+    )
+    .await;
+    assert!(!parent_uuids.contains(&child.uuid));
+
+    client
+        .write_packet(&ServerboundChatCommand {
+            command: "save-all".into(),
+        })
+        .await
+        .expect("save village population world");
+    wait_for_save_all_feedback(&mut client).await;
+    drop(client);
+    shutdown.request();
+    tokio::time::timeout(Duration::from_secs(5), serve)
+        .await
+        .expect("village population first shutdown")
+        .expect("village population first server join")
+        .expect("village population first server result");
+
+    let shutdown = mc_net::ShutdownHandle::default();
+    let bound = mc_net::bind(ruin_server_config(
+        &report,
+        blocks,
+        items,
+        generator,
+        world_dir.path(),
+        shutdown.clone(),
+        "generated village population restart",
+    ))
+    .await
+    .expect("bind restarted village population server");
+    let addr = bound
+        .local_addr()
+        .expect("restarted village population server address");
+    let serve = tokio::spawn(async move { bound.serve().await });
+    let mut client = connect_ruin_client(addr, "VillagePopGate").await;
+    let restored = observe_villager_population(&mut client, midpoint, villager_type_id, 3).await;
+    assert_eq!(
+        restored.len(),
+        3,
+        "restart must expose exactly two parents and one child"
+    );
+    for parent_uuid in &parent_uuids {
+        assert!(restored.contains_key(parent_uuid));
+    }
+    assert_eq!(
+        restored.keys().filter(|uuid| **uuid == child.uuid).count(),
+        1,
+        "restart must restore the same child UUID exactly once"
+    );
+
+    drop(client);
+    shutdown.request();
+    tokio::time::timeout(Duration::from_secs(5), serve)
+        .await
+        .expect("village population restart shutdown")
+        .expect("village population restart server join")
+        .expect("village population restart server result");
+}
+
+fn marker_distance_squared(
+    first: &mc_world::SettlementInhabitantMarker,
+    second: &mc_world::SettlementInhabitantMarker,
+) -> f64 {
+    let dx = first.position[0] - second.position[0];
+    let dy = first.position[1] - second.position[1];
+    let dz = first.position[2] - second.position[2];
+    dx.mul_add(dx, dy.mul_add(dy, dz * dz))
+}
+
+async fn observe_villager_population(
+    client: &mut Client,
+    position: [f64; 3],
+    villager_type_id: i32,
+    expected_count: usize,
+) -> std::collections::BTreeMap<uuid::Uuid, AddEntity> {
+    client
+        .write_packet(&ServerboundMovePlayerPosRot {
+            x: position[0],
+            y: position[1],
+            z: position[2],
+            yaw: 0.0,
+            pitch: 0.0,
+            flags: MovePlayerFlags::new(true, false),
+        })
+        .await
+        .expect("move to generated village population fixture");
+    let target_chunk = (
+        (position[0].floor() as i32).div_euclid(16),
+        (position[2].floor() as i32).div_euclid(16),
+    );
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(12);
+    let mut quiet_deadline = None;
+    let mut chunk_loaded = false;
+    let mut villagers = std::collections::BTreeMap::new();
+    loop {
+        let now = tokio::time::Instant::now();
+        let active_deadline = quiet_deadline.unwrap_or(deadline);
+        if now >= active_deadline {
+            break;
+        }
+        let frame = match client
+            .read_frame_with_timeout(active_deadline.saturating_duration_since(now))
+            .await
+        {
+            Ok(frame) => frame,
+            Err(error) if quiet_deadline.is_some() => {
+                let _ = error;
+                break;
+            }
+            Err(error) => panic!("generated village population visibility: {error}"),
+        };
+        let mut frame = frame;
+        if handle_keepalive(client, frame.id, &frame.body).await {
+            continue;
+        }
+        if frame.id == SynchronizePlayerPosition::ID {
+            let correction = SynchronizePlayerPosition::decode(&mut frame.body)
+                .expect("decode population movement correction");
+            panic!("movement to generated village population was rejected: {correction:?}");
+        }
+        if frame.id == LevelChunkWithLight::ID {
+            let chunk = LevelChunkWithLight::decode(&mut frame.body)
+                .expect("decode generated population chunk");
+            chunk_loaded |= (chunk.chunk_x, chunk.chunk_z) == target_chunk;
+        } else if frame.id == AddEntity::ID {
+            let entity =
+                AddEntity::decode(&mut frame.body).expect("decode generated population villager");
+            if entity.entity_type_id == villager_type_id {
+                villagers.insert(entity.uuid, entity);
+            }
+        }
+        if quiet_deadline.is_none() && chunk_loaded && villagers.len() >= expected_count {
+            quiet_deadline = Some(tokio::time::Instant::now() + Duration::from_millis(750));
+        }
+    }
+    assert!(chunk_loaded, "generated village population chunk must load");
+    assert_eq!(
+        villagers.len(),
+        expected_count,
+        "generated village population must expose exactly {expected_count} unique villager UUIDs"
+    );
+    villagers
+}
+
+async fn drop_carrots_and_wait_for_villager_food_share_birth(
+    client: &mut Client,
+    parent_ids: &std::collections::HashSet<i32>,
+    villager_type_id: i32,
+    carrot_id: u32,
+    midpoint: [f64; 3],
+) -> AddEntity {
+    client
+        .write_packet(&ServerboundChatCommand {
+            command: "debug give minecraft:carrot 48 0".into(),
+        })
+        .await
+        .expect("give carrots for generated villager food sharing");
+    let held_slot = wait_for_hotbar_inventory_item(client, carrot_id, 48).await;
+    client
+        .write_packet(&ServerboundSetCarriedItem { slot: held_slot })
+        .await
+        .expect("select carrot hotbar slot for generated villager birth");
+    client
+        .write_packet(&ServerboundPlayerAction {
+            action: PlayerActionKind::DropAllItems,
+            position: 0,
+            direction: Direction::Down,
+            sequence: 901,
+        })
+        .await
+        .expect("drop carrots for generated villager birth");
+    client
+        .write_packet(&ServerboundMovePlayerPosRot {
+            x: midpoint[0] + 4.0,
+            y: midpoint[1],
+            z: midpoint[2],
+            yaw: 0.0,
+            pitch: 0.0,
+            flags: MovePlayerFlags::new(true, false),
+        })
+        .await
+        .expect("move away from dropped villager carrots");
+
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(50);
+    let mut heart_parents = std::collections::HashSet::new();
+    let mut child: Option<AddEntity> = None;
+    let mut non_villager_entities = std::collections::HashSet::new();
+    let mut saw_player_drop = false;
+    let mut saw_villager_share = false;
+    let mut baby_metadata = std::collections::HashSet::new();
+    let mut birth_events = std::collections::HashSet::new();
+    loop {
+        let mut frame = client
+            .read_frame_with_timeout(
+                deadline.saturating_duration_since(tokio::time::Instant::now()),
+            )
+            .await
+            .unwrap_or_else(|error| {
+                panic!(
+                    "generated villager food-share birth visibility: {error}; player_drop={saw_player_drop}; villager_share={saw_villager_share}; non_villagers={non_villager_entities:?}; hearts={heart_parents:?}; child={child:?}; baby={baby_metadata:?}; birth_events={birth_events:?}"
+                )
+            });
+        if handle_keepalive(client, frame.id, &frame.body).await {
+            continue;
+        }
+        if frame.id == EntityEvent::ID {
+            let event = EntityEvent::decode(&mut frame.body)
+                .expect("decode generated villager population event");
+            if event.event_id == 18 && parent_ids.contains(&event.entity_id) {
+                heart_parents.insert(event.entity_id);
+            }
+            if event.event_id == 12 {
+                birth_events.insert(event.entity_id);
+            }
+        } else if frame.id == AddEntity::ID {
+            let entity = AddEntity::decode(&mut frame.body)
+                .expect("decode generated population AddEntity");
+            if entity.entity_type_id == villager_type_id && !parent_ids.contains(&entity.entity_id)
+            {
+                match &child {
+                    Some(existing) => assert_eq!(
+                        existing.uuid, entity.uuid,
+                        "one courtship must not publish two child identities"
+                    ),
+                    None => child = Some(entity),
+                }
+            } else if entity.entity_type_id != villager_type_id {
+                non_villager_entities.insert(entity.entity_id);
+            }
+        } else if frame.id == ClientboundSetEntityData::ID {
+            let data = ClientboundSetEntityData::decode(&mut frame.body)
+                .expect("decode generated villager population metadata");
+            if non_villager_entities.contains(&data.entity_id) {
+                saw_player_drop |= data.values.iter().any(|value| {
+                    matches!(
+                        value,
+                        EntityDataValue::ItemStack { stack, .. }
+                            if stack.item_id == carrot_id && stack.count == 48
+                    )
+                });
+                saw_villager_share |= data.values.iter().any(|value| {
+                    matches!(
+                        value,
+                        EntityDataValue::ItemStack { stack, .. }
+                            if stack.item_id == carrot_id && stack.count == 24
+                    )
+                });
+            }
+            if data.values.iter().any(|value| {
+                matches!(
+                    value,
+                    EntityDataValue::Boolean { index, value: true }
+                        if *index == AGEABLE_ENTITY_DATA_BABY_INDEX
+                )
+            }) {
+                baby_metadata.insert(data.entity_id);
+            }
+        }
+        if let Some(child) = child.as_ref()
+            && saw_player_drop
+            && saw_villager_share
+            && heart_parents == *parent_ids
+            && baby_metadata.contains(&child.entity_id)
+            && birth_events.contains(&child.entity_id)
+        {
+            return child.clone();
+        }
+    }
 }
 
 struct GeneratedVillageFixture<'a> {
@@ -1035,6 +1477,43 @@ async fn wait_for_inventory_item(client: &mut Client, item_id: u32, count: i32) 
                 .expect("decode generated toolsmith inventory content");
             if packet.container_id == 0 && container_item_count(&packet, item_id) == count {
                 return;
+            }
+        }
+    }
+}
+
+async fn wait_for_hotbar_inventory_item(client: &mut Client, item_id: u32, count: i32) -> i16 {
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+    loop {
+        let mut frame = client
+            .read_frame_with_timeout(
+                deadline.saturating_duration_since(tokio::time::Instant::now()),
+            )
+            .await
+            .expect("generated villager hotbar inventory grant");
+        if handle_keepalive(client, frame.id, &frame.body).await {
+            continue;
+        }
+        if frame.id == ClientboundContainerSetSlot::ID {
+            let packet = ClientboundContainerSetSlot::decode(&mut frame.body)
+                .expect("decode generated villager hotbar slot");
+            if packet.item_stack.item_id == item_id && packet.item_stack.count == count {
+                if packet.container_id == -2 && (0..=8).contains(&packet.slot) {
+                    return packet.slot;
+                }
+                if packet.container_id == 0 && (36..=44).contains(&packet.slot) {
+                    return packet.slot - 36;
+                }
+            }
+        } else if frame.id == ClientboundContainerSetContent::ID {
+            let packet = ClientboundContainerSetContent::decode(&mut frame.body)
+                .expect("decode generated villager hotbar inventory content");
+            if packet.container_id == 0 {
+                for (hotbar_slot, stack) in packet.items.iter().skip(36).take(9).enumerate() {
+                    if stack.item_id == item_id && stack.count == count {
+                        return i16::try_from(hotbar_slot).expect("hotbar slot fits i16");
+                    }
+                }
             }
         }
     }

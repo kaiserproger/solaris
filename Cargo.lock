@@ -465,6 +465,12 @@ checksum = "9330f8b2ff13f34540b44e946ef35111825727b38d33286ef986142615121801"
 
 [[package]]
 name = "cfg_aliases"
+version = "0.1.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "fd16c4719339c4530435d38e511904438d07cce7950afa3718a84ac36c10e89e"
+
+[[package]]
+name = "cfg_aliases"
 version = "0.2.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "f079e83a288787bcd14a6aea84cee5c87a67c5a3e660c30f557a3d24761b3527"
@@ -556,6 +562,15 @@ name = "clap_lex"
 version = "1.1.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "c8d4a3bb8b1e0c1050499d1815f5ab16d04f0959b233085fb31653fbfc9d98f9"
+
+[[package]]
+name = "clipboard-win"
+version = "5.4.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "bde03770d3df201d4fb868f2c9c59e66a3e4e2bd06692a0fe701e7103c7e84d4"
+dependencies = [
+ "error-code",
+]
 
 [[package]]
 name = "cmake"
@@ -844,6 +859,12 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "48c757948c5ede0e46177b7add2e67155f70e33c07fea8284df6576da70b3719"
 
 [[package]]
+name = "endian-type"
+version = "0.1.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "c34f04666d835ff5d62e058c3995147c06f42fe86ff053337632bca83e42702d"
+
+[[package]]
 name = "equivalent"
 version = "1.0.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -871,6 +892,12 @@ dependencies = [
 ]
 
 [[package]]
+name = "error-code"
+version = "3.3.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "dea2df4cf52843e0452895c455a1a2cfbb842a1e7329671acf418fdc53ed4c59"
+
+[[package]]
 name = "event-listener"
 version = "5.4.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -895,6 +922,17 @@ name = "fastrand"
 version = "2.4.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "9f1f227452a390804cdb637b74a86990f2a7d7ba4b7d5693aac9b4dd6defd8d6"
+
+[[package]]
+name = "fd-lock"
+version = "4.0.4"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "0ce92ff622d6dadf7349484f42c93271a0d49b7cc4d466a936405bacbe10aa78"
+dependencies = [
+ "cfg-if",
+ "rustix",
+ "windows-sys 0.52.0",
+]
 
 [[package]]
 name = "find-msvc-tools"
@@ -1131,6 +1169,15 @@ name = "hermit-abi"
 version = "0.5.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "fc0fef456e4baa96da950455cd02c081ca953b141298e41db3fc7e36b1da849c"
+
+[[package]]
+name = "home"
+version = "0.5.12"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "cc627f471c528ff0c4a49e1d5e60450c8f6461dd6d10ba9dcd3a61d3dff7728d"
+dependencies = [
+ "windows-sys 0.61.2",
+]
 
 [[package]]
 name = "http"
@@ -1538,22 +1585,179 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "112b39cec0b298b6c1999fee3e31427f74f676e4cb9879ed1a121b43661a4154"
 
 [[package]]
-name = "lua-src"
-version = "550.1.1"
+name = "luau0-src"
+version = "0.20.7+luau728"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "75c110c2fa33f34e0de05448e1f3eb2e0631e7a69e2d8ae1586cffc9fc9f9949"
+checksum = "6aa644236297645ba62215330b2a2d60cf7ee6263c33578baf8e54662868ed59"
 dependencies = [
  "cc",
 ]
 
 [[package]]
-name = "luajit-src"
-version = "210.7.2+b925b3e"
+name = "luaur"
+version = "0.1.8"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "920cf654b23d217c550ceea57c32cd2a413ea27b6d47ed77b5ee0cf655adefa6"
+checksum = "7ee5ac147ebd5cbccbd965459ba2a8b3445ef2c7615d3a68361ef89360e670c5"
 dependencies = [
- "cc",
- "which",
+ "luaur-analysis",
+ "luaur-ast",
+ "luaur-bytecode",
+ "luaur-common",
+ "luaur-compiler",
+ "luaur-config",
+ "luaur-repl-cli",
+ "luaur-require",
+ "luaur-rt",
+ "luaur-vm",
+]
+
+[[package]]
+name = "luaur-analysis"
+version = "0.1.8"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "75bbc26840a5c9931ffe0d461e8dfb27640dc4ed3c1446a6bb746a9b8caf9423"
+dependencies = [
+ "luaur-ast",
+ "luaur-bytecode",
+ "luaur-common",
+ "luaur-compiler",
+ "luaur-config",
+ "luaur-vm",
+ "windows-sys 0.52.0",
+]
+
+[[package]]
+name = "luaur-ast"
+version = "0.1.8"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "764705892871b019d59ae715a3c258c05d4c0cdc91b48bc13de1dff9528c46aa"
+dependencies = [
+ "luaur-common",
+]
+
+[[package]]
+name = "luaur-bytecode"
+version = "0.1.8"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "d04ae19a8ccc422eb05af31c3d72ea52417fe183cf3b12c5838cec539541ab3a"
+dependencies = [
+ "luaur-common",
+]
+
+[[package]]
+name = "luaur-cli-lib"
+version = "0.1.8"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "2c67779b5b166ab55c535588d884ab036e01e10b4edf1edb7f5a2935945223c9"
+dependencies = [
+ "luaur-ast",
+ "luaur-bytecode",
+ "luaur-common",
+ "luaur-compiler",
+ "luaur-config",
+ "luaur-vm",
+ "windows-sys 0.52.0",
+]
+
+[[package]]
+name = "luaur-code-gen"
+version = "0.1.8"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "77c70717b7c86689ba908cf9ebfddbd1827f692cceff848d3654ed3bf2f868f6"
+dependencies = [
+ "luaur-common",
+ "luaur-vm",
+ "windows-sys 0.52.0",
+]
+
+[[package]]
+name = "luaur-common"
+version = "0.1.8"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "0d9c24d960012cf14bd4cfd056a89d41758d5548305e91552fc71aa0318edae7"
+dependencies = [
+ "libc",
+ "windows-sys 0.52.0",
+]
+
+[[package]]
+name = "luaur-compiler"
+version = "0.1.8"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "6e84db18b5d4b63286e3725ef8473a1181dc70bad9941608ec120ecc2e255397"
+dependencies = [
+ "luaur-ast",
+ "luaur-bytecode",
+ "luaur-common",
+]
+
+[[package]]
+name = "luaur-config"
+version = "0.1.8"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "25268a18ce43d0f81c7640608d1bdee37e4982fa21733444528ec5b00c7ac07b"
+dependencies = [
+ "luaur-ast",
+ "luaur-bytecode",
+ "luaur-common",
+ "luaur-compiler",
+ "luaur-vm",
+]
+
+[[package]]
+name = "luaur-repl-cli"
+version = "0.1.8"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "1ecd2e01b16d66176018eec23db4c79568e23559a8218453dc8d7e8c07f91fd5"
+dependencies = [
+ "luaur-ast",
+ "luaur-bytecode",
+ "luaur-cli-lib",
+ "luaur-code-gen",
+ "luaur-common",
+ "luaur-compiler",
+ "luaur-config",
+ "luaur-require",
+ "luaur-vm",
+ "rustyline",
+]
+
+[[package]]
+name = "luaur-require"
+version = "0.1.8"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "9f67ee05efb48b14af27073def002ea1fff6dc13da8add242073b994ccd8c92d"
+dependencies = [
+ "luaur-ast",
+ "luaur-bytecode",
+ "luaur-common",
+ "luaur-compiler",
+ "luaur-config",
+ "luaur-vm",
+]
+
+[[package]]
+name = "luaur-rt"
+version = "0.1.8"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "e2f75240c12ca15167dae8542d7d477d28a58491e33a752c4e160f424dc6e588"
+dependencies = [
+ "luaur-analysis",
+ "luaur-ast",
+ "luaur-bytecode",
+ "luaur-common",
+ "luaur-compiler",
+ "luaur-config",
+ "luaur-vm",
+]
+
+[[package]]
+name = "luaur-vm"
+version = "0.1.8"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "945d6993538f99bc25a424b7a7a55b9db953d609f7fc869e6d80495326e46ae2"
+dependencies = [
+ "luaur-common",
 ]
 
 [[package]]
@@ -1669,9 +1873,11 @@ dependencies = [
 name = "mc-script"
 version = "0.0.1-alpha.1"
 dependencies = [
+ "luaur",
  "mlua",
  "serde",
  "sha2",
+ "tempfile",
  "tokio",
  "toml",
  "tracing",
@@ -1716,6 +1922,7 @@ dependencies = [
  "clap",
  "flate2",
  "mc-data",
+ "mc-entity",
  "mc-nbt",
  "mc-net",
  "mc-protocol",
@@ -1820,9 +2027,29 @@ dependencies = [
  "cc",
  "cfg-if",
  "libc",
- "lua-src",
- "luajit-src",
+ "luau0-src",
  "pkg-config",
+]
+
+[[package]]
+name = "nibble_vec"
+version = "0.1.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "77a5d83df9f36fe23f0c3648c6bbb8b0298bb5f1939c8f2704431371f4b84d43"
+dependencies = [
+ "smallvec",
+]
+
+[[package]]
+name = "nix"
+version = "0.28.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "ab2156c4fce2f8df6c499cc1c763e4394b7482525bf2a9701c9d79d215f519e4"
+dependencies = [
+ "bitflags",
+ "cfg-if",
+ "cfg_aliases 0.1.1",
+ "libc",
 ]
 
 [[package]]
@@ -2158,7 +2385,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "0c1a41e437b6bbd489372cd4971de128e85c855f56c57f283d20ff016cf7c0a8"
 dependencies = [
  "bytes",
- "cfg_aliases",
+ "cfg_aliases 0.2.2",
  "pin-project-lite",
  "quinn-proto",
  "quinn-udp",
@@ -2200,7 +2427,7 @@ version = "0.5.15"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "35a133f956daabe89a61a685c2649f13d82d5aa4bd5d12d1277e1072a21c0694"
 dependencies = [
- "cfg_aliases",
+ "cfg_aliases 0.2.2",
  "libc",
  "once_cell",
  "socket2",
@@ -2228,6 +2455,16 @@ name = "r-efi"
 version = "6.0.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "f8dcc9c7d52a811697d2151c701e0d08956f92b0e24136cf4cf27b57a6a0d9bf"
+
+[[package]]
+name = "radix_trie"
+version = "0.2.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "c069c179fcdc6a2fe24d8d18305cf085fdbd4f922c041943e203685d6a1c58fd"
+dependencies = [
+ "endian-type",
+ "nibble_vec",
+]
 
 [[package]]
 name = "rand"
@@ -2570,6 +2807,28 @@ dependencies = [
  "quick-error",
  "tempfile",
  "wait-timeout",
+]
+
+[[package]]
+name = "rustyline"
+version = "14.0.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "7803e8936da37efd9b6d4478277f4b2b9bb5cdb37a113e8d63222e58da647e63"
+dependencies = [
+ "bitflags",
+ "cfg-if",
+ "clipboard-win",
+ "fd-lock",
+ "home",
+ "libc",
+ "log",
+ "memchr",
+ "nix",
+ "radix_trie",
+ "unicode-segmentation",
+ "unicode-width",
+ "utf8parse",
+ "windows-sys 0.52.0",
 ]
 
 [[package]]
@@ -3244,6 +3503,12 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "c6f5d3c3b1bf09027a88a6bc961fc00497d651009560b5463668dc81b0fa87a8"
 
 [[package]]
+name = "unicode-width"
+version = "0.1.14"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "7dd6e30e90baa6f72411720665d41d89b9a3d039dc45b8faea1ddd07f617f6af"
+
+[[package]]
 name = "unicode-xid"
 version = "0.2.6"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3497,15 +3762,6 @@ dependencies = [
  "serde",
  "thiserror",
  "web-sys",
-]
-
-[[package]]
-name = "which"
-version = "8.0.5"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "8f3ef584124b911bcc3875c2f1472e80f24361ceb789bd1c62b3e9a3df9ff43c"
-dependencies = [
- "libc",
 ]
 
 [[package]]

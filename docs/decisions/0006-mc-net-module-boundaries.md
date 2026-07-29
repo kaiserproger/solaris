@@ -426,7 +426,7 @@ Other accepted concrete boundaries in this staged migration are:
   These owners snapshot exact player, mode, dimension, position, and death or
   target facts into one nonblocking push outbox before any client write. A
   single async server worker preserves outbox order and awaits required bounded
-  Lua admission. PvP and projectile player death therefore do not depend on the victim connection
+  Luau admission. PvP and projectile player death therefore do not depend on the victim connection
   consuming `PlayerDamageCommitted`, and a failed health/inventory packet write
   cannot erase an accepted event. The outbox is intentionally unbounded: a
   synchronous owner cannot await bounded capacity while holding state locks,
@@ -434,7 +434,7 @@ Other accepted concrete boundaries in this staged migration are:
   Death production is fenced to one entry per live-to-dead transition; direct
   melee-kill production is fenced to the target's one lethal transition.
   Another player-death entry requires an authoritative respawn. The bounded
-  Lua queue remains the backpressure boundary. If measured hostile workloads
+  Luau queue remains the backpressure boundary. If measured hostile workloads
   make this outbox material, replace it with a reserved-permit or durable
   segmented outbox without moving waits under owner locks. No path invents
   incomplete killer or damage-source attribution. Queue closure cannot roll
@@ -479,11 +479,11 @@ Other accepted concrete boundaries in this staged migration are:
   command router and play connections. The router alone mutates zone
   definitions; an accepted absolute player movement pushes a pose observation;
   session cleanup forgets the player. The registry mutex is released before
-  targeted event delivery awaits queue admission. Lua never receives session,
+  targeted event delivery awaits queue admission. Luau never receives session,
   entity or registry handles. Accepted mixed transitions publish deterministic
   exits before entries; rejected movement and cleanup cannot publish membership
   events.
-- `script::zone` owns the generic typed zone-protection index. A Lua plugin
+- `script::zone` owns the generic typed zone-protection index. A Luau plugin
   explicitly attaches an actor-or-operator policy through
   `solaris.upsert_protected_zone`; ordinary zones remain membership-only.
   Neither `mc-net` nor `mc-script` matches a plugin id or interprets a zone id.
@@ -501,21 +501,21 @@ Other accepted concrete boundaries in this staged migration are:
   back an unapplied registry change. Moving the bounded actor path from the
   registry mutex to the versioned published policy index remains the next
   implementation stage from ADR 0009.
-- The `mc-script` Lua loader owns optional per-plugin `config.toml` discovery,
+- The `mc-script` Luau loader owns optional per-plugin `config.toml` discovery,
   bounded parsing, recursive type/shape validation, and the immutable startup
-  snapshot exposed by `solaris.config()`. Each call materializes a fresh Lua
+  snapshot exposed by `solaris.config()`. Each call materializes a fresh Luau
   table, so plugin mutation cannot alter host state or another call. Runtime
   handlers perform no configuration I/O. Live reload, environment expansion,
   defaults, and cross-plugin configuration access require a separate contract
   and are not implied by this boundary.
-- The `mc-script` Lua host owns bounded in-memory plugin timers and deterministic
+- The `mc-script` Luau host owns bounded in-memory plugin timers and deterministic
   due-callback dispatch. `mc-net` only pushes the authoritative simulation tick
   through a monotonic latest-value admission lane. When the normal script queue
   is full, that lane coalesces to the newest tick and wakes the existing host;
   it does not block simulation, create another task or thread, poll state, or
   wait on wall-clock time. The host suppresses stale queued ticks, drains at
   most eight due callbacks per pushed tick in deadline/id order, and shares the
-  input tick's Lua fuel and command batch across callbacks and `on_server_tick`.
+  input tick's Luau fuel and command batch across callbacks and `on_server_tick`.
   Timers are host-local, non-durable plugin state; durable scheduling requires a
   separate storage/recovery contract.
 - `script::colony` owns the bounded, owner-scoped in-memory colony registry and
@@ -543,12 +543,12 @@ Other accepted concrete boundaries in this staged migration are:
   active route.
 - `play::containers::script_menu` owns the immutable plugin-menu layout,
   item resolution, fixed-slot click classification and plugin/menu/player
-  identity fence. `play::session::script_menu_endpoint` consumes admitted Lua
+  identity fence. `play::session::script_menu_endpoint` consumes admitted Luau
   commands and routes open/close requests through the target session's ordered
   reliable lane. `play.rs` remains the packet coordinator and holds the active
   window in the connection-owned interaction state. Rejected or stale clicks
   only resync content; accepted clicks publish a typed event to the retained
-  plugin owner. The wire harness covers the full Lua-to-client-to-Lua path.
+  plugin owner. The wire harness covers the full Luau-to-client-to-Luau path.
 - `script::storage` owns plugin record versions, quota checks, CRC-framed batch
   durability, and transaction command serialization. `play::script_inventory_transaction`
   owns resource resolution and inventory planning;
@@ -600,7 +600,7 @@ Other accepted concrete boundaries in this staged migration are:
   liveness/type, current pose, and canonical reach are checked in one existing
   session/entity owner turn. Living projection follows the entity behavior
   archetype rather than `MobCategory`, so living `MISC` entities such as
-  villagers retain health. `play::script_gameplay_events` owns only the Lua DTO
+  villagers retain health. `play::script_gameplay_events` owns only the Luau DTO
   mapping and required queue admission. `play.rs` completes the existing
   vanilla interaction and client writes before awaiting that admission, while
   write errors keep their original immediate return. This boundary adds no
@@ -698,7 +698,7 @@ sight cancellation is also not yet connected to the world-read path.
   batching, world access, lighting/publication helpers, and `SimulationOwner`
   remain in `simulation.rs`; this extraction does not claim the regional or ECS
   migration complete and adds no task, lock, config, sleep, or polling.
-- `script::teleport` owns admission routing and targeted Lua result publication.
+- `script::teleport` owns admission routing and targeted Luau result publication.
   `play::session::script_teleport_endpoint` resolves the exact reliable session
   and carries the correlation token. That token moves into
   `SimulationCommand::CommitPlayerPose`, so the simulation owner publishes the

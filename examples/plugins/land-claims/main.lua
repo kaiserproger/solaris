@@ -1,50 +1,54 @@
-local config = solaris.config()
+--!strict
+
+local config: any = solaris.config()
 local storage_key = "claims:v1"
-local claims = {}
-local storage_version = nil
+local claims: any = {}
+local storage_version: any = nil
 local loaded = false
-local pending_save = nil
-local pending_zone_load = nil
+local pending_save: any = nil
+local pending_zone_load: any = nil
 local request_sequence = 0
-local last_batch = nil
+local last_batch: any = nil
 
 assert(type(config.dimension) == "string")
 assert(string.match(config.dimension, "^[a-z0-9_.-]+:[a-z0-9_./-]+$") ~= nil)
-assert(math.type(config.minimum_y) == "integer" and math.type(config.maximum_y) == "integer")
+assert(type(config.minimum_y) == "number" and config.minimum_y % 1 == 0)
+assert(type(config.maximum_y) == "number" and config.maximum_y % 1 == 0)
 assert(config.minimum_y <= config.maximum_y)
-assert(math.type(config.maximum_claims) == "integer")
+assert(type(config.maximum_claims) == "number" and config.maximum_claims % 1 == 0)
 assert(config.maximum_claims >= 1 and config.maximum_claims <= 48)
 
-local function next_request(prefix)
+local function next_request(prefix: string): string
     request_sequence = request_sequence + 1
     return prefix .. "-" .. tostring(request_sequence)
 end
 
-local function normalize_uuid(uuid)
-    local normalized = string.lower(string.gsub(uuid, "-", ""))
+local function normalize_uuid(uuid: string): string?
+    local without_hyphens = string.gsub(uuid, "-", "")
+    local normalized = string.lower(without_hyphens)
     if #normalized ~= 32 or string.match(normalized, "^[0-9a-f]+$") == nil then
         return nil
     end
     return normalized
 end
 
-local function chunk_coordinate(value)
+local function chunk_coordinate(value: number): number
     return math.floor(value / 16)
 end
 
-local function coordinate_id(value)
+local function coordinate_id(value: number): string
     return value < 0 and ("n" .. tostring(-value)) or ("p" .. tostring(value))
 end
 
-local function claim_key(chunk_x, chunk_z)
+local function claim_key(chunk_x: number, chunk_z: number): string
     return tostring(chunk_x) .. "," .. tostring(chunk_z)
 end
 
-local function zone_id(claim)
+local function zone_id(claim: any): string
     return "claim-" .. claim.owner .. "-" .. coordinate_id(claim.x) .. "-" .. coordinate_id(claim.z)
 end
 
-local function register_claim(claim)
+local function register_claim(claim: any)
     solaris.upsert_protected_zone(
         zone_id(claim),
         config.dimension,
@@ -58,21 +62,21 @@ local function register_claim(claim)
     )
 end
 
-local function copy_claims(source)
-    local copied = {}
+local function copy_claims(source: any): any
+    local copied: any = {}
     for key, claim in pairs(source) do
         copied[key] = { x = claim.x, z = claim.z, owner = claim.owner }
     end
     return copied
 end
 
-local function encode_claims(values)
-    local keys = {}
+local function encode_claims(values: any): string
+    local keys: { string } = {}
     for key in pairs(values) do
         keys[#keys + 1] = key
     end
     table.sort(keys)
-    local encoded = {}
+    local encoded: { string } = {}
     for _, key in ipairs(keys) do
         local claim = values[key]
         encoded[#encoded + 1] = tostring(claim.x) .. "," .. tostring(claim.z) .. "," .. claim.owner
@@ -80,8 +84,8 @@ local function encode_claims(values)
     return "v1|" .. table.concat(encoded, ";")
 end
 
-local function decode_claims(value)
-    local decoded = {}
+local function decode_claims(value: string?): any
+    local decoded: any = {}
     if value == nil or value == "v1|" then
         return decoded
     end
@@ -90,10 +94,11 @@ local function decode_claims(value)
     end
     local count = 0
     for row in string.gmatch(string.sub(value, 4), "([^;]+)") do
-        local x, z, owner = string.match(row, "^(-?%d+),(-?%d+),([0-9a-f]+)$")
-        x = tonumber(x)
-        z = tonumber(z)
-        if x == nil or z == nil or normalize_uuid(owner or "") == nil then
+        local x_text, z_text, owner_text = string.match(row, "^(-?%d+),(-?%d+),([0-9a-f]+)$")
+        local x = tonumber(x_text)
+        local z = tonumber(z_text)
+        local owner = normalize_uuid(owner_text or "")
+        if x == nil or z == nil or owner == nil then
             return nil
         end
         count = count + 1

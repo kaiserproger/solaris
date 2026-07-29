@@ -46,6 +46,7 @@ use super::{
 use mc_data::block_facts::BlockFactsTable;
 use mc_data::block_light::BlockLightTable;
 use mc_entity::runtime_26_1_2::TargetKind;
+use mc_entity::villager_population_26_1_2::VillagerFoodItemIds;
 use mc_entity::{
     EntityEffectOperation, EntityEffectRequest, EntityEffectResult, EntityId, EntityItemStack,
     EntitySnapshot, REGION_SIZE_CHUNKS, RegionKey, RegionLease, RegionOwnership,
@@ -372,6 +373,7 @@ pub(super) enum SimulationCommand {
     CommitAnimalFeed(AnimalFeedCommand),
     CommitMerchantTrade(Box<MerchantTradeCommand>),
     CommitSheepShear(SheepShearCommand),
+    CommitZombieVillagerCure(ZombieVillagerCureCommand),
     CommitPlayerSurvival(Box<PlayerSurvivalCommand>),
     CommitPlayerPose {
         actor_session: SessionId,
@@ -449,6 +451,7 @@ impl SimulationCommand {
             Self::CommitAnimalFeed(_) => "commit_animal_feed",
             Self::CommitMerchantTrade(_) => "commit_merchant_trade",
             Self::CommitSheepShear(_) => "commit_sheep_shear",
+            Self::CommitZombieVillagerCure(_) => "commit_zombie_villager_cure",
             Self::CommitPlayerSurvival(_) => "commit_player_survival",
             Self::CommitPlayerPose { .. } => "commit_player_pose",
             Self::CommitPlayerStateEvent { .. } => "commit_player_state_event",
@@ -513,6 +516,7 @@ pub(super) enum SimulationResponse {
     AnimalFeed(Result<Option<Box<CommittedAnimalFeed>>, SimulationRequestError>),
     MerchantTrade(Result<Option<Box<CommittedMerchantTrade>>, SimulationRequestError>),
     SheepShear(Result<Option<Box<CommittedSheepShear>>, SimulationRequestError>),
+    ZombieVillagerCure(Result<Option<Box<CommittedZombieVillagerCure>>, SimulationRequestError>),
     PlayerSurvival(Result<Option<Box<PlayerSurvivalCommitOutcome>>, SimulationRequestError>),
     PlayerPose(Result<CommittedPlayerPose, SimulationRequestError>),
     PlayerStateEvent(Result<(), SimulationRequestError>),
@@ -1677,6 +1681,27 @@ pub(super) struct CommittedSheepShear {
     pub(super) dispatches: Vec<VisibilityDispatch>,
 }
 
+#[derive(Debug, Clone)]
+pub(super) struct ZombieVillagerCurePlan {
+    pub(super) entity_id: EntityId,
+    pub(super) held_slot: usize,
+    pub(super) expected_held: ItemStack,
+    pub(super) golden_apple_item_id: u32,
+}
+
+#[derive(Debug)]
+pub(super) struct ZombieVillagerCureCommand {
+    actor_session: SessionId,
+    plan: ZombieVillagerCurePlan,
+}
+
+#[derive(Debug)]
+pub(super) struct CommittedZombieVillagerCure {
+    pub(super) inventory: PlayerInventory,
+    pub(super) changed_slots: Vec<(usize, ItemStack)>,
+    pub(super) dispatches: Vec<VisibilityDispatch>,
+}
+
 #[derive(Debug)]
 pub(super) struct ChestReadSnapshot {
     pub(super) view: ChestView,
@@ -2426,6 +2451,28 @@ impl SimulationHandle {
         }
     }
 
+    pub(super) async fn commit_zombie_villager_cure(
+        &self,
+        plan: ZombieVillagerCurePlan,
+    ) -> Result<Option<CommittedZombieVillagerCure>, SimulationRequestError> {
+        let actor_session = self.session_id()?;
+        let receiver = self.enqueue_player_command(SimulationCommand::CommitZombieVillagerCure(
+            ZombieVillagerCureCommand {
+                actor_session,
+                plan,
+            },
+        ))?;
+        match receiver.await {
+            Ok(Ok(SimulationResponse::ZombieVillagerCure(Ok(committed)))) => {
+                Ok(committed.map(|committed| *committed))
+            }
+            Ok(Ok(SimulationResponse::ZombieVillagerCure(Err(error)))) => Err(error),
+            Ok(Ok(_)) => Err(SimulationRequestError::ResponseMismatch),
+            Ok(Err(error)) => Err(error),
+            Err(_) => Err(SimulationRequestError::OwnerStopped),
+        }
+    }
+
     pub(super) async fn commit_player_survival(
         &self,
         plan: PlayerSurvivalPlan,
@@ -3151,6 +3198,27 @@ impl SimulationOwner {
         elapsed_ticks: u16,
     ) -> usize {
         let (births, dispatches) = sessions.tick_animal_breeding(&self.authority, elapsed_ticks);
+        dispatch_visibility_commands(dispatches);
+        births
+    }
+
+    pub(crate) fn tick_villager_population(
+        &self,
+        sessions: &SessionRegistry,
+        current_tick: u64,
+        food_items: VillagerFoodItemIds,
+        villager_type_id: i32,
+        item_type_id: i32,
+        elapsed_ticks: u32,
+    ) -> usize {
+        let (births, dispatches) = sessions.tick_villager_population(
+            &self.authority,
+            current_tick,
+            food_items,
+            villager_type_id,
+            item_type_id,
+            elapsed_ticks,
+        );
         dispatch_visibility_commands(dispatches);
         births
     }
@@ -5533,6 +5601,25 @@ impl SimulationOwner {
                     };
                     SimulationResponse::SheepShear(result)
                 }
+                SimulationCommand::CommitZombieVillagerCure(command) => {
+                    let result = if valid_zombie_villager_cure_plan(&command.plan) {
+                        Ok(sessions
+                            .commit_zombie_villager_cure(
+                                &self.authority,
+                                command.actor_session,
+                                &command.plan,
+                            )
+                            .map(|mut committed| {
+                                dispatch_visibility_commands(std::mem::take(
+                                    &mut committed.dispatches,
+                                ));
+                                Box::new(committed)
+                            }))
+                    } else {
+                        Err(SimulationRequestError::InvalidCommand)
+                    };
+                    SimulationResponse::ZombieVillagerCure(result)
+                }
                 SimulationCommand::CommitPlayerSurvival(command) => {
                     let result = if valid_player_survival_plan(&command.plan) {
                         Ok(sessions
@@ -6091,6 +6178,12 @@ fn valid_sheep_shear_plan(plan: &SheepShearPlan) -> bool {
         && plan.shears_max_damage > 0
         && plan.item_entity_type_id >= 0
         && plan.wool_item_ids.iter().all(|item_id| *item_id > 0)
+}
+
+fn valid_zombie_villager_cure_plan(plan: &ZombieVillagerCurePlan) -> bool {
+    plan.held_slot < 46
+        && !plan.expected_held.is_empty()
+        && plan.expected_held.item_id == plan.golden_apple_item_id
 }
 
 fn valid_player_survival_plan(plan: &PlayerSurvivalPlan) -> bool {

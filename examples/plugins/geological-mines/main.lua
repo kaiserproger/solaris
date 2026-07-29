@@ -1,4 +1,6 @@
-function on_player_command(event)
+--!strict
+
+function on_player_command(event: any)
     if event.root == "geology" then
         solaris.send_message(
             event.player_id,
