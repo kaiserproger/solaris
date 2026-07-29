@@ -1,8 +1,16 @@
 # Luau Plugins
 
-Solaris exposes one Luau plugin contract: API `0.6.0`. A manifest requesting any
-other version is rejected. There is no legacy manifest or Luau API compatibility
-path.
+Solaris exposes one production Luau plugin contract: API `0.6.0`. A manifest
+requesting any other version is rejected. There is no legacy manifest or Luau
+API compatibility path.
+
+The future full server/client addon platform is specified separately in
+[`LUAU_ADDON_API_1_0_SPEC.md`](LUAU_ADDON_API_1_0_SPEC.md), with its parked
+implementation backlog in
+[`LUAU_ADDON_API_1_0_TASKS.md`](LUAU_ADDON_API_1_0_TASKS.md). Those tasks are
+blocked until the scoped vanilla 26.1.2 parity gate is closed and the owner
+explicitly activates the first addon-platform milestone; they do not describe
+current API `0.6.0` behavior.
 
 `mc-net` provides the `0.6.0` plugin-storage, zone, inventory-menu,
 inventory/storage transaction, player-inventory transaction, player-teleport,
