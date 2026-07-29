@@ -152,7 +152,7 @@ use herd_spawn_authority::{
     install_committed_herd_spawns_locked,
 };
 use herd_spawn_authority::{ClaimedPendingHostiles, claim_loaded_pending_hostiles_locked};
-use hostile_authority::update_hostile_targets;
+use hostile_authority::update_hostile_targets_from_projections;
 #[cfg(test)]
 use hostile_authority::{
     HostileCommitProbe, HostileScanProbe, changed_hostile_goal, hostile_wander_goal,
@@ -510,6 +510,11 @@ pub(crate) struct SessionRegistry {
     movement_recipients: arc_swap::ArcSwap<MovementRecipientIndex>,
     active_simulation_entities: arc_swap::ArcSwap<HashSet<EntityId>>,
     active_hostile_entities: arc_swap::ArcSwap<HashSet<EntityId>>,
+    entity_update_budget_per_lane: AtomicUsize,
+    entity_update_budget_total: AtomicUsize,
+    entity_update_selected: AtomicUsize,
+    entity_update_active_population: AtomicUsize,
+    entity_movement_publication_budget: AtomicUsize,
     overridden_villager_entities: arc_swap::ArcSwap<HashSet<EntityId>>,
     villager_brain_profile: arc_swap::ArcSwap<mc_entity::villager_26_1_2::VillagerBrainProfile>,
     mob_behavior_table: arc_swap::ArcSwap<mc_data::mob_behavior_26_1_2::MobBehaviorTable>,
@@ -810,6 +815,13 @@ impl SessionRegistry {
             movement_recipients: arc_swap::ArcSwap::from_pointee(MovementRecipientIndex::new()),
             active_simulation_entities: arc_swap::ArcSwap::from_pointee(HashSet::new()),
             active_hostile_entities: arc_swap::ArcSwap::from_pointee(HashSet::new()),
+            entity_update_budget_per_lane: AtomicUsize::new(0),
+            entity_update_budget_total: AtomicUsize::new(0),
+            entity_update_selected: AtomicUsize::new(0),
+            entity_update_active_population: AtomicUsize::new(0),
+            entity_movement_publication_budget: AtomicUsize::new(
+                ENTITY_MOVEMENT_TARGET_UPDATES_PER_TRACKING_TURN,
+            ),
             overridden_villager_entities: arc_swap::ArcSwap::from_pointee(HashSet::new()),
             villager_brain_profile: arc_swap::ArcSwap::from_pointee(
                 mc_entity::villager_26_1_2::VillagerBrainProfile::vanilla_26_1_2(),

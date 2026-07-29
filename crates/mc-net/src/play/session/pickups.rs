@@ -115,6 +115,7 @@ struct ClaimedArrowParts {
 }
 
 impl SessionRegistry {
+    #[cfg(test)]
     pub(super) fn pickup_candidate_dispatch(
         &self,
         session_id: SessionId,
@@ -140,8 +141,25 @@ impl SessionRegistry {
                 .filter_map(|session_id| {
                     let session = inner.sessions.get(&session_id)?;
                     let position = Vec3::new(session.pose.x, session.pose.y, session.pose.z);
+                    let radius_sq = ENTITY_PICKUP_RADIUS * ENTITY_PICKUP_RADIUS;
                     let candidate_ids =
-                        nearby_entity_candidate_ids_locked(&inner, position, ENTITY_PICKUP_RADIUS);
+                        nearby_entity_candidate_ids_locked(&inner, position, ENTITY_PICKUP_RADIUS)
+                            .into_iter()
+                            .filter(|entity_id| {
+                                inner.published_entity_snapshots.get(entity_id).is_some_and(
+                                    |entity| {
+                                        distance_sq(entity.position, position) <= radius_sq
+                                            && (entity.item_stack.is_some()
+                                                || entity
+                                                    .experience_value
+                                                    .is_some_and(|value| value > 0)
+                                                || (entity.type_name == "minecraft:arrow"
+                                                    && entity.on_ground
+                                                    && entity.velocity == Vec3::ZERO))
+                                    },
+                                )
+                            })
+                            .collect::<Vec<_>>();
                     Some((session_id, position, candidate_ids))
                 })
                 .collect::<Vec<_>>()

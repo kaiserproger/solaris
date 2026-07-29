@@ -3847,12 +3847,13 @@ fn dense_simulation_cohort_keeps_the_full_active_breeding_population() {
         &SimulationAuthority::for_test(),
         &resources,
         20,
+        256,
         8,
         DEFAULT_VIEW_DISTANCE,
         EntitySimulationWorldContext::empty(),
     );
 
-    assert_eq!(queries.len(), ENTITY_SIMULATION_UPDATES_PER_LANE_PER_TICK);
+    assert_eq!(queries.len(), 256);
     assert_eq!(
         registry.active_simulation_entities.load().len(),
         300,
@@ -5226,19 +5227,31 @@ fn pending_hostile_activation_releases_session_lock_during_journal_commit() {
         observer_completed,
         "register and mark_loaded must complete before pending hostile publication"
     );
-    assert!(bob_load_dispatches.iter().all(|dispatch| !matches!(
-        &dispatch.command,
-        OutboundCommand::SpawnEntity(snapshot) if snapshot.uuid == hostile_uuid
-    )));
+    assert!(
+        bob_load_dispatches
+            .iter()
+            .all(|dispatch| match &dispatch.command {
+                OutboundCommand::SpawnEntity(snapshot) => snapshot.uuid != hostile_uuid,
+                OutboundCommand::SpawnEntities(snapshots) => {
+                    snapshots
+                        .iter()
+                        .all(|snapshot| snapshot.uuid != hostile_uuid)
+                }
+                _ => true,
+            })
+    );
     let mut spawned_for = activation_dispatches
         .iter()
-        .filter(|dispatch| {
-            matches!(
-                &dispatch.command,
-                OutboundCommand::SpawnEntity(snapshot) if snapshot.uuid == hostile_uuid
-            )
+        .filter_map(|dispatch| {
+            let contains = match &dispatch.command {
+                OutboundCommand::SpawnEntity(snapshot) => snapshot.uuid == hostile_uuid,
+                OutboundCommand::SpawnEntities(snapshots) => snapshots
+                    .iter()
+                    .any(|snapshot| snapshot.uuid == hostile_uuid),
+                _ => false,
+            };
+            contains.then_some(dispatch.recipient.id)
         })
-        .map(|dispatch| dispatch.recipient.id)
         .collect::<Vec<_>>();
     spawned_for.sort_unstable();
     assert_eq!(spawned_for, vec![alice, bob]);
@@ -5358,10 +5371,15 @@ fn direct_time_set_between_herd_admission_and_claim_cannot_strand_hostiles() {
             .pending_hostile_spawns
             .is_empty()
     );
-    assert!(dispatches.iter().any(|dispatch| matches!(
-        &dispatch.command,
-        OutboundCommand::SpawnEntity(snapshot) if snapshot.type_name == "minecraft:zombie"
-    )));
+    assert!(dispatches.iter().any(|dispatch| {
+        match &dispatch.command {
+            OutboundCommand::SpawnEntity(snapshot) => snapshot.type_name == "minecraft:zombie",
+            OutboundCommand::SpawnEntities(snapshots) => snapshots
+                .iter()
+                .any(|snapshot| snapshot.type_name == "minecraft:zombie"),
+            _ => false,
+        }
+    }));
 }
 
 #[test]
@@ -5427,8 +5445,12 @@ fn pending_hostile_chunks_commit_and_publish_as_one_batch() {
     assert_eq!(
         dispatches
             .iter()
-            .filter(|dispatch| matches!(dispatch.command, OutboundCommand::SpawnEntity(_)))
-            .count(),
+            .map(|dispatch| match &dispatch.command {
+                OutboundCommand::SpawnEntity(_) => 1,
+                OutboundCommand::SpawnEntities(snapshots) => snapshots.len(),
+                _ => 0,
+            })
+            .sum::<usize>(),
         2
     );
     let inner = registry.lock_inner("inspect committed pending hostile batch");

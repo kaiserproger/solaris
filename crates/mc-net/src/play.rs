@@ -576,7 +576,6 @@ const ENTITY_SPAWNS_PER_WRITE_TURN: usize = 16;
 const ENTITY_MOVEMENTS_PER_WRITE_TURN: usize = 256;
 const ENTITY_MOVEMENT_TARGET_UPDATES_PER_TRACKING_TURN: usize = 512;
 const ENTITY_GOAL_UPDATES_PER_TICK: usize = 512;
-const ENTITY_SIMULATION_UPDATES_PER_LANE_PER_TICK: usize = 256;
 const TELEPORT_RESEND_DELAY_TICKS: u64 = 20;
 
 #[cfg(test)]
@@ -655,14 +654,15 @@ fn ordinary_entity_is_due_for_movement_tracking(
     ordinal: usize,
     tick: u64,
     entity_count: usize,
+    publication_budget: usize,
 ) -> bool {
-    if entity_count <= ENTITY_MOVEMENT_TARGET_UPDATES_PER_TRACKING_TURN {
+    let publication_budget = publication_budget.max(1);
+    if entity_count <= publication_budget {
         return true;
     }
     let turn = tick / ENTITY_MOVE_SEND_INTERVAL_TICKS;
-    let start = (turn as usize * ENTITY_MOVEMENT_TARGET_UPDATES_PER_TRACKING_TURN) % entity_count;
-    (ordinal + entity_count - start) % entity_count
-        < ENTITY_MOVEMENT_TARGET_UPDATES_PER_TRACKING_TURN
+    let start = (turn as usize * publication_budget) % entity_count;
+    (ordinal + entity_count - start) % entity_count < publication_budget
 }
 
 fn bounded_entity_ids_due_for_tick(
@@ -676,9 +676,14 @@ fn bounded_entity_ids_due_for_tick(
     }
     let mut ordered = eligible_ids.iter().copied().collect::<Vec<_>>();
     ordered.sort_unstable();
-    let start = (tick as usize).wrapping_mul(limit) % ordered.len();
+    let population = ordered.len();
     (0..limit)
-        .map(|offset| ordered[(start + offset) % ordered.len()])
+        .map(|stratum| {
+            let start = stratum.saturating_mul(population) / limit;
+            let end = (stratum + 1).saturating_mul(population) / limit;
+            let width = end.saturating_sub(start).max(1);
+            ordered[start + tick as usize % width]
+        })
         .collect()
 }
 

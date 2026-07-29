@@ -9,10 +9,10 @@ use uuid::Uuid;
 
 use crate::{
     AnimalBreedingState, EntityDamage, EntityDamageRequest, EntityEffectRequest,
-    EntityEffectResult, EntityId, EntityItemStack, EntityKinematics, EntityLifecycle,
-    EntityMotionState, EntitySnapshot, EntityStore, EntityView, GoalState, GoalTickStats,
-    PathingBudget, PathingProbe, PreparedGoalTick, ResolvedGoalTick, SpawnEntity, Vec3,
-    deterministic_uuid, snapshot_from_spawn,
+    EntityEffectResult, EntityGoalCheckpoint, EntityId, EntityItemStack, EntityKinematics,
+    EntityLifecycle, EntityMotionState, EntitySimulationProjection, EntitySnapshot, EntityStore,
+    EntityView, GoalState, GoalTickStats, PathingBudget, PathingProbe, PreparedGoalTick,
+    ResolvedGoalTick, SpawnEntity, Vec3, deterministic_uuid, snapshot_from_spawn,
 };
 
 mod owner_lane;
@@ -750,11 +750,12 @@ pub struct RegionalPreparedGoalTick {
     authority: RegionalAuthorityId,
     phase: RegionPhase,
     leases: BTreeMap<RegionKey, RegionLease>,
+    lane_versions: BTreeMap<usize, u64>,
     batches: BTreeMap<RegionKey, PreparedGoalTick>,
     follow_targets: BTreeMap<RegionKey, HashMap<EntityId, Vec3>>,
     follow_target_sources: BTreeMap<EntityId, RegionalFollowTargetSource>,
     expected_missing_follow_targets: HashSet<EntityId>,
-    goal_inputs: BTreeMap<EntityId, EntitySnapshot>,
+    goal_inputs: BTreeMap<EntityId, EntityGoalCheckpoint>,
 }
 
 #[derive(Debug)]
@@ -762,24 +763,25 @@ pub struct RegionalResolvedGoalTick {
     authority: RegionalAuthorityId,
     phase: RegionPhase,
     leases: BTreeMap<RegionKey, RegionLease>,
+    lane_versions: BTreeMap<usize, u64>,
     batches: BTreeMap<RegionKey, ResolvedGoalTick>,
     follow_targets: BTreeMap<RegionKey, HashMap<EntityId, Vec3>>,
     follow_target_sources: BTreeMap<EntityId, RegionalFollowTargetSource>,
     expected_missing_follow_targets: HashSet<EntityId>,
-    goal_inputs: BTreeMap<EntityId, EntitySnapshot>,
+    goal_inputs: BTreeMap<EntityId, EntityGoalCheckpoint>,
 }
 
 #[derive(Debug, Clone, PartialEq)]
 struct RegionalFollowTargetSource {
     region: RegionKey,
-    snapshot: EntitySnapshot,
+    checkpoint: EntityGoalCheckpoint,
 }
 
 struct CapturedFollowTargets {
     remote_by_region: BTreeMap<RegionKey, HashMap<EntityId, Vec3>>,
     sources: BTreeMap<EntityId, RegionalFollowTargetSource>,
     expected_missing_follow_targets: HashSet<EntityId>,
-    inputs: BTreeMap<EntityId, EntitySnapshot>,
+    inputs: BTreeMap<EntityId, EntityGoalCheckpoint>,
 }
 
 impl RegionalPreparedGoalTick {
@@ -811,6 +813,7 @@ impl RegionalPreparedGoalTick {
             authority: self.authority,
             phase: self.phase,
             leases: self.leases,
+            lane_versions: self.lane_versions,
             follow_targets: self.follow_targets,
             follow_target_sources: self.follow_target_sources,
             expected_missing_follow_targets: self.expected_missing_follow_targets,
@@ -839,6 +842,7 @@ impl RegionalPreparedGoalTick {
             authority,
             phase,
             leases,
+            lane_versions,
             batches,
             follow_targets,
             follow_target_sources,
@@ -889,6 +893,7 @@ impl RegionalPreparedGoalTick {
             authority,
             phase,
             leases,
+            lane_versions,
             batches: resolved,
             follow_targets,
             follow_target_sources,
@@ -1135,8 +1140,7 @@ fn cached_mutation_expected_snapshots<'a>(
     mutation: &'a RegionOwnerMutation,
 ) -> &'a [EntitySnapshot] {
     match mutation {
-        RegionOwnerMutation::SetKinematicsBatchIfCurrent { expected, .. }
-        | RegionOwnerMutation::ApplyGoalBatch { expected, .. } => expected,
+        RegionOwnerMutation::SetKinematicsBatchIfCurrent { expected, .. } => expected,
         RegionOwnerMutation::RemoveSnapshotsIfCurrent(expected) => expected,
         _ => std::slice::from_ref(fallback),
     }
@@ -1234,6 +1238,11 @@ enum RegionalOwnerCommand {
     SnapshotsForIds {
         entities: HashSet<EntityId>,
         reply: std::sync::mpsc::Sender<Result<VersionedEntitySnapshots, RegionOwnerLaneError>>,
+    },
+    SimulationProjectionsForIds {
+        entities: HashSet<EntityId>,
+        reply:
+            std::sync::mpsc::Sender<Result<Vec<EntitySimulationProjection>, RegionOwnerLaneError>>,
     },
     ContainsUuid {
         uuid: Uuid,
@@ -1674,6 +1683,23 @@ impl RegionalOwnerHandle {
         let (reply, result) = channel();
         self.sender
             .send(RegionalOwnerCommand::ApplyVillagerBindingGoal { token, goal, reply })
+            .map_err(|_| RegionOwnerLaneError::Closed)?;
+        result.recv().map_err(|_| RegionOwnerLaneError::Closed)?
+    }
+
+    pub fn simulation_projections_for_ids(
+        &self,
+        entities: &HashSet<EntityId>,
+    ) -> Result<Vec<EntitySimulationProjection>, RegionOwnerLaneError> {
+        if entities.is_empty() {
+            return Ok(Vec::new());
+        }
+        let (reply, result) = channel();
+        self.sender
+            .send(RegionalOwnerCommand::SimulationProjectionsForIds {
+                entities: entities.clone(),
+                reply,
+            })
             .map_err(|_| RegionOwnerLaneError::Closed)?;
         result.recv().map_err(|_| RegionOwnerLaneError::Closed)?
     }
@@ -2903,6 +2929,110 @@ impl RegionalOwnerHandle {
         result.recv().map_err(|_| RegionOwnerLaneError::Closed)?
     }
 
+    pub fn damage_batch_if_current(
+        &self,
+        requests: impl IntoIterator<Item = (EntitySnapshot, EntityDamageRequest)>,
+    ) -> Result<Vec<EntityDamage>, RegionOwnerLaneError> {
+        let requests = requests.into_iter().collect::<Vec<_>>();
+        if requests.is_empty() {
+            return Ok(Vec::new());
+        }
+        let mut ids = HashSet::with_capacity(requests.len());
+        if requests.iter().any(|(expected, request)| {
+            !request.is_valid()
+                || expected.lifecycle != crate::EntityLifecycle::Alive
+                || expected.retained.item_pickup_claim.is_some()
+                || !ids.insert(expected.id)
+        }) {
+            return Err(RegionOwnerLaneError::InvalidMutation);
+        }
+
+        let cached = self
+            .selected_read_routes
+            .read()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let mut groups = BTreeMap::<usize, Vec<(EntitySnapshot, EntityDamageRequest)>>::new();
+        let mut routes_complete = true;
+        for (expected, request) in requests {
+            let route = cached.get(&expected.id).filter(|route| {
+                route.uuid == expected.uuid
+                    && RegionKey::from_position(expected.position) == Some(route.lease.key)
+            });
+            let Some(route) = route else {
+                routes_complete = false;
+                groups
+                    .entry(usize::MAX)
+                    .or_default()
+                    .push((expected, request));
+                continue;
+            };
+            groups
+                .entry(route.lease.lane)
+                .or_default()
+                .push((expected, request));
+        }
+        drop(cached);
+
+        if !routes_complete {
+            let requests = groups.into_values().flatten().collect::<Vec<_>>();
+            return requests
+                .into_iter()
+                .filter_map(|(expected, request)| {
+                    self.damage_if_current(expected, request).transpose()
+                })
+                .collect();
+        }
+
+        let batches = std::thread::scope(|scope| {
+            let mut workers = Vec::with_capacity(groups.len());
+            for requests in groups.into_values() {
+                let handle = self.clone();
+                workers.push(scope.spawn(move || {
+                    let mutations = requests
+                        .iter()
+                        .cloned()
+                        .map(|(expected, request)| {
+                            (
+                                expected.clone(),
+                                RegionOwnerMutation::DamageIfCurrent {
+                                    expected: Box::new(expected),
+                                    request,
+                                },
+                            )
+                        })
+                        .collect::<Vec<_>>();
+                    match handle.try_commit_cached_snapshot_mutations(mutations) {
+                        Some(result) => result,
+                        None => requests
+                            .into_iter()
+                            .filter_map(|(expected, request)| {
+                                handle.damage_if_current(expected, request).transpose()
+                            })
+                            .collect::<Result<Vec<_>, _>>()
+                            .map(|damages| {
+                                damages.into_iter().map(|damage| damage.snapshot).collect()
+                            }),
+                    }
+                }));
+            }
+            workers
+                .into_iter()
+                .map(|worker| worker.join().map_err(|_| RegionOwnerLaneError::Closed)?)
+                .collect::<Result<Vec<_>, _>>()
+        })?;
+
+        let mut damages = batches
+            .into_iter()
+            .flatten()
+            .map(|snapshot| EntityDamage {
+                killed: snapshot.lifecycle == crate::EntityLifecycle::Despawning,
+                snapshot,
+            })
+            .collect::<Vec<_>>();
+        damages.sort_unstable_by_key(|damage| damage.snapshot.id);
+        Ok(damages)
+    }
+
     pub fn apply_effect_if_current(
         &self,
         expected: EntitySnapshot,
@@ -3281,6 +3411,9 @@ fn run_regional_owner_runtime(
                 }
                 let _ = reply.send(result);
             }
+            RegionalOwnerCommand::SimulationProjectionsForIds { entities, reply } => {
+                let _ = reply.send(coordinator.simulation_projections_for_ids(&entities));
+            }
             RegionalOwnerCommand::ContainsUuid { uuid, reply } => {
                 let _ = reply.send(
                     coordinator
@@ -3654,12 +3787,15 @@ fn run_regional_owner_runtime(
                 }
                 let selected = selected
                     .filter(|selected| versioned_snapshots_are_current(&coordinator, selected))
-                    .map(VersionedEntitySnapshots::into_snapshots);
+                    .map(|selected| {
+                        let lane_versions = selected.fence.lane_versions.clone();
+                        (selected.into_snapshots(), lane_versions)
+                    });
                 let _ = reply.send(
                     coordinator.prepare_goal_tick_with_pathing_for_ids_from_snapshots(
                         tick,
                         &active_ids,
-                        selected.as_deref(),
+                        selected,
                     ),
                 );
             }
@@ -4407,6 +4543,62 @@ impl RegionalOwnerCoordinator {
         Ok(snapshots)
     }
 
+    fn simulation_projections_for_ids(
+        &self,
+        entities: &HashSet<EntityId>,
+    ) -> Result<Vec<EntitySimulationProjection>, RegionOwnerLaneError> {
+        self.commit_state.ensure_committed_state()?;
+        let mut ordered = entities.iter().copied().collect::<Vec<_>>();
+        ordered.sort_unstable();
+        let mut requests = BTreeMap::<usize, Vec<(RegionLease, EntityId)>>::new();
+        for entity in ordered {
+            let expected_key = self
+                .locations
+                .get(&entity)
+                .copied()
+                .ok_or(RegionOwnerLaneError::UnknownEntity)?;
+            let lease = self
+                .ownership
+                .lease(expected_key)
+                .ok_or(RegionOwnerLaneError::StaleLease)?;
+            requests
+                .entry(lease.lane)
+                .or_default()
+                .push((lease, entity));
+        }
+        let mut pending = Vec::with_capacity(requests.len());
+        for (lane, entities) in requests {
+            let owner = self
+                .lanes
+                .get(&lane)
+                .ok_or(RegionOwnerLaneError::WrongLane)?;
+            pending.push(
+                owner
+                    .reader()
+                    .request_simulation_projections_for_ids(entities)?,
+            );
+        }
+        let mut projections = Vec::with_capacity(entities.len());
+        for completion in pending {
+            projections.extend(
+                completion
+                    .recv()
+                    .map_err(|_| RegionOwnerLaneError::Closed)??,
+            );
+        }
+        projections.sort_unstable_by_key(|projection| projection.id);
+        if projections.len() != entities.len()
+            || projections.iter().any(|projection| {
+                !entities.contains(&projection.id)
+                    || self.locations.get(&projection.id).copied()
+                        != RegionKey::from_position(projection.position)
+            })
+        {
+            return Err(RegionOwnerLaneError::InvalidMutation);
+        }
+        Ok(projections)
+    }
+
     fn alive_kinematics_for_ids(
         &self,
         entities: &HashSet<EntityId>,
@@ -4460,24 +4652,88 @@ impl RegionalOwnerCoordinator {
         self.uuids.contains_key(&uuid)
     }
 
+    fn goal_checkpoints_for_ids_fenced(
+        &self,
+        entities: &HashSet<EntityId>,
+    ) -> Result<(Vec<EntityGoalCheckpoint>, BTreeMap<usize, u64>), RegionOwnerLaneError> {
+        self.goal_checkpoints_for_ids_inner(entities, false)
+    }
+
+    fn goal_checkpoints_for_ids_admitted(
+        &self,
+        entities: &HashSet<EntityId>,
+    ) -> Result<(Vec<EntityGoalCheckpoint>, BTreeMap<usize, u64>), RegionOwnerLaneError> {
+        self.goal_checkpoints_for_ids_inner(entities, true)
+    }
+
+    fn goal_checkpoints_for_ids_inner(
+        &self,
+        entities: &HashSet<EntityId>,
+        acquire_admission: bool,
+    ) -> Result<(Vec<EntityGoalCheckpoint>, BTreeMap<usize, u64>), RegionOwnerLaneError> {
+        self.commit_state.ensure_committed_state()?;
+        let mut ordered = entities.iter().copied().collect::<Vec<_>>();
+        ordered.sort_unstable();
+        let mut requests = BTreeMap::<usize, Vec<(RegionLease, EntityId)>>::new();
+        for entity in ordered {
+            let expected_key = self
+                .locations
+                .get(&entity)
+                .copied()
+                .ok_or(RegionOwnerLaneError::UnknownEntity)?;
+            let lease = self
+                .ownership
+                .lease(expected_key)
+                .ok_or(RegionOwnerLaneError::StaleLease)?;
+            requests
+                .entry(lease.lane)
+                .or_default()
+                .push((lease, entity));
+        }
+        let mut pending = Vec::with_capacity(requests.len());
+        let mut lane_versions = BTreeMap::new();
+        for (lane, entities) in requests {
+            let owner = self
+                .lanes
+                .get(&lane)
+                .ok_or(RegionOwnerLaneError::WrongLane)?;
+            let completion = if acquire_admission {
+                owner.request_goal_checkpoints_for_ids_admitted(entities)?
+            } else {
+                owner.request_goal_checkpoints_for_ids_fenced(entities)?
+            };
+            lane_versions.insert(lane, owner.reader().state_version());
+            pending.push((lane, completion));
+        }
+        let mut checkpoints = Vec::with_capacity(entities.len());
+        for (_, completion) in pending {
+            checkpoints.extend(
+                completion
+                    .recv()
+                    .map_err(|_| RegionOwnerLaneError::Closed)??,
+            );
+        }
+        checkpoints.sort_unstable_by_key(|checkpoint| checkpoint.id);
+        if checkpoints.len() != entities.len()
+            || checkpoints.iter().any(|checkpoint| {
+                !entities.contains(&checkpoint.id)
+                    || self.locations.get(&checkpoint.id).copied()
+                        != RegionKey::from_position(checkpoint.position)
+            })
+            || lane_versions.iter().any(|(lane, version)| {
+                self.lanes
+                    .get(lane)
+                    .is_none_or(|owner| owner.reader().state_version() != *version)
+            })
+        {
+            return Err(RegionOwnerLaneError::InvalidMutation);
+        }
+        Ok((checkpoints, lane_versions))
+    }
+
     pub fn snapshots_for_ids(
         &self,
         entities: &HashSet<EntityId>,
-    ) -> Result<Vec<EntitySnapshot>, RegionOwnerLaneError> {
-        self.snapshots_for_ids_inner(entities, false)
-    }
-
-    fn snapshots_for_ids_admitted(
-        &self,
-        entities: &HashSet<EntityId>,
-    ) -> Result<Vec<EntitySnapshot>, RegionOwnerLaneError> {
-        self.snapshots_for_ids_inner(entities, true)
-    }
-
-    fn snapshots_for_ids_inner(
-        &self,
-        entities: &HashSet<EntityId>,
-        admitted_dispatch: bool,
     ) -> Result<Vec<EntitySnapshot>, RegionOwnerLaneError> {
         self.commit_state.ensure_committed_state()?;
         let mut ordered = entities.iter().copied().collect::<Vec<_>>();
@@ -4502,11 +4758,7 @@ impl RegionalOwnerCoordinator {
                 .lanes
                 .get(&lane)
                 .ok_or(RegionOwnerLaneError::WrongLane)?;
-            pending.push(if admitted_dispatch {
-                owner.request_snapshots_for_ids_admitted(entities)?
-            } else {
-                owner.request_snapshots_for_ids(entities)?
-            });
+            pending.push(owner.request_snapshots_for_ids(entities)?);
         }
         let mut snapshots = Vec::with_capacity(entities.len());
         for completion in pending {
@@ -6280,7 +6532,7 @@ impl RegionalOwnerCoordinator {
             }
         }
         let current = self
-            .snapshots()?
+            .snapshots_for_ids(&ids)?
             .into_iter()
             .map(|snapshot| (snapshot.id, snapshot))
             .collect::<HashMap<_, _>>();
@@ -6912,86 +7164,114 @@ impl RegionalOwnerCoordinator {
         &self,
         tick: u64,
         active_ids: &HashSet<EntityId>,
-        selected: Option<&[EntitySnapshot]>,
+        selected: Option<(Vec<EntitySnapshot>, BTreeMap<usize, u64>)>,
     ) -> Result<RegionalPreparedGoalTick, RegionOwnerLaneError> {
-        let mut snapshots = BTreeMap::new();
+        let mut checkpoints = BTreeMap::new();
+        let mut lane_versions = BTreeMap::new();
         let mut selected_is_complete = selected.is_some();
-        if let Some(selected) = selected {
+        if let Some((selected, selected_lane_versions)) = selected {
             for snapshot in selected {
-                if active_ids.contains(&snapshot.id)
-                    && snapshots.insert(snapshot.id, snapshot.clone()).is_some()
-                {
-                    selected_is_complete = false;
-                    break;
+                if active_ids.contains(&snapshot.id) {
+                    let checkpoint = goal_checkpoint_from_snapshot(snapshot);
+                    if checkpoints.insert(checkpoint.id, checkpoint).is_some() {
+                        selected_is_complete = false;
+                        break;
+                    }
                 }
             }
-            selected_is_complete &= snapshots.len() == active_ids.len();
+            selected_is_complete &= checkpoints.len() == active_ids.len();
+            if selected_is_complete {
+                lane_versions = selected_lane_versions;
+            }
         }
         if !selected_is_complete {
-            snapshots = self
-                .snapshots_for_ids_admitted(active_ids)?
+            let (selected, versions) = self.goal_checkpoints_for_ids_admitted(active_ids)?;
+            checkpoints = selected
                 .into_iter()
-                .map(|snapshot| (snapshot.id, snapshot))
+                .map(|checkpoint| (checkpoint.id, checkpoint))
                 .collect();
+            lane_versions = versions;
         }
-        let referenced_target_ids = snapshots
+        let referenced_target_ids = checkpoints
             .values()
-            .filter_map(|snapshot| goal_reference(&snapshot.goal))
+            .filter_map(|checkpoint| goal_reference(&checkpoint.goal))
             .collect::<HashSet<_>>();
         let target_ids = referenced_target_ids
             .iter()
             .copied()
-            .filter(|target| !snapshots.contains_key(target))
+            .filter(|target| !checkpoints.contains_key(target))
             .filter(|target| self.locations.contains_key(target))
             .collect::<HashSet<_>>();
-        snapshots.extend(
-            self.snapshots_for_ids_admitted(&target_ids)?
-                .into_iter()
-                .map(|snapshot| (snapshot.id, snapshot)),
-        );
+        if !target_ids.is_empty() {
+            let (targets, target_versions) = self.goal_checkpoints_for_ids_admitted(&target_ids)?;
+            for (lane, version) in target_versions {
+                if lane_versions
+                    .insert(lane, version)
+                    .is_some_and(|existing| existing != version)
+                {
+                    return Err(RegionOwnerLaneError::Busy);
+                }
+            }
+            checkpoints.extend(
+                targets
+                    .into_iter()
+                    .map(|checkpoint| (checkpoint.id, checkpoint)),
+            );
+        }
         let expected_missing_follow_targets = referenced_target_ids
             .into_iter()
-            .filter(|target| !snapshots.contains_key(target))
+            .filter(|target| !checkpoints.contains_key(target))
             .collect::<HashSet<_>>();
         let mut ids_by_region = BTreeMap::<RegionKey, HashSet<EntityId>>::new();
         for id in active_ids {
-            if let Some(key) = self.locations.get(id).copied() {
-                ids_by_region.entry(key).or_default().insert(*id);
-            }
+            let key = self
+                .locations
+                .get(id)
+                .copied()
+                .ok_or(RegionOwnerLaneError::UnknownEntity)?;
+            ids_by_region.entry(key).or_default().insert(*id);
         }
 
         let mut follow_targets = BTreeMap::<RegionKey, HashMap<EntityId, Vec3>>::new();
         let mut follow_target_sources = BTreeMap::new();
-        let mut goal_inputs = BTreeMap::new();
         for (&region, ids) in &ids_by_region {
             for id in ids {
-                let follower = snapshots
+                let follower = checkpoints
                     .get(id)
                     .ok_or(RegionOwnerLaneError::UnknownEntity)?;
-                goal_inputs.insert(*id, follower.clone());
                 let Some(target) = goal_reference(&follower.goal) else {
                     continue;
                 };
                 let Some(target_region) = self.locations.get(&target).copied() else {
                     continue;
                 };
-                let target_snapshot = snapshots
+                let target_checkpoint = checkpoints
                     .get(&target)
                     .ok_or(RegionOwnerLaneError::UnknownEntity)?;
                 follow_target_sources.insert(
                     target,
                     RegionalFollowTargetSource {
                         region: target_region,
-                        snapshot: target_snapshot.clone(),
+                        checkpoint: target_checkpoint.clone(),
                     },
                 );
                 if target_region != region {
                     follow_targets
                         .entry(region)
                         .or_default()
-                        .insert(target, target_snapshot.position);
+                        .insert(target, target_checkpoint.position);
                 }
             }
+        }
+
+        let mut goal_inputs = BTreeMap::new();
+        let mut ordered_active_ids = active_ids.iter().copied().collect::<Vec<_>>();
+        ordered_active_ids.sort_unstable();
+        for id in ordered_active_ids {
+            let checkpoint = checkpoints
+                .remove(&id)
+                .ok_or(RegionOwnerLaneError::UnknownEntity)?;
+            goal_inputs.insert(id, checkpoint);
         }
 
         let mut pending = Vec::with_capacity(ids_by_region.len());
@@ -7000,18 +7280,34 @@ impl RegionalOwnerCoordinator {
                 .ownership
                 .lease(key)
                 .ok_or(RegionOwnerLaneError::StaleLease)?;
-            let completion = self
+            let owner = self
                 .lanes
                 .get(&lease.lane)
-                .ok_or(RegionOwnerLaneError::WrongLane)?
-                .request_goal_tick_admitted(lease, tick, ids)?;
-            pending.push((key, completion));
+                .ok_or(RegionOwnerLaneError::WrongLane)?;
+            let current_version = owner.reader().state_version();
+            if lane_versions
+                .insert(lease.lane, current_version)
+                .is_some_and(|existing| existing != current_version)
+            {
+                return Err(RegionOwnerLaneError::Busy);
+            }
+            let completion = owner.request_goal_tick_admitted(lease, tick, ids)?;
+            pending.push((key, lease.lane, completion));
         }
         let mut batches = BTreeMap::new();
-        for (key, completion) in pending {
+        for (key, lane, completion) in pending {
             let prepared = completion
                 .recv()
                 .map_err(|_| RegionOwnerLaneError::Closed)??;
+            let current_version = self
+                .lanes
+                .get(&lane)
+                .ok_or(RegionOwnerLaneError::WrongLane)?
+                .reader()
+                .state_version();
+            if lane_versions.get(&lane).copied() != Some(current_version) {
+                return Err(RegionOwnerLaneError::Busy);
+            }
             batches.insert(key, prepared);
         }
         let lease_keys = batches
@@ -7031,6 +7327,7 @@ impl RegionalOwnerCoordinator {
                         .ok_or(RegionOwnerLaneError::StaleLease)
                 })
                 .collect::<Result<_, _>>()?,
+            lane_versions,
             batches,
             follow_targets,
             follow_target_sources,
@@ -7091,6 +7388,13 @@ impl RegionalOwnerCoordinator {
         {
             return Ok(None);
         }
+        if resolved.lane_versions.iter().any(|(lane, version)| {
+            self.lanes
+                .get(lane)
+                .is_none_or(|owner| owner.reader().state_version() != *version)
+        }) {
+            return Ok(None);
+        }
         if resolved.goal_inputs.values().any(|expected| {
             self.locations.get(&expected.id).copied() != RegionKey::from_position(expected.position)
         }) {
@@ -7102,19 +7406,29 @@ impl RegionalOwnerCoordinator {
             .keys()
             .copied()
             .collect::<HashSet<_>>();
-        let current = self
-            .snapshots_for_ids(&validation_ids)?
+        let (current, _) = self.goal_checkpoints_for_ids_fenced(&validation_ids)?;
+        let current = current
             .into_iter()
-            .map(|snapshot| (snapshot.id, snapshot))
+            .map(|checkpoint| (checkpoint.id, checkpoint))
             .collect::<BTreeMap<_, _>>();
         if resolved.follow_target_sources.iter().any(|(id, expected)| {
             self.locations.get(id).copied() != Some(expected.region)
-                || current.get(id) != Some(&expected.snapshot)
+                || current.get(id) != Some(&expected.checkpoint)
         }) {
             return Ok(None);
         }
         if resolved.batches.is_empty() {
             return Ok(None);
+        }
+
+        let mut expected_by_region = BTreeMap::<RegionKey, Vec<EntityGoalCheckpoint>>::new();
+        for (_, checkpoint) in std::mem::take(&mut resolved.goal_inputs) {
+            let key = self
+                .locations
+                .get(&checkpoint.id)
+                .copied()
+                .ok_or(RegionOwnerLaneError::UnknownEntity)?;
+            expected_by_region.entry(key).or_default().push(checkpoint);
         }
 
         let batch_count = resolved.batches.len();
@@ -7125,12 +7439,7 @@ impl RegionalOwnerCoordinator {
                 .ownership
                 .lease(key)
                 .ok_or(RegionOwnerLaneError::StaleLease)?;
-            let expected = resolved
-                .goal_inputs
-                .values()
-                .filter(|snapshot| self.locations.get(&snapshot.id).copied() == Some(key))
-                .cloned()
-                .collect();
+            let expected = expected_by_region.remove(&key).unwrap_or_default();
             mutations
                 .entry(lease.lane)
                 .or_default()
@@ -7139,6 +7448,11 @@ impl RegionalOwnerCoordinator {
                     lease,
                     mutation: RegionOwnerMutation::ApplyGoalBatch {
                         expected,
+                        expected_state_version: resolved
+                            .lane_versions
+                            .get(&lease.lane)
+                            .copied()
+                            .ok_or(RegionOwnerLaneError::WrongLane)?,
                         resolved: Box::new(batch),
                         follow_targets: resolved.follow_targets.remove(&key).unwrap_or_default(),
                     },
@@ -7245,7 +7559,6 @@ impl RegionalOwnerCoordinator {
                 Err(_) => first_error = first_error.or(Some(RegionOwnerLaneError::Closed)),
             }
         }
-
         if first_error.is_none() && ready.len() == participants.len() {
             let mut committed = Vec::with_capacity(ready.len() - applied.len());
             for &lane in ready.difference(&applied) {
@@ -7516,8 +7829,10 @@ fn mutation_entity_ids(mutation: &RegionOwnerMutation) -> Vec<EntityId> {
         | RegionOwnerMutation::ApplyEffectIfCurrent { expected, .. }
         | RegionOwnerMutation::RemoveIfCurrent(expected)
         | RegionOwnerMutation::InsertSnapshot(expected) => vec![expected.id],
-        RegionOwnerMutation::ApplyGoalBatch { expected, .. }
-        | RegionOwnerMutation::SetKinematicsBatchIfCurrent { expected, .. }
+        RegionOwnerMutation::ApplyGoalBatch { expected, .. } => {
+            expected.iter().map(|checkpoint| checkpoint.id).collect()
+        }
+        RegionOwnerMutation::SetKinematicsBatchIfCurrent { expected, .. }
         | RegionOwnerMutation::InsertSnapshots(expected)
         | RegionOwnerMutation::RemoveSnapshotsIfCurrent(expected) => {
             expected.iter().map(|snapshot| snapshot.id).collect()
@@ -7867,6 +8182,7 @@ impl RegionalEntityStore {
                     )
                 })
                 .collect(),
+            lane_versions: BTreeMap::new(),
             batches,
             follow_targets: captured.remote_by_region,
             follow_target_sources: captured.sources,
@@ -8350,6 +8666,7 @@ impl RegionalEntityStore {
                 let Some(follower) = self.snapshot(id) else {
                     continue;
                 };
+                let follower = goal_checkpoint_from_snapshot(follower);
                 inputs.insert(id, follower.clone());
                 let Some(target) = goal_reference(&follower.goal) else {
                     continue;
@@ -8362,15 +8679,16 @@ impl RegionalEntityStore {
                     expected_missing_follow_targets.insert(target);
                     continue;
                 };
+                let target_checkpoint = goal_checkpoint_from_snapshot(target_snapshot);
                 sources.insert(
                     target,
                     RegionalFollowTargetSource {
                         region: target_region,
-                        snapshot: target_snapshot.clone(),
+                        checkpoint: target_checkpoint.clone(),
                     },
                 );
                 if target_region != region {
-                    remote.insert(target, target_snapshot.position);
+                    remote.insert(target, target_checkpoint.position);
                 }
             }
             if !remote.is_empty() {
@@ -8391,14 +8709,21 @@ impl RegionalEntityStore {
     ) -> bool {
         expected.iter().all(|(&id, expected)| {
             self.region_for(id) == Some(expected.region)
-                && self.snapshot(id).as_ref() == Some(&expected.snapshot)
+                && self
+                    .snapshot(id)
+                    .map(goal_checkpoint_from_snapshot)
+                    .as_ref()
+                    == Some(&expected.checkpoint)
         })
     }
 
-    fn goal_inputs_match(&self, expected: &BTreeMap<EntityId, EntitySnapshot>) -> bool {
-        expected
-            .iter()
-            .all(|(&id, expected)| self.snapshot(id).as_ref() == Some(expected))
+    fn goal_inputs_match(&self, expected: &BTreeMap<EntityId, EntityGoalCheckpoint>) -> bool {
+        expected.iter().all(|(&id, expected)| {
+            self.snapshot(id)
+                .map(goal_checkpoint_from_snapshot)
+                .as_ref()
+                == Some(expected)
+        })
     }
 
     fn store_for_entity_mutation(
@@ -9117,6 +9442,7 @@ impl RegionalEntityAuthority {
                     )
                 })
                 .collect(),
+            lane_versions: BTreeMap::new(),
             batches,
             follow_targets: captured.remote_by_region,
             follow_target_sources: captured.sources,
@@ -9453,6 +9779,19 @@ fn order_vehicle_group_for_removal(group: &[EntitySnapshot]) -> Vec<EntityId> {
     ordered
 }
 
+fn goal_checkpoint_from_snapshot(snapshot: EntitySnapshot) -> EntityGoalCheckpoint {
+    EntityGoalCheckpoint {
+        id: snapshot.id,
+        position: snapshot.position,
+        rotation: snapshot.rotation,
+        velocity: snapshot.velocity,
+        on_ground: snapshot.on_ground,
+        lifecycle: snapshot.lifecycle,
+        goal: snapshot.goal,
+        path: snapshot.retained.path,
+    }
+}
+
 fn goal_reference(goal: &GoalState) -> Option<EntityId> {
     match goal {
         GoalState::FollowTarget { target, .. } => Some(*target),
@@ -9478,7 +9817,7 @@ fn add_goal_tick_stats(total: &mut GoalTickStats, batch: GoalTickStats) {
 
 #[cfg(test)]
 mod tests {
-    use std::collections::HashSet;
+    use std::collections::{BTreeMap, HashMap, HashSet};
     use std::sync::{Arc, Mutex, mpsc};
     use std::time::{Duration, Instant};
 
@@ -12171,7 +12510,7 @@ mod tests {
     }
 
     #[test]
-    fn owner_goal_tick_does_not_snapshot_inactive_lanes() {
+    fn owner_goal_tick_reads_checkpoints_only_from_participant_lanes() {
         let mut regions = RegionalEntityStore::new();
         let follower_lease = regions
             .assign_region(RegionKey::new(0, 0), 0)
@@ -12208,19 +12547,38 @@ mod tests {
             .expect("cache follower input");
         for lane in coordinator.lanes.values() {
             lane.reset_snapshot_batch_request_count();
+            lane.reset_goal_checkpoint_batch_request_count();
         }
 
         let resolved = coordinator
             .prepare_goal_tick_with_pathing_for_ids_from_snapshots(
                 23,
                 &HashSet::from([follower]),
-                Some(&cached_follower),
+                Some((
+                    cached_follower,
+                    std::collections::BTreeMap::from([(
+                        0,
+                        coordinator.lanes[&0].reader().state_version(),
+                    )]),
+                )),
             )
             .expect("prepare follower goal")
             .resolve(&WalkablePathing, PathingBudget::DEFAULT);
         assert_eq!(coordinator.lanes[&0].snapshot_batch_request_count(), 0);
-        assert_eq!(coordinator.lanes[&1].snapshot_batch_request_count(), 1);
+        assert_eq!(coordinator.lanes[&1].snapshot_batch_request_count(), 0);
         assert_eq!(coordinator.lanes[&2].snapshot_batch_request_count(), 0);
+        assert_eq!(
+            coordinator.lanes[&0].goal_checkpoint_batch_request_count(),
+            0
+        );
+        assert_eq!(
+            coordinator.lanes[&1].goal_checkpoint_batch_request_count(),
+            1
+        );
+        assert_eq!(
+            coordinator.lanes[&2].goal_checkpoint_batch_request_count(),
+            0
+        );
 
         let stats = coordinator
             .apply_prepared_goal_tick(resolved)
@@ -12228,8 +12586,129 @@ mod tests {
 
         assert_eq!(stats.decisions_applied, 1);
         assert_eq!(coordinator.lanes[&0].snapshot_batch_request_count(), 0);
-        assert_eq!(coordinator.lanes[&1].snapshot_batch_request_count(), 2);
+        assert_eq!(coordinator.lanes[&1].snapshot_batch_request_count(), 0);
         assert_eq!(coordinator.lanes[&2].snapshot_batch_request_count(), 0);
+        assert_eq!(
+            coordinator.lanes[&0].goal_checkpoint_batch_request_count(),
+            0
+        );
+        assert_eq!(
+            coordinator.lanes[&1].goal_checkpoint_batch_request_count(),
+            2
+        );
+        assert_eq!(
+            coordinator.lanes[&2].goal_checkpoint_batch_request_count(),
+            0
+        );
+    }
+
+    #[test]
+    fn owner_damage_batch_applies_independent_cross_lane_hits() {
+        let runtime = super::RegionalOwnerRuntime::from_store(RegionalEntityStore::new(), 2)
+            .expect("two-lane owner runtime");
+        let handle = runtime.handle();
+        let ids = handle
+            .spawn_batch([
+                cow(Vec3::new(0.5, 64.0, 0.5)),
+                cow(Vec3::new(128.5, 64.0, 0.5)),
+            ])
+            .expect("damage batch entities");
+        let selected = ids.iter().copied().collect::<HashSet<_>>();
+        let snapshots = handle
+            .snapshots_for_ids(&selected)
+            .expect("warm cross-lane damage routes");
+        let requests = snapshots.into_iter().map(|snapshot| {
+            let amount = if snapshot.id == ids[0] { 5.0 } else { 20.0 };
+            (snapshot, damage_request(amount))
+        });
+
+        let damages = handle
+            .damage_batch_if_current(requests)
+            .expect("cross-lane damage batch");
+
+        assert_eq!(damages.len(), 2);
+        assert_eq!(damages[0].snapshot.id, ids[0]);
+        assert_eq!(damages[0].snapshot.health, 15.0);
+        assert!(!damages[0].killed);
+        assert_eq!(damages[1].snapshot.id, ids[1]);
+        assert_eq!(damages[1].snapshot.health, 0.0);
+        assert!(damages[1].killed);
+        drop(handle);
+        runtime.shutdown().expect("damage batch shutdown");
+    }
+
+    #[test]
+    fn owner_damage_batch_rejects_duplicate_targets() {
+        let runtime = super::RegionalOwnerRuntime::from_store(RegionalEntityStore::new(), 1)
+            .expect("one-lane owner runtime");
+        let handle = runtime.handle();
+        let id = handle
+            .spawn_batch([cow(Vec3::new(0.5, 64.0, 0.5))])
+            .expect("damage batch entity")[0];
+        let expected = handle.snapshot(id).expect("snapshot read").expect("entity");
+
+        assert_eq!(
+            handle.damage_batch_if_current([
+                (expected.clone(), damage_request(1.0)),
+                (expected, damage_request(1.0)),
+            ]),
+            Err(super::RegionOwnerLaneError::InvalidMutation)
+        );
+        drop(handle);
+        runtime.shutdown().expect("duplicate damage batch shutdown");
+    }
+
+    #[test]
+    fn owner_goal_apply_handles_mutual_cross_lane_follow_targets_without_readmission_deadlock() {
+        let runtime = super::RegionalOwnerRuntime::from_store(RegionalEntityStore::new(), 2)
+            .expect("two-lane owner runtime");
+        let handle = runtime.handle();
+        let ids = handle
+            .spawn_batch([
+                cow(Vec3::new(0.5, 64.0, 0.5)),
+                cow(Vec3::new(128.5, 64.0, 0.5)),
+            ])
+            .expect("mutual target entities");
+        assert_eq!(
+            handle
+                .set_goals_deferred_journal([
+                    (
+                        ids[0],
+                        GoalState::FollowTarget {
+                            target: ids[1],
+                            speed: 0.2,
+                        },
+                    ),
+                    (
+                        ids[1],
+                        GoalState::FollowTarget {
+                            target: ids[0],
+                            speed: 0.2,
+                        },
+                    ),
+                ])
+                .expect("mutual target goals"),
+            2
+        );
+        let active = HashSet::from([ids[0], ids[1]]);
+        let resolved = handle
+            .prepare_goal_tick_with_pathing_for_ids(1, &active)
+            .expect("prepare mutual target goals")
+            .resolve(&WalkablePathing, PathingBudget::DEFAULT);
+        let stats = handle
+            .apply_prepared_goal_tick(resolved)
+            .expect("apply mutual target goals");
+        assert_eq!(stats.decisions_applied, 2);
+        assert_eq!(stats.missing_follow_targets, 0);
+        assert!(
+            handle
+                .snapshots_for_ids(&active)
+                .expect("mutual target snapshots")
+                .iter()
+                .all(|snapshot| snapshot.velocity != Vec3::ZERO)
+        );
+        drop(handle);
+        runtime.shutdown().expect("mutual target shutdown");
     }
 
     #[test]
@@ -15931,6 +16410,491 @@ mod tests {
         );
 
         runtime.shutdown().expect("runtime shutdown");
+    }
+
+    #[test]
+    #[ignore = "explicit release 1500v1500 regional entity battle benchmark"]
+    fn regional_owner_1500v1500_battle_benchmark_report() {
+        const TEAM_SIZE: usize = 1_500;
+        const TOTAL_ENTITIES: usize = TEAM_SIZE * 2;
+        const FORMATION_WIDTH: usize = 50;
+        const ACTOR_BUDGET: usize = 1_000;
+        const MAX_TICKS: u64 = 320;
+        const MELEE_RANGE: f64 = 1.75;
+        const ATTACK_PERIOD_TICKS: u64 = 10;
+        const DEATH_REMOVE_DELAY_TICKS: u64 = 20;
+        const TARGET_SEARCH_CANDIDATES: usize = 64;
+
+        fn percentile(samples: &[u128], percentile: usize) -> u128 {
+            samples[(samples.len() * percentile).div_ceil(100).saturating_sub(1)]
+        }
+
+        fn battle_order(ids: &[EntityId], seed: u64) -> Vec<EntityId> {
+            fn mix(mut value: u64) -> u64 {
+                value = value.wrapping_add(0x9e37_79b9_7f4a_7c15);
+                value = (value ^ (value >> 30)).wrapping_mul(0xbf58_476d_1ce4_e5b9);
+                value = (value ^ (value >> 27)).wrapping_mul(0x94d0_49bb_1331_11eb);
+                value ^ (value >> 31)
+            }
+            let mut ordered = ids
+                .iter()
+                .copied()
+                .enumerate()
+                .map(|(index, id)| (mix(index as u64 ^ seed), id))
+                .collect::<Vec<_>>();
+            ordered.sort_unstable_by_key(|(key, _)| *key);
+            ordered.into_iter().map(|(_, id)| id).collect()
+        }
+
+        fn formation_position(side_a: bool, index: usize) -> Vec3 {
+            let rank = index / FORMATION_WIDTH;
+            let file = index % FORMATION_WIDTH;
+            let depth = rank as f64 * 0.8;
+            let x = if side_a { -6.0 - depth } else { 6.0 + depth };
+            let z = (file as f64 - (FORMATION_WIDTH as f64 - 1.0) * 0.5) * 0.9;
+            Vec3::new(x, 64.0, z)
+        }
+
+        fn choose_target(
+            actor: EntityId,
+            candidates: &[EntityId],
+            positions: &HashMap<EntityId, Vec3>,
+            tick: u64,
+        ) -> Option<EntityId> {
+            if candidates.is_empty() {
+                return None;
+            }
+            let actor_position = positions.get(&actor)?;
+            let sample_count = candidates.len().min(TARGET_SEARCH_CANDIDATES);
+            let start = (usize::try_from(actor.0.unsigned_abs())
+                .unwrap_or_default()
+                .wrapping_mul(1_103_515_245)
+                .wrapping_add(usize::try_from(tick).unwrap_or_default()))
+                % candidates.len();
+            let stride = 37usize.min(candidates.len().saturating_sub(1).max(1));
+            (0..sample_count)
+                .map(|offset| candidates[(start + offset * stride) % candidates.len()])
+                .filter_map(|candidate| {
+                    let position = positions.get(&candidate)?;
+                    let dx = position.x - actor_position.x;
+                    let dz = position.z - actor_position.z;
+                    Some((candidate, dx * dx + dz * dz))
+                })
+                .min_by(|left, right| left.1.total_cmp(&right.1))
+                .map(|(candidate, _)| candidate)
+        }
+
+        let lanes = std::env::var("SOLARIS_BATTLE_OWNER_LANES")
+            .ok()
+            .and_then(|value| value.parse::<usize>().ok())
+            .unwrap_or(6)
+            .clamp(1, 6);
+        #[cfg(target_os = "linux")]
+        assert_benchmark_has_distinct_physical_cores(lanes);
+
+        let runtime = super::RegionalOwnerRuntime::from_store(RegionalEntityStore::new(), lanes)
+            .expect("battle owner runtime");
+        let handle = runtime.handle();
+        let mut spawns = Vec::with_capacity(TOTAL_ENTITIES);
+        for index in 0..TEAM_SIZE {
+            spawns.push(SpawnEntity::new(
+                54,
+                "minecraft:zombie",
+                formation_position(true, index),
+            ));
+        }
+        for index in 0..TEAM_SIZE {
+            spawns.push(SpawnEntity::new(
+                23,
+                "minecraft:husk",
+                formation_position(false, index),
+            ));
+        }
+        let ids = handle.spawn_batch(spawns).expect("battle entities");
+        assert_eq!(ids.len(), TOTAL_ENTITIES);
+        let team_a = ids[..TEAM_SIZE].to_vec();
+        let team_b = ids[TEAM_SIZE..].to_vec();
+        let team_a_set = team_a.iter().copied().collect::<HashSet<_>>();
+        let order_a = battle_order(&team_a, 0xA11C_E001);
+        let order_b = battle_order(&team_b, 0xB47A_1E02);
+        let order = order_a.iter().chain(&order_b).copied().collect::<Vec<_>>();
+        let mut positions = HashMap::with_capacity(TOTAL_ENTITIES);
+        for (index, &entity) in team_a.iter().enumerate() {
+            positions.insert(entity, formation_position(true, index));
+        }
+        for (index, &entity) in team_b.iter().enumerate() {
+            positions.insert(entity, formation_position(false, index));
+        }
+        let mut alive = ids.iter().copied().collect::<HashSet<_>>();
+        let mut targets = HashMap::with_capacity(TOTAL_ENTITIES);
+        let mut initial_goals = Vec::with_capacity(TOTAL_ENTITIES);
+        for &actor in &team_a {
+            let target = choose_target(actor, &team_b, &positions, 0).expect("team B target");
+            targets.insert(actor, target);
+            initial_goals.push((
+                actor,
+                GoalState::FollowTarget {
+                    target,
+                    speed: 0.27,
+                },
+            ));
+        }
+        for &actor in &team_b {
+            let target = choose_target(actor, &team_a, &positions, 0).expect("team A target");
+            targets.insert(actor, target);
+            initial_goals.push((
+                actor,
+                GoalState::FollowTarget {
+                    target,
+                    speed: 0.27,
+                },
+            ));
+        }
+        assert_eq!(
+            handle
+                .set_goals_deferred_journal(initial_goals)
+                .expect("install battle targets"),
+            TOTAL_ENTITIES
+        );
+
+        let mut next_attack_tick = HashMap::with_capacity(TOTAL_ENTITIES);
+        for index in 0..TEAM_SIZE {
+            let phase = 1 + (index as u64 % ATTACK_PERIOD_TICKS);
+            next_attack_tick.insert(team_a[index], phase);
+            next_attack_tick.insert(team_b[index], phase);
+        }
+        let mut removals = BTreeMap::<u64, Vec<EntityId>>::new();
+        let mut rotation_cursor_a = 0usize;
+        let mut rotation_cursor_b = 0usize;
+        let mut ticks_executed = 0_u64;
+        let mut attacks_planned = 0_u64;
+        let mut attacks_applied = 0_u64;
+        let mut retargets = 0_u64;
+        let mut deaths_a = 0_u64;
+        let mut deaths_b = 0_u64;
+        let mut targets_outside_actor_cohort = 0_u64;
+        let mut missing_follow_targets = 0_u64;
+        let mut tick_samples = Vec::<u128>::new();
+        let mut goal_samples = Vec::<u128>::new();
+        let mut movement_samples = Vec::<u128>::new();
+        let mut attack_samples = Vec::<u128>::new();
+        let mut retarget_samples = Vec::<u128>::new();
+        let battle_started = Instant::now();
+
+        for tick in 1..=MAX_TICKS {
+            if let Some(due) = removals.remove(&tick) {
+                for entity in due {
+                    assert!(
+                        targets.values().all(|target| *target != entity),
+                        "removed battle entity must no longer be referenced as a target"
+                    );
+                    let _ = handle.remove(entity).expect("remove dead battle entity");
+                }
+            }
+            let alive_a_order = order_a
+                .iter()
+                .copied()
+                .filter(|entity| alive.contains(entity))
+                .collect::<Vec<_>>();
+            let alive_b_order = order_b
+                .iter()
+                .copied()
+                .filter(|entity| alive.contains(entity))
+                .collect::<Vec<_>>();
+            if alive_a_order.is_empty() || alive_b_order.is_empty() {
+                break;
+            }
+
+            let side_budget = ACTOR_BUDGET / 2;
+            let actor_count_a = alive_a_order.len().min(side_budget);
+            let actor_count_b = alive_b_order.len().min(side_budget);
+            let start_a = rotation_cursor_a % alive_a_order.len();
+            let start_b = rotation_cursor_b % alive_b_order.len();
+            let mut active = (0..actor_count_a)
+                .map(|offset| alive_a_order[(start_a + offset) % alive_a_order.len()])
+                .collect::<HashSet<_>>();
+            active.extend(
+                (0..actor_count_b)
+                    .map(|offset| alive_b_order[(start_b + offset) % alive_b_order.len()]),
+            );
+            rotation_cursor_a = (start_a + actor_count_a) % alive_a_order.len();
+            rotation_cursor_b = (start_b + actor_count_b) % alive_b_order.len();
+            targets_outside_actor_cohort += active
+                .iter()
+                .filter_map(|actor| targets.get(actor))
+                .filter(|target| alive.contains(target) && !active.contains(target))
+                .count() as u64;
+
+            let tick_started = Instant::now();
+            let goal_started = Instant::now();
+            let prepared = handle
+                .prepare_goal_tick_with_pathing_for_ids(tick, &active)
+                .expect("prepare battle goal tick");
+            let resolved = prepared.resolve(&WalkablePathing, PathingBudget::DEFAULT);
+            let stats = handle
+                .apply_prepared_goal_tick(resolved)
+                .expect("apply battle goal tick");
+            missing_follow_targets += stats.missing_follow_targets as u64;
+            goal_samples.push(goal_started.elapsed().as_micros());
+
+            let movement_started = Instant::now();
+            let selected = handle
+                .snapshots_for_ids(&active)
+                .expect("battle actor snapshots");
+            let mut movement_states = Vec::with_capacity(selected.len());
+            let mut staged_positions = Vec::with_capacity(selected.len());
+            for snapshot in &selected {
+                if !alive.contains(&snapshot.id) {
+                    continue;
+                }
+                let Some(&target) = targets.get(&snapshot.id) else {
+                    continue;
+                };
+                let Some(&target_position) = positions.get(&target) else {
+                    continue;
+                };
+                let dx = target_position.x - snapshot.position.x;
+                let dz = target_position.z - snapshot.position.z;
+                let distance = dx.hypot(dz);
+                let max_step = 0.27;
+                let step = (distance - MELEE_RANGE * 0.82).clamp(0.0, max_step);
+                let (vx, vz) = if distance > f64::EPSILON && step > 0.0 {
+                    (dx / distance * max_step, dz / distance * max_step)
+                } else {
+                    (0.0, 0.0)
+                };
+                let position = Vec3::new(
+                    snapshot.position.x
+                        + if distance > f64::EPSILON {
+                            dx / distance * step
+                        } else {
+                            0.0
+                        },
+                    snapshot.position.y,
+                    snapshot.position.z
+                        + if distance > f64::EPSILON {
+                            dz / distance * step
+                        } else {
+                            0.0
+                        },
+                );
+                movement_states.push((
+                    snapshot.clone(),
+                    EntityKinematics {
+                        id: snapshot.id,
+                        position,
+                        rotation: snapshot.rotation,
+                        velocity: Vec3::new(vx, 0.0, vz),
+                        on_ground: true,
+                    },
+                ));
+                staged_positions.push((snapshot.id, position));
+            }
+            assert!(
+                handle
+                    .apply_kinematics_if_current(movement_states)
+                    .expect("apply battle movement"),
+                "battle movement batch must commit atomically"
+            );
+            positions.extend(staged_positions);
+            movement_samples.push(movement_started.elapsed().as_micros());
+
+            let attack_started = Instant::now();
+            let mut damage_by_target = HashMap::<EntityId, f32>::new();
+            for &attacker in &active {
+                if !alive.contains(&attacker)
+                    || tick < next_attack_tick.get(&attacker).copied().unwrap_or(1)
+                {
+                    continue;
+                }
+                let Some(&target) = targets.get(&attacker) else {
+                    continue;
+                };
+                if !alive.contains(&target) {
+                    continue;
+                }
+                let attacker_position = positions[&attacker];
+                let target_position = positions[&target];
+                let dx = target_position.x - attacker_position.x;
+                let dz = target_position.z - attacker_position.z;
+                if dx * dx + dz * dz > MELEE_RANGE * MELEE_RANGE {
+                    continue;
+                }
+                attacks_planned += 1;
+                next_attack_tick.insert(attacker, tick + ATTACK_PERIOD_TICKS);
+                let damage = 3.5;
+                damage_by_target
+                    .entry(target)
+                    .and_modify(|current| *current = current.max(damage))
+                    .or_insert(damage);
+            }
+            let target_ids = damage_by_target.keys().copied().collect::<HashSet<_>>();
+            let expected_targets = handle
+                .snapshots_for_ids(&target_ids)
+                .expect("battle damage target snapshots");
+            let damage_results = handle
+                .damage_batch_if_current(expected_targets.into_iter().filter_map(|expected| {
+                    let amount = damage_by_target.get(&expected.id).copied()?;
+                    Some((
+                        expected,
+                        EntityDamageRequest {
+                            amount,
+                            tick,
+                            death_remove_tick: tick + DEATH_REMOVE_DELAY_TICKS,
+                            villager_gossip_event: None,
+                        },
+                    ))
+                }))
+                .expect("apply battle melee damage batch");
+            attacks_applied += damage_results.len() as u64;
+            let mut killed = Vec::new();
+            for damage in damage_results {
+                let target = damage.snapshot.id;
+                if damage.killed && alive.remove(&target) {
+                    targets.remove(&target);
+                    next_attack_tick.remove(&target);
+                    killed.push(target);
+                    removals
+                        .entry(tick + DEATH_REMOVE_DELAY_TICKS)
+                        .or_default()
+                        .push(target);
+                    if team_a_set.contains(&target) {
+                        deaths_a += 1;
+                    } else {
+                        deaths_b += 1;
+                    }
+                }
+            }
+            attack_samples.push(attack_started.elapsed().as_micros());
+
+            let retarget_started = Instant::now();
+            if !killed.is_empty() {
+                let alive_a_ids = team_a
+                    .iter()
+                    .copied()
+                    .filter(|entity| alive.contains(entity))
+                    .collect::<Vec<_>>();
+                let alive_b_ids = team_b
+                    .iter()
+                    .copied()
+                    .filter(|entity| alive.contains(entity))
+                    .collect::<Vec<_>>();
+                let mut goal_updates = Vec::new();
+                for &actor in &order {
+                    if !alive.contains(&actor)
+                        || targets
+                            .get(&actor)
+                            .is_some_and(|target| alive.contains(target))
+                    {
+                        continue;
+                    }
+                    let candidates = if team_a_set.contains(&actor) {
+                        &alive_b_ids
+                    } else {
+                        &alive_a_ids
+                    };
+                    match choose_target(actor, candidates, &positions, tick) {
+                        Some(target) => {
+                            targets.insert(actor, target);
+                            goal_updates.push((
+                                actor,
+                                GoalState::FollowTarget {
+                                    target,
+                                    speed: 0.27,
+                                },
+                            ));
+                        }
+                        None => {
+                            targets.remove(&actor);
+                            goal_updates.push((actor, GoalState::Idle));
+                        }
+                    }
+                    retargets += 1;
+                }
+                if !goal_updates.is_empty() {
+                    assert_eq!(
+                        handle
+                            .set_goals_deferred_journal(goal_updates.clone())
+                            .expect("retarget battle entities"),
+                        goal_updates.len()
+                    );
+                }
+            }
+            retarget_samples.push(retarget_started.elapsed().as_micros());
+            tick_samples.push(tick_started.elapsed().as_micros());
+            ticks_executed = tick;
+        }
+
+        assert!(targets_outside_actor_cohort > 0);
+        assert_eq!(missing_follow_targets, 0);
+        assert!(attacks_planned > 0);
+        assert!(attacks_applied > 0);
+        assert!(deaths_a + deaths_b > 0);
+        assert!(retargets > 0);
+        assert!(!tick_samples.is_empty());
+        tick_samples.sort_unstable();
+        goal_samples.sort_unstable();
+        movement_samples.sort_unstable();
+        attack_samples.sort_unstable();
+        retarget_samples.sort_unstable();
+        let alive_a = team_a
+            .iter()
+            .filter(|entity| alive.contains(entity))
+            .count();
+        let alive_b = team_b
+            .iter()
+            .filter(|entity| alive.contains(entity))
+            .count();
+        let elapsed_ms = battle_started.elapsed().as_millis();
+        let report = format!(
+            "{{\n  \"team_size\": {},\n  \"lanes\": {},\n  \"actor_budget\": {},\n  \"ticks\": {},\n  \"elapsed_ms\": {},\n  \"alive_a\": {},\n  \"alive_b\": {},\n  \"deaths_a\": {},\n  \"deaths_b\": {},\n  \"attacks_planned\": {},\n  \"attacks_applied\": {},\n  \"retargets\": {},\n  \"targets_outside_actor_cohort\": {},\n  \"missing_follow_targets\": {},\n  \"tick_p50_us\": {},\n  \"tick_p95_us\": {},\n  \"tick_p99_us\": {},\n  \"tick_max_us\": {},\n  \"goal_p99_us\": {},\n  \"movement_p99_us\": {},\n  \"attack_p99_us\": {},\n  \"retarget_p99_us\": {}\n}}\n",
+            TEAM_SIZE,
+            lanes,
+            ACTOR_BUDGET,
+            ticks_executed,
+            elapsed_ms,
+            alive_a,
+            alive_b,
+            deaths_a,
+            deaths_b,
+            attacks_planned,
+            attacks_applied,
+            retargets,
+            targets_outside_actor_cohort,
+            missing_follow_targets,
+            percentile(&tick_samples, 50),
+            percentile(&tick_samples, 95),
+            percentile(&tick_samples, 99),
+            tick_samples.last().copied().unwrap_or_default(),
+            percentile(&goal_samples, 99),
+            percentile(&movement_samples, 99),
+            percentile(&attack_samples, 99),
+            percentile(&retarget_samples, 99),
+        );
+        let report_path = std::env::var_os("SOLARIS_BATTLE_REPORT")
+            .map(std::path::PathBuf::from)
+            .unwrap_or_else(|| {
+                std::path::PathBuf::from(".analysis/bench/entity-battle-1500x1500.json")
+            });
+        if let Some(parent) = report_path.parent() {
+            std::fs::create_dir_all(parent).expect("create battle report directory");
+        }
+        std::fs::write(&report_path, report).expect("write battle report");
+        println!(
+            "ENTITY_BATTLE_BENCH team_size={TEAM_SIZE} lanes={lanes} actor_budget={ACTOR_BUDGET} ticks={ticks_executed} elapsed_ms={elapsed_ms} alive_a={alive_a} alive_b={alive_b} deaths_a={deaths_a} deaths_b={deaths_b} attacks_planned={attacks_planned} attacks_applied={attacks_applied} retargets={retargets} outside_cohort_targets={targets_outside_actor_cohort} tick_p50_us={} tick_p95_us={} tick_p99_us={} tick_max_us={} goal_p99_us={} movement_p99_us={} attack_p99_us={} retarget_p99_us={} report={}",
+            percentile(&tick_samples, 50),
+            percentile(&tick_samples, 95),
+            percentile(&tick_samples, 99),
+            tick_samples.last().copied().unwrap_or_default(),
+            percentile(&goal_samples, 99),
+            percentile(&movement_samples, 99),
+            percentile(&attack_samples, 99),
+            percentile(&retarget_samples, 99),
+            report_path.display(),
+        );
+
+        drop(handle);
+        runtime.shutdown().expect("battle runtime shutdown");
     }
 
     #[test]

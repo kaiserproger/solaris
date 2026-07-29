@@ -558,6 +558,45 @@ pub struct EntityMotionState {
     pub sends_velocity: bool,
 }
 
+#[derive(Debug, Clone, PartialEq)]
+pub struct EntityGoalCheckpoint {
+    pub(crate) id: EntityId,
+    pub(crate) position: Vec3,
+    pub(crate) rotation: Rotation,
+    pub(crate) velocity: Vec3,
+    pub(crate) on_ground: bool,
+    pub(crate) lifecycle: EntityLifecycle,
+    pub(crate) goal: GoalState,
+    pub(crate) path: RetainedPathState,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct EntitySimulationProjection {
+    pub id: EntityId,
+    pub type_name: String,
+    pub position: Vec3,
+    pub rotation: Rotation,
+    pub velocity: Vec3,
+    pub on_ground: bool,
+    pub lifecycle: EntityLifecycle,
+    pub follow_range: f64,
+    pub goal: GoalState,
+    pub primed_tnt: bool,
+    pub has_item_stack: bool,
+    pub has_experience_value: bool,
+    pub has_block_state: bool,
+    pub has_vehicle: bool,
+    pub animal: Option<AnimalBreedingState>,
+    pub fall_distance: f64,
+    pub arrow_revision: Option<u64>,
+    pub arrow_embedded_block: Option<projectile_26_1_2::BlockPosition>,
+    pub sheep_grazing_ticks: Option<u8>,
+    pub villager: Option<VillagerData>,
+    pub villager_schedule: Option<villager_26_1_2::VillagerScheduleKind>,
+    pub villager_override_expires_tick: Option<u64>,
+    pub villager_override_order_present: bool,
+}
+
 #[derive(Debug, Clone)]
 pub struct EntityView<'a> {
     pub id: EntityId,
@@ -1322,6 +1361,43 @@ impl EntityStore {
     #[must_use]
     pub fn motion_state(&self, id: EntityId) -> Option<EntityMotionState> {
         self.runtime.motion_state(id)
+    }
+
+    pub(crate) fn goal_checkpoint(&self, id: EntityId) -> Option<EntityGoalCheckpoint> {
+        self.runtime.goal_checkpoint(id)
+    }
+
+    pub(crate) fn goal_checkpoints_for_ids(
+        &self,
+        ids: &HashSet<EntityId>,
+    ) -> Vec<EntityGoalCheckpoint> {
+        let mut ordered_ids = ids.iter().copied().collect::<Vec<_>>();
+        ordered_ids.sort_unstable();
+        ordered_ids
+            .into_iter()
+            .filter_map(|id| self.runtime.goal_checkpoint(id))
+            .collect()
+    }
+
+    pub(crate) fn restore_goal_checkpoints(
+        &mut self,
+        checkpoints: Vec<EntityGoalCheckpoint>,
+    ) -> bool {
+        checkpoints
+            .into_iter()
+            .all(|checkpoint| self.runtime.restore_goal_checkpoint(checkpoint))
+    }
+
+    pub fn simulation_projections_for_ids(
+        &self,
+        ids: &HashSet<EntityId>,
+    ) -> Vec<EntitySimulationProjection> {
+        let mut ordered_ids = ids.iter().copied().collect::<Vec<_>>();
+        ordered_ids.sort_unstable();
+        ordered_ids
+            .into_iter()
+            .filter_map(|id| self.runtime.simulation_projection(id))
+            .collect()
     }
 
     pub fn alive_kinematics_for_ids(&mut self, ids: &HashSet<EntityId>) -> Vec<EntityKinematics> {
@@ -2686,6 +2762,47 @@ mod tests {
             Vec3::new(0.75, 64.5, 0.5)
         );
         assert_eq!(store.snapshots().count(), 3);
+    }
+
+    #[test]
+    fn simulation_projection_keeps_hot_fields_without_snapshot_payloads() {
+        let mut store = EntityStore::new();
+        let mut entity = cow(Vec3::new(2.5, 64.0, 0.5));
+        entity.goal = GoalState::Wander {
+            speed: 0.2,
+            period_ticks: 1,
+        };
+        entity.animal = Some(AnimalBreedingState::adult());
+        entity.retained.spawn_tick = 77;
+        entity.retained.active_effects = Some(EntityActiveEffectsState {
+            effects: effects_26_1_2::ActiveEffectsSnapshot::default(),
+            action_order: Vec::new(),
+        });
+        let id = store.spawn(entity);
+
+        let projection = store
+            .simulation_projections_for_ids(&HashSet::from([id]))
+            .pop()
+            .expect("simulation projection");
+
+        assert_eq!(projection.id, id);
+        assert_eq!(projection.type_name, "minecraft:cow");
+        assert_eq!(projection.position, Vec3::new(2.5, 64.0, 0.5));
+        assert_eq!(projection.lifecycle, EntityLifecycle::Alive);
+        assert_eq!(projection.follow_range, 16.0);
+        assert_eq!(
+            projection.goal,
+            GoalState::Wander {
+                speed: 0.2,
+                period_ticks: 1,
+            }
+        );
+        assert!(!projection.primed_tnt);
+        assert!(projection.animal.is_some());
+        assert!(!projection.has_item_stack);
+        assert!(!projection.has_experience_value);
+        assert!(!projection.has_block_state);
+        assert!(!projection.has_vehicle);
     }
 
     #[test]

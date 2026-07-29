@@ -29,6 +29,7 @@ mod lock_metrics;
 mod login;
 mod memory_pressure;
 mod play;
+mod runtime_entity_budget;
 mod runtime_tick_metrics;
 mod script;
 mod server;
@@ -71,6 +72,11 @@ pub use server::{
     OutboundPressureSnapshot, RuntimeTelemetryHandle, RuntimeTelemetrySnapshot, SaveAllReport,
     SaveAllTimings, SaveHandle, ServerConfig, ShutdownHandle, WorldHandle, bind,
     bind_with_extension, bind_with_scripts, run,
+};
+#[cfg(feature = "load-bench")]
+pub use server::{
+    LoadBenchActivityReport, LoadBenchEntitySpec, LoadBenchHandle, LoadBenchReadinessReport,
+    LoadBenchSeedReport, LoadBenchSimulationCommandStat,
 };
 pub use session_auth::{
     MojangSessionVerifier, RsaIdentity, RsaIdentityError, SessionVerifier,

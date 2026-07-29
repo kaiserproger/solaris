@@ -4,8 +4,8 @@ use std::sync::atomic::Ordering;
 
 use mc_data::mob_behavior_26_1_2::{MobBehaviorTable, MobCombatPolicy};
 use mc_entity::{
-    AttributeKind, EntityId, EntityLifecycle, EntityPrimedTntState, EntitySnapshot, GoalState,
-    Rotation, SpawnEntity, Vec3,
+    AttributeKind, EntityId, EntityLifecycle, EntityPrimedTntState, EntitySimulationProjection,
+    EntitySnapshot, GoalState, Rotation, SpawnEntity, Vec3,
 };
 use mc_world::BlockStateId;
 
@@ -704,6 +704,113 @@ fn hostile_faces_target(position: Vec3, rotation: Rotation, target: Vec3) -> boo
     (facing_x * dx + facing_z * dz) / distance > 0.0
 }
 
+#[derive(Debug, Clone)]
+struct HostileTargetCandidate {
+    id: EntityId,
+    position: Vec3,
+    follow_range: f64,
+    uses_ranged_attack: bool,
+    is_creeper: bool,
+    fuse_active: bool,
+    wander_speed: f64,
+    wander_period_ticks: u32,
+    pursuit_speed: f64,
+    current: GoalState,
+}
+
+fn hostile_target_candidate_from_projection(
+    entity: &EntitySimulationProjection,
+    mob_behaviors: &MobBehaviorTable,
+) -> Option<HostileTargetCandidate> {
+    if entity.lifecycle != EntityLifecycle::Alive || !is_hostile_entity(&entity.type_name) {
+        return None;
+    }
+    let profile = mob_behaviors.get_by_name(&entity.type_name)?;
+    Some(HostileTargetCandidate {
+        id: entity.id,
+        position: entity.position,
+        follow_range: entity.follow_range,
+        uses_ranged_attack: matches!(
+            profile.combat,
+            MobCombatPolicy::Arrow | MobCombatPolicy::UnsupportedSpecial
+        ),
+        is_creeper: profile.combat == MobCombatPolicy::CreeperFuse,
+        fuse_active: entity.primed_tnt,
+        wander_speed: profile.wander_speed,
+        wander_period_ticks: profile.wander_period_ticks,
+        pursuit_speed: profile.pursuit_speed,
+        current: entity.goal.clone(),
+    })
+}
+
+fn apply_hostile_target_candidates(
+    entities: &mut EntityOwnerAccess,
+    players: &[Vec3],
+    hostiles: impl IntoIterator<Item = HostileTargetCandidate>,
+) {
+    let changed = hostiles
+        .into_iter()
+        .filter_map(|hostile| {
+            let target = if players.is_empty() {
+                None
+            } else {
+                let max_distance_sq = hostile.follow_range * hostile.follow_range;
+                players
+                    .iter()
+                    .copied()
+                    .filter(|position| distance_sq(*position, hostile.position) <= max_distance_sq)
+                    .min_by(|left, right| {
+                        distance_sq(*left, hostile.position)
+                            .total_cmp(&distance_sq(*right, hostile.position))
+                    })
+            };
+            let goal = match target {
+                None if hostile.is_creeper && hostile.fuse_active => GoalState::Idle,
+                None => hostile_wander_goal_for(hostile.wander_speed, hostile.wander_period_ticks),
+                Some(target)
+                    if hostile.is_creeper
+                        && (hostile.fuse_active
+                            || distance_sq(target, hostile.position)
+                                < CREEPER_TRIGGER_RANGE * CREEPER_TRIGGER_RANGE) =>
+                {
+                    GoalState::Idle
+                }
+                Some(target)
+                    if !hostile.uses_ranged_attack
+                        && (target.y - hostile.position.y).abs()
+                            <= HOSTILE_MELEE_VERTICAL_REACH
+                        && (target.x - hostile.position.x).powi(2)
+                            + (target.z - hostile.position.z).powi(2)
+                            <= HOSTILE_MELEE_RANGE * HOSTILE_MELEE_RANGE =>
+                {
+                    GoalState::FollowPosition { target, speed: 0.0 }
+                }
+                Some(target) => GoalState::FollowPosition {
+                    target,
+                    speed: hostile.pursuit_speed,
+                },
+            };
+            changed_hostile_goal(hostile.id, &hostile.current, goal)
+        })
+        .collect::<Vec<_>>();
+    if !changed.is_empty() {
+        let _ = entities.set_goals_deferred_journal(changed);
+    }
+}
+
+pub(super) fn update_hostile_targets_from_projections<'a>(
+    entities: &mut EntityOwnerAccess,
+    players: &[Vec3],
+    projections: impl IntoIterator<Item = &'a EntitySimulationProjection>,
+    mob_behaviors: &MobBehaviorTable,
+) {
+    let hostiles = projections
+        .into_iter()
+        .filter_map(|entity| hostile_target_candidate_from_projection(entity, mob_behaviors))
+        .collect::<Vec<_>>();
+    apply_hostile_target_candidates(entities, players, hostiles);
+}
+
 pub(super) fn update_hostile_targets(
     entities: &mut EntityOwnerAccess,
     players: &[Vec3],
@@ -711,124 +818,38 @@ pub(super) fn update_hostile_targets(
     mob_behaviors: &MobBehaviorTable,
 ) {
     let mut hostiles = Vec::new();
-    let mut collect_hostile = |entity: mc_entity::EntityView<'_>| {
-        if entity.lifecycle == EntityLifecycle::Alive && is_hostile_entity(entity.type_name) {
-            let Some(profile) = mob_behaviors.get_by_name(entity.type_name) else {
-                return;
-            };
-            let follow_range = entity
+    let mut collect = |entity: mc_entity::EntityView<'_>| {
+        if entity.lifecycle != EntityLifecycle::Alive || !is_hostile_entity(entity.type_name) {
+            return;
+        }
+        let Some(profile) = mob_behaviors.get_by_name(entity.type_name) else {
+            return;
+        };
+        hostiles.push(HostileTargetCandidate {
+            id: entity.id,
+            position: entity.position,
+            follow_range: entity
                 .attributes
                 .base(&AttributeKind::FollowRange)
-                .unwrap_or(16.0);
-            hostiles.push((
-                entity.id,
-                entity.position,
-                follow_range,
-                matches!(
-                    profile.combat,
-                    MobCombatPolicy::Arrow | MobCombatPolicy::UnsupportedSpecial
-                ),
-                profile.combat == MobCombatPolicy::CreeperFuse,
-                entity.retained.primed_tnt.is_some(),
-                profile.wander_speed,
-                profile.wander_period_ticks,
-                profile.pursuit_speed,
-                entity.goal.clone(),
-            ));
-        }
+                .unwrap_or(16.0),
+            uses_ranged_attack: matches!(
+                profile.combat,
+                MobCombatPolicy::Arrow | MobCombatPolicy::UnsupportedSpecial
+            ),
+            is_creeper: profile.combat == MobCombatPolicy::CreeperFuse,
+            fuse_active: entity.retained.primed_tnt.is_some(),
+            wander_speed: profile.wander_speed,
+            wander_period_ticks: profile.wander_period_ticks,
+            pursuit_speed: profile.pursuit_speed,
+            current: entity.goal.clone(),
+        });
     };
     if let Some(active_ids) = active_ids {
-        entities.visit_simulation_entities_for_ids(active_ids, &mut collect_hostile);
+        entities.visit_simulation_entities_for_ids(active_ids, &mut collect);
     } else {
-        entities.visit_simulation_entities(&mut collect_hostile);
+        entities.visit_simulation_entities(&mut collect);
     }
-    if players.is_empty() {
-        let changed = hostiles
-            .into_iter()
-            .filter_map(
-                |(
-                    hostile_id,
-                    _,
-                    _,
-                    _,
-                    is_creeper,
-                    fuse_active,
-                    wander_speed,
-                    wander_period_ticks,
-                    _,
-                    current,
-                )| {
-                    let goal = if is_creeper && fuse_active {
-                        GoalState::Idle
-                    } else {
-                        hostile_wander_goal_for(wander_speed, wander_period_ticks)
-                    };
-                    changed_hostile_goal(hostile_id, &current, goal)
-                },
-            )
-            .collect::<Vec<_>>();
-        if !changed.is_empty() {
-            let _ = entities.set_goals_deferred_journal(changed);
-        }
-        return;
-    }
-    let changed = hostiles
-        .into_iter()
-        .filter_map(
-            |(
-                hostile_id,
-                hostile_position,
-                follow_range,
-                uses_ranged_attack,
-                is_creeper,
-                fuse_active,
-                wander_speed,
-                wander_period_ticks,
-                pursuit_speed,
-                current,
-            )| {
-                let max_distance_sq = follow_range * follow_range;
-                let target = players
-                    .iter()
-                    .copied()
-                    .filter(|position| distance_sq(*position, hostile_position) <= max_distance_sq)
-                    .min_by(|left, right| {
-                        distance_sq(*left, hostile_position)
-                            .total_cmp(&distance_sq(*right, hostile_position))
-                    });
-                let goal = match target {
-                    None if is_creeper && fuse_active => GoalState::Idle,
-                    None => hostile_wander_goal_for(wander_speed, wander_period_ticks),
-                    Some(target)
-                        if is_creeper
-                            && (fuse_active
-                                || distance_sq(target, hostile_position)
-                                    < CREEPER_TRIGGER_RANGE * CREEPER_TRIGGER_RANGE) =>
-                    {
-                        GoalState::Idle
-                    }
-                    Some(target)
-                        if !uses_ranged_attack
-                            && (target.y - hostile_position.y).abs()
-                                <= HOSTILE_MELEE_VERTICAL_REACH
-                            && (target.x - hostile_position.x).powi(2)
-                                + (target.z - hostile_position.z).powi(2)
-                                <= HOSTILE_MELEE_RANGE * HOSTILE_MELEE_RANGE =>
-                    {
-                        GoalState::FollowPosition { target, speed: 0.0 }
-                    }
-                    Some(target) => GoalState::FollowPosition {
-                        target,
-                        speed: pursuit_speed,
-                    },
-                };
-                changed_hostile_goal(hostile_id, &current, goal)
-            },
-        )
-        .collect::<Vec<_>>();
-    if !changed.is_empty() {
-        let _ = entities.set_goals_deferred_journal(changed);
-    }
+    apply_hostile_target_candidates(entities, players, hostiles);
 }
 
 #[cfg(test)]

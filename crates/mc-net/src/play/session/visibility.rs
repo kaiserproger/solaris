@@ -214,11 +214,6 @@ enum VisibilityTransition {
     Despawn,
 }
 
-struct EntityPublication {
-    snapshot: ServerEntitySnapshot,
-    recipients: Vec<SessionRecipient>,
-}
-
 pub(super) fn finish_player_pose_locked(
     inner: &mut SessionRegistryInner,
     id: SessionId,
@@ -715,39 +710,32 @@ pub(super) fn install_committed_entity_publications_locked(
             .published_entity_snapshots
             .insert(snapshot.id, snapshot.clone());
         let publication_index = publications.len();
-        publications.push(EntityPublication {
-            snapshot,
-            recipients: Vec::new(),
-        });
+        publications.push(snapshot);
         publications_by_chunk
             .entry(chunk)
             .or_default()
             .push(publication_index);
     }
 
+    let mut dispatches = Vec::new();
     for (&observer_id, observer) in &mut inner.sessions {
+        let mut spawns = Vec::new();
         for (chunk, publication_indexes) in &publications_by_chunk {
             if !observer.loaded.contains(chunk) {
                 continue;
             }
             for &publication_index in publication_indexes {
-                let publication = &mut publications[publication_index];
-                if observer.visible_entities.insert(publication.snapshot.id) {
-                    publication
-                        .recipients
-                        .push(ordered_spawn_session_recipient(observer_id, observer));
+                let snapshot = &publications[publication_index];
+                if observer.visible_entities.insert(snapshot.id) {
+                    spawns.push(snapshot.clone());
                 }
             }
         }
         observer.visible_entities.publish();
-    }
-
-    let mut dispatches = Vec::new();
-    for publication in publications {
-        for recipient in publication.recipients {
+        if !spawns.is_empty() {
             dispatches.push(VisibilityDispatch {
-                recipient,
-                command: OutboundCommand::SpawnEntity(publication.snapshot.clone()),
+                recipient: ordered_spawn_session_recipient(observer_id, observer),
+                command: OutboundCommand::SpawnEntities(spawns),
             });
         }
     }

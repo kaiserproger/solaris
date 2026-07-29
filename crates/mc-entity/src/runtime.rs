@@ -20,11 +20,11 @@ use crate::runtime_26_1_2::{
     TargetKind, TickInput, TickMode, apply_effect_action, apply_tick, prepare_tick,
 };
 use crate::{
-    AnimalBreedingState, AttributeSet, EntityActiveEffectsState, EntityDamageRequest, EntityId,
-    EntityItemStack, EntityKinematics, EntityLifecycle, EntityLivingRetainedState,
-    EntityMotionState, EntityRetainedState, EntitySnapshot, EntityView, GoalPathingRequest,
-    GoalPathingResult, GoalState, GoalTickStats, PathingDecisionKind, RetainedPathState, Rotation,
-    Vec3, VehicleKind, VehicleState,
+    AnimalBreedingState, AttributeSet, EntityActiveEffectsState, EntityDamageRequest,
+    EntityGoalCheckpoint, EntityId, EntityItemStack, EntityKinematics, EntityLifecycle,
+    EntityLivingRetainedState, EntityMotionState, EntityRetainedState, EntitySimulationProjection,
+    EntitySnapshot, EntityView, GoalPathingRequest, GoalPathingResult, GoalState, GoalTickStats,
+    PathingDecisionKind, RetainedPathState, Rotation, Vec3, VehicleKind, VehicleState,
 };
 
 #[derive(Component)]
@@ -696,6 +696,56 @@ impl EntityRuntime {
                 "minecraft:item" | "minecraft:experience_orb"
             ),
         })
+    }
+
+    pub(crate) fn goal_checkpoint(&self, id: EntityId) -> Option<EntityGoalCheckpoint> {
+        entity_goal_checkpoint_from_world(&self.world, id)
+    }
+
+    pub(crate) fn restore_goal_checkpoint(&mut self, checkpoint: EntityGoalCheckpoint) -> bool {
+        let Some(entity) = self
+            .world
+            .resource::<RuntimeEntityIndex>()
+            .0
+            .get(&checkpoint.id)
+            .copied()
+        else {
+            return false;
+        };
+        let Ok(mut entity) = self.world.get_entity_mut(entity) else {
+            return false;
+        };
+        let Some(mut transform) = entity.get_mut::<TransformState>() else {
+            return false;
+        };
+        transform.position = checkpoint.position;
+        transform.rotation = checkpoint.rotation;
+        drop(transform);
+        let Some(mut motion) = entity.get_mut::<MotionState>() else {
+            return false;
+        };
+        motion.velocity = checkpoint.velocity;
+        motion.on_ground = checkpoint.on_ground;
+        drop(motion);
+        let Some(mut lifecycle) = entity.get_mut::<LifecycleState>() else {
+            return false;
+        };
+        lifecycle.0 = checkpoint.lifecycle;
+        drop(lifecycle);
+        let Some(mut goal) = entity.get_mut::<AiGoalState>() else {
+            return false;
+        };
+        goal.0 = checkpoint.goal;
+        drop(goal);
+        let Some(mut path) = entity.get_mut::<AiPathState>() else {
+            return false;
+        };
+        path.0 = checkpoint.path;
+        true
+    }
+
+    pub(crate) fn simulation_projection(&self, id: EntityId) -> Option<EntitySimulationProjection> {
+        entity_simulation_projection_from_world(&self.world, id)
     }
 
     pub(crate) fn view(&self, id: EntityId) -> Option<EntityView<'_>> {
@@ -1608,6 +1658,78 @@ fn snapshot_from_world(world: &World, id: EntityId) -> Option<EntitySnapshot> {
             villager_population: gameplay.villager_population.clone(),
             zombie_villager_conversion: gameplay.zombie_villager_conversion,
         },
+    })
+}
+
+fn entity_goal_checkpoint_from_world(world: &World, id: EntityId) -> Option<EntityGoalCheckpoint> {
+    let ecs_entity = *world.resource::<RuntimeEntityIndex>().0.get(&id)?;
+    let entity = world.get_entity(ecs_entity).ok()?;
+    let identity = entity.get::<StableIdentity>()?;
+    let transform = entity.get::<TransformState>()?;
+    let motion = entity.get::<MotionState>()?;
+    let lifecycle = entity.get::<LifecycleState>()?;
+    let goal = entity.get::<AiGoalState>()?;
+    let path = entity.get::<AiPathState>()?;
+    Some(EntityGoalCheckpoint {
+        id: identity.id,
+        position: transform.position,
+        rotation: transform.rotation,
+        velocity: motion.velocity,
+        on_ground: motion.on_ground,
+        lifecycle: lifecycle.0,
+        goal: goal.0.clone(),
+        path: path.0,
+    })
+}
+
+fn entity_simulation_projection_from_world(
+    world: &World,
+    id: EntityId,
+) -> Option<EntitySimulationProjection> {
+    let ecs_entity = *world.resource::<RuntimeEntityIndex>().0.get(&id)?;
+    let entity = world.get_entity(ecs_entity).ok()?;
+    let identity = entity.get::<StableIdentity>()?;
+    let entity_type = entity.get::<EntityTypeState>()?;
+    let transform = entity.get::<TransformState>()?;
+    let motion = entity.get::<MotionState>()?;
+    let lifecycle = entity.get::<LifecycleState>()?;
+    let living = entity.get::<LivingState>()?;
+    let goal = entity.get::<AiGoalState>()?;
+    let gameplay = entity.get::<GameplayDecisionState>()?;
+    let arrow_state = gameplay.arrow_state;
+    let villager_brain = gameplay.villager_brain.as_ref();
+
+    Some(EntitySimulationProjection {
+        id: identity.id,
+        type_name: entity_type.name.clone(),
+        position: transform.position,
+        rotation: transform.rotation,
+        velocity: motion.velocity,
+        on_ground: motion.on_ground,
+        lifecycle: lifecycle.0,
+        follow_range: living
+            .attributes
+            .base(&crate::AttributeKind::FollowRange)
+            .unwrap_or(16.0),
+        goal: goal.0.clone(),
+        primed_tnt: gameplay.primed_tnt.is_some(),
+        has_item_stack: entity.get::<ItemStackState>().is_some(),
+        has_experience_value: entity.get::<ExperienceState>().is_some(),
+        has_block_state: entity.get::<FallingBlockState>().is_some(),
+        has_vehicle: entity.get::<VehicleKindState>().is_some(),
+        animal: entity.get::<AnimalState>().map(|state| state.0),
+        fall_distance: motion.fall_distance,
+        arrow_revision: arrow_state.map(|state| state.projectile.revision),
+        arrow_embedded_block: arrow_state
+            .filter(|state| state.in_ground)
+            .and_then(|state| state.last_block_position),
+        sheep_grazing_ticks: gameplay.sheep_grazing_ticks,
+        villager: gameplay.villager,
+        villager_schedule: villager_brain.map(|brain| brain.schedule),
+        villager_override_expires_tick: villager_brain
+            .and_then(|brain| brain.override_expires_tick),
+        villager_override_order_present: villager_brain
+            .is_some_and(|brain| brain.override_order.is_some()),
     })
 }
 

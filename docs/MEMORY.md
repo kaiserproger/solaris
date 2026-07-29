@@ -355,6 +355,15 @@ and is not startup context.
   artifacts were not staged.
 - Ignored oracle/load/benchmark rows remain explicit. The P04 real-client soak
   ran; broad performance and dedicated concurrency gates did not.
+- The exact release entity-scale gate now covers 40,000 active hostile entities,
+  60 complete headless TCP clients, 16 regions, 200 warm-up ticks, and 1,200
+  measured ticks. Tick p50/p95/p99/max was
+  `37.289/41.932/43.886/52.863 ms`; goal and hostile-attack p99 were
+  `19.838/9.766 ms`. All clients stayed connected with zero reliable drops,
+  write timeouts, or pressure sheds, and the derived cohort rotated the full
+  population within 28 ticks. The separate 1,500-vs-1,500 regional battle
+  completed at `32.610 ms` tick p99 with no missing follow targets. This is
+  focused release profiling, not a broad deployment or long-soak claim.
 
 ## Delivery Priority Lock
 

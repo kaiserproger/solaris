@@ -423,6 +423,181 @@ pub struct RuntimeTelemetrySnapshot {
     pub memory_sample_failures: u64,
 }
 
+#[cfg(feature = "load-bench")]
+#[derive(Debug, Clone)]
+pub struct LoadBenchEntitySpec {
+    pub type_id: i32,
+    pub type_name: String,
+    pub x: f64,
+    pub y: f64,
+    pub z: f64,
+}
+
+#[cfg(feature = "load-bench")]
+impl LoadBenchEntitySpec {
+    #[must_use]
+    pub fn new(type_id: i32, type_name: impl Into<String>, x: f64, y: f64, z: f64) -> Self {
+        Self {
+            type_id,
+            type_name: type_name.into(),
+            x,
+            y,
+            z,
+        }
+    }
+}
+
+#[cfg(feature = "load-bench")]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct LoadBenchSeedReport {
+    pub entities: usize,
+    pub hostile_entities: usize,
+    pub regions: usize,
+    pub max_entities_per_region: usize,
+    pub spawn_dispatches: usize,
+    pub owner_lanes: usize,
+}
+
+#[cfg(feature = "load-bench")]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct LoadBenchReadinessReport {
+    pub sessions: usize,
+    pub desired_chunks: usize,
+    pub desired_loaded_chunks: usize,
+    pub pending_chunks: usize,
+    pub min_desired_loaded_chunks: usize,
+    pub max_desired_loaded_chunks: usize,
+    pub visible_entity_links: usize,
+    pub owner_entities: usize,
+    pub active_simulation_entities: usize,
+    pub active_hostile_entities: usize,
+    pub prepared_chunks: usize,
+    pub prepared_in_flight: usize,
+    pub pending_subscriber_chunks: usize,
+    pub pending_subscribers: usize,
+    pub entity_update_budget_per_lane: usize,
+    pub entity_update_budget_total: usize,
+    pub entity_update_selected: usize,
+    pub entity_update_active_population: usize,
+    pub entity_update_rotation_ticks: usize,
+    pub entity_movement_publication_budget: usize,
+}
+
+#[cfg(feature = "load-bench")]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
+pub struct LoadBenchActivityReport {
+    pub active_simulation_entities: usize,
+    pub active_hostile_entities: usize,
+    pub entity_update_budget_per_lane: usize,
+    pub entity_update_budget_total: usize,
+    pub entity_update_selected: usize,
+    pub entity_update_active_population: usize,
+    pub entity_update_rotation_ticks: usize,
+    pub entity_movement_publication_budget: usize,
+}
+
+#[cfg(feature = "load-bench")]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+pub struct LoadBenchSimulationCommandStat {
+    pub kind: String,
+    pub count: u64,
+    pub total_us: u64,
+    pub max_us: u64,
+}
+
+#[cfg(feature = "load-bench")]
+#[derive(Clone)]
+pub struct LoadBenchHandle {
+    sessions: Arc<play::SessionRegistry>,
+    simulation: play::SimulationHandle,
+}
+
+#[cfg(feature = "load-bench")]
+impl LoadBenchHandle {
+    #[must_use]
+    pub fn seed_entities(&self, specs: Vec<LoadBenchEntitySpec>) -> LoadBenchSeedReport {
+        let entities = specs
+            .into_iter()
+            .map(|spec| {
+                mc_entity::SpawnEntity::new(
+                    spec.type_id,
+                    spec.type_name,
+                    mc_entity::Vec3::new(spec.x, spec.y, spec.z),
+                )
+            })
+            .collect();
+        let seeded = self.sessions.seed_load_bench_entities(entities);
+        LoadBenchSeedReport {
+            entities: seeded.entities,
+            hostile_entities: seeded.hostile_entities,
+            regions: seeded.regions,
+            max_entities_per_region: seeded.max_entities_per_region,
+            spawn_dispatches: seeded.spawn_dispatches,
+            owner_lanes: seeded.owner_lanes,
+        }
+    }
+
+    #[must_use]
+    pub fn readiness(&self) -> LoadBenchReadinessReport {
+        let readiness = self.sessions.load_bench_readiness();
+        LoadBenchReadinessReport {
+            sessions: readiness.sessions,
+            desired_chunks: readiness.desired_chunks,
+            desired_loaded_chunks: readiness.desired_loaded_chunks,
+            pending_chunks: readiness.pending_chunks,
+            min_desired_loaded_chunks: readiness.min_desired_loaded_chunks,
+            max_desired_loaded_chunks: readiness.max_desired_loaded_chunks,
+            visible_entity_links: readiness.visible_entity_links,
+            owner_entities: readiness.owner_entities,
+            active_simulation_entities: readiness.active_simulation_entities,
+            active_hostile_entities: readiness.active_hostile_entities,
+            prepared_chunks: readiness.prepared_chunks,
+            prepared_in_flight: readiness.prepared_in_flight,
+            pending_subscriber_chunks: readiness.pending_subscriber_chunks,
+            pending_subscribers: readiness.pending_subscribers,
+            entity_update_budget_per_lane: readiness.entity_update_budget_per_lane,
+            entity_update_budget_total: readiness.entity_update_budget_total,
+            entity_update_selected: readiness.entity_update_selected,
+            entity_update_active_population: readiness.entity_update_active_population,
+            entity_update_rotation_ticks: readiness.entity_update_rotation_ticks,
+            entity_movement_publication_budget: readiness.entity_movement_publication_budget,
+        }
+    }
+
+    pub fn reset_simulation_command_stats(&self) {
+        self.simulation.reset_command_kind_stats();
+    }
+
+    #[must_use]
+    pub fn activity(&self) -> LoadBenchActivityReport {
+        let activity = self.sessions.load_bench_activity();
+        LoadBenchActivityReport {
+            active_simulation_entities: activity.active_simulation_entities,
+            active_hostile_entities: activity.active_hostile_entities,
+            entity_update_budget_per_lane: activity.entity_update_budget_per_lane,
+            entity_update_budget_total: activity.entity_update_budget_total,
+            entity_update_selected: activity.entity_update_selected,
+            entity_update_active_population: activity.entity_update_active_population,
+            entity_update_rotation_ticks: activity.entity_update_rotation_ticks,
+            entity_movement_publication_budget: activity.entity_movement_publication_budget,
+        }
+    }
+
+    #[must_use]
+    pub fn simulation_command_stats(&self) -> Vec<LoadBenchSimulationCommandStat> {
+        self.simulation
+            .command_kind_snapshot()
+            .into_iter()
+            .map(|stat| LoadBenchSimulationCommandStat {
+                kind: stat.kind.to_owned(),
+                count: stat.count,
+                total_us: stat.total_us,
+                max_us: stat.max_us,
+            })
+            .collect()
+    }
+}
+
 #[derive(Clone)]
 pub struct EntityBehaviorHandle {
     sessions: Arc<play::SessionRegistry>,
@@ -899,6 +1074,15 @@ impl BoundServer {
         }
     }
 
+    #[cfg(feature = "load-bench")]
+    #[must_use]
+    pub fn load_bench_handle(&self) -> LoadBenchHandle {
+        LoadBenchHandle {
+            sessions: Arc::clone(&self.sessions),
+            simulation: self.simulation.clone(),
+        }
+    }
+
     #[must_use]
     pub fn chunk_pipeline_metrics(&self) -> crate::ChunkPipelineResourceMetrics {
         self.chunk_pipeline_resources.metrics()
@@ -1138,6 +1322,11 @@ impl BoundServer {
             let mut simulation_command_gate = SimulationCommandGate::default();
             let mut pushed_simulation_lane_attribution = Vec::new();
             let mut entity_physics_job = None;
+            let mut entity_update_budget =
+                crate::runtime_entity_budget::EntityUpdateBudgetController::default();
+            let mut movement_publication_budget =
+                crate::runtime_entity_budget::MovementPublicationBudgetController::default();
+            let mut entity_budget_last_reliable_drops = 0_u64;
             let mut scheduled_budget_exhausted_since_publish = false;
             let mut inhabited_time = play::InhabitedTimeAccumulator::default();
             loop {
@@ -1430,6 +1619,7 @@ impl BoundServer {
                         &entity_sessions,
                         &entity_chunk_pipeline_resources,
                         tick,
+                        entity_update_budget.configured_per_lane(),
                         work_budgets.entity_pathing_candidates,
                         simulation_policy.simulation_distance,
                         simulation_owner.entity_world_context(
@@ -1761,6 +1951,40 @@ impl BoundServer {
 
                 let tick_us = elapsed_us(tick_started)
                     .saturating_add(simulation_command_telemetry.off_tick_elapsed_us);
+                let (_, _, selected_entity_updates, active_entity_population) =
+                    entity_sessions.entity_update_budget_observation();
+                let target_tick_us = entity_runtime_control
+                    .as_ref()
+                    .map(|control| {
+                        control
+                            .snapshot()
+                            .policy
+                            .target_tick_ms
+                            .saturating_mul(1_000)
+                    })
+                    .unwrap_or(50_000);
+                let outbound_pressure = entity_sessions.pressure_snapshot();
+                let reliable_drops_increased =
+                    outbound_pressure.reliable_command_drops > entity_budget_last_reliable_drops;
+                entity_budget_last_reliable_drops = outbound_pressure.reliable_command_drops;
+                let entity_pressure = crate::runtime_entity_budget::EntityUpdatePressure {
+                    reliable_drops_increased,
+                    reliable_retries_in_flight: outbound_pressure
+                        .reliable_command_retries_in_flight,
+                    simulation_queue_depth: simulation_commands.remaining_depth,
+                };
+                let entity_update_budget_snapshot = entity_update_budget.observe(
+                    tick_us,
+                    entity_goals_us,
+                    selected_entity_updates,
+                    active_entity_population,
+                    entity_chunk_pipeline_resources.cpu_limit().max(1),
+                    target_tick_us,
+                    entity_pressure,
+                );
+                let movement_budget =
+                    movement_publication_budget.observe(tick_us, target_tick_us, entity_pressure);
+                entity_sessions.set_entity_movement_publication_budget(movement_budget);
                 let current_tick_sample = RuntimeTickSample {
                     tick_us,
                     world_time_us,
@@ -1910,6 +2134,15 @@ impl BoundServer {
                             simulation_command_post_admission_us,
                             entity_queries = entity_query_count,
                             entity_steps = entity_step_count,
+                            entity_update_budget_per_lane =
+                                entity_update_budget_snapshot.configured_per_lane,
+                            entity_update_budget_total =
+                                entity_update_budget_snapshot.effective_total,
+                            entity_update_selected = entity_update_budget_snapshot.selected,
+                            entity_update_active_population =
+                                entity_update_budget_snapshot.active_population,
+                            entity_update_rotation_ticks =
+                                entity_update_budget_snapshot.estimated_rotation_ticks,
                             entity_physics_in_flight = entity_physics_job.is_some(),
                             campfire_persisted = campfire_tick.persisted,
                             campfire_completed = campfire_tick.completed,
@@ -2030,6 +2263,15 @@ impl BoundServer {
                             simulation_command_post_admission_us,
                             entity_queries = entity_query_count,
                             entity_steps = entity_step_count,
+                            entity_update_budget_per_lane =
+                                entity_update_budget_snapshot.configured_per_lane,
+                            entity_update_budget_total =
+                                entity_update_budget_snapshot.effective_total,
+                            entity_update_selected = entity_update_budget_snapshot.selected,
+                            entity_update_active_population =
+                                entity_update_budget_snapshot.active_population,
+                            entity_update_rotation_ticks =
+                                entity_update_budget_snapshot.estimated_rotation_ticks,
                             entity_physics_in_flight = entity_physics_job.is_some(),
                             campfire_persisted = campfire_tick.persisted,
                             campfire_completed = campfire_tick.completed,

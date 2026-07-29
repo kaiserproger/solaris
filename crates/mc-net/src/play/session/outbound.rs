@@ -612,10 +612,16 @@ impl ReliableRetryQueue {
             return ReliableEnqueueResult::Dropped;
         }
         let command = match self.pending.back_mut() {
-            Some(pending) => match try_coalesce_entity_movements(pending, command) {
-                None => return ReliableEnqueueResult::Queued,
-                Some(command) => command,
-            },
+            Some(pending) => {
+                let command = match try_coalesce_entity_spawns(pending, command) {
+                    None => return ReliableEnqueueResult::Queued,
+                    Some(command) => command,
+                };
+                match try_coalesce_entity_movements(pending, command) {
+                    None => return ReliableEnqueueResult::Queued,
+                    Some(command) => command,
+                }
+            }
             None => command,
         };
         if self.pending.len() < self.capacity {
@@ -632,6 +638,32 @@ impl ReliableRetryQueue {
         self.closing = true;
         ReliableEnqueueResult::Shed { dropped }
     }
+}
+
+fn try_coalesce_entity_spawns(
+    pending: &mut OutboundCommand,
+    command: OutboundCommand,
+) -> Option<OutboundCommand> {
+    let mut incoming = match command {
+        OutboundCommand::SpawnEntity(entity) => vec![entity],
+        OutboundCommand::SpawnEntities(entities) => entities,
+        command => return Some(command),
+    };
+    let existing = match pending {
+        OutboundCommand::SpawnEntity(entity) => {
+            let entity = entity.clone();
+            *pending = OutboundCommand::SpawnEntities(vec![entity]);
+            let OutboundCommand::SpawnEntities(existing) = pending else {
+                unreachable!();
+            };
+            existing
+        }
+        OutboundCommand::SpawnEntities(existing) => existing,
+        _ if incoming.len() == 1 => return Some(OutboundCommand::SpawnEntity(incoming.remove(0))),
+        _ => return Some(OutboundCommand::SpawnEntities(incoming)),
+    };
+    existing.append(&mut incoming);
+    None
 }
 
 fn try_coalesce_entity_movements(
@@ -669,24 +701,19 @@ fn try_coalesce_entity_movements(
         return None;
     }
 
-    let by_id = existing
+    let mut by_id = existing
         .iter()
         .enumerate()
         .map(|(index, movement)| (movement.id, index))
         .collect::<HashMap<_, _>>();
-    if incoming
-        .iter()
-        .any(|movement| !by_id.contains_key(&movement.id))
-    {
-        return Some(if was_single {
-            OutboundCommand::MoveEntityRelative(incoming[0])
-        } else {
-            OutboundCommand::MoveEntitiesRelative(incoming)
-        });
-    }
     for incoming in incoming {
-        let index = by_id[&incoming.id];
-        merge_entity_movement(&mut existing[index], incoming);
+        if let Some(&index) = by_id.get(&incoming.id) {
+            merge_entity_movement(&mut existing[index], incoming);
+        } else {
+            let index = existing.len();
+            by_id.insert(incoming.id, index);
+            existing.push(incoming);
+        }
     }
     None
 }

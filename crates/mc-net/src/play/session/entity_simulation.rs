@@ -678,11 +678,32 @@ impl SessionRegistry {
         dispatch_visibility_commands(dispatches);
     }
 
+    pub(crate) fn entity_update_budget_observation(&self) -> (usize, usize, usize, usize) {
+        (
+            self.entity_update_budget_per_lane.load(Ordering::Relaxed),
+            self.entity_update_budget_total.load(Ordering::Relaxed),
+            self.entity_update_selected.load(Ordering::Relaxed),
+            self.entity_update_active_population.load(Ordering::Relaxed),
+        )
+    }
+
+    pub(crate) fn set_entity_movement_publication_budget(&self, budget: usize) {
+        self.entity_movement_publication_budget
+            .store(budget.max(1), Ordering::Relaxed);
+    }
+
+    pub(crate) fn entity_movement_publication_budget(&self) -> usize {
+        self.entity_movement_publication_budget
+            .load(Ordering::Relaxed)
+            .max(1)
+    }
+
     pub(in crate::play) fn tick_entities_and_collect_physics_queries_owned(
         &self,
         _authority: &SimulationAuthority,
         cpu_resources: &crate::chunk_pipeline::ChunkPipelineResources,
         tick: u64,
+        entity_updates_per_lane: usize,
         pathing_candidates_per_entity: usize,
         simulation_distance: i32,
         world: EntitySimulationWorldContext<'_>,
@@ -690,6 +711,7 @@ impl SessionRegistry {
         self.tick_entities_and_collect_physics_queries_core(
             Some(cpu_resources),
             tick,
+            entity_updates_per_lane,
             pathing_candidates_per_entity,
             simulation_distance,
             world.pathing(),
@@ -705,6 +727,7 @@ impl SessionRegistry {
         self.tick_entities_and_collect_physics_queries_core(
             None,
             tick,
+            usize::MAX,
             PathingBudget::DEFAULT.max_candidates_per_entity,
             DEFAULT_VIEW_DISTANCE,
             None,
@@ -721,6 +744,7 @@ impl SessionRegistry {
         self.tick_entities_and_collect_physics_queries_core(
             None,
             tick,
+            usize::MAX,
             PathingBudget::DEFAULT.max_candidates_per_entity,
             simulation_distance,
             None,
@@ -737,6 +761,7 @@ impl SessionRegistry {
         self.tick_entities_and_collect_physics_queries_core(
             None,
             tick,
+            usize::MAX,
             pathing_candidates_per_entity,
             DEFAULT_VIEW_DISTANCE,
             None,
@@ -754,6 +779,7 @@ impl SessionRegistry {
         self.tick_entities_and_collect_physics_queries_core(
             None,
             tick,
+            usize::MAX,
             PathingBudget::DEFAULT.max_candidates_per_entity,
             DEFAULT_VIEW_DISTANCE,
             Some((world_read, pathing_materials)),
@@ -772,6 +798,7 @@ impl SessionRegistry {
         self.tick_entities_and_collect_physics_queries_core(
             None,
             tick,
+            usize::MAX,
             PathingBudget::DEFAULT.max_candidates_per_entity,
             DEFAULT_VIEW_DISTANCE,
             None,
@@ -783,6 +810,7 @@ impl SessionRegistry {
         &self,
         cpu_resources: Option<&crate::chunk_pipeline::ChunkPipelineResources>,
         tick: u64,
+        entity_updates_per_lane: usize,
         pathing_candidates_per_entity: usize,
         simulation_distance: i32,
         pathing: Option<(&mc_world::WorldReadView, &mc_physics::BlockMaterialIds)>,
@@ -792,6 +820,8 @@ impl SessionRegistry {
             &mc_data::items::ItemRegistry,
         )>,
     ) -> Vec<EntityPhysicsQuery> {
+        #[cfg(feature = "load-bench")]
+        let goal_profile_started = std::time::Instant::now();
         if !self.has_live_sessions() {
             self.clear_active_simulation_entities();
             return Vec::new();
@@ -845,17 +875,36 @@ impl SessionRegistry {
             villager_day_time,
             &villager_profile,
         );
-        let simulation_budget = cpu_resources.map_or(usize::MAX, |cpu| {
-            cpu.cpu_limit()
-                .max(1)
-                .saturating_mul(ENTITY_SIMULATION_UPDATES_PER_LANE_PER_TICK)
-        });
+        let lane_count = cpu_resources.map_or(1, |cpu| cpu.cpu_limit().max(1));
+        let configured_budget = lane_count.saturating_mul(entity_updates_per_lane.max(1));
+        let freshness_budget =
+            crate::runtime_entity_budget::freshness_budget(active_population_ids.len());
+        let simulation_budget = if cpu_resources.is_some() {
+            configured_budget.max(freshness_budget)
+        } else {
+            usize::MAX
+        };
         let simulation_overloaded = active_population_ids.len() > simulation_budget;
         let active_entity_candidates = if simulation_overloaded {
             bounded_entity_ids_due_for_tick(&active_population_ids, tick, simulation_budget)
         } else {
             active_population_ids.clone()
         };
+        self.entity_update_budget_per_lane
+            .store(entity_updates_per_lane.max(1), Ordering::Relaxed);
+        self.entity_update_budget_total.store(
+            simulation_budget.min(active_population_ids.len()),
+            Ordering::Relaxed,
+        );
+        self.entity_update_selected
+            .store(active_entity_candidates.len(), Ordering::Relaxed);
+        self.entity_update_active_population
+            .store(active_population_ids.len(), Ordering::Relaxed);
+        #[cfg(feature = "load-bench")]
+        let selection_us =
+            u64::try_from(goal_profile_started.elapsed().as_micros()).unwrap_or(u64::MAX);
+        #[cfg(feature = "load-bench")]
+        let projection_started = std::time::Instant::now();
         let mut entities = self.lock_entities("prepare entity goals");
         if active_chunks.is_empty() {
             self.clear_active_simulation_entities();
@@ -868,82 +917,77 @@ impl SessionRegistry {
         let mut sheep_grazing_entities = HashSet::new();
         let mut active_entity_aabbs = HashMap::new();
         let mut active_entity_kinds = HashMap::new();
-        entities.visit_simulation_entities_for_ids(&active_entity_candidates, |entity| {
-            #[cfg(test)]
-            self.active_entity_selection_visits
-                .fetch_add(1, Ordering::Relaxed);
-            if entity.lifecycle == EntityLifecycle::Alive {
-                let chunk = chunk_pos_from_coords(entity.position.x, entity.position.z);
-                if active_chunks.contains(&chunk) {
-                    active_entity_ids.insert(entity.id);
-                    if is_hostile_entity(entity.type_name) {
-                        active_hostile_ids.insert(entity.id);
-                    }
-                    if entity.type_name == "minecraft:villager"
-                        && entity.retained.villager.is_some()
-                    {
-                        active_villager_population_ids.insert(entity.id);
-                    }
-                    if entity.retained.sheep_grazing_ticks.is_some() {
-                        sheep_grazing_entities.insert(entity.id);
-                    }
-                    active_entity_aabbs.insert(
-                        entity.id,
-                        entity_geometry(entity.type_name, entity.animal).aabb,
-                    );
-                    active_entity_kinds.insert(
-                        entity.id,
-                        (
-                            if entity.type_name == "minecraft:arrow" {
-                                EntityPhysicsKind::ArrowProjectile {
-                                    revision: entity
-                                        .retained
-                                        .arrow_state
-                                        .map(|state| state.projectile.revision),
-                                    embedded_block: entity
-                                        .retained
-                                        .arrow_state
-                                        .filter(|state| state.in_ground)
-                                        .and_then(|state| state.last_block_position),
-                                }
-                            } else if entity_type_uses_aquatic_physics(entity.type_name) {
-                                EntityPhysicsKind::AquaticLiving
-                            } else if entity.type_name == "minecraft:falling_block" {
-                                EntityPhysicsKind::FallingBlock
-                            } else if entity.item_stack.is_none()
-                                && entity.experience_value.is_none()
-                                && entity.block_state.is_none()
-                                && entity.vehicle.is_none()
-                            {
-                                if entity_type_walks_on_powder_snow(entity.type_name) {
-                                    EntityPhysicsKind::PowderSnowWalkableLiving
+        let projection_ids = active_entity_candidates
+            .union(&villager_brain_probe_ids)
+            .copied()
+            .collect::<HashSet<_>>();
+        let simulation_projections = entities
+            .simulation_projections_for_ids(&projection_ids)
+            .into_iter()
+            .map(|projection| (projection.id, projection))
+            .collect::<HashMap<_, _>>();
+        for entity in simulation_projections.values() {
+            if active_entity_candidates.contains(&entity.id) {
+                #[cfg(test)]
+                self.active_entity_selection_visits
+                    .fetch_add(1, Ordering::Relaxed);
+                if entity.lifecycle == EntityLifecycle::Alive {
+                    let chunk = chunk_pos_from_coords(entity.position.x, entity.position.z);
+                    if active_chunks.contains(&chunk) {
+                        let type_name = entity.type_name.as_str();
+                        active_entity_ids.insert(entity.id);
+                        if is_hostile_entity(type_name) {
+                            active_hostile_ids.insert(entity.id);
+                        }
+                        if type_name == "minecraft:villager" && entity.villager.is_some() {
+                            active_villager_population_ids.insert(entity.id);
+                        }
+                        if entity.sheep_grazing_ticks.is_some() {
+                            sheep_grazing_entities.insert(entity.id);
+                        }
+                        active_entity_aabbs
+                            .insert(entity.id, entity_geometry(type_name, entity.animal).aabb);
+                        active_entity_kinds.insert(
+                            entity.id,
+                            (
+                                if type_name == "minecraft:arrow" {
+                                    EntityPhysicsKind::ArrowProjectile {
+                                        revision: entity.arrow_revision,
+                                        embedded_block: entity.arrow_embedded_block,
+                                    }
+                                } else if entity_type_uses_aquatic_physics(type_name) {
+                                    EntityPhysicsKind::AquaticLiving
+                                } else if type_name == "minecraft:falling_block" {
+                                    EntityPhysicsKind::FallingBlock
+                                } else if !entity.has_item_stack
+                                    && !entity.has_experience_value
+                                    && !entity.has_block_state
+                                    && !entity.has_vehicle
+                                {
+                                    if entity_type_walks_on_powder_snow(type_name) {
+                                        EntityPhysicsKind::PowderSnowWalkableLiving
+                                    } else {
+                                        EntityPhysicsKind::Living
+                                    }
                                 } else {
-                                    EntityPhysicsKind::Living
-                                }
-                            } else {
-                                EntityPhysicsKind::Default
-                            },
-                            entity.retained.fall_distance,
-                        ),
-                    );
+                                    EntityPhysicsKind::Default
+                                },
+                                entity.fall_distance,
+                            ),
+                        );
+                    }
                 }
             }
-        });
-        entities.visit_simulation_entities_for_ids(&villager_brain_probe_ids, |entity| {
-            if entity.lifecycle == EntityLifecycle::Alive
+            if villager_brain_probe_ids.contains(&entity.id)
+                && entity.lifecycle == EntityLifecycle::Alive
                 && entity.type_name == "minecraft:villager"
-                && entity.retained.villager.is_some()
+                && entity.villager.is_some()
                 && villager_brain_due_for_tick(
                     entity.id,
-                    entity.retained.villager_brain.as_ref().map_or(
-                        mc_entity::villager_26_1_2::VillagerScheduleKind::Adult,
-                        |brain| brain.schedule,
-                    ),
                     entity
-                        .retained
-                        .villager_brain
-                        .as_ref()
-                        .and_then(|brain| brain.override_expires_tick),
+                        .villager_schedule
+                        .unwrap_or(mc_entity::villager_26_1_2::VillagerScheduleKind::Adult),
+                    entity.villager_override_expires_tick,
                     tick,
                     villager_day_time,
                     &villager_profile,
@@ -951,7 +995,7 @@ impl SessionRegistry {
             {
                 active_villager_ids.insert(entity.id);
             }
-        });
+        }
         let VillagerBrainTransitionReport {
             metadata_updates: villager_metadata_updates,
             ..
@@ -973,17 +1017,16 @@ impl SessionRegistry {
             .iter()
             .copied()
             .filter(|entity| {
-                entities.snapshot(*entity).is_none_or(|snapshot| {
-                    snapshot.lifecycle != EntityLifecycle::Alive
-                        || snapshot
-                            .retained
-                            .villager_brain
-                            .as_ref()
-                            .is_none_or(|brain| brain.override_order.is_none())
+                simulation_projections.get(entity).is_none_or(|projection| {
+                    projection.lifecycle != EntityLifecycle::Alive
+                        || !projection.villager_override_order_present
                 })
             })
             .collect::<Vec<_>>();
         self.clear_villager_overrides(&cleared_overrides);
+        #[cfg(feature = "load-bench")]
+        let projection_us =
+            u64::try_from(projection_started.elapsed().as_micros()).unwrap_or(u64::MAX);
         if active_entity_ids.is_empty() {
             self.publish_active_entity_selection(
                 live_session_generation,
@@ -994,11 +1037,15 @@ impl SessionRegistry {
             self.publish_villager_metadata_updates(villager_metadata_updates);
             return Vec::new();
         }
+        #[cfg(feature = "load-bench")]
+        let targets_started = std::time::Instant::now();
         let mob_behaviors = self.mob_behavior_table();
-        update_hostile_targets(
+        update_hostile_targets_from_projections(
             &mut entities,
             &hostile_target_positions,
-            Some(&active_hostile_ids),
+            active_hostile_ids
+                .iter()
+                .filter_map(|entity_id| simulation_projections.get(entity_id)),
             &mob_behaviors,
         );
         self.publish_active_entity_selection(
@@ -1006,6 +1053,10 @@ impl SessionRegistry {
             active_population_ids,
             active_hostile_ids,
         );
+        #[cfg(feature = "load-bench")]
+        let targets_us = u64::try_from(targets_started.elapsed().as_micros()).unwrap_or(u64::MAX);
+        #[cfg(feature = "load-bench")]
+        let prepare_started = std::time::Instant::now();
         let eligible_goal_entity_ids = active_entity_ids
             .difference(&sheep_grazing_entities)
             .copied()
@@ -1018,10 +1069,14 @@ impl SessionRegistry {
             .collect::<HashSet<_>>();
         let prepared_goal_tick =
             entities.prepare_goal_tick_with_pathing_for_ids(tick, &goal_entity_ids);
+        #[cfg(feature = "load-bench")]
+        let prepare_us = u64::try_from(prepare_started.elapsed().as_micros()).unwrap_or(u64::MAX);
         drop(entities);
         self.publish_villager_metadata_updates(villager_metadata_updates);
         #[cfg(test)]
         self.pause_before_entity_goal_compute_for_test();
+        #[cfg(feature = "load-bench")]
+        let terrain_started = std::time::Instant::now();
         let goal_budget = PathingBudget {
             max_candidates_per_entity: pathing_candidates_per_entity.max(1),
             ..PathingBudget::DEFAULT
@@ -1048,6 +1103,10 @@ impl SessionRegistry {
                 world_read.snapshot_chunks(&chunks)
             })
         };
+        #[cfg(feature = "load-bench")]
+        let terrain_us = u64::try_from(terrain_started.elapsed().as_micros()).unwrap_or(u64::MAX);
+        #[cfg(feature = "load-bench")]
+        let resolve_started = std::time::Instant::now();
         let pathing_probe = LoadedChunkPathingProbe::new(
             &active_chunks,
             &terrain_pathing_entities,
@@ -1075,9 +1134,17 @@ impl SessionRegistry {
             .resolved_direct_paths
             .into_inner()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
+        #[cfg(feature = "load-bench")]
+        let resolve_us = u64::try_from(resolve_started.elapsed().as_micros()).unwrap_or(u64::MAX);
+        #[cfg(feature = "load-bench")]
+        let apply_started = std::time::Instant::now();
         let mut entities = self.lock_entities("apply entity goals");
         let applied = entities
             .apply_prepared_goal_tick_and_alive_kinematics(resolved_goal_tick, &goal_entity_ids);
+        #[cfg(feature = "load-bench")]
+        let apply_us = u64::try_from(apply_started.elapsed().as_micros()).unwrap_or(u64::MAX);
+        #[cfg(feature = "load-bench")]
+        let post_started = std::time::Instant::now();
         let current_ids = if applied.is_some() {
             for id in &unprojected_entity_ids {
                 active_entity_aabbs.remove(id);
@@ -1092,45 +1159,48 @@ impl SessionRegistry {
         let mut kinematics = applied
             .map(|(_, kinematics)| kinematics)
             .unwrap_or_default();
-        entities.visit_simulation_entities_for_ids(current_ids, |entity| {
+        let current_projections = if current_ids.is_empty() {
+            HashMap::new()
+        } else {
+            entities
+                .simulation_projections_for_ids(current_ids)
+                .into_iter()
+                .map(|projection| (projection.id, projection))
+                .collect::<HashMap<_, _>>()
+        };
+        for id in current_ids {
+            let Some(entity) = current_projections.get(id) else {
+                continue;
+            };
             if entity.lifecycle != EntityLifecycle::Alive {
-                return;
+                continue;
             }
             let chunk = chunk_pos_from_coords(entity.position.x, entity.position.z);
             if !active_chunks.contains(&chunk)
                 || !entity_is_near_player_chunk(chunk, &player_positions, simulation_distance)
             {
-                return;
+                continue;
             }
-            active_entity_aabbs.insert(
-                entity.id,
-                entity_geometry(entity.type_name, entity.animal).aabb,
-            );
+            let type_name = entity.type_name.as_str();
+            active_entity_aabbs.insert(entity.id, entity_geometry(type_name, entity.animal).aabb);
             active_entity_kinds.insert(
                 entity.id,
                 (
-                    if entity.type_name == "minecraft:arrow" {
+                    if type_name == "minecraft:arrow" {
                         EntityPhysicsKind::ArrowProjectile {
-                            revision: entity
-                                .retained
-                                .arrow_state
-                                .map(|state| state.projectile.revision),
-                            embedded_block: entity
-                                .retained
-                                .arrow_state
-                                .filter(|state| state.in_ground)
-                                .and_then(|state| state.last_block_position),
+                            revision: entity.arrow_revision,
+                            embedded_block: entity.arrow_embedded_block,
                         }
-                    } else if entity_type_uses_aquatic_physics(entity.type_name) {
+                    } else if entity_type_uses_aquatic_physics(type_name) {
                         EntityPhysicsKind::AquaticLiving
-                    } else if entity.type_name == "minecraft:falling_block" {
+                    } else if type_name == "minecraft:falling_block" {
                         EntityPhysicsKind::FallingBlock
-                    } else if entity.item_stack.is_none()
-                        && entity.experience_value.is_none()
-                        && entity.block_state.is_none()
-                        && entity.vehicle.is_none()
+                    } else if !entity.has_item_stack
+                        && !entity.has_experience_value
+                        && !entity.has_block_state
+                        && !entity.has_vehicle
                     {
-                        if entity_type_walks_on_powder_snow(entity.type_name) {
+                        if entity_type_walks_on_powder_snow(type_name) {
                             EntityPhysicsKind::PowderSnowWalkableLiving
                         } else {
                             EntityPhysicsKind::Living
@@ -1138,7 +1208,7 @@ impl SessionRegistry {
                     } else {
                         EntityPhysicsKind::Default
                     },
-                    entity.retained.fall_distance,
+                    entity.fall_distance,
                 ),
             );
             kinematics.push(EntityKinematics {
@@ -1148,7 +1218,7 @@ impl SessionRegistry {
                 velocity: entity.velocity,
                 on_ground: entity.on_ground,
             });
-        });
+        }
         kinematics.sort_unstable_by_key(|state| state.id);
         drop(goal_cpu_permits);
         let queries = kinematics
@@ -1163,6 +1233,18 @@ impl SessionRegistry {
                 kind: active_entity_kinds[&state.id].0,
             })
             .collect();
+        #[cfg(feature = "load-bench")]
+        {
+            let post_us = u64::try_from(post_started.elapsed().as_micros()).unwrap_or(u64::MAX);
+            if tick.is_multiple_of(10) {
+                eprintln!(
+                    "ENTITY_GOAL_PHASE tick={tick} active={} selected={} goal_ids={} selection_us={selection_us} projection_us={projection_us} targets_us={targets_us} prepare_us={prepare_us} terrain_us={terrain_us} resolve_us={resolve_us} apply_us={apply_us} post_us={post_us}",
+                    self.entity_update_active_population.load(Ordering::Relaxed),
+                    self.entity_update_selected.load(Ordering::Relaxed),
+                    goal_entity_ids.len(),
+                );
+            }
+        }
         drop(entities);
         if !resolved_direct_paths.is_empty() {
             self.simulation_inputs
@@ -1662,10 +1744,11 @@ impl SessionRegistry {
             })
             .map(|step| step.id)
             .collect::<HashSet<_>>();
+        let movement_publication_budget = self.entity_movement_publication_budget();
         let natural_tracker_ids_due = bounded_entity_ids_due_for_tick(
             &natural_tracker_ids,
             tick,
-            ENTITY_MOVEMENT_TARGET_UPDATES_PER_TRACKING_TURN,
+            movement_publication_budget,
         );
         let mut tracker_inputs = Vec::with_capacity(steps.len());
         for step in steps {
@@ -1771,11 +1854,8 @@ impl SessionRegistry {
 
         dispatches.extend(self.pickup_candidate_dispatches(pickup_sessions));
 
-        let mut movements = Vec::with_capacity(
-            tracker_inputs
-                .len()
-                .min(ENTITY_MOVEMENT_TARGET_UPDATES_PER_TRACKING_TURN),
-        );
+        let mut movements =
+            Vec::with_capacity(tracker_inputs.len().min(movement_publication_budget));
         let mut tracker_commits = Vec::with_capacity(tracker_inputs.len());
         let mut ordinary_ordinal = 0;
         for (motion, last_sent, smooth_natural_mob) in tracker_inputs {
@@ -1786,6 +1866,7 @@ impl SessionRegistry {
                     ordinary_ordinal,
                     tick,
                     ordinary_tracker_count,
+                    movement_publication_budget,
                 )
             {
                 ordinary_ordinal += 1;

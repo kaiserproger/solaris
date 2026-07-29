@@ -19,8 +19,9 @@ use mc_protocol::packets::play::{
     ClientboundSetEntityData, ClientboundSetExperience, ClientboundSetHealth, ConfirmTeleportation,
     ContainerInput, Direction, EntityDataValue, GameEvent, GameMode, HashedStack,
     HashedStackComponentHashes, InteractionHand, LevelChunkWithLight, MovePlayerFlags,
-    PlayDisconnect, SectionBlocksUpdate, ServerboundChatCommand, ServerboundContainerClick,
-    ServerboundKeepAlive, ServerboundMovePlayerPos, ServerboundMovePlayerStatusOnly,
+    PlayDisconnect, PlayerActionKind, SectionBlocksUpdate, ServerboundChatCommand,
+    ServerboundContainerClick, ServerboundKeepAlive, ServerboundMovePlayerPos,
+    ServerboundMovePlayerStatusOnly, ServerboundPlaceRecipe, ServerboundPlayerAction,
     ServerboundUseItemOn, SetCenterChunk, SynchronizePlayerPosition, pack_block_pos,
     pack_section_pos, pack_section_relative_pos, unpack_block_pos,
 };
@@ -59,6 +60,61 @@ const O2_VD8_QUEUE_EMPTY_STOP_BUDGET: usize = 100_000;
 const O2_VD8_CHUNK_PREPARE_HOLD_COUNT_BUDGET: u64 = (O2_VD8_WINDOW_CHUNKS as u64) * 16;
 const O2_VD8_CHUNK_RESULT_QUEUE_SIZE: usize = 64;
 
+fn parse_cpu_list(value: &str) -> Option<Vec<usize>> {
+    let mut cpus = std::collections::BTreeSet::new();
+    for part in value.trim().split(',') {
+        if part.is_empty() {
+            return None;
+        }
+        let mut bounds = part.split('-');
+        let first = bounds.next()?.parse::<usize>().ok()?;
+        let last = bounds
+            .next()
+            .map(|last| last.parse::<usize>().ok())
+            .unwrap_or(Some(first))?;
+        if first > last || bounds.next().is_some() {
+            return None;
+        }
+        cpus.extend(first..=last);
+    }
+    (!cpus.is_empty()).then(|| cpus.into_iter().collect())
+}
+
+fn entity_scale_default_owner_lanes() -> usize {
+    #[cfg(target_os = "linux")]
+    {
+        let allowed = std::fs::read_to_string("/proc/self/status")
+            .ok()
+            .and_then(|status| {
+                status.lines().find_map(|line| {
+                    line.strip_prefix("Cpus_allowed_list:")
+                        .and_then(parse_cpu_list)
+                })
+            });
+        if let Some(allowed) = allowed {
+            let mut physical = std::collections::BTreeSet::new();
+            for cpu in allowed {
+                let topology = format!("/sys/devices/system/cpu/cpu{cpu}/topology");
+                let Ok(package) =
+                    std::fs::read_to_string(format!("{topology}/physical_package_id"))
+                else {
+                    physical.clear();
+                    break;
+                };
+                let Ok(core) = std::fs::read_to_string(format!("{topology}/core_id")) else {
+                    physical.clear();
+                    break;
+                };
+                physical.insert((package.trim().to_owned(), core.trim().to_owned()));
+            }
+            if !physical.is_empty() {
+                return physical.len();
+            }
+        }
+    }
+    std::thread::available_parallelism().map_or(1, usize::from)
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 struct WorkloadLatencyPercentilesMs {
     samples: usize,
@@ -79,6 +135,44 @@ struct ChunkWindowLatencyMs {
 struct TimedChunkDrain {
     chunks: std::collections::BTreeSet<(i32, i32)>,
     latency: ChunkWindowLatencyMs,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize)]
+struct EntityScaleClientCounters {
+    frames: u64,
+    bytes: u64,
+    keepalives: u64,
+    disconnects: u64,
+    movements_sent: u64,
+    block_placements_sent: u64,
+    block_breaks_sent: u64,
+    recipe_requests_sent: u64,
+    crafted_results_taken: u64,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct EntityScaleClientWorkload {
+    client_index: usize,
+    base_x: f64,
+    base_y: f64,
+    base_z: f64,
+    ground_y: i32,
+    crafting_recipe: i32,
+    crafted_item_id: u32,
+}
+
+impl std::ops::AddAssign for EntityScaleClientCounters {
+    fn add_assign(&mut self, other: Self) {
+        self.frames += other.frames;
+        self.bytes += other.bytes;
+        self.keepalives += other.keepalives;
+        self.disconnects += other.disconnects;
+        self.movements_sent += other.movements_sent;
+        self.block_placements_sent += other.block_placements_sent;
+        self.block_breaks_sent += other.block_breaks_sent;
+        self.recipe_requests_sent += other.recipe_requests_sent;
+        self.crafted_results_taken += other.crafted_results_taken;
+    }
 }
 
 fn workload_latency_percentiles_ms(
@@ -2014,6 +2108,8 @@ async fn vd8_multi_client_stop_drains_and_flushes_disk_world_under_stream_load()
         max_players: 8,
         fixed_runtime_view_distance: false,
         chunk_result_queue_size: 8,
+        chunk_capacity: None,
+        chunk_worker_threads: LOAD_CHUNK_WORKER_THREADS,
     })
     .await;
     let addr = server.addr;
@@ -2152,6 +2248,8 @@ async fn vd8_twenty_same_spawn_clients_drain_full_window_and_stop_without_duplic
         max_players: O2_VD8_CONCURRENT_CLIENTS,
         fixed_runtime_view_distance: true,
         chunk_result_queue_size: O2_VD8_CHUNK_RESULT_QUEUE_SIZE,
+        chunk_capacity: None,
+        chunk_worker_threads: LOAD_CHUNK_WORKER_THREADS,
     })
     .await;
     let addr = server.addr;
@@ -3137,6 +3235,858 @@ async fn reports_spawn_exploration_block_entity_and_multi_client_load() {
     );
 }
 
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+#[ignore = "explicit 40k hostile / 60 headless client release profiling benchmark"]
+async fn entity_scale_40k_hostiles_60_clients_profile() {
+    let benchmark_started = Instant::now();
+    let clients =
+        entity_scale_env_usize("SOLARIS_ENTITY_BENCH_CLIENTS", ENTITY_SCALE_DEFAULT_CLIENTS);
+    let regions =
+        entity_scale_env_usize("SOLARIS_ENTITY_BENCH_REGIONS", ENTITY_SCALE_DEFAULT_REGIONS);
+    let entities_per_region = entity_scale_env_usize(
+        "SOLARIS_ENTITY_BENCH_ENTITIES_PER_REGION",
+        ENTITY_SCALE_DEFAULT_ENTITIES_PER_REGION,
+    );
+    let warmup_ticks = entity_scale_env_u64(
+        "SOLARIS_ENTITY_BENCH_WARMUP_TICKS",
+        ENTITY_SCALE_DEFAULT_WARMUP_TICKS,
+    );
+    let measure_ticks = entity_scale_env_u64(
+        "SOLARIS_ENTITY_BENCH_MEASURE_TICKS",
+        ENTITY_SCALE_DEFAULT_MEASURE_TICKS,
+    );
+    let readiness_timeout = Duration::from_secs(entity_scale_env_u64(
+        "SOLARIS_ENTITY_BENCH_READINESS_TIMEOUT_SECS",
+        300,
+    ));
+    let owner_lanes = entity_scale_env_usize(
+        "SOLARIS_ENTITY_BENCH_OWNER_LANES",
+        entity_scale_default_owner_lanes(),
+    );
+    assert!(
+        (1..=64).contains(&clients),
+        "benchmark supports 1-64 clients; the capacity profile uses 50-60"
+    );
+    assert!((1..=3_000).contains(&entities_per_region));
+    assert!((1..=12).contains(&owner_lanes));
+    let region_side = (1..=regions)
+        .find(|side| side * side == regions)
+        .expect("benchmark region count must be a perfect square");
+    let entity_count = regions * entities_per_region;
+    let benchmark_view_distance = 2;
+    let chunk_capacity =
+        clients.saturating_mul(((2 * benchmark_view_distance + 5) as usize).pow(2));
+
+    let _ = tracing_subscriber::fmt()
+        .with_env_filter(tracing_subscriber::EnvFilter::new(
+            "mc_net::lock_metrics=warn,mc_net::server=warn",
+        ))
+        .with_test_writer()
+        .try_init();
+    let server = start_load_server_with_options(LoadServerOptions {
+        view_distance: benchmark_view_distance,
+        disk_backed: false,
+        existing_world_path: None,
+        spawn_passive_entities: false,
+        runtime_control: true,
+        max_players: clients,
+        fixed_runtime_view_distance: true,
+        chunk_result_queue_size: 128,
+        chunk_capacity: Some(chunk_capacity),
+        chunk_worker_threads: owner_lanes,
+    })
+    .await;
+    eprintln!(
+        "ENTITY_SCALE_PHASE phase=server_started elapsed_ms={}",
+        benchmark_started.elapsed().as_millis()
+    );
+    let addr = server.addr;
+
+    let (stop_tx, stop_rx) = tokio::sync::watch::channel(false);
+    let mut connect_tasks = Vec::with_capacity(clients);
+    for index in 0..clients {
+        let region = index % regions;
+        let (center_x, center_z) = entity_scale_region_center(region, region_side);
+        let (offset_x, offset_z) = entity_scale_client_offset(index / regions);
+        let x = center_x + offset_x + 8.5;
+        let z = center_z + offset_z + 8.5;
+        let ground_y = server
+            .generator
+            .surface_height(x.round() as i32, z.round() as i32);
+        let y = f64::from(ground_y) + 2.0;
+        let name = format!("Scale{index:02}");
+        let chunk_pipeline_metrics = server.chunk_pipeline_metrics.clone();
+        let load_bench = server.load_bench.clone();
+        let crafting_recipe = server.crafting_recipe;
+        let crafted_item_id = server.crafted_item_id;
+        connect_tasks.push(tokio::spawn(async move {
+            let mut client = connect_entity_scale_client(
+                addr,
+                &name,
+                (x, y, z),
+                chunk_pipeline_metrics,
+                load_bench,
+                readiness_timeout,
+            )
+            .await;
+            configure_entity_scale_client(&mut client).await;
+            (
+                client,
+                EntityScaleClientWorkload {
+                    client_index: index,
+                    base_x: x,
+                    base_y: y,
+                    base_z: z,
+                    ground_y,
+                    crafting_recipe,
+                    crafted_item_id,
+                },
+            )
+        }));
+    }
+    let mut drain_tasks = Vec::with_capacity(clients);
+    for task in connect_tasks {
+        let (client, workload) = tokio::time::timeout(readiness_timeout, task)
+            .await
+            .expect("entity-scale concurrent client setup timeout")
+            .expect("entity-scale concurrent client task joins");
+        drain_tasks.push(tokio::spawn(drain_entity_scale_client(
+            client,
+            stop_rx.clone(),
+            workload,
+        )));
+    }
+    assert_eq!(drain_tasks.len(), clients);
+    eprintln!(
+        "ENTITY_SCALE_PHASE phase=clients_ready elapsed_ms={} clients={clients}",
+        benchmark_started.elapsed().as_millis()
+    );
+
+    let mut simulation_ticks = server.runtime_telemetry.subscribe_simulation_ticks();
+    let pre_seed_readiness = wait_for_entity_scale_readiness(
+        &server,
+        &mut simulation_ticks,
+        readiness_timeout,
+        "all client chunk windows to load",
+        |readiness| readiness.sessions == clients && readiness.pending_chunks == 0,
+    )
+    .await;
+    assert_eq!(pre_seed_readiness.desired_chunks, clients * 25);
+    assert_eq!(
+        pre_seed_readiness.desired_loaded_chunks,
+        pre_seed_readiness.desired_chunks
+    );
+    eprintln!(
+        "ENTITY_SCALE_PHASE phase=chunk_windows_ready elapsed_ms={} loaded={}",
+        benchmark_started.elapsed().as_millis(),
+        pre_seed_readiness.desired_loaded_chunks
+    );
+
+    let specs = entity_scale_entity_specs(&server, regions, region_side, entities_per_region);
+    assert_eq!(specs.len(), entity_count);
+    let seed_started = Instant::now();
+    let seed_report = server.load_bench.seed_entities(specs);
+    let seed_elapsed = seed_started.elapsed();
+    assert_eq!(seed_report.entities, entity_count);
+    assert_eq!(seed_report.hostile_entities, entity_count);
+    assert_eq!(seed_report.regions, regions);
+    assert!(seed_report.max_entities_per_region <= 3_000);
+    eprintln!(
+        "ENTITY_SCALE_PHASE phase=entities_seeded elapsed_ms={} seed_ms={} spawn_dispatches={}",
+        benchmark_started.elapsed().as_millis(),
+        seed_elapsed.as_millis(),
+        seed_report.spawn_dispatches
+    );
+
+    let active_activity = wait_for_entity_scale_activity(
+        &server,
+        &mut simulation_ticks,
+        readiness_timeout,
+        "all seeded hostiles to become active",
+        |activity| {
+            activity.active_simulation_entities == entity_count
+                && activity.entity_update_active_population == entity_count
+                && activity.entity_update_selected > 0
+                && activity.active_hostile_entities == activity.entity_update_selected
+        },
+    )
+    .await;
+    eprintln!(
+        "ENTITY_SCALE_PHASE phase=entities_active elapsed_ms={} population={} selected={} spawn_dispatches={}",
+        benchmark_started.elapsed().as_millis(),
+        active_activity.entity_update_active_population,
+        active_activity.entity_update_selected,
+        seed_report.spawn_dispatches
+    );
+
+    let active_tick = *simulation_ticks.borrow_and_update();
+    wait_for_entity_scale_tick(
+        &mut simulation_ticks,
+        active_tick.saturating_add(warmup_ticks),
+        Duration::from_secs(300),
+    )
+    .await;
+    eprintln!(
+        "ENTITY_SCALE_PHASE phase=warmup_complete elapsed_ms={} warmup_ticks={warmup_ticks}",
+        benchmark_started.elapsed().as_millis()
+    );
+    let warmup_end_tick = *simulation_ticks.borrow_and_update();
+    let (measure_start_source, measure_target_source, tick_profile) =
+        if measure_ticks.is_multiple_of(100) {
+            let measure_start_profile = wait_for_entity_scale_profile_source(
+                &server,
+                &mut simulation_ticks,
+                warmup_end_tick,
+                Duration::from_secs(30),
+            )
+            .await;
+            let measure_start_source = measure_start_profile.source_tick;
+            server.load_bench.reset_simulation_command_stats();
+            let measure_target_source = measure_start_source.saturating_add(measure_ticks);
+            let tick_profile = wait_for_entity_scale_profile_source(
+                &server,
+                &mut simulation_ticks,
+                measure_target_source,
+                Duration::from_secs(900),
+            )
+            .await;
+            (measure_start_source, measure_target_source, tick_profile)
+        } else {
+            let measure_start_tick = warmup_end_tick;
+            server.load_bench.reset_simulation_command_stats();
+            let measure_target_tick = measure_start_tick.saturating_add(measure_ticks);
+            wait_for_entity_scale_tick(
+                &mut simulation_ticks,
+                measure_target_tick,
+                Duration::from_secs(900),
+            )
+            .await;
+            let tick_profile = server
+                .runtime_telemetry
+                .snapshot()
+                .tick_percentiles
+                .expect("diagnostic window retains a published tick profile");
+            (measure_start_tick, measure_target_tick, tick_profile)
+        };
+    eprintln!(
+        "ENTITY_SCALE_PHASE phase=measurement_complete elapsed_ms={} measured_ticks={measure_ticks}",
+        benchmark_started.elapsed().as_millis()
+    );
+    let telemetry = server.runtime_telemetry.snapshot();
+    let command_stats = server.load_bench.simulation_command_stats();
+    assert_eq!(telemetry.active_sessions, clients);
+    assert!(telemetry.server_entities >= entity_count);
+    let final_activity = server.load_bench.activity();
+    assert_eq!(
+        final_activity.active_simulation_entities, entity_count,
+        "the measured window must keep the complete simulation population active"
+    );
+    assert_eq!(
+        final_activity.entity_update_active_population, entity_count,
+        "the measured window must keep the complete entity population eligible"
+    );
+    assert_eq!(
+        final_activity.active_hostile_entities, final_activity.entity_update_selected,
+        "every selected benchmark entity must remain hostile"
+    );
+    assert_eq!(
+        pre_seed_readiness.pending_chunks, 0,
+        "benchmark movement remains inside the preloaded client windows"
+    );
+
+    let outbound = server.outbound_pressure_snapshot();
+    let locks = mc_net::lock_pressure_snapshot();
+    let runtime_control = server
+        .runtime_control
+        .as_ref()
+        .map(mc_net::RuntimeControlHandle::snapshot);
+    let updates_per_tick = final_activity.entity_update_budget_total.max(1);
+    let estimated_rotation_ticks = final_activity.entity_update_rotation_ticks;
+    assert!(
+        estimated_rotation_ticks <= 40,
+        "dynamic entity budget must keep a full active-population rotation within two seconds at 20 TPS: {final_activity:?}"
+    );
+
+    stop_tx.send_replace(true);
+    let mut client_counters = EntityScaleClientCounters::default();
+    for task in drain_tasks {
+        client_counters += tokio::time::timeout(Duration::from_secs(10), task)
+            .await
+            .expect("entity-scale drain task stops")
+            .expect("entity-scale drain task joins");
+    }
+    assert_eq!(client_counters.disconnects, 0);
+    assert!(client_counters.movements_sent > 0);
+    assert!(client_counters.block_placements_sent > 0);
+    assert!(client_counters.block_breaks_sent > 0);
+    assert!(client_counters.recipe_requests_sent > 0);
+    assert!(client_counters.crafted_results_taken > 0);
+    assert_eq!(
+        outbound.reliable_command_drops, 0,
+        "active benchmark clients must not lose reliable server updates"
+    );
+
+    let report = serde_json::json!({
+        "workload": {
+            "clients": clients,
+            "regions": regions,
+            "entities": entity_count,
+            "entities_per_region": entities_per_region,
+            "warmup_ticks": warmup_ticks,
+            "measured_ticks": measure_ticks,
+            "owner_lanes": seed_report.owner_lanes,
+            "requested_owner_lanes": owner_lanes,
+            "chunk_capacity": chunk_capacity,
+            "updates_per_tick_budget_estimate": updates_per_tick,
+            "full_population_rotation_ticks_estimate": estimated_rotation_ticks,
+            "movement_publication_budget": final_activity.entity_movement_publication_budget,
+        },
+        "setup": {
+            "seed_elapsed_ms": seed_elapsed.as_millis(),
+            "spawn_dispatches": seed_report.spawn_dispatches,
+            "pre_seed_readiness": entity_scale_readiness_json(pre_seed_readiness),
+            "active_activity": active_activity,
+            "final_activity": final_activity,
+            "measure_start_source_tick": measure_start_source,
+            "measure_target_source_tick": measure_target_source,
+        },
+        "tick_profile": entity_scale_tick_profile_json(tick_profile),
+        "runtime": {
+            "active_sessions": telemetry.active_sessions,
+            "ticketed_chunks": telemetry.ticketed_chunks,
+            "prepared_chunks": telemetry.prepared_chunks,
+            "server_entities": telemetry.server_entities,
+            "memory_used_mb": telemetry.memory_used_mb,
+            "memory_limit_mb": telemetry.memory_limit_mb,
+            "memory_sample_available": telemetry.memory_sample_available,
+            "simulation_queue_depth": telemetry.simulation_queue_depth,
+            "simulation_queue_max_depth": telemetry.simulation_queue_max_depth,
+            "simulation_commands_processed": telemetry.simulation_commands_processed,
+            "entity_spawn_dispatches": telemetry.entity_spawn_dispatches,
+            "entity_move_dispatches": telemetry.entity_move_dispatches,
+            "entity_data_dispatches": telemetry.entity_data_dispatches,
+        },
+        "clients": client_counters,
+        "simulation_command_stats": command_stats,
+        "outbound_debug": format!("{outbound:?}"),
+        "locks_debug": format!("{locks:?}"),
+        "runtime_control_debug": format!("{runtime_control:?}"),
+    });
+    let report_path = std::env::var("SOLARIS_ENTITY_BENCH_REPORT")
+        .map(PathBuf::from)
+        .unwrap_or_else(|_| {
+            PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+                .join("../../.analysis/bench/entity-scale.json")
+        });
+    if let Some(parent) = report_path.parent() {
+        std::fs::create_dir_all(parent).expect("create entity-scale report directory");
+    }
+    std::fs::write(
+        &report_path,
+        serde_json::to_vec_pretty(&report).expect("serialize entity-scale report"),
+    )
+    .expect("write entity-scale report");
+    eprintln!(
+        "ENTITY_SCALE_PHASE phase=report_written elapsed_ms={} report={}",
+        benchmark_started.elapsed().as_millis(),
+        report_path.display()
+    );
+
+    eprintln!(
+        "ENTITY_SCALE_BENCH clients={clients} regions={regions} entities={entity_count} per_region={entities_per_region} owner_lanes={} seed_ms={} tick_p50_us={} tick_p95_us={} tick_p99_us={} tick_max_us={} goals_p99_us={} physics_p99_us={} attacks_p99_us={} dispatch_p99_us={} rotation_ticks_est={} movement_budget={} memory_mb={} client_frames={} client_bytes={} report={}",
+        seed_report.owner_lanes,
+        seed_elapsed.as_millis(),
+        tick_profile.tick.p50_us,
+        tick_profile.tick.p95_us,
+        tick_profile.tick.p99_us,
+        tick_profile.tick.max_us,
+        tick_profile.entity_goals.p99_us,
+        tick_profile.entity_physics.p99_us,
+        tick_profile.hostile_attacks.p99_us,
+        tick_profile.entity_dispatch.p99_us,
+        estimated_rotation_ticks,
+        final_activity.entity_movement_publication_budget,
+        telemetry.memory_used_mb,
+        client_counters.frames,
+        client_counters.bytes,
+        report_path.display(),
+    );
+
+    server.shutdown.request();
+    tokio::time::timeout(Duration::from_secs(30), server.serve_task)
+        .await
+        .expect("entity-scale server shutdown timeout")
+        .expect("entity-scale serve task joins")
+        .expect("entity-scale server exits cleanly");
+}
+
+fn entity_scale_region_center(region: usize, side: usize) -> (f64, f64) {
+    let half = i32::try_from(side / 2).expect("region side half fits i32");
+    let region_x = i32::try_from(region % side).expect("region x fits i32") - half;
+    let region_z = i32::try_from(region / side).expect("region z fits i32") - half;
+    (
+        f64::from(region_x * ENTITY_SCALE_REGION_SIZE_BLOCKS + ENTITY_SCALE_REGION_SIZE_BLOCKS / 2),
+        f64::from(region_z * ENTITY_SCALE_REGION_SIZE_BLOCKS + ENTITY_SCALE_REGION_SIZE_BLOCKS / 2),
+    )
+}
+
+fn entity_scale_client_offset(slot: usize) -> (f64, f64) {
+    [(0.0, 0.0), (-20.0, -20.0), (20.0, 20.0), (20.0, -20.0)][slot % 4]
+}
+
+fn entity_scale_entity_specs(
+    server: &LoadServer,
+    regions: usize,
+    region_side: usize,
+    entities_per_region: usize,
+) -> Vec<mc_net::LoadBenchEntitySpec> {
+    let names = ["minecraft:husk"];
+    let types = names.map(|name| {
+        let id = mc_data::Identifier::parse(name).expect("entity-scale entity identifier");
+        let type_id = server
+            .entity_types
+            .id_of(&id)
+            .unwrap_or_else(|| panic!("missing entity type {name}"));
+        (
+            i32::try_from(type_id).expect("entity type id fits i32"),
+            name,
+        )
+    });
+    let grid_side = (1..=entities_per_region)
+        .find(|side| side * side >= entities_per_region)
+        .expect("entity-scale grid side");
+    let spacing = 1.2_f64;
+    let half_width = (grid_side.saturating_sub(1)) as f64 * spacing * 0.5;
+    let mut specs = Vec::with_capacity(regions * entities_per_region);
+    for region in 0..regions {
+        let (center_x, center_z) = entity_scale_region_center(region, region_side);
+        for index in 0..entities_per_region {
+            let local_x = index % grid_side;
+            let local_z = index / grid_side;
+            let x = center_x + local_x as f64 * spacing - half_width;
+            let z = center_z + local_z as f64 * spacing - half_width;
+            let y = f64::from(
+                server
+                    .generator
+                    .surface_height(x.round() as i32, z.round() as i32),
+            ) + 1.0;
+            let (type_id, name) = types[(region + index) % types.len()];
+            specs.push(mc_net::LoadBenchEntitySpec::new(type_id, name, x, y, z));
+        }
+    }
+    specs
+}
+
+async fn connect_entity_scale_client(
+    addr: std::net::SocketAddr,
+    name: &str,
+    target: (f64, f64, f64),
+    chunk_pipeline: mc_net::ChunkPipelineResourceMetrics,
+    load_bench: mc_net::LoadBenchHandle,
+    setup_timeout: Duration,
+) -> Client {
+    let (mut client, _) = connect_to_play(addr, name).await;
+    client
+        .write_packet(&ServerboundChatCommand {
+            command: format!("tp {} {} {}", target.0, target.1, target.2),
+        })
+        .await
+        .expect("send entity-scale teleport");
+    let expected_center = (
+        (target.0.floor() as i32).div_euclid(16),
+        (target.2.floor() as i32).div_euclid(16),
+    );
+    let deadline = tokio::time::Instant::now() + setup_timeout;
+    let mut saw_sync = false;
+    let mut saw_center = false;
+    let mut target_chunks = std::collections::BTreeSet::new();
+    while !saw_sync || !saw_center || target_chunks.len() < 25 {
+        let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+        assert!(
+            !remaining.is_zero(),
+            "entity-scale client {name} setup timed out: sync={saw_sync} center={saw_center} chunks={} pipeline={:?} stop_reasons={:?} readiness={:?}",
+            target_chunks.len(),
+            chunk_pipeline.snapshot(),
+            chunk_pipeline.stop_reason_counts(),
+            load_bench.readiness(),
+        );
+        let frame = client.read_frame_with_timeout(remaining).await.unwrap_or_else(|error| {
+            panic!(
+                "entity-scale client {name} frame: {error:#}; sync={saw_sync} center={saw_center} chunks={} pipeline={:?} stop_reasons={:?} readiness={:?}",
+                target_chunks.len(),
+                chunk_pipeline.snapshot(),
+                chunk_pipeline.stop_reason_counts(),
+                load_bench.readiness(),
+            )
+        });
+        if handle_keepalive(&mut client, frame.id, &frame.body).await {
+            continue;
+        }
+        if frame.id == PlayDisconnect::ID {
+            let mut body = frame.body;
+            let disconnect = PlayDisconnect::decode(&mut body).expect("entity-scale disconnect");
+            panic!(
+                "entity-scale client {name} disconnected during setup: {}",
+                String::from_utf8_lossy(&disconnect.reason_nbt)
+            );
+        }
+        if frame.id == SynchronizePlayerPosition::ID {
+            let mut body = frame.body;
+            let sync = SynchronizePlayerPosition::decode(&mut body).expect("entity-scale sync");
+            client
+                .write_packet(&ConfirmTeleportation {
+                    teleport_id: sync.teleport_id,
+                })
+                .await
+                .expect("ack entity-scale teleport");
+            saw_sync = true;
+        } else if frame.id == SetCenterChunk::ID {
+            let mut body = frame.body;
+            let center = SetCenterChunk::decode(&mut body).expect("entity-scale center chunk");
+            if (center.chunk_x, center.chunk_z) == expected_center && !saw_center {
+                saw_center = true;
+                target_chunks.clear();
+            }
+        } else if frame.id == LevelChunkWithLight::ID {
+            let mut body = frame.body;
+            let chunk = LevelChunkWithLight::decode(&mut body).expect("entity-scale chunk");
+            if (chunk.chunk_x - expected_center.0).abs() <= 2
+                && (chunk.chunk_z - expected_center.1).abs() <= 2
+            {
+                saw_center = true;
+                target_chunks.insert((chunk.chunk_x, chunk.chunk_z));
+            }
+        }
+    }
+    client
+}
+
+async fn configure_entity_scale_client(client: &mut Client) {
+    set_load_client_game_mode(client, "gamemode creative", GameMode::Creative).await;
+    for command in ["give minecraft:dirt 64", "give minecraft:oak_planks 64"] {
+        client
+            .write_packet(&ServerboundChatCommand {
+                command: command.to_owned(),
+            })
+            .await
+            .unwrap_or_else(|error| {
+                panic!("configure entity-scale client with {command:?}: {error:#}")
+            });
+    }
+}
+
+async fn drain_entity_scale_client(
+    mut client: Client,
+    mut stop: tokio::sync::watch::Receiver<bool>,
+    workload: EntityScaleClientWorkload,
+) -> EntityScaleClientCounters {
+    let mut counters = EntityScaleClientCounters::default();
+    let mut workload_tick = 0_u64;
+    let mut sequence = 10_000_i32;
+    let mut workload_interval = tokio::time::interval(Duration::from_millis(50));
+    workload_interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    loop {
+        tokio::select! {
+            changed = stop.changed() => {
+                if changed.is_err() || *stop.borrow_and_update() {
+                    return counters;
+                }
+            }
+            _ = workload_interval.tick() => {
+                workload_tick = workload_tick.wrapping_add(1);
+                let movement_phase = (workload_tick / 10) % 4;
+                let (dx, dz) = match movement_phase {
+                    0 => (1.5, 0.0),
+                    1 => (0.0, 1.5),
+                    2 => (-1.5, 0.0),
+                    _ => (0.0, -1.5),
+                };
+                if client
+                    .write_packet(&ServerboundMovePlayerPos {
+                        x: workload.base_x + dx,
+                        y: workload.base_y,
+                        z: workload.base_z + dz,
+                        flags: MovePlayerFlags::new(true, false),
+                    })
+                    .await
+                    .is_err()
+                {
+                    counters.disconnects += 1;
+                    return counters;
+                }
+                counters.movements_sent += 1;
+
+                if workload_tick.is_multiple_of(20) {
+                    let block_index = i32::try_from((workload_tick / 20) % 8).unwrap_or(0);
+                    let target_x = workload.base_x.floor() as i32 + 3 + block_index % 4;
+                    let target_z = workload.base_z.floor() as i32 - 1 + block_index / 4;
+                    let support = pack_block_pos(target_x, workload.ground_y, target_z);
+                    sequence = sequence.wrapping_add(1).max(1);
+                    if client
+                        .write_packet(&ServerboundUseItemOn {
+                            hand: InteractionHand::MainHand,
+                            position: support,
+                            direction: Direction::Up,
+                            cursor_x: 0.5,
+                            cursor_y: 1.0,
+                            cursor_z: 0.5,
+                            inside: false,
+                            world_border_hit: false,
+                            sequence,
+                        })
+                        .await
+                        .is_err()
+                    {
+                        counters.disconnects += 1;
+                        return counters;
+                    }
+                    counters.block_placements_sent += 1;
+
+                    let placed = pack_block_pos(target_x, workload.ground_y + 1, target_z);
+                    for action in [
+                        PlayerActionKind::StartDestroyBlock,
+                        PlayerActionKind::StopDestroyBlock,
+                    ] {
+                        sequence = sequence.wrapping_add(1).max(1);
+                        if client
+                            .write_packet(&ServerboundPlayerAction {
+                                action,
+                                position: placed,
+                                direction: Direction::Up,
+                                sequence,
+                            })
+                            .await
+                            .is_err()
+                        {
+                            counters.disconnects += 1;
+                            return counters;
+                        }
+                    }
+                    counters.block_breaks_sent += 1;
+                }
+
+                if workload_tick.is_multiple_of(40) {
+                    if client
+                        .write_packet(&ServerboundPlaceRecipe {
+                            container_id: 0,
+                            recipe_display_id: workload.crafting_recipe,
+                            use_max_items: false,
+                        })
+                        .await
+                        .is_err()
+                    {
+                        counters.disconnects += 1;
+                        return counters;
+                    }
+                    counters.recipe_requests_sent += 1;
+                }
+            }
+            frame = client.read_frame() => {
+                let frame = match frame {
+                    Ok(frame) => frame,
+                    Err(error) => {
+                        eprintln!(
+                            "ENTITY_SCALE_CLIENT_DISCONNECT index={} read_error={error:#}",
+                            workload.client_index
+                        );
+                        counters.disconnects += 1;
+                        return counters;
+                    }
+                };
+                counters.frames += 1;
+                counters.bytes += u64::try_from(frame.body.len()).unwrap_or(u64::MAX);
+                if frame.id == ClientboundKeepAlive::ID {
+                    counters.keepalives += 1;
+                    let mut body = frame.body;
+                    let keepalive = ClientboundKeepAlive::decode(&mut body)
+                        .expect("decode entity-scale keepalive");
+                    if client
+                        .write_packet(&ServerboundKeepAlive { id: keepalive.id })
+                        .await
+                        .is_err()
+                    {
+                        counters.disconnects += 1;
+                        return counters;
+                    }
+                } else if frame.id == ClientboundContainerSetSlot::ID {
+                    let mut body = frame.body;
+                    let slot = ClientboundContainerSetSlot::decode(&mut body)
+                        .expect("decode entity-scale container slot");
+                    if slot.container_id == 0
+                        && slot.item_stack.item_id == workload.crafted_item_id
+                        && slot.item_stack.count > 0
+                    {
+                        counters.crafted_results_taken += 1;
+                    }
+                } else if frame.id == PlayDisconnect::ID {
+                    let mut body = frame.body;
+                    let disconnect = PlayDisconnect::decode(&mut body)
+                        .expect("decode entity-scale workload disconnect");
+                    eprintln!(
+                        "ENTITY_SCALE_CLIENT_DISCONNECT index={} reason={}",
+                        workload.client_index,
+                        String::from_utf8_lossy(&disconnect.reason_nbt)
+                    );
+                    counters.disconnects += 1;
+                    return counters;
+                }
+            }
+        }
+    }
+}
+
+async fn wait_for_entity_scale_tick(
+    ticks: &mut tokio::sync::watch::Receiver<u64>,
+    target: u64,
+    timeout: Duration,
+) {
+    let deadline = tokio::time::Instant::now() + timeout;
+    while *ticks.borrow_and_update() < target {
+        let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+        assert!(!remaining.is_zero(), "entity-scale tick {target} timed out");
+        tokio::time::timeout(remaining, ticks.changed())
+            .await
+            .expect("entity-scale tick wait timed out")
+            .expect("entity-scale tick sender remains active");
+    }
+}
+
+async fn wait_for_entity_scale_readiness(
+    server: &LoadServer,
+    ticks: &mut tokio::sync::watch::Receiver<u64>,
+    timeout: Duration,
+    description: &str,
+    ready: impl Fn(mc_net::LoadBenchReadinessReport) -> bool,
+) -> mc_net::LoadBenchReadinessReport {
+    let deadline = tokio::time::Instant::now() + timeout;
+    loop {
+        let readiness = server.load_bench.readiness();
+        if ready(readiness) {
+            return readiness;
+        }
+        let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+        assert!(
+            !remaining.is_zero(),
+            "timed out waiting for {description}: {readiness:?}"
+        );
+        tokio::time::timeout(remaining, ticks.changed())
+            .await
+            .unwrap_or_else(|_| panic!("timed out waiting for {description}: {readiness:?}"))
+            .expect("entity-scale tick sender remains active");
+        let _ = ticks.borrow_and_update();
+    }
+}
+
+async fn wait_for_entity_scale_activity(
+    server: &LoadServer,
+    ticks: &mut tokio::sync::watch::Receiver<u64>,
+    timeout: Duration,
+    description: &str,
+    ready: impl Fn(mc_net::LoadBenchActivityReport) -> bool,
+) -> mc_net::LoadBenchActivityReport {
+    let deadline = tokio::time::Instant::now() + timeout;
+    loop {
+        let activity = server.load_bench.activity();
+        if ready(activity) {
+            return activity;
+        }
+        let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+        assert!(
+            !remaining.is_zero(),
+            "timed out waiting for {description}: {activity:?}"
+        );
+        tokio::time::timeout(remaining, ticks.changed())
+            .await
+            .unwrap_or_else(|_| panic!("timed out waiting for {description}: {activity:?}"))
+            .expect("entity-scale tick sender remains active");
+        let _ = ticks.borrow_and_update();
+    }
+}
+
+async fn wait_for_entity_scale_profile_source(
+    server: &LoadServer,
+    ticks: &mut tokio::sync::watch::Receiver<u64>,
+    target_source_tick: u64,
+    timeout: Duration,
+) -> mc_net::RuntimeTickPercentiles {
+    let deadline = tokio::time::Instant::now() + timeout;
+    loop {
+        if let Some(profile) = server.runtime_telemetry.snapshot().tick_percentiles
+            && profile.source_tick >= target_source_tick
+        {
+            return profile;
+        }
+        let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+        assert!(
+            !remaining.is_zero(),
+            "timed out waiting for tick profile source {target_source_tick}"
+        );
+        tokio::time::timeout(remaining, ticks.changed())
+            .await
+            .expect("entity-scale profile wait timed out")
+            .expect("entity-scale tick sender remains active");
+        let _ = ticks.borrow_and_update();
+    }
+}
+
+fn entity_scale_readiness_json(value: mc_net::LoadBenchReadinessReport) -> serde_json::Value {
+    serde_json::json!({
+        "sessions": value.sessions,
+        "desired_chunks": value.desired_chunks,
+        "desired_loaded_chunks": value.desired_loaded_chunks,
+        "pending_chunks": value.pending_chunks,
+        "min_desired_loaded_chunks": value.min_desired_loaded_chunks,
+        "max_desired_loaded_chunks": value.max_desired_loaded_chunks,
+        "visible_entity_links": value.visible_entity_links,
+        "owner_entities": value.owner_entities,
+        "active_simulation_entities": value.active_simulation_entities,
+        "active_hostile_entities": value.active_hostile_entities,
+        "prepared_chunks": value.prepared_chunks,
+        "prepared_in_flight": value.prepared_in_flight,
+        "pending_subscriber_chunks": value.pending_subscriber_chunks,
+        "pending_subscribers": value.pending_subscribers,
+        "entity_update_budget_per_lane": value.entity_update_budget_per_lane,
+        "entity_update_budget_total": value.entity_update_budget_total,
+        "entity_update_selected": value.entity_update_selected,
+        "entity_update_active_population": value.entity_update_active_population,
+        "entity_update_rotation_ticks": value.entity_update_rotation_ticks,
+        "entity_movement_publication_budget": value.entity_movement_publication_budget,
+    })
+}
+
+fn entity_scale_latency_json(value: mc_net::RuntimeLatencyPercentiles) -> serde_json::Value {
+    serde_json::json!({
+        "samples": value.samples,
+        "p50_us": value.p50_us,
+        "p95_us": value.p95_us,
+        "p99_us": value.p99_us,
+        "max_us": value.max_us,
+    })
+}
+
+fn entity_scale_tick_profile_json(value: mc_net::RuntimeTickPercentiles) -> serde_json::Value {
+    serde_json::json!({
+        "source_tick": value.source_tick,
+        "observer_submit_us": value.observer_submit_us,
+        "observer_compute_us": value.observer_compute_us,
+        "observer_skipped_windows": value.observer_skipped_windows,
+        "tick": entity_scale_latency_json(value.tick),
+        "world_time": entity_scale_latency_json(value.world_time),
+        "sheep_grazing": entity_scale_latency_json(value.sheep_grazing),
+        "animal_breeding": entity_scale_latency_json(value.animal_breeding),
+        "hostile_attacks": entity_scale_latency_json(value.hostile_attacks),
+        "entity_goals": entity_scale_latency_json(value.entity_goals),
+        "entity_physics": entity_scale_latency_json(value.entity_physics),
+        "entity_dispatch": entity_scale_latency_json(value.entity_dispatch),
+        "campfire_tick": entity_scale_latency_json(value.campfire_tick),
+        "inhabited_time": entity_scale_latency_json(value.inhabited_time),
+        "entity_save": entity_scale_latency_json(value.entity_save),
+        "random_tick": entity_scale_latency_json(value.random_tick),
+        "block_tick": entity_scale_latency_json(value.block_tick),
+        "fluid_tick": entity_scale_latency_json(value.fluid_tick),
+    })
+}
+
 struct LoadServer {
     addr: std::net::SocketAddr,
     blocks: Arc<mc_world::BlockRegistry>,
@@ -3146,6 +4096,10 @@ struct LoadServer {
     chunk_pipeline_metrics: mc_net::ChunkPipelineResourceMetrics,
     outbound_pressure: mc_net::OutboundPressureHandle,
     runtime_telemetry: mc_net::RuntimeTelemetryHandle,
+    load_bench: mc_net::LoadBenchHandle,
+    generator: Arc<mc_worldgen::TerrainGenerator>,
+    crafting_recipe: i32,
+    crafted_item_id: u32,
     save_handle: mc_net::SaveHandle,
     shutdown: mc_net::ShutdownHandle,
     runtime_control: Option<mc_net::RuntimeControlHandle>,
@@ -3171,6 +4125,8 @@ struct LoadServerOptions {
     max_players: usize,
     fixed_runtime_view_distance: bool,
     chunk_result_queue_size: usize,
+    chunk_capacity: Option<usize>,
+    chunk_worker_threads: usize,
 }
 
 impl Default for LoadServerOptions {
@@ -3184,6 +4140,8 @@ impl Default for LoadServerOptions {
             max_players: 8,
             fixed_runtime_view_distance: false,
             chunk_result_queue_size: 8,
+            chunk_capacity: None,
+            chunk_worker_threads: LOAD_CHUNK_WORKER_THREADS,
         }
     }
 }
@@ -3231,7 +4189,9 @@ async fn start_load_server_with_options(options: LoadServerOptions) -> LoadServe
     if let Some(path) = world_path.as_ref() {
         std::fs::create_dir_all(path.join("region")).expect("create legacy region dir");
     }
-    let chunk_capacity = ((2 * options.view_distance + 5) as usize).pow(2);
+    let chunk_capacity = options
+        .chunk_capacity
+        .unwrap_or_else(|| ((2 * options.view_distance + 5) as usize).pow(2));
     let storage = if let Some(path) = world_path.as_ref() {
         mc_world::WorldStorage::open_with_capacity(path, Arc::clone(&blocks), chunk_capacity)
             .expect("open disk-backed load world")
@@ -3251,6 +4211,18 @@ async fn start_load_server_with_options(options: LoadServerOptions) -> LoadServe
         mc_data::entity_types::EntityTypeRegistry::try_from_report_26_1_2(&entity_report)
             .expect("exact 26.1.2 entity registry"),
     );
+    let recipes = Arc::new(mc_data::recipes::solaris_required_recipes());
+    let stick_recipe_id = mc_data::Identifier::parse("minecraft:stick").expect("stick recipe id");
+    let crafting_recipe = i32::try_from(
+        recipes
+            .iter()
+            .position(|recipe| recipe.id == stick_recipe_id)
+            .expect("required stick recipe"),
+    )
+    .expect("stick recipe display id fits i32");
+    let crafted_item_id = items
+        .id_of(&mc_data::Identifier::parse("minecraft:stick").expect("stick item id"))
+        .expect("stick item registry entry");
     let biome_spawns = if options.spawn_passive_entities {
         mc_data::biomes::load_biome_spawn_rules(vanilla_dir.join("data/minecraft/worldgen/biome"))
             .map(Arc::new)
@@ -3262,7 +4234,7 @@ async fn start_load_server_with_options(options: LoadServerOptions) -> LoadServe
     let mut chunk_pipeline = mc_net::ChunkPipelinePolicy {
         chunk_prepare_batch_size: 2,
         chunk_io_threads: LOAD_CHUNK_IO_THREADS,
-        chunk_worker_threads: LOAD_CHUNK_WORKER_THREADS,
+        chunk_worker_threads: options.chunk_worker_threads,
         chunk_result_queue_size: options.chunk_result_queue_size,
         ..mc_net::ChunkPipelinePolicy::default()
     };
@@ -3299,7 +4271,7 @@ async fn start_load_server_with_options(options: LoadServerOptions) -> LoadServe
         blocks: Arc::clone(&blocks),
         world: Some(Arc::clone(&world)),
         tags,
-        recipes: Arc::new(Vec::new()),
+        recipes: Arc::clone(&recipes),
         loot: Arc::new(mc_data::loot::LootTables::default()),
         block_light,
         items: Arc::clone(&items),
@@ -3346,13 +4318,17 @@ async fn start_load_server_with_options(options: LoadServerOptions) -> LoadServe
         chunk_pipeline_metrics,
         outbound_pressure,
         runtime_telemetry,
+        load_bench,
+        generator,
+        crafting_recipe,
+        crafted_item_id,
         save_handle,
         shutdown,
         runtime_control,
         serve_task,
         chunk_policy: chunk_pipeline,
         chunk_io_threads: LOAD_CHUNK_IO_THREADS,
-        chunk_worker_threads: LOAD_CHUNK_WORKER_THREADS,
+        chunk_worker_threads: options.chunk_worker_threads,
         world_dir,
     }
 }

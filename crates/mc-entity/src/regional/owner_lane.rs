@@ -10,9 +10,10 @@ use super::{
 };
 
 use crate::{
-    AnimalBreedingState, EntityDamageRequest, EntityEffectRequest, EntityEffectResult, EntityId,
-    EntityItemStack, EntityKinematics, EntitySnapshot, EntityStore, GoalState, GoalTickStats,
-    PreparedGoalTick, ResolvedGoalTick, Vec3,
+    AnimalBreedingState, EntityDamageRequest, EntityEffectRequest, EntityEffectResult,
+    EntityGoalCheckpoint, EntityId, EntityItemStack, EntityKinematics, EntitySimulationProjection,
+    EntitySnapshot, EntityStore, GoalState, GoalTickStats, PreparedGoalTick, ResolvedGoalTick,
+    Vec3,
 };
 
 #[derive(Debug, Clone, PartialEq)]
@@ -64,7 +65,8 @@ pub enum RegionOwnerMutation {
         request: Box<EntityEffectRequest>,
     },
     ApplyGoalBatch {
-        expected: Vec<EntitySnapshot>,
+        expected: Vec<EntityGoalCheckpoint>,
+        expected_state_version: u64,
         resolved: Box<ResolvedGoalTick>,
         follow_targets: HashMap<EntityId, Vec3>,
     },
@@ -177,6 +179,15 @@ enum RegionOwnerLaneMessage {
         entities: Vec<(RegionLease, EntityId)>,
         reply: std::sync::mpsc::Sender<Result<Vec<EntitySnapshot>, RegionOwnerLaneError>>,
     },
+    SimulationProjectionsForIds {
+        entities: Vec<(RegionLease, EntityId)>,
+        reply:
+            std::sync::mpsc::Sender<Result<Vec<EntitySimulationProjection>, RegionOwnerLaneError>>,
+    },
+    GoalCheckpointsForIds {
+        entities: Vec<(RegionLease, EntityId)>,
+        reply: std::sync::mpsc::Sender<Result<Vec<EntityGoalCheckpoint>, RegionOwnerLaneError>>,
+    },
     AliveKinematicsForIds {
         entities: Vec<(RegionLease, EntityId)>,
         reply: std::sync::mpsc::Sender<Result<Vec<EntityKinematics>, RegionOwnerLaneError>>,
@@ -272,7 +283,7 @@ enum RegionOwnerUndo {
     },
     GoalBatch {
         lease: RegionLease,
-        snapshots: Vec<EntitySnapshot>,
+        checkpoints: Vec<EntityGoalCheckpoint>,
     },
 }
 
@@ -293,6 +304,8 @@ pub struct RegionalOwnerLane {
     prepare_and_commit_requests: std::sync::Arc<AtomicU64>,
     #[cfg(test)]
     snapshot_batch_requests: std::sync::Arc<AtomicU64>,
+    #[cfg(test)]
+    goal_checkpoint_batch_requests: std::sync::Arc<AtomicU64>,
 }
 
 #[derive(Clone)]
@@ -344,6 +357,34 @@ impl RegionalOwnerLaneReader {
             .send(RegionOwnerLaneMessage::ExistingSnapshotsForIds { entities, reply })
             .map_err(|_| RegionOwnerLaneError::Closed)?;
         Ok(snapshots)
+    }
+
+    pub(super) fn request_simulation_projections_for_ids(
+        &self,
+        entities: Vec<(RegionLease, EntityId)>,
+    ) -> Result<
+        Receiver<Result<Vec<EntitySimulationProjection>, RegionOwnerLaneError>>,
+        RegionOwnerLaneError,
+    > {
+        let (reply, projections) = channel();
+        self.sender
+            .send(RegionOwnerLaneMessage::SimulationProjectionsForIds { entities, reply })
+            .map_err(|_| RegionOwnerLaneError::Closed)?;
+        Ok(projections)
+    }
+
+    pub(super) fn request_goal_checkpoints_for_ids(
+        &self,
+        entities: Vec<(RegionLease, EntityId)>,
+    ) -> Result<
+        Receiver<Result<Vec<EntityGoalCheckpoint>, RegionOwnerLaneError>>,
+        RegionOwnerLaneError,
+    > {
+        let (reply, checkpoints) = channel();
+        self.sender
+            .send(RegionOwnerLaneMessage::GoalCheckpointsForIds { entities, reply })
+            .map_err(|_| RegionOwnerLaneError::Closed)?;
+        Ok(checkpoints)
     }
 
     pub(super) fn request_alive_kinematics_for_ids(
@@ -479,6 +520,8 @@ impl RegionalOwnerLane {
         let prepare_and_commit_requests = std::sync::Arc::new(AtomicU64::new(0));
         #[cfg(test)]
         let snapshot_batch_requests = std::sync::Arc::new(AtomicU64::new(0));
+        #[cfg(test)]
+        let goal_checkpoint_batch_requests = std::sync::Arc::new(AtomicU64::new(0));
         let handoff = std::sync::Arc::new(std::sync::Mutex::new(Some(owned)));
         let worker_handoff = std::sync::Arc::clone(&handoff);
         let worker = match std::thread::Builder::new()
@@ -522,6 +565,8 @@ impl RegionalOwnerLane {
             prepare_and_commit_requests,
             #[cfg(test)]
             snapshot_batch_requests,
+            #[cfg(test)]
+            goal_checkpoint_batch_requests,
         })
     }
 
@@ -574,6 +619,17 @@ impl RegionalOwnerLane {
     #[cfg(test)]
     pub(super) fn snapshot_batch_request_count(&self) -> u64 {
         self.snapshot_batch_requests.load(Ordering::Relaxed)
+    }
+
+    #[cfg(test)]
+    pub(super) fn reset_goal_checkpoint_batch_request_count(&self) {
+        self.goal_checkpoint_batch_requests
+            .store(0, Ordering::Relaxed);
+    }
+
+    #[cfg(test)]
+    pub(super) fn goal_checkpoint_batch_request_count(&self) -> u64 {
+        self.goal_checkpoint_batch_requests.load(Ordering::Relaxed)
     }
 
     pub(super) fn reader(&self) -> RegionalOwnerLaneReader {
@@ -708,16 +764,34 @@ impl RegionalOwnerLane {
         Ok(snapshots)
     }
 
-    pub(super) fn request_snapshots_for_ids_admitted(
+    pub(super) fn request_goal_checkpoints_for_ids_fenced(
         &self,
         entities: Vec<(RegionLease, EntityId)>,
-    ) -> Result<Receiver<Result<Vec<EntitySnapshot>, RegionOwnerLaneError>>, RegionOwnerLaneError>
-    {
+    ) -> Result<
+        Receiver<Result<Vec<EntityGoalCheckpoint>, RegionOwnerLaneError>>,
+        RegionOwnerLaneError,
+    > {
+        #[cfg(test)]
+        self.goal_checkpoint_batch_requests
+            .fetch_add(1, Ordering::Relaxed);
+        self.reader().request_goal_checkpoints_for_ids(entities)
+    }
+
+    pub(super) fn request_goal_checkpoints_for_ids_admitted(
+        &self,
+        entities: Vec<(RegionLease, EntityId)>,
+    ) -> Result<
+        Receiver<Result<Vec<EntityGoalCheckpoint>, RegionOwnerLaneError>>,
+        RegionOwnerLaneError,
+    > {
+        #[cfg(test)]
+        self.goal_checkpoint_batch_requests
+            .fetch_add(1, Ordering::Relaxed);
         let _admission = self
             .admission
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
-        self.request_snapshots_for_ids(entities)
+        self.reader().request_goal_checkpoints_for_ids(entities)
     }
 
     pub(super) fn request_existing_snapshots_for_ids(
@@ -898,13 +972,20 @@ fn run_region_owner_lane(
                 let result = if pending.is_some() || committed.is_some() {
                     Err(RegionOwnerLaneError::Busy)
                 } else {
-                    prepare_region_owner_batch(lane, &regions, last_phase, last_sequence, batch)
-                        .map(|batch| {
-                            let phase = batch.phase;
-                            last_phase = phase.0;
-                            pending = Some(batch);
-                            phase
-                        })
+                    prepare_region_owner_batch(
+                        lane,
+                        &regions,
+                        last_phase,
+                        last_sequence,
+                        state_version.load(Ordering::Acquire),
+                        batch,
+                    )
+                    .map(|batch| {
+                        let phase = batch.phase;
+                        last_phase = phase.0;
+                        pending = Some(batch);
+                        phase
+                    })
                 };
                 if result.is_ok() {
                     state_version.fetch_add(1, Ordering::Release);
@@ -915,17 +996,24 @@ fn run_region_owner_lane(
                 let result = if pending.is_some() || committed.is_some() {
                     Err(RegionOwnerLaneError::Busy)
                 } else {
-                    prepare_region_owner_batch(lane, &regions, last_phase, last_sequence, batch)
-                        .and_then(|batch| {
-                            let phase = batch.phase;
-                            last_phase = phase.0;
-                            apply_prepared_region_owner_batch(&mut regions, batch).map(
-                                |(completion, applied)| {
-                                    committed = Some(applied);
-                                    completion
-                                },
-                            )
-                        })
+                    prepare_region_owner_batch(
+                        lane,
+                        &regions,
+                        last_phase,
+                        last_sequence,
+                        state_version.load(Ordering::Acquire),
+                        batch,
+                    )
+                    .and_then(|batch| {
+                        let phase = batch.phase;
+                        last_phase = phase.0;
+                        apply_prepared_region_owner_batch(&mut regions, batch).map(
+                            |(completion, applied)| {
+                                committed = Some(applied);
+                                completion
+                            },
+                        )
+                    })
                 };
                 if result.is_ok() {
                     state_version.fetch_add(1, Ordering::Release);
@@ -1079,6 +1167,74 @@ fn run_region_owner_lane(
                 let _ = reply.send(match error {
                     Some(error) => Err(error),
                     None => Ok(snapshots),
+                });
+            }
+            RegionOwnerLaneMessage::SimulationProjectionsForIds { entities, reply } => {
+                let mut projections = Vec::with_capacity(entities.len());
+                let mut error = None;
+                let mut ids_by_region = BTreeMap::<RegionKey, HashSet<EntityId>>::new();
+                for (lease, entity) in entities {
+                    if lease.lane != lane {
+                        error = Some(RegionOwnerLaneError::WrongLane);
+                        break;
+                    }
+                    let Some((current, _)) = regions.get(&lease.key) else {
+                        error = Some(RegionOwnerLaneError::UnknownRegion);
+                        break;
+                    };
+                    if *current != lease {
+                        error = Some(RegionOwnerLaneError::StaleLease);
+                        break;
+                    }
+                    ids_by_region.entry(lease.key).or_default().insert(entity);
+                }
+                if error.is_none() {
+                    for (key, ids) in ids_by_region {
+                        let Some((_, store)) = regions.get(&key) else {
+                            error = Some(RegionOwnerLaneError::UnknownRegion);
+                            break;
+                        };
+                        projections.extend(store.simulation_projections_for_ids(&ids));
+                    }
+                }
+                projections.sort_unstable_by_key(|projection| projection.id);
+                let _ = reply.send(match error {
+                    Some(error) => Err(error),
+                    None => Ok(projections),
+                });
+            }
+            RegionOwnerLaneMessage::GoalCheckpointsForIds { entities, reply } => {
+                let mut checkpoints = Vec::with_capacity(entities.len());
+                let mut error = None;
+                let mut ids_by_region = BTreeMap::<RegionKey, HashSet<EntityId>>::new();
+                for (lease, entity) in entities {
+                    if lease.lane != lane {
+                        error = Some(RegionOwnerLaneError::WrongLane);
+                        break;
+                    }
+                    let Some((current, _)) = regions.get(&lease.key) else {
+                        error = Some(RegionOwnerLaneError::UnknownRegion);
+                        break;
+                    };
+                    if *current != lease {
+                        error = Some(RegionOwnerLaneError::StaleLease);
+                        break;
+                    }
+                    ids_by_region.entry(lease.key).or_default().insert(entity);
+                }
+                if error.is_none() {
+                    for (key, ids) in ids_by_region {
+                        let Some((_, store)) = regions.get(&key) else {
+                            error = Some(RegionOwnerLaneError::UnknownRegion);
+                            break;
+                        };
+                        checkpoints.extend(store.goal_checkpoints_for_ids(&ids));
+                    }
+                }
+                checkpoints.sort_unstable_by_key(|checkpoint| checkpoint.id);
+                let _ = reply.send(match error {
+                    Some(error) => Err(error),
+                    None => Ok(checkpoints),
                 });
             }
             RegionOwnerLaneMessage::AliveKinematicsForIds { entities, reply } => {
@@ -1281,6 +1437,7 @@ fn prepare_region_owner_batch(
     regions: &BTreeMap<RegionKey, (RegionLease, EntityStore)>,
     last_phase: u64,
     last_sequence: u64,
+    current_state_version: u64,
     mut batch: RegionOwnerBatch,
 ) -> Result<RegionOwnerBatch, RegionOwnerLaneError> {
     if batch.phase.0 <= last_phase {
@@ -1419,16 +1576,20 @@ fn prepare_region_owner_batch(
                 }
             }
             RegionOwnerMutation::ApplyGoalBatch {
-                expected, resolved, ..
+                expected,
+                expected_state_version,
+                resolved,
+                ..
             } => {
                 let expected_ids = expected
                     .iter()
-                    .map(|snapshot| snapshot.id)
+                    .map(|checkpoint| checkpoint.id)
                     .collect::<HashSet<_>>();
-                if expected_ids.len() != expected.len()
-                    || expected.iter().any(|snapshot| {
-                        RegionKey::from_position(snapshot.position) != Some(mutation.lease.key)
-                            || store.snapshot(snapshot.id).as_ref() != Some(snapshot)
+                if *expected_state_version != current_state_version
+                    || expected_ids.len() != expected.len()
+                    || expected.iter().any(|checkpoint| {
+                        RegionKey::from_position(checkpoint.position) != Some(mutation.lease.key)
+                            || store.goal_checkpoint(checkpoint.id).as_ref() != Some(checkpoint)
                     })
                     || resolved
                         .active_ids
@@ -1690,16 +1851,17 @@ fn apply_prepared_region_owner_batch(
             }
             RegionOwnerMutation::ApplyGoalBatch {
                 expected,
+                expected_state_version: _,
                 resolved,
                 follow_targets,
             } => {
-                let snapshots = expected;
+                let checkpoints = expected;
                 let stats =
                     store.apply_prepared_goal_tick_with_follow_targets(*resolved, &follow_targets);
                 add_goal_tick_stats(&mut goal_stats, stats);
                 undo.push(RegionOwnerUndo::GoalBatch {
                     lease: mutation.lease,
-                    snapshots,
+                    checkpoints,
                 });
                 true
             }
@@ -1962,15 +2124,12 @@ fn rollback_region_owner_undo(
                 }
                 continue;
             }
-            RegionOwnerUndo::GoalBatch { lease, snapshots } => {
+            RegionOwnerUndo::GoalBatch { lease, checkpoints } => {
                 let store = &mut regions
                     .get_mut(&lease.key)
                     .ok_or(RegionOwnerLaneError::UnknownRegion)?
                     .1;
-                if snapshots
-                    .into_iter()
-                    .any(|snapshot| !store.restore_snapshot_in_place(snapshot))
-                {
+                if !store.restore_goal_checkpoints(checkpoints) {
                     return Err(RegionOwnerLaneError::InvalidMutation);
                 }
                 continue;

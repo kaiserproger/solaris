@@ -65,6 +65,8 @@ use std::sync::Arc;
 #[cfg(test)]
 use std::sync::atomic::AtomicUsize;
 use std::sync::atomic::Ordering;
+#[cfg(feature = "load-bench")]
+use std::time::Instant;
 use tokio::sync::mpsc;
 #[cfg(test)]
 use tokio::sync::oneshot;
@@ -486,6 +488,20 @@ impl SimulationCommand {
             _ => Err(ScriptPlayerTeleportFailure::RuntimeUnavailable),
         };
         completion.complete(result);
+    }
+}
+
+fn regular_player_pose_command(
+    command: &SimulationCommand,
+) -> Option<(SessionId, PlayerPose, f32)> {
+    match command {
+        SimulationCommand::CommitPlayerPose {
+            actor_session,
+            pose,
+            exhaustion,
+            script_teleport_completion: None,
+        } => Some((*actor_session, *pose, *exhaustion)),
+        _ => None,
     }
 }
 
@@ -3382,6 +3398,7 @@ impl SimulationOwner {
         sessions: &SessionRegistry,
         cpu_resources: &crate::chunk_pipeline::ChunkPipelineResources,
         tick: u64,
+        entity_updates_per_lane: usize,
         pathing_candidates_per_entity: usize,
         simulation_distance: i32,
         world: EntitySimulationWorldContext<'_>,
@@ -3390,6 +3407,7 @@ impl SimulationOwner {
             &self.authority,
             cpu_resources,
             tick,
+            entity_updates_per_lane,
             pathing_candidates_per_entity,
             simulation_distance,
             world,
@@ -4668,6 +4686,60 @@ impl SimulationOwner {
                 envelope.respond(Err(SimulationRequestError::StaleSession));
                 continue;
             }
+            if let Some(first_pose) = regular_player_pose_command(&envelope.command) {
+                let mut pose_envelopes = vec![envelope];
+                let mut pose_requests = vec![first_pose];
+                while let Some(next) = batch.front() {
+                    let Some(request) = regular_player_pose_command(&next.command) else {
+                        break;
+                    };
+                    if next.response_is_closed()
+                        || next
+                            .session_fence
+                            .is_some_and(|session_id| !sessions.is_active_session(session_id))
+                    {
+                        break;
+                    }
+                    pose_requests.push(request);
+                    pose_envelopes.push(batch.pop_front().expect("matching pose command"));
+                }
+                let command_count = pose_envelopes.len();
+                #[cfg(feature = "load-bench")]
+                let command_started = Instant::now();
+                let outcomes = sessions.commit_player_pose_batch(&self.authority, pose_requests);
+                #[cfg(feature = "load-bench")]
+                {
+                    let command_elapsed_us =
+                        u64::try_from(command_started.elapsed().as_micros()).unwrap_or(u64::MAX);
+                    self.metrics.record_command_kind_batch(
+                        "commit_player_pose",
+                        command_count,
+                        command_elapsed_us,
+                    );
+                }
+                let mut dispatches = Vec::new();
+                let mut responses = Vec::with_capacity(command_count);
+                for outcome in outcomes {
+                    match outcome {
+                        Ok((mut pose_dispatches, committed)) => {
+                            dispatches.append(&mut pose_dispatches);
+                            responses.push(SimulationResponse::PlayerPose(Ok(committed)));
+                        }
+                        Err(error) => {
+                            responses.push(SimulationResponse::PlayerPose(Err(error)));
+                        }
+                    }
+                }
+                dispatch_visibility_commands(dispatches);
+                for (envelope, response) in pose_envelopes.into_iter().zip(responses) {
+                    envelope.respond(Ok(response));
+                }
+                processed += command_count;
+                self.metrics
+                    .processed
+                    .fetch_add(command_count as u64, Ordering::Relaxed);
+                continue;
+            }
             let detached = envelope.is_detached();
             if detached
                 && let SimulationCommand::EnsureChunkHerd { chunk, spawns } = &envelope.command
@@ -4718,6 +4790,10 @@ impl SimulationOwner {
                 SimulationCommand::CommitOpaqueBlockEntity { .. }
                     | SimulationCommand::CommitCampfireUse(_)
             );
+            #[cfg(feature = "load-bench")]
+            let command_kind = envelope.command.kind();
+            #[cfg(feature = "load-bench")]
+            let command_started = Instant::now();
             let mut response = match &envelope.command {
                 SimulationCommand::SaveBarrier { capture_world } => {
                     let simulation_tick = sessions.simulation_tick();
@@ -5885,6 +5961,13 @@ impl SimulationOwner {
                     SimulationResponse::TntIgnition(result)
                 }
             };
+            #[cfg(feature = "load-bench")]
+            {
+                let command_elapsed_us =
+                    u64::try_from(command_started.elapsed().as_micros()).unwrap_or(u64::MAX);
+                self.metrics
+                    .record_command_kind(command_kind, command_elapsed_us);
+            }
             processed += 1;
             self.metrics.processed.fetch_add(1, Ordering::Relaxed);
             if item_pickup {

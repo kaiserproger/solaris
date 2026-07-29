@@ -67,6 +67,23 @@ pub(crate) struct SimulationQueueSnapshot {
     pub(crate) max_batch: usize,
 }
 
+#[cfg(feature = "load-bench")]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub(crate) struct SimulationCommandKindSnapshot {
+    pub(crate) kind: &'static str,
+    pub(crate) count: u64,
+    pub(crate) total_us: u64,
+    pub(crate) max_us: u64,
+}
+
+#[cfg(feature = "load-bench")]
+#[derive(Debug, Clone, Copy, Default)]
+struct SimulationCommandKindAccumulator {
+    count: u64,
+    total_us: u64,
+    max_us: u64,
+}
+
 #[derive(Debug)]
 pub(super) struct SimulationQueueMetrics {
     pub(super) capacity: usize,
@@ -89,6 +106,8 @@ pub(super) struct SimulationQueueMetrics {
     pub(super) rejected_stale_session: AtomicU64,
     pub(super) cancelled: AtomicU64,
     pub(super) max_batch: AtomicUsize,
+    #[cfg(feature = "load-bench")]
+    command_kind_stats: Mutex<HashMap<&'static str, SimulationCommandKindAccumulator>>,
     requested_herd_chunks: Mutex<HashMap<(i32, i32), Arc<HerdEnqueueClaim>>>,
     #[cfg(test)]
     herd_enqueue_probe: Mutex<Option<Arc<HerdEnqueueProbe>>>,
@@ -166,6 +185,8 @@ impl SimulationQueueMetrics {
             rejected_stale_session: AtomicU64::new(0),
             cancelled: AtomicU64::new(0),
             max_batch: AtomicUsize::new(0),
+            #[cfg(feature = "load-bench")]
+            command_kind_stats: Mutex::new(HashMap::new()),
             requested_herd_chunks: Mutex::new(HashMap::new()),
             #[cfg(test)]
             herd_enqueue_probe: Mutex::new(None),
@@ -204,6 +225,57 @@ impl SimulationQueueMetrics {
 
     pub(super) fn record_batch(&self, batch: usize) {
         record_atomic_max(&self.max_batch, batch);
+    }
+
+    #[cfg(feature = "load-bench")]
+    pub(super) fn record_command_kind(&self, kind: &'static str, elapsed_us: u64) {
+        self.record_command_kind_batch(kind, 1, elapsed_us);
+    }
+
+    #[cfg(feature = "load-bench")]
+    pub(super) fn record_command_kind_batch(
+        &self,
+        kind: &'static str,
+        count: usize,
+        elapsed_us: u64,
+    ) {
+        let mut stats = self
+            .command_kind_stats
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let entry = stats.entry(kind).or_default();
+        entry.count = entry
+            .count
+            .saturating_add(u64::try_from(count).unwrap_or(u64::MAX));
+        entry.total_us = entry.total_us.saturating_add(elapsed_us);
+        entry.max_us = entry.max_us.max(elapsed_us);
+    }
+
+    #[cfg(feature = "load-bench")]
+    fn reset_command_kind_stats(&self) {
+        self.command_kind_stats
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clear();
+    }
+
+    #[cfg(feature = "load-bench")]
+    fn command_kind_snapshot(&self) -> Vec<SimulationCommandKindSnapshot> {
+        let stats = self
+            .command_kind_stats
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let mut snapshot = stats
+            .iter()
+            .map(|(&kind, stat)| SimulationCommandKindSnapshot {
+                kind,
+                count: stat.count,
+                total_us: stat.total_us,
+                max_us: stat.max_us,
+            })
+            .collect::<Vec<_>>();
+        snapshot.sort_unstable_by_key(|stat| std::cmp::Reverse(stat.total_us));
+        snapshot
     }
 }
 
@@ -488,6 +560,16 @@ impl SimulationHandle {
 
     pub(crate) fn snapshot(&self) -> super::SimulationQueueSnapshot {
         self.metrics.snapshot()
+    }
+
+    #[cfg(feature = "load-bench")]
+    pub(crate) fn reset_command_kind_stats(&self) {
+        self.metrics.reset_command_kind_stats();
+    }
+
+    #[cfg(feature = "load-bench")]
+    pub(crate) fn command_kind_snapshot(&self) -> Vec<SimulationCommandKindSnapshot> {
+        self.metrics.command_kind_snapshot()
     }
 }
 

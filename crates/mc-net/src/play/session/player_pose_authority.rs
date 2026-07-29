@@ -1,6 +1,8 @@
 use std::collections::{HashMap, HashSet};
 
-use mc_entity::{EntityId, EntityKinematics, EntityLifecycle, EntitySnapshot, Vec3};
+use mc_entity::{
+    EntityId, EntityKinematics, EntityLifecycle, EntitySimulationProjection, EntitySnapshot, Vec3,
+};
 use mc_physics::entity_collision_26_1_2::{
     CrammingContact, EntityPushPairInput, TeamCollisionRule, TeamRelationship, apply_cramming_roll,
     vanilla_cramming_roll_request, vanilla_push_impulses, vanilla_pushable_by,
@@ -154,6 +156,20 @@ pub(super) fn accept_player_pose_locked(
         PLAYER_BODY_HALF_WIDTH + max_entity_half_width,
     )
     .into_iter()
+    .filter(|entity_id| {
+        inner
+            .published_entity_snapshots
+            .get(entity_id)
+            .filter(|entity| entity.health.is_none_or(|health| health > 0.0))
+            .filter(|entity| {
+                canonical_entity_facts(&entity.type_name)
+                    .is_some_and(|facts| facts.category.is_living())
+            })
+            .is_some_and(|entity| {
+                let aabb = entity_geometry(&entity.type_name, entity.animal).aabb;
+                player_aabb_intersects(pose, entity.position, aabb)
+            })
+    })
     .collect();
     Some(AcceptedPlayerPose {
         old_observers,
@@ -163,28 +179,35 @@ pub(super) fn accept_player_pose_locked(
     })
 }
 
-pub(super) fn plan_entities_from_player_locked(
+pub(super) fn player_contact_geometry_from_projections<'a>(
+    pose: PlayerPose,
+    projections: impl IntoIterator<Item = &'a EntitySimulationProjection>,
+) -> Vec<(EntityId, mc_physics::Aabb)> {
+    projections
+        .into_iter()
+        .filter(|entity| entity.lifecycle == EntityLifecycle::Alive)
+        .filter_map(|entity| {
+            canonical_entity_facts(&entity.type_name)
+                .filter(|facts| facts.category.is_living())
+                .map(|_| {
+                    (
+                        entity,
+                        entity_geometry(&entity.type_name, entity.animal).aabb,
+                    )
+                })
+        })
+        .filter(|(entity, aabb)| player_aabb_intersects(pose, entity.position, *aabb))
+        .map(|(entity, aabb)| (entity.id, aabb))
+        .collect()
+}
+
+pub(super) fn plan_entities_from_player_candidate_geometry_locked(
     entities: &EntityStoreGuard<'_>,
     pose: PlayerPose,
-    candidate_ids: &HashSet<EntityId>,
+    candidate_geometry: Vec<(EntityId, mc_physics::Aabb)>,
     context: Option<&PlayerContactContext>,
+    _visited_entities: u64,
 ) -> PlayerBodyPushes {
-    let mut candidate_geometry = Vec::new();
-    #[cfg(test)]
-    let mut visited_entities = 0_u64;
-    entities.visit_simulation_entities_for_ids(candidate_ids, |entity| {
-        #[cfg(test)]
-        {
-            visited_entities += 1;
-        }
-        if entity.lifecycle == EntityLifecycle::Alive
-            && canonical_entity_facts(entity.type_name)
-                .is_some_and(|facts| facts.category.is_living())
-        {
-            let aabb = entity_geometry(entity.type_name, entity.animal).aabb;
-            candidate_geometry.push((entity.id, aabb));
-        }
-    });
     let candidates = candidate_geometry
         .into_iter()
         .filter_map(|(entity_id, aabb)| {
@@ -200,7 +223,7 @@ pub(super) fn plan_entities_from_player_locked(
         mutations: std::mem::take(&mut plan.mutations),
         requirements: std::mem::take(&mut plan.requirements),
         #[cfg(test)]
-        visited_entities,
+        visited_entities: _visited_entities,
     }
 }
 

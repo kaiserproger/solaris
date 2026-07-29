@@ -867,21 +867,28 @@ impl EntityOwnerAccess {
         }
     }
 
+    pub(super) fn simulation_projections_for_ids(
+        &self,
+        ids: &HashSet<EntityId>,
+    ) -> Vec<mc_entity::EntitySimulationProjection> {
+        #[cfg(test)]
+        self.record_owner_request();
+        owner_result(self.handle.simulation_projections_for_ids(ids))
+    }
+
     pub(super) fn visit_simulation_entities_for_ids(
         &self,
         ids: &HashSet<EntityId>,
         mut visitor: impl FnMut(mc_entity::EntityView<'_>),
     ) {
         self.prefetch(ids);
-        let mut snapshots = {
-            let cache = self.snapshots.borrow();
-            ids.iter()
-                .filter_map(|id| cache.get(id).and_then(Clone::clone))
-                .collect::<Vec<_>>()
-        };
-        snapshots.sort_unstable_by_key(|snapshot| snapshot.id);
-        for snapshot in snapshots {
-            visitor(entity_snapshot_view(&snapshot));
+        let mut ordered_ids = ids.iter().copied().collect::<Vec<_>>();
+        ordered_ids.sort_unstable();
+        let cache = self.snapshots.borrow();
+        for id in ordered_ids {
+            if let Some(Some(snapshot)) = cache.get(&id) {
+                visitor(entity_snapshot_view(snapshot));
+            }
         }
     }
 

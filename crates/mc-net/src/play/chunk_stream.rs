@@ -1181,6 +1181,7 @@ impl ChunkStreamState {
         ));
         self.publish_active_generation();
         self.reset_window_metrics();
+        self.progress_notify.notify_one();
         unloads
     }
 
@@ -1232,6 +1233,7 @@ impl ChunkStreamState {
         ));
         self.publish_active_generation();
         self.reset_window_metrics();
+        self.progress_notify.notify_one();
         unloads
     }
 
@@ -1258,6 +1260,7 @@ impl ChunkStreamState {
         ));
         self.publish_active_generation();
         self.reset_window_metrics();
+        self.progress_notify.notify_one();
     }
 
     fn reset_window_metrics(&mut self) {
@@ -6371,6 +6374,54 @@ mod tests {
         assert_eq!(stream.emitted, 2);
         assert_eq!(stream.ready.len(), 1);
         assert_eq!(stream.last_stop_reason, ChunkPipelineStopReason::SendBudget);
+    }
+
+    #[tokio::test]
+    async fn center_replan_notifies_stalled_chunk_stream() {
+        let registry = Arc::new(BlockRegistry::from_report(&[]).expect("empty registry builds"));
+        let world = Arc::new(Mutex::new(WorldStorage::in_memory_with_capacity(
+            Arc::clone(&registry),
+            1,
+        )));
+        let mut stream = ChunkStreamState::new(
+            world,
+            Arc::new(test_biome_registry()),
+            registry,
+            None,
+            Arc::new(ItemRegistry::from_report(&[])),
+            Arc::new(TagsData::default()),
+            Arc::new(Vec::new()),
+            Arc::new(mc_data::block_entity_types::BlockEntityTypeRegistry::default()),
+            None,
+            Arc::new(Vec::new()),
+            Arc::new(Vec::new()),
+            Arc::new(Vec::new()),
+            Arc::new(mc_data::biomes::BiomeSpawnRules::default()),
+            Arc::new(mc_data::entity_types::solaris_required_entity_types()),
+            Compression::Disabled,
+            Arc::new(SessionRegistry::new()),
+            1,
+            0,
+            0,
+            0.0,
+            0,
+            ChunkPipelineResources::with_limits(1, 1),
+            ChunkPipelinePolicy::default(),
+        );
+        let notify = stream.progress_notify();
+        assert!(
+            tokio::time::timeout(Duration::from_millis(1), notify.notified())
+                .await
+                .is_err()
+        );
+        stream.last_stop_reason = ChunkPipelineStopReason::Complete;
+
+        stream.replan_center(1, 0, 0.0);
+
+        tokio::time::timeout(Duration::from_secs(1), notify.notified())
+            .await
+            .expect("replanned chunk stream must wake its play loop");
+        assert!(stream.scheduler.queued_len() > 0);
     }
 
     #[test]
