@@ -66,6 +66,7 @@ mod scheduled_hoppers;
 mod shield;
 mod stone_full_cube_collision;
 mod stonecutter;
+mod synthetic_slab_identity_collision;
 mod tall_narrow_fence_collision;
 mod toggle_planning;
 mod top_slab_collision;
@@ -2769,17 +2770,6 @@ async fn player_collision_does_not_apply_vanilla_shape_to_unrelated_overlapping_
     assert!(
         player_pose_collides_with_solid(Some(&state), PlayerPose::new(0.5, 64.5, 0.5)).await,
         "an unrelated synthetic solid keeps full-cube collision despite its overlapping state id"
-    );
-}
-
-#[tokio::test]
-async fn player_collision_rejects_minecraft_synthetic_slab_identity_on_overlapping_id() {
-    let (state, synthetic_slab) = minecraft_synthetic_slab_overlap_test_state();
-    set_collision_test_block(&state, synthetic_slab).await;
-
-    assert!(
-        player_pose_collides_with_solid(Some(&state), PlayerPose::new(0.5, 64.5, 0.5)).await,
-        "a synthetic Minecraft slab name must not inherit the overlapping vanilla slab shape"
     );
 }
 

@@ -303,6 +303,10 @@ not replace functional, package, workspace, or real-client gates.
    `play/tests/fake_farmland_identity_collision.rs`; its renamed canonical
    farmland/slab identities and full-cube collision are recorded in
    [`evidence/mc-net-fake-farmland-identity-test-extraction.md`](evidence/mc-net-fake-farmland-identity-test-extraction.md).
+   The following synthetic-Minecraft-slab identity test now lives in focused
+   `play/tests/synthetic_slab_identity_collision.rs`; its renamed slab identity,
+   retained state id/properties, and full-cube collision are recorded in
+   [`evidence/mc-net-synthetic-slab-identity-test-extraction.md`](evidence/mc-net-synthetic-slab-identity-test-extraction.md).
 4. [ ] Separate behavioral tests from structural tripwires. Structural checks may
    enforce crate ownership and dependency direction, but may not assert Rust
    statement order or source-text layout.
