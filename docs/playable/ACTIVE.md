@@ -23,14 +23,22 @@ replacement-readiness claims.
 ## Active Checkpoint
 
 Next autonomous goal checkpoint: route `playable`; mechanically move the
-`block_drop_builtin_short_grass_returns_wheat_seeds`
+`stale_container_updates_do_not_discard_another_open_container`
 test from aggregate `crates/mc-net/src/play/tests.rs` to a focused sibling
 module.
-Preserve its exact air/short-grass registry, wheat-seeds item protocol id `51`,
-default short-grass state, default loot table, runtime stack
-`ItemStack::new(51, 1)`, and production behavior. Leave the preceding
-`crop_test_registry` helper and following `fluid_block` helper
-aggregate-owned, and use explicit imports rather than a new `use super::*`.
+Preserve its exact furnace position `(1, 64, 1)`, chest position `(2, 64, 2)`,
+chest container id `7` surviving the stale furnace lookup, and furnace
+container id `8` with `FurnaceKind::Furnace` surviving the stale chest lookup,
+plus production behavior. Leave the preceding
+`pending_teleport_movement_guard_returns_false_without_pending_teleport` test
+and following `state` helper aggregate-owned, and use explicit imports rather
+than a new `use super::*`.
+
+The complete built-in short-grass drop test has moved to
+`crates/mc-net/src/play/tests/block_drop_short_grass.rs`. Its unchanged
+air/short-grass registry, wheat-seeds item protocol id, default short-grass
+state, default loot path, and runtime stack are recorded in
+[`../evidence/mc-net-block-drop-short-grass-test-extraction.md`](../evidence/mc-net-block-drop-short-grass-test-extraction.md).
 
 The complete configured block-loot count test has moved to
 `crates/mc-net/src/play/tests/block_drop_configured_loot.rs`. Its unchanged

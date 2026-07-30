@@ -326,6 +326,11 @@ not replace functional, package, workspace, or real-client gates.
    carrot item id, dirt loot mapping, fixed count, and resulting runtime stack
    are recorded in
    [`evidence/mc-net-block-drop-configured-loot-test-extraction.md`](evidence/mc-net-block-drop-configured-loot-test-extraction.md).
+   The following built-in short-grass drop test now lives in focused
+   `play/tests/block_drop_short_grass.rs`; its unchanged air/short-grass
+   registry, wheat-seeds item id, default loot path, and runtime stack are
+   recorded in
+   [`evidence/mc-net-block-drop-short-grass-test-extraction.md`](evidence/mc-net-block-drop-short-grass-test-extraction.md).
 4. [ ] Separate behavioral tests from structural tripwires. Structural checks may
    enforce crate ownership and dependency direction, but may not assert Rust
    statement order or source-text layout.

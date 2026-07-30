@@ -21,6 +21,7 @@ mod arrow_launch;
 mod attack_pvp;
 mod bed_sleep;
 mod block_drop_configured_loot;
+mod block_drop_short_grass;
 mod block_placement_nbt;
 mod block_placement_planning;
 mod block_resync;
@@ -2364,32 +2365,6 @@ fn attached_stem_block(first_id: u32, name: &str) -> BlockReport {
 
 fn crop_test_registry() -> mc_world::BlockRegistry {
     mc_world::BlockRegistry::from_report(&crop_test_reports()).unwrap()
-}
-
-#[test]
-fn block_drop_builtin_short_grass_returns_wheat_seeds() {
-    let blocks = mc_world::BlockRegistry::from_report(&[
-        simple_block(0, "minecraft:air"),
-        simple_block(1, "minecraft:short_grass"),
-    ])
-    .unwrap();
-    let items = ItemRegistry::from_report(&[ItemReport {
-        id: Identifier::parse("minecraft:wheat_seeds").unwrap(),
-        protocol_id: 51,
-    }]);
-    let short_grass = blocks
-        .block(&Identifier::parse("minecraft:short_grass").unwrap())
-        .unwrap()
-        .default;
-
-    let drops = block_drop_stacks_from(
-        &mc_data::loot::LootTables::default(),
-        &items,
-        &blocks,
-        short_grass,
-    );
-
-    assert_eq!(drops, vec![ItemStack::new(51, 1)]);
 }
 
 fn fluid_block(first_id: u32, name: &str, max_level: u8) -> BlockReport {
