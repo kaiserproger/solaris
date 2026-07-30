@@ -27,6 +27,7 @@ mod campfire_cooking;
 mod chest;
 mod container_inventory;
 mod container_safety;
+mod death_xp;
 mod debug_commands;
 mod door_toggles;
 mod enchanting_recipe_settlement;
@@ -3601,20 +3602,6 @@ fn use_item_on_preflight_rejects_out_of_reach_creative_and_allows_reachable_targ
         ),
         UseItemOnOutcome::PlaceBlock
     );
-}
-
-#[test]
-fn recoverable_death_xp_uses_level_cap() {
-    let mut xp = XpState {
-        total: 1_000,
-        level: 40,
-        ..XpState::default()
-    };
-
-    assert_eq!(recoverable_death_xp(&xp), 100);
-
-    xp.level = 3;
-    assert_eq!(recoverable_death_xp(&xp), 21);
 }
 
 #[test]

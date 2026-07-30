@@ -22,18 +22,19 @@ replacement-readiness claims.
 
 ## Active Checkpoint
 
-Next autonomous goal checkpoint: route `playable`; mechanically move the
-one-test recoverable-death experience cap class
-`recoverable_death_xp_uses_level_cap` out of aggregate
-`crates/mc-net/src/play/tests.rs` into a focused sibling module. Preserve the
-test and production behavior, leave the preceding
+Next autonomous goal checkpoint: route `playable`; mechanically move the full
+four-test use-item-on preflight class, including the `test_use_item_on` helper,
+beginning with `use_item_on_preflight_reports_dead_survival_player` and ending
+with
 `use_item_on_preflight_rejects_out_of_reach_creative_and_allows_reachable_targets`
-test in the aggregate file, and use explicit imports rather than a new
-`use super::*`. The complete three-test debug-command parsing, water-corridor
-fixture, and zero-count give execution class has already moved to
-`crates/mc-net/src/play/tests/debug_commands.rs`; its concentration and
-validation are recorded in
-[`../evidence/mc-net-debug-commands-test-extraction.md`](../evidence/mc-net-debug-commands-test-extraction.md).
+out of aggregate `crates/mc-net/src/play/tests.rs` into a focused sibling
+module. Preserve every test and production behavior, leave the preceding
+`loader_interaction_channel_is_claimed_before_extension_forwarding` test in
+the aggregate file, and use explicit imports rather than a new `use super::*`.
+The complete recoverable-death experience level-cap test has already moved to
+`crates/mc-net/src/play/tests/death_xp.rs`; its concentration and validation
+are recorded in
+[`../evidence/mc-net-death-xp-test-extraction.md`](../evidence/mc-net-death-xp-test-extraction.md).
 The owner-run subjective fresh-world seed-`712816` playtest and
 release-candidate performance gates remain queued at their declared
 boundaries.

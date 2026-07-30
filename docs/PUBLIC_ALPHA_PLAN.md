@@ -182,6 +182,10 @@ not replace functional, package, workspace, or real-client gates.
    `play/tests/debug_commands.rs`; its preserved command validation, fixture,
    inventory-clear, and publication coverage is recorded in
    [`evidence/mc-net-debug-commands-test-extraction.md`](evidence/mc-net-debug-commands-test-extraction.md).
+   The following recoverable-death experience level-cap test now lives in
+   focused `play/tests/death_xp.rs`; its preserved high- and low-level cap
+   coverage is recorded in
+   [`evidence/mc-net-death-xp-test-extraction.md`](evidence/mc-net-death-xp-test-extraction.md).
 4. [ ] Separate behavioral tests from structural tripwires. Structural checks may
    enforce crate ownership and dependency direction, but may not assert Rust
    statement order or source-text layout.
