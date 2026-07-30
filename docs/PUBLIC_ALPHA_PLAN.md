@@ -307,6 +307,10 @@ not replace functional, package, workspace, or real-client gates.
    `play/tests/synthetic_slab_identity_collision.rs`; its renamed slab identity,
    retained state id/properties, and full-cube collision are recorded in
    [`evidence/mc-net-synthetic-slab-identity-test-extraction.md`](evidence/mc-net-synthetic-slab-identity-test-extraction.md).
+   The following unrelated overlapping-state test now lives in focused
+   `play/tests/unrelated_state_collision.rs`; its covered numeric state id,
+   mismatched synthetic identity, and retained full-cube collision are recorded
+   in [`evidence/mc-net-unrelated-state-collision-test-extraction.md`](evidence/mc-net-unrelated-state-collision-test-extraction.md).
 4. [ ] Separate behavioral tests from structural tripwires. Structural checks may
    enforce crate ownership and dependency direction, but may not assert Rust
    statement order or source-text layout.

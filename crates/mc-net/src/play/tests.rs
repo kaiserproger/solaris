@@ -71,6 +71,7 @@ mod tall_narrow_fence_collision;
 mod toggle_planning;
 mod top_slab_collision;
 mod torch_campfire_collision;
+mod unrelated_state_collision;
 mod use_item_on_preflight;
 mod wrong_property_slab_collision;
 
@@ -2754,23 +2755,6 @@ fn low_id_exact_farmland_test_state() -> (InteractionState, BlockStateId) {
         interaction_state_for_blocks(Arc::new(blocks)),
         BlockStateId(1),
     )
-}
-
-#[tokio::test]
-async fn player_collision_does_not_apply_vanilla_shape_to_unrelated_overlapping_state_id() {
-    let (state, synthetic_solid) = synthetic_collision_overlap_test_state();
-    assert!(
-        mc_data::collision_shapes::vanilla_collision_shapes()
-            .get(synthetic_solid.0)
-            .is_some(),
-        "the synthetic state must overlap a covered vanilla state id"
-    );
-    set_collision_test_block(&state, synthetic_solid).await;
-
-    assert!(
-        player_pose_collides_with_solid(Some(&state), PlayerPose::new(0.5, 64.5, 0.5)).await,
-        "an unrelated synthetic solid keeps full-cube collision despite its overlapping state id"
-    );
 }
 
 fn button_test_registry() -> mc_world::BlockRegistry {

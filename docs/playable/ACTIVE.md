@@ -23,16 +23,22 @@ replacement-readiness claims.
 ## Active Checkpoint
 
 Next autonomous goal checkpoint: route `playable`; mechanically move the
-`player_collision_does_not_apply_vanilla_shape_to_unrelated_overlapping_state_id`
+`collision_correction_still_rejects_entry_from_free_space_into_solid`
 test from aggregate `crates/mc-net/src/play/tests.rs` to a focused sibling
 module.
-Preserve its exact synthetic-solid helper: rename the dry bottom-slab block to
-`solaris:synthetic_solid` while retaining its slab state id and properties;
-preserve the assertion that the numeric state id overlaps the vanilla shape
-table and the `(0.5, 64.5, 0.5)` full-cube collision. Leave the preceding
-`low_id_exact_farmland_test_state` helper and following `button_test_registry`
-helper aggregate-owned, preserve production behavior, and use explicit imports
-rather than a new `use super::*`.
+Preserve its exact block fixture at `(0, 64, 0)`, old free pose
+`(1.50, 64.0, 0.50)`, new colliding pose `(0.50, 64.0, 0.50)`, teleport id
+transition `2 -> 3`, single position-sync packet, pending teleport id `2`, and
+production behavior. Leave the preceding
+`collision_correction_does_not_teleport_back_into_existing_solid_overlap` test
+and following `vanilla_collision_test_state` helper aggregate-owned, and use
+explicit imports rather than a new `use super::*`.
+
+The complete unrelated overlapping-state collision test has moved to
+`crates/mc-net/src/play/tests/unrelated_state_collision.rs`. Its unchanged
+synthetic-solid fixture, covered numeric state id, mismatched identity,
+full-cube collision, and published collision-context coverage are recorded in
+[`../evidence/mc-net-unrelated-state-collision-test-extraction.md`](../evidence/mc-net-unrelated-state-collision-test-extraction.md).
 
 The complete synthetic-Minecraft-slab identity test has moved to
 `crates/mc-net/src/play/tests/synthetic_slab_identity_collision.rs`. Its
