@@ -22,19 +22,19 @@ replacement-readiness claims.
 
 ## Active Checkpoint
 
-Next autonomous goal checkpoint: route `playable`; mechanically move the
-contiguous two-test block-resync class beginning with
-`rejected_visible_block_edit_resyncs_authoritative_cached_state` and ending
-with `rejected_use_item_on_resync_does_not_wait_for_world_writer` out of
-aggregate `crates/mc-net/src/play/tests.rs` into a focused sibling module.
+Next autonomous goal checkpoint: route `playable`; mechanically move the full
+fourteen-test furnace class beginning with
+`furnace_window_swap_and_throw_mutate_menu_slots` and ending with
+`stale_furnace_click_after_peer_mutation_resyncs_without_mutating_storage` out
+of aggregate `crates/mc-net/src/play/tests.rs` into a focused sibling module.
 Preserve every test and production behavior, leave the preceding shared
-`register_interaction_player` helper and following `shield_item_state` helper
-in the aggregate file, and use explicit imports rather than a new
-`use super::*`. The complete five-test enchanting projection and recipe
-settlement class has already moved to
-`crates/mc-net/src/play/tests/enchanting_recipe_settlement.rs`; its
-concentration and validation are recorded in
-[`../evidence/mc-net-enchanting-recipe-settlement-test-extraction.md`](../evidence/mc-net-enchanting-recipe-settlement-test-extraction.md).
+`decode_player_position_sync_packets` helper and following
+`chest_window_swap_and_throw_mutate_storage_slots` test in the aggregate file,
+and use explicit imports rather than a new `use super::*`. The complete
+two-test authoritative block-resync class has already moved to
+`crates/mc-net/src/play/tests/block_resync.rs`; its concentration and
+validation are recorded in
+[`../evidence/mc-net-block-resync-test-extraction.md`](../evidence/mc-net-block-resync-test-extraction.md).
 The owner-run subjective fresh-world seed-`712816` playtest and
 release-candidate performance gates remain queued at their declared
 boundaries.

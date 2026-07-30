@@ -112,6 +112,11 @@ not replace functional, package, workspace, or real-client gates.
    fail-closed settlement, bounded max-craft, owner-commit, and script-event
    coverage is recorded in
    [`evidence/mc-net-enchanting-recipe-settlement-test-extraction.md`](evidence/mc-net-enchanting-recipe-settlement-test-extraction.md).
+   The following two-test authoritative block-resync class now lives in
+   focused `play/tests/block_resync.rs`; its cached-state publication,
+   world-writer independence, exact block-update, and acknowledgement coverage
+   is recorded in
+   [`evidence/mc-net-block-resync-test-extraction.md`](evidence/mc-net-block-resync-test-extraction.md).
 4. [ ] Separate behavioral tests from structural tripwires. Structural checks may
    enforce crate ownership and dependency direction, but may not assert Rust
    statement order or source-text layout.
