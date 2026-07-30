@@ -263,6 +263,10 @@ not replace functional, package, workspace, or real-client gates.
    `play/tests/torch_campfire_collision.rs`; its empty-torch, exact campfire
    state, and `7/16`-block top-boundary coverage is recorded in
    [`evidence/mc-net-torch-campfire-collision-test-extraction.md`](evidence/mc-net-torch-campfire-collision-test-extraction.md).
+   The following exact-stone full-cube test now lives in focused
+   `play/tests/stone_full_cube_collision.rs`; its vanilla state identity,
+   published block, center pose, and full-cube coverage is recorded in
+   [`evidence/mc-net-stone-full-cube-collision-test-extraction.md`](evidence/mc-net-stone-full-cube-collision-test-extraction.md).
 4. [ ] Separate behavioral tests from structural tripwires. Structural checks may
    enforce crate ownership and dependency direction, but may not assert Rust
    statement order or source-text layout.

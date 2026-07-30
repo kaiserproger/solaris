@@ -23,13 +23,20 @@ replacement-readiness claims.
 ## Active Checkpoint
 
 Next autonomous goal checkpoint: route `playable`; mechanically move the
-`player_collision_uses_exact_full_cube_shape_for_stone` test out of
+`player_collision_scans_fence_below_at_deflated_top_boundary` test out of
 aggregate `crates/mc-net/src/play/tests.rs` into a focused sibling module.
-Preserve its exact vanilla stone identity, full-cube collision, center pose,
-and published collision-context coverage and production behavior, leave the
-preceding `player_collision_scans_fence_below_at_deflated_top_boundary` test
-and following `button_test_registry` helper aggregate-owned, and use explicit
-imports rather than a new `use super::*`.
+Preserve its isolated-fence state, oracle `1.0e-5_f32` deflation, both sides
+of the deflated `1.5`-block top boundary, minimum-Y scan coverage, and
+production behavior, leave the preceding
+`player_collision_uses_tall_narrow_fence_box` test and following
+`button_test_registry` helper aggregate-owned, and use explicit imports rather
+than a new `use super::*`.
+
+The complete exact-stone full-cube test has moved to
+`crates/mc-net/src/play/tests/stone_full_cube_collision.rs`. Its exact vanilla
+state identity, published block, center pose, full-cube collision, and
+published collision-context coverage is recorded in
+[`../evidence/mc-net-stone-full-cube-collision-test-extraction.md`](../evidence/mc-net-stone-full-cube-collision-test-extraction.md).
 
 The complete torch/campfire exact-shape test has moved to
 `crates/mc-net/src/play/tests/torch_campfire_collision.rs`. Its empty torch
