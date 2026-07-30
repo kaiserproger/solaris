@@ -5522,18 +5522,25 @@ mod tests {
             .unwrap();
         let request = ScriptPluginStorageGetRequest::try_new("read", "balance").unwrap();
         let result = ScriptEvent::plugin_storage_get_result("shop", &request, None, None).unwrap();
+        use std::future::Future;
+        use std::pin::Pin;
+        use std::task::{Context, Poll, Waker};
 
-        let delivery = tokio::spawn({
-            let boundary = boundary.clone();
-            async move { boundary.enqueue_targeted_event(result).await }
-        });
-        tokio::task::yield_now().await;
-        assert!(!delivery.is_finished());
+        let mut delivery = Box::pin(boundary.enqueue_targeted_event(result));
+        let waker = Waker::noop();
+        let mut cx = Context::from_waker(waker);
+        assert!(matches!(
+            Future::poll(Pin::as_mut(&mut delivery), &mut cx),
+            Poll::Pending
+        ));
 
         assert!(
             matches!(endpoint.recv_event().await, Some(event) if event.event_name() == "server.started")
         );
-        delivery.await.unwrap().unwrap();
+        assert!(matches!(
+            Future::poll(Pin::as_mut(&mut delivery), &mut cx),
+            Poll::Ready(Ok(()))
+        ));
         assert!(
             matches!(endpoint.recv_event().await, Some(event) if event.event_name() == "plugin.storage.get_result")
         );
