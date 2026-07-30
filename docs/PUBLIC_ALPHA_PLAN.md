@@ -393,6 +393,11 @@ not replace functional, package, workspace, or real-client gates.
    pose/respawn and play-loop arguments, timeout, and clean-close expectations
    are recorded in
    [`evidence/mc-net-outbound-channel-close-test-extraction.md`](evidence/mc-net-outbound-channel-close-test-extraction.md).
+   The following direct-response write-stall play-loop test now lives in
+   focused `play/tests/direct_response_write_stall.rs`; its command packet
+   encoding, stall fixtures, exact play-loop arguments and expectations, and
+   timeout counter are recorded in
+   [`evidence/mc-net-direct-response-write-stall-test-extraction.md`](evidence/mc-net-direct-response-write-stall-test-extraction.md).
 4. [ ] Separate behavioral tests from structural tripwires. Structural checks may
    enforce crate ownership and dependency direction, but may not assert Rust
    statement order or source-text layout.

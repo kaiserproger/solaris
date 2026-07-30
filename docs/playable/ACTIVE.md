@@ -23,18 +23,25 @@ replacement-readiness claims.
 ## Active Checkpoint
 
 Next autonomous goal checkpoint: route `playable`; mechanically move the
-`play_loop_closes_session_when_direct_response_write_stalls` test from
-aggregate `crates/mc-net/src/play/tests.rs` to a focused sibling module.
-Preserve the 256-byte duplex client/reader, command-suggestion id `7` and
-`"/"` command, packet body/frame encoding and client write, three-write
-`AllowThenStallWriter`, buffer, session/simulation fixtures and starting
-write-timeout count, slow-client config, capacity-one outbound channel, exact
-pose and overworld survival respawn, 250 ms timeout, complete `play_loop`
-argument list with both `"DirectWriter"` names, exact timeout and clean-close
-expectations, and final `start_timeouts + 1` assertion. Leave the preceding
-`play_loop_closes_session_when_outbound_write_stalls` test and following
-`state` helper aggregate-owned, and use explicit imports rather than a new
-`use super::*`.
+`play_loop_closes_session_when_outbound_write_stalls` test from aggregate
+`crates/mc-net/src/play/tests.rs` to a focused sibling module. Preserve the
+64-byte duplex reader, three-write `AllowThenStallWriter`, buffer,
+session/simulation fixtures and starting write-timeout count, slow-client
+config, capacity-one outbound channel, `AnimatePlayer { entity_id: 1 }`
+`try_send` and exact expectation, exact pose and overworld survival respawn,
+250 ms timeout, complete `play_loop` argument list with both `"SlowWriter"`
+names, exact timeout and clean-close expectations, and final
+`start_timeouts + 1` assertion. Leave the preceding
+`enchanting_button_commits_xp_through_owner_before_mutating_table_inputs` test
+and following `state` helper aggregate-owned, and use explicit imports rather
+than a new `use super::*`.
+
+The complete direct-response write-stall play-loop test has moved to
+`crates/mc-net/src/play/tests/direct_response_write_stall.rs`. Its unchanged
+command-suggestion encoding and client write, stall fixtures, exact
+pose/respawn and play-loop arguments, expectations, and timeout counter are
+recorded in
+[`../evidence/mc-net-direct-response-write-stall-test-extraction.md`](../evidence/mc-net-direct-response-write-stall-test-extraction.md).
 
 The complete closed-outbound-channel play-loop test has moved to
 `crates/mc-net/src/play/tests/outbound_channel_close.rs`. Its unchanged dropped
