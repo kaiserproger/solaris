@@ -413,6 +413,11 @@ not replace functional, package, workspace, or real-client gates.
    midpoint-clearance, partial-clearance, and fifteen-shelf cap assertions are
    recorded in
    [`evidence/mc-net-enchanting-bookshelf-geometry-test-extraction.md`](evidence/mc-net-enchanting-bookshelf-geometry-test-extraction.md).
+   The following held-sharpness damage test now lives in focused
+   `play/tests/held_sharpness_damage.rs`; its exact stone-sword, level-three
+   sharpness, base attack, and held enchanted attack assertions are recorded
+   in
+   [`evidence/mc-net-held-sharpness-damage-test-extraction.md`](evidence/mc-net-held-sharpness-damage-test-extraction.md).
 4. [ ] Separate behavioral tests from structural tripwires. Structural checks may
    enforce crate ownership and dependency direction, but may not assert Rust
    statement order or source-text layout.

@@ -23,16 +23,24 @@ replacement-readiness claims.
 ## Active Checkpoint
 
 Next autonomous goal checkpoint: route `playable`; mechanically move the
-`held_sharpness_uses_the_vanilla_26_1_2_damage_formula`
+`fifteen_bookshelves_expose_and_apply_protection_to_armor`
 test from aggregate `crates/mc-net/src/play/tests.rs` to a focused sibling
-module. Preserve the Solaris-required item registry and stone-sword id,
-interaction state built from the fluid test registry, assigned item registry,
-hotbar stack enchanted with `minecraft:sharpness` level `3`, base stone-sword
-attack damage equal to `5.0`, and held enchanted attack damage equal to `7.0`.
-Leave the preceding
-`fifteen_bookshelves_expose_and_apply_protection_to_armor` test and following
+module. Preserve the Solaris-required items and item-facts registries;
+iron-chestplate and lapis ids; `minecraft:protection` id and registry clue;
+window id/position and chestplate input; XP level `30`, progress `0.25`, total
+`1_395`, and seed `123`; the exact fifteen-bookshelf values `(0, 1)`, `(1, 10)`,
+`(2, 30)`, `(3, 123)`, `(4..=6, protection clue)`, `(7, 1)`, `(8, 2)`, and
+`(9, 3)`; candidate application from `enchanting_offer(15, 2)`; protection
+level `3`; empty lapis input; and final XP level `27`. Leave the preceding
+`fifteen_bookshelves_expose_and_apply_sharpness_to_swords` test and following
 `state` helper aggregate-owned, and use explicit imports rather than a new
 `use super::*`.
+
+The complete held-sharpness damage test has moved to
+`crates/mc-net/src/play/tests/held_sharpness_damage.rs`. Its unchanged item
+registry, stone-sword and level-three sharpness fixtures, base `5.0` attack,
+and held `7.0` enchanted attack are recorded in
+[`../evidence/mc-net-held-sharpness-damage-test-extraction.md`](../evidence/mc-net-held-sharpness-damage-test-extraction.md).
 
 The complete enchanting bookshelf-geometry test has moved to
 `crates/mc-net/src/play/tests/enchanting_bookshelf_geometry.rs`. Its unchanged
