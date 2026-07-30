@@ -295,6 +295,10 @@ not replace functional, package, workspace, or real-client gates.
    `play/tests/farmland_fallback_collision.rs`; its minimal farmland fixture,
    `15/16` top boundary, and overlapping pose are recorded in
    [`evidence/mc-net-farmland-fallback-collision-test-extraction.md`](evidence/mc-net-farmland-fallback-collision-test-extraction.md).
+   The following wrong-property slab-identity test now lives in focused
+   `play/tests/wrong_property_slab_collision.rs`; its canonical name/id,
+   altered ordered property, and full-cube collision are recorded in
+   [`evidence/mc-net-wrong-property-slab-collision-test-extraction.md`](evidence/mc-net-wrong-property-slab-collision-test-extraction.md).
 4. [ ] Separate behavioral tests from structural tripwires. Structural checks may
    enforce crate ownership and dependency direction, but may not assert Rust
    statement order or source-text layout.

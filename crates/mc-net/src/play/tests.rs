@@ -70,6 +70,7 @@ mod toggle_planning;
 mod top_slab_collision;
 mod torch_campfire_collision;
 mod use_item_on_preflight;
+mod wrong_property_slab_collision;
 
 use stonecutter::{stonecutter_test_items, stonecutter_test_recipe};
 use use_item_on_preflight::test_use_item_on;
@@ -2789,17 +2790,6 @@ async fn player_collision_rejects_fake_farmland_identity_on_overlapping_slab_id(
     assert!(
         player_pose_collides_with_solid(Some(&state), PlayerPose::new(0.5, 64.5, 0.5)).await,
         "fake farmland properties must neither inherit the slab table shape nor farmland height"
-    );
-}
-
-#[tokio::test]
-async fn player_collision_rejects_wrong_properties_under_canonical_slab_name_and_id() {
-    let (state, altered_slab) = wrong_property_slab_overlap_test_state();
-    set_collision_test_block(&state, altered_slab).await;
-
-    assert!(
-        player_pose_collides_with_solid(Some(&state), PlayerPose::new(0.5, 64.5, 0.5)).await,
-        "a canonical name and numeric id are insufficient when ordered properties differ"
     );
 }
 

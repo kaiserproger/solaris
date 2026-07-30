@@ -23,15 +23,24 @@ replacement-readiness claims.
 ## Active Checkpoint
 
 Next autonomous goal checkpoint: route `playable`; mechanically move the
-`player_collision_rejects_wrong_properties_under_canonical_slab_name_and_id`
+`player_collision_rejects_fake_farmland_identity_on_overlapping_slab_id`
 test from aggregate `crates/mc-net/src/play/tests.rs` to a focused sibling
 module.
-Preserve its exact altered-slab helper, canonical stone-slab name and numeric
-state id with the ordered `type=synthetic` property mismatch, the
-`(0.5, 64.5, 0.5)` colliding pose, and production behavior. Leave the preceding
-`player_collision_rejects_fake_farmland_identity_on_overlapping_slab_id` test
-and following `button_test_registry` helper aggregate-owned, and use explicit
-imports rather than a new `use super::*`.
+Preserve its exact fake-farmland helper: rename canonical farmland to
+`solaris:canonical_farmland`, rename the dry bottom-slab block to
+`minecraft:farmland` while retaining its slab state id and properties, and
+preserve the `(0.5, 64.5, 0.5)` colliding pose and production behavior. Leave
+the preceding
+`player_collision_rejects_minecraft_synthetic_slab_identity_on_overlapping_id`
+test and following `button_test_registry` helper aggregate-owned, and use
+explicit imports rather than a new `use super::*`.
+
+The complete wrong-property slab-identity test has moved to
+`crates/mc-net/src/play/tests/wrong_property_slab_collision.rs`. Its unchanged
+altered-slab fixture, canonical block name and numeric id, ordered
+`type=synthetic` mismatch, full-cube collision, and published collision-context
+coverage are recorded in
+[`../evidence/mc-net-wrong-property-slab-collision-test-extraction.md`](../evidence/mc-net-wrong-property-slab-collision-test-extraction.md).
 
 The complete exact low-id farmland-fallback test has moved to
 `crates/mc-net/src/play/tests/farmland_fallback_collision.rs`. Its unchanged
