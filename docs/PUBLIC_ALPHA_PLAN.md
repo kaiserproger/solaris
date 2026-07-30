@@ -299,6 +299,10 @@ not replace functional, package, workspace, or real-client gates.
    `play/tests/wrong_property_slab_collision.rs`; its canonical name/id,
    altered ordered property, and full-cube collision are recorded in
    [`evidence/mc-net-wrong-property-slab-collision-test-extraction.md`](evidence/mc-net-wrong-property-slab-collision-test-extraction.md).
+   The following fake-farmland identity test now lives in focused
+   `play/tests/fake_farmland_identity_collision.rs`; its renamed canonical
+   farmland/slab identities and full-cube collision are recorded in
+   [`evidence/mc-net-fake-farmland-identity-test-extraction.md`](evidence/mc-net-fake-farmland-identity-test-extraction.md).
 4. [ ] Separate behavioral tests from structural tripwires. Structural checks may
    enforce crate ownership and dependency direction, but may not assert Rust
    statement order or source-text layout.

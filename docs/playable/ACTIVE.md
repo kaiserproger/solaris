@@ -23,17 +23,23 @@ replacement-readiness claims.
 ## Active Checkpoint
 
 Next autonomous goal checkpoint: route `playable`; mechanically move the
-`player_collision_rejects_fake_farmland_identity_on_overlapping_slab_id`
+`player_collision_rejects_minecraft_synthetic_slab_identity_on_overlapping_id`
 test from aggregate `crates/mc-net/src/play/tests.rs` to a focused sibling
 module.
-Preserve its exact fake-farmland helper: rename canonical farmland to
-`solaris:canonical_farmland`, rename the dry bottom-slab block to
-`minecraft:farmland` while retaining its slab state id and properties, and
-preserve the `(0.5, 64.5, 0.5)` colliding pose and production behavior. Leave
-the preceding
-`player_collision_rejects_minecraft_synthetic_slab_identity_on_overlapping_id`
+Preserve its exact synthetic-slab helper: rename the dry bottom-slab block to
+`minecraft:synthetic_slab` while retaining its slab state id and properties,
+and preserve the `(0.5, 64.5, 0.5)` colliding pose and production behavior.
+Leave the preceding
+`player_collision_does_not_apply_vanilla_shape_to_unrelated_overlapping_state_id`
 test and following `button_test_registry` helper aggregate-owned, and use
 explicit imports rather than a new `use super::*`.
+
+The complete fake-farmland identity test has moved to
+`crates/mc-net/src/play/tests/fake_farmland_identity_collision.rs`. Its
+unchanged fixture, renamed canonical farmland and slab identities, retained
+slab state id/properties, full-cube collision, and published collision-context
+coverage are recorded in
+[`../evidence/mc-net-fake-farmland-identity-test-extraction.md`](../evidence/mc-net-fake-farmland-identity-test-extraction.md).
 
 The complete wrong-property slab-identity test has moved to
 `crates/mc-net/src/play/tests/wrong_property_slab_collision.rs`. Its unchanged
