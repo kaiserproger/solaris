@@ -186,6 +186,11 @@ not replace functional, package, workspace, or real-client gates.
    focused `play/tests/death_xp.rs`; its preserved high- and low-level cap
    coverage is recorded in
    [`evidence/mc-net-death-xp-test-extraction.md`](evidence/mc-net-death-xp-test-extraction.md).
+   The following four-test use-item-on preflight class now lives in focused
+   `play/tests/use_item_on_preflight.rs`; its preserved dead-player,
+   unsupported-mode, survival-reach, and creative-reach coverage is recorded
+   in
+   [`evidence/mc-net-use-item-on-preflight-test-extraction.md`](evidence/mc-net-use-item-on-preflight-test-extraction.md).
 4. [ ] Separate behavioral tests from structural tripwires. Structural checks may
    enforce crate ownership and dependency direction, but may not assert Rust
    statement order or source-text layout.

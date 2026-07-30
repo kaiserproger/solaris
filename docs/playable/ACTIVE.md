@@ -22,15 +22,21 @@ replacement-readiness claims.
 
 ## Active Checkpoint
 
-Next autonomous goal checkpoint: route `playable`; mechanically move the full
-four-test use-item-on preflight class, including the `test_use_item_on` helper,
-beginning with `use_item_on_preflight_reports_dead_survival_player` and ending
-with
-`use_item_on_preflight_rejects_out_of_reach_creative_and_allows_reachable_targets`
-out of aggregate `crates/mc-net/src/play/tests.rs` into a focused sibling
-module. Preserve every test and production behavior, leave the preceding
-`loader_interaction_channel_is_claimed_before_extension_forwarding` test in
-the aggregate file, and use explicit imports rather than a new `use super::*`.
+Next autonomous goal checkpoint: route `playable`; mechanically move the
+ignored local-sidecar parity test
+`real_door_states_plan_hand_toggle_when_sidecar_is_present` out of aggregate
+`crates/mc-net/src/play/tests.rs` into a focused sibling module. Preserve its
+explicit ignore contract, assertions, and production behavior, leave the
+preceding `loader_interaction_channel_is_claimed_before_extension_forwarding`
+test and following `button_test_registry` helper aggregate-owned, and use
+explicit imports rather than a new `use super::*`.
+
+The complete four-test use-item-on preflight class, including its
+`test_use_item_on` helper, has moved to
+`crates/mc-net/src/play/tests/use_item_on_preflight.rs`. Its dead-player,
+unsupported-mode, survival-reach, creative-reach, and reachable-target
+coverage is recorded in
+[`../evidence/mc-net-use-item-on-preflight-test-extraction.md`](../evidence/mc-net-use-item-on-preflight-test-extraction.md).
 The complete recoverable-death experience level-cap test has already moved to
 `crates/mc-net/src/play/tests/death_xp.rs`; its concentration and validation
 are recorded in
