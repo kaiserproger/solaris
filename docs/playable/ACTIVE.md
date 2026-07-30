@@ -23,18 +23,24 @@ replacement-readiness claims.
 ## Active Checkpoint
 
 Next autonomous goal checkpoint: route `playable`; mechanically move the
-`fifteen_bookshelves_expose_and_apply_protection_to_armor`
+`fifteen_bookshelves_expose_and_apply_sharpness_to_swords`
 test from aggregate `crates/mc-net/src/play/tests.rs` to a focused sibling
 module. Preserve the Solaris-required items and item-facts registries;
-iron-chestplate and lapis ids; `minecraft:protection` id and registry clue;
-window id/position and chestplate input; XP level `30`, progress `0.25`, total
-`1_395`, and seed `123`; the exact fifteen-bookshelf values `(0, 1)`, `(1, 10)`,
-`(2, 30)`, `(3, 123)`, `(4..=6, protection clue)`, `(7, 1)`, `(8, 2)`, and
-`(9, 3)`; candidate application from `enchanting_offer(15, 2)`; protection
-level `3`; empty lapis input; and final XP level `27`. Leave the preceding
-`fifteen_bookshelves_expose_and_apply_sharpness_to_swords` test and following
-`state` helper aggregate-owned, and use explicit imports rather than a new
-`use super::*`.
+stone-sword and lapis ids; `minecraft:sharpness` id and registry clue; window
+id/position and sword input; XP level `30`, progress `0.25`, total `1_395`, and
+seed `123`; the exact fifteen-bookshelf values `(0, 1)`, `(1, 10)`, `(2, 30)`,
+`(3, 123)`, `(4..=6, sharpness clue)`, `(7, 1)`, `(8, 2)`, and `(9, 3)`;
+candidate application from `enchanting_offer(15, 2)`; sharpness level `3`;
+empty lapis input; and final XP level `27`. Leave the preceding
+`fifteen_bookshelves_keep_efficiency_as_the_first_pickaxe_offer` test and
+following `state` helper aggregate-owned, and use explicit imports rather than
+a new `use super::*`.
+
+The complete fifteen-bookshelf protection test has moved to
+`crates/mc-net/src/play/tests/enchanting_protection.rs`. Its unchanged
+registries, chestplate/lapis ids, protection clue and data values, slot-two
+offer result, consumed lapis, and final XP are recorded in
+[`../evidence/mc-net-enchanting-protection-test-extraction.md`](../evidence/mc-net-enchanting-protection-test-extraction.md).
 
 The complete held-sharpness damage test has moved to
 `crates/mc-net/src/play/tests/held_sharpness_damage.rs`. Its unchanged item

@@ -418,6 +418,11 @@ not replace functional, package, workspace, or real-client gates.
    sharpness, base attack, and held enchanted attack assertions are recorded
    in
    [`evidence/mc-net-held-sharpness-damage-test-extraction.md`](evidence/mc-net-held-sharpness-damage-test-extraction.md).
+   The following fifteen-bookshelf protection test now lives in focused
+   `play/tests/enchanting_protection.rs`; its exact registries, protection
+   clue, offer data, applied enchantment, lapis consumption, and XP result are
+   recorded in
+   [`evidence/mc-net-enchanting-protection-test-extraction.md`](evidence/mc-net-enchanting-protection-test-extraction.md).
 4. [ ] Separate behavioral tests from structural tripwires. Structural checks may
    enforce crate ownership and dependency direction, but may not assert Rust
    statement order or source-text layout.
