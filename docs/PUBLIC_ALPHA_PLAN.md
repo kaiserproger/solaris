@@ -275,6 +275,10 @@ not replace functional, package, workspace, or real-client gates.
    `play/tests/tall_narrow_fence_collision.rs`; its exact fence state, empty
    side space, and `1.5`-block collision-height coverage is recorded in
    [`evidence/mc-net-tall-narrow-fence-collision-test-extraction.md`](evidence/mc-net-tall-narrow-fence-collision-test-extraction.md).
+   The following oriented-stair collision test now lives in focused
+   `play/tests/oriented_stair_collision.rs`; its exact north-facing bottom
+   state and occupied/empty stair-half coverage is recorded in
+   [`evidence/mc-net-oriented-stair-collision-test-extraction.md`](evidence/mc-net-oriented-stair-collision-test-extraction.md).
 4. [ ] Separate behavioral tests from structural tripwires. Structural checks may
    enforce crate ownership and dependency direction, but may not assert Rust
    statement order or source-text layout.
