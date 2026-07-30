@@ -1080,45 +1080,36 @@ mod tests {
 
     // ---- real-world chunk smoke test ----
     //
-    // Skipped silently when the test world is absent (same pattern as
-    // M2's round-trip oracle).
+    // Explicitly opt-in because the test world and Mojang sidecars are
+    // local artifacts.
 
     #[test]
+    #[ignore = "requires local .analysis/test-world and 26.1.2 data sidecars"]
     fn encodes_real_test_world_chunk_zero_zero() {
         use crate::WorldStorage;
         use std::path::PathBuf;
 
         let world_dir =
             PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../.analysis/test-world");
-        if !world_dir.exists() {
-            eprintln!(
-                "skipping: {} missing (run tools/generate-test-world.sh)",
-                world_dir.display()
-            );
-            return;
-        }
+        assert!(
+            world_dir.exists(),
+            "{} missing; run tools/generate-test-world.sh",
+            world_dir.display()
+        );
 
         let report_path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
             .join("../../data/vanilla/reports/blocks.json");
-        if !report_path.exists() {
-            eprintln!(
-                "skipping: {} missing (run tools/extract-vanilla-data.sh --reports)",
-                report_path.display()
-            );
-            return;
-        }
+        assert!(
+            report_path.exists(),
+            "{} missing; run tools/extract-vanilla-data.sh --reports",
+            report_path.display()
+        );
         let report = mc_data::blocks::load_blocks_report(&report_path).expect("blocks.json loads");
         let registry = std::sync::Arc::new(
             crate::BlockRegistry::from_report(&report).expect("block registry builds"),
         );
 
-        let mut storage = match WorldStorage::open(&world_dir, std::sync::Arc::clone(&registry)) {
-            Ok(storage) => storage,
-            Err(err) => {
-                eprintln!("skipping: {} ({err})", world_dir.display());
-                return;
-            }
-        };
+        let mut storage = WorldStorage::open(&world_dir, std::sync::Arc::clone(&registry)).unwrap();
         let chunk = storage
             .get_chunk(ChunkPos { x: 0, z: 0 })
             .expect("chunk (0,0) reads without error")
@@ -1126,13 +1117,7 @@ mod tests {
             .clone();
 
         let data_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../data/vanilla");
-        let data = match mc_data::load(&data_dir) {
-            Ok(data) => data,
-            Err(err) => {
-                eprintln!("skipping: {} ({err})", data_dir.display());
-                return;
-            }
-        };
+        let data = mc_data::load(&data_dir).unwrap();
         let biome_registry = data
             .registry("worldgen/biome")
             .expect("vanilla data carries biome registry");

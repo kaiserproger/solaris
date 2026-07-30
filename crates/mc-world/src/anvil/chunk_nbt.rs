@@ -1750,19 +1750,18 @@ mod tests {
     /// The big M2 acceptance test: load every chunk in the real
     /// .mca, decode it, re-encode it, decode again, and verify the
     /// modelled state is bit-identical between the two decoded
-    /// chunks. Skipped when the prerequisites aren't on disk.
+    /// chunks. The local oracle and sidecar make this an opt-in gate.
     #[test]
+    #[ignore = "requires local .analysis/test-world and 26.1.2 blocks report"]
     fn round_trip_real_vanilla_chunks() {
         let region_path = workspace_path(".analysis/test-world/region/r.0.0.mca");
         let blocks_path = workspace_path("data/vanilla/reports/blocks.json");
-        if !region_path.is_file() || !blocks_path.is_file() {
-            eprintln!(
-                "skipping: need both {} and {}",
-                region_path.display(),
-                blocks_path.display()
-            );
-            return;
-        }
+        assert!(
+            region_path.is_file() && blocks_path.is_file(),
+            "need both {} and {}",
+            region_path.display(),
+            blocks_path.display()
+        );
         let report = mc_data::blocks::load_blocks_report(&blocks_path).unwrap();
         let registry = BlockRegistry::from_report(&report).unwrap();
         let payloads = region::read_region(&region_path).unwrap();
@@ -1859,13 +1858,16 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "requires vanilla-generated .analysis/test-world root extras"]
     fn real_test_world_carries_dropped_root_fields_in_extras() {
         let region_path = workspace_path(".analysis/test-world/region/r.0.0.mca");
         let blocks_path = workspace_path("data/vanilla/reports/blocks.json");
-        if !region_path.is_file() || !blocks_path.is_file() {
-            eprintln!("skipping: prerequisites missing");
-            return;
-        }
+        assert!(
+            region_path.is_file() && blocks_path.is_file(),
+            "need both {} and {}",
+            region_path.display(),
+            blocks_path.display()
+        );
         let report = mc_data::blocks::load_blocks_report(&blocks_path).unwrap();
         let registry = BlockRegistry::from_report(&report).unwrap();
         let payloads = region::read_region(&region_path).unwrap();
@@ -1890,13 +1892,11 @@ mod tests {
         }
 
         // Vanilla-generated oracle chunks have at least DataVersion +
-        // InhabitedTime + LastUpdate. Solaris-generated local worlds do
-        // not currently persist unmodelled root extras, so this oracle
-        // assertion is skipped for that shape.
-        if chunks_with_extras == 0 {
-            eprintln!("skipping: test world carries no unmodelled root fields");
-            return;
-        }
+        // InhabitedTime + LastUpdate.
+        assert!(
+            chunks_with_extras > 0,
+            "vanilla oracle world carries no unmodelled root fields"
+        );
         for required in &["DataVersion", "InhabitedTime", "LastUpdate"] {
             assert!(
                 seen_keys.contains(*required),
@@ -1912,13 +1912,16 @@ mod tests {
     /// fresh `.mca` file. The mutated cell must read back as the new
     /// state, every other modelled field plus `extras` must survive.
     #[test]
+    #[ignore = "requires local .analysis/test-world and 26.1.2 blocks report"]
     fn round_trip_modified_chunk_through_disk() {
         let region_path = workspace_path(".analysis/test-world/region/r.0.0.mca");
         let blocks_path = workspace_path("data/vanilla/reports/blocks.json");
-        if !region_path.is_file() || !blocks_path.is_file() {
-            eprintln!("skipping: prerequisites missing");
-            return;
-        }
+        assert!(
+            region_path.is_file() && blocks_path.is_file(),
+            "need both {} and {}",
+            region_path.display(),
+            blocks_path.display()
+        );
         let report = mc_data::blocks::load_blocks_report(&blocks_path).unwrap();
         let registry = BlockRegistry::from_report(&report).unwrap();
         let payloads = region::read_region(&region_path).unwrap();
@@ -2635,13 +2638,16 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "requires vanilla-generated .analysis/test-world baked skylight"]
     fn real_test_world_carries_some_baked_skylight() {
         let region_path = workspace_path(".analysis/test-world/region/r.0.0.mca");
         let blocks_path = workspace_path("data/vanilla/reports/blocks.json");
-        if !region_path.is_file() || !blocks_path.is_file() {
-            eprintln!("skipping: prerequisites missing");
-            return;
-        }
+        assert!(
+            region_path.is_file() && blocks_path.is_file(),
+            "need both {} and {}",
+            region_path.display(),
+            blocks_path.display()
+        );
         let report = mc_data::blocks::load_blocks_report(&blocks_path).unwrap();
         let registry = BlockRegistry::from_report(&report).unwrap();
         let payloads = region::read_region(&region_path).unwrap();
@@ -2668,13 +2674,11 @@ mod tests {
             }
         }
 
-        // Vanilla-generated oracle chunks carry baked SkyLight. Solaris
-        // generated local worlds do not persist light arrays yet (queued
-        // for a later milestone), so skip that oracle shape.
-        if chunks_with_sky == 0 {
-            eprintln!("skipping: test world carries no baked SkyLight");
-            return;
-        }
+        // Vanilla-generated oracle chunks carry baked SkyLight.
+        assert!(
+            chunks_with_sky > 0,
+            "vanilla oracle world carries no baked SkyLight"
+        );
         assert!(
             sections_with_sky >= 1,
             "expected ≥1 section with baked SkyLight, got {sections_with_sky}",

@@ -269,6 +269,12 @@ Benchmark reproduction happens at that feature boundary, not after every edit:
   unmapped M94, release-candidate, and subjective owner gates remain open with
   owners, prerequisites, and close conditions recorded in
   [`evidence/manual-client-test-gates.md`](evidence/manual-client-test-gates.md).
+- [x] Classify 15 `mc-world` tests that depended on ignored local Mojang data or
+  generated oracle worlds. They are now explicit opt-in gates and fail closed
+  when deliberately invoked without their prerequisite or required oracle
+  shape; the ordinary suite no longer treats a successful early return as a
+  pass. Owners and close conditions are recorded in
+  [`evidence/mc-world-local-artifact-tests.md`](evidence/mc-world-local-artifact-tests.md).
 - [x] Record the exact local 26.1.2 world-clock oracle in
   [`evidence/world-clock-26.1.2.md`](evidence/world-clock-26.1.2.md).
 - [x] Implement the typed world-clock map, separating monotonic `game_time` from

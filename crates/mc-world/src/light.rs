@@ -1997,6 +1997,7 @@ mod tests {
     /// invariants are checked: sky=15 on the very top, and block-light
     /// stays dark only when the sampled chunk has no emitters.
     #[test]
+    #[ignore = "requires local .analysis/test-world and 26.1.2 light sidecars"]
     fn engine_runs_on_real_spawn_chunk_when_data_present() {
         let workspace = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
             .parent()
@@ -2006,10 +2007,13 @@ mod tests {
         let blocks_path = workspace.join("data/vanilla/reports/blocks.json");
         let light_path = workspace.join("data/vanilla/reports/block_light.json");
         let region_path = workspace.join(".analysis/test-world/region/r.0.0.mca");
-        if !blocks_path.is_file() || !light_path.is_file() || !region_path.is_file() {
-            eprintln!("skipping: prerequisites missing");
-            return;
-        }
+        assert!(
+            blocks_path.is_file() && light_path.is_file() && region_path.is_file(),
+            "need {}, {}, and {}",
+            blocks_path.display(),
+            light_path.display(),
+            region_path.display()
+        );
 
         let report = mc_data::blocks::load_blocks_report(&blocks_path).unwrap();
         let registry = BlockRegistry::from_report(&report).unwrap();
@@ -2027,10 +2031,7 @@ mod tests {
                 break;
             }
         }
-        let Some(chunk) = full_chunk else {
-            eprintln!("skipping: no Status:full chunk in test world");
-            return;
-        };
+        let chunk = full_chunk.expect("test world must contain a Status:full chunk");
 
         let has_emitter = (0..WORLD_HEIGHT).any(|ly| {
             let world_y = MIN_Y + ly as i32;

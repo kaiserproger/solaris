@@ -343,18 +343,16 @@ mod tests {
         ));
     }
 
-    /// Exhaustive round-trip on real vanilla data. Skipped when the
-    /// sidecar isn't present.
+    /// Exhaustive opt-in round-trip on the local vanilla sidecar.
     #[test]
+    #[ignore = "requires local 26.1.2 data/vanilla blocks report"]
     fn round_trip_real_blocks_report() {
         let path = workspace_path("data/vanilla/reports/blocks.json");
-        if !path.is_file() {
-            eprintln!(
-                "skipping: {} not present (run tools/extract-vanilla-data.sh)",
-                path.display()
-            );
-            return;
-        }
+        assert!(
+            path.is_file(),
+            "{} not present; run tools/extract-vanilla-data.sh",
+            path.display()
+        );
         let report = mc_data::blocks::load_blocks_report(&path).unwrap();
         let reg = BlockRegistry::from_report(&report).unwrap();
 

@@ -2917,23 +2917,20 @@ mod tests {
     /// LRU stays bounded. The oracle may be the old vanilla flat world
     /// or a Solaris-generated terrain world.
     #[test]
+    #[ignore = "requires local .analysis/test-world and 26.1.2 blocks report"]
     fn opens_real_test_world_and_queries_blocks() {
         let world_dir = workspace_path(".analysis/test-world");
         let blocks_path = workspace_path("data/vanilla/reports/blocks.json");
-        if !world_dir.is_dir() || !blocks_path.is_file() {
-            eprintln!("skipping: prerequisites missing");
-            return;
-        }
+        assert!(
+            world_dir.is_dir() && blocks_path.is_file(),
+            "need {} and {}",
+            world_dir.display(),
+            blocks_path.display()
+        );
         let report = mc_data::blocks::load_blocks_report(&blocks_path).unwrap();
         let registry = Arc::new(BlockRegistry::from_report(&report).unwrap());
-        let mut world = match WorldStorage::open_with_capacity(&world_dir, Arc::clone(&registry), 4)
-        {
-            Ok(world) => world,
-            Err(err) => {
-                eprintln!("skipping: {} ({err})", world_dir.display());
-                return;
-            }
-        };
+        let mut world =
+            WorldStorage::open_with_capacity(&world_dir, Arc::clone(&registry), 4).unwrap();
 
         let resolve = |w: &WorldStorage, id: BlockStateId| {
             w.registry()
@@ -3002,26 +2999,29 @@ mod tests {
     /// the structural M3.f assertion: without the region cache the
     /// equivalent path re-opened `r.0.0.mca` 121 times.
     #[test]
+    #[ignore = "requires local .analysis/test-world and 26.1.2 blocks report"]
     fn region_cache_holds_one_region_across_quadrant_walk() {
         let world_dir = workspace_path(".analysis/test-world");
         let blocks_path = workspace_path("data/vanilla/reports/blocks.json");
-        if !world_dir.is_dir() || !blocks_path.is_file() {
-            eprintln!("skipping: prerequisites missing");
-            return;
-        }
+        assert!(
+            world_dir.is_dir() && blocks_path.is_file(),
+            "need {} and {}",
+            world_dir.display(),
+            blocks_path.display()
+        );
         let report = mc_data::blocks::load_blocks_report(&blocks_path).unwrap();
         let registry = Arc::new(BlockRegistry::from_report(&report).unwrap());
-        let mut world = match WorldStorage::open_with_capacity(&world_dir, registry, 4) {
-            Ok(world) => world,
-            Err(err) => {
-                eprintln!("skipping: {} ({err})", world_dir.display());
-                return;
-            }
-        };
+        let mut world = WorldStorage::open_with_capacity(&world_dir, registry, 4).unwrap();
 
         for cz in 0..=10 {
             for cx in 0..=10 {
-                let _ = world.get_chunk(ChunkPos { x: cx, z: cz }).unwrap();
+                assert!(
+                    world
+                        .get_chunk(ChunkPos { x: cx, z: cz })
+                        .unwrap()
+                        .is_some(),
+                    "test world must contain required chunk ({cx}, {cz})"
+                );
             }
         }
         // Chunk LRU still capped at 4. Region LRU now holds exactly
@@ -3795,25 +3795,28 @@ mod tests {
     /// clean). This guards against an accidental `dirty = true`
     /// default that would turn the burst into an I/O storm.
     #[test]
+    #[ignore = "requires local .analysis/test-world and 26.1.2 blocks report"]
     fn spawn_burst_load_does_not_dirty_chunks() {
         let world_dir = workspace_path(".analysis/test-world");
         let blocks_path = workspace_path("data/vanilla/reports/blocks.json");
-        if !world_dir.is_dir() || !blocks_path.is_file() {
-            eprintln!("skipping: prerequisites missing");
-            return;
-        }
+        assert!(
+            world_dir.is_dir() && blocks_path.is_file(),
+            "need {} and {}",
+            world_dir.display(),
+            blocks_path.display()
+        );
         let report = mc_data::blocks::load_blocks_report(&blocks_path).unwrap();
         let registry = Arc::new(BlockRegistry::from_report(&report).unwrap());
-        let mut world = match WorldStorage::open_with_capacity(&world_dir, registry, 4) {
-            Ok(world) => world,
-            Err(err) => {
-                eprintln!("skipping: {} ({err})", world_dir.display());
-                return;
-            }
-        };
+        let mut world = WorldStorage::open_with_capacity(&world_dir, registry, 4).unwrap();
         for cz in 0..=10 {
             for cx in 0..=10 {
-                let _ = world.get_chunk(ChunkPos { x: cx, z: cz }).unwrap();
+                assert!(
+                    world
+                        .get_chunk(ChunkPos { x: cx, z: cz })
+                        .unwrap()
+                        .is_some(),
+                    "test world must contain required chunk ({cx}, {cz})"
+                );
             }
         }
         assert_eq!(world.dirty_count(), 0);
@@ -3929,39 +3932,33 @@ mod tests {
     /// the time-to-stream so the M3.f region-cache lands with a
     /// before/after number rather than a guess.
     #[test]
+    #[ignore = "explicit local vd=10 chunk-stream performance probe"]
     fn streams_view_distance_quadrant_within_budget() {
         let world_dir = workspace_path(".analysis/test-world");
         let blocks_path = workspace_path("data/vanilla/reports/blocks.json");
-        if !world_dir.is_dir() || !blocks_path.is_file() {
-            eprintln!("skipping: prerequisites missing");
-            return;
-        }
+        assert!(
+            world_dir.is_dir() && blocks_path.is_file(),
+            "need {} and {}",
+            world_dir.display(),
+            blocks_path.display()
+        );
         let report = mc_data::blocks::load_blocks_report(&blocks_path).unwrap();
         let registry = Arc::new(BlockRegistry::from_report(&report).unwrap());
         // Match the production chunk-LRU default. M3.e thrashes this
         // at vd=10 because the LRU only holds 16 of the 121 hot
         // chunks; the region cache is what de-amortises it.
-        let mut world = match WorldStorage::open(&world_dir, registry) {
-            Ok(world) => world,
-            Err(err) => {
-                eprintln!("skipping: {} ({err})", world_dir.display());
-                return;
-            }
-        };
+        let mut world = WorldStorage::open(&world_dir, registry).unwrap();
 
         for cz in 0..=10 {
             for cx in 0..=10 {
-                if world
-                    .get_chunk_without_generation(ChunkPos { x: cx, z: cz })
-                    .unwrap()
-                    .is_none()
-                {
-                    eprintln!(
-                        "skipping: {} does not contain required vd=10 chunk ({cx}, {cz})",
-                        world_dir.display()
-                    );
-                    return;
-                }
+                assert!(
+                    world
+                        .get_chunk_without_generation(ChunkPos { x: cx, z: cz })
+                        .unwrap()
+                        .is_some(),
+                    "{} does not contain required vd=10 chunk ({cx}, {cz})",
+                    world_dir.display()
+                );
             }
         }
 

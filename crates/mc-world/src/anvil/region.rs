@@ -549,17 +549,16 @@ mod tests {
     /// Read every chunk out of the real vanilla r.0.0.mca, decompress
     /// each, and assert the payload starts with the NBT named-root
     /// header (`0x0a` = Compound, followed by a length-prefixed name).
-    /// Skipped when the test world isn't present.
+    /// Opt-in because the vanilla test world is a local artifact.
     #[test]
+    #[ignore = "requires local .analysis/test-world vanilla region"]
     fn reads_real_vanilla_region() {
         let path = workspace_path(".analysis/test-world/region/r.0.0.mca");
-        if !path.is_file() {
-            eprintln!(
-                "skipping: {} not present (run tools/generate-test-world.sh)",
-                path.display()
-            );
-            return;
-        }
+        assert!(
+            path.is_file(),
+            "{} not present; run tools/generate-test-world.sh",
+            path.display()
+        );
         let chunks = read_region(&path).unwrap();
         assert!(!chunks.is_empty(), "spawn region should have chunks");
         for c in &chunks {
@@ -572,16 +571,16 @@ mod tests {
     /// out to a fresh file, then read that back, then confirm the
     /// decompressed payloads match byte-for-byte.
     #[test]
+    #[ignore = "requires local .analysis/test-world vanilla region"]
     fn round_trip_real_vanilla_region() {
         let path = workspace_path(".analysis/test-world/region/r.0.0.mca");
-        if !path.is_file() {
-            eprintln!(
-                "skipping: {} not present (run tools/generate-test-world.sh)",
-                path.display()
-            );
-            return;
-        }
+        assert!(
+            path.is_file(),
+            "{} not present; run tools/generate-test-world.sh",
+            path.display()
+        );
         let original = read_region(&path).unwrap();
+        assert!(!original.is_empty(), "vanilla oracle region has no chunks");
         let tmp = tempfile::NamedTempFile::new().unwrap();
         write_region(tmp.path(), &original).unwrap();
         let reread = read_region(tmp.path()).unwrap();
@@ -601,17 +600,16 @@ mod tests {
 
     /// Prove the local vanilla oracle was actually written with
     /// compression byte 4 before exercising the Anvil reader. Skipped
-    /// when the LZ4 oracle world hasn't been generated.
+    /// against the opt-in local LZ4 oracle world.
     #[test]
+    #[ignore = "requires local .analysis/test-world-lz4 vanilla region"]
     fn reads_real_vanilla_lz4_region() {
         let path = workspace_path(".analysis/test-world-lz4/region/r.0.0.mca");
-        if !path.is_file() {
-            eprintln!(
-                "skipping: {} not present (run OUT_DIR=.analysis/test-world-lz4 REGION_FILE_COMPRESSION=lz4 tools/generate-test-world.sh)",
-                path.display()
-            );
-            return;
-        }
+        assert!(
+            path.is_file(),
+            "{} not present; run OUT_DIR=.analysis/test-world-lz4 REGION_FILE_COMPRESSION=lz4 tools/generate-test-world.sh",
+            path.display()
+        );
 
         let (compression, payload) = first_populated_chunk(&path).unwrap();
         assert_eq!(compression, CompressionType::Lz4 as u8);
@@ -626,15 +624,14 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "requires local .analysis/test-world-lz4 vanilla region"]
     fn lz4_block_api_matches_real_vanilla_lz4_payload() {
         let path = workspace_path(".analysis/test-world-lz4/region/r.0.0.mca");
-        if !path.is_file() {
-            eprintln!(
-                "skipping: {} not present (run OUT_DIR=.analysis/test-world-lz4 REGION_FILE_COMPRESSION=lz4 tools/generate-test-world.sh)",
-                path.display()
-            );
-            return;
-        }
+        assert!(
+            path.is_file(),
+            "{} not present; run OUT_DIR=.analysis/test-world-lz4 REGION_FILE_COMPRESSION=lz4 tools/generate-test-world.sh",
+            path.display()
+        );
 
         let (compression, payload) = first_populated_chunk(&path).unwrap();
         assert_eq!(compression, CompressionType::Lz4 as u8);
