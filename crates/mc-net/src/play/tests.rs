@@ -23,6 +23,7 @@ mod bed_sleep;
 mod block_placement_nbt;
 mod block_placement_planning;
 mod block_resync;
+mod bottom_slab_collision;
 mod button_planning;
 mod button_runtime_edges;
 mod campfire_cooking;
@@ -2813,26 +2814,6 @@ async fn player_collision_uses_farmland_fallback_for_exact_low_id_semantics() {
     assert!(
         player_pose_collides_with_solid(Some(&state), PlayerPose::new(0.5, 64.90, 0.5)).await,
         "the exact farmland fallback still rejects overlap below its top"
-    );
-}
-
-#[tokio::test]
-async fn player_collision_uses_bottom_slab_box() {
-    let state = vanilla_collision_test_state();
-    let slab = vanilla_collision_state_id(
-        &state,
-        "minecraft:stone_slab",
-        &[("type", "bottom"), ("waterlogged", "false")],
-    );
-    set_collision_test_block(&state, slab).await;
-
-    assert!(
-        !player_pose_collides_with_solid(Some(&state), PlayerPose::new(0.5, 64.5, 0.5)).await,
-        "a player may stand on the bottom slab's half-block top"
-    );
-    assert!(
-        player_pose_collides_with_solid(Some(&state), PlayerPose::new(0.5, 64.49, 0.5)).await,
-        "a player may not overlap the bottom slab box"
     );
 }
 

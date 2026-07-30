@@ -22,16 +22,22 @@ replacement-readiness claims.
 
 ## Active Checkpoint
 
-Next autonomous goal checkpoint: route `playable`; mechanically move the
-`player_collision_uses_bottom_slab_box` test out of
+Next autonomous goal checkpoint: route `playable`; mechanically move
+`player_collision_uses_farmland_fallback_for_exact_low_id_semantics` out of
 aggregate `crates/mc-net/src/play/tests.rs` into a focused sibling module.
-Preserve its exact `minecraft:stone_slab` state with `type=bottom` and
-`waterlogged=false`, the `(0.5, 64.5, 0.5)` non-collision pose on the slab top,
-the `(0.5, 64.49, 0.5)` colliding overlap pose, and production behavior. Leave
-the preceding `player_collision_uses_farmland_fallback_for_exact_low_id_semantics`
+Preserve its exact low-id farmland helper, the `(0.5, 64.9375, 0.5)`
+non-collision pose at the `15/16` top, the `(0.5, 64.90, 0.5)` colliding
+overlap pose, and production behavior. Leave the preceding
+`player_collision_rejects_wrong_properties_under_canonical_slab_name_and_id`
 test and following
 `button_test_registry` helper aggregate-owned, and use explicit imports rather
 than a new `use super::*`.
+
+The complete bottom-slab collision test has moved to
+`crates/mc-net/src/play/tests/bottom_slab_collision.rs`. Its exact bottom-slab
+state, half-block standing boundary, colliding overlap pose, exact coordinates,
+and published collision-context coverage are recorded in
+[`../evidence/mc-net-bottom-slab-collision-test-extraction.md`](../evidence/mc-net-bottom-slab-collision-test-extraction.md).
 
 The complete oracle-AABB-deflation collision test has moved to
 `crates/mc-net/src/play/tests/oracle_aabb_deflation_boundary.rs`. Its exact
