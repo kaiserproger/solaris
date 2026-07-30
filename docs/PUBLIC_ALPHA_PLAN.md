@@ -73,10 +73,11 @@ touched domain rules belong in the lowest existing crate that owns the domain:
 
 Required migration:
 
-1. [ ] Generate a measured ownership inventory for `mc-net`: large files, domain
+1. [x] Generate a measured ownership inventory for `mc-net`: large files, domain
    state machines, dependency edges, test concentration, and code-health
    exceptions. This inventory selects work; line count alone is not a reason to
    extract code.
+   Evidence: [`evidence/mc-net-ownership-inventory.md`](evidence/mc-net-ownership-inventory.md).
 2. [x] Extract pure natural-spawn scheduling and planning into `mc-entity`.
    `mc-net` retains session snapshots, regional-owner commit, visibility
    publication, and wire adapters.
@@ -269,6 +270,11 @@ Benchmark reproduction happens at that feature boundary, not after every edit:
   retains live session/world snapshots, owner commit, visibility publication,
   and dispatch. The exact boundary and validation are recorded in
   [`evidence/natural-spawn-crate-boundary.md`](evidence/natural-spawn-crate-boundary.md).
+- [x] Measure current `mc-net` size, test concentration, domain state machines,
+  dependency edges, and structural exceptions. The inventory selects
+  deterministic plant planning as the next bounded lower-crate cut rather than
+  treating root line count as an extraction order:
+  [`evidence/mc-net-ownership-inventory.md`](evidence/mc-net-ownership-inventory.md).
 - [x] Inventory the manual and graphical client gate class. The 108
   `manual-pending` manifest scenarios are fail-closed declarations with
   agent-run real-client paths, not 108 owner-only tests. The exact graphical,

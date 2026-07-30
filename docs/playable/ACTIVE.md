@@ -22,18 +22,22 @@ replacement-readiness claims.
 
 ## Active Checkpoint
 
-Next: generate the measured `mc-net` ownership inventory required by Phase 2
-item 1: large files, domain state machines, dependency edges, test
-concentration, and code-health exceptions. Use it to select the next bounded
-vertical extraction before entering measured performance work.
+Next: extract deterministic plant growth, survival, tree, bonemeal, harvest,
+and drop planning from `mc-net::play::plants` into protocol-neutral
+`mc-world` contracts. Keep snapshot acquisition, world commit, durability,
+relight, publication, and packet/item translation in `mc-net`; move focused
+pure-rule tests with the owner and pin the one-way boundary in code-health.
 
-The natural-spawn crate boundary is closed. `mc-entity` now owns the herd DTO,
-deterministic identity, caps, rotating scheduler, metrics, terrain/darkness,
-collision, distance, and candidate planning. `mc-net` retains live
-session/world snapshots, regional owner commit, visibility publication,
-dispatch, and the server ticker. Code-health pins the one-way boundary.
+The measured `mc-net` ownership inventory is closed. It records 205 Rust files,
+189,753 physical lines, 1,741 test attributes, concentrated root/test clusters,
+direct and reverse dependency edges, current state-machine ownership, 170
+code-health anchors, 38 path-specific scanner branches, and explicit
+structural/lint exceptions. It selects the plant vertical from its dependency
+shape and 66 plant-focused test matches, not from line count alone. The
+inventory is in
+[`../evidence/mc-net-ownership-inventory.md`](../evidence/mc-net-ownership-inventory.md).
 Graphical owner-host gates remain external release evidence and are not implied
-by this mechanical cutover.
+by this documentation checkpoint.
 
 ## Recent Checkpoints — through 2026-07-30
 
