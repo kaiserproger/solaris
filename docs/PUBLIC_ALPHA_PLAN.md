@@ -376,6 +376,9 @@ Benchmark reproduction happens at that feature boundary, not after every edit:
 - [ ] Complete revision-10 drainage,
   [rendered height/biome/vegetation mosaics](evidence/worldgen-mosaics.md),
   clean seed-`712816` owner playtest, restart, and release-host throughput gates.
+  The exact-seed
+  [agent-run graphical preflight](evidence/worldgen-seed-712816-preflight.md)
+  is complete; owner traversal and disposition remain open.
 
 ## Observed baseline
 

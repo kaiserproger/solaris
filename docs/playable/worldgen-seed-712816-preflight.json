@@ -1,0 +1,63 @@
+{
+  "schema_version": 1,
+  "pack_id": "worldgen-seed-712816-preflight",
+  "quality_label": "playable-worldgen-graphical-preflight",
+  "server_command": "SOLARIS_REAL_CLIENT_MANIFEST=docs/playable/worldgen-seed-712816-preflight.json SOLARIS_REAL_CLIENT_AGENT_SCENARIO=playable-01-join-generated-spawn SOLARIS_REAL_CLIENT_SERVER_SEED=712816 SOLARIS_REAL_CLIENT_TIMEOUT_SECONDS=240 bash tools/run-playable-client-gate.sh --run",
+  "client_requirement": "A real Minecraft Java 26.1.2 client must connect through the repo-native Gradle runClient adapter to a fresh world generated from playable.toml with seed 712816.",
+  "forbidden_client_evidence": [
+    "wire-probe",
+    "mc_test_harness::client::Client",
+    "protocol-only bot",
+    "debug commands",
+    "headless mock client"
+  ],
+  "required_artifacts": [
+    "manifest.json",
+    "client.log",
+    "server.log",
+    "observations.json",
+    "screenshots/",
+    "git.txt",
+    "toolchain.txt",
+    "automation-driver.txt",
+    "server.toml"
+  ],
+  "automation_runner": {
+    "script": "tools/run-playable-client-gate.sh",
+    "delegates_to": "tools/run-real-client-regression.sh",
+    "client_adapter": "client-mod/solaris-client-agent/gradlew --no-configuration-cache :fabric-agent:runClientAgent",
+    "server_config_env": "SOLARIS_REAL_CLIENT_SERVER_CONFIG",
+    "server_config_value": "playable.toml",
+    "server_seed_env": "SOLARIS_REAL_CLIENT_SERVER_SEED",
+    "server_seed_value": 712816,
+    "fresh_world_env": "SOLARIS_REAL_CLIENT_FRESH_WORLD",
+    "fresh_world_value": 1,
+    "agent_scenario_env": "SOLARIS_REAL_CLIENT_AGENT_SCENARIO",
+    "agent_scenario_value": "playable-01-join-generated-spawn",
+    "timeout_env": "SOLARIS_REAL_CLIENT_TIMEOUT_SECONDS",
+    "timeout_seconds": 240,
+    "passing_gate": "agent-run real-client preflight"
+  },
+  "scenarios": [
+    {
+      "id": "playable-01-join-generated-spawn",
+      "status": "agent-preflight",
+      "bounded_time_minutes": 4,
+      "screenshots_required": true,
+      "no_debug_commands": true,
+      "steps": [
+        "Start Solaris from playable.toml with an isolated fresh world and seed 712816.",
+        "Connect one real Minecraft Java 26.1.2 client to 127.0.0.1:25565.",
+        "Wait until the client reaches Play and generated spawn chunks are visible.",
+        "Capture a screenshot after terrain and the player HUD render."
+      ],
+      "expected_observations": [
+        "The effective server.toml records seed = 712816 and a per-run world directory.",
+        "The client reaches Play without debug commands or operator privileges.",
+        "Generated terrain and the player HUD render in a valid screenshot.",
+        "observations.json records client_gate=agent-run-real-client and result=passed."
+      ]
+    }
+  ],
+  "evidence_boundary": "This preflight proves graphical startup and rendered spawn on the exact seed. It does not replace the owner's subjective terrain/playability disposition, ordinary traversal, restart/rejoin, or release-host throughput gates."
+}

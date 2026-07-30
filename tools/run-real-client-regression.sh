@@ -18,6 +18,7 @@ CLIENT_TIMEOUT_SECONDS="${SOLARIS_REAL_CLIENT_TIMEOUT_SECONDS:-180}"
 SERVER_READY_TIMEOUT_SECONDS="${SOLARIS_REAL_CLIENT_SERVER_READY_TIMEOUT_SECONDS:-120}"
 SERVER_CONFIG="${SOLARIS_REAL_CLIENT_SERVER_CONFIG:-example.toml}"
 FRESH_WORLD="${SOLARIS_REAL_CLIENT_FRESH_WORLD:-0}"
+SERVER_SEED="${SOLARIS_REAL_CLIENT_SERVER_SEED:-}"
 SERVER_ADDR="${SOLARIS_REAL_CLIENT_SERVER_ADDR:-127.0.0.1:25565}"
 AGENT_DRIVER="${SOLARIS_REAL_CLIENT_AGENT_DRIVER:-$REPO_ROOT/tools/real-client-agent-driver.py}"
 AGENT_BRIDGE_URL="${SOLARIS_REAL_CLIENT_AGENT_BRIDGE_URL:-}"
@@ -52,6 +53,9 @@ Environment:
                                 access for local debug commands, except
                                 playable-46-generated-ruin-cache which uses
                                 no operators.
+  SOLARIS_REAL_CLIENT_SERVER_SEED
+                                Optional signed decimal integer used to override
+                                data.seed in the prepared server config.
   SOLARIS_REAL_CLIENT_SERVER_ADDR
                                 Server address passed to the in-client agent driver.
                                 Defaults to 127.0.0.1:25565.
@@ -119,6 +123,22 @@ while [[ $# -gt 0 ]]; do
   esac
   shift
 done
+
+if [[ -n "$SERVER_SEED" ]]; then
+  if [[ ! "$SERVER_SEED" =~ ^[+-]?[0-9]+$ ]] \
+    || ! SERVER_SEED="$(python3 - "$SERVER_SEED" <<'PY'
+import sys
+
+value = int(sys.argv[1], 10)
+if value < -(1 << 63) or value > (1 << 63) - 1:
+    raise SystemExit(1)
+print(value)
+PY
+)"; then
+    printf 'error: SOLARIS_REAL_CLIENT_SERVER_SEED must be a signed 64-bit decimal integer\n' >&2
+    exit 2
+  fi
+fi
 
 require_file() {
   if [[ ! -f "$1" ]]; then
@@ -366,7 +386,7 @@ write_real_client_server_config() {
   if [[ -n "$world_dir" && "$MODE" == "run" ]]; then
     mkdir -p "$world_dir"
   fi
-  awk -v world_dir="$world_dir" -v operators="$operators" -v hostile_spawn_interval_override="$hostile_spawn_interval_override" '
+  awk -v world_dir="$world_dir" -v operators="$operators" -v hostile_spawn_interval_override="$hostile_spawn_interval_override" -v seed_override="$SERVER_SEED" '
     BEGIN {
       section = ""
       seen_admin = 0
@@ -374,6 +394,7 @@ write_real_client_server_config() {
       wrote_admin_operators = 0
       wrote_hostile_spawn_interval = 0
       replaced_world_dir = 0
+      replaced_seed = 0
       escaped_world_dir = world_dir
       gsub(/\\/, "\\\\", escaped_world_dir)
       gsub(/"/, "\\\"", escaped_world_dir)
@@ -410,6 +431,11 @@ write_real_client_server_config() {
       replaced_world_dir = 1
       next
     }
+    section == "data" && seed_override != "" && /^[[:space:]]*seed[[:space:]]*=/ && replaced_seed == 0 {
+      print "seed = " seed_override
+      replaced_seed = 1
+      next
+    }
     section == "admin" && /^[[:space:]]*operators[[:space:]]*=/ {
       print "operators = " operators
       wrote_admin_operators = 1
@@ -431,6 +457,10 @@ write_real_client_server_config() {
       }
       if (world_dir != "" && replaced_world_dir == 0) {
         print "error: server config has no data.world_dir setting" > "/dev/stderr"
+        exit 1
+      }
+      if (seed_override != "" && replaced_seed == 0) {
+        print "error: server config has no data.seed setting" > "/dev/stderr"
         exit 1
       }
       if (hostile_spawn_interval_override != "" && seen_simulation == 0) {
@@ -1140,6 +1170,9 @@ if [[ "$MODE" == "prepare" ]]; then
     if [[ -n "$fresh_world_dir" ]]; then
       printf 'server_world_dir=%s\n' "$fresh_world_dir"
     fi
+    if [[ -n "$SERVER_SEED" ]]; then
+      printf 'server_seed_override=%s\n' "$SERVER_SEED"
+    fi
   } >> "$run_dir/automation-driver.txt"
   printf '%s\n' "$run_dir"
   exit 0
@@ -1189,6 +1222,9 @@ PY
       printf 'server_world_dir=%s\n' "$fresh_world_dir"
     else
       printf 'server_world_dir=UNCHANGED_FROM_SOURCE\n'
+    fi
+    if [[ -n "$SERVER_SEED" ]]; then
+      printf 'server_seed_override=%s\n' "$SERVER_SEED"
     fi
   } >> "$run_dir/automation-driver.txt"
   printf 'running real-client regression into %s\n' "$run_dir"

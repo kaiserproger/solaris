@@ -22,10 +22,20 @@ replacement-readiness claims.
 
 ## Active Checkpoint
 
-Next: run the clean fresh-world seed-`712816` owner playtest on the exact
-candidate tree, using the checked height, biome, and vegetation mosaics as
-navigation context. Keep restart and release-host throughput comparison as
-separate follow-up checkpoints.
+Next: the owner runs the subjective fresh-world seed-`712816` playtest on the
+exact candidate tree, using the checked mosaics and spawn screenshot as
+navigation context. Ordinary traversal and the owner's terrain/playability
+disposition remain required. Keep restart and release-host throughput
+comparison as separate follow-up checkpoints.
+
+The automatable graphical preflight is closed. A real Minecraft Java 26.1.2
+client joined a fresh no-operator `tellus_like` seed-`712816` world at
+`(0.5, 71.0, 0.5)`, rendered terrain and HUD, received all `81` visible
+view-distance-4 chunks without absence or degraded delivery, wrote a valid
+`854x480` screenshot, and passed the fail-closed artifact validator. Exact
+config, observations, checksums, logs, screenshot path, and limits are in
+[`../evidence/worldgen-seed-712816-preflight.md`](../evidence/worldgen-seed-712816-preflight.md).
+This is agent-run graphical startup evidence, not the owner disposition.
 
 The current tree now includes a deterministic production-sampler renderer and
 checked `2048x2048`-block height, biome, and vegetation artifacts for seed
