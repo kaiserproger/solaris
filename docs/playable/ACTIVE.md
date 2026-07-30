@@ -23,18 +23,17 @@ replacement-readiness claims.
 ## Active Checkpoint
 
 Next autonomous goal checkpoint: route `playable`; mechanically move the full
-ten-test bucket-source, fluid-tick, decay, scheduling, and lava-water
-interaction class beginning with `bucket_items_resolve_fluid_sources`,
-including the `seed_fluid_test_floor` and `run_fluid_test_step` helpers, and
-ending with `water_lava_interactions_make_solid_blocks` out of aggregate
+four-test registry-derived item-to-block and standing/wall sign mapping class
+beginning with `item_to_block_table_is_registry_derived` and ending with
+`sign_items_choose_floor_or_wall_sign_for_clicked_face` out of aggregate
 `crates/mc-net/src/play/tests.rs` into a focused sibling module. Preserve every
 test and production behavior, leave the preceding
-`sign_items_choose_floor_or_wall_sign_for_clicked_face` test in the aggregate
-file, and use explicit imports rather than a new `use super::*`. The complete
-five-test falling-block class has already moved to
-`crates/mc-net/src/play/tests/falling_blocks.rs`; its concentration and
-validation are recorded in
-[`../evidence/mc-net-falling-blocks-test-extraction.md`](../evidence/mc-net-falling-blocks-test-extraction.md).
+`local_dev_profiles_are_op_capable_for_now` test in the aggregate file, and
+use explicit imports rather than a new `use super::*`. The complete ten-test
+bucket-source, fluid-tick, decay, scheduling, and lava-water interaction class
+has already moved to `crates/mc-net/src/play/tests/fluid_runtime.rs`; its
+concentration and validation are recorded in
+[`../evidence/mc-net-fluid-runtime-test-extraction.md`](../evidence/mc-net-fluid-runtime-test-extraction.md).
 The owner-run subjective fresh-world seed-`712816` playtest and
 release-candidate performance gates remain queued at their declared
 boundaries.
