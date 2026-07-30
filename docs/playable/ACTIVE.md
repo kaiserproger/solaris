@@ -23,15 +23,20 @@ replacement-readiness claims.
 ## Active Checkpoint
 
 Next autonomous goal checkpoint: route `playable`; mechanically move the
-`block_drop_configured_loot_count_reaches_runtime_stack`
+`block_drop_builtin_short_grass_returns_wheat_seeds`
 test from aggregate `crates/mc-net/src/play/tests.rs` to a focused sibling
 module.
-Preserve its exact crop registry, carrot item protocol id `52`, default dirt
-state, configured dirt-to-three-carrots loot map, runtime stack
-`ItemStack::new(52, 3)`, and production behavior. Leave the preceding
-`block_drop_builtin_short_grass_returns_wheat_seeds` test and following
-`fluid_block` helper aggregate-owned, and use explicit imports rather than a
-new `use super::*`.
+Preserve its exact air/short-grass registry, wheat-seeds item protocol id `51`,
+default short-grass state, default loot table, runtime stack
+`ItemStack::new(51, 1)`, and production behavior. Leave the preceding
+`crop_test_registry` helper and following `fluid_block` helper
+aggregate-owned, and use explicit imports rather than a new `use super::*`.
+
+The complete configured block-loot count test has moved to
+`crates/mc-net/src/play/tests/block_drop_configured_loot.rs`. Its unchanged
+crop registry, carrot item protocol id, default dirt state, configured
+dirt-to-three-carrots loot map, and runtime stack are recorded in
+[`../evidence/mc-net-block-drop-configured-loot-test-extraction.md`](../evidence/mc-net-block-drop-configured-loot-test-extraction.md).
 
 The complete existing-overlap collision-correction escape test has moved to
 `crates/mc-net/src/play/tests/collision_correction_escape.rs`. Its unchanged
