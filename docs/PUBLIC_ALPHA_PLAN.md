@@ -147,6 +147,11 @@ not replace functional, package, workspace, or real-client gates.
    lives in focused `play/tests/shield.rs`; its preserved shield-state,
    inventory, owner-commit, and fail-closed conflict coverage is recorded in
    [`evidence/mc-net-shield-test-extraction.md`](evidence/mc-net-shield-test-extraction.md).
+   The following eleven-test player contact-damage, pushed-damage, armor,
+   knockback, and stale-publication class now lives in focused
+   `play/tests/player_damage.rs`; its preserved death, inventory, equipment,
+   motion, and publication-fencing coverage is recorded in
+   [`evidence/mc-net-player-damage-test-extraction.md`](evidence/mc-net-player-damage-test-extraction.md).
 4. [ ] Separate behavioral tests from structural tripwires. Structural checks may
    enforce crate ownership and dependency direction, but may not assert Rust
    statement order or source-text layout.
