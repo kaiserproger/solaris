@@ -16,12 +16,12 @@ not change.
 
 ## Concentration
 
-Before the extraction, `play/tests.rs` contained 21,707 physical lines and 372
-test attributes. Afterwards:
+Before the extraction, `play/tests.rs` contained 21,707 physical lines and 379
+test functions, counting test attributes with or without arguments. Afterwards:
 
-| File | Physical lines | Test attributes |
+| File | Physical lines | Test functions |
 | --- | ---: | ---: |
-| `play/tests.rs` | 18,483 | 296 |
+| `play/tests.rs` | 18,483 | 303 |
 | `play/tests/plants.rs` | 3,246 | 76 |
 
 The focused class contains 65 synchronous and 11 Tokio tests. It covers crop
@@ -29,7 +29,7 @@ drops and placement, farmland collision/trampling/tilling, cactus and vertical
 plant survival, bamboo, random-tick growth, stems, sweet berries, cocoa,
 bonemeal, and single/2x2 sapling growth. A sorted multiset comparison of every
 function name in the original aggregate file against both resulting modules
-has no difference; the total source test-attribute count remains 372.
+has no difference; the total source test count remains 379.
 
 Shared fixtures still used by unrelated aggregate tests remain in
 `play/tests.rs`. The extraction therefore does not duplicate their authority or

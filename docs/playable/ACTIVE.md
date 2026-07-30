@@ -23,17 +23,17 @@ replacement-readiness claims.
 ## Active Checkpoint
 
 Next autonomous goal checkpoint: route `playable`; mechanically move the
-door/trapdoor toggle class beginning with
-`interactive_toggle_helpers_preserve_other_properties` and ending with
-`two_client_door_and_trapdoor_toggles_converge_and_reject_stale_retry` out of
-aggregate `crates/mc-net/src/play/tests.rs` into a focused sibling module.
-Preserve every test and production behavior, leave the following
-`lever_toggle_powers_adjacent_iron_door` redstone class in the aggregate file,
-and use explicit imports rather than a new `use super::*`.
-The four-test natural random-tick/leaves/fire class has already moved to
-`crates/mc-net/src/play/tests/natural_random_ticks.rs`; its concentration and
+lever/piston redstone class beginning with
+`lever_toggle_powers_adjacent_iron_door` and ending with
+`protected_piston_destination_rejects_the_atomic_piston_group` out of aggregate
+`crates/mc-net/src/play/tests.rs` into a focused sibling module. Preserve every
+test and production behavior, leave the following
+`real_door_states_plan_hand_toggle_when_sidecar_is_present` test in the
+aggregate file, and use explicit imports rather than a new `use super::*`.
+The three-test door/trapdoor hand-toggle class has already moved to
+`crates/mc-net/src/play/tests/door_toggles.rs`; its concentration and
 validation are recorded in
-[`../evidence/mc-net-natural-random-tick-test-extraction.md`](../evidence/mc-net-natural-random-tick-test-extraction.md).
+[`../evidence/mc-net-door-toggle-test-extraction.md`](../evidence/mc-net-door-toggle-test-extraction.md).
 The owner-run subjective fresh-world seed-`712816` playtest and
 release-candidate performance gates remain queued at their declared
 boundaries.

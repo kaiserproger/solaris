@@ -54,6 +54,10 @@ not replace functional, package, workspace, or real-client gates.
    focused `play/tests/natural_random_ticks.rs`; its preserved concentration is
    recorded in
    [`evidence/mc-net-natural-random-tick-test-extraction.md`](evidence/mc-net-natural-random-tick-test-extraction.md).
+   The three-test door/trapdoor hand-toggle class now lives in focused
+   `play/tests/door_toggles.rs`; its preserved unit, two-client, and exact-wire
+   coverage is recorded in
+   [`evidence/mc-net-door-toggle-test-extraction.md`](evidence/mc-net-door-toggle-test-extraction.md).
 4. [ ] Separate behavioral tests from structural tripwires. Structural checks may
    enforce crate ownership and dependency direction, but may not assert Rust
    statement order or source-text layout.

@@ -1,44 +1,46 @@
-# `mc-net` natural random-tick test extraction
+# `mc-net` door/trapdoor toggle test extraction
 
 Date: 2026-07-30
 
-Checkpoint base: `99b3d153178c85a97f9de7f46bbd7330453113fb`
+Checkpoint base: `d2611e26b775a8048e6ff797944b4d56503e6875`
 
 ## Result
 
-The contiguous natural random-tick class moved from aggregate
+The contiguous door/trapdoor hand-toggle class moved from aggregate
 `crates/mc-net/src/play/tests.rs` to the focused Rust module
-`crates/mc-net/src/play/tests/natural_random_ticks.rs`. The child module has
-explicit imports and does not inherit the aggregate file's `use super::*`.
+`crates/mc-net/src/play/tests/door_toggles.rs`. The child module has explicit
+imports and does not inherit the aggregate file's `use super::*`.
 
-The four tests cover leaf decay and fire state helpers, seeded fire spread,
-zone-protected ambient fire edits, and the exact sapling/stick/apple leaf-decay
-drop pools. The immediately following door/trapdoor toggle class remains in the
-aggregate module.
+The three tests cover property-preserving boolean toggles, hand-toggle material
+policy for doors/trapdoors/fence gates, and two-client door/trapdoor
+convergence. The two-client gate retains exact block-delta packet decoding,
+atomic two-half publication, stale-retry rejection, and the following-tick
+no-publication fence. The immediately following lever/piston class remains in
+the aggregate module.
 
 This is a test-ownership change only. Production code and behavior did not
 change.
 
 ## Concentration
 
-Before the extraction, `play/tests.rs` contained 18,483 physical lines and 303
+Before the extraction, `play/tests.rs` contained 18,260 physical lines and 299
 test functions, counting test attributes with or without arguments. Afterwards:
 
 | File | Physical lines | Test functions |
 | --- | ---: | ---: |
-| `play/tests.rs` | 18,260 | 299 |
-| `play/tests/natural_random_ticks.rs` | 231 | 4 |
+| `play/tests.rs` | 17,832 | 296 |
+| `play/tests/door_toggles.rs` | 442 | 3 |
 
-A sorted multiset comparison of all 381 function names in the original
+A sorted multiset comparison of all 377 function names in the original
 aggregate file against both resulting modules is identical. The combined test
-count remains 303.
+count remains 299.
 
 Benchmark: not applicable. The checkpoint changes only test-module ownership
 and has no performance contract.
 
 ## Validation
 
-- Focused execution: 4 passed, 0 failed, 0 ignored.
+- Focused execution: 3 passed, 0 failed, 0 ignored.
 - `cargo test -p mc-net`: 1,852 passed, 0 failed, 5 documented ignored;
   three doctests passed.
 - `cargo run -p xtask -- code-health`: 0 failures, `KEEP`.
