@@ -23,20 +23,17 @@ replacement-readiness claims.
 ## Active Checkpoint
 
 Next autonomous goal checkpoint: route `playable`; mechanically move the full
-fifteen-test attack-strength, PVP, weapon-cost, reach, immunity, and lethal
-reward class beginning with the `assert_attack_damage_close` and
-`attack_strength_test_state` helpers and
-`empty_hand_attack_strength_scales_partial_and_full_damage`, including the
-`run_pvp_commit_cost_case` helper, and ending with
-`concurrent_lethal_attacks_create_one_drop_and_one_xp_reward`, out of aggregate
-`crates/mc-net/src/play/tests.rs` into a focused sibling module. Preserve every
-test and production behavior, leave the following
-`furnace_like_recipe_lookup_uses_matching_cooking_category` test in the
-aggregate file, and use explicit imports rather than a new `use super::*`. The
-complete three-test pickup class has already moved to
-`crates/mc-net/src/play/tests/pickup.rs`; its concentration and validation are
-recorded in
-[`../evidence/mc-net-pickup-test-extraction.md`](../evidence/mc-net-pickup-test-extraction.md).
+nine-test cooking and campfire class beginning with
+`furnace_like_recipe_lookup_uses_matching_cooking_category` and ending with
+`campfire_tick_does_not_load_cold_chunks_and_is_durable_when_resident` out of
+aggregate `crates/mc-net/src/play/tests.rs` into a focused sibling module.
+Preserve every test and production behavior, leave the following
+`shield_use_starts_blocking_state_for_shield_stack` test in the aggregate file,
+and use explicit imports rather than a new `use super::*`. The complete
+fifteen-test attack/PVP class and its three helpers have already moved to
+`crates/mc-net/src/play/tests/attack_pvp.rs`; their concentration and
+validation are recorded in
+[`../evidence/mc-net-attack-pvp-test-extraction.md`](../evidence/mc-net-attack-pvp-test-extraction.md).
 The owner-run subjective fresh-world seed-`712816` playtest and
 release-candidate performance gates remain queued at their declared
 boundaries.

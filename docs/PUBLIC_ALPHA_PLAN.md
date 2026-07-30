@@ -132,6 +132,11 @@ not replace functional, package, workspace, or real-client gates.
    its conservation, inventory publication, and fail-closed saturation
    coverage is recorded in
    [`evidence/mc-net-pickup-test-extraction.md`](evidence/mc-net-pickup-test-extraction.md).
+   The following fifteen-test attack-strength, PVP, weapon-cost, reach,
+   immunity, and lethal-reward class now lives in focused
+   `play/tests/attack_pvp.rs`; its preserved authority, conservation,
+   publication, and concurrent-lethal-reward coverage is recorded in
+   [`evidence/mc-net-attack-pvp-test-extraction.md`](evidence/mc-net-attack-pvp-test-extraction.md).
 4. [ ] Separate behavioral tests from structural tripwires. Structural checks may
    enforce crate ownership and dependency direction, but may not assert Rust
    statement order or source-text layout.
