@@ -66,6 +66,10 @@ not replace functional, package, workspace, or real-client gates.
    focused `play/tests/button_planning.rs`; its scheduling and unloaded-neighbor
    fences are recorded in
    [`evidence/mc-net-button-planning-test-extraction.md`](evidence/mc-net-button-planning-test-extraction.md).
+   The following nine-test scheduled-button runtime and concurrency class now
+   lives in focused `play/tests/scheduled_buttons.rs`; its regional commit,
+   cleanup, writer-independence, and journal-ordering fences are recorded in
+   [`evidence/mc-net-scheduled-button-test-extraction.md`](evidence/mc-net-scheduled-button-test-extraction.md).
 4. [ ] Separate behavioral tests from structural tripwires. Structural checks may
    enforce crate ownership and dependency direction, but may not assert Rust
    statement order or source-text layout.
