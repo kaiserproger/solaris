@@ -23,12 +23,20 @@ replacement-readiness claims.
 ## Active Checkpoint
 
 Next autonomous goal checkpoint: route `playable`; mechanically move the
-`client_view_distance_is_clamped_to_server_policy` test out of aggregate
-`crates/mc-net/src/play/tests.rs` into a focused sibling module. Preserve its
-complete server-policy clamp matrix and production behavior, leave the
-preceding `gamemode_command_rejects_unknown_or_extra_args` test and following
+complete two-test game-mode command parser class, beginning with
+`gamemode_command_parses_names_and_numeric_modes` and ending with
+`gamemode_command_rejects_unknown_or_extra_args`, out of aggregate
+`crates/mc-net/src/play/tests.rs` into a focused sibling module. Preserve every
+assertion and production behavior, leave the preceding
+`arrow_launch_uses_player_look_direction_and_draw_power` test and following
 `button_test_registry` helper aggregate-owned, and use explicit imports rather
 than a new `use super::*`.
+
+The complete client-view-distance server-policy clamp matrix has moved to
+`crates/mc-net/src/play/tests/client_view_distance.rs`. Its server-cap,
+client-cap, minimum, negative-input, and absolute-maximum coverage is recorded
+in
+[`../evidence/mc-net-client-view-distance-test-extraction.md`](../evidence/mc-net-client-view-distance-test-extraction.md).
 
 The complete two-test play custom-payload classification class, beginning with
 `oversized_play_custom_payload_is_rejected_before_decode` and ending with

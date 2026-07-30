@@ -25,6 +25,7 @@ mod button_planning;
 mod button_runtime_edges;
 mod campfire_cooking;
 mod chest;
+mod client_view_distance;
 mod container_inventory;
 mod container_safety;
 mod death_xp;
@@ -3466,15 +3467,6 @@ fn gamemode_command_rejects_unknown_or_extra_args() {
     assert_eq!(parse_gamemode_command("time set day"), None);
     assert_eq!(parse_gamemode_command("gamemode nope"), None);
     assert_eq!(parse_gamemode_command("gamemode creative other"), None);
-}
-
-#[test]
-fn client_view_distance_is_clamped_to_server_policy() {
-    assert_eq!(clamp_client_view_distance(12, 8), 8);
-    assert_eq!(clamp_client_view_distance(6, 10), 6);
-    assert_eq!(clamp_client_view_distance(0, 10), 2);
-    assert_eq!(clamp_client_view_distance(-8, 1), 2);
-    assert_eq!(clamp_client_view_distance(i8::MAX, i32::MAX), 32);
 }
 
 fn button_test_registry() -> mc_world::BlockRegistry {

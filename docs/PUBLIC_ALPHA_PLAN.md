@@ -201,6 +201,10 @@ not replace functional, package, workspace, or real-client gates.
    Loader interaction-channel ownership, and preserved classification coverage
    are recorded in
    [`evidence/mc-net-play-custom-payload-test-extraction.md`](evidence/mc-net-play-custom-payload-test-extraction.md).
+   The following client-view-distance policy test now lives in focused
+   `play/tests/client_view_distance.rs`; its server-cap, client-cap, minimum,
+   negative-input, and absolute-maximum coverage is recorded in
+   [`evidence/mc-net-client-view-distance-test-extraction.md`](evidence/mc-net-client-view-distance-test-extraction.md).
 4. [ ] Separate behavioral tests from structural tripwires. Structural checks may
    enforce crate ownership and dependency direction, but may not assert Rust
    statement order or source-text layout.
