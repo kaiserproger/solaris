@@ -23,18 +23,26 @@ replacement-readiness claims.
 ## Active Checkpoint
 
 Next autonomous goal checkpoint: route `playable`; mechanically move the
-`play_loop_closes_session_when_outbound_write_stalls` test from aggregate
-`crates/mc-net/src/play/tests.rs` to a focused sibling module. Preserve the
-64-byte duplex reader, three-write `AllowThenStallWriter`, buffer,
-session/simulation fixtures and starting write-timeout count, slow-client
-config, capacity-one outbound channel, `AnimatePlayer { entity_id: 1 }`
-`try_send` and exact expectation, exact pose and overworld survival respawn,
-250 ms timeout, complete `play_loop` argument list with both `"SlowWriter"`
-names, exact timeout and clean-close expectations, and final
-`start_timeouts + 1` assertion. Leave the preceding
 `enchanting_button_commits_xp_through_owner_before_mutating_table_inputs` test
-and following `state` helper aggregate-owned, and use explicit imports rather
-than a new `use super::*`.
+from aggregate `crates/mc-net/src/play/tests.rs` to a focused sibling module.
+Preserve the required item/facts registries and stone-pickaxe/lapis ids,
+interaction state and simulation owner, exact pose/profile/session registration,
+persisted XP and enchanting inputs, table window id/position/inputs, active
+container, cloned session/world authority, survival/XP/writer fixtures, pinned
+container-button request, pending-before-owner-commit assertion and exact
+message, one processed owner command, final XP/table/input,
+`minecraft:efficiency`, and persistence assertions, exact atomic-commit
+message, and non-empty writer.
+Leave the preceding
+`enchanting_bookshelf_geometry_requires_clear_midpoints_and_caps_at_fifteen`
+test and following `state` helper aggregate-owned, and use explicit imports
+rather than a new `use super::*`.
+
+The complete outbound write-stall play-loop test has moved to
+`crates/mc-net/src/play/tests/outbound_write_stall.rs`. Its unchanged queued
+animation, stall fixtures, exact pose/respawn and play-loop arguments,
+expectations, and timeout counter are recorded in
+[`../evidence/mc-net-outbound-write-stall-test-extraction.md`](../evidence/mc-net-outbound-write-stall-test-extraction.md).
 
 The complete direct-response write-stall play-loop test has moved to
 `crates/mc-net/src/play/tests/direct_response_write_stall.rs`. Its unchanged
