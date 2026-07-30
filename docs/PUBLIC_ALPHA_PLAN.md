@@ -152,6 +152,11 @@ not replace functional, package, workspace, or real-client gates.
    `play/tests/player_damage.rs`; its preserved death, inventory, equipment,
    motion, and publication-fencing coverage is recorded in
    [`evidence/mc-net-player-damage-test-extraction.md`](evidence/mc-net-player-damage-test-extraction.md).
+   The following five-test falling-block start, landing, world-writer
+   independence, item-drop, and stale-plan class now lives in focused
+   `play/tests/falling_blocks.rs`; its preserved planning, authority,
+   publication, and stale-snapshot coverage is recorded in
+   [`evidence/mc-net-falling-blocks-test-extraction.md`](evidence/mc-net-falling-blocks-test-extraction.md).
 4. [ ] Separate behavioral tests from structural tripwires. Structural checks may
    enforce crate ownership and dependency direction, but may not assert Rust
    statement order or source-text layout.
