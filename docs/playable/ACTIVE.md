@@ -23,15 +23,22 @@ replacement-readiness claims.
 ## Active Checkpoint
 
 Next autonomous goal checkpoint: route `playable`; mechanically move the
-`enchanting_bookshelf_geometry_requires_clear_midpoints_and_caps_at_fifteen`
+`held_sharpness_uses_the_vanilla_26_1_2_damage_formula`
 test from aggregate `crates/mc-net/src/play/tests.rs` to a focused sibling
-module. Preserve the exact table, two provider, and two gap positions; provider
-and clear-gap sets; first count with both clear gaps equal to `2`; second count
-with only the first gap clear equal to `1`; and all-provider/all-clear cap equal
-to `15`. Leave the preceding
-`held_sharpness_uses_the_vanilla_26_1_2_damage_formula` test and following
+module. Preserve the Solaris-required item registry and stone-sword id,
+interaction state built from the fluid test registry, assigned item registry,
+hotbar stack enchanted with `minecraft:sharpness` level `3`, base stone-sword
+attack damage equal to `5.0`, and held enchanted attack damage equal to `7.0`.
+Leave the preceding
+`fifteen_bookshelves_expose_and_apply_protection_to_armor` test and following
 `state` helper aggregate-owned, and use explicit imports rather than a new
 `use super::*`.
+
+The complete enchanting bookshelf-geometry test has moved to
+`crates/mc-net/src/play/tests/enchanting_bookshelf_geometry.rs`. Its unchanged
+table, provider and midpoint positions, both-clear and partial-clear counts,
+and fifteen-shelf cap are recorded in
+[`../evidence/mc-net-enchanting-bookshelf-geometry-test-extraction.md`](../evidence/mc-net-enchanting-bookshelf-geometry-test-extraction.md).
 
 The complete enchanting owner-commit test has moved to
 `crates/mc-net/src/play/tests/enchanting_owner_commit.rs`. Its unchanged

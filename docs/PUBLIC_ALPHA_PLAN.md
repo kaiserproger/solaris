@@ -408,6 +408,11 @@ not replace functional, package, workspace, or real-client gates.
    one processed owner command, atomic XP/input persistence, exact efficiency
    result, and writer output are recorded in
    [`evidence/mc-net-enchanting-owner-commit-test-extraction.md`](evidence/mc-net-enchanting-owner-commit-test-extraction.md).
+   The following enchanting bookshelf-geometry test now lives in focused
+   `play/tests/enchanting_bookshelf_geometry.rs`; its exact table, provider,
+   midpoint-clearance, partial-clearance, and fifteen-shelf cap assertions are
+   recorded in
+   [`evidence/mc-net-enchanting-bookshelf-geometry-test-extraction.md`](evidence/mc-net-enchanting-bookshelf-geometry-test-extraction.md).
 4. [ ] Separate behavioral tests from structural tripwires. Structural checks may
    enforce crate ownership and dependency direction, but may not assert Rust
    statement order or source-text layout.
