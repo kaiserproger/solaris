@@ -122,6 +122,11 @@ not replace functional, package, workspace, or real-client gates.
    `play/tests/furnace.rs`; its preserved container, resident-state,
    world-writer, observer, and owner-commit coverage is recorded in
    [`evidence/mc-net-furnace-test-extraction.md`](evidence/mc-net-furnace-test-extraction.md).
+   The following four-test chest mutation, stale-click, snapshot, and
+   concurrent-conservation class now lives in focused `play/tests/chest.rs`;
+   its preserved storage, state-id, publication, and shared-view coverage is
+   recorded in
+   [`evidence/mc-net-chest-test-extraction.md`](evidence/mc-net-chest-test-extraction.md).
 4. [ ] Separate behavioral tests from structural tripwires. Structural checks may
    enforce crate ownership and dependency direction, but may not assert Rust
    statement order or source-text layout.

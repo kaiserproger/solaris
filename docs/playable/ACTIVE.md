@@ -23,17 +23,17 @@ replacement-readiness claims.
 ## Active Checkpoint
 
 Next autonomous goal checkpoint: route `playable`; mechanically move the
-contiguous four-test chest class beginning with
-`chest_window_swap_and_throw_mutate_storage_slots` and ending with
-`shared_chest_same_version_click_commits_once_and_conserves_items` out of
-aggregate `crates/mc-net/src/play/tests.rs` into a focused sibling module.
-Preserve every test and production behavior, leave the preceding shared
-`decode_player_position_sync_packets` helper and following
-`spawn_test_simulation_owner` helper in the aggregate file, and use explicit
-imports rather than a new `use super::*`. The complete fourteen-test furnace
-class has already moved to `crates/mc-net/src/play/tests/furnace.rs`; its
-concentration and validation are recorded in
-[`../evidence/mc-net-furnace-test-extraction.md`](../evidence/mc-net-furnace-test-extraction.md).
+contiguous three-test item, XP, and arrow-pickup class beginning with
+`concurrent_pickup_tasks_conserve_item_and_xp_entities` and ending with
+`full_simulation_queue_leaves_item_pickup_state_unchanged` out of aggregate
+`crates/mc-net/src/play/tests.rs` into a focused sibling module. Preserve every
+test and production behavior, leave the preceding shared
+`register_survival_test_player` helper and following
+`assert_attack_damage_close` helper in the aggregate file, and use explicit
+imports rather than a new `use super::*`. The complete four-test chest class
+has already moved to `crates/mc-net/src/play/tests/chest.rs`; its concentration
+and validation are recorded in
+[`../evidence/mc-net-chest-test-extraction.md`](../evidence/mc-net-chest-test-extraction.md).
 The owner-run subjective fresh-world seed-`712816` playtest and
 release-candidate performance gates remain queued at their declared
 boundaries.
