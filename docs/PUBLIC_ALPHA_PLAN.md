@@ -267,6 +267,10 @@ not replace functional, package, workspace, or real-client gates.
    `play/tests/stone_full_cube_collision.rs`; its vanilla state identity,
    published block, center pose, and full-cube coverage is recorded in
    [`evidence/mc-net-stone-full-cube-collision-test-extraction.md`](evidence/mc-net-stone-full-cube-collision-test-extraction.md).
+   The following deflated fence-top boundary test now lives in focused
+   `play/tests/fence_deflation_boundary.rs`; its isolated-fence state, oracle
+   deflation, minimum-Y scan, and both boundary sides are recorded in
+   [`evidence/mc-net-fence-deflation-boundary-test-extraction.md`](evidence/mc-net-fence-deflation-boundary-test-extraction.md).
 4. [ ] Separate behavioral tests from structural tripwires. Structural checks may
    enforce crate ownership and dependency direction, but may not assert Rust
    statement order or source-text layout.

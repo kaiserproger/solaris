@@ -23,14 +23,20 @@ replacement-readiness claims.
 ## Active Checkpoint
 
 Next autonomous goal checkpoint: route `playable`; mechanically move the
-`player_collision_scans_fence_below_at_deflated_top_boundary` test out of
+`player_collision_uses_tall_narrow_fence_box` test out of
 aggregate `crates/mc-net/src/play/tests.rs` into a focused sibling module.
-Preserve its isolated-fence state, oracle `1.0e-5_f32` deflation, both sides
-of the deflated `1.5`-block top boundary, minimum-Y scan coverage, and
-production behavior, leave the preceding
-`player_collision_uses_tall_narrow_fence_box` test and following
-`button_test_registry` helper aggregate-owned, and use explicit imports rather
-than a new `use super::*`.
+Preserve its isolated-fence state, empty space beside the narrow post,
+`1.5`-block collision height, exact outside/inside poses, and production
+behavior, leave the preceding `player_collision_uses_oriented_stair_boxes`
+test and following `button_test_registry` helper aggregate-owned, and use
+explicit imports rather than a new `use super::*`.
+
+The complete deflated fence-top boundary test has moved to
+`crates/mc-net/src/play/tests/fence_deflation_boundary.rs`. Its isolated-fence
+state, oracle `1.0e-5_f32` deflation, both sides of the deflated `1.5`-block
+top boundary, minimum-Y scan, and published collision-context coverage are
+recorded in
+[`../evidence/mc-net-fence-deflation-boundary-test-extraction.md`](../evidence/mc-net-fence-deflation-boundary-test-extraction.md).
 
 The complete exact-stone full-cube test has moved to
 `crates/mc-net/src/play/tests/stone_full_cube_collision.rs`. Its exact vanilla

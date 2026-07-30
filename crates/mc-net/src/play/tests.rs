@@ -37,6 +37,7 @@ mod door_toggles;
 mod enchanting_recipe_settlement;
 mod entity_tick_cadence;
 mod falling_blocks;
+mod fence_deflation_boundary;
 mod fluid_runtime;
 mod furnace;
 mod gamemode_commands;
@@ -2928,41 +2929,6 @@ async fn player_collision_uses_tall_narrow_fence_box() {
     assert!(
         player_pose_collides_with_solid(Some(&state), PlayerPose::new(0.5, 65.25, 0.5)).await,
         "the isolated fence post collision extends to 1.5 blocks"
-    );
-}
-
-#[tokio::test]
-async fn player_collision_scans_fence_below_at_deflated_top_boundary() {
-    let state = vanilla_collision_test_state();
-    let fence = vanilla_collision_state_id(
-        &state,
-        "minecraft:oak_fence",
-        &[
-            ("east", "false"),
-            ("north", "false"),
-            ("south", "false"),
-            ("west", "false"),
-            ("waterlogged", "false"),
-        ],
-    );
-    set_collision_test_block(&state, fence).await;
-    let oracle_deflation = f64::from(1.0e-5_f32);
-
-    assert!(
-        !player_pose_collides_with_solid(
-            Some(&state),
-            PlayerPose::new(0.5, 65.5 - oracle_deflation / 2.0, 0.5),
-        )
-        .await,
-        "sub-boundary overlap with the fence top is deflated away"
-    );
-    assert!(
-        player_pose_collides_with_solid(
-            Some(&state),
-            PlayerPose::new(0.5, 65.5 - oracle_deflation * 2.0, 0.5),
-        )
-        .await,
-        "the minimum Y scan must retain the 1.5-block fence below"
     );
 }
 
