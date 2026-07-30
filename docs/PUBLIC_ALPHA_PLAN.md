@@ -245,6 +245,11 @@ Benchmark reproduction happens at that feature boundary, not after every edit:
   prerequisites instead of returning a false-green result. Owners, executable
   fences, and exact close conditions are recorded in
   [`evidence/mc-test-harness-ignored-tests.md`](evidence/mc-test-harness-ignored-tests.md).
+- [x] Classify the two explicit `mc-worldgen` ignores as debug-build stage and
+  throughput probes. Ordinary executable tests remain the behavioral authority;
+  the probes stay opt-in under the worldgen performance feature-boundary policy.
+  Their workloads, limits, owners, and exact close conditions are recorded in
+  [`evidence/mc-worldgen-ignored-tests.md`](evidence/mc-worldgen-ignored-tests.md).
 - [x] Record the exact local 26.1.2 world-clock oracle in
   [`evidence/world-clock-26.1.2.md`](evidence/world-clock-26.1.2.md).
 - [x] Implement the typed world-clock map, separating monotonic `game_time` from
