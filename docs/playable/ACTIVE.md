@@ -23,16 +23,24 @@ replacement-readiness claims.
 ## Active Checkpoint
 
 Next autonomous goal checkpoint: route `playable`; mechanically move the
-`container_title_nbt_reports_oversized_text_instead_of_panicking`
+`entity_movement_write_turn_preserves_order_across_the_budget_boundary`
 test from aggregate `crates/mc-net/src/play/tests.rs` to a focused sibling
 module.
-Preserve its text length of `usize::from(u16::MAX) + 1`, exact
-`"oversized NBT title should fail"` expectation, resulting
-`mc_protocol::CodecError::Nbt` variant, and production behavior. Leave the
-preceding
-`entity_movement_write_turn_preserves_order_across_the_budget_boundary` test and
-following `state` helper aggregate-owned, and use explicit imports rather than
-a new `use super::*`.
+Preserve the inclusive `0..=ENTITY_MOVEMENTS_PER_WRITE_TURN` input, exact
+per-index entity id, `(index, 64.0, 0.0)` position and absolute wire move, zero
+velocity and rotation, grounded state, disabled velocity/head-rotation sends,
+write-turn split, current batch length, first id `0`, last id
+`ENTITY_MOVEMENTS_PER_WRITE_TURN - 1`, one remaining movement with id
+`ENTITY_MOVEMENTS_PER_WRITE_TURN`, and production behavior. Leave the preceding
+`play_loop_drains_bounded_outbound_pressure_without_shedding` test and following
+`state` helper aggregate-owned, and use explicit imports rather than a new
+`use super::*`.
+
+The complete oversized container-title NBT test has moved to
+`crates/mc-net/src/play/tests/container_title_nbt.rs`. Its unchanged oversized
+text length, exact failure expectation, and `CodecError::Nbt` result are
+recorded in
+[`../evidence/mc-net-container-title-nbt-test-extraction.md`](../evidence/mc-net-container-title-nbt-test-extraction.md).
 
 The complete teleport-id allocator test has moved to
 `crates/mc-net/src/play/tests/teleport_id_allocator.rs`. Its unchanged initial

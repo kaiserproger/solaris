@@ -374,6 +374,10 @@ not replace functional, package, workspace, or real-client gates.
    `play/tests/teleport_id_allocator.rs`; its sequential ids, resulting next
    id, maximum-id boundary, and positive wrap are recorded in
    [`evidence/mc-net-teleport-id-allocator-test-extraction.md`](evidence/mc-net-teleport-id-allocator-test-extraction.md).
+   The following oversized container-title NBT test now lives in focused
+   `play/tests/container_title_nbt.rs`; its oversized text boundary, exact
+   failure expectation, and codec error variant are recorded in
+   [`evidence/mc-net-container-title-nbt-test-extraction.md`](evidence/mc-net-container-title-nbt-test-extraction.md).
 4. [ ] Separate behavioral tests from structural tripwires. Structural checks may
    enforce crate ownership and dependency direction, but may not assert Rust
    statement order or source-text layout.

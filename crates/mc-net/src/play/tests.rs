@@ -35,6 +35,7 @@ mod collision_correction_entry;
 mod collision_correction_escape;
 mod container_inventory;
 mod container_safety;
+mod container_title_nbt;
 mod crafting_table_open;
 mod death_xp;
 mod debug_commands;
@@ -1950,15 +1951,6 @@ fn entity_movement_write_turn_preserves_order_across_the_budget_boundary() {
         remaining[0].id,
         EntityId(ENTITY_MOVEMENTS_PER_WRITE_TURN as i32)
     );
-}
-
-#[test]
-fn container_title_nbt_reports_oversized_text_instead_of_panicking() {
-    let oversized = "x".repeat(usize::from(u16::MAX) + 1);
-
-    let err = chest_menu_title_nbt(&oversized).expect_err("oversized NBT title should fail");
-
-    assert!(matches!(err, mc_protocol::CodecError::Nbt(_)));
 }
 
 fn state(id: u32, default: bool, properties: &[(&str, &str)]) -> BlockStateReport {
