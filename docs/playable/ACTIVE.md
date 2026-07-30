@@ -23,13 +23,21 @@ replacement-readiness claims.
 ## Active Checkpoint
 
 Next autonomous goal checkpoint: route `playable`; mechanically move the
-ignored local-sidecar parity test
-`real_door_states_plan_hand_toggle_when_sidecar_is_present` out of aggregate
-`crates/mc-net/src/play/tests.rs` into a focused sibling module. Preserve its
-explicit ignore contract, assertions, and production behavior, leave the
-preceding `loader_interaction_channel_is_claimed_before_extension_forwarding`
-test and following `button_test_registry` helper aggregate-owned, and use
-explicit imports rather than a new `use super::*`.
+complete two-test play custom-payload classification class, beginning with
+`oversized_play_custom_payload_is_rejected_before_decode` and ending with
+`loader_interaction_channel_is_claimed_before_extension_forwarding`, out of
+aggregate `crates/mc-net/src/play/tests.rs` into a focused sibling module.
+Preserve every assertion and production behavior, leave the preceding
+`client_view_distance_is_clamped_to_server_policy` test and following
+`button_test_registry` helper aggregate-owned, and use explicit imports rather
+than a new `use super::*`.
+
+The ignored real-door local-sidecar parity gate
+`real_door_states_plan_hand_toggle_when_sidecar_is_present` has moved to
+`crates/mc-net/src/play/tests/real_door_sidecar.rs`. Its exact ignore contract,
+two-block toggle plan, selected local-sidecar execution, and ownership boundary
+are recorded in
+[`../evidence/mc-net-real-door-sidecar-test-extraction.md`](../evidence/mc-net-real-door-sidecar-test-extraction.md).
 
 The complete four-test use-item-on preflight class, including its
 `test_use_item_on` helper, has moved to

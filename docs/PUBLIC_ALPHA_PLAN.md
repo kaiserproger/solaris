@@ -191,6 +191,11 @@ not replace functional, package, workspace, or real-client gates.
    unsupported-mode, survival-reach, and creative-reach coverage is recorded
    in
    [`evidence/mc-net-use-item-on-preflight-test-extraction.md`](evidence/mc-net-use-item-on-preflight-test-extraction.md).
+   The following ignored real-door local-sidecar parity gate now lives in
+   focused `play/tests/real_door_sidecar.rs`; its exact ignore contract,
+   two-block toggle plan, selected local-sidecar execution, and ownership
+   boundary are recorded in
+   [`evidence/mc-net-real-door-sidecar-test-extraction.md`](evidence/mc-net-real-door-sidecar-test-extraction.md).
 4. [ ] Separate behavioral tests from structural tripwires. Structural checks may
    enforce crate ownership and dependency direction, but may not assert Rust
    statement order or source-text layout.
