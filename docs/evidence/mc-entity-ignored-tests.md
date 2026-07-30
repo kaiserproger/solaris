@@ -68,3 +68,29 @@ cargo test -p mc-entity -- --list --ignored
 
 It lists the six names above and no other ignored unit, integration, or doctest
 in `mc-entity`.
+
+## Current-tree revalidation
+
+The wrapper later replayed this checkpoint from its original
+`5328f9dcc550ffb9f5499b40c4806ade4ea1300a` resume base even though commit
+`8add5e32f0eff83ec6080983b37e89b57ec836f7` had already closed it. The
+2026-07-30 revalidation used current tree
+`10d542976dd688b2b98c548601e80996af2d089e` and confirmed:
+
+- `cargo test -p mc-entity -- --list --ignored` still lists exactly the six
+  benchmark reports in the inventory and no integration or doctest ignores;
+- the always-executable
+  `dense_ecs_pathing_requests_are_stably_ordered`,
+  `cached_single_animal_cas_bypasses_the_coordinator_actor`, and
+  `owner_coordinator_damage_uses_snapshot_cas_and_reports_lethal_result`
+  regressions each pass;
+- no ignored benchmark was executed or claimed as reproduced.
+- one independent read-only review passed with no findings after checking the
+  source annotations, captured inventory, focused regressions, policy, links,
+  scope, and next cursor.
+
+This is a documentation/test-policy checkpoint. Affected-package, workspace,
+Clippy, and graphical gates are not mapped to it and were not rerun. The next
+Phase 1 cursor is one bounded `mc-net` wall-clock-wait test class under item 2;
+inventory and replace/classify the first real polling or sleep dependency
+without combining unrelated gameplay work.
