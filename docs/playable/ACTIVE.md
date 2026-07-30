@@ -23,15 +23,24 @@ replacement-readiness claims.
 ## Active Checkpoint
 
 Next autonomous goal checkpoint: route `playable`; mechanically move the
-`pending_teleport_movement_guard_returns_false_without_pending_teleport`
+`teleport_command_waits_for_pending_confirmation_before_repositioning_player`
 test from aggregate `crates/mc-net/src/play/tests.rs` to a focused sibling
 module.
-Preserve its exact absent pending teleport, packet name
-`ServerboundMovePlayerPos`, false guard result, and production behavior. Leave
-the preceding
-`teleport_command_waits_for_pending_confirmation_before_repositioning_player`
-test and following `state` helper aggregate-owned, and use explicit imports
-rather than a new `use super::*`.
+Preserve its exact slow-client config, session/simulation fixtures, original
+pose `(1.0, 65.0, 2.0)`, `/tp 10 70 -5` console command, Survival/FULL/default
+XP state, pending teleport id `7` at sent tick `0`, next id `8`, absent chunk
+stream, `1/1` chunk-pipeline limits, empty position-sync output, retained
+pending/next ids, unchanged position, yaw and pitch, and production behavior.
+Leave the preceding
+`pending_teleport_resends_after_vanilla_tick_window` test and following
+`state` helper aggregate-owned, and use explicit imports rather than a new
+`use super::*`.
+
+The complete no-state pending-teleport movement guard test has moved to
+`crates/mc-net/src/play/tests/pending_teleport_movement_guard.rs`. Its absent
+pending state, exact `ServerboundMovePlayerPos` packet name, and false guard
+result are recorded in
+[`../evidence/mc-net-pending-teleport-no-state-guard-test-extraction.md`](../evidence/mc-net-pending-teleport-no-state-guard-test-extraction.md).
 
 The complete stale-container isolation test has moved to
 `crates/mc-net/src/play/tests/stale_container_updates.rs`. Its unchanged

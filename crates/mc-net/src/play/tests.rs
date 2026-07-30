@@ -55,6 +55,7 @@ mod movement_block_reads;
 mod natural_random_ticks;
 mod oracle_aabb_deflation_boundary;
 mod oriented_stair_collision;
+mod pending_teleport_movement_guard;
 mod pickup;
 mod plants;
 mod play_custom_payload;
@@ -2132,16 +2133,6 @@ async fn teleport_command_waits_for_pending_confirmation_before_repositioning_pl
     assert_eq!(player_pose.z, original_pose.z);
     assert_eq!(player_pose.yaw, original_pose.yaw);
     assert_eq!(player_pose.pitch, original_pose.pitch);
-}
-
-#[test]
-fn pending_teleport_movement_guard_returns_false_without_pending_teleport() {
-    let pending = None;
-
-    assert!(!guard_pending_teleport_movement(
-        &pending,
-        "ServerboundMovePlayerPos"
-    ));
 }
 
 fn state(id: u32, default: bool, properties: &[(&str, &str)]) -> BlockStateReport {

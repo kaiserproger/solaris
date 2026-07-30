@@ -336,6 +336,10 @@ not replace functional, package, workspace, or real-client gates.
    furnace ids, mismatched lookups, and retained active-container variants are
    recorded in
    [`evidence/mc-net-stale-container-updates-test-extraction.md`](evidence/mc-net-stale-container-updates-test-extraction.md).
+   The following no-state pending-teleport movement guard test now lives in
+   focused `play/tests/pending_teleport_movement_guard.rs`; its absent pending
+   state, exact move-packet name, and false guard result are recorded in
+   [`evidence/mc-net-pending-teleport-no-state-guard-test-extraction.md`](evidence/mc-net-pending-teleport-no-state-guard-test-extraction.md).
 4. [ ] Separate behavioral tests from structural tripwires. Structural checks may
    enforce crate ownership and dependency direction, but may not assert Rust
    statement order or source-text layout.
