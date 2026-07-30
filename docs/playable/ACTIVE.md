@@ -23,17 +23,18 @@ replacement-readiness claims.
 ## Active Checkpoint
 
 Next autonomous goal checkpoint: route `playable`; mechanically move the full
-nine-test cooking and campfire class beginning with
-`furnace_like_recipe_lookup_uses_matching_cooking_category` and ending with
-`campfire_tick_does_not_load_cold_chunks_and_is_durable_when_resident` out of
+thirteen-test shield-use, activation, directional blocking, durability,
+game-mode transition, publication, and CAS-conflict class beginning with
+`shield_use_starts_blocking_state_for_shield_stack` and ending with
+`repeated_shield_cas_conflict_refreshes_owner_state_and_fails_closed` out of
 aggregate `crates/mc-net/src/play/tests.rs` into a focused sibling module.
-Preserve every test and production behavior, leave the following
-`shield_use_starts_blocking_state_for_shield_stack` test in the aggregate file,
-and use explicit imports rather than a new `use super::*`. The complete
-fifteen-test attack/PVP class and its three helpers have already moved to
-`crates/mc-net/src/play/tests/attack_pvp.rs`; their concentration and
+Preserve every test and production behavior, leave the following shared
+`campfire_test_interaction_state` helper in the aggregate file, and use explicit
+imports rather than a new `use super::*`. The complete nine-test cooking and
+campfire class has already moved to
+`crates/mc-net/src/play/tests/campfire_cooking.rs`; its concentration and
 validation are recorded in
-[`../evidence/mc-net-attack-pvp-test-extraction.md`](../evidence/mc-net-attack-pvp-test-extraction.md).
+[`../evidence/mc-net-campfire-cooking-test-extraction.md`](../evidence/mc-net-campfire-cooking-test-extraction.md).
 The owner-run subjective fresh-world seed-`712816` playtest and
 release-candidate performance gates remain queued at their declared
 boundaries.
