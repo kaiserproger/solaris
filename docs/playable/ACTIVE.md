@@ -23,20 +23,23 @@ replacement-readiness claims.
 ## Active Checkpoint
 
 Next autonomous goal checkpoint: route `playable`; mechanically move the
-`rejected_inventory_drag_resyncs_without_mutation_or_owner_publication`
+`only_vanilla_outside_slot_sentinel_can_drop_the_cursor`
 test from aggregate `crates/mc-net/src/play/tests.rs` to a focused sibling
-module. Preserve the dirt item report at protocol id `10`; carried dirt count
-`3`; cloned pre-click inventory and carried state; actual hashed carried stack
-with item id `10`, count `3`, and empty component hashes; script player
-identity/context; default XP; opening and rejected quick-craft clicks
-`(0, -999)` and `(2, -999)` in survival with pose `(0.5, 64.0, 0.5)`,
-container id `0`, state id `1`, empty changed slots, and no scripts/events;
-unchanged inventory slots and carried state; simulation depth `0`; and exactly
-one container-content packet containing the pre-click wire inventory and
-carried item. Leave the preceding
-`only_vanilla_outside_slot_sentinel_can_drop_the_cursor` test and following
+module. Preserve the click constructor's container id `0`, state id `1`,
+button `0`, `ContainerInput::Pickup`, empty changed slots, and empty carried
+hashed stack; classification of slot `-999` as
+`ContainerClickAction::OutsidePickup { button: 0 }`; and classification of
+malformed slots `-1`, `-2`, and `i16::MIN` as
+`ContainerClickAction::Unsupported`. Leave the preceding
+`dense_entity_simulation_rotates_lane_sized_cohorts` test and following
 `state` helper aggregate-owned, and use explicit imports rather than a new
 `use super::*`.
+
+The complete rejected inventory-drag resync test has moved to
+`crates/mc-net/src/play/tests/rejected_inventory_drag.rs`. Its unchanged
+quick-craft fixtures, inventory/carried state, zero owner-publication depth,
+and exact resync packet are recorded in
+[`../evidence/mc-net-rejected-inventory-drag-test-extraction.md`](../evidence/mc-net-rejected-inventory-drag-test-extraction.md).
 
 The complete stale inventory-drag resync test has moved to
 `crates/mc-net/src/play/tests/stale_inventory_drag.rs`. Its unchanged

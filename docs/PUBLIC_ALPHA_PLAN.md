@@ -455,6 +455,10 @@ not replace functional, package, workspace, or real-client gates.
    authoritative inventory recovery, one resync packet, and no-publication
    boundary are recorded in
    [`evidence/mc-net-stale-inventory-drag-test-extraction.md`](evidence/mc-net-stale-inventory-drag-test-extraction.md).
+   The following rejected inventory-drag resync test now lives in focused
+   `play/tests/rejected_inventory_drag.rs`; its unchanged inventory, zero
+   owner-publication depth, and exact resync packet are recorded in
+   [`evidence/mc-net-rejected-inventory-drag-test-extraction.md`](evidence/mc-net-rejected-inventory-drag-test-extraction.md).
 4. [ ] Separate behavioral tests from structural tripwires. Structural checks may
    enforce crate ownership and dependency direction, but may not assert Rust
    statement order or source-text layout.
