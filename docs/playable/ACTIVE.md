@@ -22,10 +22,16 @@ replacement-readiness claims.
 
 ## Active Checkpoint
 
-Next: add a bounded deterministic renderer for revision-10 height, biome, and
-vegetation mosaics, then record the exact seed set, extent, palette, checksums,
-and rendered artifacts. Keep the seed-`712816` owner playtest, restart, and
-release-host throughput comparison for their own checkpoints.
+Next: run the clean fresh-world seed-`712816` owner playtest on the exact
+candidate tree, using the checked height, biome, and vegetation mosaics as
+navigation context. Keep restart and release-host throughput comparison as
+separate follow-up checkpoints.
+
+The current tree now includes a deterministic production-sampler renderer and
+checked `2048x2048`-block height, biome, and vegetation artifacts for seed
+`712816`. The exact extent, resolution, fixed palettes, reproduction command,
+SHA-256 checksums, and evidence boundary are recorded in
+[`../evidence/worldgen-mosaics.md`](../evidence/worldgen-mosaics.md).
 
 The downhill-drainage vertical is closed. Revision-10 cells now select only
 strictly lower seeded hydraulic elevations, depth-three accumulation stays

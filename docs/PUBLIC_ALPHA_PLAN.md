@@ -373,7 +373,8 @@ Benchmark reproduction happens at that feature boundary, not after every edit:
   seed/order/border regressions. The mapped debug stage and 25-chunk throughput
   probes are recorded in
   [`evidence/worldgen-downhill-drainage.md`](evidence/worldgen-downhill-drainage.md).
-- [ ] Complete revision-10 drainage, rendered height/biome/vegetation mosaics,
+- [ ] Complete revision-10 drainage,
+  [rendered height/biome/vegetation mosaics](evidence/worldgen-mosaics.md),
   clean seed-`712816` owner playtest, restart, and release-host throughput gates.
 
 ## Observed baseline
@@ -472,8 +473,9 @@ Acceptance:
 - Seeds `0`, `712816`, `-1` and at least 29 generated regression seeds have
   different height, biome and feature fingerprints near their selected spawns.
 - No production branch checks fixed world coordinates to place starter resources.
-- Seed `712816` receives a clean fresh-world owner playtest and rendered
-  height/biome/vegetation mosaics for at least a 2048x2048-block area.
+- Seed `712816` receives a clean fresh-world owner playtest and
+  [rendered height/biome/vegetation mosaics](evidence/worldgen-mosaics.md) for
+  at least a 2048x2048-block area.
 - Multi-seed metrics reject a single biome occupying an unreasonable share of the
   sampled land unless the seed naturally produces that result at a larger scale.
 - Chunk seams, cave surface shell, water fill, persistence and restart gates pass.

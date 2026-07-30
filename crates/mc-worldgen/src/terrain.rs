@@ -81,6 +81,15 @@ pub struct SpawnLocation {
     pub block_z: i32,
 }
 
+/// Read-only view of the production column plan for diagnostics and tooling.
+#[derive(Clone, Debug, PartialEq)]
+pub struct TerrainDiagnosticSample {
+    pub surface_y: i32,
+    pub biome: Identifier,
+    /// The production vegetation density for biomes that support land vegetation.
+    pub vegetation_density: Option<f64>,
+}
+
 impl SpawnLocation {
     #[must_use]
     pub const fn chunk(self) -> ChunkPos {
@@ -566,6 +575,30 @@ impl TerrainGenerator {
         self.density_router().sample(world_x, world_z).surface_y
     }
 
+    /// Sample the same terrain, biome, and vegetation decisions used to plan a
+    /// generated column, without constructing or mutating a chunk.
+    #[must_use]
+    pub fn diagnostic_sample(&self, world_x: i32, world_z: i32) -> TerrainDiagnosticSample {
+        let sample = self.density_router().sample(world_x, world_z);
+        let surface_y = sample.surface_y;
+        let biome = match self.worldgen_mode {
+            WorldgenMode::VanillaLike => {
+                self.vanilla_biome_for(world_x, world_z, surface_y, sample)
+            }
+            WorldgenMode::TellusLike(settings) => {
+                self.tellus_biome_for(world_x, world_z, surface_y, settings, sample)
+            }
+        };
+        let vegetation_density = self
+            .biome_supports_land_vegetation(&biome)
+            .then(|| self.vegetation_density(world_x, world_z, sample.moisture));
+        TerrainDiagnosticSample {
+            surface_y,
+            biome,
+            vegetation_density,
+        }
+    }
+
     /// Find a deterministic natural spawn centre without modifying terrain.
     ///
     /// The search walks expanding 64-block rings around the origin and accepts
@@ -847,27 +880,21 @@ impl TerrainGenerator {
         (regional * 0.72 + moisture * 0.28).clamp(-1.0, 1.0)
     }
 
+    fn biome_supports_land_vegetation(&self, biome: &Identifier) -> bool {
+        self.biomes.grassland.contains(biome)
+            || self.biomes.temperate_forest.contains(biome)
+            || self.biomes.jungle.contains(biome)
+            || Self::is_cold_forest(biome)
+            || Self::is_savanna(biome)
+    }
+
     fn plan_column(&self, pos: ChunkPos, lx: u8, lz: u8) -> ColumnPlan {
         let wx = world_block_coordinate(pos.x, lx);
         let wz = world_block_coordinate(pos.z, lz);
-        let sample = self.density_router().sample(wx, wz);
-        let height = sample.surface_y;
-        let biome = match self.worldgen_mode {
-            WorldgenMode::VanillaLike => self.vanilla_biome_for(wx, wz, height, sample),
-            WorldgenMode::TellusLike(settings) => {
-                self.tellus_biome_for(wx, wz, height, settings, sample)
-            }
-        };
-        let vegetation_density = if self.biomes.grassland.contains(&biome)
-            || self.biomes.temperate_forest.contains(&biome)
-            || self.biomes.jungle.contains(&biome)
-            || Self::is_cold_forest(&biome)
-            || Self::is_savanna(&biome)
-        {
-            self.vegetation_density(wx, wz, sample.moisture)
-        } else {
-            -1.0
-        };
+        let diagnostic = self.diagnostic_sample(wx, wz);
+        let height = diagnostic.surface_y;
+        let biome = diagnostic.biome;
+        let vegetation_density = diagnostic.vegetation_density.unwrap_or(-1.0);
         let (sea_level, water_enabled) = match self.worldgen_mode {
             WorldgenMode::VanillaLike => (SEA_LEVEL, true),
             WorldgenMode::TellusLike(settings) => (settings.sea_level, settings.water_enabled),
