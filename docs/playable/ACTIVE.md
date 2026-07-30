@@ -23,18 +23,17 @@ replacement-readiness claims.
 ## Active Checkpoint
 
 Next autonomous goal checkpoint: route `playable`; mechanically move the full
-thirteen-test shield-use, activation, directional blocking, durability,
-game-mode transition, publication, and CAS-conflict class beginning with
-`shield_use_starts_blocking_state_for_shield_stack` and ending with
-`repeated_shield_cas_conflict_refreshes_owner_state_and_fails_closed` out of
+remaining eleven-test player contact-damage, pushed-damage, armor, knockback,
+and stale-publication tail beginning with
+`player_collision_allows_lit_campfire_overlap_for_contact_damage` and ending
+with `stale_damage_publication_does_not_apply_health_side_effects` out of
 aggregate `crates/mc-net/src/play/tests.rs` into a focused sibling module.
-Preserve every test and production behavior, leave the following shared
+Preserve every test and production behavior, leave the preceding shared
 `campfire_test_interaction_state` helper in the aggregate file, and use explicit
-imports rather than a new `use super::*`. The complete nine-test cooking and
-campfire class has already moved to
-`crates/mc-net/src/play/tests/campfire_cooking.rs`; its concentration and
-validation are recorded in
-[`../evidence/mc-net-campfire-cooking-test-extraction.md`](../evidence/mc-net-campfire-cooking-test-extraction.md).
+imports rather than a new `use super::*`. The complete thirteen-test shield
+class has already moved to `crates/mc-net/src/play/tests/shield.rs`; its
+concentration and validation are recorded in
+[`../evidence/mc-net-shield-test-extraction.md`](../evidence/mc-net-shield-test-extraction.md).
 The owner-run subjective fresh-world seed-`712816` playtest and
 release-candidate performance gates remain queued at their declared
 boundaries.

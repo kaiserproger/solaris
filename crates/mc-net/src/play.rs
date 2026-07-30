@@ -226,8 +226,6 @@ use falling_blocks::{
     is_falling_block_state, plan_falling_block_landings, plan_falling_block_starts,
 };
 pub(crate) use inhabited_time::InhabitedTimeAccumulator;
-#[cfg(test)]
-use mc_protocol::packets::play::{LIVING_ENTITY_FLAG_OFF_HAND, LIVING_ENTITY_FLAG_USING_ITEM};
 pub(crate) use session::SessionRegistry;
 #[cfg(test)]
 pub(in crate::play) use session::{ENTITY_PICKUP_RADIUS, ITEM_PICKUP_DELAY_TICKS};

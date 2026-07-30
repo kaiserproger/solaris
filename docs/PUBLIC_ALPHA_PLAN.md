@@ -142,6 +142,11 @@ not replace functional, package, workspace, or real-client gates.
    `play/tests/campfire_cooking.rs`; its preserved recipe-category,
    conservation, NBT, resident-chunk, and WAL coverage is recorded in
    [`evidence/mc-net-campfire-cooking-test-extraction.md`](evidence/mc-net-campfire-cooking-test-extraction.md).
+   The following thirteen-test shield use, activation, directional blocking,
+   durability, game-mode transition, publication, and CAS-conflict class now
+   lives in focused `play/tests/shield.rs`; its preserved shield-state,
+   inventory, owner-commit, and fail-closed conflict coverage is recorded in
+   [`evidence/mc-net-shield-test-extraction.md`](evidence/mc-net-shield-test-extraction.md).
 4. [ ] Separate behavioral tests from structural tripwires. Structural checks may
    enforce crate ownership and dependency direction, but may not assert Rust
    statement order or source-text layout.
