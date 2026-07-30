@@ -136,7 +136,6 @@ mod movement;
 #[cfg(test)]
 mod movement_tests;
 pub(crate) mod persistence;
-mod plants;
 mod player_breathing;
 #[cfg(test)]
 mod player_breathing_tests;
@@ -403,10 +402,6 @@ use movement::{
 #[cfg(test)]
 use persistence::PersistedEntityRecord;
 use persistence::{PersistedEntityCheckpoint, PlayerPersistedState, XpState, load_player_state};
-#[cfg(test)]
-use plants::{
-    bonemeal_growth_edit, bonemeal_growth_edits, next_crop_growth_state, sweet_berry_harvest,
-};
 use player_damage_adapter::{
     PlayerDamageApplication, apply_contact_block_damage, apply_fall_damage, apply_player_damage,
     apply_player_damage_publication, player_melee_knockback,
@@ -995,6 +990,56 @@ pub(crate) struct ArrowPhysicsFact {
 pub(super) struct BlockEdit {
     pos: mc_world::BlockPos,
     new_state: mc_world::BlockStateId,
+}
+
+impl From<mc_world::plant_rules_26_1_2::PlantBlockEdit> for BlockEdit {
+    fn from(edit: mc_world::plant_rules_26_1_2::PlantBlockEdit) -> Self {
+        Self {
+            pos: edit.pos,
+            new_state: edit.new_state,
+        }
+    }
+}
+
+#[cfg(test)]
+fn next_crop_growth_state(
+    blocks: &mc_world::BlockRegistry,
+    state: mc_world::BlockStateId,
+) -> Option<mc_world::BlockStateId> {
+    mc_world::plant_rules_26_1_2::next_crop_growth_state(blocks, state)
+}
+
+#[cfg(test)]
+fn bonemeal_growth_edit(
+    blocks: &mc_world::BlockRegistry,
+    pos: mc_world::BlockPos,
+    state: mc_world::BlockStateId,
+) -> Option<BlockEdit> {
+    mc_world::plant_rules_26_1_2::bonemeal_growth_edit(blocks, pos, state).map(BlockEdit::from)
+}
+
+#[cfg(test)]
+fn bonemeal_growth_edits(
+    blocks: &mc_world::BlockRegistry,
+    world: &impl mc_world::plant_rules_26_1_2::PlantBlockRead,
+    pos: mc_world::BlockPos,
+    state: mc_world::BlockStateId,
+    tree_seed: u64,
+) -> Option<Vec<BlockEdit>> {
+    mc_world::plant_rules_26_1_2::bonemeal_growth_edits(blocks, world, pos, state, tree_seed)
+        .map(|edits| edits.into_iter().map(BlockEdit::from).collect())
+}
+
+#[cfg(test)]
+fn sweet_berry_harvest(
+    blocks: &mc_world::BlockRegistry,
+    items: &ItemRegistry,
+    pos: mc_world::BlockPos,
+    state: mc_world::BlockStateId,
+) -> Option<(BlockEdit, ItemStack)> {
+    let (edit, drop) = mc_world::plant_rules_26_1_2::sweet_berry_harvest(blocks, pos, state)?;
+    let item_id = items.id_of(&drop.item)?;
+    Some((BlockEdit::from(edit), ItemStack::new(item_id, drop.count)))
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

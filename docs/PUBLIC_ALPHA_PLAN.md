@@ -85,6 +85,8 @@ Required migration:
 3. [ ] Continue one touched vertical domain at a time: move request/result types and
    pure rules first, keep authority mutation in its accepted owner, then narrow the
    adapter. Do not create generic service traits without two real implementations.
+   The plant vertical is complete:
+   [`evidence/plant-rules-crate-boundary.md`](evidence/plant-rules-crate-boundary.md).
 4. [ ] Remove superseded in-crate APIs, compatibility shims, duplicate authorities,
    feature flags, and fallbacks after all callers move.
 5. [ ] Reject dependency cycles and reverse edges into `mc-net`. Semantic domain

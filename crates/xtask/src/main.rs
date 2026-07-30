@@ -1421,6 +1421,15 @@ const MC_NET_OWNERSHIP: &[OwnershipRule] = &[
     },
 ];
 
+const LOWER_CRATE_OWNERSHIP: &[OwnershipRule] = &[OwnershipRule {
+    name: "plant rules",
+    module_file: "crates/mc-world/src/plant_rules_26_1_2.rs",
+    parent_file: "crates/mc-world/src/lib.rs",
+    mod_declaration: "pub mod plant_rules_26_1_2;",
+    definition_file: "crates/mc-world/src/plant_rules_26_1_2.rs",
+    definition_anchor: "pub trait PlantBlockRead",
+}];
+
 const LEGACY_MC_NET_PARENTS: &[&str] = &[
     "crates/mc-net/src/play.rs",
     "crates/mc-net/src/play/session.rs",
@@ -1453,6 +1462,7 @@ fn run_code_health() -> Result<(), i32> {
     })?;
     let mut findings = Vec::new();
     scan_mc_net_ownership(&root, MC_NET_OWNERSHIP, &mut findings);
+    scan_mc_net_ownership(&root, LOWER_CRATE_OWNERSHIP, &mut findings);
     scan_rust_sources(&root.join("crates"), &mut findings);
     scan_api_manifests(&root, &mut findings);
 
@@ -1618,6 +1628,7 @@ fn scan_rust_file(path: &Path, findings: &mut Vec<Finding>) {
     };
     let lines: Vec<&str> = source.lines().collect();
     scan_generic_modules(path, &lines, findings);
+    scan_plant_rules_boundary(path, &lines, findings);
     scan_combat_boundary(path, &lines, findings);
     scan_player_combat_adapter(path, &lines, findings);
     scan_player_combat_shared_shield(path, &lines, findings);
@@ -1631,6 +1642,65 @@ fn scan_rust_file(path: &Path, findings: &mut Vec<Finding>) {
     scan_container_facade(path, &lines, findings);
     scan_explicit_play_boundaries(path, &lines, findings);
     scan_api_leaks(path, &lines, findings);
+}
+
+fn scan_plant_rules_boundary(path: &Path, lines: &[&str], findings: &mut Vec<Finding>) {
+    if path.ends_with("mc-net/src/play/plants.rs") {
+        findings.push(Finding {
+            path: path.to_path_buf(),
+            line: 1,
+            message: "plant rules returned to mc-net".into(),
+        });
+        return;
+    }
+    if !path.ends_with("mc-world/src/plant_rules_26_1_2.rs") {
+        return;
+    }
+
+    const FORBIDDEN: &[&str] = &[
+        "mc_net",
+        "crate::play",
+        "mc_protocol",
+        "ItemRegistry",
+        "protocol_id",
+        "item_id",
+        ".id_of(",
+        ".name_of(",
+        "SessionRegistry",
+        "OutboundCommand",
+        "VisibilityDispatch",
+        "WorldMutationView",
+        "WorldHandle",
+        "WorldWriter",
+        "WorldWrite",
+        "Mutex",
+        "RwLock",
+        "parking_lot",
+        ".lock(",
+        "asyncfn",
+        ".await",
+        "tokio::",
+        "mpsc",
+        "Sender<",
+        "Receiver<",
+        "write_packet",
+        "Clientbound",
+        "Serverbound",
+    ];
+    for (index, line) in lines.iter().enumerate() {
+        let normalized = line.split_whitespace().collect::<String>();
+        if FORBIDDEN
+            .iter()
+            .any(|forbidden| normalized.contains(forbidden))
+        {
+            findings.push(Finding {
+                path: path.to_path_buf(),
+                line: index + 1,
+                message: "plant rules depend on network, session, mutation, or async runtime"
+                    .into(),
+            });
+        }
+    }
 }
 
 fn scan_container_facade(path: &Path, lines: &[&str], findings: &mut Vec<Finding>) {

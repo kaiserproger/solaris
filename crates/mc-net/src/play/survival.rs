@@ -1,8 +1,8 @@
 #[cfg(test)]
 pub(super) use super::combat::is_durability_tool_path;
 pub(super) use super::combat::max_tool_damage_for_path;
-use super::plants::plant_drop_stacks;
 use super::*;
+use mc_world::plant_rules_26_1_2::plant_drop_stacks;
 
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub(super) struct SurvivalState {
@@ -811,15 +811,22 @@ pub(super) fn block_drop_stacks_with_tool_and_facts_from_seeded(
             })
             .collect();
     }
-    if let Some(crop_drops) = plant_drop_stacks(items, block) {
+    if let Some(crop_drops) = plant_drop_stacks(block) {
+        let crop_drops = crop_drops
+            .into_iter()
+            .map(|drop| items.id_of(&drop.item).map(|item_id| (item_id, drop.count)))
+            .collect::<Option<Vec<_>>>();
+        let Some(crop_drops) = crop_drops else {
+            return Vec::new();
+        };
         return crop_drops
             .into_iter()
-            .flat_map(|stack| {
+            .flat_map(|(item_id, count)| {
                 split_drop_stack(
                     items,
                     item_facts,
-                    stack.item_id,
-                    u32::try_from(stack.count).unwrap_or(0),
+                    item_id,
+                    u32::try_from(count).unwrap_or(0),
                 )
             })
             .collect();

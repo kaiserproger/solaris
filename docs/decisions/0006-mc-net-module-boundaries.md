@@ -243,6 +243,13 @@ Other accepted concrete boundaries in this staged migration are:
   durability, relight, drop spawning, and publication remain in `play.rs`.
   The boundary rejects writer, session, lock, async, sender, packet, and
   publication dependencies.
+- `mc_world::plant_rules_26_1_2` owns deterministic crop, stem, vertical-plant,
+  bamboo, sapling/tree, bonemeal, cocoa, survival, harvest, and drop planning.
+  Its contract uses semantic block edits, item drops, horizontal directions,
+  and a read-only block lookup. `mc-net` retains snapshot acquisition,
+  mutation preconditions, world commit, durability, relight, publication, and
+  protocol/item translation. Code-health rejects network, session, mutation,
+  async-runtime, and reverse `mc-net` dependencies from the lower-crate owner.
 - `play::session::hostile_authority` owns hostile attack planning, target
   refresh, bed-rest exclusion, melee/skeleton tick authority, creeper
   prime/cancel authority, goal diffing, and test probes. A creeper uses the

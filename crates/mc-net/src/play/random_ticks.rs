@@ -1,17 +1,29 @@
 use mc_data::block_facts::{BlockFactsTable, RandomTickFamily};
+use mc_world::plant_rules_26_1_2::{
+    PlantBlockEdit, PlantBlockRead, bamboo_sapling_growth_edits, next_crop_growth_state,
+    sapling_tree_edits, stem_fruit_edits, vertical_plant_growth_edits,
+};
 use mc_world::{
     BlockPos, BlockRegistry, BlockStateId, ChunkSection, MAX_Y, MIN_Y, SECTION_COUNT, SECTION_DIM,
 };
 
-use super::plants::{
-    bamboo_sapling_growth_edits, next_crop_growth_state, sapling_tree_edits, stem_fruit_edits,
-    vertical_plant_growth_edits,
-};
 use super::{
     BlockEdit, BlockPlanningRead, Identifier, ItemRegistry, ItemStack, RandomTickPolicy,
     RandomTickSample, air_state_id, block_state_property, fluid_neighbour_positions,
     sibling_state_with_property, splitmix64,
 };
+
+struct PlantReadAdapter<'a, T: ?Sized>(&'a T);
+
+impl<T: BlockPlanningRead + ?Sized> PlantBlockRead for PlantReadAdapter<'_, T> {
+    fn get_cached_block(&self, pos: BlockPos) -> Option<BlockStateId> {
+        self.0.get_cached_block(pos)
+    }
+}
+
+fn into_block_edits(edits: Vec<PlantBlockEdit>) -> Vec<BlockEdit> {
+    edits.into_iter().map(BlockEdit::from).collect()
+}
 
 pub(super) fn section_may_random_tick(section: &ChunkSection, facts: &BlockFactsTable) -> bool {
     if let Some(palette) = section.palette() {
@@ -43,11 +55,15 @@ pub(super) fn random_tick_edit_seeded(
     family: RandomTickFamily,
     random_seed: u64,
 ) -> Option<Vec<BlockEdit>> {
+    let plant_world = PlantReadAdapter(world);
     match family {
         RandomTickFamily::Crop => next_crop_growth_state(blocks, state)
             .map(|new_state| vec![BlockEdit { pos, new_state }])
-            .or_else(|| stem_fruit_edits(blocks, world, pos, state))
-            .or_else(|| vertical_plant_growth_edits(blocks, world, pos, state, random_seed)),
+            .or_else(|| stem_fruit_edits(blocks, &plant_world, pos, state).map(into_block_edits))
+            .or_else(|| {
+                vertical_plant_growth_edits(blocks, &plant_world, pos, state, random_seed)
+                    .map(into_block_edits)
+            }),
         RandomTickFamily::Farmland => next_farmland_state(blocks, facts, world, pos, state)
             .map(|new_state| vec![BlockEdit { pos, new_state }]),
         RandomTickFamily::Fire => fire_tick_edits(blocks, world, pos, state, random_seed),
@@ -62,18 +78,20 @@ pub(super) fn random_tick_edit_seeded(
                 .by_id(state)
                 .is_some_and(|state| state.block.id.path() == "bamboo_sapling")
             {
-                return bamboo_sapling_growth_edits(blocks, world, pos, random_seed);
+                return bamboo_sapling_growth_edits(blocks, &plant_world, pos, random_seed)
+                    .map(into_block_edits);
             }
             if !random_seed.is_multiple_of(7) {
                 return None;
             }
             sapling_tree_edits(
                 blocks,
-                world,
+                &plant_world,
                 pos,
                 state,
                 splitmix64(random_seed ^ 0x5452_4545_4752_4f57),
             )
+            .map(into_block_edits)
         }
     }
 }

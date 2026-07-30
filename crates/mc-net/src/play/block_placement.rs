@@ -5,11 +5,11 @@ use mc_nbt::{ListTag, Tag};
 use mc_protocol::packets::play::Direction;
 use mc_world::{BlockPos, BlockRegistry, BlockState, BlockStateId, WorldReadSnapshot};
 
-use super::plants::vertical_plant_can_survive_at;
 use super::{
     BlockEdit, BlockEditBatchOutcome, BlockEditPrecondition, BlockPlanningRead, PendingSignEdit,
     PlayerPose, sibling_state_with_property,
 };
+use mc_world::plant_rules_26_1_2::vertical_plant_can_survive_at;
 
 #[derive(Debug, PartialEq, Eq)]
 pub(super) struct PlannedBlockPlacement {

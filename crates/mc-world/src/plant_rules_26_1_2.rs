@@ -1,19 +1,68 @@
-use mc_data::items::ItemRegistry;
-use mc_protocol::codec::Identifier;
-use mc_protocol::packets::play::{Direction, ItemStack};
+use mc_data::Identifier;
 
-use super::{
-    BlockEdit, BlockPlanningRead, block_state_property, named_block_default,
-    sibling_state_with_property, splitmix64,
+use crate::{
+    BlockPos, BlockRegistry, BlockState, BlockStateId, WorldReadSnapshot, WorldReadView,
+    WorldStorage,
 };
 
-pub(super) fn vertical_plant_growth_edits(
-    blocks: &mc_world::BlockRegistry,
-    world: &impl BlockPlanningRead,
-    pos: mc_world::BlockPos,
-    state: mc_world::BlockStateId,
+pub trait PlantBlockRead {
+    fn get_cached_block(&self, pos: BlockPos) -> Option<BlockStateId>;
+}
+
+impl PlantBlockRead for WorldStorage {
+    fn get_cached_block(&self, pos: BlockPos) -> Option<BlockStateId> {
+        WorldStorage::get_cached_block(self, pos)
+    }
+}
+
+impl PlantBlockRead for WorldReadSnapshot {
+    fn get_cached_block(&self, pos: BlockPos) -> Option<BlockStateId> {
+        WorldReadSnapshot::get_cached_block(self, pos)
+    }
+}
+
+impl PlantBlockRead for WorldReadView {
+    fn get_cached_block(&self, pos: BlockPos) -> Option<BlockStateId> {
+        WorldReadView::get_cached_block(self, pos)
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PlantBlockEdit {
+    pub pos: BlockPos,
+    pub new_state: BlockStateId,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PlantItemDrop {
+    pub item: Identifier,
+    pub count: i32,
+}
+
+impl PlantItemDrop {
+    fn new(item: &str, count: i32) -> Self {
+        Self {
+            item: Identifier::parse(item).expect("static identifier"),
+            count,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PlantHorizontalDirection {
+    North,
+    South,
+    West,
+    East,
+}
+
+pub fn vertical_plant_growth_edits(
+    blocks: &crate::BlockRegistry,
+    world: &impl PlantBlockRead,
+    pos: crate::BlockPos,
+    state: crate::BlockStateId,
     random_seed: u64,
-) -> Option<Vec<BlockEdit>> {
+) -> Option<Vec<PlantBlockEdit>> {
     let current = blocks.by_id(state)?;
     if !matches!(current.block.id.path(), "sugar_cane" | "cactus" | "bamboo") {
         return None;
@@ -28,7 +77,7 @@ pub(super) fn vertical_plant_growth_edits(
     }
     let plant_state = blocks.block(&current.block.id).map(|block| block.default)?;
     let air = named_block_default(blocks, "minecraft:air")?;
-    let above = mc_world::BlockPos {
+    let above = crate::BlockPos {
         y: pos.y + 1,
         ..pos
     };
@@ -41,14 +90,14 @@ pub(super) fn vertical_plant_growth_edits(
         blocks,
         world,
         plant_path,
-        mc_world::BlockPos {
+        crate::BlockPos {
             y: bottom_y - 1,
             ..pos
         },
     )? {
         bottom_y -= 1;
     }
-    let support = mc_world::BlockPos {
+    let support = crate::BlockPos {
         y: bottom_y - 1,
         ..pos
     };
@@ -64,18 +113,18 @@ pub(super) fn vertical_plant_growth_edits(
     if plant_path == "cactus" && !cactus_growth_target_clear(world, above, air) {
         return None;
     }
-    Some(vec![BlockEdit {
+    Some(vec![PlantBlockEdit {
         pos: above,
         new_state: plant_state,
     }])
 }
 
-pub(super) fn bamboo_sapling_growth_edits(
-    blocks: &mc_world::BlockRegistry,
-    world: &impl BlockPlanningRead,
-    pos: mc_world::BlockPos,
+pub fn bamboo_sapling_growth_edits(
+    blocks: &crate::BlockRegistry,
+    world: &impl PlantBlockRead,
+    pos: crate::BlockPos,
     random_seed: u64,
-) -> Option<Vec<BlockEdit>> {
+) -> Option<Vec<PlantBlockEdit>> {
     if !random_seed.is_multiple_of(3) {
         return None;
     }
@@ -84,7 +133,7 @@ pub(super) fn bamboo_sapling_growth_edits(
         return None;
     }
     let air = named_block_default(blocks, "minecraft:air")?;
-    let above = mc_world::BlockPos {
+    let above = crate::BlockPos {
         y: pos.y + 1,
         ..pos
     };
@@ -95,11 +144,11 @@ pub(super) fn bamboo_sapling_growth_edits(
     let bottom = bamboo_state_with_properties(blocks, bamboo.default, "0", "none", "0")?;
     let top = bamboo_state_with_properties(blocks, bamboo.default, "0", "small", "0")?;
     Some(vec![
-        BlockEdit {
+        PlantBlockEdit {
             pos,
             new_state: bottom,
         },
-        BlockEdit {
+        PlantBlockEdit {
             pos: above,
             new_state: top,
         },
@@ -107,18 +156,18 @@ pub(super) fn bamboo_sapling_growth_edits(
 }
 
 fn bamboo_growth_edits(
-    blocks: &mc_world::BlockRegistry,
-    world: &impl BlockPlanningRead,
-    pos: mc_world::BlockPos,
-    state: mc_world::BlockStateId,
+    blocks: &crate::BlockRegistry,
+    world: &impl PlantBlockRead,
+    pos: crate::BlockPos,
+    state: crate::BlockStateId,
     random_seed: u64,
-) -> Option<Vec<BlockEdit>> {
+) -> Option<Vec<PlantBlockEdit>> {
     let current = blocks.by_id(state)?;
     if block_state_property(current, "stage") != Some("0") || !random_seed.is_multiple_of(3) {
         return None;
     }
     let air = named_block_default(blocks, "minecraft:air")?;
-    let above = mc_world::BlockPos {
+    let above = crate::BlockPos {
         y: pos.y + 1,
         ..pos
     };
@@ -132,7 +181,7 @@ fn bamboo_growth_edits(
             blocks,
             world,
             "bamboo",
-            mc_world::BlockPos {
+            crate::BlockPos {
                 y: bottom_y - 1,
                 ..pos
             },
@@ -145,11 +194,11 @@ fn bamboo_growth_edits(
         return None;
     }
 
-    let b1_pos = mc_world::BlockPos {
+    let b1_pos = crate::BlockPos {
         y: pos.y - 1,
         ..pos
     };
-    let b2_pos = mc_world::BlockPos {
+    let b2_pos = crate::BlockPos {
         y: pos.y - 2,
         ..pos
     };
@@ -184,7 +233,7 @@ fn bamboo_growth_edits(
 
     let mut edits = Vec::new();
     for y in bottom_y..=pos.y {
-        let existing_pos = mc_world::BlockPos { y, ..pos };
+        let existing_pos = crate::BlockPos { y, ..pos };
         let existing = world.get_cached_block(existing_pos)?;
         let existing_state = blocks.by_id(existing)?;
         let desired_age = if age == "1" {
@@ -207,14 +256,14 @@ fn bamboo_growth_edits(
             block_state_property(existing_state, "stage")?,
         )?;
         if desired != existing {
-            edits.push(BlockEdit {
+            edits.push(PlantBlockEdit {
                 pos: existing_pos,
                 new_state: desired,
             });
         }
     }
     let bamboo = blocks.block(&current.block.id)?;
-    edits.push(BlockEdit {
+    edits.push(PlantBlockEdit {
         pos: above,
         new_state: bamboo_state_with_properties(blocks, bamboo.default, age, leaves, stage)?,
     });
@@ -222,12 +271,12 @@ fn bamboo_growth_edits(
 }
 
 fn bamboo_state_with_properties(
-    blocks: &mc_world::BlockRegistry,
-    state: mc_world::BlockStateId,
+    blocks: &crate::BlockRegistry,
+    state: crate::BlockStateId,
     age: &str,
     leaves: &str,
     stage: &str,
-) -> Option<mc_world::BlockStateId> {
+) -> Option<crate::BlockStateId> {
     let current = blocks.by_id(state)?;
     let mut properties = current.properties.clone();
     for (name, value) in [("age", age), ("leaves", leaves), ("stage", stage)] {
@@ -236,11 +285,11 @@ fn bamboo_state_with_properties(
     blocks.by_name_and_props(&current.block.id, &properties)
 }
 
-pub(super) fn vertical_plant_can_survive_at(
-    blocks: &mc_world::BlockRegistry,
-    snapshot: &mc_world::WorldReadSnapshot,
-    pos: mc_world::BlockPos,
-    state: mc_world::BlockStateId,
+pub fn vertical_plant_can_survive_at(
+    blocks: &crate::BlockRegistry,
+    snapshot: &crate::WorldReadSnapshot,
+    pos: crate::BlockPos,
+    state: crate::BlockStateId,
 ) -> bool {
     let Some(current) = blocks.by_id(state) else {
         return false;
@@ -249,7 +298,7 @@ pub(super) fn vertical_plant_can_survive_at(
     if !matches!(path, "sugar_cane" | "cactus" | "bamboo") {
         return true;
     }
-    let below = mc_world::BlockPos {
+    let below = crate::BlockPos {
         y: pos.y - 1,
         ..pos
     };
@@ -263,11 +312,11 @@ pub(super) fn vertical_plant_can_survive_at(
 }
 
 fn vertical_plant_supported_base_snapshot(
-    blocks: &mc_world::BlockRegistry,
-    snapshot: &mc_world::WorldReadSnapshot,
+    blocks: &crate::BlockRegistry,
+    snapshot: &crate::WorldReadSnapshot,
     path: &str,
-    support: mc_world::BlockPos,
-    air: mc_world::BlockStateId,
+    support: crate::BlockPos,
+    air: crate::BlockStateId,
 ) -> bool {
     let Some(support_state) = snapshot.get_cached_block(support) else {
         return false;
@@ -300,14 +349,14 @@ fn vertical_plant_supported_base_snapshot(
 }
 
 fn has_adjacent_sugar_cane_support_snapshot(
-    blocks: &mc_world::BlockRegistry,
-    snapshot: &mc_world::WorldReadSnapshot,
-    pos: mc_world::BlockPos,
+    blocks: &crate::BlockRegistry,
+    snapshot: &crate::WorldReadSnapshot,
+    pos: crate::BlockPos,
 ) -> bool {
     [(1, 0), (-1, 0), (0, 1), (0, -1)]
         .into_iter()
         .any(|(dx, dz)| {
-            let side = mc_world::BlockPos {
+            let side = crate::BlockPos {
                 x: pos.x + dx,
                 z: pos.z + dz,
                 ..pos
@@ -325,10 +374,10 @@ fn has_adjacent_sugar_cane_support_snapshot(
 }
 
 fn same_block_at_snapshot(
-    blocks: &mc_world::BlockRegistry,
-    snapshot: &mc_world::WorldReadSnapshot,
+    blocks: &crate::BlockRegistry,
+    snapshot: &crate::WorldReadSnapshot,
     path: &str,
-    pos: mc_world::BlockPos,
+    pos: crate::BlockPos,
 ) -> Option<bool> {
     let state = snapshot.get_cached_block(pos)?;
     Some(
@@ -339,11 +388,11 @@ fn same_block_at_snapshot(
 }
 
 fn vertical_plant_supported_base(
-    blocks: &mc_world::BlockRegistry,
-    world: &impl BlockPlanningRead,
+    blocks: &crate::BlockRegistry,
+    world: &impl PlantBlockRead,
     path: &str,
-    support: mc_world::BlockPos,
-    air: mc_world::BlockStateId,
+    support: crate::BlockPos,
+    air: crate::BlockStateId,
 ) -> bool {
     let Some(support_state) = world.get_cached_block(support) else {
         return false;
@@ -395,14 +444,14 @@ fn supports_overworld_plant(path: &str) -> bool {
 }
 
 fn has_adjacent_sugar_cane_support(
-    blocks: &mc_world::BlockRegistry,
-    world: &impl BlockPlanningRead,
-    pos: mc_world::BlockPos,
+    blocks: &crate::BlockRegistry,
+    world: &impl PlantBlockRead,
+    pos: crate::BlockPos,
 ) -> bool {
     [(1, 0), (-1, 0), (0, 1), (0, -1)]
         .into_iter()
         .any(|(dx, dz)| {
-            let side = mc_world::BlockPos {
+            let side = crate::BlockPos {
                 x: pos.x + dx,
                 z: pos.z + dz,
                 ..pos
@@ -420,14 +469,14 @@ fn has_adjacent_sugar_cane_support(
 }
 
 fn cactus_growth_target_clear(
-    world: &impl BlockPlanningRead,
-    pos: mc_world::BlockPos,
-    air: mc_world::BlockStateId,
+    world: &impl PlantBlockRead,
+    pos: crate::BlockPos,
+    air: crate::BlockStateId,
 ) -> bool {
     [(1, 0), (-1, 0), (0, 1), (0, -1)]
         .into_iter()
         .all(|(dx, dz)| {
-            let side = mc_world::BlockPos {
+            let side = crate::BlockPos {
                 x: pos.x + dx,
                 z: pos.z + dz,
                 ..pos
@@ -437,10 +486,10 @@ fn cactus_growth_target_clear(
 }
 
 fn same_block_at(
-    blocks: &mc_world::BlockRegistry,
-    world: &impl BlockPlanningRead,
+    blocks: &crate::BlockRegistry,
+    world: &impl PlantBlockRead,
     path: &str,
-    pos: mc_world::BlockPos,
+    pos: crate::BlockPos,
 ) -> Option<bool> {
     let state = world.get_cached_block(pos)?;
     Some(
@@ -450,10 +499,10 @@ fn same_block_at(
     )
 }
 
-pub(super) fn next_crop_growth_state(
-    blocks: &mc_world::BlockRegistry,
-    state: mc_world::BlockStateId,
-) -> Option<mc_world::BlockStateId> {
+pub fn next_crop_growth_state(
+    blocks: &crate::BlockRegistry,
+    state: crate::BlockStateId,
+) -> Option<crate::BlockStateId> {
     let current = blocks.by_id(state)?;
     if !is_supported_age_crop(&current.block.id) {
         return None;
@@ -491,25 +540,25 @@ fn is_bonemeal_age_crop(block: &Identifier) -> bool {
     )
 }
 
-pub(super) fn bonemeal_growth_edit(
-    blocks: &mc_world::BlockRegistry,
-    pos: mc_world::BlockPos,
-    state: mc_world::BlockStateId,
-) -> Option<BlockEdit> {
+pub fn bonemeal_growth_edit(
+    blocks: &crate::BlockRegistry,
+    pos: crate::BlockPos,
+    state: crate::BlockStateId,
+) -> Option<PlantBlockEdit> {
     let current = blocks.by_id(state)?;
     if !is_bonemeal_age_crop(&current.block.id) {
         return None;
     }
-    next_crop_growth_state(blocks, state).map(|new_state| BlockEdit { pos, new_state })
+    next_crop_growth_state(blocks, state).map(|new_state| PlantBlockEdit { pos, new_state })
 }
 
-pub(super) fn bonemeal_growth_edits(
-    blocks: &mc_world::BlockRegistry,
-    world: &impl BlockPlanningRead,
-    pos: mc_world::BlockPos,
-    state: mc_world::BlockStateId,
+pub fn bonemeal_growth_edits(
+    blocks: &crate::BlockRegistry,
+    world: &impl PlantBlockRead,
+    pos: crate::BlockPos,
+    state: crate::BlockStateId,
     tree_seed: u64,
-) -> Option<Vec<BlockEdit>> {
+) -> Option<Vec<PlantBlockEdit>> {
     if let Some(edit) = bonemeal_growth_edit(blocks, pos, state) {
         return Some(vec![edit]);
     }
@@ -519,12 +568,12 @@ pub(super) fn bonemeal_growth_edits(
     sapling_tree_edits(blocks, world, pos, state, tree_seed)
 }
 
-pub(super) fn stem_fruit_edits(
-    blocks: &mc_world::BlockRegistry,
-    world: &impl BlockPlanningRead,
-    pos: mc_world::BlockPos,
-    state: mc_world::BlockStateId,
-) -> Option<Vec<BlockEdit>> {
+pub fn stem_fruit_edits(
+    blocks: &crate::BlockRegistry,
+    world: &impl PlantBlockRead,
+    pos: crate::BlockPos,
+    state: crate::BlockStateId,
+) -> Option<Vec<PlantBlockEdit>> {
     let current = blocks.by_id(state)?;
     let (fruit_name, attached_name) = stem_lifecycle_blocks(current.block.id.as_str())?;
     let age = block_state_property(current, "age")?.parse::<u8>().ok()?;
@@ -547,7 +596,7 @@ pub(super) fn stem_fruit_edits(
         ("west", -1, 0),
         ("east", 1, 0),
     ] {
-        let fruit_pos = mc_world::BlockPos {
+        let fruit_pos = crate::BlockPos {
             x: pos.x + dx,
             z: pos.z + dz,
             ..pos
@@ -558,11 +607,11 @@ pub(super) fn stem_fruit_edits(
         let attached_state =
             sibling_state_with_property(blocks, attached_default, "facing", facing)?;
         return Some(vec![
-            BlockEdit {
+            PlantBlockEdit {
                 pos,
                 new_state: attached_state,
             },
-            BlockEdit {
+            PlantBlockEdit {
                 pos: fruit_pos,
                 new_state: fruit_state,
             },
@@ -580,13 +629,13 @@ fn stem_lifecycle_blocks(stem: &str) -> Option<(&'static str, &'static str)> {
     }
 }
 
-pub(super) fn sapling_tree_edits(
-    blocks: &mc_world::BlockRegistry,
-    world: &impl BlockPlanningRead,
-    pos: mc_world::BlockPos,
-    state: mc_world::BlockStateId,
+pub fn sapling_tree_edits(
+    blocks: &crate::BlockRegistry,
+    world: &impl PlantBlockRead,
+    pos: crate::BlockPos,
+    state: crate::BlockStateId,
     tree_seed: u64,
-) -> Option<Vec<BlockEdit>> {
+) -> Option<Vec<PlantBlockEdit>> {
     let current = blocks.by_id(state)?;
     let sapling_name = current.block.id.as_str();
     let (log_name, leaves_name, base_height, random_height) = sapling_tree_blocks(sapling_name)?;
@@ -603,7 +652,7 @@ pub(super) fn sapling_tree_edits(
     match block_state_property(current, "stage")? {
         "0" => {
             let staged = sibling_state_with_property(blocks, current, "stage", "1")?;
-            return Some(vec![BlockEdit {
+            return Some(vec![PlantBlockEdit {
                 pos,
                 new_state: staged,
             }]);
@@ -644,8 +693,8 @@ pub(super) fn sapling_tree_edits(
 
     let mut edits = Vec::new();
     for dy in 0..tree_height {
-        edits.push(BlockEdit {
-            pos: mc_world::BlockPos {
+        edits.push(PlantBlockEdit {
+            pos: crate::BlockPos {
                 y: pos.y + dy,
                 ..pos
             },
@@ -672,8 +721,8 @@ pub(super) fn sapling_tree_edits(
                 if dx == 0 && dz == 0 && foliage_y < pos.y + tree_height {
                     continue;
                 }
-                edits.push(BlockEdit {
-                    pos: mc_world::BlockPos {
+                edits.push(PlantBlockEdit {
+                    pos: crate::BlockPos {
                         x: pos.x + dx,
                         y: foliage_y,
                         z: pos.z + dz,
@@ -698,28 +747,28 @@ pub(super) fn sapling_tree_edits(
 }
 
 fn find_two_by_two_saplings(
-    blocks: &mc_world::BlockRegistry,
-    world: &impl BlockPlanningRead,
-    clicked: mc_world::BlockPos,
+    blocks: &crate::BlockRegistry,
+    world: &impl PlantBlockRead,
+    clicked: crate::BlockPos,
     sapling_name: &str,
-) -> Option<[mc_world::BlockPos; 4]> {
+) -> Option<[crate::BlockPos; 4]> {
     for (dx, dz) in [(0, 0), (-1, 0), (0, -1), (-1, -1)] {
-        let northwest = mc_world::BlockPos {
+        let northwest = crate::BlockPos {
             x: clicked.x.checked_add(dx)?,
             z: clicked.z.checked_add(dz)?,
             ..clicked
         };
         let square = [
             northwest,
-            mc_world::BlockPos {
+            crate::BlockPos {
                 x: northwest.x.checked_add(1)?,
                 ..northwest
             },
-            mc_world::BlockPos {
+            crate::BlockPos {
                 z: northwest.z.checked_add(1)?,
                 ..northwest
             },
-            mc_world::BlockPos {
+            crate::BlockPos {
                 x: northwest.x.checked_add(1)?,
                 z: northwest.z.checked_add(1)?,
                 ..northwest
@@ -738,14 +787,14 @@ fn find_two_by_two_saplings(
 }
 
 fn dark_oak_two_by_two_edits(
-    blocks: &mc_world::BlockRegistry,
-    world: &impl BlockPlanningRead,
-    saplings: [mc_world::BlockPos; 4],
+    blocks: &crate::BlockRegistry,
+    world: &impl PlantBlockRead,
+    saplings: [crate::BlockPos; 4],
     log_name: &str,
     leaves_name: &str,
     tree_height: i32,
     tree_seed: u64,
-) -> Option<Vec<BlockEdit>> {
+) -> Option<Vec<PlantBlockEdit>> {
     let northwest = saplings[0];
     let log = tree_state_with_props(blocks, log_name, &[("axis", "y")])?;
     let leaves = tree_leaves_state(blocks, leaves_name)?;
@@ -754,8 +803,8 @@ fn dark_oak_two_by_two_edits(
 
     for dy in 0..tree_height {
         for trunk in saplings {
-            edits.push(BlockEdit {
-                pos: mc_world::BlockPos {
+            edits.push(PlantBlockEdit {
+                pos: crate::BlockPos {
                     y: northwest.y.checked_add(dy)?,
                     ..trunk
                 },
@@ -787,8 +836,8 @@ fn dark_oak_two_by_two_edits(
                 {
                     continue;
                 }
-                edits.push(BlockEdit {
-                    pos: mc_world::BlockPos {
+                edits.push(PlantBlockEdit {
+                    pos: crate::BlockPos {
                         x: northwest.x.checked_add(dx)?,
                         y: foliage_y,
                         z: northwest.z.checked_add(dz)?,
@@ -813,14 +862,14 @@ fn dark_oak_two_by_two_edits(
 }
 
 fn spruce_or_jungle_two_by_two_edits(
-    blocks: &mc_world::BlockRegistry,
-    world: &impl BlockPlanningRead,
-    saplings: [mc_world::BlockPos; 4],
+    blocks: &crate::BlockRegistry,
+    world: &impl PlantBlockRead,
+    saplings: [crate::BlockPos; 4],
     sapling_name: &str,
     log_name: &str,
     leaves_name: &str,
     tree_seed: u64,
-) -> Option<Vec<BlockEdit>> {
+) -> Option<Vec<PlantBlockEdit>> {
     let northwest = saplings[0];
     let log = tree_state_with_props(blocks, log_name, &[("axis", "y")])?;
     let leaves = tree_leaves_state(blocks, leaves_name)?;
@@ -842,8 +891,8 @@ fn spruce_or_jungle_two_by_two_edits(
 
     for dy in 0..tree_height {
         for trunk in saplings {
-            edits.push(BlockEdit {
-                pos: mc_world::BlockPos {
+            edits.push(PlantBlockEdit {
+                pos: crate::BlockPos {
                     y: northwest.y.checked_add(dy)?,
                     ..trunk
                 },
@@ -894,11 +943,11 @@ fn spruce_or_jungle_two_by_two_edits(
 }
 
 fn push_two_by_two_leaf_layer(
-    edits: &mut Vec<BlockEdit>,
-    northwest: mc_world::BlockPos,
+    edits: &mut Vec<PlantBlockEdit>,
+    northwest: crate::BlockPos,
     y: i32,
     radius: i32,
-    leaves: mc_world::BlockStateId,
+    leaves: crate::BlockStateId,
     layer_seed: u64,
     trunk_top: i32,
 ) -> Option<()> {
@@ -918,8 +967,8 @@ fn push_two_by_two_leaf_layer(
             {
                 continue;
             }
-            edits.push(BlockEdit {
-                pos: mc_world::BlockPos {
+            edits.push(PlantBlockEdit {
+                pos: crate::BlockPos {
                     x: northwest.x.checked_add(dx)?,
                     y,
                     z: northwest.z.checked_add(dz)?,
@@ -932,9 +981,9 @@ fn push_two_by_two_leaf_layer(
 }
 
 fn tree_growth_can_replace(
-    blocks: &mc_world::BlockRegistry,
-    state: mc_world::BlockStateId,
-    air: mc_world::BlockStateId,
+    blocks: &crate::BlockRegistry,
+    state: crate::BlockStateId,
+    air: crate::BlockStateId,
 ) -> bool {
     state == air
         || blocks
@@ -1022,10 +1071,10 @@ fn sapling_tree_blocks(sapling: &str) -> Option<(&'static str, &'static str, i32
 }
 
 fn tree_state_with_props(
-    blocks: &mc_world::BlockRegistry,
+    blocks: &crate::BlockRegistry,
     name: &str,
     props: &[(&str, &str)],
-) -> Option<mc_world::BlockStateId> {
+) -> Option<crate::BlockStateId> {
     let id = Identifier::parse(name).expect("static identifier");
     let props = props
         .iter()
@@ -1036,10 +1085,7 @@ fn tree_state_with_props(
         .or_else(|| blocks.block(&id).map(|block| block.default))
 }
 
-fn tree_leaves_state(
-    blocks: &mc_world::BlockRegistry,
-    name: &str,
-) -> Option<mc_world::BlockStateId> {
+fn tree_leaves_state(blocks: &crate::BlockRegistry, name: &str) -> Option<crate::BlockStateId> {
     tree_state_with_props(
         blocks,
         name,
@@ -1069,12 +1115,11 @@ fn tree_leaves_state(
     })
 }
 
-pub(super) fn sweet_berry_harvest(
-    blocks: &mc_world::BlockRegistry,
-    items: &ItemRegistry,
-    pos: mc_world::BlockPos,
-    state: mc_world::BlockStateId,
-) -> Option<(BlockEdit, ItemStack)> {
+pub fn sweet_berry_harvest(
+    blocks: &crate::BlockRegistry,
+    pos: crate::BlockPos,
+    state: crate::BlockStateId,
+) -> Option<(PlantBlockEdit, PlantItemDrop)> {
     let current = blocks.by_id(state)?;
     if current.block.id.as_str() != "minecraft:sweet_berry_bush" {
         return None;
@@ -1085,21 +1130,16 @@ pub(super) fn sweet_berry_harvest(
     }
 
     let harvested_state = sibling_state_with_property(blocks, current, "age", "1")?;
-    let berries = Identifier::parse("minecraft:sweet_berries").expect("static identifier");
-    let item_id = items.id_of(&berries)?;
     Some((
-        BlockEdit {
+        PlantBlockEdit {
             pos,
             new_state: harvested_state,
         },
-        ItemStack::new(item_id, i32::from(age - 1)),
+        PlantItemDrop::new("minecraft:sweet_berries", i32::from(age - 1)),
     ))
 }
 
-pub(super) fn plant_drop_stacks(
-    items: &ItemRegistry,
-    block: &mc_world::BlockState,
-) -> Option<Vec<ItemStack>> {
+pub fn plant_drop_stacks(block: &crate::BlockState) -> Option<Vec<PlantItemDrop>> {
     const WHEAT_MATURE_DROPS: &[(&str, i32)] =
         &[("minecraft:wheat", 1), ("minecraft:wheat_seeds", 1)];
     const WHEAT_IMMATURE_DROPS: &[(&str, i32)] = &[("minecraft:wheat_seeds", 1)];
@@ -1131,25 +1171,23 @@ pub(super) fn plant_drop_stacks(
     } else {
         immature_drops
     };
-    let stacks = drops
-        .iter()
-        .map(|(item, count)| item_id(items, item).map(|id| ItemStack::new(id, *count)))
-        .collect::<Option<Vec<_>>>()
-        .unwrap_or_default();
-    Some(stacks)
+    Some(
+        drops
+            .iter()
+            .map(|(item, count)| PlantItemDrop::new(item, *count))
+            .collect(),
+    )
 }
 
-pub(super) fn is_cocoa_beans_item(items: &ItemRegistry, item_id: u32) -> bool {
-    items
-        .name_of(item_id)
-        .is_some_and(|item| item.as_str() == "minecraft:cocoa_beans")
+pub fn is_cocoa_beans_item(item: &Identifier) -> bool {
+    item.as_str() == "minecraft:cocoa_beans"
 }
 
-pub(super) fn cocoa_state_for_use_on(
-    clicked_state: mc_world::BlockStateId,
-    direction: Direction,
-    blocks: &mc_world::BlockRegistry,
-) -> Option<mc_world::BlockStateId> {
+pub fn cocoa_state_for_use_on(
+    clicked_state: crate::BlockStateId,
+    direction: PlantHorizontalDirection,
+    blocks: &crate::BlockRegistry,
+) -> Option<crate::BlockStateId> {
     let facing = cocoa_facing_for_direction(direction)?;
     let clicked = blocks.by_id(clicked_state)?;
     if !matches!(clicked.block.id.as_str(), "minecraft:jungle_log") {
@@ -1165,17 +1203,43 @@ pub(super) fn cocoa_state_for_use_on(
     )
 }
 
-fn cocoa_facing_for_direction(direction: Direction) -> Option<&'static str> {
+fn cocoa_facing_for_direction(direction: PlantHorizontalDirection) -> Option<&'static str> {
     match direction {
-        Direction::North => Some("north"),
-        Direction::South => Some("south"),
-        Direction::West => Some("west"),
-        Direction::East => Some("east"),
-        Direction::Down | Direction::Up => None,
+        PlantHorizontalDirection::North => Some("north"),
+        PlantHorizontalDirection::South => Some("south"),
+        PlantHorizontalDirection::West => Some("west"),
+        PlantHorizontalDirection::East => Some("east"),
     }
 }
 
-fn item_id(items: &ItemRegistry, name: &str) -> Option<u32> {
-    let id = Identifier::parse(name).expect("static identifier");
-    items.id_of(&id)
+fn named_block_default(blocks: &BlockRegistry, name: &str) -> Option<BlockStateId> {
+    blocks
+        .block(&Identifier::parse(name).expect("static identifier"))
+        .map(|block| block.default)
+}
+
+fn block_state_property<'a>(state: &'a BlockState, name: &str) -> Option<&'a str> {
+    state
+        .properties
+        .iter()
+        .find_map(|(key, value)| (key == name).then_some(value.as_str()))
+}
+
+fn sibling_state_with_property(
+    blocks: &BlockRegistry,
+    state: &BlockState,
+    name: &str,
+    value: &str,
+) -> Option<BlockStateId> {
+    let mut props = state.properties.clone();
+    let (_, current) = props.iter_mut().find(|(key, _)| key == name)?;
+    *current = value.to_string();
+    blocks.by_name_and_props(&state.block.id, &props)
+}
+
+fn splitmix64(mut value: u64) -> u64 {
+    value = value.wrapping_add(0x9E37_79B9_7F4A_7C15);
+    value = (value ^ (value >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+    value = (value ^ (value >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+    value ^ (value >> 31)
 }

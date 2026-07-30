@@ -8,6 +8,7 @@ pub mod anvil;
 pub mod block;
 pub mod chunk;
 pub mod light;
+pub mod plant_rules_26_1_2;
 pub mod resident;
 pub mod section;
 pub mod storage;
@@ -41,3 +42,5 @@ pub const VERSION: &str = env!("CARGO_PKG_VERSION");
 
 #[cfg(test)]
 mod inhabited_time_tests;
+#[cfg(test)]
+mod plant_rules_26_1_2_tests;

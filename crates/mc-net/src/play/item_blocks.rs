@@ -1,4 +1,7 @@
 use super::*;
+use mc_world::plant_rules_26_1_2::{
+    PlantHorizontalDirection, cocoa_state_for_use_on, is_cocoa_beans_item,
+};
 
 /// Item->default-block-state lookup for items whose identifier also
 /// names a registered block.
@@ -77,8 +80,15 @@ impl ItemToBlockTable {
         {
             return None;
         }
-        if plants::is_cocoa_beans_item(items, item_id) {
-            return plants::cocoa_state_for_use_on(clicked_state, direction, blocks);
+        if items.name_of(item_id).is_some_and(is_cocoa_beans_item) {
+            let direction = match direction {
+                Direction::North => PlantHorizontalDirection::North,
+                Direction::South => PlantHorizontalDirection::South,
+                Direction::West => PlantHorizontalDirection::West,
+                Direction::East => PlantHorizontalDirection::East,
+                Direction::Down | Direction::Up => return None,
+            };
+            return cocoa_state_for_use_on(clicked_state, direction, blocks);
         }
         if is_sign_item(items, item_id) {
             return sign_state_for_use_on(items, item_id, direction, blocks);

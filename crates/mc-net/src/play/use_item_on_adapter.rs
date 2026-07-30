@@ -35,7 +35,6 @@ use super::explosions::{TNT_ENTITY_TYPE_NAME, TntIgnitionPlan};
 #[cfg(test)]
 use super::inventory::PlayerInventory;
 use super::persistence::XpState;
-use super::plants::{bonemeal_growth_edits, sweet_berry_harvest};
 use super::scheduled_blocks::placed_hopper_ticks;
 use super::session::{dispatch_visibility_commands, within_block_reach};
 use super::simulation::{
@@ -55,6 +54,7 @@ use super::{
     schedule_fluid_ticks_for_interaction, splitmix64, start_falling_blocks_after_edits,
     write_block_ack, write_block_resync_then_ack, write_inventory_slot_updates,
 };
+use mc_world::plant_rules_26_1_2::{bonemeal_growth_edits, sweet_berry_harvest};
 
 #[cfg(test)]
 #[path = "use_item_on_adapter_tests.rs"]
@@ -913,7 +913,10 @@ pub(super) fn plan_loaded_bonemeal_growth(
         block_break_loot_seed(clicked_pos, current, current_token)
             ^ (sequence as i64 as u64).rotate_left(23),
     );
-    let edits = bonemeal_growth_edits(&state.blocks, &snapshot, clicked_pos, current, tree_seed)?;
+    let edits = bonemeal_growth_edits(&state.blocks, &snapshot, clicked_pos, current, tree_seed)?
+        .into_iter()
+        .map(BlockEdit::from)
+        .collect::<Vec<_>>();
     let preconditions = edits
         .iter()
         .map(|edit| {
@@ -1527,13 +1530,13 @@ pub(super) fn plan_loaded_plant_harvest(
     position: mc_world::BlockPos,
 ) -> Option<(BlockEdit, ItemStack, BlockEditPrecondition)> {
     let precondition = published_block_precondition(state, position)?;
-    let (edit, drop) = sweet_berry_harvest(
-        &state.blocks,
-        &state.items,
-        position,
-        precondition.expected_state,
-    )?;
-    Some((edit, drop, precondition))
+    let (edit, drop) = sweet_berry_harvest(&state.blocks, position, precondition.expected_state)?;
+    let item_id = state.items.id_of(&drop.item)?;
+    Some((
+        BlockEdit::from(edit),
+        ItemStack::new(item_id, drop.count),
+        precondition,
+    ))
 }
 
 #[cfg(test)]
