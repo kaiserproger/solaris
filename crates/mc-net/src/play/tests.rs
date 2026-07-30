@@ -71,6 +71,7 @@ mod oriented_stair_collision;
 mod outbound_channel_close;
 mod outbound_pressure_draining;
 mod outbound_write_stall;
+mod outside_slot_sentinel;
 mod pending_teleport_confirm_behaviour;
 mod pending_teleport_matching_confirm;
 mod pending_teleport_movement_gate;
@@ -893,30 +894,6 @@ fn dense_entity_simulation_rotates_lane_sized_cohorts() {
         }
     }
     assert!(visits.into_iter().all(|visits| visits == 1));
-}
-
-#[test]
-fn only_vanilla_outside_slot_sentinel_can_drop_the_cursor() {
-    let click = |slot_num| ServerboundContainerClick {
-        container_id: 0,
-        state_id: 1,
-        slot_num,
-        button_num: 0,
-        container_input: ContainerInput::Pickup,
-        changed_slots: Vec::new(),
-        carried_item: mc_protocol::packets::play::HashedStack::empty(),
-    };
-
-    assert!(matches!(
-        classify_container_click(&click(-999)),
-        ContainerClickAction::OutsidePickup { button: 0 }
-    ));
-    for malformed in [-1, -2, i16::MIN] {
-        assert!(matches!(
-            classify_container_click(&click(malformed)),
-            ContainerClickAction::Unsupported
-        ));
-    }
 }
 
 fn state(id: u32, default: bool, properties: &[(&str, &str)]) -> BlockStateReport {

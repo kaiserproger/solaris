@@ -23,17 +23,22 @@ replacement-readiness claims.
 ## Active Checkpoint
 
 Next autonomous goal checkpoint: route `playable`; mechanically move the
-`only_vanilla_outside_slot_sentinel_can_drop_the_cursor`
+`dense_entity_simulation_rotates_lane_sized_cohorts`
 test from aggregate `crates/mc-net/src/play/tests.rs` to a focused sibling
-module. Preserve the click constructor's container id `0`, state id `1`,
-button `0`, `ContainerInput::Pickup`, empty changed slots, and empty carried
-hashed stack; classification of slot `-999` as
-`ContainerClickAction::OutsidePickup { button: 0 }`; and classification of
-malformed slots `-1`, `-2`, and `i16::MIN` as
-`ContainerClickAction::Unsupported`. Leave the preceding
-`dense_entity_simulation_rotates_lane_sized_cohorts` test and following
-`state` helper aggregate-owned, and use explicit imports rather than a new
-`use super::*`.
+module. Preserve limit `512`; entity count `5_120`; sequential `EntityId`
+construction through checked `i32` conversion and `HashSet` collection; zeroed
+visit counts; ticks `0..10`; `bounded_entity_ids_due_for_tick` with the exact
+tick and limit; exactly `512` due entities each tick; checked entity-id index
+conversion; and the final assertion that every entity is visited exactly once.
+Leave the preceding `ordinary_entity_goal_updates_keep_full_tick_cadence` test
+and following `state` helper aggregate-owned, and use explicit imports rather
+than a new `use super::*`.
+
+The complete outside-slot sentinel test has moved to
+`crates/mc-net/src/play/tests/outside_slot_sentinel.rs`. Its unchanged click
+constructor, exact vanilla `-999` classification, and malformed negative-slot
+rejections are recorded in
+[`../evidence/mc-net-outside-slot-sentinel-test-extraction.md`](../evidence/mc-net-outside-slot-sentinel-test-extraction.md).
 
 The complete rejected inventory-drag resync test has moved to
 `crates/mc-net/src/play/tests/rejected_inventory_drag.rs`. Its unchanged
