@@ -23,16 +23,22 @@ replacement-readiness claims.
 ## Active Checkpoint
 
 Next autonomous goal checkpoint: route `playable`; mechanically move the
-`stale_container_updates_do_not_discard_another_open_container`
+`pending_teleport_movement_guard_returns_false_without_pending_teleport`
 test from aggregate `crates/mc-net/src/play/tests.rs` to a focused sibling
 module.
-Preserve its exact furnace position `(1, 64, 1)`, chest position `(2, 64, 2)`,
-chest container id `7` surviving the stale furnace lookup, and furnace
-container id `8` with `FurnaceKind::Furnace` surviving the stale chest lookup,
-plus production behavior. Leave the preceding
-`pending_teleport_movement_guard_returns_false_without_pending_teleport` test
-and following `state` helper aggregate-owned, and use explicit imports rather
-than a new `use super::*`.
+Preserve its exact absent pending teleport, packet name
+`ServerboundMovePlayerPos`, false guard result, and production behavior. Leave
+the preceding
+`teleport_command_waits_for_pending_confirmation_before_repositioning_player`
+test and following `state` helper aggregate-owned, and use explicit imports
+rather than a new `use super::*`.
+
+The complete stale-container isolation test has moved to
+`crates/mc-net/src/play/tests/stale_container_updates.rs`. Its unchanged
+furnace and chest positions, chest container id `7` retained after a stale
+furnace lookup, and furnace container id `8` with `FurnaceKind::Furnace`
+retained after a stale chest lookup are recorded in
+[`../evidence/mc-net-stale-container-updates-test-extraction.md`](../evidence/mc-net-stale-container-updates-test-extraction.md).
 
 The complete built-in short-grass drop test has moved to
 `crates/mc-net/src/play/tests/block_drop_short_grass.rs`. Its unchanged
