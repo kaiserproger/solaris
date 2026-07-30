@@ -316,6 +316,11 @@ not replace functional, package, workspace, or real-client gates.
    free and colliding poses, single position-sync packet, pending teleport, and
    `2 -> 3` teleport-id transition are recorded in
    [`evidence/mc-net-collision-correction-entry-test-extraction.md`](evidence/mc-net-collision-correction-entry-test-extraction.md).
+   The following existing-overlap escape test now lives in focused
+   `play/tests/collision_correction_escape.rs`; its unchanged block fixture,
+   already-colliding and escaping poses, empty correction output, absent
+   pending teleport, and stable teleport id are recorded in
+   [`evidence/mc-net-collision-correction-escape-test-extraction.md`](evidence/mc-net-collision-correction-escape-test-extraction.md).
 4. [ ] Separate behavioral tests from structural tripwires. Structural checks may
    enforce crate ownership and dependency direction, but may not assert Rust
    statement order or source-text layout.

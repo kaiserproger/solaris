@@ -23,15 +23,21 @@ replacement-readiness claims.
 ## Active Checkpoint
 
 Next autonomous goal checkpoint: route `playable`; mechanically move the
-`collision_correction_does_not_teleport_back_into_existing_solid_overlap`
+`block_drop_configured_loot_count_reaches_runtime_stack`
 test from aggregate `crates/mc-net/src/play/tests.rs` to a focused sibling
 module.
-Preserve its exact block fixture at `(0, 64, 0)`, old already-colliding pose
-`(0.50, 64.0, 0.50)`, new escaping pose `(0.55, 64.0, 0.50)`, unchanged
-teleport id `2`, empty writer, absent pending teleport, and production
-behavior. Leave the preceding `insert_fluid_test_chunk` helper and following
-`vanilla_collision_test_state` helper aggregate-owned, and use explicit
-imports rather than a new `use super::*`.
+Preserve its exact crop registry, carrot item protocol id `52`, default dirt
+state, configured dirt-to-three-carrots loot map, runtime stack
+`ItemStack::new(52, 3)`, and production behavior. Leave the preceding
+`block_drop_builtin_short_grass_returns_wheat_seeds` test and following
+`fluid_block` helper aggregate-owned, and use explicit imports rather than a
+new `use super::*`.
+
+The complete existing-overlap collision-correction escape test has moved to
+`crates/mc-net/src/play/tests/collision_correction_escape.rs`. Its unchanged
+block fixture, already-colliding and escaping poses, empty correction output,
+absent pending teleport, and stable teleport id are recorded in
+[`../evidence/mc-net-collision-correction-escape-test-extraction.md`](../evidence/mc-net-collision-correction-escape-test-extraction.md).
 
 The complete free-to-solid collision-correction test has moved to
 `crates/mc-net/src/play/tests/collision_correction_entry.rs`. Its unchanged
