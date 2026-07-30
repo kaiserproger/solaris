@@ -102,6 +102,11 @@ not replace functional, package, workspace, or real-client gates.
    persistence, stale-click, FIFO, and event-publication coverage is recorded
    in
    [`evidence/mc-net-inventory-settlement-test-extraction.md`](evidence/mc-net-inventory-settlement-test-extraction.md).
+   The following twelve-test stonecutter selection, quick-move, owner-commit,
+   stale-session, reconnect, and close/reopen class now lives in focused
+   `play/tests/stonecutter.rs`; its preserved conservation and publication
+   coverage is recorded in
+   [`evidence/mc-net-stonecutter-test-extraction.md`](evidence/mc-net-stonecutter-test-extraction.md).
 4. [ ] Separate behavioral tests from structural tripwires. Structural checks may
    enforce crate ownership and dependency direction, but may not assert Rust
    statement order or source-text layout.

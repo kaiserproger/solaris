@@ -22,21 +22,19 @@ replacement-readiness claims.
 
 ## Active Checkpoint
 
-Next autonomous goal checkpoint: route `playable`; mechanically move the full
-twelve-test stonecutter class beginning with the `stonecutter_test_recipe`,
-`stonecutter_test_items`, and `register_stonecutter_owner` helpers and
-`stonecutter_invalid_selection_and_input_fail_closed`, and ending with
-`stonecutter_close_reopen_conserves_input_through_one_owner_turn`, out of
+Next autonomous goal checkpoint: route `playable`; mechanically move the
+contiguous five-test enchanting/recipe settlement class beginning with
+`stale_enchanting_click_rebuilds_inputs_from_owner_projection` and ending with
+`placed_recipe_commits_inventory_and_publishes_aggregate_craft` out of
 aggregate `crates/mc-net/src/play/tests.rs` into a focused sibling module.
 Preserve every test and production behavior, leave the preceding shared
-`interaction_state_for_items` helper and following
-`stale_enchanting_click_rebuilds_inputs_from_owner_projection` test in the
-aggregate file, and use explicit imports rather than a new `use super::*`. The
-fourteen-test inventory settlement, recovery, checkpoint, and publication
-class has already moved to
-`crates/mc-net/src/play/tests/inventory_settlement.rs`; its concentration and
-validation are recorded in
-[`../evidence/mc-net-inventory-settlement-test-extraction.md`](../evidence/mc-net-inventory-settlement-test-extraction.md).
+`interaction_state_for_items` helper and following shared
+`register_interaction_player` helper in the aggregate file, and use explicit
+imports rather than a new `use super::*`. The complete twelve-test stonecutter
+class and its three local helpers have already moved to
+`crates/mc-net/src/play/tests/stonecutter.rs`; its concentration and validation
+are recorded in
+[`../evidence/mc-net-stonecutter-test-extraction.md`](../evidence/mc-net-stonecutter-test-extraction.md).
 The owner-run subjective fresh-world seed-`712816` playtest and
 release-candidate performance gates remain queued at their declared
 boundaries.
