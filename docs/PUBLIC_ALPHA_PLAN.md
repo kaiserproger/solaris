@@ -250,6 +250,13 @@ Benchmark reproduction happens at that feature boundary, not after every edit:
   the probes stay opt-in under the worldgen performance feature-boundary policy.
   Their workloads, limits, owners, and exact close conditions are recorded in
   [`evidence/mc-worldgen-ignored-tests.md`](evidence/mc-worldgen-ignored-tests.md).
+- [x] Classify the 80 `mc-script` tests gated by `lua-runtime` across exact Lua
+  event payloads, Loader manifests, player inventory, plugin configuration,
+  sandbox/host behavior, timers, and startup worldgen declarations. The empty
+  default feature set is an intentional dependency boundary; production
+  `mc-server` enables the runtime. Both the 85-test default suite and 165-test
+  feature suite are green, with ownership and close conditions recorded in
+  [`evidence/mc-script-lua-runtime-tests.md`](evidence/mc-script-lua-runtime-tests.md).
 - [x] Record the exact local 26.1.2 world-clock oracle in
   [`evidence/world-clock-26.1.2.md`](evidence/world-clock-26.1.2.md).
 - [x] Implement the typed world-clock map, separating monotonic `game_time` from
