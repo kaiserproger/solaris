@@ -23,17 +23,18 @@ replacement-readiness claims.
 ## Active Checkpoint
 
 Next autonomous goal checkpoint: route `playable`; mechanically move the
-lever/piston redstone class beginning with
-`lever_toggle_powers_adjacent_iron_door` and ending with
-`protected_piston_destination_rejects_the_atomic_piston_group` out of aggregate
-`crates/mc-net/src/play/tests.rs` into a focused sibling module. Preserve every
-test and production behavior, leave the following
-`real_door_states_plan_hand_toggle_when_sidecar_is_present` test in the
-aggregate file, and use explicit imports rather than a new `use super::*`.
-The three-test door/trapdoor hand-toggle class has already moved to
-`crates/mc-net/src/play/tests/door_toggles.rs`; its concentration and
+button-planning class beginning with
+`button_press_schedules_release_tick_without_global_scan` and ending with
+`powered_button_press_is_consumed_without_duplicate_release_tick` out of
+aggregate `crates/mc-net/src/play/tests.rs` into a focused sibling module.
+Preserve every test and production behavior, leave the preceding ignored
+`real_door_states_plan_hand_toggle_when_sidecar_is_present` sidecar gate and
+the following `scheduled_button_tick_releases_powered_button` runtime class in
+the aggregate file, and use explicit imports rather than a new `use super::*`.
+The four-test lever/piston redstone class has already moved to
+`crates/mc-net/src/play/tests/redstone_pistons.rs`; its concentration and
 validation are recorded in
-[`../evidence/mc-net-door-toggle-test-extraction.md`](../evidence/mc-net-door-toggle-test-extraction.md).
+[`../evidence/mc-net-redstone-piston-test-extraction.md`](../evidence/mc-net-redstone-piston-test-extraction.md).
 The owner-run subjective fresh-world seed-`712816` playtest and
 release-candidate performance gates remain queued at their declared
 boundaries.

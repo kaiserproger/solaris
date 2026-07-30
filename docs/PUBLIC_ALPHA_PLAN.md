@@ -58,6 +58,10 @@ not replace functional, package, workspace, or real-client gates.
    `play/tests/door_toggles.rs`; its preserved unit, two-client, and exact-wire
    coverage is recorded in
    [`evidence/mc-net-door-toggle-test-extraction.md`](evidence/mc-net-door-toggle-test-extraction.md).
+   The adjacent four-test lever/piston redstone class now lives in focused
+   `play/tests/redstone_pistons.rs`; its stale-power and zone-protection fences
+   are recorded in
+   [`evidence/mc-net-redstone-piston-test-extraction.md`](evidence/mc-net-redstone-piston-test-extraction.md).
 4. [ ] Separate behavioral tests from structural tripwires. Structural checks may
    enforce crate ownership and dependency direction, but may not assert Rust
    statement order or source-text layout.
