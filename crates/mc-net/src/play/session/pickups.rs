@@ -1223,6 +1223,8 @@ pub(super) fn merge_item_entities_locked(
             if candidate.lifecycle != EntityLifecycle::Alive
                 || candidate.type_name != "minecraft:item"
                 || candidate.retained.item_pickup_claim.is_some()
+                || candidate.retained.villager_food_recipient
+                    != ready.retained.villager_food_recipient
                 || distance_sq(ready.position, candidate.position) > radius_sq
             {
                 continue;

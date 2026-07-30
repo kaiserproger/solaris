@@ -9322,16 +9322,10 @@ fn protected_piston_destination_rejects_the_atomic_piston_group() {
 }
 
 #[test]
+#[ignore = "explicit local 26.1.2 blocks sidecar parity gate"]
 fn real_door_states_plan_hand_toggle_when_sidecar_is_present() {
     let manifest = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"));
     let blocks_json = manifest.join("../../data/vanilla/reports/blocks.json");
-    if !blocks_json.exists() {
-        eprintln!(
-            "skipping real door toggle planner test; missing {}",
-            blocks_json.display()
-        );
-        return;
-    }
     let report = mc_data::blocks::load_blocks_report(&blocks_json).expect("blocks report loads");
     let blocks = Arc::new(mc_world::BlockRegistry::from_report(&report).expect("registry builds"));
     let mut world = in_memory_button_world(Arc::clone(&blocks));

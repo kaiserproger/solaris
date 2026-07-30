@@ -422,16 +422,56 @@ fn session_registry_uses_persistent_regional_entity_owners() {
 }
 
 #[test]
+fn sheep_recipe_mix_matches_checked_in_26_1_2_table() {
+    use mc_entity::SheepColor;
+
+    let expected = [
+        (SheepColor::White, SheepColor::Blue, SheepColor::LightBlue),
+        (SheepColor::White, SheepColor::Green, SheepColor::Lime),
+        (SheepColor::White, SheepColor::Red, SheepColor::Pink),
+        (SheepColor::White, SheepColor::Gray, SheepColor::LightGray),
+        (SheepColor::White, SheepColor::Black, SheepColor::Gray),
+        (SheepColor::Yellow, SheepColor::Red, SheepColor::Orange),
+        (SheepColor::Blue, SheepColor::Green, SheepColor::Cyan),
+        (SheepColor::Blue, SheepColor::Red, SheepColor::Purple),
+        (SheepColor::Pink, SheepColor::Purple, SheepColor::Magenta),
+    ];
+    for (first, second, result) in expected {
+        assert_eq!(sheep_recipe_mix(first, second), Some(result));
+        assert_eq!(sheep_recipe_mix(second, first), Some(result));
+    }
+    assert_eq!(
+        sheep_recipe_mix_table(),
+        expected
+            .into_iter()
+            .map(|(first, second, result)| ((first.id(), second.id()), result.id()))
+            .collect()
+    );
+}
+
+fn sheep_recipe_mix_table() -> BTreeMap<(u8, u8), u8> {
+    let mut actual = BTreeMap::new();
+    for first in mc_entity::SheepColor::ALL {
+        for second in mc_entity::SheepColor::ALL {
+            if first.id() > second.id() {
+                continue;
+            }
+            if let Some(result) = sheep_recipe_mix(first, second) {
+                actual.insert((first.id(), second.id()), result.id());
+            }
+        }
+    }
+    actual
+}
+
+#[test]
+#[ignore = "explicit local 26.1.2 recipe sidecar parity gate"]
 fn sheep_recipe_mix_matches_all_local_vanilla_two_dye_recipes() {
     let recipe_dir = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
         .parent()
         .and_then(std::path::Path::parent)
         .unwrap()
         .join("data/vanilla/data/minecraft/recipe");
-    if !recipe_dir.is_dir() {
-        eprintln!("skipping: local vanilla recipes missing");
-        return;
-    }
 
     let mut expected = BTreeMap::new();
     for recipe in mc_data::recipes::load_recipes(recipe_dir).unwrap() {
@@ -458,20 +498,8 @@ fn sheep_recipe_mix_matches_all_local_vanilla_two_dye_recipes() {
         expected.insert(key, result.id());
     }
 
-    let mut actual = BTreeMap::new();
-    for first in mc_entity::SheepColor::ALL {
-        for second in mc_entity::SheepColor::ALL {
-            if first.id() > second.id() {
-                continue;
-            }
-            if let Some(result) = sheep_recipe_mix(first, second) {
-                actual.insert((first.id(), second.id()), result.id());
-            }
-        }
-    }
-
     assert_eq!(expected.len(), 9, "local 26.1.2 two-dye recipe count");
-    assert_eq!(actual, expected);
+    assert_eq!(sheep_recipe_mix_table(), expected);
 }
 
 #[test]

@@ -267,6 +267,11 @@ use typed projection; active grazing entities excluded from goal CAS always use
 the current full-state path. Owner/lane/journal errors remain errors. This is
 an incremental ECS boundary, not removal of the full-snapshot CAS input or
 direct shared access to lane worlds.
+ID-filtered simulation-projection reads treat an entity removed after interest
+selection as an omitted result, matching ID-filtered snapshot reads. Every
+returned projection still has to match the requested set and coordinator route.
+This keeps ordinary same-tick removals from turning a stale read set into an
+owner failure.
 Goal-owned rotation remains authoritative through the later physics phase:
 collision resolution may clip position and velocity but does not derive a new
 living-mob yaw from that clipped vector. Moving ground goals use bounded turns;
@@ -412,6 +417,15 @@ projection, so delayed player push, breeding, grazing, or hostile-arrow output
 cannot overwrite a newer owner mutation. ID-filtered reads are grouped into one
 request per lane, breeding uses owner-maintained indexes, UUID checks use the
 coordinator index, and physics reuses a batch-prefetched snapshot set.
+Villager inventory pickup applies the same distinction as other conditional
+owner mutations: a stale snapshot or finite geometric miss returns `false`
+without mutation, while malformed non-finite input remains an error. Food thrown
+between villagers carries its persisted recipient identity; only that villager
+may collect it within the bounded shared-food pickup radius, and item merging
+requires the same recipient. A committed courtship installs reciprocal follow
+goals; scheduled villager-brain transitions preserve those goals while the
+pending birth exists, and birth, no-bed, or abort resolution returns both
+parents to `Idle`.
 Owner lanes now support live scale-up and scale-down. At an idle owner-command
 boundary, the source lane detaches the physical store, the coordinator advances
 the region lease epoch, and the target lane installs that same store. A failed

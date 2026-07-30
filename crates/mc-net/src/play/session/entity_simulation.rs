@@ -327,6 +327,16 @@ fn apply_villager_brain_transitions_with_professions(
         let Ok(plan) = validated_profile.plan(&current, lifecycle_tick, day_time) else {
             continue;
         };
+        let goal = if expected
+            .retained
+            .villager_population
+            .as_ref()
+            .is_some_and(|population| population.pending_birth.is_some())
+        {
+            expected.goal.clone()
+        } else {
+            plan.goal
+        };
         let profession_assignment = profession_context
             .and_then(|context| supported_profession_assignment(&expected, &plan.state, context));
         let updated_gossip = expected
@@ -344,7 +354,7 @@ fn apply_villager_brain_transitions_with_professions(
                         && merchant.restock(day_time).ok() == Some(true))
                     .then_some(merchant)
                 });
-        if expected.goal == plan.goal
+        if expected.goal == goal
             && expected.retained.villager_brain.as_ref() == Some(&plan.state)
             && updated_gossip.is_none()
             && updated_merchant.is_none()
@@ -353,7 +363,7 @@ fn apply_villager_brain_transitions_with_professions(
             continue;
         }
         let mut next = expected.clone();
-        next.goal = plan.goal;
+        next.goal = goal;
         next.retained.villager_brain = Some(plan.state);
         if let Some(gossip) = updated_gossip {
             next.retained.villager_gossip = Some(gossip);

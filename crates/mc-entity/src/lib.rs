@@ -456,6 +456,9 @@ pub struct EntityRetainedState {
     /// omit it so an interrupted transaction restarts from the unchanged item.
     #[serde(skip)]
     pub item_pickup_claim: Option<u64>,
+    /// Recipient for food thrown by one villager to another.
+    #[serde(default)]
+    pub villager_food_recipient: Option<EntityId>,
     pub primed_tnt: Option<EntityPrimedTntState>,
     #[serde(default)]
     pub crossbow_attack: Option<EntityCrossbowAttackState>,

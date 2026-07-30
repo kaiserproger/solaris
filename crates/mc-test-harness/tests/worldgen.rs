@@ -1129,6 +1129,17 @@ async fn drop_carrots_and_wait_for_villager_food_share_birth(
         .await
         .expect("select carrot hotbar slot for generated villager birth");
     client
+        .write_packet(&ServerboundMovePlayerPosRot {
+            x: midpoint[0],
+            y: midpoint[1],
+            z: midpoint[2] - 1.0,
+            yaw: 0.0,
+            pitch: 0.0,
+            flags: MovePlayerFlags::new(true, false),
+        })
+        .await
+        .expect("move behind generated villager carrot drop target");
+    client
         .write_packet(&ServerboundPlayerAction {
             action: PlayerActionKind::DropAllItems,
             position: 0,

@@ -4552,11 +4552,9 @@ impl RegionalOwnerCoordinator {
         ordered.sort_unstable();
         let mut requests = BTreeMap::<usize, Vec<(RegionLease, EntityId)>>::new();
         for entity in ordered {
-            let expected_key = self
-                .locations
-                .get(&entity)
-                .copied()
-                .ok_or(RegionOwnerLaneError::UnknownEntity)?;
+            let Some(expected_key) = self.locations.get(&entity).copied() else {
+                continue;
+            };
             let lease = self
                 .ownership
                 .lease(expected_key)
@@ -4587,13 +4585,11 @@ impl RegionalOwnerCoordinator {
             );
         }
         projections.sort_unstable_by_key(|projection| projection.id);
-        if projections.len() != entities.len()
-            || projections.iter().any(|projection| {
-                !entities.contains(&projection.id)
-                    || self.locations.get(&projection.id).copied()
-                        != RegionKey::from_position(projection.position)
-            })
-        {
+        if projections.iter().any(|projection| {
+            !entities.contains(&projection.id)
+                || self.locations.get(&projection.id).copied()
+                    != RegionKey::from_position(projection.position)
+        }) {
             return Err(RegionOwnerLaneError::InvalidMutation);
         }
         Ok(projections)
@@ -5391,16 +5387,27 @@ impl RegionalOwnerCoordinator {
         let item_max_y = item_expected.position.y + 0.25;
         let item_min_z = item_expected.position.z - 0.125;
         let item_max_z = item_expected.position.z + 0.125;
-        if !villager_expected.position.is_finite()
-            || !item_expected.position.is_finite()
-            || item_max_x < villager_min_x
+        if !villager_expected.position.is_finite() || !item_expected.position.is_finite() {
+            return Err(RegionOwnerLaneError::InvalidMutation);
+        }
+        if item_max_x < villager_min_x
             || item_min_x > villager_max_x
             || item_max_y < villager_min_y
             || item_min_y > villager_max_y
             || item_max_z < villager_min_z
             || item_min_z > villager_max_z
         {
-            return Err(RegionOwnerLaneError::InvalidMutation);
+            let dx = villager_expected.position.x - item_expected.position.x;
+            let dy = villager_expected.position.y - item_expected.position.y;
+            let dz = villager_expected.position.z - item_expected.position.z;
+            let targeted_share_in_range = item_expected.retained.villager_food_recipient
+                == Some(villager_expected.id)
+                && dx.mul_add(dx, dy.mul_add(dy, dz * dz))
+                    <= crate::villager_population_26_1_2::VILLAGER_SHARED_FOOD_PICKUP_RADIUS
+                        .powi(2);
+            if !targeted_share_in_range {
+                return Ok(false);
+            }
         }
 
         let mut derived_population = villager_expected
@@ -5598,6 +5605,7 @@ impl RegionalOwnerCoordinator {
                     crate::villager_population_26_1_2::VILLAGER_ITEM_THROW_PICKUP_DELAY_TICKS,
                 )
             || thrown_item.retained.item_pickup_owner_block.is_some()
+            || thrown_item.retained.villager_food_recipient != Some(recipient.id)
             || !thrown_item.position.is_finite()
             || !thrown_item.velocity.is_finite()
         {
@@ -5745,6 +5753,10 @@ impl RegionalOwnerCoordinator {
                 .map_err(|_| RegionOwnerLaneError::InvalidMutation)?;
             let mut derived_next = expected.clone();
             derived_next.retained.villager_population = Some(derived_population);
+            derived_next.goal = GoalState::FollowTarget {
+                target: parents[1 - index].0.id,
+                speed: crate::villager_population_26_1_2::VILLAGER_COURTSHIP_SPEED,
+            };
             if *next != derived_next {
                 return Err(RegionOwnerLaneError::InvalidMutation);
             }
@@ -5877,6 +5889,7 @@ impl RegionalOwnerCoordinator {
                 .map_err(|_| RegionOwnerLaneError::InvalidMutation)?;
             let mut derived_next = expected.clone();
             derived_next.retained.villager_population = Some(derived_population);
+            derived_next.goal = GoalState::Idle;
             if *next != derived_next {
                 return Err(RegionOwnerLaneError::InvalidMutation);
             }
@@ -6052,6 +6065,7 @@ impl RegionalOwnerCoordinator {
                 .map_err(|_| RegionOwnerLaneError::InvalidMutation)?;
             let mut derived_next = expected.clone();
             derived_next.retained.villager_population = Some(derived_population);
+            derived_next.goal = GoalState::Idle;
             if *next != derived_next {
                 return Err(RegionOwnerLaneError::InvalidMutation);
             }
@@ -12028,6 +12042,32 @@ mod tests {
         let restored = coordinator.shutdown().expect("coordinator shutdown");
         assert!(!restored.contains(entity));
         assert!(!restored.contains_uuid(removed.uuid));
+    }
+
+    #[test]
+    fn owner_coordinator_simulation_projection_skips_removed_requested_ids() {
+        let mut coordinator =
+            super::RegionalOwnerCoordinator::from_store(RegionalEntityStore::new(), 2)
+                .expect("empty owner coordinator");
+        let kept = coordinator
+            .spawn(cow(Vec3::new(0.5, 64.0, 0.5)))
+            .expect("spawn kept cow");
+        let removed = coordinator
+            .spawn(cow(Vec3::new(1.5, 64.0, 0.5)))
+            .expect("spawn removed cow");
+        coordinator.remove(removed).expect("remove cow");
+
+        let projections = coordinator
+            .simulation_projections_for_ids(&HashSet::from([kept, removed]))
+            .expect("read surviving simulation projection");
+
+        assert_eq!(
+            projections
+                .into_iter()
+                .map(|projection| projection.id)
+                .collect::<Vec<_>>(),
+            vec![kept]
+        );
     }
 
     #[test]
@@ -18278,6 +18318,10 @@ mod tests {
                 .expect("parent population")
                 .start_pending_birth(expected[1 - index].uuid, 10, 0, false, POPULATION_FOOD)
                 .expect("start reciprocal courtship");
+            next[index].goal = GoalState::FollowTarget {
+                target: expected[1 - index].id,
+                speed: 0.3,
+            };
         }
         super::VillagerCourtshipCommit {
             parents: [
@@ -18335,6 +18379,7 @@ mod tests {
                 .expect("pending population")
                 .finish_courtship_without_child(285, POPULATION_FOOD)
                 .expect("finish no-bed courtship");
+            snapshot.goal = GoalState::Idle;
             snapshot
         });
         super::VillagerNoBedCommit {
@@ -18366,6 +18411,7 @@ mod tests {
                 .expect("pending population")
                 .finish_successful_birth(285, POPULATION_FOOD)
                 .expect("finish successful birth");
+            snapshot.goal = GoalState::Idle;
             snapshot
         });
         let started_tick = expected[0]
@@ -18512,7 +18558,7 @@ mod tests {
     }
 
     #[test]
-    fn villager_inventory_pickup_rejects_stale_or_out_of_reach_without_partial_mutation() {
+    fn villager_inventory_pickup_returns_false_for_stale_or_out_of_reach_without_mutation() {
         for stale in [false, true] {
             let mut coordinator = population_coordinator(None);
             let villager = coordinator
@@ -18559,13 +18605,47 @@ mod tests {
                 assert_parity_snapshots(&mut coordinator, before);
             } else {
                 let before = parity_snapshots(&mut coordinator, [villager, item]);
-                assert_eq!(
-                    coordinator.commit_villager_inventory_pickup_if_current(commit),
-                    Err(super::RegionOwnerLaneError::InvalidMutation)
+                assert!(
+                    !coordinator
+                        .commit_villager_inventory_pickup_if_current(commit)
+                        .unwrap()
                 );
                 assert_parity_snapshots(&mut coordinator, before);
             }
         }
+    }
+
+    #[test]
+    fn villager_inventory_pickup_accepts_targeted_shared_food_within_search_radius() {
+        let mut coordinator = population_coordinator(None);
+        let villager = coordinator
+            .spawn(parity_population_villager(Vec3::new(0.5, 64.0, 0.5), None))
+            .unwrap();
+        let mut shared_food = parity_item(Vec3::new(2.25, 64.0, 0.5), POPULATION_FOOD.carrot, 3);
+        shared_food.retained.villager_food_recipient = Some(villager);
+        let item = coordinator.spawn(shared_food).unwrap();
+        let villager_expected = coordinator.snapshot(villager).unwrap().unwrap();
+        let item_expected = coordinator.snapshot(item).unwrap().unwrap();
+        let mut villager_next = villager_expected.clone();
+        let remainder = villager_next
+            .retained
+            .villager_population
+            .as_mut()
+            .unwrap()
+            .add_to_inventory(item_expected.item_stack.clone().unwrap(), 64)
+            .unwrap();
+
+        assert!(remainder.is_none());
+        assert!(
+            coordinator
+                .commit_villager_inventory_pickup_if_current(super::VillagerInventoryPickupCommit {
+                    villager: (villager_expected, villager_next),
+                    item: (item_expected, None),
+                    item_max_stack_size: 64,
+                },)
+                .unwrap()
+        );
+        assert!(coordinator.snapshot(item).unwrap().is_none());
     }
 
     #[test]
@@ -18592,8 +18672,15 @@ mod tests {
                 .commit_villager_courtship_if_current(commit)
                 .unwrap()
         );
-        for parent in parents {
+        for (index, parent) in parents.into_iter().enumerate() {
             let snapshot = coordinator.snapshot(parent).unwrap().unwrap();
+            assert_eq!(
+                snapshot.goal,
+                GoalState::FollowTarget {
+                    target: parents[1 - index],
+                    speed: crate::villager_population_26_1_2::VILLAGER_COURTSHIP_SPEED,
+                }
+            );
             let population = snapshot.retained.villager_population.unwrap();
             assert_eq!(population.food_level, 0);
             assert_eq!(population.inventory.food_points(POPULATION_FOOD), 12);

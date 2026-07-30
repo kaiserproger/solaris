@@ -270,6 +270,7 @@ fn abort_villager_courtship_locked(inner: &mut SessionEntityGuards<'_>, entity_i
             .as_mut()
             .expect("population state was observed")
             .abort_pending_birth();
+        next.goal = GoalState::Idle;
         transitions.push((expected, next));
     }
     if !transitions.is_empty() {
@@ -315,7 +316,11 @@ fn pick_up_villager_food_locked(
         {
             continue;
         }
-        let mut candidates = nearby_entity_candidate_ids_locked(inner, villager.position, 2.0);
+        let mut candidates = nearby_entity_candidate_ids_locked(
+            inner,
+            villager.position,
+            mc_entity::villager_population_26_1_2::VILLAGER_SHARED_FOOD_PICKUP_RADIUS,
+        );
         candidates.sort_unstable();
         for item_id in candidates {
             let Some(item) = inner.entities.snapshot(item_id) else {
@@ -336,6 +341,10 @@ fn pick_up_villager_food_locked(
                     .retained
                     .item_pickup_owner_block
                     .is_some_and(|block| block.expires_tick > current_tick)
+                || item
+                    .retained
+                    .villager_food_recipient
+                    .is_some_and(|recipient| recipient != villager_id)
             {
                 continue;
             }
@@ -467,6 +476,7 @@ fn share_one_villager_food_stack_locked(
             thrown.retained.item_pickup_ready_tick = current_tick.checked_add(
                 mc_entity::villager_population_26_1_2::VILLAGER_ITEM_THROW_PICKUP_DELAY_TICKS,
             );
+            thrown.retained.villager_food_recipient = Some(recipient.id);
             let Some(thrown) = inner.entities.commit_villager_food_share_if_current(
                 mc_entity::VillagerFoodShareCommit {
                     donor: (donor.clone(), donor_next),
@@ -554,6 +564,14 @@ fn start_one_villager_courtship_locked(
                 .as_ref()
                 .expect("pending birth was installed")
                 .ready_tick;
+            first_next.goal = GoalState::FollowTarget {
+                target: second.id,
+                speed: mc_entity::villager_population_26_1_2::VILLAGER_COURTSHIP_SPEED,
+            };
+            second_next.goal = GoalState::FollowTarget {
+                target: first.id,
+                speed: mc_entity::villager_population_26_1_2::VILLAGER_COURTSHIP_SPEED,
+            };
             let commit = mc_entity::VillagerCourtshipCommit {
                 parents: [(first.clone(), first_next), (second.clone(), second_next)],
                 current_tick,
@@ -646,6 +664,8 @@ fn finish_due_villager_births_locked(
                 abort_villager_courtship_locked(inner, &pair);
                 continue;
             }
+            first_next.goal = GoalState::Idle;
+            second_next.goal = GoalState::Idle;
             if inner
                 .entities
                 .commit_villager_no_bed_if_current(mc_entity::VillagerNoBedCommit {
@@ -695,6 +715,8 @@ fn finish_due_villager_births_locked(
             abort_villager_courtship_locked(inner, &pair);
             continue;
         }
+        first_next.goal = GoalState::Idle;
+        second_next.goal = GoalState::Idle;
 
         inner.settlement_claimed_homes.insert(home_claim.clone());
         let mut child = SpawnEntity::new(villager_type_id, "minecraft:villager", first.position);
