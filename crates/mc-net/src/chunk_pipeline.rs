@@ -67,6 +67,22 @@ pub(crate) struct ChunkPipelineResources {
     metrics: ChunkPipelineResourceMetrics,
 }
 
+#[derive(Debug, Clone)]
+pub struct ChunkPipelineIdleHandle {
+    resources: ChunkPipelineResources,
+}
+
+impl ChunkPipelineIdleHandle {
+    pub(crate) fn new(resources: ChunkPipelineResources) -> Self {
+        Self { resources }
+    }
+
+    pub async fn wait_for_idle(&self) -> ChunkPipelineResourceSnapshot {
+        self.resources.wait_for_idle().await;
+        self.resources.metrics().snapshot()
+    }
+}
+
 #[derive(Debug, Clone, Default)]
 pub struct ChunkPipelineResourceMetrics {
     active_io: Arc<AtomicUsize>,

@@ -22,18 +22,18 @@ replacement-readiness claims.
 
 ## Active Checkpoint
 
-Next: replace the `mc-test-harness` container-support
-`wait_for_chunk_pipeline_idle` deadline/yield loop with the exact chunk-pipeline
-idle notification. Keep its timeout only as a fail-only watchdog and do not
-combine unrelated block-edit or streaming behavior.
+Next: replace `load_scenarios::wait_for_chunk_cancellation` snapshot/deadline/
+yield polling with an exact chunk-stream cancellation notification. Keep its
+timeout only as a fail-only watchdog and do not change cancellation semantics
+or unrelated load-scenario behavior.
 
-The `mc-net` shutdown-wait test class is closed. Its scheduler-yield ordering
-assumption was replaced by explicitly polling the wait future to `Pending`
-before requesting shutdown, while a second test proves that a request made
-before waiter registration is observed from authoritative state. The remaining
-timeout is only a fail watchdog around the exact notification/state event.
+The container-support chunk-pipeline idle wait is closed. The harness now
+retains a narrow handle to the existing production idle barrier before
+`BoundServer::serve` consumes the server. That barrier registers its
+notification before checking IO, CPU, prepare-task, and prepare-request state;
+the five-second timeout is only a fail watchdog around the exact future.
 Evidence is in
-[`../evidence/mc-net-shutdown-wait-test.md`](../evidence/mc-net-shutdown-wait-test.md).
+[`../evidence/mc-test-harness-chunk-pipeline-idle-wait.md`](../evidence/mc-test-harness-chunk-pipeline-idle-wait.md).
 No graphical or gameplay-readiness claim is implied.
 
 ## Recent Checkpoints — through 2026-07-30

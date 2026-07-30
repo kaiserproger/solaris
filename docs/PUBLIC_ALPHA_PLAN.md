@@ -233,6 +233,11 @@ Benchmark reproduction happens at that feature boundary, not after every edit:
   request and state observation after an earlier request; evidence is recorded
   in
   [`evidence/mc-net-shutdown-wait-test.md`](evidence/mc-net-shutdown-wait-test.md).
+- [x] Replace the `mc-test-harness` container-support chunk-pipeline idle
+  snapshot/yield loop with the existing exact full-pipeline idle barrier. A
+  narrow read-only handle preserves the barrier across `BoundServer::serve`;
+  evidence is recorded in
+  [`evidence/mc-test-harness-chunk-pipeline-idle-wait.md`](evidence/mc-test-harness-chunk-pipeline-idle-wait.md).
 - [x] Classify the five explicit `mc-net` ignores: three mapped performance
   reports and two local 26.1.2 sidecar parity gates. The parity gates no longer
   self-skip as green when Mojang data is absent, and the sheep-mix behavior has

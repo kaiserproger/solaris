@@ -1091,6 +1091,11 @@ impl BoundServer {
     }
 
     #[must_use]
+    pub fn chunk_pipeline_idle_handle(&self) -> crate::ChunkPipelineIdleHandle {
+        crate::ChunkPipelineIdleHandle::new(self.chunk_pipeline_resources.clone())
+    }
+
+    #[must_use]
     pub fn outbound_pressure_handle(&self) -> OutboundPressureHandle {
         OutboundPressureHandle {
             sessions: Arc::clone(&self.sessions),

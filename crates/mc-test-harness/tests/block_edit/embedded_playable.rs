@@ -133,7 +133,7 @@ async fn embedded_playable_short_session_soak_keeps_clients_responsive() {
     cfg.shutdown = shutdown.clone();
     let bound = mc_net::bind(cfg).await.expect("bind");
     let addr = bound.local_addr().expect("local_addr");
-    let chunk_metrics = bound.chunk_pipeline_metrics();
+    let chunk_pipeline_idle = bound.chunk_pipeline_idle_handle();
     let outbound_pressure = bound.outbound_pressure_handle();
     let serve = tokio::spawn(async move { bound.serve().await });
 
@@ -224,7 +224,8 @@ async fn embedded_playable_short_session_soak_keeps_clients_responsive() {
     );
     drop(probe);
 
-    let chunk_snapshot = wait_for_chunk_pipeline_idle(&chunk_metrics, Duration::from_secs(5)).await;
+    let chunk_snapshot =
+        wait_for_chunk_pipeline_idle(&chunk_pipeline_idle, Duration::from_secs(5)).await;
     assert_eq!(
         chunk_snapshot.active_cpu, 0,
         "chunk CPU work should drain after playable soak: {chunk_snapshot:?}"

@@ -211,21 +211,12 @@ fn assert_position_near(
 }
 
 async fn wait_for_chunk_pipeline_idle(
-    metrics: &mc_net::ChunkPipelineResourceMetrics,
+    idle: &mc_net::ChunkPipelineIdleHandle,
     duration: Duration,
 ) -> mc_net::ChunkPipelineResourceSnapshot {
-    let deadline = tokio::time::Instant::now() + duration;
-    loop {
-        let snapshot = metrics.snapshot();
-        if snapshot.active_cpu == 0 && snapshot.active_io == 0 {
-            return snapshot;
-        }
-        assert!(
-            tokio::time::Instant::now() < deadline,
-            "chunk pipeline did not go idle: {snapshot:?}"
-        );
-        tokio::task::yield_now().await;
-    }
+    tokio::time::timeout(duration, idle.wait_for_idle())
+        .await
+        .unwrap_or_else(|_| panic!("chunk pipeline did not go idle before {duration:?}"))
 }
 
 async fn mine_block_and_wait_for_stack(
@@ -579,4 +570,3 @@ fn embedded_playable_config(
         shutdown: mc_net::ShutdownHandle::default(),
     }
 }
-

@@ -42,9 +42,9 @@ pub use autoscale_soak::{
 };
 pub use chunk_pipeline::{
     ChunkLoadSource, ChunkPipelineCancellationSnapshot, ChunkPipelineGeneration,
-    ChunkPipelinePolicy, ChunkPipelineResourceMetrics, ChunkPipelineResourceSnapshot,
-    ChunkPipelineStopReason, ChunkPipelineStopReasonCounts, ChunkPriority, ChunkRequest,
-    ChunkScheduler, PreparedChunk, automatic_worker_limits,
+    ChunkPipelineIdleHandle, ChunkPipelinePolicy, ChunkPipelineResourceMetrics,
+    ChunkPipelineResourceSnapshot, ChunkPipelineStopReason, ChunkPipelineStopReasonCounts,
+    ChunkPriority, ChunkRequest, ChunkScheduler, PreparedChunk, automatic_worker_limits,
 };
 pub use control_plane::{
     AutoscaleAction, AutoscaleDecision, AutoscalePolicy, AutoscalePressure, AutoscaleProfile,
