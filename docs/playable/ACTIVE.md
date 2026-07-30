@@ -23,17 +23,23 @@ replacement-readiness claims.
 ## Active Checkpoint
 
 Next autonomous goal checkpoint: route `playable`; mechanically move the
-`pending_teleport_resends_after_vanilla_tick_window`
+`pending_teleport_confirm_behaviour_after_unconfirmed_movement`
 test from aggregate `crates/mc-net/src/play/tests.rs` to a focused sibling
 module.
-Preserve its exact pose `(12.5, 70.0, -3.25)`, pending teleport id `7` at sent
-tick `100`, next id `8`, no resend and empty writer at tick `120`, successful
-resend at tick `121`, one position-sync packet with teleport id `8` and the
-exact pose coordinates, pending id `8` at sent tick `121`, next id `9`, and
-production behavior. Leave the preceding
-`pending_teleport_confirm_behaviour_after_unconfirmed_movement` test and
+Preserve its pending teleport id `7` at sent tick `0`, initial movement guard
+for the exact `ServerboundMovePlayerPos` packet name, mismatched confirmation
+id `8` with expected id `7` and retained pending id `7`, successful
+confirmation id `7`, cleared pending state, final false movement guard for the
+same packet name, and production behavior. Leave the preceding
+`pending_teleport_movement_gate_waits_without_duplicate_sync_packets` test and
 following `state` helper aggregate-owned, and use explicit imports rather than
 a new `use super::*`.
+
+The complete pending-teleport resend-window test has moved to
+`crates/mc-net/src/play/tests/pending_teleport_resend.rs`. Its unchanged pose,
+pending and next teleport ids, tick `120` no-resend boundary, tick `121`
+position-sync resend, and updated pending/next ids are recorded in
+[`../evidence/mc-net-pending-teleport-resend-window-test-extraction.md`](../evidence/mc-net-pending-teleport-resend-window-test-extraction.md).
 
 The complete pending-confirmation teleport-command test has moved to
 `crates/mc-net/src/play/tests/teleport_command_pending_confirmation.rs`. Its
