@@ -259,6 +259,10 @@ not replace functional, package, workspace, or real-client gates.
    focused `play/tests/powder_snow_equipment_context.rs`; its no-boots,
    leather-boots, Shift-descent, and already-inside coverage is recorded in
    [`evidence/mc-net-powder-snow-equipment-context-test-extraction.md`](evidence/mc-net-powder-snow-equipment-context-test-extraction.md).
+   The following torch/campfire exact-shape test now lives in focused
+   `play/tests/torch_campfire_collision.rs`; its empty-torch, exact campfire
+   state, and `7/16`-block top-boundary coverage is recorded in
+   [`evidence/mc-net-torch-campfire-collision-test-extraction.md`](evidence/mc-net-torch-campfire-collision-test-extraction.md).
 4. [ ] Separate behavioral tests from structural tripwires. Structural checks may
    enforce crate ownership and dependency direction, but may not assert Rust
    statement order or source-text layout.
