@@ -23,14 +23,20 @@ replacement-readiness claims.
 ## Active Checkpoint
 
 Next autonomous goal checkpoint: route `playable`; mechanically move the
-`collision_correction_applies_powder_snow_movement_context` test out of
+`powder_snow_dynamic_shape_requires_exact_vanilla_state_identity` test out of
 aggregate `crates/mc-net/src/play/tests.rs` into a focused sibling module.
-Preserve its complete leather-boots entry correction, Shift descent, long-fall
-0.9F landing-shape, teleport-sequence, and published collision-context coverage
+Preserve its complete altered-registry fingerprint, dense state-id, leather
+boots, conservative custom-block fallback, and exact collision-context coverage
 and production behavior, leave the preceding
-`powder_snow_dynamic_shape_requires_exact_vanilla_state_identity` test and
-following `button_test_registry` helper aggregate-owned, and use explicit
-imports rather than a new `use super::*`.
+`powder_snow_uses_falling_collision_shape_after_long_fall` test and following
+`button_test_registry` helper aggregate-owned, and use explicit imports rather
+than a new `use super::*`.
+
+The complete powder-snow collision-correction test has moved to
+`crates/mc-net/src/play/tests/powder_snow_collision_correction.rs`. Its
+leather-boots entry, Shift descent, long-fall 0.9F landing shape,
+teleport-sequence, and published collision-context coverage is recorded in
+[`../evidence/mc-net-powder-snow-collision-correction-test-extraction.md`](../evidence/mc-net-powder-snow-collision-correction-test-extraction.md).
 
 The complete movement block-read writer-lock test has moved to
 `crates/mc-net/src/play/tests/movement_block_reads.rs`. Its solid-collision,

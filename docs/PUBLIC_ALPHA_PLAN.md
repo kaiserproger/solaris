@@ -242,6 +242,11 @@ not replace functional, package, workspace, or real-client gates.
    exact block/pose, ready-result, and writer-lock-independence coverage is
    recorded in
    [`evidence/mc-net-movement-block-reads-test-extraction.md`](evidence/mc-net-movement-block-reads-test-extraction.md).
+   The following powder-snow collision-correction test now lives in focused
+   `play/tests/powder_snow_collision_correction.rs`; its leather-boots entry,
+   Shift descent, long-fall 0.9F shape, and teleport-sequence coverage is
+   recorded in
+   [`evidence/mc-net-powder-snow-collision-correction-test-extraction.md`](evidence/mc-net-powder-snow-collision-correction-test-extraction.md).
 4. [ ] Separate behavioral tests from structural tripwires. Structural checks may
    enforce crate ownership and dependency direction, but may not assert Rust
    statement order or source-text layout.
