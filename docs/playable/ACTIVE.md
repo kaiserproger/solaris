@@ -22,20 +22,19 @@ replacement-readiness claims.
 
 ## Active Checkpoint
 
-Next: extract the pure health, food, saturation, exhaustion, and regeneration
-transitions from `mc-net::play::survival` into `mc-entity`. Leave block
-mining/drop planning, player/session snapshots, authoritative commits,
-persistence, and publication untouched in that slice.
+Next: replace the `mc-test-harness` container-support
+`wait_for_chunk_pipeline_idle` deadline/yield loop with the exact chunk-pipeline
+idle notification. Keep its timeout only as a fail-only watchdog and do not
+combine unrelated block-edit or streaming behavior.
 
-The plant vertical is closed. Deterministic growth, survival, tree, bonemeal,
-harvest, and drop planning now lives in
-`mc_world::plant_rules_26_1_2`; `mc-net` retains snapshot acquisition,
-preconditions, commit, durability, relight, publication, and protocol/item
-translation. Focused lower-crate tests and code-health pin the one-way
-boundary. Evidence is in
-[`../evidence/plant-rules-crate-boundary.md`](../evidence/plant-rules-crate-boundary.md).
-Graphical owner-host gates remain external release evidence and are not implied
-by this ownership checkpoint.
+The `mc-net` shutdown-wait test class is closed. Its scheduler-yield ordering
+assumption was replaced by explicitly polling the wait future to `Pending`
+before requesting shutdown, while a second test proves that a request made
+before waiter registration is observed from authoritative state. The remaining
+timeout is only a fail watchdog around the exact notification/state event.
+Evidence is in
+[`../evidence/mc-net-shutdown-wait-test.md`](../evidence/mc-net-shutdown-wait-test.md).
+No graphical or gameplay-readiness claim is implied.
 
 ## Recent Checkpoints — through 2026-07-30
 

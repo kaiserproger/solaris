@@ -5485,8 +5485,10 @@ mod tests {
         script_boundary_pair, start_lua_host,
     };
     use std::collections::BTreeMap;
+    use std::future::Future;
     use std::num::NonZeroUsize;
     use std::sync::atomic::AtomicUsize;
+    use std::task::Poll;
     use tokio::sync::mpsc;
 
     type StateSpec<'a> = (u32, bool, &'a [(&'a str, &'a str)]);
@@ -5621,18 +5623,28 @@ mod tests {
     #[tokio::test]
     async fn shutdown_wait_wakes_when_shutdown_is_requested() {
         let shutdown = ShutdownHandle::default();
-        let waiter = tokio::spawn({
-            let shutdown = shutdown.clone();
-            async move { shutdown.wait_requested().await }
-        });
+        let mut waiter = Box::pin(shutdown.wait_requested());
 
-        tokio::task::yield_now().await;
+        std::future::poll_fn(|context| match waiter.as_mut().poll(context) {
+            Poll::Pending => Poll::Ready(()),
+            Poll::Ready(()) => panic!("shutdown wait completed before the request"),
+        })
+        .await;
         shutdown.request();
 
-        tokio::time::timeout(Duration::from_secs(1), waiter)
+        tokio::time::timeout(Duration::from_secs(1), waiter.as_mut())
             .await
-            .expect("shutdown waiter did not wake")
-            .expect("shutdown waiter task failed");
+            .expect("shutdown waiter did not wake");
+    }
+
+    #[tokio::test]
+    async fn shutdown_wait_observes_request_made_before_registration() {
+        let shutdown = ShutdownHandle::default();
+        shutdown.request();
+
+        tokio::time::timeout(Duration::from_secs(1), shutdown.wait_requested())
+            .await
+            .expect("pre-requested shutdown wait did not complete");
     }
 
     #[tokio::test]
