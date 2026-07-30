@@ -46,6 +46,7 @@ use std::collections::HashSet;
 const VIEW_DISTANCE: i32 = 2;
 
 #[test]
+#[ignore = "requires local data/vanilla sidecars"]
 fn place_dirt_persists_through_flush_to_disk() {
     let test = std::thread::Builder::new()
         .name("persistence-inventory".to_string())
@@ -69,11 +70,10 @@ async fn place_dirt_persists_through_flush_to_disk_inner() {
     let blocks_json = vanilla_dir.join("reports/blocks.json");
     let registries_json = vanilla_dir.join("reports/registries.json");
     if !blocks_json.exists() || !registries_json.exists() {
-        eprintln!(
-            "skipping: prerequisites missing under {}",
+        panic!(
+            "prerequisite failed: prerequisites missing under {}",
             vanilla_dir.display()
         );
-        return;
     }
 
     let tmp_world = tempfile::tempdir().unwrap();
@@ -101,8 +101,10 @@ async fn place_dirt_persists_through_flush_to_disk_inner() {
     let block_light = match mc_data::block_light::load(&block_light_path) {
         Ok(table) => Some(Arc::new(table)),
         Err(err) => {
-            eprintln!("skipping: {} ({err})", block_light_path.display());
-            return;
+            panic!(
+                "prerequisite failed: {} ({err})",
+                block_light_path.display()
+            );
         }
     };
 
@@ -379,6 +381,7 @@ async fn place_dirt_persists_through_flush_to_disk_inner() {
 }
 
 #[test]
+#[ignore = "requires local data/vanilla sidecars"]
 fn item_despawn_deadline_survives_restart() {
     let test = std::thread::Builder::new()
         .name("item-despawn-restart".to_string())
@@ -405,11 +408,10 @@ async fn item_despawn_deadline_survives_restart_inner() {
     let blocks_json = vanilla_dir.join("reports/blocks.json");
     let registries_json = vanilla_dir.join("reports/registries.json");
     if !blocks_json.exists() || !registries_json.exists() {
-        eprintln!(
-            "skipping: prerequisites missing under {}",
+        panic!(
+            "prerequisite failed: prerequisites missing under {}",
             vanilla_dir.display()
         );
-        return;
     }
 
     let tmp_world = tempfile::tempdir().expect("item despawn temp world");

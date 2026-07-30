@@ -1,11 +1,11 @@
 #[tokio::test]
+#[ignore = "requires local data/vanilla sidecars"]
 async fn break_block_round_trips_update_ack_relight() {
     let manifest = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
     let vanilla_dir = manifest.join("../../data/vanilla");
     let blocks_json = vanilla_dir.join("reports/blocks.json");
     if !blocks_json.exists() {
-        eprintln!("skipping: {} missing", blocks_json.display());
-        return;
+        panic!("prerequisite failed: {} missing", blocks_json.display());
     }
 
     let data = Arc::new(mc_data::load(&vanilla_dir).expect("vanilla data loads"));
@@ -27,8 +27,7 @@ async fn break_block_round_trips_update_ack_relight() {
     let block_light = match mc_data::block_light::load(&block_light_path) {
         Ok(table) => Some(Arc::new(table)),
         Err(err) => {
-            eprintln!("skipping: {} ({err})", block_light_path.display(),);
-            return;
+            panic!("prerequisite failed: {} ({err})", block_light_path.display(),);
         }
     };
 
@@ -224,13 +223,13 @@ async fn break_block_round_trips_update_ack_relight() {
 }
 
 #[tokio::test]
+#[ignore = "requires local data/vanilla sidecars"]
 async fn break_block_broadcasts_update_to_second_subscriber() {
     let manifest = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
     let vanilla_dir = manifest.join("../../data/vanilla");
     let blocks_json = vanilla_dir.join("reports/blocks.json");
     if !blocks_json.exists() {
-        eprintln!("skipping: {} missing", blocks_json.display());
-        return;
+        panic!("prerequisite failed: {} missing", blocks_json.display());
     }
 
     let data = Arc::new(mc_data::load(&vanilla_dir).expect("vanilla data loads"));
@@ -249,8 +248,7 @@ async fn break_block_broadcasts_update_to_second_subscriber() {
     let block_light = match mc_data::block_light::load(&block_light_path) {
         Ok(table) => Some(Arc::new(table)),
         Err(err) => {
-            eprintln!("skipping: {} ({err})", block_light_path.display(),);
-            return;
+            panic!("prerequisite failed: {} ({err})", block_light_path.display(),);
         }
     };
     let air_state_id = blocks
@@ -384,13 +382,13 @@ async fn break_block_broadcasts_update_to_second_subscriber() {
 }
 
 #[tokio::test]
+#[ignore = "requires local data/vanilla sidecars"]
 async fn early_survival_stop_completes_after_server_progress_reaches_one() {
     let manifest = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
     let vanilla_dir = manifest.join("../../data/vanilla");
     let blocks_json = vanilla_dir.join("reports/blocks.json");
     if !blocks_json.exists() {
-        eprintln!("skipping: {} missing", blocks_json.display());
-        return;
+        panic!("prerequisite failed: {} missing", blocks_json.display());
     }
 
     let data = Arc::new(mc_data::load(&vanilla_dir).expect("vanilla data loads"));
@@ -841,13 +839,13 @@ async fn wait_for_stale_break_ack_and_resync(
 }
 
 #[tokio::test]
+#[ignore = "requires local data/vanilla sidecars"]
 async fn out_of_reach_survival_and_creative_breaks_are_ack_only() {
     let manifest = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
     let vanilla_dir = manifest.join("../../data/vanilla");
     let blocks_json = vanilla_dir.join("reports/blocks.json");
     if !blocks_json.exists() {
-        eprintln!("skipping: {} missing", blocks_json.display());
-        return;
+        panic!("prerequisite failed: {} missing", blocks_json.display());
     }
 
     let data = Arc::new(mc_data::load(&vanilla_dir).expect("vanilla data loads"));
@@ -1056,13 +1054,13 @@ async fn bedrock_break_is_rejected_in_survival_and_succeeds_in_creative() {
 }
 
 #[tokio::test]
+#[ignore = "requires local data/vanilla sidecars"]
 async fn far_out_of_reach_survival_break_does_not_load_target_before_ack() {
     let manifest = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
     let vanilla_dir = manifest.join("../../data/vanilla");
     let blocks_json = vanilla_dir.join("reports/blocks.json");
     if !blocks_json.exists() {
-        eprintln!("skipping: {} missing", blocks_json.display());
-        return;
+        panic!("prerequisite failed: {} missing", blocks_json.display());
     }
 
     let data = Arc::new(mc_data::load(&vanilla_dir).expect("vanilla data loads"));

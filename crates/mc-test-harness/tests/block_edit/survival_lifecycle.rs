@@ -1,4 +1,5 @@
 #[test]
+#[ignore = "requires local data/vanilla sidecars"]
 fn survival_double_chest_opens_combined_storage_and_mutates_second_half() {
     let test = std::thread::Builder::new()
         .name("survival_double_chest_opens_combined_storage_and_mutates_second_half".to_owned())
@@ -22,12 +23,11 @@ async fn survival_double_chest_opens_combined_storage_and_mutates_second_half_in
     let blocks_json = vanilla_dir.join("reports/blocks.json");
     let registries_json = vanilla_dir.join("reports/registries.json");
     if !blocks_json.exists() || !registries_json.exists() {
-        eprintln!(
-            "skipping: missing {} or {}",
+        panic!(
+            "prerequisite failed: missing {} or {}",
             blocks_json.display(),
             registries_json.display()
         );
-        return;
     }
 
     let data = Arc::new(mc_data::load(&vanilla_dir).expect("vanilla data loads"));
@@ -191,6 +191,7 @@ async fn survival_double_chest_opens_combined_storage_and_mutates_second_half_in
 }
 
 #[test]
+#[ignore = "requires local data/vanilla sidecars"]
 fn survival_generic_damage_bypasses_armor_and_durability() {
     let test = std::thread::Builder::new()
         .name("survival_generic_damage_bypasses_armor_and_durability".to_owned())
@@ -214,12 +215,11 @@ async fn survival_generic_damage_bypasses_armor_and_durability_inner() {
     let blocks_json = vanilla_dir.join("reports/blocks.json");
     let registries_json = vanilla_dir.join("reports/registries.json");
     if !blocks_json.exists() || !registries_json.exists() {
-        eprintln!(
-            "skipping: missing {} or {}",
+        panic!(
+            "prerequisite failed: missing {} or {}",
             blocks_json.display(),
             registries_json.display()
         );
-        return;
     }
 
     let data = Arc::new(mc_data::load(&vanilla_dir).expect("vanilla data loads"));
@@ -353,6 +353,7 @@ async fn survival_generic_damage_bypasses_armor_and_durability_inner() {
 }
 
 #[test]
+#[ignore = "requires local data/vanilla sidecars"]
 fn survival_use_item_eats_apple_and_updates_food() {
     let test = std::thread::Builder::new()
         .name("survival_use_item_eats_apple_and_updates_food".to_owned())
@@ -376,12 +377,11 @@ async fn survival_use_item_eats_apple_and_updates_food_inner() {
     let blocks_json = vanilla_dir.join("reports/blocks.json");
     let registries_json = vanilla_dir.join("reports/registries.json");
     if !blocks_json.exists() || !registries_json.exists() {
-        eprintln!(
-            "skipping: missing {} or {}",
+        panic!(
+            "prerequisite failed: missing {} or {}",
             blocks_json.display(),
             registries_json.display()
         );
-        return;
     }
 
     let data = Arc::new(mc_data::load(&vanilla_dir).expect("vanilla data loads"));
@@ -559,6 +559,7 @@ async fn survival_use_item_eats_apple_and_updates_food_inner() {
 }
 
 #[test]
+#[ignore = "requires local data/vanilla sidecars"]
 fn survival_use_item_release_cancels_food_use() {
     let test = std::thread::Builder::new()
         .name("survival_use_item_release_cancels_food_use".to_owned())
@@ -582,12 +583,11 @@ async fn survival_use_item_release_cancels_food_use_inner() {
     let blocks_json = vanilla_dir.join("reports/blocks.json");
     let registries_json = vanilla_dir.join("reports/registries.json");
     if !blocks_json.exists() || !registries_json.exists() {
-        eprintln!(
-            "skipping: missing {} or {}",
+        panic!(
+            "prerequisite failed: missing {} or {}",
             blocks_json.display(),
             registries_json.display()
         );
-        return;
     }
 
     let data = Arc::new(mc_data::load(&vanilla_dir).expect("vanilla data loads"));
@@ -684,6 +684,7 @@ async fn survival_use_item_release_cancels_food_use_inner() {
 }
 
 #[test]
+#[ignore = "requires local data/vanilla sidecars"]
 fn survival_bow_release_spawns_and_moves_arrow() {
     let test = std::thread::Builder::new()
         .name("survival_bow_release_spawns_and_moves_arrow".to_owned())
@@ -707,12 +708,11 @@ async fn survival_bow_release_spawns_and_moves_arrow_inner() {
     let blocks_json = vanilla_dir.join("reports/blocks.json");
     let registries_json = vanilla_dir.join("reports/registries.json");
     if !blocks_json.exists() || !registries_json.exists() {
-        eprintln!(
-            "skipping: missing {} or {}",
+        panic!(
+            "prerequisite failed: missing {} or {}",
             blocks_json.display(),
             registries_json.display()
         );
-        return;
     }
 
     let data = Arc::new(mc_data::load(&vanilla_dir).expect("vanilla data loads"));
@@ -1372,6 +1372,7 @@ async fn offhand_swap_updates_both_slots_and_owner_inventory_inner() {
 }
 
 #[test]
+#[ignore = "requires local data/vanilla sidecars"]
 fn dead_survival_player_cannot_mine_or_eat() {
     let test = std::thread::Builder::new()
         .name("dead_survival_player_cannot_mine_or_eat".to_owned())
@@ -1395,12 +1396,11 @@ async fn dead_survival_player_cannot_mine_or_eat_inner() {
     let blocks_json = vanilla_dir.join("reports/blocks.json");
     let registries_json = vanilla_dir.join("reports/registries.json");
     if !blocks_json.exists() || !registries_json.exists() {
-        eprintln!(
-            "skipping: missing {} or {}",
+        panic!(
+            "prerequisite failed: missing {} or {}",
             blocks_json.display(),
             registries_json.display()
         );
-        return;
     }
 
     let data = Arc::new(mc_data::load(&vanilla_dir).expect("vanilla data loads"));
@@ -1543,6 +1543,7 @@ async fn dead_survival_player_cannot_mine_or_eat_inner() {
 }
 
 #[test]
+#[ignore = "requires local data/vanilla sidecars"]
 fn dead_survival_player_can_respawn_and_act_again() {
     let test = std::thread::Builder::new()
         .name("dead_survival_player_can_respawn_and_act_again".to_owned())
@@ -1566,12 +1567,11 @@ async fn dead_survival_player_can_respawn_and_act_again_inner() {
     let blocks_json = vanilla_dir.join("reports/blocks.json");
     let registries_json = vanilla_dir.join("reports/registries.json");
     if !blocks_json.exists() || !registries_json.exists() {
-        eprintln!(
-            "skipping: missing {} or {}",
+        panic!(
+            "prerequisite failed: missing {} or {}",
             blocks_json.display(),
             registries_json.display()
         );
-        return;
     }
 
     let data = Arc::new(mc_data::load(&vanilla_dir).expect("vanilla data loads"));

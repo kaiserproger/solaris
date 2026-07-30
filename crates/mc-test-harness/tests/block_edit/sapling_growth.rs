@@ -1,16 +1,16 @@
 #[tokio::test]
+#[ignore = "requires local data/vanilla sidecars"]
 async fn survival_bonemeal_grows_oak_sapling_into_tree() {
     let manifest = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
     let vanilla_dir = manifest.join("../../data/vanilla");
     let blocks_json = vanilla_dir.join("reports/blocks.json");
     let registries_json = vanilla_dir.join("reports/registries.json");
     if !blocks_json.exists() || !registries_json.exists() {
-        eprintln!(
-            "skipping: missing {} or {}",
+        panic!(
+            "prerequisite failed: missing {} or {}",
             blocks_json.display(),
             registries_json.display()
         );
-        return;
     }
 
     let data = Arc::new(mc_data::load(&vanilla_dir).expect("vanilla data loads"));
@@ -165,18 +165,18 @@ async fn survival_bonemeal_grows_oak_sapling_into_tree() {
 }
 
 #[tokio::test]
+#[ignore = "requires local data/vanilla sidecars"]
 async fn survival_bonemeal_stage_one_oak_replaces_existing_canopy_leaf() {
     let manifest = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
     let vanilla_dir = manifest.join("../../data/vanilla");
     let blocks_json = vanilla_dir.join("reports/blocks.json");
     let registries_json = vanilla_dir.join("reports/registries.json");
     if !blocks_json.exists() || !registries_json.exists() {
-        eprintln!(
-            "skipping: missing {} or {}",
+        panic!(
+            "prerequisite failed: missing {} or {}",
             blocks_json.display(),
             registries_json.display()
         );
-        return;
     }
 
     let data = Arc::new(mc_data::load(&vanilla_dir).expect("vanilla data loads"));
@@ -333,18 +333,18 @@ async fn survival_bonemeal_stage_one_oak_replaces_existing_canopy_leaf() {
 }
 
 #[tokio::test]
+#[ignore = "requires local data/vanilla sidecars"]
 async fn survival_bonemeal_does_not_consume_on_single_dark_oak() {
     let manifest = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
     let vanilla_dir = manifest.join("../../data/vanilla");
     let blocks_json = vanilla_dir.join("reports/blocks.json");
     let registries_json = vanilla_dir.join("reports/registries.json");
     if !blocks_json.exists() || !registries_json.exists() {
-        eprintln!(
-            "skipping: missing {} or {}",
+        panic!(
+            "prerequisite failed: missing {} or {}",
             blocks_json.display(),
             registries_json.display()
         );
-        return;
     }
 
     let data = Arc::new(mc_data::load(&vanilla_dir).expect("vanilla data loads"));
@@ -496,6 +496,7 @@ struct MegaSaplingWireFixture {
 }
 
 #[tokio::test]
+#[ignore = "requires local data/vanilla sidecars"]
 async fn survival_bonemeal_emits_client_visible_atomic_batch_for_two_by_two_spruce_and_jungle() {
     for (index, case) in MEGA_SAPLING_WIRE_CASES.into_iter().enumerate() {
         let Some(mut fixture) = start_mega_sapling_wire_fixture(
@@ -590,6 +591,7 @@ async fn survival_bonemeal_emits_client_visible_atomic_batch_for_two_by_two_spru
 }
 
 #[tokio::test]
+#[ignore = "requires local data/vanilla sidecars"]
 async fn survival_bonemeal_rejects_obstructed_two_by_two_spruce_and_jungle_without_client_visible_partial_batch()
  {
     for (index, case) in MEGA_SAPLING_WIRE_CASES.into_iter().enumerate() {
@@ -642,6 +644,7 @@ async fn survival_bonemeal_rejects_obstructed_two_by_two_spruce_and_jungle_witho
 }
 
 #[tokio::test]
+#[ignore = "requires local data/vanilla sidecars"]
 async fn survival_bonemeal_rejects_unloaded_two_by_two_spruce_and_jungle_canopy_without_client_visible_partial_batch()
  {
     for (index, case) in MEGA_SAPLING_WIRE_CASES.into_iter().enumerate() {
@@ -802,12 +805,11 @@ async fn start_mega_sapling_wire_fixture(
     let blocks_json = vanilla_dir.join("reports/blocks.json");
     let registries_json = vanilla_dir.join("reports/registries.json");
     if !blocks_json.exists() || !registries_json.exists() {
-        eprintln!(
-            "skipping: missing {} or {}",
+        panic!(
+            "prerequisite failed: missing {} or {}",
             blocks_json.display(),
             registries_json.display()
         );
-        return None;
     }
 
     let data = Arc::new(mc_data::load(&vanilla_dir).expect("vanilla data loads"));

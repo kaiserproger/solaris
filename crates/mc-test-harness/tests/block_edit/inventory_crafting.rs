@@ -1,16 +1,16 @@
 #[tokio::test]
+#[ignore = "requires local data/vanilla sidecars"]
 async fn place_recipe_crafts_torch_from_authoritative_inventory() {
     let manifest = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
     let vanilla_dir = manifest.join("../../data/vanilla");
     let blocks_json = vanilla_dir.join("reports/blocks.json");
     let registries_json = vanilla_dir.join("reports/registries.json");
     if !blocks_json.exists() || !registries_json.exists() {
-        eprintln!(
-            "skipping: missing {} or {}",
+        panic!(
+            "prerequisite failed: missing {} or {}",
             blocks_json.display(),
             registries_json.display()
         );
-        return;
     }
 
     let data = Arc::new(mc_data::load(&vanilla_dir).expect("vanilla data loads"));
@@ -46,8 +46,7 @@ async fn place_recipe_crafts_torch_from_authoritative_inventory() {
             .position(|recipe| recipe.id.as_str() == "minecraft:torch")
             .and_then(|idx| i32::try_from(idx).ok())
     }) else {
-        eprintln!("skipping: missing torch recipe");
-        return;
+        panic!("prerequisite failed: missing torch recipe");
     };
 
     let cfg = mc_net::ServerConfig {
@@ -134,18 +133,18 @@ async fn place_recipe_crafts_torch_from_authoritative_inventory() {
 }
 
 #[tokio::test]
+#[ignore = "requires local data/vanilla sidecars"]
 async fn place_recipe_crafts_tag_based_planks_sticks_and_table() {
     let manifest = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
     let vanilla_dir = manifest.join("../../data/vanilla");
     let blocks_json = vanilla_dir.join("reports/blocks.json");
     let registries_json = vanilla_dir.join("reports/registries.json");
     if !blocks_json.exists() || !registries_json.exists() {
-        eprintln!(
-            "skipping: missing {} or {}",
+        panic!(
+            "prerequisite failed: missing {} or {}",
             blocks_json.display(),
             registries_json.display()
         );
-        return;
     }
 
     let loaded_recipes = mc_data::recipes::load_recipes(vanilla_dir.join("data/minecraft/recipe"))
@@ -167,16 +166,13 @@ async fn place_recipe_crafts_tag_based_planks_sticks_and_table() {
         }
     };
     let Some(oak_planks_recipe) = recipe_display_id("minecraft:oak_planks") else {
-        eprintln!("skipping: missing oak_planks recipe");
-        return;
+        panic!("prerequisite failed: missing oak_planks recipe");
     };
     let Some(stick_recipe) = recipe_display_id("minecraft:stick") else {
-        eprintln!("skipping: missing stick recipe");
-        return;
+        panic!("prerequisite failed: missing stick recipe");
     };
     let Some(crafting_table_recipe) = recipe_display_id("minecraft:crafting_table") else {
-        eprintln!("skipping: missing crafting_table recipe");
-        return;
+        panic!("prerequisite failed: missing crafting_table recipe");
     };
 
     let data = Arc::new(mc_data::load(&vanilla_dir).expect("vanilla data loads"));
@@ -201,8 +197,7 @@ async fn place_recipe_crafts_tag_based_planks_sticks_and_table() {
             item_tags.contains_key(&oak_logs_tag) && item_tags.contains_key(&planks_tag)
         })
     {
-        eprintln!("skipping: missing item oak_logs/planks tags");
-        return;
+        panic!("prerequisite failed: missing item oak_logs/planks tags");
     }
     let items_report = mc_data::items::load_items_report(&registries_json).expect("items report");
     let items = Arc::new(mc_data::items::ItemRegistry::from_report(&items_report));

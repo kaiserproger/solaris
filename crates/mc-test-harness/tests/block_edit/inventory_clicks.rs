@@ -1,16 +1,16 @@
 #[tokio::test]
+#[ignore = "requires local data/vanilla sidecars"]
 async fn survival_container_click_moves_stack_through_server_cursor() {
     let manifest = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
     let vanilla_dir = manifest.join("../../data/vanilla");
     let blocks_json = vanilla_dir.join("reports/blocks.json");
     let registries_json = vanilla_dir.join("reports/registries.json");
     if !blocks_json.exists() || !registries_json.exists() {
-        eprintln!(
-            "skipping: missing {} or {}",
+        panic!(
+            "prerequisite failed: missing {} or {}",
             blocks_json.display(),
             registries_json.display()
         );
-        return;
     }
 
     let data = Arc::new(mc_data::load(&vanilla_dir).expect("vanilla data loads"));
@@ -114,18 +114,18 @@ async fn survival_container_click_moves_stack_through_server_cursor() {
     .await;
 }
 #[tokio::test]
+#[ignore = "requires local data/vanilla sidecars"]
 async fn malformed_inventory_click_resyncs_and_next_valid_click_succeeds() {
     let manifest = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
     let vanilla_dir = manifest.join("../../data/vanilla");
     let blocks_json = vanilla_dir.join("reports/blocks.json");
     let registries_json = vanilla_dir.join("reports/registries.json");
     if !blocks_json.exists() || !registries_json.exists() {
-        eprintln!(
-            "skipping: missing {} or {}",
+        panic!(
+            "prerequisite failed: missing {} or {}",
             blocks_json.display(),
             registries_json.display()
         );
-        return;
     }
 
     let data = Arc::new(mc_data::load(&vanilla_dir).expect("vanilla data loads"));

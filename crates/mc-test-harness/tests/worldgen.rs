@@ -690,6 +690,7 @@ fn system_chat_text(packet: &ClientboundSystemChat) -> String {
 }
 
 #[test]
+#[ignore = "requires local data/vanilla sidecars"]
 fn generated_village_villager_wire_and_restart_are_stable() {
     let test = std::thread::Builder::new()
         .name("generated_village_villager_wire_and_restart_are_stable".to_owned())
@@ -719,8 +720,7 @@ async fn generated_village_villager_wire_and_restart_are_stable_inner() {
     if required.iter().any(|path| !path.is_file())
         || !vanilla_dir.join("data/minecraft/worldgen").is_dir()
     {
-        eprintln!("skipping generated village gate: vanilla structure sidecars are missing");
-        return;
+        panic!("prerequisite failed: generated village gate requires vanilla structure sidecars");
     }
 
     let report = mc_data::blocks::solaris_required_blocks_report();
@@ -830,6 +830,7 @@ impl ChunkGenerator for PopulationFixtureGenerator {
 }
 
 #[test]
+#[ignore = "requires local data/vanilla sidecars"]
 fn generated_village_food_share_birth_wire_and_restart_are_stable() {
     let test = std::thread::Builder::new()
         .name("generated_village_food_share_birth_wire_and_restart_are_stable".to_owned())
@@ -858,8 +859,7 @@ async fn generated_village_food_share_birth_wire_and_restart_are_stable_inner() 
     if required.iter().any(|path| !path.is_file())
         || !vanilla_dir.join("data/minecraft/worldgen").is_dir()
     {
-        eprintln!("skipping generated village population gate: vanilla sidecars are missing");
-        return;
+        panic!("prerequisite failed: generated village population gate requires vanilla sidecars");
     }
 
     let report = mc_data::blocks::solaris_required_blocks_report();
@@ -1674,6 +1674,7 @@ async fn observe_generated_village_villager(
 }
 
 #[test]
+#[ignore = "requires local data/vanilla sidecars"]
 fn empty_world_plus_generator_produces_terrain_on_demand() {
     let test = std::thread::Builder::new()
         .name("empty_world_plus_generator_produces_terrain_on_demand".to_owned())
@@ -1696,8 +1697,7 @@ async fn empty_world_plus_generator_produces_terrain_on_demand_inner() {
     let vanilla_dir = manifest.join("../../data/vanilla");
     let blocks_json = vanilla_dir.join("reports/blocks.json");
     if !blocks_json.exists() {
-        eprintln!("skipping: {} missing", blocks_json.display());
-        return;
+        panic!("prerequisite failed: {} missing", blocks_json.display());
     }
 
     let report = mc_data::blocks::load_blocks_report(&blocks_json).expect("blocks report");

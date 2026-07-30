@@ -26,6 +26,7 @@ use mc_world::{BlockPos, BlockRegistry, BlockStateId, MAX_Y, WorldStorage};
 const VIEW_DISTANCE: i32 = 2;
 
 #[test]
+#[ignore = "requires local data/vanilla sidecars"]
 fn deterministic_physics_fixture_materializes_named_shapes() {
     let Some(blocks) = load_block_registry() else {
         return;
@@ -116,6 +117,7 @@ fn deterministic_physics_fixture_materializes_named_shapes() {
 }
 
 #[tokio::test]
+#[ignore = "requires local data/vanilla sidecars"]
 async fn physics_fixture_server_reaches_play_and_streams_spawn_chunk() {
     let Some(addr) = start_physics_server().await else {
         return;
@@ -130,6 +132,7 @@ async fn physics_fixture_server_reaches_play_and_streams_spawn_chunk() {
 }
 
 #[tokio::test]
+#[ignore = "requires local data/vanilla sidecars"]
 async fn shallow_water_entry_keeps_self_motion_client_predicted() {
     let Some(addr) = start_physics_server().await else {
         return;
@@ -173,6 +176,7 @@ async fn shallow_water_entry_keeps_self_motion_client_predicted() {
 }
 
 #[tokio::test]
+#[ignore = "requires local data/vanilla sidecars"]
 async fn deep_water_swim_and_exit_keep_self_motion_client_predicted() {
     let Some(addr) = start_physics_server().await else {
         return;
@@ -242,6 +246,7 @@ async fn deep_water_swim_and_exit_keep_self_motion_client_predicted() {
 }
 
 #[tokio::test]
+#[ignore = "requires local data/vanilla sidecars"]
 async fn flat_ground_move_does_not_emit_position_correction() {
     let Some(addr) = start_physics_server().await else {
         return;
@@ -265,6 +270,7 @@ async fn flat_ground_move_does_not_emit_position_correction() {
 }
 
 #[tokio::test]
+#[ignore = "requires local data/vanilla sidecars"]
 async fn wall_collision_corrects_player_to_last_accepted_position() {
     let Some(addr) = start_physics_server().await else {
         return;
@@ -302,6 +308,7 @@ async fn wall_collision_corrects_player_to_last_accepted_position() {
 }
 
 #[tokio::test]
+#[ignore = "requires local data/vanilla sidecars"]
 async fn full_block_non_step_attempt_corrects_player() {
     let Some(addr) = start_physics_server().await else {
         return;
@@ -339,6 +346,7 @@ async fn full_block_non_step_attempt_corrects_player() {
 }
 
 #[tokio::test]
+#[ignore = "requires local data/vanilla sidecars"]
 async fn landing_fall_damage_uses_accumulated_descent() {
     let Some(addr) = start_physics_server().await else {
         return;
@@ -398,6 +406,7 @@ async fn landing_fall_damage_uses_accumulated_descent() {
 }
 
 #[tokio::test]
+#[ignore = "requires local data/vanilla sidecars"]
 async fn water_entry_suppresses_fall_damage() {
     let Some(addr) = start_physics_server().await else {
         return;
@@ -431,6 +440,7 @@ async fn water_entry_suppresses_fall_damage() {
 }
 
 #[tokio::test]
+#[ignore = "requires local data/vanilla sidecars"]
 async fn sugar_cane_support_break_emits_real_block_edit_observation() {
     let Some(blocks) = load_block_registry() else {
         return;
@@ -495,6 +505,7 @@ async fn sugar_cane_support_break_emits_real_block_edit_observation() {
 }
 
 #[tokio::test]
+#[ignore = "requires local data/vanilla sidecars"]
 async fn survival_sugar_cane_support_break_drops_cascaded_cane() {
     let Some(blocks) = load_block_registry() else {
         return;
@@ -591,6 +602,7 @@ async fn survival_sugar_cane_support_break_drops_cascaded_cane() {
 }
 
 #[tokio::test]
+#[ignore = "requires local data/vanilla sidecars"]
 async fn falling_blocks_start_when_support_breaks() {
     let Some(blocks) = load_block_registry() else {
         return;
@@ -673,6 +685,7 @@ async fn falling_blocks_start_when_support_breaks() {
 }
 
 #[tokio::test]
+#[ignore = "requires local data/vanilla sidecars"]
 async fn stacked_falling_blocks_all_start_when_support_breaks() {
     let Some(blocks) = load_block_registry() else {
         return;
@@ -746,6 +759,7 @@ async fn stacked_falling_blocks_all_start_when_support_breaks() {
 }
 
 #[tokio::test]
+#[ignore = "requires local data/vanilla sidecars"]
 async fn falling_block_lands_as_block_and_despawns_entity() {
     let Some(blocks) = load_block_registry() else {
         return;
@@ -818,6 +832,7 @@ async fn falling_block_lands_as_block_and_despawns_entity() {
 }
 
 #[tokio::test]
+#[ignore = "requires local data/vanilla sidecars"]
 async fn cactus_dirt_side_neighbor_placement_cascades_visible_column_removal() {
     let Some(blocks) = load_block_registry() else {
         return;
@@ -902,10 +917,10 @@ async fn cactus_dirt_side_neighbor_placement_cascades_visible_column_removal() {
 }
 
 #[tokio::test]
+#[ignore = "requires M43_VANILLA_ADDR external vanilla oracle"]
 async fn external_vanilla_sugar_cane_support_break_oracle() {
     let Ok(addr) = std::env::var("M43_VANILLA_ADDR") else {
-        eprintln!("skipping: M43_VANILLA_ADDR not set");
-        return;
+        panic!("prerequisite failed: M43_VANILLA_ADDR not set");
     };
     let addr = addr.parse().expect("M43_VANILLA_ADDR parses");
     let Some(blocks) = load_block_registry() else {
@@ -974,8 +989,7 @@ async fn start_physics_server() -> Option<std::net::SocketAddr> {
     let vanilla_dir = vanilla_data_dir();
     let blocks_json = vanilla_dir.join("reports/blocks.json");
     if !blocks_json.exists() {
-        eprintln!("skipping: {} missing", blocks_json.display());
-        return None;
+        panic!("prerequisite failed: {} missing", blocks_json.display());
     }
 
     let data = Arc::new(mc_data::load(&vanilla_dir).expect("vanilla data loads"));
@@ -1035,8 +1049,7 @@ async fn start_physics_server() -> Option<std::net::SocketAddr> {
 fn load_block_registry() -> Option<Arc<BlockRegistry>> {
     let blocks_json = vanilla_data_dir().join("reports/blocks.json");
     if !blocks_json.exists() {
-        eprintln!("skipping: {} missing", blocks_json.display());
-        return None;
+        panic!("prerequisite failed: {} missing", blocks_json.display());
     }
     let report = mc_data::blocks::load_blocks_report(&blocks_json).expect("blocks report loads");
     Some(Arc::new(
@@ -1047,8 +1060,7 @@ fn load_block_registry() -> Option<Arc<BlockRegistry>> {
 fn load_item_registry() -> Option<mc_data::items::ItemRegistry> {
     let registries_json = vanilla_data_dir().join("reports/registries.json");
     if !registries_json.exists() {
-        eprintln!("skipping: {} missing", registries_json.display());
-        return None;
+        panic!("prerequisite failed: {} missing", registries_json.display());
     }
     Some(mc_data::items::ItemRegistry::from_report(
         &mc_data::items::load_items_report(&registries_json).expect("items report loads"),

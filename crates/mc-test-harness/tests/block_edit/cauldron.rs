@@ -1,16 +1,16 @@
 #[tokio::test]
+#[ignore = "requires local data/vanilla sidecars"]
 async fn survival_water_bucket_fills_and_drains_cauldron_with_persistence() {
     let manifest = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
     let vanilla_dir = manifest.join("../../data/vanilla");
     let blocks_json = vanilla_dir.join("reports/blocks.json");
     let registries_json = vanilla_dir.join("reports/registries.json");
     if !blocks_json.exists() || !registries_json.exists() {
-        eprintln!(
-            "skipping cauldron bucket test; missing {} or {}",
+        panic!(
+            "prerequisite failed: cauldron bucket test requires {} and {}",
             blocks_json.display(),
             registries_json.display()
         );
-        return;
     }
 
     let data = Arc::new(mc_data::load(&vanilla_dir).expect("vanilla data loads"));
@@ -214,16 +214,16 @@ async fn survival_water_bucket_fills_and_drains_cauldron_with_persistence() {
 }
 
 #[test]
+#[ignore = "requires local data/vanilla sidecars"]
 fn cauldron_states_survive_disk_flush_and_reopen() {
     let manifest = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
     let vanilla_dir = manifest.join("../../data/vanilla");
     let blocks_json = vanilla_dir.join("reports/blocks.json");
     if !blocks_json.exists() {
-        eprintln!(
-            "skipping cauldron state persistence test; missing {}",
+        panic!(
+            "prerequisite failed: cauldron state persistence test requires {}",
             blocks_json.display()
         );
-        return;
     }
 
     let report = mc_data::blocks::load_blocks_report(&blocks_json).expect("blocks report loads");

@@ -281,6 +281,12 @@ Benchmark reproduction happens at that feature boundary, not after every edit:
   longer treats a successful early return as a pass. Owners and close
   conditions are recorded in
   [`evidence/mc-data-local-artifact-tests.md`](evidence/mc-data-local-artifact-tests.md).
+- [x] Classify 99 additional `mc-test-harness` tests whose local sidecar or
+  external-oracle prerequisites returned success when absent. They are now
+  explicit opt-in gates and fail closed when selected; together with the 27
+  previously classified ignores, the crate exposes 126 ignored tests. Owners,
+  exact inventory, and close conditions are recorded in
+  [`evidence/mc-test-harness-local-artifact-tests.md`](evidence/mc-test-harness-local-artifact-tests.md).
 - [x] Record the exact local 26.1.2 world-clock oracle in
   [`evidence/world-clock-26.1.2.md`](evidence/world-clock-26.1.2.md).
 - [x] Implement the typed world-clock map, separating monotonic `game_time` from

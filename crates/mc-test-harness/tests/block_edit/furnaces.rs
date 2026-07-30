@@ -1,4 +1,5 @@
 #[test]
+#[ignore = "requires local data/vanilla sidecars"]
 fn two_clients_stale_furnace_click_after_peer_update_resyncs() {
     let test = std::thread::Builder::new()
         .name("two_clients_stale_furnace_click_after_peer_update_resyncs".to_owned())
@@ -22,12 +23,11 @@ async fn two_clients_stale_furnace_click_after_peer_update_resyncs_inner() {
     let blocks_json = vanilla_dir.join("reports/blocks.json");
     let registries_json = vanilla_dir.join("reports/registries.json");
     if !blocks_json.exists() || !registries_json.exists() {
-        eprintln!(
-            "skipping: missing {} or {}",
+        panic!(
+            "prerequisite failed: missing {} or {}",
             blocks_json.display(),
             registries_json.display()
         );
-        return;
     }
 
     let data = Arc::new(mc_data::load(&vanilla_dir).expect("vanilla data loads"));
@@ -224,6 +224,7 @@ async fn two_clients_stale_furnace_click_after_peer_update_resyncs_inner() {
 }
 
 #[test]
+#[ignore = "requires local data/vanilla sidecars"]
 fn malformed_furnace_clicks_resync_without_trusting_client_slots() {
     let test = std::thread::Builder::new()
         .name("malformed_furnace_clicks_resync_without_trusting_client_slots".to_owned())
@@ -247,12 +248,11 @@ async fn malformed_furnace_clicks_resync_without_trusting_client_slots_inner() {
     let blocks_json = vanilla_dir.join("reports/blocks.json");
     let registries_json = vanilla_dir.join("reports/registries.json");
     if !blocks_json.exists() || !registries_json.exists() {
-        eprintln!(
-            "skipping: missing {} or {}",
+        panic!(
+            "prerequisite failed: missing {} or {}",
             blocks_json.display(),
             registries_json.display()
         );
-        return;
     }
 
     let data = Arc::new(mc_data::load(&vanilla_dir).expect("vanilla data loads"));
@@ -430,6 +430,7 @@ async fn malformed_furnace_clicks_resync_without_trusting_client_slots_inner() {
 }
 
 #[test]
+#[ignore = "requires local data/vanilla sidecars"]
 fn survival_furnace_container_smelts_input_with_fuel() {
     let test = std::thread::Builder::new()
         .name("survival_furnace_container_smelts_input_with_fuel".to_owned())
@@ -453,12 +454,11 @@ async fn survival_furnace_container_smelts_input_with_fuel_inner() {
     let blocks_json = vanilla_dir.join("reports/blocks.json");
     let registries_json = vanilla_dir.join("reports/registries.json");
     if !blocks_json.exists() || !registries_json.exists() {
-        eprintln!(
-            "skipping: missing {} or {}",
+        panic!(
+            "prerequisite failed: missing {} or {}",
             blocks_json.display(),
             registries_json.display()
         );
-        return;
     }
 
     let data = Arc::new(mc_data::load(&vanilla_dir).expect("vanilla data loads"));
@@ -810,6 +810,7 @@ async fn survival_furnace_container_smelts_input_with_fuel_inner() {
 }
 
 #[test]
+#[ignore = "requires local data/vanilla sidecars"]
 fn survival_specialized_furnaces_open_vanilla_menu_types() {
     let test = std::thread::Builder::new()
         .name("survival_specialized_furnaces_open_vanilla_menu_types".to_owned())
@@ -833,12 +834,11 @@ async fn survival_specialized_furnaces_open_vanilla_menu_types_inner() {
     let blocks_json = vanilla_dir.join("reports/blocks.json");
     let registries_json = vanilla_dir.join("reports/registries.json");
     if !blocks_json.exists() || !registries_json.exists() {
-        eprintln!(
-            "skipping: missing {} or {}",
+        panic!(
+            "prerequisite failed: missing {} or {}",
             blocks_json.display(),
             registries_json.display()
         );
-        return;
     }
 
     let data = Arc::new(mc_data::load(&vanilla_dir).expect("vanilla data loads"));

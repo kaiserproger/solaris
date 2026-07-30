@@ -1,4 +1,5 @@
 #[test]
+#[ignore = "requires local data/vanilla sidecars"]
 fn crafting_table_container_crafts_shapeless_and_shaped_results() {
     let test = std::thread::Builder::new()
         .name("crafting_table_container_crafts_shapeless_and_shaped_results".to_owned())
@@ -22,12 +23,11 @@ async fn crafting_table_container_crafts_shapeless_and_shaped_results_inner() {
     let blocks_json = vanilla_dir.join("reports/blocks.json");
     let registries_json = vanilla_dir.join("reports/registries.json");
     if !blocks_json.exists() || !registries_json.exists() {
-        eprintln!(
-            "skipping: missing {} or {}",
+        panic!(
+            "prerequisite failed: missing {} or {}",
             blocks_json.display(),
             registries_json.display()
         );
-        return;
     }
 
     let data = Arc::new(mc_data::load(&vanilla_dir).expect("vanilla data loads"));

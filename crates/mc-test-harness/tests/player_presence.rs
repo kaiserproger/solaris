@@ -16,6 +16,7 @@ use uuid::Uuid;
 const VIEW_DISTANCE: i32 = 2;
 
 #[tokio::test]
+#[ignore = "requires local data/vanilla sidecars"]
 async fn two_clients_spawn_move_and_despawn_visible_players() {
     let Some(addr) = start_presence_server(8).await else {
         return;
@@ -46,6 +47,7 @@ async fn two_clients_spawn_move_and_despawn_visible_players() {
 }
 
 #[tokio::test]
+#[ignore = "requires local data/vanilla sidecars"]
 async fn disconnect_reconnect_replaces_player_visibility_cleanly() {
     let Some(addr) = start_presence_server(8).await else {
         return;
@@ -71,8 +73,7 @@ async fn start_presence_server(max_players: u32) -> Option<std::net::SocketAddr>
     let vanilla_dir = manifest.join("../../data/vanilla");
     let blocks_json = vanilla_dir.join("reports/blocks.json");
     if !blocks_json.exists() {
-        eprintln!("skipping: {} missing", blocks_json.display());
-        return None;
+        panic!("prerequisite failed: {} missing", blocks_json.display());
     }
 
     let data = Arc::new(mc_data::load(&vanilla_dir).expect("vanilla data loads"));

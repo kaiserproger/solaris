@@ -275,16 +275,16 @@ async fn vanilla_client_receives_spawn_view_distance_window() {
 }
 
 #[tokio::test]
+#[ignore = "requires local data/vanilla sidecars"]
 async fn movement_across_chunk_boundary_replans_view_subscription() {
     let manifest = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
     let vanilla_dir = manifest.join("../../data/vanilla");
     let blocks_json = vanilla_dir.join("reports/blocks.json");
     if !blocks_json.exists() {
-        eprintln!(
-            "skipping: {} missing — run tools/extract-vanilla-data.sh --reports",
+        panic!(
+            "prerequisite failed: {} missing — run tools/extract-vanilla-data.sh --reports",
             blocks_json.display()
         );
-        return;
     }
 
     let data = Arc::new(mc_data::load(&vanilla_dir).expect("vanilla data loads"));
@@ -460,16 +460,16 @@ async fn movement_across_chunk_boundary_replans_view_subscription() {
 }
 
 #[tokio::test]
+#[ignore = "requires local data/vanilla sidecars"]
 async fn reconnect_during_chunk_prepare_receives_only_the_new_exact_view() {
     let manifest = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
     let vanilla_dir = manifest.join("../../data/vanilla");
     let blocks_json = vanilla_dir.join("reports/blocks.json");
     if !blocks_json.exists() {
-        eprintln!(
-            "skipping: {} missing — run tools/extract-vanilla-data.sh --reports",
+        panic!(
+            "prerequisite failed: {} missing — run tools/extract-vanilla-data.sh --reports",
             blocks_json.display()
         );
-        return;
     }
 
     let data = Arc::new(mc_data::load(&vanilla_dir).expect("vanilla data loads"));

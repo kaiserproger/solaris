@@ -1,4 +1,5 @@
 #[test]
+#[ignore = "requires local data/vanilla sidecars"]
 fn survival_enchanting_table_applies_high_efficiency_sharpness_and_protection() {
     let test = std::thread::Builder::new()
         .name("survival_enchanting_table_applies_high_efficiency_sharpness_and_protection".to_owned())
@@ -22,12 +23,11 @@ async fn survival_enchanting_table_applies_high_efficiency_sharpness_and_protect
     let blocks_json = vanilla_dir.join("reports/blocks.json");
     let registries_json = vanilla_dir.join("reports/registries.json");
     if !blocks_json.exists() || !registries_json.exists() {
-        eprintln!(
-            "skipping: missing {} or {}",
+        panic!(
+            "prerequisite failed: missing {} or {}",
             blocks_json.display(),
             registries_json.display()
         );
-        return;
     }
 
     let data = Arc::new(mc_data::load(&vanilla_dir).expect("vanilla data loads"));

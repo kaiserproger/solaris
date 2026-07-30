@@ -1,16 +1,16 @@
 #[tokio::test]
+#[ignore = "requires local data/vanilla sidecars"]
 async fn station_noop_and_creative_placement_preserve_inventory() {
     let manifest = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
     let vanilla_dir = manifest.join("../../data/vanilla");
     let blocks_json = vanilla_dir.join("reports/blocks.json");
     let registries_json = vanilla_dir.join("reports/registries.json");
     if !blocks_json.exists() || !registries_json.exists() {
-        eprintln!(
-            "skipping: missing {} or {}",
+        panic!(
+            "prerequisite failed: missing {} or {}",
             blocks_json.display(),
             registries_json.display()
         );
-        return;
     }
 
     let data = Arc::new(mc_data::load(&vanilla_dir).expect("vanilla data loads"));
@@ -222,6 +222,7 @@ async fn read_station_noop_ack(
 }
 
 #[tokio::test]
+#[ignore = "requires local data/vanilla sidecars"]
 async fn placing_torch_on_a_wall_publishes_exact_state_then_ack_then_one_debit() {
     let Some(WallTorchWireFixture {
         mut client,
@@ -294,18 +295,18 @@ async fn placing_torch_on_a_wall_publishes_exact_state_then_ack_then_one_debit()
 }
 
 #[tokio::test]
+#[ignore = "requires local data/vanilla sidecars"]
 async fn adjacent_stair_place_remove_recomputes_neighbor_on_wire_and_survives_restart() {
     let manifest = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
     let vanilla_dir = manifest.join("../../data/vanilla");
     let blocks_json = vanilla_dir.join("reports/blocks.json");
     let registries_json = vanilla_dir.join("reports/registries.json");
     if !blocks_json.exists() || !registries_json.exists() {
-        eprintln!(
-            "skipping: missing {} or {}",
+        panic!(
+            "prerequisite failed: missing {} or {}",
             blocks_json.display(),
             registries_json.display()
         );
-        return;
     }
 
     let data = Arc::new(mc_data::load(&vanilla_dir).expect("vanilla data loads"));

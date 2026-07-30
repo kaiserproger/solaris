@@ -35,6 +35,7 @@ use mc_world::{Chunk, ChunkPos};
 const VIEW_DISTANCE: i32 = 2;
 
 #[tokio::test]
+#[ignore = "requires local data/vanilla sidecars"]
 async fn incremental_relight_wire_matches_full_recompute() {
     let manifest = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
     let vanilla_dir = manifest.join("../../data/vanilla");
@@ -42,11 +43,10 @@ async fn incremental_relight_wire_matches_full_recompute() {
     let registries_json = vanilla_dir.join("reports/registries.json");
     let block_light_path = vanilla_dir.join("reports/block_light.json");
     if !blocks_json.exists() || !registries_json.exists() || !block_light_path.exists() {
-        eprintln!(
-            "skipping: prerequisites missing under {}",
+        panic!(
+            "prerequisite failed: prerequisites missing under {}",
             vanilla_dir.display()
         );
-        return;
     }
 
     let data = Arc::new(mc_data::load(&vanilla_dir).expect("vanilla data loads"));

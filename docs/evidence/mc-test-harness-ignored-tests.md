@@ -1,12 +1,19 @@
 # `mc-test-harness` ignored-test classification
 
-Scope: Phase 1 test inventory for `crates/mc-test-harness`.
+Scope: Phase 1 inventory of the 27 tests that were already explicitly ignored
+before the complete local-artifact false-green scan.
 
-The crate has exactly 27 ignored integration tests across five test targets.
-They split into local vanilla-oracle parity gates, sidecar-backed behavioral
-compositions, load/reliability gates, and explicit performance reports. Every
-ignore now has a reason, and an explicitly requested gate fails when its named
-prerequisite is unavailable instead of returning a false-green result.
+Those 27 tests split into local vanilla-oracle parity gates, sidecar-backed
+behavioral compositions, load/reliability gates, and explicit performance
+reports. Every ignore has a reason, and an explicitly requested gate fails when
+its named prerequisite is unavailable instead of returning a false-green
+result.
+
+A later complete scan found 99 additional ordinary tests whose local
+prerequisite branches returned success. They are now explicit opt-in gates, so
+the crate's current ignored inventory is 126. Their exact source list, owners,
+and close conditions are recorded in
+[`mc-test-harness-local-artifact-tests.md`](mc-test-harness-local-artifact-tests.md).
 
 ## Inventory summary
 

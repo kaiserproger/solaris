@@ -1,4 +1,5 @@
 #[test]
+#[ignore = "requires local data/vanilla sidecars"]
 fn two_clients_stale_chest_click_after_peer_update_resyncs() {
     let test = std::thread::Builder::new()
         .name("two_clients_stale_chest_click_after_peer_update_resyncs".to_owned())
@@ -22,12 +23,11 @@ async fn two_clients_stale_chest_click_after_peer_update_resyncs_inner() {
     let blocks_json = vanilla_dir.join("reports/blocks.json");
     let registries_json = vanilla_dir.join("reports/registries.json");
     if !blocks_json.exists() || !registries_json.exists() {
-        eprintln!(
-            "skipping: missing {} or {}",
+        panic!(
+            "prerequisite failed: missing {} or {}",
             blocks_json.display(),
             registries_json.display()
         );
-        return;
     }
 
     let data = Arc::new(mc_data::load(&vanilla_dir).expect("vanilla data loads"));
@@ -216,6 +216,7 @@ async fn two_clients_stale_chest_click_after_peer_update_resyncs_inner() {
 }
 
 #[test]
+#[ignore = "requires local data/vanilla sidecars"]
 fn server_origin_hopper_tick_updates_open_chests_and_comparator_over_tcp() {
     let test = std::thread::Builder::new()
         .name("server_origin_hopper_tick_updates_open_chests_and_comparator_over_tcp".to_owned())
@@ -239,12 +240,11 @@ async fn server_origin_hopper_tick_updates_open_chests_and_comparator_over_tcp_i
     let blocks_json = vanilla_dir.join("reports/blocks.json");
     let registries_json = vanilla_dir.join("reports/registries.json");
     if !blocks_json.exists() || !registries_json.exists() {
-        eprintln!(
-            "skipping: missing {} or {}",
+        panic!(
+            "prerequisite failed: missing {} or {}",
             blocks_json.display(),
             registries_json.display()
         );
-        return;
     }
 
     let data = Arc::new(mc_data::load(&vanilla_dir).expect("vanilla data loads"));
@@ -500,6 +500,7 @@ async fn server_origin_hopper_tick_updates_open_chests_and_comparator_over_tcp_i
 }
 
 #[test]
+#[ignore = "requires local data/vanilla sidecars"]
 fn chest_quickcraft_left_drag_splits_carried_stack_across_empty_slots() {
     let test = std::thread::Builder::new()
         .name("chest_quickcraft_left_drag_splits_carried_stack_across_empty_slots".to_owned())
@@ -523,12 +524,11 @@ async fn chest_quickcraft_left_drag_splits_carried_stack_across_empty_slots_inne
     let blocks_json = vanilla_dir.join("reports/blocks.json");
     let registries_json = vanilla_dir.join("reports/registries.json");
     if !blocks_json.exists() || !registries_json.exists() {
-        eprintln!(
-            "skipping: missing {} or {}",
+        panic!(
+            "prerequisite failed: missing {} or {}",
             blocks_json.display(),
             registries_json.display()
         );
-        return;
     }
 
     let data = Arc::new(mc_data::load(&vanilla_dir).expect("vanilla data loads"));
@@ -742,6 +742,7 @@ async fn chest_quickcraft_left_drag_splits_carried_stack_across_empty_slots_inne
 }
 
 #[test]
+#[ignore = "requires local data/vanilla sidecars"]
 fn chest_quickcraft_right_drag_places_one_per_selected_slot_and_merges_partial_stack() {
     let test = std::thread::Builder::new()
         .name("chest_quickcraft_right_drag_places_one_per_selected_slot_and_merges_partial_stack".to_owned())
@@ -765,12 +766,11 @@ async fn chest_quickcraft_right_drag_places_one_per_selected_slot_and_merges_par
     let blocks_json = vanilla_dir.join("reports/blocks.json");
     let registries_json = vanilla_dir.join("reports/registries.json");
     if !blocks_json.exists() || !registries_json.exists() {
-        eprintln!(
-            "skipping: missing {} or {}",
+        panic!(
+            "prerequisite failed: missing {} or {}",
             blocks_json.display(),
             registries_json.display()
         );
-        return;
     }
 
     let data = Arc::new(mc_data::load(&vanilla_dir).expect("vanilla data loads"));
@@ -994,6 +994,7 @@ async fn chest_quickcraft_right_drag_places_one_per_selected_slot_and_merges_par
 }
 
 #[test]
+#[ignore = "requires local data/vanilla sidecars"]
 fn unsupported_chest_click_modes_resync_without_trusting_client_slots() {
     let test = std::thread::Builder::new()
         .name("unsupported_chest_click_modes_resync_without_trusting_client_slots".to_owned())
@@ -1017,12 +1018,11 @@ async fn unsupported_chest_click_modes_resync_without_trusting_client_slots_inne
     let blocks_json = vanilla_dir.join("reports/blocks.json");
     let registries_json = vanilla_dir.join("reports/registries.json");
     if !blocks_json.exists() || !registries_json.exists() {
-        eprintln!(
-            "skipping: missing {} or {}",
+        panic!(
+            "prerequisite failed: missing {} or {}",
             blocks_json.display(),
             registries_json.display()
         );
-        return;
     }
 
     let data = Arc::new(mc_data::load(&vanilla_dir).expect("vanilla data loads"));
