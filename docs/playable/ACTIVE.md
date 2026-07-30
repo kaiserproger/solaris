@@ -22,16 +22,22 @@ replacement-readiness claims.
 
 ## Active Checkpoint
 
-Next autonomous goal checkpoint: route `playable`; mechanically move
-`player_collision_uses_farmland_fallback_for_exact_low_id_semantics` out of
-aggregate `crates/mc-net/src/play/tests.rs` into a focused sibling module.
-Preserve its exact low-id farmland helper, the `(0.5, 64.9375, 0.5)`
-non-collision pose at the `15/16` top, the `(0.5, 64.90, 0.5)` colliding
-overlap pose, and production behavior. Leave the preceding
+Next autonomous goal checkpoint: route `playable`; mechanically move the
 `player_collision_rejects_wrong_properties_under_canonical_slab_name_and_id`
-test and following
-`button_test_registry` helper aggregate-owned, and use explicit imports rather
-than a new `use super::*`.
+test from aggregate `crates/mc-net/src/play/tests.rs` to a focused sibling
+module.
+Preserve its exact altered-slab helper, canonical stone-slab name and numeric
+state id with the ordered `type=synthetic` property mismatch, the
+`(0.5, 64.5, 0.5)` colliding pose, and production behavior. Leave the preceding
+`player_collision_rejects_fake_farmland_identity_on_overlapping_slab_id` test
+and following `button_test_registry` helper aggregate-owned, and use explicit
+imports rather than a new `use super::*`.
+
+The complete exact low-id farmland-fallback test has moved to
+`crates/mc-net/src/play/tests/farmland_fallback_collision.rs`. Its unchanged
+minimal farmland fixture, `15/16` top boundary, colliding overlap pose, exact
+coordinates, and published collision-context coverage are recorded in
+[`../evidence/mc-net-farmland-fallback-collision-test-extraction.md`](../evidence/mc-net-farmland-fallback-collision-test-extraction.md).
 
 The complete bottom-slab collision test has moved to
 `crates/mc-net/src/play/tests/bottom_slab_collision.rs`. Its exact bottom-slab
