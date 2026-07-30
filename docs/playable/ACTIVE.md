@@ -22,11 +22,21 @@ replacement-readiness claims.
 
 ## Active Checkpoint
 
-Next: the owner runs the subjective fresh-world seed-`712816` playtest on the
-exact candidate tree, using the checked mosaics and spawn screenshot as
-navigation context. Ordinary traversal and the owner's terrain/playability
-disposition remain required. Keep restart and release-host throughput
-comparison as separate follow-up checkpoints.
+Next autonomous goal checkpoint: inventory Cargo features that alter workspace
+test discovery outside the already classified `mc-script` `lua-runtime` and
+`mc-net` `load-bench` boundaries, then select the first unexplained
+feature-gated test class. The owner-run subjective fresh-world seed-`712816`
+playtest remains queued; ordinary traversal, terrain/playability disposition,
+restart, and release-host throughput are not closed by test-policy work.
+
+The Phase 1 progress-wait class is closed. First-party tests contain no
+remaining wall-clock sleep or scheduler-yield call; candidate loops wait on
+exact packet, channel, watch, notification, process, or filesystem events, use
+timeouts only as failure watchdogs, or perform finite iteration. The bounded
+inventory, classifications, reproduction, and limits are in
+[`../evidence/phase1-progress-wait-inventory.md`](../evidence/phase1-progress-wait-inventory.md).
+This does not close the remaining ignored, feature-gated, structural, or
+manual test inventories.
 
 The automatable graphical preflight is closed. A real Minecraft Java 26.1.2
 client joined a fresh no-operator `tellus_like` seed-`712816` world at

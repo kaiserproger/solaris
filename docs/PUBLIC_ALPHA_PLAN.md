@@ -40,7 +40,7 @@ not replace functional, package, workspace, or real-client gates.
 1. [ ] Inventory every failing, ignored, flaky, feature-gated, and manual-only
    workspace test. Give each non-green gate an owner, reason, and exact close
    condition; do not silently delete or weaken it.
-2. [ ] Replace wall-clock sleeps and polling with the exact packet, notification,
+2. [x] Replace wall-clock sleeps and polling with the exact packet, notification,
    process, world-state, or simulation event that proves progress.
 3. [ ] Keep substantial tests beside their focused domain in `*_tests.rs`; stop
    growing aggregate `play.rs`, `session.rs`, and inline production test modules.
@@ -248,6 +248,12 @@ Benchmark reproduction happens at that feature boundary, not after every edit:
   pending delivery while capacity is full and completion after the host
   consumes the buffered event; evidence is recorded in
   [`evidence/mc-script-targeted-delivery-wait.md`](evidence/mc-script-targeted-delivery-wait.md).
+- [x] Close the Phase 1 progress-wait inventory. First-party test sources have
+  no remaining wall-clock sleep or scheduler-yield call, and every candidate
+  state loop is an exact packet, channel, watch, notification, process, or
+  filesystem event wait, a fail-only watchdog, or finite iteration rather than
+  progress polling. Scope and reproduction are recorded in
+  [`evidence/phase1-progress-wait-inventory.md`](evidence/phase1-progress-wait-inventory.md).
 - [x] Classify the five explicit `mc-net` ignores: three mapped performance
   reports and two local 26.1.2 sidecar parity gates. The parity gates no longer
   self-skip as green when Mojang data is absent, and the sheep-mix behavior has
