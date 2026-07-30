@@ -144,6 +144,99 @@ fn check_prints_parsed_config_and_exits_zero() {
 }
 
 #[test]
+fn check_reports_derived_deployment_for_every_plugin() {
+    let root = tempfile::tempdir().expect("plugin root");
+    let plugins = root.path().join("plugins");
+    let server_only = plugins.join("server-only");
+    let server_and_client = plugins.join("server-and-client");
+    std::fs::create_dir_all(&server_only).expect("create server-only plugin");
+    std::fs::create_dir_all(server_and_client.join("client"))
+        .expect("create client-required plugin");
+    std::fs::write(
+        server_only.join("plugin.toml"),
+        r#"
+            id = "server-only"
+            name = "Server Only"
+            version = "0.1.0"
+            api = "0.6.0"
+        "#,
+    )
+    .expect("write server-only manifest");
+    std::fs::write(server_only.join("main.lua"), "").expect("write server-only source");
+    std::fs::write(
+        server_and_client.join("plugin.toml"),
+        r#"
+            id = "server-and-client"
+            name = "Server And Client"
+            version = "0.1.0"
+            api = "0.6.0"
+
+            [client]
+            schema = 1
+
+            [[client.bundles]]
+            id = "assets"
+            version = "1"
+            artifact = "client/assets.zip"
+            sha256 = "2d711642b726b04401627ca9fbac32f5c8530fb1903cc4db02258717921a4881"
+            size_bytes = 1
+            loaders = ["fabric"]
+            content = ["assets"]
+            permissions = ["load_assets"]
+        "#,
+    )
+    .expect("write client-required manifest");
+    std::fs::write(server_and_client.join("main.lua"), "").expect("write client-required source");
+    std::fs::write(server_and_client.join("client/assets.zip"), b"x")
+        .expect("write client artifact");
+    let world = root.path().join("world");
+    let config = root.path().join("config.toml");
+    std::fs::write(
+        &config,
+        format!(
+            r#"
+                [server]
+                name = "Plugin Deployment Check"
+                motd = "Hello"
+
+                [network]
+                bind_address = "127.0.0.1"
+                port = 30000
+
+                [data]
+                world_dir = "{}"
+
+                [plugins]
+                directory = "{}"
+            "#,
+            world.display(),
+            plugins.display()
+        ),
+    )
+    .expect("write config");
+
+    let output = Command::cargo_bin("mc-server")
+        .expect("locate mc-server binary")
+        .arg("--check")
+        .arg("--config")
+        .arg(config)
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    let check: serde_json::Value = serde_json::from_slice(&output).expect("parse check JSON");
+
+    assert_eq!(
+        check["discovered_plugins"],
+        serde_json::json!([
+            {"id": "server-and-client", "deployment": "server_and_client"},
+            {"id": "server-only", "deployment": "server_only"}
+        ])
+    );
+}
+
+#[test]
 fn check_prints_automatic_worker_capacity() {
     let mut file = NamedTempFile::new().expect("tempfile");
     file.write_all(

@@ -40,11 +40,11 @@ mod tick_delivery_tests;
 #[cfg(feature = "lua-runtime")]
 pub use lua::{
     BundledLuauPlugin, LuaClientBundle, LuaClientContentKind, LuaClientLoader, LuaClientPermission,
-    LuaHost, LuaHostConfig, LuaHostError, LuaSettlementBuilding, LuaSettlementBuildingRole,
-    LuaSettlementBuildingTemplate, LuaSettlementExtension, LuaSettlementInhabitant,
-    LuaSettlementInhabitantKind, LuaSettlementJob, LuaSettlementPlan, LuaWorldgenOreProfile,
-    LuaWorldgenSettlementProfile, PreparedLuaPlugins, prepare_bundled_luau_plugins,
-    prepare_lua_plugins, start_lua_host, start_prepared_lua_host,
+    LuaHost, LuaHostConfig, LuaHostError, LuaPluginDeployment, LuaPluginDiscovery,
+    LuaSettlementBuilding, LuaSettlementBuildingRole, LuaSettlementBuildingTemplate,
+    LuaSettlementExtension, LuaSettlementInhabitant, LuaSettlementInhabitantKind, LuaSettlementJob,
+    LuaSettlementPlan, LuaWorldgenOreProfile, LuaWorldgenSettlementProfile, PreparedLuaPlugins,
+    prepare_bundled_luau_plugins, prepare_lua_plugins, start_lua_host, start_prepared_lua_host,
 };
 
 /// Crate version, exposed so other crates and the binary can report it.

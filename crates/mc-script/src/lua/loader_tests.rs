@@ -65,8 +65,11 @@ permissions = [
 
     let prepared = prepare_lua_plugins(LuaHostConfig::new(&root)).unwrap();
     let bundle = &prepared.client_bundles()[0];
+    let plugin = prepared.discovered_plugins().next().unwrap();
 
     assert_eq!(bundle.owner_plugin_id(), "loader-test");
+    assert_eq!(plugin.id(), "loader-test");
+    assert_eq!(plugin.deployment(), LuaPluginDeployment::ServerAndClient);
     assert_eq!(bundle.id(), "rich-content");
     assert_eq!(
         bundle.loaders(),
@@ -94,6 +97,20 @@ permissions = [
         bundle.artifact_path(),
         fs::canonicalize(root.join("loader-test/client/rich-content.zip")).unwrap()
     );
+    fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn plugin_without_client_bundles_is_discovered_as_server_only() {
+    let root = plugin_root("server-only");
+    write_plugin(&root, "");
+
+    let prepared = prepare_lua_plugins(LuaHostConfig::new(&root)).unwrap();
+    let plugins = prepared.discovered_plugins().collect::<Vec<_>>();
+
+    assert_eq!(plugins.len(), 1);
+    assert_eq!(plugins[0].id(), "loader-test");
+    assert_eq!(plugins[0].deployment(), LuaPluginDeployment::ServerOnly);
     fs::remove_dir_all(root).unwrap();
 }
 

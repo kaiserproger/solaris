@@ -141,8 +141,8 @@ fn check_config(path: &Path) -> Result<()> {
         )
     })?;
     validate_runtime_config(&cfg)?;
-    let _prepared_plugins = prepare_configured_luau_plugins(&cfg)?;
-    let effective = EffectiveConfig::from(&cfg);
+    let prepared_plugins = prepare_configured_luau_plugins(&cfg)?;
+    let effective = EffectiveConfig::with_plugins(&cfg, prepared_plugins.as_ref());
     let rendered = serde_json::to_string_pretty(&effective).context("rendering config as JSON")?;
     println!("{rendered}");
     Ok(())
@@ -152,6 +152,7 @@ fn check_config(path: &Path) -> Result<()> {
 struct EffectiveConfig<'a> {
     #[serde(flatten)]
     config: &'a ServerConfig,
+    discovered_plugins: Vec<mc_script::LuaPluginDiscovery<'a>>,
     effective_chunk_pipeline: EffectiveChunkPipeline,
     effective_autoscale: EffectiveAutoscale,
     operator_warnings: Vec<OperatorWarning>,
@@ -159,8 +160,21 @@ struct EffectiveConfig<'a> {
 
 impl<'a> From<&'a ServerConfig> for EffectiveConfig<'a> {
     fn from(config: &'a ServerConfig) -> Self {
+        Self::with_plugins(config, None)
+    }
+}
+
+impl<'a> EffectiveConfig<'a> {
+    fn with_plugins(
+        config: &'a ServerConfig,
+        plugins: Option<&'a mc_script::PreparedLuaPlugins>,
+    ) -> Self {
         Self {
             config,
+            discovered_plugins: plugins
+                .into_iter()
+                .flat_map(mc_script::PreparedLuaPlugins::discovered_plugins)
+                .collect(),
             effective_chunk_pipeline: EffectiveChunkPipeline::from(
                 config.chunk_pipeline.to_network(),
             ),
@@ -550,6 +564,17 @@ async fn serve(path: &Path) -> Result<()> {
     let world_dir = required_world_dir(&cfg)?;
     let worldgen_mode = cfg.data.worldgen_mode.to_worldgen();
     let mut prepared_plugins = prepare_configured_luau_plugins(&cfg)?;
+    for plugin in prepared_plugins
+        .as_ref()
+        .into_iter()
+        .flat_map(mc_script::PreparedLuaPlugins::discovered_plugins)
+    {
+        tracing::info!(
+            plugin_id = plugin.id(),
+            deployment = plugin.deployment().contract_name(),
+            "Luau plugin discovered"
+        );
+    }
     let plugin_ore_profile = prepared_plugins
         .as_ref()
         .and_then(mc_script::PreparedLuaPlugins::worldgen_ore_profile);

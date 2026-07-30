@@ -9,7 +9,7 @@ use std::sync::{Arc, Mutex};
 use std::thread;
 
 use mlua::{Function, Lua, LuaOptions, LuaString, StdLib, Table, Value, VmState};
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use tracing::{info, warn};
 
@@ -284,6 +284,42 @@ pub struct LuaClientBundle {
     loaders: Vec<LuaClientLoader>,
     content: Vec<LuaClientContentKind>,
     permissions: Vec<LuaClientPermission>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+#[non_exhaustive]
+pub enum LuaPluginDeployment {
+    ServerOnly,
+    ServerAndClient,
+}
+
+impl LuaPluginDeployment {
+    #[must_use]
+    pub const fn contract_name(self) -> &'static str {
+        match self {
+            Self::ServerOnly => "server_only",
+            Self::ServerAndClient => "server_and_client",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+pub struct LuaPluginDiscovery<'a> {
+    id: &'a str,
+    deployment: LuaPluginDeployment,
+}
+
+impl<'a> LuaPluginDiscovery<'a> {
+    #[must_use]
+    pub const fn id(self) -> &'a str {
+        self.id
+    }
+
+    #[must_use]
+    pub const fn deployment(self) -> LuaPluginDeployment {
+        self.deployment
+    }
 }
 
 impl LuaClientBundle {
@@ -606,6 +642,17 @@ impl PreparedLuaPlugins {
     #[must_use]
     pub fn client_bundles(&self) -> &[LuaClientBundle] {
         &self.client_bundles
+    }
+
+    pub fn discovered_plugins(&self) -> impl ExactSizeIterator<Item = LuaPluginDiscovery<'_>> + '_ {
+        self.sources.iter().map(|source| LuaPluginDiscovery {
+            id: source.manifest.plugin_id(),
+            deployment: if source.client_bundles.is_empty() {
+                LuaPluginDeployment::ServerOnly
+            } else {
+                LuaPluginDeployment::ServerAndClient
+            },
+        })
     }
 
     pub fn merge(mut self, other: Self) -> Result<Self, LuaHostError> {

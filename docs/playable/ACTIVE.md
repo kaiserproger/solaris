@@ -22,19 +22,19 @@ replacement-readiness claims.
 
 ## Active Checkpoint
 
-Next autonomous goal checkpoint: route `playable`; mechanically move the
-button-planning class beginning with
-`button_press_schedules_release_tick_without_global_scan` and ending with
-`powered_button_press_is_consumed_without_duplicate_release_tick` out of
+Next autonomous goal checkpoint: route `playable`; mechanically move the full
+nine-test scheduled-button runtime/concurrency class beginning with
+`scheduled_button_tick_releases_powered_button` and ending with
+`stale_resident_journal_commit_does_not_block_the_next_decision` out of
 aggregate `crates/mc-net/src/play/tests.rs` into a focused sibling module.
 Preserve every test and production behavior, leave the preceding ignored
 `real_door_states_plan_hand_toggle_when_sidecar_is_present` sidecar gate and
-the following `scheduled_button_tick_releases_powered_button` runtime class in
-the aggregate file, and use explicit imports rather than a new `use super::*`.
-The four-test lever/piston redstone class has already moved to
-`crates/mc-net/src/play/tests/redstone_pistons.rs`; its concentration and
-validation are recorded in
-[`../evidence/mc-net-redstone-piston-test-extraction.md`](../evidence/mc-net-redstone-piston-test-extraction.md).
+the following `removed_log_pushes_leaf_distance_updates_through_scheduled_ticks`
+leaf-distance class in the aggregate file, and use explicit imports rather
+than a new `use super::*`. The three-test button interaction-planning class has
+already moved to `crates/mc-net/src/play/tests/button_planning.rs`; its
+concentration and validation are recorded in
+[`../evidence/mc-net-button-planning-test-extraction.md`](../evidence/mc-net-button-planning-test-extraction.md).
 The owner-run subjective fresh-world seed-`712816` playtest and
 release-candidate performance gates remain queued at their declared
 boundaries.

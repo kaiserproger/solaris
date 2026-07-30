@@ -62,6 +62,10 @@ not replace functional, package, workspace, or real-client gates.
    `play/tests/redstone_pistons.rs`; its stale-power and zone-protection fences
    are recorded in
    [`evidence/mc-net-redstone-piston-test-extraction.md`](evidence/mc-net-redstone-piston-test-extraction.md).
+   The following three-test button interaction-planning class now lives in
+   focused `play/tests/button_planning.rs`; its scheduling and unloaded-neighbor
+   fences are recorded in
+   [`evidence/mc-net-button-planning-test-extraction.md`](evidence/mc-net-button-planning-test-extraction.md).
 4. [ ] Separate behavioral tests from structural tripwires. Structural checks may
    enforce crate ownership and dependency direction, but may not assert Rust
    statement order or source-text layout.
@@ -660,14 +664,16 @@ bundle declaration. Derive and expose the classification.
 
 Required change:
 
-1. Add derived `deployment = server_only | server_and_client` to plugin discovery
+1. [x] Add derived `deployment = server_only | server_and_client` to plugin discovery
    results.
-2. Show it in startup logs and `solaris --check` JSON for every plugin.
-3. For client-required plugins, report supported loaders, bundle identities,
+2. [x] Show it in startup logs and `solaris --check` JSON for every plugin. The
+   implementation and focused validation are recorded in
+   [`evidence/plugin-deployment-reporting.md`](evidence/plugin-deployment-reporting.md).
+3. [ ] For client-required plugins, report supported loaders, bundle identities,
    permissions and total artifact bytes.
-4. Label every shipped example plugin README and the main plugin documentation as
+4. [ ] Label every shipped example plugin README and the main plugin documentation as
    **Server-only** or **Requires Solaris Loader on client**.
-5. Use a precise disconnect message when a client-required plugin cannot complete
+5. [ ] Use a precise disconnect message when a client-required plugin cannot complete
    the Loader handshake.
 
 Acceptance:
