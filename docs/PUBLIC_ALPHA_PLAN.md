@@ -232,6 +232,12 @@ Benchmark reproduction happens at that feature boundary, not after every edit:
   selection, plus recipient-fenced food sharing and stable courtship movement.
   Owners, current status, and close conditions are recorded in
   [`evidence/mc-net-ignored-tests.md`](evidence/mc-net-ignored-tests.md).
+- [x] Classify the four explicit `mc-server` ignores: two startup performance
+  gates and two process-level crash/shutdown integration gates. All four require
+  explicit local 26.1.2 sidecar opt-in and fail rather than self-skip when a
+  prerequisite is absent. Their ordinary-suite coverage, owners, current
+  disposition, and exact close conditions are recorded in
+  [`evidence/mc-server-ignored-tests.md`](evidence/mc-server-ignored-tests.md).
 - [x] Record the exact local 26.1.2 world-clock oracle in
   [`evidence/world-clock-26.1.2.md`](evidence/world-clock-26.1.2.md).
 - [x] Implement the typed world-clock map, separating monotonic `game_time` from
