@@ -283,6 +283,10 @@ not replace functional, package, workspace, or real-client gates.
    `play/tests/top_slab_collision.rs`; its exact top-slab state, empty lower
    half, and occupied upper-half head boundary are recorded in
    [`evidence/mc-net-top-slab-collision-test-extraction.md`](evidence/mc-net-top-slab-collision-test-extraction.md).
+   The following oracle-AABB-deflation collision test now lives in focused
+   `play/tests/oracle_aabb_deflation_boundary.rs`; its exact bottom-slab state,
+   oracle deflation, and both sides of the deflated boundary are recorded in
+   [`evidence/mc-net-oracle-aabb-deflation-test-extraction.md`](evidence/mc-net-oracle-aabb-deflation-test-extraction.md).
 4. [ ] Separate behavioral tests from structural tripwires. Structural checks may
    enforce crate ownership and dependency direction, but may not assert Rust
    statement order or source-text layout.

@@ -46,6 +46,7 @@ mod item_block_mapping;
 mod leaf_distance_ticks;
 mod movement_block_reads;
 mod natural_random_ticks;
+mod oracle_aabb_deflation_boundary;
 mod oriented_stair_collision;
 mod pickup;
 mod plants;
@@ -2832,35 +2833,6 @@ async fn player_collision_uses_bottom_slab_box() {
     assert!(
         player_pose_collides_with_solid(Some(&state), PlayerPose::new(0.5, 64.49, 0.5)).await,
         "a player may not overlap the bottom slab box"
-    );
-}
-
-#[tokio::test]
-async fn player_collision_uses_oracle_aabb_deflation_boundary() {
-    let state = vanilla_collision_test_state();
-    let slab = vanilla_collision_state_id(
-        &state,
-        "minecraft:stone_slab",
-        &[("type", "bottom"), ("waterlogged", "false")],
-    );
-    set_collision_test_block(&state, slab).await;
-    let oracle_deflation = f64::from(1.0e-5_f32);
-
-    assert!(
-        !player_pose_collides_with_solid(
-            Some(&state),
-            PlayerPose::new(0.5, 64.5 - oracle_deflation / 2.0, 0.5),
-        )
-        .await,
-        "an overlap below the oracle deflation remains non-colliding"
-    );
-    assert!(
-        player_pose_collides_with_solid(
-            Some(&state),
-            PlayerPose::new(0.5, 64.5 - oracle_deflation * 2.0, 0.5),
-        )
-        .await,
-        "an overlap beyond the oracle deflation collides"
     );
 }
 

@@ -23,15 +23,22 @@ replacement-readiness claims.
 ## Active Checkpoint
 
 Next autonomous goal checkpoint: route `playable`; mechanically move the
-`player_collision_uses_oracle_aabb_deflation_boundary` test out of
+`player_collision_uses_bottom_slab_box` test out of
 aggregate `crates/mc-net/src/play/tests.rs` into a focused sibling module.
-Preserve its exact bottom-slab state,
-`let oracle_deflation = f64::from(1.0e-5_f32)`, the
-`64.5 - oracle_deflation / 2.0` non-collision pose, the
-`64.5 - oracle_deflation * 2.0` collision pose, and production behavior. Leave
-the preceding `player_collision_uses_bottom_slab_box` test and following
+Preserve its exact `minecraft:stone_slab` state with `type=bottom` and
+`waterlogged=false`, the `(0.5, 64.5, 0.5)` non-collision pose on the slab top,
+the `(0.5, 64.49, 0.5)` colliding overlap pose, and production behavior. Leave
+the preceding `player_collision_uses_farmland_fallback_for_exact_low_id_semantics`
+test and following
 `button_test_registry` helper aggregate-owned, and use explicit imports rather
 than a new `use super::*`.
+
+The complete oracle-AABB-deflation collision test has moved to
+`crates/mc-net/src/play/tests/oracle_aabb_deflation_boundary.rs`. Its exact
+bottom-slab state, `1.0e-5_f32` oracle deflation, sub-boundary non-collision,
+beyond-boundary collision, exact poses, and published collision-context
+coverage are recorded in
+[`../evidence/mc-net-oracle-aabb-deflation-test-extraction.md`](../evidence/mc-net-oracle-aabb-deflation-test-extraction.md).
 
 The complete top-slab collision test has moved to
 `crates/mc-net/src/play/tests/top_slab_collision.rs`. Its exact top-slab state,
