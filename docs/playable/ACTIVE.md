@@ -23,13 +23,18 @@ replacement-readiness claims.
 ## Active Checkpoint
 
 Next autonomous goal checkpoint: route `playable`; mechanically move the
-`arrow_launch_uses_player_look_direction_and_draw_power` test out of aggregate
+`entity_tick_cadence_matches_vanilla_cow_tracking` test out of aggregate
 `crates/mc-net/src/play/tests.rs` into a focused sibling module. Preserve its
-complete spawn-position and draw-power velocity matrix and production
-behavior, leave the preceding
-`entity_tick_cadence_matches_vanilla_cow_tracking` test and following
+complete wall-clock period, physics-step, and move-publication cadence matrix
+and production behavior, leave the preceding
+`toggle_planning_does_not_wait_for_world_writer` test and following
 `button_test_registry` helper aggregate-owned, and use explicit imports rather
 than a new `use super::*`.
+
+The complete arrow launch spawn-position and draw-power velocity matrix has
+moved to `crates/mc-net/src/play/tests/arrow_launch.rs`. Its yaw/pitch-derived
+spawn and three-axis velocity coverage is recorded in
+[`../evidence/mc-net-arrow-launch-test-extraction.md`](../evidence/mc-net-arrow-launch-test-extraction.md).
 
 The complete two-test game-mode command parser class, beginning with
 `gamemode_command_parses_names_and_numeric_modes` and ending with

@@ -209,6 +209,10 @@ not replace functional, package, workspace, or real-client gates.
    `play/tests/gamemode_commands.rs`; its named, numeric, wrong-root, unknown,
    and extra-argument coverage is recorded in
    [`evidence/mc-net-gamemode-commands-test-extraction.md`](evidence/mc-net-gamemode-commands-test-extraction.md).
+   The following arrow launch geometry and draw-power test now lives in
+   focused `play/tests/arrow_launch.rs`; its spawn-position and three-axis
+   velocity coverage is recorded in
+   [`evidence/mc-net-arrow-launch-test-extraction.md`](evidence/mc-net-arrow-launch-test-extraction.md).
 4. [ ] Separate behavioral tests from structural tripwires. Structural checks may
    enforce crate ownership and dependency direction, but may not assert Rust
    statement order or source-text layout.
