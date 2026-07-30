@@ -23,18 +23,24 @@ replacement-readiness claims.
 ## Active Checkpoint
 
 Next autonomous goal checkpoint: route `playable`; mechanically move the
-`teleport_command_waits_for_pending_confirmation_before_repositioning_player`
+`pending_teleport_resends_after_vanilla_tick_window`
 test from aggregate `crates/mc-net/src/play/tests.rs` to a focused sibling
 module.
-Preserve its exact slow-client config, session/simulation fixtures, original
-pose `(1.0, 65.0, 2.0)`, `/tp 10 70 -5` console command, Survival/FULL/default
-XP state, pending teleport id `7` at sent tick `0`, next id `8`, absent chunk
-stream, `1/1` chunk-pipeline limits, empty position-sync output, retained
-pending/next ids, unchanged position, yaw and pitch, and production behavior.
-Leave the preceding
-`pending_teleport_resends_after_vanilla_tick_window` test and following
-`state` helper aggregate-owned, and use explicit imports rather than a new
-`use super::*`.
+Preserve its exact pose `(12.5, 70.0, -3.25)`, pending teleport id `7` at sent
+tick `100`, next id `8`, no resend and empty writer at tick `120`, successful
+resend at tick `121`, one position-sync packet with teleport id `8` and the
+exact pose coordinates, pending id `8` at sent tick `121`, next id `9`, and
+production behavior. Leave the preceding
+`pending_teleport_confirm_behaviour_after_unconfirmed_movement` test and
+following `state` helper aggregate-owned, and use explicit imports rather than
+a new `use super::*`.
+
+The complete pending-confirmation teleport-command test has moved to
+`crates/mc-net/src/play/tests/teleport_command_pending_confirmation.rs`. Its
+unchanged slow-client/session/simulation fixtures, original pose,
+`/tp 10 70 -5` console command, pending and next teleport ids, empty
+position-sync output, and unchanged position/yaw/pitch are recorded in
+[`../evidence/mc-net-teleport-command-pending-confirmation-test-extraction.md`](../evidence/mc-net-teleport-command-pending-confirmation-test-extraction.md).
 
 The complete no-state pending-teleport movement guard test has moved to
 `crates/mc-net/src/play/tests/pending_teleport_movement_guard.rs`. Its absent
