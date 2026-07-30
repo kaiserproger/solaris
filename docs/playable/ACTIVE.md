@@ -23,18 +23,24 @@ replacement-readiness claims.
 ## Active Checkpoint
 
 Next autonomous goal checkpoint: route `playable`; mechanically move the
-`entity_movement_write_turn_preserves_order_across_the_budget_boundary`
-test from aggregate `crates/mc-net/src/play/tests.rs` to a focused sibling
-module.
-Preserve the inclusive `0..=ENTITY_MOVEMENTS_PER_WRITE_TURN` input, exact
-per-index entity id, `(index, 64.0, 0.0)` position and absolute wire move, zero
-velocity and rotation, grounded state, disabled velocity/head-rotation sends,
-write-turn split, current batch length, first id `0`, last id
-`ENTITY_MOVEMENTS_PER_WRITE_TURN - 1`, one remaining movement with id
-`ENTITY_MOVEMENTS_PER_WRITE_TURN`, and production behavior. Leave the preceding
-`play_loop_drains_bounded_outbound_pressure_without_shedding` test and following
-`state` helper aggregate-owned, and use explicit imports rather than a new
-`use super::*`.
+`play_loop_drains_bounded_outbound_pressure_without_shedding` test from
+aggregate `crates/mc-net/src/play/tests.rs` to a focused sibling module.
+Preserve the 64-byte duplex reader, sink writer, buffer, session registry,
+simulation channel and initial pressure snapshot, slow-client test config,
+capacity-16 outbound channel, `1..=16` `try_send` prefill and exact expectation,
+spawned `17..=80` awaited producer and exact expectation, exact pose and
+overworld survival respawn, 250 ms timeout, complete `play_loop` argument list
+and exact result/producer expectations. Preserve both final pressure assertions,
+including the unchanged timeout/shed counters and messages. Leave the preceding
+`play_loop_exits_when_outbound_channel_closes` test and following `state` helper
+aggregate-owned, and use explicit imports rather than a new `use super::*`.
+
+The complete entity-movement write-turn boundary test has moved to
+`crates/mc-net/src/play/tests/entity_movement_write_turn.rs`. Its unchanged
+inclusive movement range, per-index ids/positions, exact wire moves and flags,
+write-turn split, current batch boundaries, and one remaining movement are
+recorded in
+[`../evidence/mc-net-entity-movement-write-turn-test-extraction.md`](../evidence/mc-net-entity-movement-write-turn-test-extraction.md).
 
 The complete oversized container-title NBT test has moved to
 `crates/mc-net/src/play/tests/container_title_nbt.rs`. Its unchanged oversized

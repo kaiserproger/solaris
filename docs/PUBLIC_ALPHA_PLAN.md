@@ -378,6 +378,11 @@ not replace functional, package, workspace, or real-client gates.
    `play/tests/container_title_nbt.rs`; its oversized text boundary, exact
    failure expectation, and codec error variant are recorded in
    [`evidence/mc-net-container-title-nbt-test-extraction.md`](evidence/mc-net-container-title-nbt-test-extraction.md).
+   The following entity-movement write-turn boundary test now lives in focused
+   `play/tests/entity_movement_write_turn.rs`; its inclusive movement range,
+   exact per-index movement fields, current batch boundary, and remaining
+   movement are recorded in
+   [`evidence/mc-net-entity-movement-write-turn-test-extraction.md`](evidence/mc-net-entity-movement-write-turn-test-extraction.md).
 4. [ ] Separate behavioral tests from structural tripwires. Structural checks may
    enforce crate ownership and dependency direction, but may not assert Rust
    statement order or source-text layout.
