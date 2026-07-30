@@ -279,6 +279,10 @@ not replace functional, package, workspace, or real-client gates.
    `play/tests/oriented_stair_collision.rs`; its exact north-facing bottom
    state and occupied/empty stair-half coverage is recorded in
    [`evidence/mc-net-oriented-stair-collision-test-extraction.md`](evidence/mc-net-oriented-stair-collision-test-extraction.md).
+   The following top-slab collision test now lives in focused
+   `play/tests/top_slab_collision.rs`; its exact top-slab state, empty lower
+   half, and occupied upper-half head boundary are recorded in
+   [`evidence/mc-net-top-slab-collision-test-extraction.md`](evidence/mc-net-top-slab-collision-test-extraction.md).
 4. [ ] Separate behavioral tests from structural tripwires. Structural checks may
    enforce crate ownership and dependency direction, but may not assert Rust
    statement order or source-text layout.

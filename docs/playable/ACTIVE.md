@@ -23,13 +23,21 @@ replacement-readiness claims.
 ## Active Checkpoint
 
 Next autonomous goal checkpoint: route `playable`; mechanically move the
-`player_collision_uses_top_slab_box` test out of
+`player_collision_uses_oracle_aabb_deflation_boundary` test out of
 aggregate `crates/mc-net/src/play/tests.rs` into a focused sibling module.
-Preserve its exact top-slab state, empty lower half, occupied upper-half head
-boundary, exact poses, and production behavior, leave the preceding
-`player_collision_uses_oracle_aabb_deflation_boundary` test and following
+Preserve its exact bottom-slab state,
+`let oracle_deflation = f64::from(1.0e-5_f32)`, the
+`64.5 - oracle_deflation / 2.0` non-collision pose, the
+`64.5 - oracle_deflation * 2.0` collision pose, and production behavior. Leave
+the preceding `player_collision_uses_bottom_slab_box` test and following
 `button_test_registry` helper aggregate-owned, and use explicit imports rather
 than a new `use super::*`.
+
+The complete top-slab collision test has moved to
+`crates/mc-net/src/play/tests/top_slab_collision.rs`. Its exact top-slab state,
+empty lower half, occupied upper-half head boundary, exact poses, and published
+collision-context coverage are recorded in
+[`../evidence/mc-net-top-slab-collision-test-extraction.md`](../evidence/mc-net-top-slab-collision-test-extraction.md).
 
 The complete oriented-stair collision test has moved to
 `crates/mc-net/src/play/tests/oriented_stair_collision.rs`. Its exact
