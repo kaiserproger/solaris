@@ -23,18 +23,18 @@ replacement-readiness claims.
 ## Active Checkpoint
 
 Next autonomous goal checkpoint: route `playable`; mechanically move the full
-twelve-test block-placement/NBT class beginning with
-`door_half_state_builds_two_block_placement_states`, including its oriented
-placement and torch helper functions, and ending with
-`campfire_update_nbt_contains_visible_cooking_items_only` out of aggregate
+twelve-test bed interaction and sleep-planning class beginning with the
+`bed_occupancy_test_registry` helper and
+`bed_respawn_pose_uses_block_above_bed`, and ending with
+`sleep_skip_targets_the_next_morning`, out of aggregate
 `crates/mc-net/src/play/tests.rs` into a focused sibling module. Preserve every
-test and production behavior, leave the preceding `button_and_door_test_registry`
-helper class and the following `bed_occupancy_test_registry` helper class in
-the aggregate file, and use explicit imports rather than a new `use super::*`.
-The five-test scheduled-button loaded/ABA/adjacent-power class has already
-moved to `crates/mc-net/src/play/tests/button_runtime_edges.rs`; its
-concentration and validation are recorded in
-[`../evidence/mc-net-button-runtime-edge-test-extraction.md`](../evidence/mc-net-button-runtime-edge-test-extraction.md).
+test and production behavior, leave the preceding block-placement/NBT class
+and following `common_container_paper_cuts_resolve_to_existing_menus` test in
+their current modules, and use explicit imports rather than a new
+`use super::*`. The twelve-test block-placement/NBT class has already moved to
+`crates/mc-net/src/play/tests/block_placement_nbt.rs`; its concentration and
+validation are recorded in
+[`../evidence/mc-net-block-placement-nbt-test-extraction.md`](../evidence/mc-net-block-placement-nbt-test-extraction.md).
 The owner-run subjective fresh-world seed-`712816` playtest and
 release-candidate performance gates remain queued at their declared
 boundaries.

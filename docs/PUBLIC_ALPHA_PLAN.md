@@ -83,6 +83,10 @@ not replace functional, package, workspace, or real-client gates.
    `play/tests/button_runtime_edges.rs`; its retained runtime-edge coverage is
    recorded in
    [`evidence/mc-net-button-runtime-edge-test-extraction.md`](evidence/mc-net-button-runtime-edge-test-extraction.md).
+   The following twelve-test block-placement and block-entity NBT class now
+   lives in focused `play/tests/block_placement_nbt.rs`; its retained
+   door/stair/slab/torch/sign/campfire coverage is recorded in
+   [`evidence/mc-net-block-placement-nbt-test-extraction.md`](evidence/mc-net-block-placement-nbt-test-extraction.md).
 4. [ ] Separate behavioral tests from structural tripwires. Structural checks may
    enforce crate ownership and dependency direction, but may not assert Rust
    statement order or source-text layout.
