@@ -22,20 +22,18 @@ replacement-readiness claims.
 
 ## Active Checkpoint
 
-Next autonomous goal checkpoint: route `playable`; mechanically move the full
-three-test debug-command parsing, water-corridor fixture, and zero-count give
-execution class beginning with
-`debug_commands_parse_survival_mutations_and_give` and ending with
-`debug_give_zero_count_clears_hotbar_slot_before_item_lookup` out of aggregate
-`crates/mc-net/src/play/tests.rs` into a focused sibling module. Preserve every
+Next autonomous goal checkpoint: route `playable`; mechanically move the
+one-test recoverable-death experience cap class
+`recoverable_death_xp_uses_level_cap` out of aggregate
+`crates/mc-net/src/play/tests.rs` into a focused sibling module. Preserve the
 test and production behavior, leave the preceding
-`recoverable_death_xp_uses_level_cap` test in the aggregate file, and use
-explicit imports rather than a new `use super::*`. The complete six-test chest
-quick-move, stack-limit, menu/crafting revision, and persistent-container
-claim class has already moved to
-`crates/mc-net/src/play/tests/container_inventory.rs`; its concentration and
+`use_item_on_preflight_rejects_out_of_reach_creative_and_allows_reachable_targets`
+test in the aggregate file, and use explicit imports rather than a new
+`use super::*`. The complete three-test debug-command parsing, water-corridor
+fixture, and zero-count give execution class has already moved to
+`crates/mc-net/src/play/tests/debug_commands.rs`; its concentration and
 validation are recorded in
-[`../evidence/mc-net-container-inventory-test-extraction.md`](../evidence/mc-net-container-inventory-test-extraction.md).
+[`../evidence/mc-net-debug-commands-test-extraction.md`](../evidence/mc-net-debug-commands-test-extraction.md).
 The owner-run subjective fresh-world seed-`712816` playtest and
 release-candidate performance gates remain queued at their declared
 boundaries.
