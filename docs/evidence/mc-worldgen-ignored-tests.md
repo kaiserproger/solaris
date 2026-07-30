@@ -2,9 +2,12 @@
 
 Scope: Phase 1 test inventory for `crates/mc-worldgen`.
 
-The crate has exactly two ignored tests. Both are explicit debug-build
-measurement probes over a seed-42, 5×5 chunk window using the synthetic test
-registry. Neither is a hidden behavioral regression or a manual gameplay gate.
+This inventory covers the crate's two explicit debug-build measurement probes
+over a seed-42, 5×5 chunk window using the synthetic test registry. Neither is
+a hidden behavioral regression or a manual gameplay gate. The crate now has
+three additional ignored local-artifact structure gates, classified separately
+in
+[`mc-worldgen-structure-local-artifact-tests.md`](mc-worldgen-structure-local-artifact-tests.md).
 
 ## Inventory
 
@@ -32,9 +35,10 @@ release-host throughput comparison.
 
 ## Current disposition
 
-The bounded inventory command compiled `mc-worldgen` and listed these two tests
-and no other ignored unit, integration, or doctest. Neither probe was executed
-during this classification checkpoint.
+The original bounded inventory command compiled `mc-worldgen` and listed these
+two probes. The current ignored inventory contains both probes plus the three
+separately classified structure sidecar gates. Neither performance probe was
+executed during this classification checkpoint.
 
 The public plan's `929.473 chunks/s` result is historical 225-chunk evidence,
 not a result from either ignored probe on this tree. The revision-10 visual,
@@ -46,7 +50,7 @@ ownership record; it does not change a measured worldgen path.
 
 ## Reproduction
 
-List the exact ignored inventory:
+List the current ignored inventory:
 
 ```sh
 cargo test -p mc-worldgen -- --list --ignored

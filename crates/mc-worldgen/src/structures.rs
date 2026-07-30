@@ -689,14 +689,22 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "requires local 26.1.2 blocks report and plains fountain structure"]
     fn loads_real_plains_fountain_template_when_present() {
         let blocks_path = workspace_path("data/vanilla/reports/blocks.json");
         let template_path = workspace_path(
             "data/vanilla/data/minecraft/structure/village/plains/town_centers/plains_fountain_01.nbt",
         );
-        if !blocks_path.exists() || !template_path.exists() {
-            return;
-        }
+        assert!(
+            blocks_path.is_file(),
+            "requires local 26.1.2 blocks report at {}",
+            blocks_path.display()
+        );
+        assert!(
+            template_path.is_file(),
+            "requires local 26.1.2 plains fountain structure at {}",
+            template_path.display()
+        );
         let report = mc_data::blocks::load_blocks_report(&blocks_path).unwrap();
         let registry = BlockRegistry::from_report(&report).unwrap();
         let template = StructureTemplate::from_nbt_file(&template_path, &registry).unwrap();
@@ -712,14 +720,22 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "requires local 26.1.2 blocks report and plains fountain structure"]
     fn loads_real_plains_village_prototype_when_present() {
         let vanilla = workspace_path("data/vanilla");
         let blocks_path = vanilla.join("reports/blocks.json");
         let fountain = vanilla
             .join("data/minecraft/structure/village/plains/town_centers/plains_fountain_01.nbt");
-        if !blocks_path.exists() || !fountain.exists() {
-            return;
-        }
+        assert!(
+            blocks_path.is_file(),
+            "requires local 26.1.2 blocks report at {}",
+            blocks_path.display()
+        );
+        assert!(
+            fountain.is_file(),
+            "requires local 26.1.2 plains fountain structure at {}",
+            fountain.display()
+        );
         let report = mc_data::blocks::load_blocks_report(&blocks_path).unwrap();
         let registry = BlockRegistry::from_report(&report).unwrap();
 
@@ -736,14 +752,22 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "requires local 26.1.2 blocks report and plains fountain structure"]
     fn plains_village_plan_selects_only_declared_building_parts_when_present() {
         let vanilla = workspace_path("data/vanilla");
         let blocks_path = vanilla.join("reports/blocks.json");
         let fountain = vanilla
             .join("data/minecraft/structure/village/plains/town_centers/plains_fountain_01.nbt");
-        if !blocks_path.exists() || !fountain.exists() {
-            return;
-        }
+        assert!(
+            blocks_path.is_file(),
+            "requires local 26.1.2 blocks report at {}",
+            blocks_path.display()
+        );
+        assert!(
+            fountain.is_file(),
+            "requires local 26.1.2 plains fountain structure at {}",
+            fountain.display()
+        );
         let report = mc_data::blocks::load_blocks_report(&blocks_path).unwrap();
         let registry = BlockRegistry::from_report(&report).unwrap();
 

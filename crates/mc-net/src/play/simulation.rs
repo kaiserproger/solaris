@@ -110,43 +110,51 @@ struct BlockDropAwaitProbe {
     stage: BlockDropAwaitStage,
     entered: std::sync::mpsc::SyncSender<()>,
     release: std::sync::Mutex<std::sync::mpsc::Receiver<()>>,
+    consumed: std::sync::atomic::AtomicBool,
 }
 
 #[cfg(test)]
-static BLOCK_DROP_AWAIT_PROBE: std::sync::Mutex<Option<Arc<BlockDropAwaitProbe>>> =
-    std::sync::Mutex::new(None);
+tokio::task_local! {
+    static BLOCK_DROP_AWAIT_PROBE: Arc<BlockDropAwaitProbe>;
+}
 
 #[cfg(test)]
-static BLOCK_DROP_AWAIT_TEST_SERIAL: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
-
-#[cfg(test)]
-fn install_block_drop_await_probe(
+fn block_drop_await_probe(
     stage: BlockDropAwaitStage,
     entered: std::sync::mpsc::SyncSender<()>,
     release: std::sync::mpsc::Receiver<()>,
-) {
-    let mut slot = BLOCK_DROP_AWAIT_PROBE
-        .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner());
-    assert!(slot.is_none(), "block-drop await probe already installed");
-    *slot = Some(Arc::new(BlockDropAwaitProbe {
+) -> Arc<BlockDropAwaitProbe> {
+    Arc::new(BlockDropAwaitProbe {
         stage,
         entered,
         release: std::sync::Mutex::new(release),
-    }));
+        consumed: std::sync::atomic::AtomicBool::new(false),
+    })
+}
+
+#[cfg(test)]
+async fn with_block_drop_await_probe<F>(probe: Arc<BlockDropAwaitProbe>, future: F) -> F::Output
+where
+    F: std::future::Future,
+{
+    BLOCK_DROP_AWAIT_PROBE.scope(probe, future).await
 }
 
 #[cfg(test)]
 async fn pause_block_drop_after(stage: BlockDropAwaitStage) {
     let probe = BLOCK_DROP_AWAIT_PROBE
-        .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner())
-        .as_ref()
-        .filter(|probe| probe.stage == stage)
-        .cloned();
+        .try_with(Arc::clone)
+        .ok()
+        .filter(|probe| probe.stage == stage);
     let Some(probe) = probe else {
         return;
     };
+    if probe
+        .consumed
+        .swap(true, std::sync::atomic::Ordering::AcqRel)
+    {
+        return;
+    }
     probe.entered.send(()).expect("block-drop probe receiver");
     let waiter = Arc::clone(&probe);
     tokio::task::spawn_blocking(move || {
@@ -159,15 +167,6 @@ async fn pause_block_drop_after(stage: BlockDropAwaitStage) {
     })
     .await
     .expect("block-drop probe worker");
-    let mut slot = BLOCK_DROP_AWAIT_PROBE
-        .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner());
-    if slot
-        .as_ref()
-        .is_some_and(|installed| Arc::ptr_eq(installed, &probe))
-    {
-        slot.take();
-    }
 }
 
 fn elapsed_us(started: std::time::Instant) -> u64 {

@@ -829,11 +829,11 @@ async fn run_authority_recheck_case(
         .unwrap();
     let (entered_tx, entered_rx) = std::sync::mpsc::sync_channel(1);
     let (release_tx, release_rx) = std::sync::mpsc::sync_channel(1);
-    install_block_drop_await_probe(stage, entered_tx, release_rx);
+    let probe = block_drop_await_probe(stage, entered_tx, release_rx);
     let owner_sessions = Arc::clone(&sessions);
     let owner_world = Arc::clone(&world);
     let owner_read = read_view.clone();
-    let owner_task = tokio::spawn(async move {
+    let owner_task = tokio::spawn(with_block_drop_await_probe(probe, async move {
         owner
             .process_commands_with_world_views(
                 &owner_sessions,
@@ -847,7 +847,7 @@ async fn run_authority_recheck_case(
                 1,
             )
             .await
-    });
+    }));
     tokio::task::spawn_blocking(move || entered_rx.recv().unwrap())
         .await
         .unwrap();
@@ -876,7 +876,6 @@ async fn run_authority_recheck_case(
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn block_drop_rechecks_cancellation_and_session_after_each_journal_await() {
-    let _serial = BLOCK_DROP_AWAIT_TEST_SERIAL.lock().await;
     run_authority_recheck_case(BlockDropAwaitStage::AfterReservation, true, BlockStateId(1)).await;
     run_authority_recheck_case(
         BlockDropAwaitStage::AfterReservation,
@@ -890,7 +889,6 @@ async fn block_drop_rechecks_cancellation_and_session_after_each_journal_await()
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn block_drop_waits_for_earlier_reserved_decision_without_reordering() {
-    let _serial = BLOCK_DROP_AWAIT_TEST_SERIAL.lock().await;
     let temp = tempfile::tempdir().unwrap();
     std::fs::create_dir_all(temp.path().join("region")).unwrap();
     let blocks = Arc::new(BlockRegistry::from_report(&test_block_reports()).unwrap());
@@ -933,7 +931,7 @@ async fn block_drop_waits_for_earlier_reserved_decision_without_reordering() {
         .unwrap();
     let (entered_tx, entered_rx) = std::sync::mpsc::sync_channel(1);
     let (release_tx, release_rx) = std::sync::mpsc::sync_channel(1);
-    install_block_drop_await_probe(
+    let probe = block_drop_await_probe(
         BlockDropAwaitStage::AfterReservation,
         entered_tx,
         release_rx,
@@ -941,7 +939,7 @@ async fn block_drop_waits_for_earlier_reserved_decision_without_reordering() {
     let owner_sessions = Arc::clone(&sessions);
     let owner_world = Arc::clone(&world);
     let owner_read = read_view.clone();
-    let owner_task = tokio::spawn(async move {
+    let owner_task = tokio::spawn(with_block_drop_await_probe(probe, async move {
         owner
             .process_commands_with_world_views(
                 &owner_sessions,
@@ -955,7 +953,7 @@ async fn block_drop_waits_for_earlier_reserved_decision_without_reordering() {
                 1,
             )
             .await
-    });
+    }));
     tokio::task::spawn_blocking(move || entered_rx.recv().unwrap())
         .await
         .unwrap();
@@ -979,7 +977,6 @@ async fn block_drop_waits_for_earlier_reserved_decision_without_reordering() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn block_drop_clear_mismatch_fail_stops_without_old_publication() {
-    let _serial = BLOCK_DROP_AWAIT_TEST_SERIAL.lock().await;
     let temp = tempfile::tempdir().unwrap();
     std::fs::create_dir_all(temp.path().join("region")).unwrap();
     let blocks = Arc::new(BlockRegistry::from_report(&test_block_reports()).unwrap());
@@ -1034,12 +1031,12 @@ async fn block_drop_clear_mismatch_fail_stops_without_old_publication() {
         .unwrap();
     let (entered_tx, entered_rx) = std::sync::mpsc::sync_channel(1);
     let (release_tx, release_rx) = std::sync::mpsc::sync_channel(1);
-    install_block_drop_await_probe(BlockDropAwaitStage::AfterAppend, entered_tx, release_rx);
+    let probe = block_drop_await_probe(BlockDropAwaitStage::AfterAppend, entered_tx, release_rx);
     let owner_sessions = Arc::clone(&sessions);
     let owner_world = Arc::clone(&world);
     let owner_read = read_view.clone();
     let competing_mutation = mutation_view.clone();
-    let owner_task = tokio::spawn(async move {
+    let owner_task = tokio::spawn(with_block_drop_await_probe(probe, async move {
         owner
             .process_commands_with_world_views(
                 &owner_sessions,
@@ -1053,7 +1050,7 @@ async fn block_drop_clear_mismatch_fail_stops_without_old_publication() {
                 2,
             )
             .await
-    });
+    }));
     tokio::task::spawn_blocking(move || entered_rx.recv().unwrap())
         .await
         .unwrap();

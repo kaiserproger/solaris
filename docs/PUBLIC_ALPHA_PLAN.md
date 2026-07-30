@@ -298,6 +298,16 @@ Benchmark reproduction happens at that feature boundary, not after every edit:
   `mc-net` test discovery, and no other local or `required-features` test gate
   exists. Current lists, ownership, and evidence boundaries are recorded in
   [`evidence/cargo-feature-gated-test-inventory.md`](evidence/cargo-feature-gated-test-inventory.md).
+- [x] Classify three `mc-worldgen::structures` tests whose local blocks-report
+  or fountain-template prerequisite returned success when absent. They are now
+  explicit opt-in gates and fail closed when selected; ownership, reproduction,
+  and evidence boundaries are recorded in
+  [`evidence/mc-worldgen-structure-local-artifact-tests.md`](evidence/mc-worldgen-structure-local-artifact-tests.md).
+- [x] Isolate the `mc-net` block-drop journal await probe to the exact Tokio
+  owner task under test. The three probe tests no longer share a process-global
+  hook or require a serial-only mutex; the observed closed-receiver race,
+  focused coverage, and limits are recorded in
+  [`evidence/mc-net-block-drop-await-probe.md`](evidence/mc-net-block-drop-await-probe.md).
 - [x] Move natural-spawn DTOs, bounded rotating scheduler, capacity/distance,
   terrain, collision, and candidate planning into `mc-entity`. `mc-net`
   retains live session/world snapshots, owner commit, visibility publication,

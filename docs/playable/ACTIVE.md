@@ -22,12 +22,28 @@ replacement-readiness claims.
 
 ## Active Checkpoint
 
-Next autonomous goal checkpoint: inventory retry, quarantine, serial-only, and
-environment-sensitive self-skip patterns outside the already classified local
-artifact gates, then select the first unexplained flaky test class. The
-owner-run subjective fresh-world seed-`712816` playtest remains queued;
-ordinary traversal, terrain/playability disposition, restart, and release-host
-throughput are not closed by test-policy work.
+Next autonomous goal checkpoint: classify the two `mc-server/src/main.rs`
+tests that currently return success when the local plains-fountain template is
+absent, convert them to explicit fail-closed opt-in gates, and record their
+owner and close condition. The owner-run subjective fresh-world seed-`712816`
+playtest remains queued; ordinary traversal, terrain/playability disposition,
+restart, and release-host throughput are not closed by test-policy work.
+
+The `mc-worldgen::structures` local-artifact class is closed. Three tests that
+previously returned success when the local blocks report or plains-fountain NBT
+was absent are explicit ignored gates and fail closed when selected. The three
+selected gates pass against the current local 26.1.2 sidecars; scope, ownership,
+reproduction, and limits are in
+[`../evidence/mc-worldgen-structure-local-artifact-tests.md`](../evidence/mc-worldgen-structure-local-artifact-tests.md).
+This does not claim complete vanilla village parity.
+
+The first workspace closeout run exposed and closed a real `mc-net` block-drop
+test-isolation race. Its process-global journal await probe could be reached by
+another concurrently running block-drop owner despite the three probe tests'
+serial mutex, producing a closed-receiver panic. The probe is now scoped to the
+exact Tokio owner task and consumed once; the focused eight-test slice and
+workspace gates pass. Evidence and limits are in
+[`../evidence/mc-net-block-drop-await-probe.md`](../evidence/mc-net-block-drop-await-probe.md).
 
 The Cargo feature-gated test class is closed. The workspace declares only
 `mc-script/lua-runtime` and `mc-net/load-bench`: the former adds the already
