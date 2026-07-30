@@ -368,6 +368,11 @@ Benchmark reproduction happens at that feature boundary, not after every edit:
 - [x] Run one independent read-only vegetation-diff review session. It inspected the
   production and external-test diff, then exhausted the 180-second limit without a
   verdict or actionable finding; no second reviewer was run.
+- [x] Enforce strictly downhill revision-10 drainage through a deterministic
+  seeded hydraulic elevation, depth-three bounded accumulation, and
+  seed/order/border regressions. The mapped debug stage and 25-chunk throughput
+  probes are recorded in
+  [`evidence/worldgen-downhill-drainage.md`](evidence/worldgen-downhill-drainage.md).
 - [ ] Complete revision-10 drainage, rendered height/biome/vegetation mosaics,
   clean seed-`712816` owner playtest, restart, and release-host throughput gates.
 

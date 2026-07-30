@@ -186,9 +186,9 @@ fn accumulated_drainage_paths_stay_downhill_and_reach_coast() {
                     }
                     let next = drainage::downstream(seed, current);
                     assert!(
-                        drainage::hydraulic_rank(seed, next)
-                            > drainage::hydraulic_rank(seed, current),
-                        "seed {seed} drainage failed downhill rank at {current:?} -> {next:?}"
+                        drainage::hydraulic_elevation(seed, next)
+                            < drainage::hydraulic_elevation(seed, current),
+                        "seed {seed} drainage climbed at {current:?} -> {next:?}"
                     );
                     current = next;
                 }

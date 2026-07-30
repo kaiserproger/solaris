@@ -133,8 +133,9 @@ pub(super) fn sample(router: OverworldRouter, block_x: i32, block_z: i32) -> Ter
     let mountain_relief = ridges * (mountain_height + mountain_detail * 36.0 * land_scale);
     let mut height = lerp(ocean_floor, rolling_land + mountain_relief, land);
 
-    // Coarse drainage cells choose one acyclic downhill branch, accumulate local
-    // upstream runoff, and expose the distance to the resulting segment network.
+    // Coarse drainage cells choose one acyclic branch down a seeded hydraulic
+    // elevation, accumulate local upstream runoff, and expose the distance to
+    // the resulting segment network.
     // Keep carving alive through the coast band so channels meet the ocean rather
     // than disappearing at the old inland mask boundary.
     let drainage = if continentalness > -0.48 && ridges < 0.18 {

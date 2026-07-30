@@ -2,7 +2,7 @@ use std::cmp::Ordering;
 
 const BASE_CELL_BLOCKS: f64 = 128.0;
 const MIN_CELL_BLOCKS: f64 = 32.0;
-const ACCUMULATION_DEPTH: u8 = 2;
+const ACCUMULATION_DEPTH: u8 = 3;
 const MIN_CHANNEL_ACCUMULATION: f64 = 2.0;
 const FULL_CHANNEL_ACCUMULATION: f64 = 8.5;
 const BASIN_SPACING_CELLS: i64 = 12;
@@ -141,6 +141,7 @@ pub(super) fn downstream(seed: i64, cell: DrainageCell) -> DrainageCell {
             x: cell.x.saturating_add(dx),
             z: cell.z.saturating_add(dz),
         })
+        .filter(|candidate| hydraulic_elevation(seed, *candidate) < hydraulic_elevation(seed, cell))
         .min_by(|left, right| {
             branch_score(seed, cell, *left)
                 .partial_cmp(&branch_score(seed, cell, *right))
@@ -148,7 +149,7 @@ pub(super) fn downstream(seed: i64, cell: DrainageCell) -> DrainageCell {
                 .then_with(|| left.x.cmp(&right.x))
                 .then_with(|| left.z.cmp(&right.z))
         })
-        .expect("drainage has three forward candidates")
+        .expect("drainage has three downhill candidates")
 }
 
 pub(super) fn accumulation(seed: i64, cell: DrainageCell, depth: u8) -> f64 {
@@ -164,10 +165,15 @@ pub(super) fn accumulation(seed: i64, cell: DrainageCell, depth: u8) -> f64 {
     total
 }
 
-#[cfg(test)]
-pub(super) fn hydraulic_rank(seed: i64, cell: DrainageCell) -> i64 {
+pub(super) fn hydraulic_elevation(seed: i64, cell: DrainageCell) -> f64 {
     let (dx, dz) = flow_direction(seed);
-    i64::from(cell.x) * i64::from(dx) + i64::from(cell.z) * i64::from(dz)
+    let rank = i64::from(cell.x) * i64::from(dx) + i64::from(cell.z) * i64::from(dz);
+    let local_relief = signed_unit(cell_hash(seed, cell.x, cell.z, 0x4859_4452_4155_4C49)) * 0.08;
+    // The basin term bends neighbouring branches toward the same collector.
+    // Its one-cell delta plus the bounded local relief remains below the
+    // mandatory rank drop, so every selected edge still descends.
+    let basin_relief = basin_distance_cells(seed, cell) * 0.82;
+    -(rank as f64) + local_relief + basin_relief
 }
 
 #[cfg(test)]
@@ -321,13 +327,26 @@ mod tests {
     use super::*;
 
     #[test]
-    fn downstream_strictly_increases_hydraulic_rank() {
+    fn downstream_strictly_decreases_hydraulic_elevation() {
         for seed in [-17, 0, 712_816, i64::MAX] {
             for z in -32..=32 {
                 for x in -32..=32 {
                     let cell = DrainageCell { x, z };
+                    for (dx, dz) in forward_offsets(flow_direction(seed)) {
+                        let candidate = DrainageCell {
+                            x: cell.x.saturating_add(dx),
+                            z: cell.z.saturating_add(dz),
+                        };
+                        assert!(
+                            hydraulic_elevation(seed, candidate) < hydraulic_elevation(seed, cell),
+                            "{cell:?} has non-downhill forward candidate {candidate:?}"
+                        );
+                    }
                     let next = downstream(seed, cell);
-                    assert!(hydraulic_rank(seed, next) > hydraulic_rank(seed, cell));
+                    assert!(
+                        hydraulic_elevation(seed, next) < hydraulic_elevation(seed, cell),
+                        "{cell:?} did not drain downhill to {next:?}"
+                    );
                 }
             }
         }
@@ -343,6 +362,28 @@ mod tests {
         };
         assert_ne!(fingerprint(0), fingerprint(1));
         assert_ne!(fingerprint(0), fingerprint(712_816));
+    }
+
+    #[test]
+    fn drainage_samples_are_deterministic_and_seed_sensitive() {
+        let fingerprint = |seed| {
+            (-1_024..=1_024)
+                .step_by(31)
+                .flat_map(|z| {
+                    (-1_024..=1_024).step_by(29).map(move |x| {
+                        let value = sample(seed, x, z, 1.0);
+                        (
+                            value.channel_weight.to_bits(),
+                            value.river_distance.to_bits(),
+                            value.accumulation.to_bits(),
+                        )
+                    })
+                })
+                .collect::<Vec<_>>()
+        };
+        let first = fingerprint(712_816);
+        assert_eq!(first, fingerprint(712_816));
+        assert_ne!(first, fingerprint(712_817));
     }
 
     #[test]
@@ -378,7 +419,7 @@ mod tests {
                     let first = accumulation(seed, cell, ACCUMULATION_DEPTH);
                     let second = accumulation(seed, cell, ACCUMULATION_DEPTH);
                     assert_eq!(first.to_bits(), second.to_bits());
-                    assert!((0.72..=16.64).contains(&first), "{first}");
+                    assert!((0.72..=51.2).contains(&first), "{first}");
                 }
             }
         }
@@ -403,5 +444,38 @@ mod tests {
             maximum_step <= 0.42,
             "channel step is too abrupt: {maximum_step}"
         );
+    }
+
+    #[test]
+    fn drainage_sampling_is_chunk_order_and_border_independent() {
+        let coordinates = [
+            (15, 15),
+            (16, 15),
+            (15, 16),
+            (16, 16),
+            (-17, -17),
+            (-16, -17),
+            (-17, -16),
+            (-16, -16),
+        ];
+        let fingerprint = |coordinates: &[(i32, i32)]| {
+            coordinates
+                .iter()
+                .map(|&(x, z)| {
+                    let value = sample(712_816, x, z, 1.0);
+                    (
+                        (x, z),
+                        (
+                            value.channel_weight.to_bits(),
+                            value.river_distance.to_bits(),
+                            value.accumulation.to_bits(),
+                        ),
+                    )
+                })
+                .collect::<std::collections::BTreeMap<_, _>>()
+        };
+        let mut reversed = coordinates;
+        reversed.reverse();
+        assert_eq!(fingerprint(&coordinates), fingerprint(&reversed));
     }
 }

@@ -22,18 +22,18 @@ replacement-readiness claims.
 
 ## Active Checkpoint
 
-Next: revalidate the pending downhill-drainage feature commit `7054417` against
-the current tree and integrate only that revision-10 worldgen vertical. Keep
-rendered mosaics, the seed-`712816` owner playtest, restart, and release-host
-throughput gates for their own checkpoints.
+Next: add a bounded deterministic renderer for revision-10 height, biome, and
+vegetation mosaics, then record the exact seed set, extent, palette, checksums,
+and rendered artifacts. Keep the seed-`712816` owner playtest, restart, and
+release-host throughput comparison for their own checkpoints.
 
-The load-scenario chunk-cancellation wait is closed. Pipeline metrics now
-register a cancellation notification before checking the authoritative stream
-counter. Request totals publish before the stream counter with release/acquire
-ordering, so a completed wait observes the full cancellation snapshot. The
-five-second harness timeout remains only a fail watchdog.
+The downhill-drainage vertical is closed. Revision-10 cells now select only
+strictly lower seeded hydraulic elevations, depth-three accumulation stays
+bounded, and deterministic seed/order/border regressions protect the network.
+The mapped seed-42 debug probes completed all 25 chunks in 526 ms
+(`47.5 chunks/s`); this is not the open release-host comparison.
 Evidence is in
-[`../evidence/mc-test-harness-chunk-cancellation-wait.md`](../evidence/mc-test-harness-chunk-cancellation-wait.md).
+[`../evidence/worldgen-downhill-drainage.md`](../evidence/worldgen-downhill-drainage.md).
 No graphical or gameplay-readiness claim is implied.
 
 ## Recent Checkpoints — through 2026-07-30
