@@ -23,18 +23,18 @@ replacement-readiness claims.
 ## Active Checkpoint
 
 Next autonomous goal checkpoint: route `playable`; mechanically move the
-contiguous five-test enchanting/recipe settlement class beginning with
-`stale_enchanting_click_rebuilds_inputs_from_owner_projection` and ending with
-`placed_recipe_commits_inventory_and_publishes_aggregate_craft` out of
+contiguous two-test block-resync class beginning with
+`rejected_visible_block_edit_resyncs_authoritative_cached_state` and ending
+with `rejected_use_item_on_resync_does_not_wait_for_world_writer` out of
 aggregate `crates/mc-net/src/play/tests.rs` into a focused sibling module.
 Preserve every test and production behavior, leave the preceding shared
-`interaction_state_for_items` helper and following shared
-`register_interaction_player` helper in the aggregate file, and use explicit
-imports rather than a new `use super::*`. The complete twelve-test stonecutter
-class and its three local helpers have already moved to
-`crates/mc-net/src/play/tests/stonecutter.rs`; its concentration and validation
-are recorded in
-[`../evidence/mc-net-stonecutter-test-extraction.md`](../evidence/mc-net-stonecutter-test-extraction.md).
+`register_interaction_player` helper and following `shield_item_state` helper
+in the aggregate file, and use explicit imports rather than a new
+`use super::*`. The complete five-test enchanting projection and recipe
+settlement class has already moved to
+`crates/mc-net/src/play/tests/enchanting_recipe_settlement.rs`; its
+concentration and validation are recorded in
+[`../evidence/mc-net-enchanting-recipe-settlement-test-extraction.md`](../evidence/mc-net-enchanting-recipe-settlement-test-extraction.md).
 The owner-run subjective fresh-world seed-`712816` playtest and
 release-candidate performance gates remain queued at their declared
 boundaries.
