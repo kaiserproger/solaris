@@ -22,17 +22,22 @@ replacement-readiness claims.
 
 ## Active Checkpoint
 
-Next autonomous goal checkpoint: route `playable`; mechanically move the
-`ordinary_entity_goal_updates_keep_full_tick_cadence`
-test from aggregate `crates/mc-net/src/play/tests.rs` to a focused sibling
-module. Preserve entity count `ENTITY_GOAL_UPDATES_PER_TICK + 88`; sequential
-`EntityId` construction through checked `i32` conversion and `HashSet`
-collection; `entity_goal_ids_due_for_tick` at tick `7` with the dense flag
-`false`; and equality of the complete due set with the original entity set.
-Leave the preceding
-`dense_entity_simulation_cohorts_are_stratified_across_regions` test and
-following `state` helper aggregate-owned, and use explicit imports rather than
-a new `use super::*`.
+Next autonomous goal checkpoint: route `playable`; close Phase 1 item 3 of
+[`../PUBLIC_ALPHA_PLAN.md`](../PUBLIC_ALPHA_PLAN.md) as one feature-sized
+checkpoint. Inventory the substantial tests that still live in aggregate
+`play.rs`, `session.rs`, or inline production test modules, then move the
+complete remaining focused domain classes needed to stop those aggregate roots
+from growing. Batch the mechanical extractions and their focused validation;
+produce one consolidated evidence update, one clean L2 run, one independent
+review, and one local commit only after the plan item is complete.
+
+Acceptance evidence must show the before/after aggregate concentration, exact
+preservation of the moved test set, focused domain ownership, and the absence of
+new substantial aggregate or inline production tests. Do not close or advance
+this checkpoint for an individual test, function, file move, or documentation
+update. If a concrete blocker prevents the complete outcome, record that
+blocker and the unfinished plan item instead of substituting a smaller
+mechanical checkpoint.
 
 The complete dense entity-simulation cohort test has moved to
 `crates/mc-net/src/play/tests/dense_entity_simulation_cohorts.rs`. Its

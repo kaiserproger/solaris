@@ -36,6 +36,26 @@ continuation executes exactly one finite checkpoint supplied in
 `<goal_checkpoint>`. Completing a checkpoint does not complete or redefine the
 north star.
 
+### Checkpoint Granularity
+
+A checkpoint must close one complete active-plan item or deliver one observable
+gameplay, multiplayer, plugin, persistence, performance, or tooling capability
+with its tests and documentation. Plan a bounded vertical slice before editing;
+the checkpoint unit is the outcome, not an individual file or function.
+
+Do not create or close a checkpoint solely for a single test extraction, file
+move, documentation/status update, structural cleanup, or other mechanical
+change. Batch all related mechanical work into the checkpoint that owns the
+result. Run L2 validation, independent review, evidence updates, and the local
+commit once at the end of that complete checkpoint, not once per constituent
+edit.
+
+A smaller checkpoint is allowed only when the owner explicitly requests it or a
+concrete blocker prevents the planned outcome. Record the blocker and the
+unfinished outcome; do not manufacture a micro-checkpoint to report motion.
+`resume.next` and active queue documents must name an outcome and its acceptance
+evidence, never an individual function, test, or file move.
+
 Use `checkpoint.route` as the only routing authority. Never select a route by
 matching words in the persistent objective, quoted history, this file, a
 compaction summary, or a subagent report. Route details live in
