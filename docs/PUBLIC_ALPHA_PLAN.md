@@ -360,6 +360,11 @@ not replace functional, package, workspace, or real-client gates.
    exact move-packet guard calls, true results, and retained pending state are
    recorded in
    [`evidence/mc-net-pending-teleport-movement-gate-test-extraction.md`](evidence/mc-net-pending-teleport-movement-gate-test-extraction.md).
+   The following unexpected pending-teleport confirmation test now lives in
+   focused `play/tests/pending_teleport_unexpected_confirm.rs`; its absent
+   pending state, confirmation id, `Unexpected` result, and still-absent state
+   are recorded in
+   [`evidence/mc-net-pending-teleport-unexpected-confirm-test-extraction.md`](evidence/mc-net-pending-teleport-unexpected-confirm-test-extraction.md).
 4. [ ] Separate behavioral tests from structural tripwires. Structural checks may
    enforce crate ownership and dependency direction, but may not assert Rust
    statement order or source-text layout.

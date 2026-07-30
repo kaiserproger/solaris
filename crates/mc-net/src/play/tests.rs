@@ -59,6 +59,7 @@ mod pending_teleport_confirm_behaviour;
 mod pending_teleport_movement_gate;
 mod pending_teleport_movement_guard;
 mod pending_teleport_resend;
+mod pending_teleport_unexpected_confirm;
 mod pickup;
 mod plants;
 mod play_custom_payload;
@@ -1984,17 +1985,6 @@ fn pending_teleport_confirm_clears_only_matching_id() {
     assert_eq!(
         confirm_pending_teleport(&mut pending, 7),
         TeleportConfirmResult::Confirmed
-    );
-    assert!(pending.is_none());
-}
-
-#[test]
-fn pending_teleport_reports_unexpected_confirm_without_pending_state() {
-    let mut pending = None;
-
-    assert_eq!(
-        confirm_pending_teleport(&mut pending, 1),
-        TeleportConfirmResult::Unexpected
     );
     assert!(pending.is_none());
 }
