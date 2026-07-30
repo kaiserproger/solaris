@@ -22,18 +22,21 @@ replacement-readiness claims.
 
 ## Active Checkpoint
 
-Next autonomous goal checkpoint: route `playable`; mechanically move the
-contiguous three-test item, XP, and arrow-pickup class beginning with
-`concurrent_pickup_tasks_conserve_item_and_xp_entities` and ending with
-`full_simulation_queue_leaves_item_pickup_state_unchanged` out of aggregate
+Next autonomous goal checkpoint: route `playable`; mechanically move the full
+fifteen-test attack-strength, PVP, weapon-cost, reach, immunity, and lethal
+reward class beginning with the `assert_attack_damage_close` and
+`attack_strength_test_state` helpers and
+`empty_hand_attack_strength_scales_partial_and_full_damage`, including the
+`run_pvp_commit_cost_case` helper, and ending with
+`concurrent_lethal_attacks_create_one_drop_and_one_xp_reward`, out of aggregate
 `crates/mc-net/src/play/tests.rs` into a focused sibling module. Preserve every
-test and production behavior, leave the preceding shared
-`register_survival_test_player` helper and following
-`assert_attack_damage_close` helper in the aggregate file, and use explicit
-imports rather than a new `use super::*`. The complete four-test chest class
-has already moved to `crates/mc-net/src/play/tests/chest.rs`; its concentration
-and validation are recorded in
-[`../evidence/mc-net-chest-test-extraction.md`](../evidence/mc-net-chest-test-extraction.md).
+test and production behavior, leave the following
+`furnace_like_recipe_lookup_uses_matching_cooking_category` test in the
+aggregate file, and use explicit imports rather than a new `use super::*`. The
+complete three-test pickup class has already moved to
+`crates/mc-net/src/play/tests/pickup.rs`; its concentration and validation are
+recorded in
+[`../evidence/mc-net-pickup-test-extraction.md`](../evidence/mc-net-pickup-test-extraction.md).
 The owner-run subjective fresh-world seed-`712816` playtest and
 release-candidate performance gates remain queued at their declared
 boundaries.

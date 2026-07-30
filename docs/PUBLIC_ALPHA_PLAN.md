@@ -127,6 +127,11 @@ not replace functional, package, workspace, or real-client gates.
    its preserved storage, state-id, publication, and shared-view coverage is
    recorded in
    [`evidence/mc-net-chest-test-extraction.md`](evidence/mc-net-chest-test-extraction.md).
+   The following three-test concurrent item, XP, grounded-arrow, and
+   queue-pressure pickup class now lives in focused `play/tests/pickup.rs`;
+   its conservation, inventory publication, and fail-closed saturation
+   coverage is recorded in
+   [`evidence/mc-net-pickup-test-extraction.md`](evidence/mc-net-pickup-test-extraction.md).
 4. [ ] Separate behavioral tests from structural tripwires. Structural checks may
    enforce crate ownership and dependency direction, but may not assert Rust
    statement order or source-text layout.
