@@ -512,20 +512,18 @@ async fn early_survival_stop_completes_after_server_progress_reaches_one() {
 }
 
 #[tokio::test]
-#[ignore = "covered by the commands stale-break wire gate and owner stale-root tests"]
+#[ignore = "explicit local 26.1.2 stale-break sidecar gate; covered by commands wire and owner stale-root tests"]
 async fn stale_survival_break_cannot_break_peer_replacement() {
     let manifest = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
     let vanilla_dir = manifest.join("../../data/vanilla");
     let blocks_json = vanilla_dir.join("reports/blocks.json");
     let registries_json = vanilla_dir.join("reports/registries.json");
-    if !blocks_json.exists() || !registries_json.exists() {
-        eprintln!(
-            "skipping: missing {} or {}",
-            blocks_json.display(),
-            registries_json.display()
-        );
-        return;
-    }
+    assert!(
+        blocks_json.exists() && registries_json.exists(),
+        "stale-break sidecar gate requires {} and {}",
+        blocks_json.display(),
+        registries_json.display()
+    );
 
     let data = Arc::new(mc_data::load(&vanilla_dir).expect("vanilla data loads"));
     let report = mc_data::blocks::load_blocks_report(&blocks_json).expect("blocks report loads");

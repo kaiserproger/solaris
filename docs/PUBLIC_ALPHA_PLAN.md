@@ -238,6 +238,13 @@ Benchmark reproduction happens at that feature boundary, not after every edit:
   prerequisite is absent. Their ordinary-suite coverage, owners, current
   disposition, and exact close conditions are recorded in
   [`evidence/mc-server-ignored-tests.md`](evidence/mc-server-ignored-tests.md).
+- [x] Classify the 27 explicit `mc-test-harness` ignores across block-edit,
+  chunk-stream, entity-parity, protocol-parity, deterministic replay, load,
+  soak, and profiling targets. Every ignore now states its reason; eight
+  vanilla-oracle gates and the stale-break composition now fail missing
+  prerequisites instead of returning a false-green result. Owners, executable
+  fences, and exact close conditions are recorded in
+  [`evidence/mc-test-harness-ignored-tests.md`](evidence/mc-test-harness-ignored-tests.md).
 - [x] Record the exact local 26.1.2 world-clock oracle in
   [`evidence/world-clock-26.1.2.md`](evidence/world-clock-26.1.2.md).
 - [x] Implement the typed world-clock map, separating monotonic `game_time` from

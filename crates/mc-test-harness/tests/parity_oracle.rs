@@ -582,8 +582,10 @@ async fn solaris_configuration_phase_scenario_produces_normalized_observations()
 async fn vanilla_and_solaris_configuration_phase_can_be_diffed() {
     let availability = vanilla_oracle_availability(repo_root());
     let OracleAvailability::Available { jar } = availability else {
-        eprintln!("{}", availability.skip_message().expect("skip message"));
-        return;
+        panic!(
+            "{}",
+            availability.skip_message().expect("oracle unavailable")
+        );
     };
 
     let vanilla_dir = tempfile::tempdir().expect("vanilla tempdir");
@@ -623,8 +625,10 @@ async fn vanilla_and_solaris_configuration_phase_can_be_diffed() {
 async fn vanilla_and_solaris_full_registry_fallback_match() {
     let availability = vanilla_oracle_availability(repo_root());
     let OracleAvailability::Available { jar } = availability else {
-        eprintln!("{}", availability.skip_message().expect("skip message"));
-        return;
+        panic!(
+            "{}",
+            availability.skip_message().expect("oracle unavailable")
+        );
     };
 
     let vanilla_dir = tempfile::tempdir().expect("vanilla tempdir");
@@ -891,8 +895,10 @@ async fn checked_manifest_replays_deterministically_on_two_fresh_solaris_servers
 async fn vanilla_and_solaris_spawn_smoke_can_be_diffed() {
     let availability = vanilla_oracle_availability(repo_root());
     let OracleAvailability::Available { jar } = availability else {
-        eprintln!("{}", availability.skip_message().expect("skip message"));
-        return;
+        panic!(
+            "{}",
+            availability.skip_message().expect("oracle unavailable")
+        );
     };
 
     let vanilla_dir = tempfile::tempdir().expect("vanilla tempdir");
@@ -930,8 +936,10 @@ async fn vanilla_and_solaris_spawn_smoke_can_be_diffed() {
 async fn vanilla_and_solaris_seeded_core_actions_can_be_diffed() {
     let availability = vanilla_oracle_availability(repo_root());
     let OracleAvailability::Available { jar } = availability else {
-        eprintln!("{}", availability.skip_message().expect("skip message"));
-        return;
+        panic!(
+            "{}",
+            availability.skip_message().expect("oracle unavailable")
+        );
     };
 
     let vanilla_dir = tempfile::tempdir().expect("vanilla tempdir");
@@ -988,8 +996,10 @@ async fn vanilla_and_solaris_seeded_core_actions_can_be_diffed() {
 async fn checked_manifest_vanilla_and_solaris_protocol_observations_can_be_diffed() {
     let availability = vanilla_oracle_availability(repo_root());
     let OracleAvailability::Available { jar } = availability else {
-        eprintln!("{}", availability.skip_message().expect("skip message"));
-        return;
+        panic!(
+            "{}",
+            availability.skip_message().expect("oracle unavailable")
+        );
     };
     let manifest = ReplayScenarioManifest::from_json(include_str!(
         "../../../tools/core-replay-scenarios/core-actions-seed-81.json"
@@ -1324,8 +1334,10 @@ async fn solaris_container_held_slot_produces_observations() {
 async fn vanilla_and_solaris_container_held_slot_can_be_diffed() {
     let availability = vanilla_oracle_availability(repo_root());
     let OracleAvailability::Available { jar } = availability else {
-        eprintln!("{}", availability.skip_message().expect("skip message"));
-        return;
+        panic!(
+            "{}",
+            availability.skip_message().expect("oracle unavailable")
+        );
     };
 
     let vanilla_dir = tempfile::tempdir().expect("vanilla tempdir");
@@ -1604,8 +1616,10 @@ async fn solaris_entity_lifecycle_produces_observations() {
 async fn vanilla_and_solaris_entity_lifecycle_can_be_diffed() {
     let availability = vanilla_oracle_availability(repo_root());
     let OracleAvailability::Available { jar } = availability else {
-        eprintln!("{}", availability.skip_message().expect("skip message"));
-        return;
+        panic!(
+            "{}",
+            availability.skip_message().expect("oracle unavailable")
+        );
     };
 
     let vanilla_dir = tempfile::tempdir().expect("vanilla tempdir");
@@ -1826,8 +1840,10 @@ async fn solaris_timed_action_produces_liveness_observations() {
 async fn vanilla_and_solaris_timed_action_can_be_diffed() {
     let availability = vanilla_oracle_availability(repo_root());
     let OracleAvailability::Available { jar } = availability else {
-        eprintln!("{}", availability.skip_message().expect("skip message"));
-        return;
+        panic!(
+            "{}",
+            availability.skip_message().expect("oracle unavailable")
+        );
     };
 
     let vanilla_dir = tempfile::tempdir().expect("vanilla tempdir");

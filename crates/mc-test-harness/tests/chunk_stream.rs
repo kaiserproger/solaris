@@ -39,7 +39,7 @@ const VIEW_DISTANCE: i32 = 8;
 const MOVEMENT_VIEW_DISTANCE: i32 = 2;
 
 #[tokio::test]
-#[ignore]
+#[ignore = "explicit local 26.1.2 generated-world chunk/light sidecar gate"]
 async fn vanilla_client_receives_spawn_view_distance_window() {
     let manifest = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
     let vanilla_dir = manifest.join("../../data/vanilla");
