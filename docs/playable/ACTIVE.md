@@ -23,13 +23,20 @@ replacement-readiness claims.
 ## Active Checkpoint
 
 Next autonomous goal checkpoint: route `playable`; mechanically move the
-`block_placement_planning_does_not_wait_for_world_writer` test out of aggregate
-`crates/mc-net/src/play/tests.rs` into a focused sibling module. Preserve its
-complete loaded-world, placement-edit, pose, direction, hit-position, and
-writer-lock-independence coverage and production behavior, leave the preceding
-`stonecutter_open_uses_proved_menu_type_and_published_world_view` test and
-following `button_test_registry` helper aggregate-owned, and use explicit
-imports rather than a new `use super::*`.
+`stonecutter_open_uses_proved_menu_type_and_published_world_view` test out of
+aggregate `crates/mc-net/src/play/tests.rs` into the existing focused
+`crates/mc-net/src/play/tests/stonecutter.rs` module. Preserve its complete
+published-world, proved-menu-type, active-window, open-screen packet, no-recipe
+resend, and writer-lock-independence coverage and production behavior, leave
+the preceding `crafting_table_open_does_not_wait_for_world_writer` test and
+following `button_test_registry` helper aggregate-owned, and retain explicit
+imports rather than adding `use super::*`.
+
+The complete block-placement planning writer-lock test has moved to
+`crates/mc-net/src/play/tests/block_placement_planning.rs`. Its loaded-world,
+placement-edit, pose, direction, hit-position, and writer-lock-independence
+coverage is recorded in
+[`../evidence/mc-net-block-placement-planning-test-extraction.md`](../evidence/mc-net-block-placement-planning-test-extraction.md).
 
 The complete toggle-planning writer-lock test has moved to
 `crates/mc-net/src/play/tests/toggle_planning.rs`. Its published-world,

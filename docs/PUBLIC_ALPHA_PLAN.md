@@ -222,6 +222,11 @@ not replace functional, package, workspace, or real-client gates.
    precondition, scheduled-tick, and writer-lock-independence coverage is
    recorded in
    [`evidence/mc-net-toggle-planning-test-extraction.md`](evidence/mc-net-toggle-planning-test-extraction.md).
+   The following block-placement planning writer-lock test now lives in
+   focused `play/tests/block_placement_planning.rs`; its loaded-world,
+   placement-edit, pose, direction, hit-position, and writer-lock-independence
+   coverage is recorded in
+   [`evidence/mc-net-block-placement-planning-test-extraction.md`](evidence/mc-net-block-placement-planning-test-extraction.md).
 4. [ ] Separate behavioral tests from structural tripwires. Structural checks may
    enforce crate ownership and dependency direction, but may not assert Rust
    statement order or source-text layout.
