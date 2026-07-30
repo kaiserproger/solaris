@@ -383,6 +383,11 @@ not replace functional, package, workspace, or real-client gates.
    exact per-index movement fields, current batch boundary, and remaining
    movement are recorded in
    [`evidence/mc-net-entity-movement-write-turn-test-extraction.md`](evidence/mc-net-entity-movement-write-turn-test-extraction.md).
+   The following bounded outbound-pressure draining test now lives in focused
+   `play/tests/outbound_pressure_draining.rs`; its exact queue ranges,
+   play-loop fixtures and arguments, timeout/result expectations, and unchanged
+   pressure counters are recorded in
+   [`evidence/mc-net-outbound-pressure-draining-test-extraction.md`](evidence/mc-net-outbound-pressure-draining-test-extraction.md).
 4. [ ] Separate behavioral tests from structural tripwires. Structural checks may
    enforce crate ownership and dependency direction, but may not assert Rust
    statement order or source-text layout.

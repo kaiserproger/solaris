@@ -23,17 +23,22 @@ replacement-readiness claims.
 ## Active Checkpoint
 
 Next autonomous goal checkpoint: route `playable`; mechanically move the
-`play_loop_drains_bounded_outbound_pressure_without_shedding` test from
-aggregate `crates/mc-net/src/play/tests.rs` to a focused sibling module.
-Preserve the 64-byte duplex reader, sink writer, buffer, session registry,
-simulation channel and initial pressure snapshot, slow-client test config,
-capacity-16 outbound channel, `1..=16` `try_send` prefill and exact expectation,
-spawned `17..=80` awaited producer and exact expectation, exact pose and
-overworld survival respawn, 250 ms timeout, complete `play_loop` argument list
-and exact result/producer expectations. Preserve both final pressure assertions,
-including the unchanged timeout/shed counters and messages. Leave the preceding
-`play_loop_exits_when_outbound_channel_closes` test and following `state` helper
-aggregate-owned, and use explicit imports rather than a new `use super::*`.
+`play_loop_exits_when_outbound_channel_closes` test from aggregate
+`crates/mc-net/src/play/tests.rs` to a focused sibling module. Preserve the
+64-byte duplex reader, sink writer, buffer, session registry, simulation
+channel, slow-client test config, capacity-one outbound channel and dropped
+sender, exact pose and overworld survival respawn, 250 ms timeout, complete
+`play_loop` argument list with both `"ClosedOutbound"` names, exact timeout
+expectation, and clean-close result expectation. Leave the preceding
+`play_loop_closes_session_when_direct_response_write_stalls` test and following
+`state` helper aggregate-owned, and use explicit imports rather than a new
+`use super::*`.
+
+The complete bounded outbound-pressure draining test has moved to
+`crates/mc-net/src/play/tests/outbound_pressure_draining.rs`. Its unchanged
+queue prefill and producer ranges, exact pose/respawn and play-loop call,
+timeout/result expectations, and pressure-counter assertions are recorded in
+[`../evidence/mc-net-outbound-pressure-draining-test-extraction.md`](../evidence/mc-net-outbound-pressure-draining-test-extraction.md).
 
 The complete entity-movement write-turn boundary test has moved to
 `crates/mc-net/src/play/tests/entity_movement_write_turn.rs`. Its unchanged
