@@ -1314,6 +1314,10 @@ impl BoundServer {
                     _ => None,
                 }
             };
+            let village_defense_golem_type_id = Identifier::parse("minecraft:iron_golem")
+                .ok()
+                .and_then(|id| entity_config.entity_types.id_of(&id))
+                .and_then(|id| i32::try_from(id).ok());
             let mut session_empty_generation = entity_sessions.session_empty_generation();
             let mut player_save_generation = entity_sessions.player_save_generation();
             let mut simulation_command_window = SimulationCommandTelemetryWindow::default();
@@ -1653,6 +1657,15 @@ impl BoundServer {
                         villager_type_id,
                         item_type_id,
                         1,
+                    );
+                }
+                if let Some(iron_golem_type_id) = village_defense_golem_type_id {
+                    simulation_owner.tick_village_defense(
+                        &entity_sessions,
+                        tick,
+                        iron_golem_type_id,
+                        entity_world_read.as_ref(),
+                        entity_pathing_materials.as_deref(),
                     );
                 }
                 let entity_query_count = queries.len();

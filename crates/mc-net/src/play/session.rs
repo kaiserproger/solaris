@@ -110,11 +110,13 @@ mod simulation_input_publication_tests;
 mod sleep;
 mod survival_action_authority;
 mod transactions;
+mod village_defense;
 #[cfg(test)]
 mod villager_brain_tests;
 mod villager_merchant_authority;
 #[cfg(test)]
 mod villager_merchant_tests;
+pub(crate) use village_defense::VillageDefenseReport;
 mod villager_population;
 mod visibility;
 mod zombie_villager;
@@ -2110,6 +2112,14 @@ fn apply_player_melee_knockback_locked(
         (target.velocity.y + PLAYER_MELEE_KNOCKBACK_VERTICAL).max(PLAYER_MELEE_KNOCKBACK_VERTICAL),
         target.velocity.z + dz / horizontal * PLAYER_MELEE_KNOCKBACK_HORIZONTAL,
     );
+    apply_entity_velocity_locked(inner, target_id, velocity)
+}
+
+fn apply_entity_velocity_locked(
+    inner: &mut SessionEntityGuards<'_>,
+    target_id: EntityId,
+    velocity: Vec3,
+) -> Vec<VisibilityDispatch> {
     if !inner.entities.set_velocity(target_id, velocity) {
         return Vec::new();
     }

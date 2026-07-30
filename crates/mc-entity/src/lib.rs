@@ -610,6 +610,7 @@ pub struct EntitySimulationProjection {
     pub on_ground: bool,
     pub lifecycle: EntityLifecycle,
     pub follow_range: f64,
+    pub attack_damage: f64,
     pub goal: GoalState,
     pub primed_tnt: bool,
     pub has_item_stack: bool,
@@ -623,6 +624,8 @@ pub struct EntitySimulationProjection {
     pub sheep_grazing_ticks: Option<u8>,
     pub villager: Option<VillagerData>,
     pub villager_schedule: Option<villager_26_1_2::VillagerScheduleKind>,
+    pub villager_last_slept_tick: Option<u64>,
+    pub villager_golem_detected_until_tick: Option<u64>,
     pub villager_override_expires_tick: Option<u64>,
     pub villager_override_order_present: bool,
 }

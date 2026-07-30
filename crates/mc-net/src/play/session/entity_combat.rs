@@ -24,6 +24,32 @@ use std::time::Instant;
 const VILLAGER_WITNESS_FOLLOW_RANGE_DEFAULT: f64 = 16.0;
 const VILLAGER_WITNESS_FOLLOW_RANGE_MAX: f64 = 2_048.0;
 
+pub(super) fn entity_kill_rewards_locked(
+    inner: &SessionEntityGuards<'_>,
+    target: &EntitySnapshot,
+) -> EntityKillRewards {
+    EntityKillRewards {
+        items: inner.arrow_kill_rewards.item_entity_type_id.map_or_else(
+            Vec::new,
+            |entity_type_id| {
+                entity_kill_drop_stacks(
+                    &inner.arrow_kill_rewards,
+                    &target.type_name,
+                    target.animal,
+                    target.id.0 as i64 as u64,
+                )
+                .into_iter()
+                .map(|drop| (entity_type_id, entity_item_stack(drop)))
+                .collect()
+            },
+        ),
+        experience: inner
+            .arrow_kill_rewards
+            .xp_orb_entity_type_id
+            .map(|entity_type_id| (entity_type_id, mob_xp_value(&target.type_name))),
+    }
+}
+
 fn villager_killed_witness_snapshots_locked(
     inner: &SessionEntityGuards<'_>,
     victim: &EntitySnapshot,
@@ -152,26 +178,7 @@ impl SessionRegistry {
         if target.item_stack.is_some() {
             return PlayerAttackResult::ValidationRejected;
         }
-        let rewards = EntityKillRewards {
-            items: inner.arrow_kill_rewards.item_entity_type_id.map_or_else(
-                Vec::new,
-                |entity_type_id| {
-                    entity_kill_drop_stacks(
-                        &inner.arrow_kill_rewards,
-                        &target.type_name,
-                        target.animal,
-                        target.id.0 as i64 as u64,
-                    )
-                    .into_iter()
-                    .map(|drop| (entity_type_id, entity_item_stack(drop)))
-                    .collect()
-                },
-            ),
-            experience: inner
-                .arrow_kill_rewards
-                .xp_orb_entity_type_id
-                .map(|entity_type_id| (entity_type_id, mob_xp_value(&target.type_name))),
-        };
+        let rewards = entity_kill_rewards_locked(&inner, &target);
         let knockback_origin = (game_mode == GameMode::Survival).then_some(Vec3::new(
             player_pose.x,
             player_pose.y,

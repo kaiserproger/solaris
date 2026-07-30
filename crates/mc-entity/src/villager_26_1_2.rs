@@ -109,6 +109,13 @@ pub struct VillagerBrainState {
     pub pois: VillagerPoiSet,
     pub override_order: Option<VillagerBrainOverride>,
     pub override_expires_tick: Option<u64>,
+    /// Bounded 26.1.2 `LAST_SLEPT` projection. Until villager bed pose is modeled,
+    /// Solaris records this when a Rest-scheduled villager with a home POI leaves Rest.
+    #[serde(default)]
+    pub last_slept_tick: Option<u64>,
+    /// Inclusive lifecycle tick through which `GOLEM_DETECTED_RECENTLY` is present.
+    #[serde(default)]
+    pub golem_detected_until_tick: Option<u64>,
     #[serde(skip)]
     pub interaction_target: Option<EntityId>,
     #[serde(skip)]
@@ -124,6 +131,8 @@ impl VillagerBrainState {
             pois,
             override_order: None,
             override_expires_tick: None,
+            last_slept_tick: None,
+            golem_detected_until_tick: None,
             interaction_target: None,
             last_gossip_time: 0,
         }
@@ -137,6 +146,8 @@ impl VillagerBrainState {
             pois,
             override_order: None,
             override_expires_tick: None,
+            last_slept_tick: None,
+            golem_detected_until_tick: None,
             interaction_target: None,
             last_gossip_time: 0,
         }
@@ -160,6 +171,22 @@ impl VillagerBrainState {
     pub fn clear_override(&mut self) {
         self.override_order = None;
         self.override_expires_tick = None;
+    }
+
+    #[must_use]
+    pub fn recently_slept(&self, current_tick: u64) -> bool {
+        self.last_slept_tick
+            .is_some_and(|last| current_tick.saturating_sub(last) < 24_000)
+    }
+
+    #[must_use]
+    pub fn golem_detected_recently(&self, current_tick: u64) -> bool {
+        self.golem_detected_until_tick
+            .is_some_and(|expires| current_tick <= expires)
+    }
+
+    pub fn note_golem_detected(&mut self, current_tick: u64) {
+        self.golem_detected_until_tick = Some(current_tick.saturating_add(599));
     }
 }
 
@@ -334,8 +361,15 @@ fn plan_villager_brain_validated(
         });
     }
 
+    let previous_activity = next.activity;
     let scheduled = scheduled_activity(profile, next.schedule, day_time);
     let (activity, goal) = scheduled_goal(scheduled, next.pois, profile);
+    if previous_activity == VillagerActivity::Rest
+        && activity != VillagerActivity::Rest
+        && next.pois.home.is_some()
+    {
+        next.last_slept_tick = Some(lifecycle_tick);
+    }
     next.activity = activity;
     Ok(VillagerBrainPlan { state: next, goal })
 }
@@ -592,5 +626,28 @@ mod tests {
             ),
             Err(VillagerBrainError::InvalidSpeed)
         );
+    }
+
+    #[test]
+    fn leaving_rest_records_exact_sleep_tick_and_recent_sleep_boundary() {
+        let profile = VillagerBrainProfile::vanilla_26_1_2();
+        let mut state = VillagerBrainState::adult(pois());
+        state.activity = VillagerActivity::Rest;
+
+        let plan = plan_villager_brain(&state, &profile, 123, 2_000).unwrap();
+        assert_eq!(plan.state.activity, VillagerActivity::Work);
+        assert_eq!(plan.state.last_slept_tick, Some(123));
+        assert!(plan.state.recently_slept(24_122));
+        assert!(!plan.state.recently_slept(24_123));
+    }
+
+    #[test]
+    fn golem_detection_memory_expires_after_exact_599_tick_ttl() {
+        let mut state = VillagerBrainState::adult(pois());
+        state.note_golem_detected(100);
+
+        assert_eq!(state.golem_detected_until_tick, Some(699));
+        assert!(state.golem_detected_recently(699));
+        assert!(!state.golem_detected_recently(700));
     }
 }

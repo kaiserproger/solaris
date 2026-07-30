@@ -150,6 +150,10 @@ fn install_unemployed_villager(registry: &SessionRegistry) -> mc_entity::EntityI
         .iter()
         .find_map(|dispatch| match &dispatch.command {
             OutboundCommand::SpawnEntity(snapshot) => Some(snapshot.id),
+            OutboundCommand::SpawnEntities(snapshots) => snapshots
+                .iter()
+                .find(|snapshot| snapshot.type_name == "minecraft:villager")
+                .map(|snapshot| snapshot.id),
             _ => None,
         })
         .expect("villager spawn dispatch");
@@ -682,17 +686,23 @@ fn production_villager_tick_routes_due_idle_gossip_transfer() {
             },
         ],
     );
-    let mut spawned = dispatches
-        .iter()
-        .filter_map(|dispatch| match &dispatch.command {
+    let mut spawned = Vec::new();
+    for dispatch in &dispatches {
+        match &dispatch.command {
             OutboundCommand::SpawnEntity(snapshot)
                 if snapshot.type_name == "minecraft:villager" =>
             {
-                Some((snapshot.position.x, snapshot.id))
+                spawned.push((snapshot.position.x, snapshot.id));
             }
-            _ => None,
-        })
-        .collect::<Vec<_>>();
+            OutboundCommand::SpawnEntities(snapshots) => spawned.extend(
+                snapshots
+                    .iter()
+                    .filter(|snapshot| snapshot.type_name == "minecraft:villager")
+                    .map(|snapshot| (snapshot.position.x, snapshot.id)),
+            ),
+            _ => {}
+        }
+    }
     spawned.sort_by(|left, right| left.0.total_cmp(&right.0));
     let receiver = spawned[0].1;
     let source = spawned[1].1;

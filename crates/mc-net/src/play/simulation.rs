@@ -3269,6 +3269,25 @@ impl SimulationOwner {
         attacks
     }
 
+    pub(crate) fn tick_village_defense(
+        &self,
+        sessions: &SessionRegistry,
+        tick: u64,
+        iron_golem_type_id: i32,
+        world_read: Option<&mc_world::WorldReadView>,
+        materials: Option<&BlockMaterialIds>,
+    ) -> super::session::VillageDefenseReport {
+        let (report, dispatches) = sessions.tick_village_defense(
+            &self.authority,
+            tick,
+            iron_golem_type_id,
+            world_read,
+            materials,
+        );
+        dispatch_visibility_commands(dispatches);
+        report
+    }
+
     pub(crate) fn tick_dying_entities(&self, sessions: &SessionRegistry, tick: u64) {
         dispatch_visibility_commands(sessions.tick_dying_entities(&self.authority, tick));
     }

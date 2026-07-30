@@ -1717,6 +1717,10 @@ fn entity_simulation_projection_from_world(
             .attributes
             .base(&crate::AttributeKind::FollowRange)
             .unwrap_or(16.0),
+        attack_damage: living
+            .attributes
+            .base(&crate::AttributeKind::AttackDamage)
+            .unwrap_or(0.0),
         goal: goal.0.clone(),
         primed_tnt: gameplay.primed_tnt.is_some(),
         has_item_stack: entity.get::<ItemStackState>().is_some(),
@@ -1732,6 +1736,9 @@ fn entity_simulation_projection_from_world(
         sheep_grazing_ticks: gameplay.sheep_grazing_ticks,
         villager: gameplay.villager,
         villager_schedule: villager_brain.map(|brain| brain.schedule),
+        villager_last_slept_tick: villager_brain.and_then(|brain| brain.last_slept_tick),
+        villager_golem_detected_until_tick: villager_brain
+            .and_then(|brain| brain.golem_detected_until_tick),
         villager_override_expires_tick: villager_brain
             .and_then(|brain| brain.override_expires_tick),
         villager_override_order_present: villager_brain
@@ -2510,6 +2517,19 @@ mod tests {
         minecart.health = 0.0;
         minecart.vehicle = Some(VehicleState::new(VehicleKind::Minecart));
 
+        let mut villager = snapshot(9, 9, "minecraft:villager");
+        villager.retained.villager = Some(crate::VillagerData::new(
+            crate::VillagerKind::Plains,
+            crate::VillagerProfession::None,
+            1,
+        ));
+        let mut villager_brain = crate::villager_26_1_2::VillagerBrainState::adult(
+            crate::villager_26_1_2::VillagerPoiSet::default(),
+        );
+        villager_brain.last_slept_tick = Some(100);
+        villager_brain.golem_detected_until_tick = Some(699);
+        villager.retained.villager_brain = Some(villager_brain);
+
         let expected = vec![
             item,
             xp,
@@ -2519,6 +2539,7 @@ mod tests {
             boat,
             passenger,
             minecart,
+            villager,
         ];
         let mut runtime = EntityRuntime::new();
         for entity in expected.iter().rev().cloned() {

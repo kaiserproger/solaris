@@ -7,9 +7,9 @@ and is not startup context.
 
 ## Current Checkpoint
 
-- Date: 2026-07-29.
+- Date: 2026-07-30.
 - Branch: `main`.
-- Checkpoint base: `4902a3d` (`feat(plugins): move colony policy into Luau`).
+- Checkpoint head: `feat(villages): add iron golem defence`.
   The first owner-run public-alpha session remains the routing authority for the
   next stabilization release; its exact plan is `docs/PUBLIC_ALPHA_PLAN.md`.
 - The future full Luau addon platform is frozen in
@@ -17,12 +17,16 @@ and is not startup context.
   `docs/LUAU_ADDON_API_1_0_TASKS.md`. Only the two documentation tasks are
   complete and all 143 runtime tasks remain `BLOCKED-VP` until scoped vanilla
   parity and explicit owner activation.
-- Pillager crossbow combat is the latest bounded parity slice. Pillagers now
-  project the canonical 26.1.2 crossbow, retain aim/charge/charged deadlines,
-  publish charging metadata and fire one owner-attributed arrow after the exact
-  local 5/25/20–39 tick sequence. Mutable mob equipment, raids and broader
-  village defence remain open; the next cursor is an iron-golem spawning/combat
-  slice.
+- The latest bounded parity slice closes iron-golem panic defence. Adult villagers
+  persist a bounded recent-sleep projection plus the exact inclusive 599-tick
+  golem-detected memory; three eligible villagers can create one block- and
+  entity-collision-validated persisted golem, and save/restart preserves the
+  villagers, memory and golem without duplication. The golem pursues nearby
+  hostiles except creepers and reuses ordinary goal, damage, death, loot,
+  velocity and tracking-event authority. Actual bed pose, five-villager gossip
+  spawning, exact Java RNG, player anger/reputation, repair/crackiness, Hero
+  pricing and raids remain open. The next cursor is raids or the next reachable
+  `UnsupportedSpecial` species-specific path.
 - The strong baseline must be preserved: seed `712816`, VD16 and one local player
   pre-generated 225 chunks at 929.473 chunks/s, streamed every requested chunk
   without degradation or memory-pressure shedding, used roughly 300 MiB by owner
