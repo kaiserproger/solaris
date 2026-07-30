@@ -96,6 +96,12 @@ not replace functional, package, workspace, or real-client gates.
    now lives in focused `play/tests/container_safety.rs`; its menu mapping and
    safe-rejection coverage is recorded in
    [`evidence/mc-net-container-safety-test-extraction.md`](evidence/mc-net-container-safety-test-extraction.md).
+   The following fourteen-test inventory settlement, recovery, checkpoint, and
+   publication class now lives in focused
+   `play/tests/inventory_settlement.rs`; its owner-commit, conservation,
+   persistence, stale-click, FIFO, and event-publication coverage is recorded
+   in
+   [`evidence/mc-net-inventory-settlement-test-extraction.md`](evidence/mc-net-inventory-settlement-test-extraction.md).
 4. [ ] Separate behavioral tests from structural tripwires. Structural checks may
    enforce crate ownership and dependency direction, but may not assert Rust
    statement order or source-text layout.
