@@ -61,6 +61,7 @@ mod scheduled_hoppers;
 mod shield;
 mod stone_full_cube_collision;
 mod stonecutter;
+mod tall_narrow_fence_collision;
 mod toggle_planning;
 mod torch_campfire_collision;
 mod use_item_on_preflight;
@@ -2903,32 +2904,6 @@ async fn player_collision_uses_oriented_stair_boxes() {
     assert!(
         !player_pose_collides_with_solid(Some(&state), PlayerPose::new(0.5, 64.5, 0.85)).await,
         "the south half above a north stair's lower step is empty"
-    );
-}
-
-#[tokio::test]
-async fn player_collision_uses_tall_narrow_fence_box() {
-    let state = vanilla_collision_test_state();
-    let fence = vanilla_collision_state_id(
-        &state,
-        "minecraft:oak_fence",
-        &[
-            ("east", "false"),
-            ("north", "false"),
-            ("south", "false"),
-            ("west", "false"),
-            ("waterlogged", "false"),
-        ],
-    );
-    set_collision_test_block(&state, fence).await;
-
-    assert!(
-        !player_pose_collides_with_solid(Some(&state), PlayerPose::new(0.05, 64.0, 0.5)).await,
-        "space beside an isolated fence post is empty"
-    );
-    assert!(
-        player_pose_collides_with_solid(Some(&state), PlayerPose::new(0.5, 65.25, 0.5)).await,
-        "the isolated fence post collision extends to 1.5 blocks"
     );
 }
 

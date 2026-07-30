@@ -23,13 +23,19 @@ replacement-readiness claims.
 ## Active Checkpoint
 
 Next autonomous goal checkpoint: route `playable`; mechanically move the
-`player_collision_uses_tall_narrow_fence_box` test out of
+`player_collision_uses_oriented_stair_boxes` test out of
 aggregate `crates/mc-net/src/play/tests.rs` into a focused sibling module.
-Preserve its isolated-fence state, empty space beside the narrow post,
-`1.5`-block collision height, exact outside/inside poses, and production
-behavior, leave the preceding `player_collision_uses_oriented_stair_boxes`
-test and following `button_test_registry` helper aggregate-owned, and use
-explicit imports rather than a new `use super::*`.
+Preserve its exact north-facing bottom-stair state, occupied north upper step,
+empty south half above the lower step, exact poses, and production behavior,
+leave the preceding `player_collision_uses_top_slab_box` test and following
+`button_test_registry` helper aggregate-owned, and use explicit imports rather
+than a new `use super::*`.
+
+The complete tall/narrow isolated-fence test has moved to
+`crates/mc-net/src/play/tests/tall_narrow_fence_collision.rs`. Its exact
+isolated-fence state, empty side space, `1.5`-block collision height,
+outside/inside poses, and published collision-context coverage are recorded in
+[`../evidence/mc-net-tall-narrow-fence-collision-test-extraction.md`](../evidence/mc-net-tall-narrow-fence-collision-test-extraction.md).
 
 The complete deflated fence-top boundary test has moved to
 `crates/mc-net/src/play/tests/fence_deflation_boundary.rs`. Its isolated-fence

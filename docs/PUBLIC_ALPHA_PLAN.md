@@ -271,6 +271,10 @@ not replace functional, package, workspace, or real-client gates.
    `play/tests/fence_deflation_boundary.rs`; its isolated-fence state, oracle
    deflation, minimum-Y scan, and both boundary sides are recorded in
    [`evidence/mc-net-fence-deflation-boundary-test-extraction.md`](evidence/mc-net-fence-deflation-boundary-test-extraction.md).
+   The following tall/narrow isolated-fence test now lives in focused
+   `play/tests/tall_narrow_fence_collision.rs`; its exact fence state, empty
+   side space, and `1.5`-block collision-height coverage is recorded in
+   [`evidence/mc-net-tall-narrow-fence-collision-test-extraction.md`](evidence/mc-net-tall-narrow-fence-collision-test-extraction.md).
 4. [ ] Separate behavioral tests from structural tripwires. Structural checks may
    enforce crate ownership and dependency direction, but may not assert Rust
    statement order or source-text layout.
