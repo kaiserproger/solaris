@@ -2,7 +2,9 @@ use super::combat::{ActiveShield, PlayerHurtResistance};
 use super::persistence::PlayerPersistedState;
 #[cfg(test)]
 use super::simulation::PlayerStateEvent;
-use super::simulation::{EntitySimulationWorldContext, SimulationAuthority};
+use super::simulation::{
+    EntitySimulationTickPolicy, EntitySimulationWorldContext, SimulationAuthority,
+};
 use super::*;
 #[cfg(test)]
 use mc_entity::RegionKey;
@@ -32,11 +34,14 @@ mod entity_lifecycle;
 mod entity_owner;
 mod entity_physics_class;
 mod entity_simulation;
+mod entity_spawn_facts;
 mod entity_tracking;
 #[cfg(test)]
 mod entity_tracking_tests;
 mod explosion_authority;
 mod herd_spawn_authority;
+#[cfg(test)]
+mod herd_spawn_authority_tests;
 mod hostile_authority;
 #[cfg(test)]
 #[path = "session/hostile_authority_tests.rs"]
@@ -143,6 +148,7 @@ use entity_lifecycle::{
     ENTITY_EVENT_DEATH_COMPLETE, nearby_entity_candidate_ids_locked, nearby_entity_snapshots_locked,
 };
 use entity_owner::*;
+use entity_spawn_facts::apply_entity_facts;
 use entity_tracking::EntityMovementTrackers;
 #[allow(unused_imports)]
 pub(super) use explosion_authority::{
@@ -155,7 +161,9 @@ use herd_spawn_authority::{
     ChunkHerdClaimProbe, VANILLA_CREATURE_MOB_CAP, VANILLA_HOSTILE_MOB_CAP,
     install_committed_herd_spawns_locked,
 };
+#[cfg(test)]
 use herd_spawn_authority::{ClaimedPendingHostiles, claim_loaded_pending_hostiles_locked};
+pub(crate) use herd_spawn_authority::{NaturalSpawnScheduler, NaturalSpawnTickInput};
 use hostile_authority::update_hostile_targets_from_projections;
 #[cfg(test)]
 use hostile_authority::{
@@ -236,12 +244,11 @@ pub(super) use visibility::server_entity_snapshot_from;
 use visibility::{
     entity_event_dispatches_locked, entity_velocity_changed,
     initialize_entity_wire_state_from_snapshot_locked, initialize_entity_wire_state_locked,
-    install_committed_entity_publications_locked, ordered_session_recipient,
-    packed_rotation_changed, plan_entity_position_update, publish_server_entity_snapshot_locked,
-    refresh_entity_target_visibility_locked, session_recipients,
-    spawn_entity_visibility_from_snapshot_locked, spawn_entity_visibility_locked,
-    spawned_xp_observer_ids, visibility_dispatches, visible_entity_observers_locked,
-    visible_observers_locked,
+    ordered_session_recipient, packed_rotation_changed, plan_entity_position_update,
+    publish_server_entity_snapshot_locked, refresh_entity_target_visibility_locked,
+    session_recipients, spawn_entity_visibility_from_snapshot_locked,
+    spawn_entity_visibility_locked, spawned_xp_observer_ids, visibility_dispatches,
+    visible_entity_observers_locked, visible_observers_locked,
 };
 
 pub(super) type SessionId = u64;
@@ -268,7 +275,7 @@ pub(super) enum EntityAttackOutcome {
     },
     Killed {
         damage: mc_entity::EntityDamage,
-        entity: ServerEntitySnapshot,
+        entity: Box<ServerEntitySnapshot>,
         dispatches: Vec<VisibilityDispatch>,
         attacker_costs: Option<CommittedPlayerAttackCosts>,
     },
@@ -397,12 +404,15 @@ struct SessionRegistryInner {
     simulation_inputs: Arc<SimulationInputPublication>,
     entity_movement_trackers: Arc<EntityMovementTrackers>,
     arrow_tick_scratch: projectiles::ArrowTickScratch,
+    #[cfg(test)]
     spawned_entity_chunks: HashSet<(i32, i32)>,
+    natural_spawn_templates: HashMap<(i32, i32), Vec<HerdSpawn>>,
     settlement_spawn_claims: BTreeSet<String>,
     settlement_vacant_homes: BTreeMap<String, Vec3>,
     settlement_claimed_homes: BTreeSet<String>,
     villager_birth_deadlines: BTreeMap<u64, VecDeque<[EntityId; 2]>>,
     villager_birth_deadline_by_parent: HashMap<EntityId, u64>,
+    #[cfg(test)]
     pending_hostile_spawns: BTreeMap<(i32, i32), Vec<HerdSpawn>>,
     item_pickup_ready: BTreeMap<u64, Vec<EntityId>>,
     item_despawn_deadlines: BTreeMap<u64, VecDeque<EntityId>>,
@@ -1920,41 +1930,6 @@ impl SessionRegistry {
     }
 }
 
-fn apply_entity_facts(entity: &mut SpawnEntity) {
-    let Some(facts) = interaction_geometry::canonical_entity_facts(&entity.type_name) else {
-        return;
-    };
-    if let Some(value) = facts.attributes.max_health {
-        entity.attributes.set_base(AttributeKind::MaxHealth, value);
-    }
-    if let Some(value) = facts.attributes.movement_speed {
-        entity
-            .attributes
-            .set_base(AttributeKind::MovementSpeed, value);
-    }
-    if let Some(value) = facts.attributes.follow_range {
-        entity
-            .attributes
-            .set_base(AttributeKind::FollowRange, value);
-    }
-    if let Some(value) = facts.attributes.attack_damage {
-        entity
-            .attributes
-            .set_base(AttributeKind::AttackDamage, value);
-    }
-    match entity.type_name.as_str() {
-        "minecraft:sheep" => {
-            entity.animal = Some(mc_entity::AnimalBreedingState::adult_sheep(
-                mc_entity::SheepColor::White,
-            ));
-        }
-        "minecraft:cow" | "minecraft:chicken" => {
-            entity.animal = Some(mc_entity::AnimalBreedingState::adult());
-        }
-        _ => {}
-    }
-}
-
 fn schedule_item_despawn_locked(
     inner: &mut SessionRegistryInner,
     entity_id: EntityId,
@@ -2222,6 +2197,7 @@ fn remove_loaded_chunk_reference_locked(inner: &mut SessionRegistryInner, chunk:
     *refcount = refcount.saturating_sub(1);
     if *refcount == 0 {
         inner.loaded_chunk_refcounts.remove(&chunk);
+        inner.natural_spawn_templates.remove(&chunk);
         inner.simulation_inputs.remove_active_chunk(chunk);
     }
 }

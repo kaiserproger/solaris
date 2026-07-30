@@ -29,9 +29,11 @@ use mc_data::item_components::ItemFactsTable;
 use mc_data::items::ItemRegistry;
 use mc_data::tags::TagsData;
 use mc_data::{Registry, VanillaData};
+#[cfg(test)]
+use mc_entity::AttributeKind;
 use mc_entity::{
-    AttributeKind, EntityId, EntityItemStack, EntityLifecycle, EntitySnapshot, GoalState,
-    PathingBudget, PathingProbe, PathingProbeResult, RegionKey, Rotation, SpawnEntity, Vec3,
+    EntityId, EntityItemStack, EntityLifecycle, EntitySnapshot, GoalState, PathingBudget,
+    PathingProbe, PathingProbeResult, RegionKey, Rotation, SpawnEntity, Vec3,
 };
 use mc_extension::{DEFAULT_MAX_CUSTOM_PAYLOAD_BYTES, InboundEvent, PlayerId, ProtocolPhase};
 #[cfg(test)]
@@ -254,8 +256,8 @@ pub struct PlayerAttackObservation {
     pub authority_sequence: u64,
 }
 pub(crate) use simulation::{
-    SIMULATION_COMMAND_BATCH_LIMIT, SimulationHandle, SimulationOwner, SimulationSaveSnapshot,
-    SimulationTickReport, simulation_channel_with_explosion_seed,
+    EntitySimulationTickPolicy, SIMULATION_COMMAND_BATCH_LIMIT, SimulationHandle, SimulationOwner,
+    SimulationSaveSnapshot, SimulationTickReport, simulation_channel_with_explosion_seed,
 };
 pub(crate) use spawn::prepare_spawn_chunk;
 
@@ -438,6 +440,7 @@ use session::{
     VisibilityDispatch, apply_loader_item_grant, apply_script_player_inventory_transaction,
     dispatch_visibility_commands, publish_script_menu_click,
 };
+pub(crate) use session::{NaturalSpawnScheduler, NaturalSpawnTickInput};
 #[cfg(test)]
 use session::{PlayerDamagePublication, PlayerInventorySlotDelta, within_block_reach};
 #[cfg(test)]
@@ -795,6 +798,7 @@ fn world_time_is_night(world_time: u64) -> bool {
     world_time % DAY_LENGTH_TICKS >= NIGHT_START_TICK
 }
 
+#[cfg(test)]
 fn world_time_advance_crosses_night_start(world_time: u64, ticks: u64) -> bool {
     if ticks == 0 {
         return false;
@@ -845,7 +849,8 @@ pub struct RandomTickPolicy {
     pub chunk_budget: usize,
     pub fluid_tick_budget: usize,
     pub save_interval_ticks: u64,
-    pub spawn_monsters: bool,
+    pub friendly_spawn_interval_ticks: u64,
+    pub hostile_spawn_interval_ticks: u64,
     pub seed: u64,
 }
 
@@ -857,7 +862,8 @@ impl Default for RandomTickPolicy {
             chunk_budget: 64,
             fluid_tick_budget: DEFAULT_FLUID_TICK_BUDGET,
             save_interval_ticks: 20,
-            spawn_monsters: true,
+            friendly_spawn_interval_ticks: 400,
+            hostile_spawn_interval_ticks: 20,
             seed: 0,
         }
     }
@@ -874,7 +880,8 @@ impl RandomTickPolicy {
             chunk_budget: self.chunk_budget.max(1),
             fluid_tick_budget: self.fluid_tick_budget.max(1),
             save_interval_ticks: self.save_interval_ticks.max(1),
-            spawn_monsters: self.spawn_monsters,
+            friendly_spawn_interval_ticks: self.friendly_spawn_interval_ticks,
+            hostile_spawn_interval_ticks: self.hostile_spawn_interval_ticks,
             seed: self.seed,
         }
     }
@@ -1912,7 +1919,6 @@ where
                 chunk_pipeline_resources.clone(),
                 config.chunk_pipeline,
             )
-            .with_spawn_monsters(config.random_tick.spawn_monsters)
             .with_world_read(world_read.clone())
             .with_world_mutation(world_mutation.clone())
             .with_chunk_source(chunk_source)

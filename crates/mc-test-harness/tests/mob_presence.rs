@@ -21,6 +21,15 @@ const VIEW_DISTANCE: i32 = 2;
 static SURVIVAL_MOB_TEST_LOCK: LazyLock<tokio::sync::Mutex<()>> =
     LazyLock::new(|| tokio::sync::Mutex::new(()));
 
+fn passive_spawn_test_policy() -> mc_net::RandomTickPolicy {
+    mc_net::RandomTickPolicy {
+        simulation_distance: VIEW_DISTANCE,
+        friendly_spawn_interval_ticks: 1,
+        hostile_spawn_interval_ticks: 0,
+        ..mc_net::RandomTickPolicy::default()
+    }
+}
+
 #[tokio::test]
 async fn vanilla_client_receives_server_owned_passive_mob_and_motion() {
     let manifest = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
@@ -77,7 +86,7 @@ async fn vanilla_client_receives_server_owned_passive_mob_and_motion() {
         entity_types,
         biome_spawns,
         chunk_pipeline: mc_net::ChunkPipelinePolicy::default(),
-        random_tick: mc_net::RandomTickPolicy::default(),
+        random_tick: passive_spawn_test_policy(),
         command_permissions: mc_net::CommandPermissionConfig::new(Vec::<String>::new(), true),
         loader_manifest: None,
         shutdown: mc_net::ShutdownHandle::default(),
@@ -143,7 +152,7 @@ async fn embedded_playable_seed_spawns_food_mob_in_initial_window() {
         entity_types,
         biome_spawns: Arc::new(mc_data::biomes::solaris_required_biome_spawn_rules()),
         chunk_pipeline: mc_net::ChunkPipelinePolicy::default(),
-        random_tick: mc_net::RandomTickPolicy::default(),
+        random_tick: passive_spawn_test_policy(),
         command_permissions: mc_net::CommandPermissionConfig::new(Vec::<String>::new(), false),
         loader_manifest: None,
         shutdown: mc_net::ShutdownHandle::default(),
@@ -223,7 +232,7 @@ async fn two_clients_receive_same_server_owned_mob() {
         entity_types,
         biome_spawns,
         chunk_pipeline: mc_net::ChunkPipelinePolicy::default(),
-        random_tick: mc_net::RandomTickPolicy::default(),
+        random_tick: passive_spawn_test_policy(),
         command_permissions: mc_net::CommandPermissionConfig::new(Vec::<String>::new(), true),
         loader_manifest: None,
         shutdown: mc_net::ShutdownHandle::default(),

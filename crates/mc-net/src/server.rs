@@ -55,6 +55,8 @@ use crate::{
 };
 use crate::{login, play};
 
+mod natural_spawn_ticker;
+
 static CONSOLE_LINES: OnceLock<broadcast::Sender<String>> = OnceLock::new();
 type PhysicsMaterialCache = HashMap<
     (usize, usize),
@@ -1263,6 +1265,8 @@ impl BoundServer {
             let metrics_policy = RuntimeMetricsPolicy::default().normalized();
             let mut metrics_log_gate = RuntimeMetricsLogGate::default();
             let simulation_policy = entity_config.random_tick.normalized();
+            let mut natural_spawn_ticker =
+                natural_spawn_ticker::NaturalSpawnTicker::new(simulation_policy);
             let mut tick_metrics = RuntimeTickMetricsWindow::default();
             let (tick_metrics_publisher, mut tick_metrics_observations, tick_metrics_worker) =
                 spawn_runtime_tick_metrics_worker(entity_tick_metrics.clone());
@@ -1600,6 +1604,12 @@ impl BoundServer {
                 simulation_owner
                     .tick_dying_entities(&entity_sessions, entity_sessions.simulation_tick());
                 let world_time_us = elapsed_us(started);
+                natural_spawn_ticker.tick(
+                    &entity_sessions,
+                    tick,
+                    entity_world_read.as_ref(),
+                    entity_pathing_materials.as_deref(),
+                );
                 let started = Instant::now();
                 simulation_owner
                     .run_sheep_grazing(
@@ -1621,9 +1631,11 @@ impl BoundServer {
                         &entity_sessions,
                         &entity_chunk_pipeline_resources,
                         tick,
-                        entity_update_budget.configured_per_lane(),
-                        work_budgets.entity_pathing_candidates,
-                        simulation_policy.simulation_distance,
+                        play::EntitySimulationTickPolicy {
+                            entity_updates_per_lane: entity_update_budget.configured_per_lane(),
+                            pathing_candidates_per_entity: work_budgets.entity_pathing_candidates,
+                            simulation_distance: simulation_policy.simulation_distance,
+                        },
                         simulation_owner.entity_world_context(
                             entity_world_read.as_ref(),
                             entity_pathing_materials.as_deref(),
@@ -1986,13 +1998,15 @@ impl BoundServer {
                     simulation_queue_depth: simulation_commands.remaining_depth,
                 };
                 let entity_update_budget_snapshot = entity_update_budget.observe(
-                    tick_us,
-                    entity_goals_us,
-                    selected_entity_updates,
-                    active_entity_population,
-                    entity_chunk_pipeline_resources.cpu_limit().max(1),
-                    target_tick_us,
-                    entity_pressure,
+                    crate::runtime_entity_budget::EntityUpdateBudgetObservation {
+                        tick_us,
+                        entity_goals_us,
+                        selected: selected_entity_updates,
+                        active_population: active_entity_population,
+                        lane_count: entity_chunk_pipeline_resources.cpu_limit().max(1),
+                        target_tick_us,
+                        pressure: entity_pressure,
+                    },
                 );
                 let movement_budget =
                     movement_publication_budget.observe(tick_us, target_tick_us, entity_pressure);

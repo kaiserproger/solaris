@@ -4411,9 +4411,11 @@ fn dense_simulation_cohort_keeps_the_full_active_breeding_population() {
         &SimulationAuthority::for_test(),
         &resources,
         20,
-        256,
-        8,
-        DEFAULT_VIEW_DISTANCE,
+        EntitySimulationTickPolicy {
+            entity_updates_per_lane: 256,
+            pathing_candidates_per_entity: 8,
+            simulation_distance: DEFAULT_VIEW_DISTANCE,
+        },
         EntitySimulationWorldContext::empty(),
     );
 

@@ -217,18 +217,19 @@ Acceptance:
 - Conservation/race tests cover partial pickup, full inventory, disconnect,
   concurrent collectors, stale revisions, restart and requester loss.
 
-### P1 — Natural mob spawning is a one-shot chunk materialization, not a continuing spawn cycle
+### P1 — Periodic natural mob spawning runtime is implemented; client evidence remains
 
-The current implementation plans herds while preparing chunks. Passive candidates
-are admitted only for a deterministic subset of newly seen chunks and share a
-global creature cap of 10. Hostiles are deferred until the server's internal
-night window. There is no complete periodic loaded-chunk spawn cycle. The frozen
-client sun does not prove that the internal game clock also stopped; v0.0.2 must
-test and report visual clock progression and hostile activation separately.
+The current implementation registers bounded templates while preparing chunks,
+then runs independent friendly and hostile attempts over a rotating subset of
+simulation-loaded chunks. Admission rechecks active players, category and
+per-chunk caps, distance, support/fluid, collision, world time and block light
+before the regional owner commit. Movement and despawn release capacity for a
+later attempt; attempts and rejection reasons are reported periodically.
 
-The embedded fallback contains only two concrete biome spawn tables (plains and
-ocean), with other land/water biomes mapped to those defaults. This is enough for
-a baseline, not biome-complete spawning.
+The repo-owned fallback now contains concrete 26.1.2 supported-entity subsets
+for plains, forest, taiga, savanna, desert, swamp, river and ocean. Other
+land/water biomes still use the explicit plains/ocean fallback, so this is a
+common-biome alpha baseline rather than a biome-complete parity claim.
 
 Required config:
 
@@ -248,28 +249,28 @@ hostile authority. Alpha compatibility is not promised.
 
 Required runtime change:
 
-1. Add a bounded rotating scheduler over currently simulation-loaded chunks.
-2. Run friendly and hostile categories on their configured cadences.
-3. Retain internal category caps and player-distance fences; do not scan every
+1. [x] Add a bounded rotating scheduler over currently simulation-loaded chunks.
+2. [x] Run friendly and hostile categories on their configured cadences.
+3. [x] Retain internal category caps and player-distance fences; do not scan every
    loaded chunk every attempt.
-4. Require valid collision/support/fluid rules. Hostiles also require the exact
+4. [x] Require valid collision/support/fluid rules. Hostiles also require the exact
    supported darkness/time conditions.
-5. Refill populations after movement/despawn instead of marking a chunk spawned
+5. [x] Refill populations after movement/despawn instead of marking a chunk spawned
    forever.
-6. Add bounded periodic metrics: attempts, accepted entities and rejection reasons.
-7. Expand repo-owned biome rules for the supported common biomes instead of mapping
+6. [x] Add bounded periodic metrics: attempts, accepted entities and rejection reasons.
+7. [x] Expand repo-owned biome rules for the supported common biomes instead of mapping
    every land biome to plains indefinitely.
 
 Acceptance:
 
-- In a fresh 20-minute survival session with defaults, friendly mobs become
+- [ ] In a fresh 20-minute survival session with defaults, friendly mobs become
   observable near the player and hostiles become observable during night without
   operator setup.
-- Setting either interval to `0` disables only that category.
-- Halving an interval approximately doubles attempt cadence without bypassing caps.
-- No spawn occurs inside the minimum player radius, in invalid blocks or outside
+- [x] Setting either interval to `0` disables only that category.
+- [x] Halving an interval doubles attempt cadence without bypassing caps.
+- [x] No spawn occurs inside the minimum player radius, in invalid blocks or outside
   loaded simulation chunks.
-- Restart does not duplicate deterministic identities or lose retained entities.
+- [ ] Restart does not duplicate deterministic identities or lose retained entities.
 
 ### P1 — Plugin deployment requirements are implicit instead of operator-visible
 

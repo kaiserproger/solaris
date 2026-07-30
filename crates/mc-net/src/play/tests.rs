@@ -11,9 +11,7 @@ use std::pin::Pin;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::task::{Context, Poll};
 
-use crate::play::chunk_stream::{
-    hostile_chunk_spawns, natural_spawns_for_policy, passive_chunk_spawns, prioritized_spiral,
-};
+use crate::play::chunk_stream::{hostile_chunk_spawns, passive_chunk_spawns, prioritized_spiral};
 use mc_data::blocks::{BlockReport, BlockStateReport, solaris_required_blocks_report};
 use mc_data::items::ItemReport;
 use mc_world::light::compute_chunk_light_in;

@@ -22,12 +22,15 @@ replacement-readiness claims.
 
 ## Active Checkpoint
 
-Next: close the release blockers in `PUBLIC_ALPHA_PLAN.md` on the unified `main` tree.
-The immediate cursor is periodic natural spawning: a bounded scheduler over currently
-simulation-loaded chunks, independent friendly/hostile cadences, exact player-distance and
-block/fluid admission, refill after movement/despawn, and operator-visible metrics. After
-that, close plugin deployment reporting and the release closeout matrix. The first bounded
-population slice, merchant trading/restock, all five gossip types, zombie-villager curing,
+Next: move the already-separated natural-spawn scheduler and pure planning rules out of
+`mc-net` into a dedicated lower-level crate, leaving session snapshots, owner commit and
+wire publication in `mc-net`. Enforce the one-way dependency with code-health before
+starting another extraction. The periodic natural-spawning runtime, its common-biome
+baseline and the previously failing `player_body_push` and crossing-prewarm package gates
+are green. After the crate-boundary checkpoint, continue measured performance work,
+ordinary-play vanilla parity, the planned production Luau API and the release closeout
+matrix in the owner's requested order. The first bounded population slice, merchant
+trading/restock, all five gossip types, zombie-villager curing,
 pillager crossbow combat, iron-golem panic defence and guardian beam combat are closed.
 Guardian and elder guardian now use a dedicated runtime-only beam state, exact 10-tick
 warmup, 80/60-tick beam durations, target metadata index 17, entity event 21 and ordered
@@ -42,6 +45,7 @@ complete from this headless workspace.
 
 | Slice | Result | Current-tree evidence |
 | --- | --- | --- |
+| Periodic natural spawning runtime | Chunk preparation now registers templates without production one-shot materialization. A four-chunk rotating scheduler runs independent friendly/hostile cadences over simulation-loaded chunks, rechecks distance, active-chunk, cap, collision, support/fluid, night and block-light fences, refills after movement/despawn, and reports bounded rejection metrics. Spawn ownership is split into scheduler, planning, periodic authority, commit/publication and test-only legacy modules; the server owns only a narrow ticker. Repo-owned 26.1.2 supported-entity tables now cover eight common overworld biomes. The 20-minute graphical survival and restart identity gates remain unrun. | Periodic focused slice `12/12`; bounded chunk-candidate projection `1/1`; chunk registration/no-one-shot gate `1/1`; common-biome rules `2/2`; `mc-entity` `568/568` executable and `mc-net` `1849/1849` executable PASS; mob-presence wire gate `6/6`; workspace Clippy `-D warnings`, formatter, diff-check and code-health PASS. Independent review found the unbounded pre-selection snapshot; selected-chunk-only snapshots fixed it. The following test-gate review passed after exact body-push and crossing-prewarm fixes. |
 | Respawn bundle | Respawn republishes health, abilities, default spawn, chunk view, position and the complete inventory snapshot. A disk-world restart/rejoin restores an alive, damageable player rather than stale dead state. | `mc-net` respawn `6/6`; exact wire lifecycle `1/1`; save/restart/rejoin `1/1`; focused Java route test passed. |
 | Attachment sturdy faces | Removed the block-name fallback. Torch/attachment support now requires an exact embedded 26.1.2 state fingerprint and complete collision-face coverage; partial faces, fences and mismatches reject through resync-before-ack/no-debit. | `mc-data block_facts` `6/6`; placement support `7/7`; accepted and rejected TCP paths `1/1` each. |
 | Stair neighbour recomputation | Placement publishes root plus corner before acknowledgement and exactly one later debit, survives save/restart, then removal after restart publishes target air plus the straightened neighbour and survives a second reopen. Existing stale placement/break paths retain atomic conservation. | stair unit slice `25/25`; raw-TCP place/restart/remove/restart `1/1`; scoped read-only review passed. |

@@ -607,13 +607,12 @@ impl SessionRegistry {
                 HostileAttackKind::Crossbow => {
                     let target = targets
                         .iter()
-                        .filter_map(|target| {
-                            target.visible_entities.contains(&hostile.id).then(|| {
-                                (
-                                    distance_sq(hostile.position, target.position),
-                                    target.position,
-                                )
-                            })
+                        .filter(|target| target.visible_entities.contains(&hostile.id))
+                        .map(|target| {
+                            (
+                                distance_sq(hostile.position, target.position),
+                                target.position,
+                            )
                         })
                         .min_by(|left, right| left.0.total_cmp(&right.0));
                     if let Some(transition) =

@@ -259,13 +259,27 @@ Other accepted concrete boundaries in this staged migration are:
   commit, durability, relight, invalidation, broadcasts, and publication. A
   narrow parent wrapper performs `ServerConfig` normalization; the child has
   no async, packet, direct-send, or lock backedge.
-- `play::session::herd_spawn_authority` owns herd claims/outcomes, grouped
-  admission, pending-hostile activation, owner commit/rollback, candidate
-  construction, distance/cap rules, and committed publication installation.
-  Registry/probe fields, lock helpers, generic indexes, simulation retry,
-  sleep/world-time orchestration, and actual delivery remain in their current
-  owners. Existing lock order, journal outcomes, exact retry, UUID dedupe, and
-  stable batch publication are unchanged.
+- `play::session::herd_spawn_authority` is the narrow herd-spawn facade.
+  Its `scheduler` child owns only cadence, bounded rotating chunk selection,
+  reports, and cumulative metrics; it cannot depend on session, entity, world,
+  physics, or outbound types. `planning` owns read-only distance, cap,
+  block/fluid, darkness, collision, and candidate rules. `periodic` snapshots
+  session authority and coordinates the periodic plan. Its steady-state
+  scheduler identifies an unchanged active ring by publication identity,
+  snapshots templates only for the selected chunks, and projects collision
+  candidates only from their one-chunk halo; it must not pre-scan every active
+  chunk or clone the complete template/entity indexes. `commit` owns the unique
+  entity commit and committed-publication installation. Legacy
+  one-shot herd claims and pending-hostile activation are test-only in
+  `legacy`. `server::natural_spawn_ticker` owns the scheduler instance and
+  normalized intervals, delegates once through the facade, and owns no
+  eligibility, cap, selection, commit, or dispatch rules. Generic entity
+  defaults live in `session::entity_spawn_facts` instead of the session root.
+  Code-health pins these owners and rejects wildcard backedges, direct sends,
+  production async, session/lock/outbound dependencies in pure planning and
+  scheduler code, and domain-rule dependencies in the server ticker. Existing
+  lock order, journal outcomes, UUID dedupe, and stable batch publication are
+  unchanged.
 - `play::lighting` owns incremental source capture and currentness, light
   computation, full-fallback collection, outbound light value construction,
   cache seeding, and baked-light persistence. Async world-lock orchestration,

@@ -176,6 +176,7 @@ impl SessionRegistry {
         &self,
         world_time: u64,
     ) -> HerdSpawnOutcome {
+        #[cfg(test)]
         let (pending, sleep_transition) = {
             let mut inner = self.lock_inner("set world time and claim pending hostiles");
             self.world_time.store(world_time, Ordering::Release);
@@ -187,8 +188,16 @@ impl SessionRegistry {
             let sleep_transition = self.resolve_sleep_transition_locked(&mut inner);
             (pending, sleep_transition)
         };
-
+        #[cfg(not(test))]
+        let sleep_transition = {
+            let mut inner = self.lock_inner("set world time");
+            self.world_time.store(world_time, Ordering::Release);
+            self.resolve_sleep_transition_locked(&mut inner)
+        };
+        #[cfg(test)]
         let mut outcome = self.commit_claimed_pending_hostiles(pending);
+        #[cfg(not(test))]
+        let mut outcome = HerdSpawnOutcome::committed(Vec::new());
         let sleep_published_time =
             matches!(sleep_transition, Some(SleepTransition::Skipped { .. }));
         outcome
@@ -539,6 +548,7 @@ impl SessionRegistry {
         _authority: &SimulationAuthority,
         ticks: u64,
     ) -> (u64, HerdSpawnOutcome) {
+        #[cfg(test)]
         let (world_time, pending) = {
             let mut inner = self.lock_inner("advance world time and claim pending hostiles");
             let previous_world_time = self.world_time();
@@ -552,7 +562,17 @@ impl SessionRegistry {
                 };
             (world_time, pending)
         };
-        (world_time, self.commit_claimed_pending_hostiles(pending))
+        #[cfg(test)]
+        {
+            (world_time, self.commit_claimed_pending_hostiles(pending))
+        }
+        #[cfg(not(test))]
+        {
+            (
+                self.advance_world_time_core(ticks),
+                HerdSpawnOutcome::committed(Vec::new()),
+            )
+        }
     }
 
     #[cfg(test)]

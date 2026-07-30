@@ -185,6 +185,10 @@ impl SessionRegistry {
             .iter()
             .map(|(&entity, (index, _))| (entity, *index))
             .collect::<HashMap<_, _>>();
+        #[cfg(test)]
+        if !latest_push.is_empty() {
+            self.pause_between_player_push_entity_and_session_commit_for_test();
+        }
         let current_pushes = self.current_expected_entity_snapshots(
             latest_push.into_values().map(|(_, snapshot)| snapshot),
         );

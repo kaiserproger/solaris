@@ -1,35 +1,4 @@
 #[test]
-fn disabling_monster_spawns_keeps_passive_natural_spawns() {
-    let spawns = vec![
-        HerdSpawn {
-            chunk: (0, 0),
-            slot: 0,
-            entity_type_id: 1,
-            entity_type_name: "minecraft:cow".to_owned(),
-            position: Vec3::new(1.5, 64.0, 1.5),
-            hostile: false,
-            sheep_color: None,
-        },
-        HerdSpawn {
-            chunk: (0, 0),
-            slot: 1,
-            entity_type_id: 2,
-            entity_type_name: "minecraft:zombie".to_owned(),
-            position: Vec3::new(2.5, 64.0, 2.5),
-            hostile: true,
-            sheep_color: None,
-        },
-    ];
-
-    let filtered = natural_spawns_for_policy(&spawns, false);
-
-    assert_eq!(filtered.len(), 1);
-    assert_eq!(filtered[0].entity_type_name, "minecraft:cow");
-    assert!(!filtered[0].hostile);
-    assert_eq!(natural_spawns_for_policy(&spawns, true), spawns);
-}
-
-#[test]
 fn passive_spawn_planner_keeps_water_mobs_off_land() {
     use std::collections::BTreeMap;
 
@@ -1835,7 +1804,8 @@ async fn random_ticks_ignore_ticketed_chunks_until_loaded() {
             chunk_budget: 1,
             fluid_tick_budget: 1,
             save_interval_ticks: 20,
-            spawn_monsters: true,
+            friendly_spawn_interval_ticks: 400,
+            hostile_spawn_interval_ticks: 20,
             seed: 0,
         },
         Arc::new(mc_data::block_facts::BlockFactsTable::from_blocks_report(
@@ -1922,7 +1892,8 @@ async fn random_tick_owner_keeps_protected_fuel_while_source_fire_ages() {
                 chunk_budget: 1,
                 fluid_tick_budget: 1,
                 save_interval_ticks: 20,
-                spawn_monsters: true,
+                friendly_spawn_interval_ticks: 400,
+                hostile_spawn_interval_ticks: 20,
                 seed,
             };
             let source = sample_random_tick_positions(policy, 0, &[(0, 0)])
@@ -2061,7 +2032,8 @@ async fn inert_random_tick_pass_does_not_wait_for_world_writer() {
             chunk_budget: 1,
             fluid_tick_budget: 1,
             save_interval_ticks: 20,
-            spawn_monsters: true,
+            friendly_spawn_interval_ticks: 400,
+            hostile_spawn_interval_ticks: 20,
             seed: 0,
         },
         Arc::new(mc_data::block_facts::BlockFactsTable::from_blocks_report(
@@ -2117,7 +2089,8 @@ fn mutating_random_tick_fixture(
         chunk_budget: 1,
         fluid_tick_budget: 1,
         save_interval_ticks: 20,
-        spawn_monsters: true,
+        friendly_spawn_interval_ticks: 400,
+        hostile_spawn_interval_ticks: 20,
         seed: 0,
     };
     let sample = sample_random_tick_positions(policy, 0, &[(0, 0)])[0];
@@ -2201,7 +2174,8 @@ async fn checkpoint_only_random_ticks_in_distinct_regions_do_not_wait_for_world_
         chunk_budget: 2,
         fluid_tick_budget: 1,
         save_interval_ticks: 20,
-        spawn_monsters: true,
+        friendly_spawn_interval_ticks: 400,
+        hostile_spawn_interval_ticks: 20,
         seed: 0,
     };
     let chunk_positions = [(0, 0), (8, 0)];
@@ -2391,7 +2365,8 @@ async fn boundary_random_tick_coordinator_fallback_uses_periodic_checkpoint() {
         chunk_budget: 1,
         fluid_tick_budget: 1,
         save_interval_ticks: 20,
-        spawn_monsters: true,
+        friendly_spawn_interval_ticks: 400,
+        hostile_spawn_interval_ticks: 20,
         seed: 0,
     };
     let sample = sample_random_tick_positions(policy, 0, &[(0, 0)])
@@ -2511,7 +2486,8 @@ fn random_tick_region_planning_preserves_boundary_barrier_order() {
         chunk_budget: 1,
         fluid_tick_budget: 1,
         save_interval_ticks: 20,
-        spawn_monsters: true,
+        friendly_spawn_interval_ticks: 400,
+        hostile_spawn_interval_ticks: 20,
         seed: 0,
     };
     let positions = [
@@ -2624,7 +2600,8 @@ async fn random_leaf_decay_spawns_deterministic_natural_drop() {
             chunk_budget: 1,
             fluid_tick_budget: 1,
             save_interval_ticks: 20,
-            spawn_monsters: true,
+            friendly_spawn_interval_ticks: 400,
+            hostile_spawn_interval_ticks: 20,
             seed,
         };
         let sample = sample_random_tick_positions(policy, 0, &[(0, 0)])[0];
@@ -2834,7 +2811,8 @@ async fn scheduled_fluid_ticks_ignore_ticketed_chunks_until_loaded() {
             chunk_budget: 1,
             fluid_tick_budget: 1,
             save_interval_ticks: 20,
-            spawn_monsters: true,
+            friendly_spawn_interval_ticks: 400,
+            hostile_spawn_interval_ticks: 20,
             seed: 0,
         },
         block_facts,
@@ -2932,7 +2910,8 @@ async fn resident_scheduled_fluid_tick_stays_off_the_synchronous_journal_path() 
             chunk_budget: 1,
             fluid_tick_budget: 1,
             save_interval_ticks: 20,
-            spawn_monsters: true,
+            friendly_spawn_interval_ticks: 400,
+            hostile_spawn_interval_ticks: 20,
             seed: 0,
         },
         block_facts,
@@ -3044,7 +3023,8 @@ async fn region_boundary_scheduled_fluid_tick_uses_exact_coordinator_fallback() 
             chunk_budget: 1,
             fluid_tick_budget: 1,
             save_interval_ticks: 20,
-            spawn_monsters: true,
+            friendly_spawn_interval_ticks: 400,
+            hostile_spawn_interval_ticks: 20,
             seed: 0,
         },
         Arc::new(mc_data::block_facts::BlockFactsTable::from_blocks_report(
@@ -3129,7 +3109,8 @@ async fn stale_scheduled_fluid_plan_keeps_due_tick_without_edit() {
             chunk_budget: 1,
             fluid_tick_budget: 1,
             save_interval_ticks: 20,
-            spawn_monsters: true,
+            friendly_spawn_interval_ticks: 400,
+            hostile_spawn_interval_ticks: 20,
             seed: 0,
         },
         block_facts,
@@ -3193,7 +3174,8 @@ fn random_tick_sampling_is_deterministic_for_seed_tick_and_chunks() {
         chunk_budget: 2,
         fluid_tick_budget: 256,
         save_interval_ticks: 20,
-        spawn_monsters: true,
+        friendly_spawn_interval_ticks: 400,
+        hostile_spawn_interval_ticks: 20,
         seed: 99,
     };
     let chunks = vec![(0, 0), (1, 0), (2, 0)];
@@ -3232,7 +3214,8 @@ fn random_tick_speed_applies_to_every_world_section() {
         chunk_budget: 1,
         fluid_tick_budget: 256,
         save_interval_ticks: 20,
-        spawn_monsters: true,
+        friendly_spawn_interval_ticks: 400,
+        hostile_spawn_interval_ticks: 20,
         seed: 99,
     };
 
@@ -3254,7 +3237,8 @@ fn random_tick_sampling_rotates_chunk_budget() {
         chunk_budget: 2,
         fluid_tick_budget: 256,
         save_interval_ticks: 20,
-        spawn_monsters: true,
+        friendly_spawn_interval_ticks: 400,
+        hostile_spawn_interval_ticks: 20,
         seed: 0,
     };
     let chunks = vec![(0, 0), (1, 0), (2, 0)];
@@ -3282,7 +3266,8 @@ fn random_tick_speed_zero_disables_sampling() {
         chunk_budget: 2,
         fluid_tick_budget: 256,
         save_interval_ticks: 20,
-        spawn_monsters: true,
+        friendly_spawn_interval_ticks: 400,
+        hostile_spawn_interval_ticks: 20,
         seed: 0,
     };
 
@@ -3297,7 +3282,8 @@ fn simulation_tick_policy_normalizes_deferred_work_budgets() {
         chunk_budget: 0,
         fluid_tick_budget: 0,
         save_interval_ticks: 0,
-        spawn_monsters: true,
+        friendly_spawn_interval_ticks: 400,
+        hostile_spawn_interval_ticks: 20,
         seed: 0,
     }
     .normalized();

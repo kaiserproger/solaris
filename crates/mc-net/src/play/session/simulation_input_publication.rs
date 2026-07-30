@@ -231,6 +231,24 @@ impl SimulationInputPublication {
         candidates
     }
 
+    pub(super) fn entity_candidates_in_chunks(
+        &self,
+        chunks: &HashSet<(i32, i32)>,
+    ) -> HashSet<EntityId> {
+        self.read_routing(|| {
+            let mut candidates = HashSet::new();
+            for &chunk in chunks {
+                if let Some(entities) = self.entity_chunks[entity_index_shard(chunk)]
+                    .load()
+                    .get(&chunk)
+                {
+                    candidates.extend(entities.iter().copied());
+                }
+            }
+            candidates
+        })
+    }
+
     pub(super) fn active_entity_candidates(&self) -> (Arc<HashSet<(i32, i32)>>, HashSet<EntityId>) {
         self.read_routing(|| {
             let active_chunks = self.active_chunks();

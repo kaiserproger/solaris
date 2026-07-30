@@ -584,6 +584,56 @@ mod tests {
     }
 
     #[test]
+    fn required_spawn_rules_cover_common_overworld_biomes_with_distinct_tables() {
+        let rules = solaris_required_biome_spawn_rules();
+        assert_eq!(rules.len(), 8);
+
+        let plains = Identifier::parse("minecraft:plains").unwrap();
+        let forest = Identifier::parse("minecraft:forest").unwrap();
+        let desert = Identifier::parse("minecraft:desert").unwrap();
+        let river = Identifier::parse("minecraft:river").unwrap();
+        let ocean = Identifier::parse("minecraft:ocean").unwrap();
+
+        let plains_zombie = rules
+            .entries(&plains, "monster")
+            .iter()
+            .find(|entry| entry.entity_type.as_str() == "minecraft:zombie")
+            .unwrap();
+        let forest_zombie = rules
+            .entries(&forest, "monster")
+            .iter()
+            .find(|entry| entry.entity_type.as_str() == "minecraft:zombie")
+            .unwrap();
+        let desert_zombie = rules
+            .entries(&desert, "monster")
+            .iter()
+            .find(|entry| entry.entity_type.as_str() == "minecraft:zombie")
+            .unwrap();
+        assert_eq!((plains_zombie.min_count, plains_zombie.weight), (4, 90));
+        assert_eq!((forest_zombie.min_count, forest_zombie.weight), (4, 95));
+        assert_eq!((desert_zombie.min_count, desert_zombie.weight), (4, 19));
+
+        assert_eq!(
+            rules.entries(&river, "water_ambient"),
+            &[BiomeSpawnEntry {
+                entity_type: Identifier::parse("minecraft:salmon").unwrap(),
+                min_count: 1,
+                max_count: 5,
+                weight: 5,
+            }]
+        );
+        assert_eq!(
+            rules.entries(&ocean, "water_ambient"),
+            &[BiomeSpawnEntry {
+                entity_type: Identifier::parse("minecraft:cod").unwrap(),
+                min_count: 3,
+                max_count: 6,
+                weight: 10,
+            }]
+        );
+    }
+
+    #[test]
     fn custom_spawn_rules_do_not_get_implicit_defaults() {
         let plains = Identifier::parse("minecraft:plains").unwrap();
         let forest = Identifier::parse("minecraft:forest").unwrap();

@@ -1,3 +1,5 @@
+#[cfg(test)]
+use super::HerdSpawn;
 use super::SettlementInhabitantSpawn;
 use super::block_edit_commit::{
     apply_block_edit_batch_to_storage_conditionally,
@@ -37,8 +39,8 @@ use super::{
     BlockEditPrecondition, BlockMutationSnapshot, CAMPFIRE_BLOCK_ENTITY_TYPE_ID,
     CampfireCookingState, ChestCommitOutcome, ChestView, ContainerDropPlan, ContainerPlayerPlan,
     ContainerXpPlan, EntityPhysicsQuery, EntityPhysicsStep, FurnaceCommitOutcome, GameMode,
-    HerdSpawn, PendingCampfireOutput, PlayerInventoryCommitOutcome, PlayerPose,
-    SharedContainerCommit, SurvivalState, WorldHandle, air_state_id, block_edit_changes_light,
+    PendingCampfireOutput, PlayerInventoryCommitOutcome, PlayerPose, SharedContainerCommit,
+    SurvivalState, WorldHandle, air_state_id, block_edit_changes_light,
     chest_menu_state_change_count, chest_slot_stacks, furnace_output_was_taken,
     furnace_slot_stacks, is_campfire_block, schedule_fluid_ticks_near_applied,
     schedule_leaf_ticks_near_applied,
@@ -199,6 +201,13 @@ pub(crate) struct EntitySimulationWorldContext<'a> {
     items: Option<&'a mc_data::items::ItemRegistry>,
 }
 
+#[derive(Clone, Copy)]
+pub(crate) struct EntitySimulationTickPolicy {
+    pub(crate) entity_updates_per_lane: usize,
+    pub(crate) pathing_candidates_per_entity: usize,
+    pub(crate) simulation_distance: i32,
+}
+
 impl<'a> EntitySimulationWorldContext<'a> {
     #[cfg(test)]
     pub(in crate::play) const fn empty() -> Self {
@@ -343,6 +352,7 @@ pub(super) enum SimulationCommand {
     SetWorldTime {
         world_time: u64,
     },
+    #[cfg(test)]
     EnsureChunkHerd {
         chunk: (i32, i32),
         spawns: Vec<HerdSpawn>,
@@ -441,6 +451,7 @@ impl SimulationCommand {
             Self::AttackServerEntity { .. } => "attack_server_entity",
             Self::SpawnCommandEntity { .. } => "spawn_command_entity",
             Self::SetWorldTime { .. } => "set_world_time",
+            #[cfg(test)]
             Self::EnsureChunkHerd { .. } => "ensure_chunk_herd",
             Self::EnsureSettlementInhabitants { .. } => "ensure_settlement_inhabitants",
             Self::ApplyBlockEdits { .. } => "apply_block_edits",
@@ -710,10 +721,13 @@ fn command_requires_world(command: &SimulationCommand) -> bool {
 }
 
 fn command_is_background(command: &SimulationCommand) -> bool {
+    #[cfg(test)]
+    if matches!(command, SimulationCommand::EnsureChunkHerd { .. }) {
+        return true;
+    }
     matches!(
         command,
-        SimulationCommand::EnsureChunkHerd { .. }
-            | SimulationCommand::EnsureSettlementInhabitants { .. }
+        SimulationCommand::EnsureSettlementInhabitants { .. }
     )
 }
 
@@ -838,6 +852,7 @@ fn command_single_owner_region(command: &SimulationCommand) -> Option<RegionKey>
 
     let position = match command {
         SimulationCommand::SpawnCommandEntity { position, .. } => *position,
+        #[cfg(test)]
         SimulationCommand::EnsureChunkHerd { chunk, .. } => {
             return Some(RegionKey::from_chunk(chunk.0, chunk.1));
         }
@@ -2892,6 +2907,7 @@ impl SimulationOwner {
 
     pub(crate) fn advance_world_time(&self, sessions: &SessionRegistry, ticks: u64) -> u64 {
         let (_, pending) = sessions.advance_world_time_owned(&self.authority, ticks);
+        #[cfg(test)]
         self.release_retryable_herd_requests(pending.retryable_chunks());
         dispatch_visibility_commands(pending.into_dispatches());
         dispatch_visibility_commands(
@@ -3417,18 +3433,14 @@ impl SimulationOwner {
         sessions: &SessionRegistry,
         cpu_resources: &crate::chunk_pipeline::ChunkPipelineResources,
         tick: u64,
-        entity_updates_per_lane: usize,
-        pathing_candidates_per_entity: usize,
-        simulation_distance: i32,
+        policy: EntitySimulationTickPolicy,
         world: EntitySimulationWorldContext<'_>,
     ) -> Vec<EntityPhysicsQuery> {
         sessions.tick_entities_and_collect_physics_queries_owned(
             &self.authority,
             cpu_resources,
             tick,
-            entity_updates_per_lane,
-            pathing_candidates_per_entity,
-            simulation_distance,
+            policy,
             world,
         )
     }
@@ -4760,6 +4772,7 @@ impl SimulationOwner {
                 continue;
             }
             let detached = envelope.is_detached();
+            #[cfg(test)]
             if detached
                 && let SimulationCommand::EnsureChunkHerd { chunk, spawns } = &envelope.command
             {
@@ -5112,10 +5125,12 @@ impl SimulationOwner {
                 )),
                 SimulationCommand::SetWorldTime { world_time } => {
                     let outcome = sessions.set_world_time_owned(&self.authority, *world_time);
+                    #[cfg(test)]
                     self.release_retryable_herd_requests(outcome.retryable_chunks());
                     dispatch_visibility_commands(outcome.into_dispatches());
                     SimulationResponse::WorldTimeSet
                 }
+                #[cfg(test)]
                 SimulationCommand::EnsureChunkHerd { chunk, spawns } => {
                     let outcome = sessions.ensure_chunk_herd(&self.authority, *chunk, spawns);
                     self.release_retryable_herd_requests(outcome.retryable_chunks());

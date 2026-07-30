@@ -435,8 +435,8 @@ fn playable_real_client_prepare_uses_playable_manifest_config_and_scenario() {
     let effective_server_config: toml::Value = toml::from_str(&effective_server_config)
         .expect("prepared playable server config parses as TOML");
     assert_eq!(
-        effective_server_config["simulation"]["spawn_monsters"].as_bool(),
-        Some(false),
+        effective_server_config["simulation"]["hostile_spawn_interval_ticks"].as_integer(),
+        Some(0),
         "the continuity soak must isolate natural hostile pressure from its separate combat gate"
     );
     assert!(
@@ -489,8 +489,8 @@ fn playable_combat_prepare_keeps_natural_monsters_enabled() {
     let effective_server_config: toml::Value = toml::from_str(&effective_server_config)
         .expect("prepared combat server config parses as TOML");
     assert_eq!(
-        effective_server_config["simulation"]["spawn_monsters"].as_bool(),
-        Some(true),
+        effective_server_config["simulation"]["hostile_spawn_interval_ticks"].as_integer(),
+        Some(20),
         "combat scenarios must retain natural hostile spawning"
     );
 }

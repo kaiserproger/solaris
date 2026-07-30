@@ -60,7 +60,8 @@ region_cache_size = 9
 [simulation]
 random_tick_speed = 5
 save_interval_ticks = 1200
-spawn_monsters = true
+friendly_spawn_interval_ticks = 400
+hostile_spawn_interval_ticks = 20
 
 [autoscale]
 enabled = true

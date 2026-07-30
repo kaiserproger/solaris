@@ -92,7 +92,6 @@ pub(super) struct ChunkStreamState {
     passive_herd_passable: Arc<Vec<BlockStateId>>,
     passive_spawn_rules: Arc<mc_data::biomes::BiomeSpawnRules>,
     entity_types: Arc<mc_data::entity_types::EntityTypeRegistry>,
-    spawn_monsters: bool,
     compression: Compression,
     sessions: Arc<SessionRegistry>,
     simulation: Option<SimulationHandle>,
@@ -966,7 +965,6 @@ impl ChunkStreamState {
             passive_herd_passable,
             passive_spawn_rules,
             entity_types,
-            spawn_monsters: true,
             compression,
             sessions,
             simulation: None,
@@ -1058,11 +1056,6 @@ impl ChunkStreamState {
 
     pub(super) fn with_world_read(mut self, world_read: Option<mc_world::WorldReadView>) -> Self {
         self.world_read = world_read;
-        self
-    }
-
-    pub(super) fn with_spawn_monsters(mut self, spawn_monsters: bool) -> Self {
-        self.spawn_monsters = spawn_monsters;
         self
     }
 
@@ -2125,8 +2118,7 @@ impl ChunkStreamState {
                 }
                 #[cfg(test)]
                 let mut visibility = visibility;
-                let herd_spawns =
-                    natural_spawns_for_policy(&prepared.herd_spawns, self.spawn_monsters);
+                let herd_spawns = prepared.herd_spawns.clone();
                 let settlement_spawns = self
                     .world_read
                     .as_ref()
@@ -2217,11 +2209,11 @@ impl ChunkStreamState {
                             cx, cz, "simulation settlement inhabitant request rejected"
                         );
                     }
-                    if let Err(error) = simulation.ensure_chunk_herd((cx, cz), herd_spawns.clone())
-                    {
-                        warn!(?error, cx, cz, "simulation chunk herd request rejected");
-                    }
+                    self.sessions
+                        .register_natural_spawn_templates((cx, cz), herd_spawns);
                 } else {
+                    self.sessions
+                        .register_natural_spawn_templates((cx, cz), herd_spawns.clone());
                     #[cfg(test)]
                     {
                         visibility.extend(
@@ -2510,20 +2502,6 @@ impl ChunkStreamState {
             "chunk stream finished",
         );
     }
-}
-
-pub(super) fn natural_spawns_for_policy(
-    spawns: &[HerdSpawn],
-    spawn_monsters: bool,
-) -> Vec<HerdSpawn> {
-    if spawn_monsters {
-        return spawns.to_vec();
-    }
-    spawns
-        .iter()
-        .filter(|spawn| !spawn.hostile)
-        .cloned()
-        .collect()
 }
 
 impl Drop for ChunkStreamState {
@@ -4139,6 +4117,7 @@ mod tests {
         max_active: Arc<AtomicUsize>,
         concurrent_call_started: Option<Arc<tokio::sync::Notify>>,
         first_call_gate: Option<Arc<GenerationGate>>,
+        gated_chunk: Option<ChunkPos>,
         gate_first_call: AtomicBool,
     }
 
@@ -4152,7 +4131,8 @@ mod tests {
             {
                 concurrent_call_started.notify_one();
             }
-            if self.gate_first_call.swap(false, Ordering::AcqRel)
+            if self.gated_chunk.is_none_or(|chunk| chunk == pos)
+                && self.gate_first_call.swap(false, Ordering::AcqRel)
                 && let Some(gate) = self.first_call_gate.as_ref()
             {
                 gate.block_until_released();
@@ -4458,7 +4438,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn disabled_monsters_filters_cached_spawn_plan_before_publication() {
+    async fn chunk_emit_registers_templates_without_one_shot_materialization() {
         let registry = Arc::new(BlockRegistry::from_report(&[]).expect("empty registry builds"));
         let world = Arc::new(Mutex::new(WorldStorage::in_memory_with_capacity(
             Arc::clone(&registry),
@@ -4478,6 +4458,8 @@ mod tests {
             tx,
             PlayerPose::new(0.5, DEFAULT_SPAWN_Y, 0.5),
         );
+        let (simulation, _simulation_owner) =
+            crate::play::simulation::simulation_channel_with_capacity(1);
         let mut stream = ChunkStreamState::new(
             Arc::clone(&world),
             Arc::new(test_biome_registry()),
@@ -4503,7 +4485,7 @@ mod tests {
             ChunkPipelineResources::with_limits(1, 1),
             ChunkPipelinePolicy::default(),
         )
-        .with_spawn_monsters(false);
+        .with_simulation(simulation);
         let request = stream.scheduler.poll_next().expect("chunk request");
         stream.accept_result(ChunkPrepareResult {
             request,
@@ -4520,7 +4502,7 @@ mod tests {
                         slot: 0,
                         entity_type_id: 1,
                         entity_type_name: "minecraft:cow".to_owned(),
-                        position: Vec3::new(1.5, 64.0, 1.5),
+                        position: Vec3::new(1.5, DEFAULT_SPAWN_Y, 1.5),
                         hostile: false,
                         sheep_color: None,
                     },
@@ -4529,7 +4511,7 @@ mod tests {
                         slot: 1,
                         entity_type_id: 2,
                         entity_type_name: "minecraft:zombie".to_owned(),
-                        position: Vec3::new(2.5, 64.0, 2.5),
+                        position: Vec3::new(2.5, DEFAULT_SPAWN_Y, 2.5),
                         hostile: true,
                         sheep_color: None,
                     },
@@ -4550,13 +4532,26 @@ mod tests {
                 .unwrap(),
             EmitReadyResult::SentPacket
         );
-        let entities = sessions.persisted_entity_records();
-        assert_eq!(entities.len(), 1);
-        assert_eq!(entities[0].snapshot.type_name, "minecraft:cow");
+        assert!(sessions.persisted_entity_records().is_empty());
         sessions.set_world_time_and_update_sleep(NIGHT_START_TICK);
-        let entities_after_night = sessions.persisted_entity_records();
-        assert_eq!(entities_after_night.len(), 1);
-        assert_eq!(entities_after_night[0].snapshot.type_name, "minecraft:cow");
+        let mut scheduler = crate::play::NaturalSpawnScheduler::default();
+        let (report, dispatches) = sessions.tick_periodic_natural_spawning(
+            &mut scheduler,
+            crate::play::NaturalSpawnTickInput {
+                tick: 1,
+                friendly_interval: 1,
+                hostile_interval: 1,
+                simulation_distance: 2,
+                world_read: None,
+                materials: None,
+            },
+        );
+        assert!(dispatches.is_empty());
+        assert_eq!(report.friendly.templates_considered, 1);
+        assert_eq!(report.hostile.templates_considered, 1);
+        assert_eq!(report.friendly.rejected_player_distance, 1);
+        assert_eq!(report.hostile.rejected_player_distance, 1);
+        assert!(sessions.persisted_entity_records().is_empty());
     }
 
     #[tokio::test]
@@ -7588,6 +7583,7 @@ mod tests {
                     max_active: Arc::clone(&max_active),
                     concurrent_call_started: Some(Arc::clone(&concurrent_call_started)),
                     first_call_gate: Some(Arc::clone(&first_call_gate)),
+                    gated_chunk: None,
                     gate_first_call: AtomicBool::new(true),
                 }),
             ),
@@ -7685,6 +7681,7 @@ mod tests {
                     max_active: Arc::clone(&max_active),
                     concurrent_call_started: None,
                     first_call_gate: Some(Arc::clone(&first_call_gate)),
+                    gated_chunk: None,
                     gate_first_call: AtomicBool::new(true),
                 }),
             ),
@@ -7802,6 +7799,7 @@ mod tests {
                     max_active,
                     concurrent_call_started: None,
                     first_call_gate: Some(Arc::clone(&first_call_gate)),
+                    gated_chunk: Some(ChunkPos { x: -5, z: -4 }),
                     gate_first_call: AtomicBool::new(true),
                 }),
             ),
@@ -7849,11 +7847,12 @@ mod tests {
         stream.dispatch_forward_prewarm();
         first_call_gate.wait_started().await;
 
+        stream.replan_center(-1, 0, 0.0);
         let prewarm_progress = stream.progress_notify();
+        prewarm_progress.notified().await;
         let prewarm_settled = prewarm_progress.notified();
         tokio::pin!(prewarm_settled);
         prewarm_settled.as_mut().enable();
-        stream.replan_center(-1, 0, 0.0);
         first_call_gate.release();
 
         tokio::time::timeout(Duration::from_secs(2), prewarm_settled)

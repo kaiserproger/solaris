@@ -703,17 +703,13 @@ impl SessionRegistry {
         _authority: &SimulationAuthority,
         cpu_resources: &crate::chunk_pipeline::ChunkPipelineResources,
         tick: u64,
-        entity_updates_per_lane: usize,
-        pathing_candidates_per_entity: usize,
-        simulation_distance: i32,
+        policy: EntitySimulationTickPolicy,
         world: EntitySimulationWorldContext<'_>,
     ) -> Vec<EntityPhysicsQuery> {
         self.tick_entities_and_collect_physics_queries_core(
             Some(cpu_resources),
             tick,
-            entity_updates_per_lane,
-            pathing_candidates_per_entity,
-            simulation_distance,
+            policy,
             world.pathing(),
             world.profession_context(),
         )
@@ -727,9 +723,11 @@ impl SessionRegistry {
         self.tick_entities_and_collect_physics_queries_core(
             None,
             tick,
-            usize::MAX,
-            PathingBudget::DEFAULT.max_candidates_per_entity,
-            DEFAULT_VIEW_DISTANCE,
+            EntitySimulationTickPolicy {
+                entity_updates_per_lane: usize::MAX,
+                pathing_candidates_per_entity: PathingBudget::DEFAULT.max_candidates_per_entity,
+                simulation_distance: DEFAULT_VIEW_DISTANCE,
+            },
             None,
             None,
         )
@@ -744,9 +742,11 @@ impl SessionRegistry {
         self.tick_entities_and_collect_physics_queries_core(
             None,
             tick,
-            usize::MAX,
-            PathingBudget::DEFAULT.max_candidates_per_entity,
-            simulation_distance,
+            EntitySimulationTickPolicy {
+                entity_updates_per_lane: usize::MAX,
+                pathing_candidates_per_entity: PathingBudget::DEFAULT.max_candidates_per_entity,
+                simulation_distance,
+            },
             None,
             None,
         )
@@ -761,9 +761,11 @@ impl SessionRegistry {
         self.tick_entities_and_collect_physics_queries_core(
             None,
             tick,
-            usize::MAX,
-            pathing_candidates_per_entity,
-            DEFAULT_VIEW_DISTANCE,
+            EntitySimulationTickPolicy {
+                entity_updates_per_lane: usize::MAX,
+                pathing_candidates_per_entity,
+                simulation_distance: DEFAULT_VIEW_DISTANCE,
+            },
             None,
             None,
         )
@@ -779,9 +781,11 @@ impl SessionRegistry {
         self.tick_entities_and_collect_physics_queries_core(
             None,
             tick,
-            usize::MAX,
-            PathingBudget::DEFAULT.max_candidates_per_entity,
-            DEFAULT_VIEW_DISTANCE,
+            EntitySimulationTickPolicy {
+                entity_updates_per_lane: usize::MAX,
+                pathing_candidates_per_entity: PathingBudget::DEFAULT.max_candidates_per_entity,
+                simulation_distance: DEFAULT_VIEW_DISTANCE,
+            },
             Some((world_read, pathing_materials)),
             None,
         )
@@ -798,9 +802,11 @@ impl SessionRegistry {
         self.tick_entities_and_collect_physics_queries_core(
             None,
             tick,
-            usize::MAX,
-            PathingBudget::DEFAULT.max_candidates_per_entity,
-            DEFAULT_VIEW_DISTANCE,
+            EntitySimulationTickPolicy {
+                entity_updates_per_lane: usize::MAX,
+                pathing_candidates_per_entity: PathingBudget::DEFAULT.max_candidates_per_entity,
+                simulation_distance: DEFAULT_VIEW_DISTANCE,
+            },
             None,
             Some((world_read, blocks, items)),
         )
@@ -810,9 +816,7 @@ impl SessionRegistry {
         &self,
         cpu_resources: Option<&crate::chunk_pipeline::ChunkPipelineResources>,
         tick: u64,
-        entity_updates_per_lane: usize,
-        pathing_candidates_per_entity: usize,
-        simulation_distance: i32,
+        policy: EntitySimulationTickPolicy,
         pathing: Option<(&mc_world::WorldReadView, &mc_physics::BlockMaterialIds)>,
         profession_context: Option<(
             &mc_world::WorldReadView,
@@ -820,6 +824,11 @@ impl SessionRegistry {
             &mc_data::items::ItemRegistry,
         )>,
     ) -> Vec<EntityPhysicsQuery> {
+        let EntitySimulationTickPolicy {
+            entity_updates_per_lane,
+            pathing_candidates_per_entity,
+            simulation_distance,
+        } = policy;
         #[cfg(feature = "load-bench")]
         let goal_profile_started = std::time::Instant::now();
         if !self.has_live_sessions() {

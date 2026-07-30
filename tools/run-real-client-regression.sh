@@ -347,32 +347,32 @@ real_client_operator_list() {
 }
 
 write_real_client_server_config() {
-  local source_config target_config world_dir operators spawn_monsters_override
+  local source_config target_config world_dir operators hostile_spawn_interval_override
   source_config="$1"
   target_config="$2"
   world_dir="$3"
   operators="$(real_client_operator_list)"
   case "$AGENT_SCENARIO" in
     playable-04-twenty-minute-survival-loop)
-      spawn_monsters_override="false"
+      hostile_spawn_interval_override="0"
       ;;
     playable-*)
-      spawn_monsters_override="true"
+      hostile_spawn_interval_override="20"
       ;;
     *)
-      spawn_monsters_override=""
+      hostile_spawn_interval_override=""
       ;;
   esac
   if [[ -n "$world_dir" && "$MODE" == "run" ]]; then
     mkdir -p "$world_dir"
   fi
-  awk -v world_dir="$world_dir" -v operators="$operators" -v spawn_monsters_override="$spawn_monsters_override" '
+  awk -v world_dir="$world_dir" -v operators="$operators" -v hostile_spawn_interval_override="$hostile_spawn_interval_override" '
     BEGIN {
       section = ""
       seen_admin = 0
       seen_simulation = 0
       wrote_admin_operators = 0
-      wrote_spawn_monsters = 0
+      wrote_hostile_spawn_interval = 0
       replaced_world_dir = 0
       escaped_world_dir = world_dir
       gsub(/\\/, "\\\\", escaped_world_dir)
@@ -384,15 +384,15 @@ write_real_client_server_config() {
         wrote_admin_operators = 1
       }
     }
-    function emit_spawn_monsters_if_needed() {
-      if (section == "simulation" && spawn_monsters_override != "" && wrote_spawn_monsters == 0) {
-        print "spawn_monsters = " spawn_monsters_override
-        wrote_spawn_monsters = 1
+    function emit_hostile_spawn_interval_if_needed() {
+      if (section == "simulation" && hostile_spawn_interval_override != "" && wrote_hostile_spawn_interval == 0) {
+        print "hostile_spawn_interval_ticks = " hostile_spawn_interval_override
+        wrote_hostile_spawn_interval = 1
       }
     }
     /^[[:space:]]*\[[^]]+\][[:space:]]*$/ {
       emit_admin_operators_if_needed()
-      emit_spawn_monsters_if_needed()
+      emit_hostile_spawn_interval_if_needed()
       section = $0
       gsub(/^[[:space:]]*\[/, "", section)
       gsub(/\][[:space:]]*$/, "", section)
@@ -415,15 +415,15 @@ write_real_client_server_config() {
       wrote_admin_operators = 1
       next
     }
-    section == "simulation" && spawn_monsters_override != "" && /^[[:space:]]*spawn_monsters[[:space:]]*=/ {
-      print "spawn_monsters = " spawn_monsters_override
-      wrote_spawn_monsters = 1
+    section == "simulation" && hostile_spawn_interval_override != "" && /^[[:space:]]*hostile_spawn_interval_ticks[[:space:]]*=/ {
+      print "hostile_spawn_interval_ticks = " hostile_spawn_interval_override
+      wrote_hostile_spawn_interval = 1
       next
     }
     { print }
     END {
       emit_admin_operators_if_needed()
-      emit_spawn_monsters_if_needed()
+      emit_hostile_spawn_interval_if_needed()
       if (seen_admin == 0) {
         print ""
         print "[admin]"
@@ -433,10 +433,10 @@ write_real_client_server_config() {
         print "error: server config has no data.world_dir setting" > "/dev/stderr"
         exit 1
       }
-      if (spawn_monsters_override != "" && seen_simulation == 0) {
+      if (hostile_spawn_interval_override != "" && seen_simulation == 0) {
         print ""
         print "[simulation]"
-        print "spawn_monsters = " spawn_monsters_override
+        print "hostile_spawn_interval_ticks = " hostile_spawn_interval_override
       }
     }
   ' "$source_config" > "$target_config"

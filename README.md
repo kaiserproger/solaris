@@ -114,7 +114,8 @@ seed = 0
 [simulation]
 random_tick_speed = 5
 save_interval_ticks = 1200
-spawn_monsters = true
+friendly_spawn_interval_ticks = 400
+hostile_spawn_interval_ticks = 20
 
 [chunk_pipeline]
 chunk_send_rate = 8

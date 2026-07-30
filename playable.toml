@@ -34,9 +34,10 @@ worldgen_mode = "tellus_like"
 [simulation]
 random_tick_speed = 5
 save_interval_ticks = 1200
-# Manual play keeps natural combat. The automated P04 continuity gate writes
-# an isolated effective config with this disabled; combat has its own gate.
-spawn_monsters = true
+# Manual play keeps both natural categories. The automated P04 continuity gate
+# writes an isolated effective config with hostile attempts disabled.
+friendly_spawn_interval_ticks = 400
+hostile_spawn_interval_ticks = 20
 
 [chunk_pipeline]
 chunk_send_rate = 8

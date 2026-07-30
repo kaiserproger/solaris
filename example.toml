@@ -55,9 +55,12 @@ random_tick_speed = 5
 # Autosave cadence in game ticks. The debug manual gate uses a longer cadence
 # because large restored entity sets are expensive to serialize every second.
 save_interval_ticks = 1200
-# Vanilla-style natural hostile spawn switch. Existing hostile entities are
-# not deleted when this is false.
-spawn_monsters = true
+# Natural friendly-mob attempts: 400 ticks = once every 20 seconds. Set to 0
+# to disable only friendly natural spawning.
+friendly_spawn_interval_ticks = 400
+# Natural hostile-mob attempts: 20 ticks = once per second. Set to 0 to
+# disable only hostile natural spawning.
+hostile_spawn_interval_ticks = 20
 
 [chunk_pipeline]
 # Chunk stream policy. Worker capacity is derived automatically from the

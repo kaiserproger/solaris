@@ -15,6 +15,17 @@ pub(crate) struct EntityUpdatePressure {
     pub(crate) simulation_queue_depth: usize,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct EntityUpdateBudgetObservation {
+    pub(crate) tick_us: u64,
+    pub(crate) entity_goals_us: u64,
+    pub(crate) selected: usize,
+    pub(crate) active_population: usize,
+    pub(crate) lane_count: usize,
+    pub(crate) target_tick_us: u64,
+    pub(crate) pressure: EntityUpdatePressure,
+}
+
 impl EntityUpdatePressure {
     fn is_active(self) -> bool {
         self.reliable_drops_increased
@@ -54,14 +65,17 @@ impl EntityUpdateBudgetController {
 
     pub(crate) fn observe(
         &mut self,
-        tick_us: u64,
-        entity_goals_us: u64,
-        selected: usize,
-        active_population: usize,
-        lane_count: usize,
-        target_tick_us: u64,
-        pressure: EntityUpdatePressure,
+        observation: EntityUpdateBudgetObservation,
     ) -> EntityUpdateBudgetSnapshot {
+        let EntityUpdateBudgetObservation {
+            tick_us,
+            entity_goals_us,
+            selected,
+            active_population,
+            lane_count,
+            target_tick_us,
+            pressure,
+        } = observation;
         let lanes = lane_count.max(1);
         let freshness_total = active_population.div_ceil(MAX_ROTATION_TICKS);
         let freshness_per_lane = freshness_total.div_ceil(lanes);
@@ -210,15 +224,15 @@ mod tests {
     #[test]
     fn forty_thousand_entities_never_rotate_slower_than_two_seconds() {
         let mut controller = EntityUpdateBudgetController::default();
-        let snapshot = controller.observe(
-            330_000,
-            325_000,
-            512,
-            40_000,
-            2,
-            50_000,
-            EntityUpdatePressure::default(),
-        );
+        let snapshot = controller.observe(EntityUpdateBudgetObservation {
+            tick_us: 330_000,
+            entity_goals_us: 325_000,
+            selected: 512,
+            active_population: 40_000,
+            lane_count: 2,
+            target_tick_us: 50_000,
+            pressure: EntityUpdatePressure::default(),
+        });
 
         assert!(snapshot.effective_total >= 1_000);
         assert!(snapshot.estimated_rotation_ticks <= MAX_ROTATION_TICKS);
@@ -231,15 +245,15 @@ mod tests {
             smoothed_cost_per_update_scaled: 0,
         };
         let before = controller.configured_per_lane();
-        let snapshot = controller.observe(
-            10_000,
-            5_000,
-            256,
-            4_000,
-            4,
-            50_000,
-            EntityUpdatePressure::default(),
-        );
+        let snapshot = controller.observe(EntityUpdateBudgetObservation {
+            tick_us: 10_000,
+            entity_goals_us: 5_000,
+            selected: 256,
+            active_population: 4_000,
+            lane_count: 4,
+            target_tick_us: 50_000,
+            pressure: EntityUpdatePressure::default(),
+        });
 
         assert!(snapshot.configured_per_lane > before);
     }
@@ -247,15 +261,15 @@ mod tests {
     #[test]
     fn overloaded_ticks_reduce_budget_without_breaking_freshness_floor() {
         let mut controller = EntityUpdateBudgetController::default();
-        let snapshot = controller.observe(
-            100_000,
-            90_000,
-            2_048,
-            40_000,
-            2,
-            50_000,
-            EntityUpdatePressure::default(),
-        );
+        let snapshot = controller.observe(EntityUpdateBudgetObservation {
+            tick_us: 100_000,
+            entity_goals_us: 90_000,
+            selected: 2_048,
+            active_population: 40_000,
+            lane_count: 2,
+            target_tick_us: 50_000,
+            pressure: EntityUpdatePressure::default(),
+        });
 
         assert!(snapshot.configured_per_lane <= INITIAL_UPDATES_PER_LANE);
         assert!(snapshot.effective_total >= freshness_budget(40_000));
@@ -264,18 +278,18 @@ mod tests {
     #[test]
     fn reliable_drop_pressure_halves_budget_but_keeps_freshness() {
         let mut controller = EntityUpdateBudgetController::default();
-        let snapshot = controller.observe(
-            35_000,
-            15_000,
-            2_048,
-            40_000,
-            2,
-            50_000,
-            EntityUpdatePressure {
+        let snapshot = controller.observe(EntityUpdateBudgetObservation {
+            tick_us: 35_000,
+            entity_goals_us: 15_000,
+            selected: 2_048,
+            active_population: 40_000,
+            lane_count: 2,
+            target_tick_us: 50_000,
+            pressure: EntityUpdatePressure {
                 reliable_drops_increased: true,
                 ..EntityUpdatePressure::default()
             },
-        );
+        });
 
         assert!(snapshot.effective_total >= freshness_budget(40_000));
         assert!(snapshot.effective_total <= freshness_budget(40_000) + 24);
@@ -285,15 +299,15 @@ mod tests {
     #[test]
     fn non_entity_work_reduces_entity_allowance_before_target_tick_is_exceeded() {
         let mut controller = EntityUpdateBudgetController::default();
-        let snapshot = controller.observe(
-            44_000,
-            20_000,
-            2_048,
-            40_000,
-            2,
-            50_000,
-            EntityUpdatePressure::default(),
-        );
+        let snapshot = controller.observe(EntityUpdateBudgetObservation {
+            tick_us: 44_000,
+            entity_goals_us: 20_000,
+            selected: 2_048,
+            active_population: 40_000,
+            lane_count: 2,
+            target_tick_us: 50_000,
+            pressure: EntityUpdatePressure::default(),
+        });
 
         assert!(snapshot.configured_per_lane <= INITIAL_UPDATES_PER_LANE);
         assert!(snapshot.effective_total >= freshness_budget(40_000));

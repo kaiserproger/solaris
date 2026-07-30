@@ -18592,14 +18592,11 @@ mod tests {
                 .commit_villager_courtship_if_current(commit)
                 .unwrap()
         );
-        for (index, parent) in parents.into_iter().enumerate() {
+        for parent in parents {
             let snapshot = coordinator.snapshot(parent).unwrap().unwrap();
             let population = snapshot.retained.villager_population.unwrap();
             assert_eq!(population.food_level, 0);
-            assert_eq!(
-                population.inventory.food_points(POPULATION_FOOD),
-                if index == 0 { 12 } else { 12 }
-            );
+            assert_eq!(population.inventory.food_points(POPULATION_FOOD), 12);
             let pending = population.pending_birth.unwrap();
             assert_eq!(pending.started_tick, 10);
             assert_eq!(pending.ready_tick, 285);

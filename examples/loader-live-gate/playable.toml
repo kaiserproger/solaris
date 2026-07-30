@@ -30,7 +30,8 @@ worldgen_mode = "tellus_like"
 [simulation]
 random_tick_speed = 0
 save_interval_ticks = 1200
-spawn_monsters = false
+friendly_spawn_interval_ticks = 0
+hostile_spawn_interval_ticks = 0
 
 [chunk_pipeline]
 chunk_send_rate = 8

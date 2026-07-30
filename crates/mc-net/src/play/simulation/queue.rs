@@ -6,11 +6,17 @@ use super::{
 use crate::play::SettlementInhabitantSpawn;
 use crate::play::session::ScriptPlayerTeleportCompletion;
 use mc_script::ScriptPlayerTeleportFailure;
-use std::collections::{HashMap, VecDeque};
+#[cfg(any(test, feature = "load-bench"))]
+use std::collections::HashMap;
+use std::collections::VecDeque;
+use std::sync::Arc;
+#[cfg(test)]
+use std::sync::Condvar;
+#[cfg(any(test, feature = "load-bench"))]
+use std::sync::Mutex;
 #[cfg(test)]
 use std::sync::atomic::AtomicBool;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
-use std::sync::{Arc, Condvar, Mutex};
 use tokio::sync::{mpsc, oneshot};
 
 pub(crate) const SIMULATION_COMMAND_QUEUE_CAPACITY: usize = 1024;
@@ -108,17 +114,20 @@ pub(super) struct SimulationQueueMetrics {
     pub(super) max_batch: AtomicUsize,
     #[cfg(feature = "load-bench")]
     command_kind_stats: Mutex<HashMap<&'static str, SimulationCommandKindAccumulator>>,
+    #[cfg(test)]
     requested_herd_chunks: Mutex<HashMap<(i32, i32), Arc<HerdEnqueueClaim>>>,
     #[cfg(test)]
     herd_enqueue_probe: Mutex<Option<Arc<HerdEnqueueProbe>>>,
 }
 
+#[cfg(test)]
 #[derive(Debug)]
 struct HerdEnqueueClaim {
     outcome: Mutex<Option<Result<(), SimulationRequestError>>>,
     completed: Condvar,
 }
 
+#[cfg(test)]
 impl HerdEnqueueClaim {
     fn pending() -> Self {
         Self {
@@ -187,6 +196,7 @@ impl SimulationQueueMetrics {
             max_batch: AtomicUsize::new(0),
             #[cfg(feature = "load-bench")]
             command_kind_stats: Mutex::new(HashMap::new()),
+            #[cfg(test)]
             requested_herd_chunks: Mutex::new(HashMap::new()),
             #[cfg(test)]
             herd_enqueue_probe: Mutex::new(None),
@@ -475,6 +485,7 @@ impl SimulationHandle {
         }
     }
 
+    #[cfg(test)]
     pub(in super::super) fn ensure_chunk_herd(
         &self,
         chunk: (i32, i32),
@@ -586,6 +597,7 @@ impl SimulationOwner {
         true
     }
 
+    #[cfg(test)]
     pub(super) fn release_retryable_herd_requests(&self, chunks: &[(i32, i32)]) {
         if chunks.is_empty() {
             return;
@@ -694,6 +706,7 @@ impl SimulationOwner {
 
     fn reject_pending(&mut self, error: SimulationRequestError) {
         self.receiver.close();
+        #[cfg(test)]
         self.metrics
             .requested_herd_chunks
             .lock()

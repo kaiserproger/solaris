@@ -717,28 +717,32 @@ impl EntityRuntime {
         let Ok(mut entity) = self.world.get_entity_mut(entity) else {
             return false;
         };
-        let Some(mut transform) = entity.get_mut::<TransformState>() else {
-            return false;
-        };
-        transform.position = checkpoint.position;
-        transform.rotation = checkpoint.rotation;
-        drop(transform);
-        let Some(mut motion) = entity.get_mut::<MotionState>() else {
-            return false;
-        };
-        motion.velocity = checkpoint.velocity;
-        motion.on_ground = checkpoint.on_ground;
-        drop(motion);
-        let Some(mut lifecycle) = entity.get_mut::<LifecycleState>() else {
-            return false;
-        };
-        lifecycle.0 = checkpoint.lifecycle;
-        drop(lifecycle);
-        let Some(mut goal) = entity.get_mut::<AiGoalState>() else {
-            return false;
-        };
-        goal.0 = checkpoint.goal;
-        drop(goal);
+        {
+            let Some(mut transform) = entity.get_mut::<TransformState>() else {
+                return false;
+            };
+            transform.position = checkpoint.position;
+            transform.rotation = checkpoint.rotation;
+        }
+        {
+            let Some(mut motion) = entity.get_mut::<MotionState>() else {
+                return false;
+            };
+            motion.velocity = checkpoint.velocity;
+            motion.on_ground = checkpoint.on_ground;
+        }
+        {
+            let Some(mut lifecycle) = entity.get_mut::<LifecycleState>() else {
+                return false;
+            };
+            lifecycle.0 = checkpoint.lifecycle;
+        }
+        {
+            let Some(mut goal) = entity.get_mut::<AiGoalState>() else {
+                return false;
+            };
+            goal.0 = checkpoint.goal;
+        }
         let Some(mut path) = entity.get_mut::<AiPathState>() else {
             return false;
         };

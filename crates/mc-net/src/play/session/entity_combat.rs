@@ -481,7 +481,7 @@ pub(super) fn attack_server_entity_locked(
         dispatches.splice(0..0, health_dispatches);
         return Some(EntityAttackOutcome::Killed {
             damage,
-            entity,
+            entity: Box::new(entity),
             dispatches,
             attacker_costs: None,
         });

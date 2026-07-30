@@ -465,7 +465,8 @@ async fn water_bucket_scheduled_spread_survives_save_restart_without_duplicate_t
         chunk_pipeline: mc_net::ChunkPipelinePolicy::default(),
         random_tick: mc_net::RandomTickPolicy {
             random_tick_speed: 0,
-            spawn_monsters: false,
+            friendly_spawn_interval_ticks: 0,
+            hostile_spawn_interval_ticks: 0,
             ..mc_net::RandomTickPolicy::default()
         },
         command_permissions: mc_net::CommandPermissionConfig::new(Vec::<String>::new(), true),
@@ -592,7 +593,8 @@ async fn water_bucket_scheduled_spread_survives_save_restart_without_duplicate_t
         chunk_pipeline: mc_net::ChunkPipelinePolicy::default(),
         random_tick: mc_net::RandomTickPolicy {
             random_tick_speed: 0,
-            spawn_monsters: false,
+            friendly_spawn_interval_ticks: 0,
+            hostile_spawn_interval_ticks: 0,
             ..mc_net::RandomTickPolicy::default()
         },
         command_permissions: mc_net::CommandPermissionConfig::new(Vec::<String>::new(), true),

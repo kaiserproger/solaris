@@ -90,6 +90,25 @@ fn chunk_and_entity_publications_follow_exact_membership() {
 }
 
 #[test]
+fn bounded_chunk_candidate_projection_excludes_unselected_chunks() {
+    let inputs = SimulationInputPublication::default();
+    let selected = (2, -1);
+    let neighbour = (3, -1);
+    let distant = (20, 20);
+    let selected_entity = EntityId(7);
+    let neighbour_entity = EntityId(8);
+    let distant_entity = EntityId(9);
+    inputs.track_entity(selected, selected_entity);
+    inputs.track_entity(neighbour, neighbour_entity);
+    inputs.track_entity(distant, distant_entity);
+
+    assert_eq!(
+        inputs.entity_candidates_in_chunks(&HashSet::from([selected, neighbour])),
+        HashSet::from([selected_entity, neighbour_entity])
+    );
+}
+
+#[test]
 fn terrain_pathing_publication_applies_batched_add_and_remove() {
     let inputs = SimulationInputPublication::default();
     let first = EntityId(3);

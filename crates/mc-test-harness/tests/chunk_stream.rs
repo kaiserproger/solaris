@@ -511,7 +511,8 @@ async fn reconnect_during_chunk_prepare_receives_only_the_new_exact_view() {
         biome_spawns: Arc::new(mc_data::biomes::BiomeSpawnRules::default()),
         chunk_pipeline: policy,
         random_tick: mc_net::RandomTickPolicy {
-            spawn_monsters: false,
+            friendly_spawn_interval_ticks: 0,
+            hostile_spawn_interval_ticks: 0,
             ..mc_net::RandomTickPolicy::default()
         },
         command_permissions: mc_net::CommandPermissionConfig::new(Vec::<String>::new(), true),
