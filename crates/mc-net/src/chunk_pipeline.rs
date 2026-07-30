@@ -142,6 +142,7 @@ struct ChunkPipelineCancellationMetrics {
     cancelled_streams: AtomicUsize,
     cancelled_requests: AtomicUsize,
     stale_results_rejected: AtomicUsize,
+    changed: Notify,
 }
 
 pub(crate) struct ChunkPipelinePermit {
@@ -213,6 +214,22 @@ impl ChunkPipelineResourceMetrics {
         }
     }
 
+    pub async fn wait_for_stream_cancellation_after(
+        &self,
+        previous_cancelled_streams: usize,
+    ) -> ChunkPipelineCancellationSnapshot {
+        loop {
+            let changed = self.cancellations.changed.notified();
+            tokio::pin!(changed);
+            changed.as_mut().enable();
+            let snapshot = self.cancellation_snapshot();
+            if snapshot.cancelled_streams > previous_cancelled_streams {
+                return snapshot;
+            }
+            changed.await;
+        }
+    }
+
     pub(crate) fn record_stop_reason(&self, reason: ChunkPipelineStopReason) {
         self.stop_reasons
             .counter(reason)
@@ -229,11 +246,12 @@ impl ChunkPipelineResourceMetrics {
             return;
         }
         self.cancellations
-            .cancelled_streams
-            .fetch_add(1, Ordering::AcqRel);
-        self.cancellations
             .cancelled_requests
-            .fetch_add(requests, Ordering::AcqRel);
+            .fetch_add(requests, Ordering::Relaxed);
+        self.cancellations
+            .cancelled_streams
+            .fetch_add(1, Ordering::Release);
+        self.cancellations.changed.notify_waiters();
     }
 
     pub(crate) fn record_stale_result_rejection(&self) {
@@ -803,6 +821,53 @@ mod tests {
         resources.observe_result_queue_depth(3);
 
         assert_eq!(metrics.snapshot().max_result_queue_depth, 7);
+    }
+
+    #[tokio::test]
+    async fn cancellation_wait_wakes_a_registered_waiter() {
+        let metrics = ChunkPipelineResourceMetrics::default();
+        let mut waiting = std::pin::pin!(metrics.wait_for_stream_cancellation_after(0));
+        std::future::poll_fn(|cx| {
+            assert!(
+                std::future::Future::poll(waiting.as_mut(), cx).is_pending(),
+                "wait must remain pending before a cancellation"
+            );
+            std::task::Poll::Ready(())
+        })
+        .await;
+
+        metrics.record_stream_cancellation(3);
+
+        assert_eq!(
+            tokio::time::timeout(std::time::Duration::from_secs(1), waiting)
+                .await
+                .expect("recording a stream cancellation must wake the waiter"),
+            ChunkPipelineCancellationSnapshot {
+                cancelled_streams: 1,
+                cancelled_requests: 3,
+                stale_results_rejected: 0,
+            }
+        );
+    }
+
+    #[tokio::test]
+    async fn cancellation_wait_observes_requests_recorded_before_registration() {
+        let metrics = ChunkPipelineResourceMetrics::default();
+        metrics.record_stream_cancellation(4);
+
+        assert_eq!(
+            tokio::time::timeout(
+                std::time::Duration::from_secs(1),
+                metrics.wait_for_stream_cancellation_after(0),
+            )
+            .await
+            .expect("an earlier stream cancellation must remain observable"),
+            ChunkPipelineCancellationSnapshot {
+                cancelled_streams: 1,
+                cancelled_requests: 4,
+                stale_results_rejected: 0,
+            }
+        );
     }
 
     #[tokio::test]

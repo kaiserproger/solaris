@@ -22,18 +22,18 @@ replacement-readiness claims.
 
 ## Active Checkpoint
 
-Next: replace `load_scenarios::wait_for_chunk_cancellation` snapshot/deadline/
-yield polling with an exact chunk-stream cancellation notification. Keep its
-timeout only as a fail-only watchdog and do not change cancellation semantics
-or unrelated load-scenario behavior.
+Next: revalidate the pending downhill-drainage feature commit `7054417` against
+the current tree and integrate only that revision-10 worldgen vertical. Keep
+rendered mosaics, the seed-`712816` owner playtest, restart, and release-host
+throughput gates for their own checkpoints.
 
-The container-support chunk-pipeline idle wait is closed. The harness now
-retains a narrow handle to the existing production idle barrier before
-`BoundServer::serve` consumes the server. That barrier registers its
-notification before checking IO, CPU, prepare-task, and prepare-request state;
-the five-second timeout is only a fail watchdog around the exact future.
+The load-scenario chunk-cancellation wait is closed. Pipeline metrics now
+register a cancellation notification before checking the authoritative stream
+counter. Request totals publish before the stream counter with release/acquire
+ordering, so a completed wait observes the full cancellation snapshot. The
+five-second harness timeout remains only a fail watchdog.
 Evidence is in
-[`../evidence/mc-test-harness-chunk-pipeline-idle-wait.md`](../evidence/mc-test-harness-chunk-pipeline-idle-wait.md).
+[`../evidence/mc-test-harness-chunk-cancellation-wait.md`](../evidence/mc-test-harness-chunk-cancellation-wait.md).
 No graphical or gameplay-readiness claim is implied.
 
 ## Recent Checkpoints — through 2026-07-30

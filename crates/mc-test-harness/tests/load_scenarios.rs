@@ -4663,17 +4663,21 @@ async fn wait_for_chunk_cancellation(
     server: &LoadServer,
     before: mc_net::ChunkPipelineCancellationSnapshot,
 ) -> mc_net::ChunkPipelineCancellationSnapshot {
-    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
-    loop {
-        let after = server.chunk_pipeline_metrics.cancellation_snapshot();
-        if after.cancelled_streams > before.cancelled_streams {
-            return after;
+    match tokio::time::timeout(
+        Duration::from_secs(5),
+        server
+            .chunk_pipeline_metrics
+            .wait_for_stream_cancellation_after(before.cancelled_streams),
+    )
+    .await
+    {
+        Ok(after) => after,
+        Err(_) => {
+            let after = server.chunk_pipeline_metrics.cancellation_snapshot();
+            panic!(
+                "timed out waiting for chunk-stream cancellation: before={before:?} after={after:?}"
+            );
         }
-        assert!(
-            tokio::time::Instant::now() < deadline,
-            "timed out waiting for chunk-stream cancellation: before={before:?} after={after:?}"
-        );
-        tokio::task::yield_now().await;
     }
 }
 
