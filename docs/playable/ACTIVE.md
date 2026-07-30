@@ -22,19 +22,18 @@ replacement-readiness claims.
 
 ## Active Checkpoint
 
-Next autonomous goal checkpoint: route `playable`; mechanically move the full
-twelve-test bed interaction and sleep-planning class beginning with the
-`bed_occupancy_test_registry` helper and
-`bed_respawn_pose_uses_block_above_bed`, and ending with
-`sleep_skip_targets_the_next_morning`, out of aggregate
+Next autonomous goal checkpoint: route `playable`; mechanically move the
+two-test common-container and cauldron safe-interaction class beginning with
+`common_container_paper_cuts_resolve_to_existing_menus` and ending with
+`cauldron_variants_are_safe_interaction_targets` out of aggregate
 `crates/mc-net/src/play/tests.rs` into a focused sibling module. Preserve every
-test and production behavior, leave the preceding block-placement/NBT class
-and following `common_container_paper_cuts_resolve_to_existing_menus` test in
-their current modules, and use explicit imports rather than a new
-`use super::*`. The twelve-test block-placement/NBT class has already moved to
-`crates/mc-net/src/play/tests/block_placement_nbt.rs`; its concentration and
-validation are recorded in
-[`../evidence/mc-net-block-placement-nbt-test-extraction.md`](../evidence/mc-net-block-placement-nbt-test-extraction.md).
+test and production behavior, leave the preceding bed/sleep class and
+following `interaction_state_for_items` helper in their current modules, and
+use explicit imports rather than a new `use super::*`. The twelve-test bed
+interaction and sleep-planning class has already moved to
+`crates/mc-net/src/play/tests/bed_sleep.rs`; its concentration and validation
+are recorded in
+[`../evidence/mc-net-bed-sleep-test-extraction.md`](../evidence/mc-net-bed-sleep-test-extraction.md).
 The owner-run subjective fresh-world seed-`712816` playtest and
 release-candidate performance gates remain queued at their declared
 boundaries.

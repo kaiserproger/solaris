@@ -87,6 +87,11 @@ not replace functional, package, workspace, or real-client gates.
    lives in focused `play/tests/block_placement_nbt.rs`; its retained
    door/stair/slab/torch/sign/campfire coverage is recorded in
    [`evidence/mc-net-block-placement-nbt-test-extraction.md`](evidence/mc-net-block-placement-nbt-test-extraction.md).
+   The following twelve-test bed interaction and sleep-planning class now
+   lives in focused `play/tests/bed_sleep.rs`; its retained occupancy, ABA,
+   obstruction, monster, wake-position, and morning-skip coverage is recorded
+   in
+   [`evidence/mc-net-bed-sleep-test-extraction.md`](evidence/mc-net-bed-sleep-test-extraction.md).
 4. [ ] Separate behavioral tests from structural tripwires. Structural checks may
    enforce crate ownership and dependency direction, but may not assert Rust
    statement order or source-text layout.
