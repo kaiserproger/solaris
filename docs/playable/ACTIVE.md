@@ -23,20 +23,22 @@ replacement-readiness claims.
 ## Active Checkpoint
 
 Next autonomous goal checkpoint: route `playable`; mechanically move the
-`five_bookshelves_keep_efficiency_clue_and_add_fortune_to_pickaxes`
+`enchanting_data_exposes_the_supported_efficiency_offer`
 test from aggregate `crates/mc-net/src/play/tests.rs` to a focused sibling
 module. Preserve the Solaris-required items and item-facts registries;
-`minecraft:stone_pickaxe` and `minecraft:lapis_lazuli` ids;
-`minecraft:fortune`; window id `7`, position `(0, 0, 0)`, and pickaxe input;
-XP level `10`, progress `0.25`, total `160`, and seed `123`;
-five-book values at indices `1`, `5`, and `8` equal to `(1, 10)`, `(5, 8)`,
-and `(8, 2)`; candidate application from `enchanting_offer(5, 1)`; exact
-ordered enchantments `minecraft:efficiency` level `2` then `minecraft:fortune`
-level `2`; empty lapis input; final XP level `8`, progress `0.25`, and total
-`160`; and changed seed. Leave the preceding
-`enchanting_data_exposes_the_supported_efficiency_offer` test and following
-`state` helper aggregate-owned, and use explicit imports rather than a new
-`use super::*`.
+`minecraft:stone_pickaxe` id; window id `7`, position `(0, 0, 0)`, and
+pickaxe input; XP seed `123` with every other field defaulted; zero-bookshelf
+data values exactly `[(0, 1), (1, 0), (2, 0), (3, 123), (4, 8), (5, -1),
+(6, -1), (7, 1), (8, -1), (9, -1)]`. Leave the preceding
+`enchanting_selection_consumes_lapis_and_level_but_preserves_total_xp` test
+and following `state` helper aggregate-owned, and use explicit imports rather
+than a new `use super::*`.
+
+The complete five-bookshelf fortune test has moved to
+`crates/mc-net/src/play/tests/enchanting_fortune.rs`. Its unchanged
+registries, pickaxe/lapis/fortune fixtures, offer clues, ordered enchantment
+result, consumed lapis, XP, and changed seed are recorded in
+[`../evidence/mc-net-enchanting-fortune-test-extraction.md`](../evidence/mc-net-enchanting-fortune-test-extraction.md).
 
 The complete fifteen-bookshelf silk-touch test has moved to
 `crates/mc-net/src/play/tests/enchanting_silk_touch.rs`. Its unchanged
