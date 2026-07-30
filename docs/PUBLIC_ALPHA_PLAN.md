@@ -450,6 +450,11 @@ not replace functional, package, workspace, or real-client gates.
    consumption, exact efficiency result, preserved total XP, and changed seed
    are recorded in
    [`evidence/mc-net-enchanting-selection-test-extraction.md`](evidence/mc-net-enchanting-selection-test-extraction.md).
+   The following stale inventory-drag resync test now lives in focused
+   `play/tests/stale_inventory_drag.rs`; its pending owner commit, exact
+   authoritative inventory recovery, one resync packet, and no-publication
+   boundary are recorded in
+   [`evidence/mc-net-stale-inventory-drag-test-extraction.md`](evidence/mc-net-stale-inventory-drag-test-extraction.md).
 4. [ ] Separate behavioral tests from structural tripwires. Structural checks may
    enforce crate ownership and dependency direction, but may not assert Rust
    statement order or source-text layout.

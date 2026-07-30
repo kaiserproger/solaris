@@ -23,24 +23,27 @@ replacement-readiness claims.
 ## Active Checkpoint
 
 Next autonomous goal checkpoint: route `playable`; mechanically move the
-`stale_inventory_drag_resyncs_exact_owner_state_without_loss_or_publication`
+`rejected_inventory_drag_resyncs_without_mutation_or_owner_publication`
 test from aggregate `crates/mc-net/src/play/tests.rs` to a focused sibling
 module. Preserve the dirt item report at protocol id `10`; carried dirt count
-`3`; pose `(0.5, 64.0, 0.5)`; `StaleInventoryDrag` offline profile; capacity
-`8` outbound channel; registered session and player persistence; owner
-simulation/probe; default XP; script player identity/context; actual hashed
-carried stack with item id `10`, count `3`,
-and empty component hashes; two opening quick-craft clicks `(0, -999)` and
-`(1, 9)` with no immediate write; pending closing click `(-999, 2)` and queued
-depth `1`; owner-side replacement with slot `10` holding item `10` count `1`
-and carried item `10` count `2`; one processed owner command; final slot `9`
-empty, slot `10` holding item `10` count `1`, carried item `10` count `2`, and
-total count `3`; one container-content packet with state id `1` and exact
-items/carried state; empty outbound queue; and no persisted entity records.
-Leave the preceding
-`rejected_inventory_drag_resyncs_without_mutation_or_owner_publication` test
-and following `state` helper aggregate-owned, and use explicit imports rather
-than a new `use super::*`.
+`3`; cloned pre-click inventory and carried state; actual hashed carried stack
+with item id `10`, count `3`, and empty component hashes; script player
+identity/context; default XP; opening and rejected quick-craft clicks
+`(0, -999)` and `(2, -999)` in survival with pose `(0.5, 64.0, 0.5)`,
+container id `0`, state id `1`, empty changed slots, and no scripts/events;
+unchanged inventory slots and carried state; simulation depth `0`; and exactly
+one container-content packet containing the pre-click wire inventory and
+carried item. Leave the preceding
+`only_vanilla_outside_slot_sentinel_can_drop_the_cursor` test and following
+`state` helper aggregate-owned, and use explicit imports rather than a new
+`use super::*`.
+
+The complete stale inventory-drag resync test has moved to
+`crates/mc-net/src/play/tests/stale_inventory_drag.rs`. Its unchanged
+session/persistence fixtures, queued owner boundary, exact authoritative
+inventory recovery, single resync packet, and no-publication assertions are
+recorded in
+[`../evidence/mc-net-stale-inventory-drag-test-extraction.md`](../evidence/mc-net-stale-inventory-drag-test-extraction.md).
 
 The complete enchanting-selection test has moved to
 `crates/mc-net/src/play/tests/enchanting_selection.rs`. Its unchanged
