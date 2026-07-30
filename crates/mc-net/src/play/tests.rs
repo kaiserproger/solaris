@@ -35,6 +35,7 @@ mod enchanting_recipe_settlement;
 mod falling_blocks;
 mod fluid_runtime;
 mod furnace;
+mod gamemode_commands;
 mod inventory_settlement;
 mod item_block_mapping;
 mod leaf_distance_ticks;
@@ -3436,37 +3437,6 @@ fn arrow_launch_uses_player_look_direction_and_draw_power() {
     assert!((velocity.x + 1.299_038_105_676_658).abs() < 0.000_001);
     assert!((velocity.y - 0.75).abs() < 0.000_001);
     assert!(velocity.z.abs() < 0.000_001);
-}
-
-#[test]
-fn gamemode_command_parses_names_and_numeric_modes() {
-    assert_eq!(
-        parse_gamemode_command("gamemode survival"),
-        Some(GameMode::Survival)
-    );
-    assert_eq!(
-        parse_gamemode_command("gamemode creative"),
-        Some(GameMode::Creative)
-    );
-    assert_eq!(
-        parse_gamemode_command("gamemode adventure"),
-        Some(GameMode::Adventure)
-    );
-    assert_eq!(
-        parse_gamemode_command("gamemode spectator"),
-        Some(GameMode::Spectator)
-    );
-    assert_eq!(
-        parse_gamemode_command("gamemode 1"),
-        Some(GameMode::Creative)
-    );
-}
-
-#[test]
-fn gamemode_command_rejects_unknown_or_extra_args() {
-    assert_eq!(parse_gamemode_command("time set day"), None);
-    assert_eq!(parse_gamemode_command("gamemode nope"), None);
-    assert_eq!(parse_gamemode_command("gamemode creative other"), None);
 }
 
 fn button_test_registry() -> mc_world::BlockRegistry {

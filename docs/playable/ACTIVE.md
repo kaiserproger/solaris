@@ -23,14 +23,20 @@ replacement-readiness claims.
 ## Active Checkpoint
 
 Next autonomous goal checkpoint: route `playable`; mechanically move the
-complete two-test game-mode command parser class, beginning with
-`gamemode_command_parses_names_and_numeric_modes` and ending with
-`gamemode_command_rejects_unknown_or_extra_args`, out of aggregate
-`crates/mc-net/src/play/tests.rs` into a focused sibling module. Preserve every
-assertion and production behavior, leave the preceding
-`arrow_launch_uses_player_look_direction_and_draw_power` test and following
+`arrow_launch_uses_player_look_direction_and_draw_power` test out of aggregate
+`crates/mc-net/src/play/tests.rs` into a focused sibling module. Preserve its
+complete spawn-position and draw-power velocity matrix and production
+behavior, leave the preceding
+`entity_tick_cadence_matches_vanilla_cow_tracking` test and following
 `button_test_registry` helper aggregate-owned, and use explicit imports rather
 than a new `use super::*`.
+
+The complete two-test game-mode command parser class, beginning with
+`gamemode_command_parses_names_and_numeric_modes` and ending with
+`gamemode_command_rejects_unknown_or_extra_args`, has moved to
+`crates/mc-net/src/play/tests/gamemode_commands.rs`. Its named, numeric,
+wrong-root, unknown, and extra-argument coverage is recorded in
+[`../evidence/mc-net-gamemode-commands-test-extraction.md`](../evidence/mc-net-gamemode-commands-test-extraction.md).
 
 The complete client-view-distance server-policy clamp matrix has moved to
 `crates/mc-net/src/play/tests/client_view_distance.rs`. Its server-cap,

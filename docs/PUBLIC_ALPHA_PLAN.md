@@ -205,6 +205,10 @@ not replace functional, package, workspace, or real-client gates.
    `play/tests/client_view_distance.rs`; its server-cap, client-cap, minimum,
    negative-input, and absolute-maximum coverage is recorded in
    [`evidence/mc-net-client-view-distance-test-extraction.md`](evidence/mc-net-client-view-distance-test-extraction.md).
+   The following two-test game-mode command parser class now lives in focused
+   `play/tests/gamemode_commands.rs`; its named, numeric, wrong-root, unknown,
+   and extra-argument coverage is recorded in
+   [`evidence/mc-net-gamemode-commands-test-extraction.md`](evidence/mc-net-gamemode-commands-test-extraction.md).
 4. [ ] Separate behavioral tests from structural tripwires. Structural checks may
    enforce crate ownership and dependency direction, but may not assert Rust
    statement order or source-text layout.
