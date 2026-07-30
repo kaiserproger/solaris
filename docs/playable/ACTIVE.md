@@ -23,16 +23,22 @@ replacement-readiness claims.
 ## Active Checkpoint
 
 Next autonomous goal checkpoint: route `playable`; mechanically move the
-`dense_entity_simulation_rotates_lane_sized_cohorts`
+`ordinary_entity_goal_updates_keep_full_tick_cadence`
 test from aggregate `crates/mc-net/src/play/tests.rs` to a focused sibling
-module. Preserve limit `512`; entity count `5_120`; sequential `EntityId`
-construction through checked `i32` conversion and `HashSet` collection; zeroed
-visit counts; ticks `0..10`; `bounded_entity_ids_due_for_tick` with the exact
-tick and limit; exactly `512` due entities each tick; checked entity-id index
-conversion; and the final assertion that every entity is visited exactly once.
-Leave the preceding `ordinary_entity_goal_updates_keep_full_tick_cadence` test
-and following `state` helper aggregate-owned, and use explicit imports rather
-than a new `use super::*`.
+module. Preserve entity count `ENTITY_GOAL_UPDATES_PER_TICK + 88`; sequential
+`EntityId` construction through checked `i32` conversion and `HashSet`
+collection; `entity_goal_ids_due_for_tick` at tick `7` with the dense flag
+`false`; and equality of the complete due set with the original entity set.
+Leave the preceding
+`dense_entity_simulation_cohorts_are_stratified_across_regions` test and
+following `state` helper aggregate-owned, and use explicit imports rather than
+a new `use super::*`.
+
+The complete dense entity-simulation cohort test has moved to
+`crates/mc-net/src/play/tests/dense_entity_simulation_cohorts.rs`. Its
+unchanged lane limit, ten-turn rotation, exact per-turn cohort size, and
+exactly-once entity coverage are recorded in
+[`../evidence/mc-net-dense-entity-simulation-cohorts-test-extraction.md`](../evidence/mc-net-dense-entity-simulation-cohorts-test-extraction.md).
 
 The complete outside-slot sentinel test has moved to
 `crates/mc-net/src/play/tests/outside_slot_sentinel.rs`. Its unchanged click

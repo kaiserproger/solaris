@@ -463,6 +463,10 @@ not replace functional, package, workspace, or real-client gates.
    `play/tests/outside_slot_sentinel.rs`; its exact `-999` vanilla
    classification and malformed negative-slot rejection are recorded in
    [`evidence/mc-net-outside-slot-sentinel-test-extraction.md`](evidence/mc-net-outside-slot-sentinel-test-extraction.md).
+   The following dense entity-simulation cohort test now lives in focused
+   `play/tests/dense_entity_simulation_cohorts.rs`; its lane limit, ten-turn
+   rotation, and exactly-once coverage are recorded in
+   [`evidence/mc-net-dense-entity-simulation-cohorts-test-extraction.md`](evidence/mc-net-dense-entity-simulation-cohorts-test-extraction.md).
 4. [ ] Separate behavioral tests from structural tripwires. Structural checks may
    enforce crate ownership and dependency direction, but may not assert Rust
    statement order or source-text layout.

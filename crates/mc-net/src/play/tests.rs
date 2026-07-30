@@ -39,6 +39,7 @@ mod container_title_nbt;
 mod crafting_table_open;
 mod death_xp;
 mod debug_commands;
+mod dense_entity_simulation_cohorts;
 mod direct_response_write_stall;
 mod door_toggles;
 mod enchanting_bookshelf_geometry;
@@ -875,25 +876,6 @@ fn ordinary_entity_goal_updates_keep_full_tick_cadence() {
         .collect::<HashSet<_>>();
 
     assert_eq!(entity_goal_ids_due_for_tick(&entities, 7, false), entities);
-}
-
-#[test]
-fn dense_entity_simulation_rotates_lane_sized_cohorts() {
-    let limit = 512;
-    let entity_count = limit * 10;
-    let entities = (0..entity_count)
-        .map(|id| EntityId(i32::try_from(id).unwrap()))
-        .collect::<HashSet<_>>();
-    let mut visits = vec![0; entity_count];
-
-    for tick in 0..10 {
-        let due = bounded_entity_ids_due_for_tick(&entities, tick, limit);
-        assert_eq!(due.len(), limit);
-        for entity in due {
-            visits[usize::try_from(entity.0).unwrap()] += 1;
-        }
-    }
-    assert!(visits.into_iter().all(|visits| visits == 1));
 }
 
 fn state(id: u32, default: bool, properties: &[(&str, &str)]) -> BlockStateReport {
