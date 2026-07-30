@@ -433,6 +433,10 @@ not replace functional, package, workspace, or real-client gates.
    first-slot efficiency result, remaining lapis, and XP result are recorded
    in
    [`evidence/mc-net-enchanting-first-pickaxe-offer-test-extraction.md`](evidence/mc-net-enchanting-first-pickaxe-offer-test-extraction.md).
+   The following fifteen-bookshelf silk-touch test now lives in focused
+   `play/tests/enchanting_silk_touch.rs`; its offer clues, ordered efficiency
+   and silk-touch result, consumed lapis, XP, and changed seed are recorded in
+   [`evidence/mc-net-enchanting-silk-touch-test-extraction.md`](evidence/mc-net-enchanting-silk-touch-test-extraction.md).
 4. [ ] Separate behavioral tests from structural tripwires. Structural checks may
    enforce crate ownership and dependency direction, but may not assert Rust
    statement order or source-text layout.
