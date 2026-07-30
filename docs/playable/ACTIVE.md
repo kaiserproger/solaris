@@ -23,16 +23,21 @@ replacement-readiness claims.
 ## Active Checkpoint
 
 Next autonomous goal checkpoint: route `playable`; mechanically move the
-`collision_correction_still_rejects_entry_from_free_space_into_solid`
+`collision_correction_does_not_teleport_back_into_existing_solid_overlap`
 test from aggregate `crates/mc-net/src/play/tests.rs` to a focused sibling
 module.
-Preserve its exact block fixture at `(0, 64, 0)`, old free pose
-`(1.50, 64.0, 0.50)`, new colliding pose `(0.50, 64.0, 0.50)`, teleport id
-transition `2 -> 3`, single position-sync packet, pending teleport id `2`, and
-production behavior. Leave the preceding
-`collision_correction_does_not_teleport_back_into_existing_solid_overlap` test
-and following `vanilla_collision_test_state` helper aggregate-owned, and use
-explicit imports rather than a new `use super::*`.
+Preserve its exact block fixture at `(0, 64, 0)`, old already-colliding pose
+`(0.50, 64.0, 0.50)`, new escaping pose `(0.55, 64.0, 0.50)`, unchanged
+teleport id `2`, empty writer, absent pending teleport, and production
+behavior. Leave the preceding `insert_fluid_test_chunk` helper and following
+`vanilla_collision_test_state` helper aggregate-owned, and use explicit
+imports rather than a new `use super::*`.
+
+The complete free-to-solid collision-correction test has moved to
+`crates/mc-net/src/play/tests/collision_correction_entry.rs`. Its unchanged
+block fixture, free and colliding poses, single position-sync packet, pending
+teleport id, and `2 -> 3` teleport-id transition are recorded in
+[`../evidence/mc-net-collision-correction-entry-test-extraction.md`](../evidence/mc-net-collision-correction-entry-test-extraction.md).
 
 The complete unrelated overlapping-state collision test has moved to
 `crates/mc-net/src/play/tests/unrelated_state_collision.rs`. Its unchanged

@@ -311,6 +311,11 @@ not replace functional, package, workspace, or real-client gates.
    `play/tests/unrelated_state_collision.rs`; its covered numeric state id,
    mismatched synthetic identity, and retained full-cube collision are recorded
    in [`evidence/mc-net-unrelated-state-collision-test-extraction.md`](evidence/mc-net-unrelated-state-collision-test-extraction.md).
+   The following free-to-solid collision-correction test now lives in focused
+   `play/tests/collision_correction_entry.rs`; its unchanged block fixture,
+   free and colliding poses, single position-sync packet, pending teleport, and
+   `2 -> 3` teleport-id transition are recorded in
+   [`evidence/mc-net-collision-correction-entry-test-extraction.md`](evidence/mc-net-collision-correction-entry-test-extraction.md).
 4. [ ] Separate behavioral tests from structural tripwires. Structural checks may
    enforce crate ownership and dependency direction, but may not assert Rust
    statement order or source-text layout.
