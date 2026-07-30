@@ -263,6 +263,12 @@ Benchmark reproduction happens at that feature boundary, not after every edit:
   seeding/readiness surface, and timing diagnostics are owned by the explicit
   feature suite and recorded in
   [`evidence/mc-net-load-bench-tests.md`](evidence/mc-net-load-bench-tests.md).
+- [x] Inventory the manual and graphical client gate class. The 108
+  `manual-pending` manifest scenarios are fail-closed declarations with
+  agent-run real-client paths, not 108 owner-only tests. The exact graphical,
+  unmapped M94, release-candidate, and subjective owner gates remain open with
+  owners, prerequisites, and close conditions recorded in
+  [`evidence/manual-client-test-gates.md`](evidence/manual-client-test-gates.md).
 - [x] Record the exact local 26.1.2 world-clock oracle in
   [`evidence/world-clock-26.1.2.md`](evidence/world-clock-26.1.2.md).
 - [x] Implement the typed world-clock map, separating monotonic `game_time` from
