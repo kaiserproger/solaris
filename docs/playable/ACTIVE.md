@@ -23,19 +23,25 @@ replacement-readiness claims.
 ## Active Checkpoint
 
 Next autonomous goal checkpoint: route `playable`; mechanically move the
-`fifteen_bookshelves_keep_efficiency_as_the_first_pickaxe_offer`
+`fifteen_bookshelves_keep_efficiency_clue_and_add_silk_touch_to_pickaxes`
 test from aggregate `crates/mc-net/src/play/tests.rs` to a focused sibling
 module. Preserve the Solaris-required items and item-facts registries;
-stone-pickaxe and lapis ids; window id/position and pickaxe input; XP level
-`30`, progress `0.25`, total `1_395`, and seed `123`; the exact
-fifteen-bookshelf values `(0, 1)`, `(1, 10)`, `(2, 30)`, `(3, 123)`,
-`(4..=6, 8)`, `(7, 1)`, `(8, 2)`, and `(9, 3)`; candidate application from
-`enchanting_offer(15, 0)`; exactly `minecraft:efficiency` level `1`; remaining
-lapis count `2`; and final XP level `29`, progress `0.25`, and total `1_395`.
-Leave the preceding
-`fifteen_bookshelves_keep_efficiency_clue_and_add_silk_touch_to_pickaxes` test
-and following `state` helper aggregate-owned, and use explicit imports rather
-than a new `use super::*`.
+stone-pickaxe and lapis ids; `minecraft:silk_touch`; window id/position and
+pickaxe input; XP level `30`, progress `0.25`, total `1_395`, and seed `123`;
+fifteen-book values at indices `2`, `6`, and `9` equal to `(2, 30)`, `(6, 8)`,
+and `(9, 3)`; candidate application from `enchanting_offer(15, 2)`; exact
+ordered enchantments `minecraft:efficiency` level `3` then
+`minecraft:silk_touch` level `1`; empty lapis input; final XP level `27`,
+progress `0.25`, and total `1_395`; and changed seed. Leave the preceding
+`five_bookshelves_keep_efficiency_clue_and_add_fortune_to_pickaxes` test and
+following `state` helper aggregate-owned, and use explicit imports rather than
+a new `use super::*`.
+
+The complete first pickaxe-offer test has moved to
+`crates/mc-net/src/play/tests/enchanting_first_pickaxe_offer.rs`. Its unchanged
+registries, pickaxe/lapis fixtures, fifteen-book offer data, first-slot
+efficiency result, remaining lapis, and final XP are recorded in
+[`../evidence/mc-net-enchanting-first-pickaxe-offer-test-extraction.md`](../evidence/mc-net-enchanting-first-pickaxe-offer-test-extraction.md).
 
 The complete fifteen-bookshelf sharpness test has moved to
 `crates/mc-net/src/play/tests/enchanting_sharpness.rs`. Its unchanged

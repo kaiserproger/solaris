@@ -428,6 +428,11 @@ not replace functional, package, workspace, or real-client gates.
    offer data, applied enchantment, lapis consumption, and XP result are
    recorded in
    [`evidence/mc-net-enchanting-sharpness-test-extraction.md`](evidence/mc-net-enchanting-sharpness-test-extraction.md).
+   The following first pickaxe-offer test now lives in focused
+   `play/tests/enchanting_first_pickaxe_offer.rs`; its exact offer data,
+   first-slot efficiency result, remaining lapis, and XP result are recorded
+   in
+   [`evidence/mc-net-enchanting-first-pickaxe-offer-test-extraction.md`](evidence/mc-net-enchanting-first-pickaxe-offer-test-extraction.md).
 4. [ ] Separate behavioral tests from structural tripwires. Structural checks may
    enforce crate ownership and dependency direction, but may not assert Rust
    statement order or source-text layout.
