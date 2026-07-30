@@ -5,6 +5,8 @@ use std::task::Poll;
 use mc_data::item_components::ItemFactsTable;
 use mc_data::items::{ItemRegistry, ItemReport};
 use mc_protocol::codec::Identifier;
+use mc_protocol::frame::Compression;
+use mc_protocol::packets::Packet;
 use mc_protocol::packets::play::{ContainerInput, ItemStack, ServerboundContainerClick};
 use mc_world::{BlockStateId, Chunk, ChunkPos};
 use tokio::sync::mpsc;
@@ -16,11 +18,11 @@ use crate::play::tests::{
     interaction_state_for_items, simple_block, spawn_test_simulation_owner,
 };
 use crate::play::{
-    ActiveContainer, ActiveShield, InteractionState, PlayerPersistedState, PlayerPose, SessionId,
-    StonecutterWindow, apply_stonecutter_quick_move_click, handle_stonecutter_container_click,
-    open_stonecutter_container, select_stonecutter_recipe, settle_disconnected_inventory,
-    simulation_channel, stonecutter_input_from_projection, stonecutter_input_projection,
-    store_active_container,
+    ActiveContainer, ActiveShield, InteractionState, PlayerPersistedState, PlayerPose,
+    STONECUTTER_MENU_TYPE_ID, SessionId, StonecutterWindow, apply_stonecutter_quick_move_click,
+    handle_stonecutter_container_click, open_stonecutter_container, select_stonecutter_recipe,
+    settle_disconnected_inventory, simulation_channel, stonecutter_input_from_projection,
+    stonecutter_input_projection, store_active_container,
 };
 
 pub(super) fn stonecutter_test_recipe() -> mc_data::recipes::Recipe {
@@ -63,6 +65,75 @@ pub(super) fn stonecutter_test_items() -> Arc<ItemRegistry> {
             protocol_id: 12,
         },
     ]))
+}
+
+#[tokio::test]
+async fn stonecutter_open_uses_proved_menu_type_and_published_world_view() {
+    let blocks = Arc::new(
+        mc_world::BlockRegistry::from_report(&[
+            simple_block(0, "minecraft:air"),
+            simple_block(1, "minecraft:stonecutter"),
+        ])
+        .unwrap(),
+    );
+    let mut state = interaction_state_for_blocks(blocks);
+    state.items = stonecutter_test_items();
+    state.recipes.push(stonecutter_test_recipe());
+    let position = mc_world::BlockPos { x: 1, y: 64, z: 1 };
+    {
+        let mut storage = state.world.lock().await;
+        let chunk = ChunkPos { x: 0, z: 0 };
+        storage
+            .insert_generated_chunk(
+                chunk,
+                Chunk::empty(
+                    chunk,
+                    BlockStateId(0),
+                    Identifier::parse("minecraft:plains").unwrap(),
+                ),
+            )
+            .unwrap();
+        storage.set_block_at(position, BlockStateId(1)).unwrap();
+    }
+
+    let world = Arc::clone(&state.world);
+    let world_writer = world.lock().await;
+    let mut writer = Vec::new();
+    assert!(
+        open_stonecutter_container(
+            &mut state,
+            &mut writer,
+            PlayerPose::new(1.5, 64.0, 1.5),
+            7,
+            position,
+        )
+        .await
+        .unwrap()
+    );
+    let Some(ActiveContainer::Stonecutter(window)) = state.active_container.as_ref() else {
+        panic!("stonecutter window must become active");
+    };
+    assert_eq!(window.state_id, 1);
+    assert_eq!(STONECUTTER_MENU_TYPE_ID, 24);
+    let mut frames = bytes::BytesMut::from(writer.as_slice());
+    let first = mc_protocol::frame::try_decode_frame(&mut frames, Compression::Disabled)
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        first.id,
+        mc_protocol::packets::play::ClientboundOpenScreen::ID
+    );
+    while let Some(frame) =
+        mc_protocol::frame::try_decode_frame(&mut frames, Compression::Disabled).unwrap()
+    {
+        assert_ne!(
+            frame.id,
+            mc_protocol::packets::play::ClientboundUpdateRecipes::ID,
+            "stonecutter open must not resend the initial recipe update",
+        );
+    }
+
+    drop(world_writer);
 }
 
 fn register_stonecutter_owner(

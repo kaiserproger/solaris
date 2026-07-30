@@ -227,6 +227,11 @@ not replace functional, package, workspace, or real-client gates.
    placement-edit, pose, direction, hit-position, and writer-lock-independence
    coverage is recorded in
    [`evidence/mc-net-block-placement-planning-test-extraction.md`](evidence/mc-net-block-placement-planning-test-extraction.md).
+   The following stonecutter-open writer-lock test now lives in the existing
+   focused `play/tests/stonecutter.rs`; its published-world, proved-menu-type,
+   active-window, open-screen packet, and no-recipe-resend coverage is recorded
+   in
+   [`evidence/mc-net-stonecutter-open-test-extraction.md`](evidence/mc-net-stonecutter-open-test-extraction.md).
 4. [ ] Separate behavioral tests from structural tripwires. Structural checks may
    enforce crate ownership and dependency direction, but may not assert Rust
    statement order or source-text layout.
