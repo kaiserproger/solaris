@@ -78,6 +78,11 @@ not replace functional, package, workspace, or real-client gates.
    `play/tests/scheduled_hoppers.rs`; its transfer and inventory-preservation
    fences are recorded in
    [`evidence/mc-net-scheduled-hopper-test-extraction.md`](evidence/mc-net-scheduled-hopper-test-extraction.md).
+   The following five-test scheduled-button loaded-state, ABA, and
+   adjacent-power class now lives in focused
+   `play/tests/button_runtime_edges.rs`; its retained runtime-edge coverage is
+   recorded in
+   [`evidence/mc-net-button-runtime-edge-test-extraction.md`](evidence/mc-net-button-runtime-edge-test-extraction.md).
 4. [ ] Separate behavioral tests from structural tripwires. Structural checks may
    enforce crate ownership and dependency direction, but may not assert Rust
    statement order or source-text layout.

@@ -22,19 +22,19 @@ replacement-readiness claims.
 
 ## Active Checkpoint
 
-Next autonomous goal checkpoint: route `playable`; mechanically move the
-five-test scheduled-button loaded/ABA/adjacent-power class beginning with
-`scheduled_button_tick_ignores_ticketed_chunk_until_loaded` and ending with
-`scheduled_button_release_keeps_piston_extended_when_head_is_protected` out of
-aggregate `crates/mc-net/src/play/tests.rs` into a focused sibling module.
-Preserve every test and production behavior, leave the preceding ignored
-`real_door_states_plan_hand_toggle_when_sidecar_is_present` sidecar gate and
-the following `button_test_registry` helper class in the aggregate file, and
-use explicit imports rather than a new `use super::*`. The full twenty-test
-scheduled-hopper transfer/persistence class and its range helper have already
-moved to `crates/mc-net/src/play/tests/scheduled_hoppers.rs`; their
+Next autonomous goal checkpoint: route `playable`; mechanically move the full
+twelve-test block-placement/NBT class beginning with
+`door_half_state_builds_two_block_placement_states`, including its oriented
+placement and torch helper functions, and ending with
+`campfire_update_nbt_contains_visible_cooking_items_only` out of aggregate
+`crates/mc-net/src/play/tests.rs` into a focused sibling module. Preserve every
+test and production behavior, leave the preceding `button_and_door_test_registry`
+helper class and the following `bed_occupancy_test_registry` helper class in
+the aggregate file, and use explicit imports rather than a new `use super::*`.
+The five-test scheduled-button loaded/ABA/adjacent-power class has already
+moved to `crates/mc-net/src/play/tests/button_runtime_edges.rs`; its
 concentration and validation are recorded in
-[`../evidence/mc-net-scheduled-hopper-test-extraction.md`](../evidence/mc-net-scheduled-hopper-test-extraction.md).
+[`../evidence/mc-net-button-runtime-edge-test-extraction.md`](../evidence/mc-net-button-runtime-edge-test-extraction.md).
 The owner-run subjective fresh-world seed-`712816` playtest and
 release-candidate performance gates remain queued at their declared
 boundaries.
