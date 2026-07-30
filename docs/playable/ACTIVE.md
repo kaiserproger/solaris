@@ -22,12 +22,22 @@ replacement-readiness claims.
 
 ## Active Checkpoint
 
-Next autonomous goal checkpoint: inventory Cargo features that alter workspace
-test discovery outside the already classified `mc-script` `lua-runtime` and
-`mc-net` `load-bench` boundaries, then select the first unexplained
-feature-gated test class. The owner-run subjective fresh-world seed-`712816`
-playtest remains queued; ordinary traversal, terrain/playability disposition,
-restart, and release-host throughput are not closed by test-policy work.
+Next autonomous goal checkpoint: inventory retry, quarantine, serial-only, and
+environment-sensitive self-skip patterns outside the already classified local
+artifact gates, then select the first unexplained flaky test class. The
+owner-run subjective fresh-world seed-`712816` playtest remains queued;
+ordinary traversal, terrain/playability disposition, restart, and release-host
+throughput are not closed by test-policy work.
+
+The Cargo feature-gated test class is closed. The workspace declares only
+`mc-script/lua-runtime` and `mc-net/load-bench`: the former adds the already
+classified 80 in-process Luau tests, while the latter exposes benchmark support
+without changing the 1,857-unit/3-doctest `mc-net` list. No other local feature
+or `required-features` test gate exists. Current lists, owner boundaries, and
+limits are in
+[`../evidence/cargo-feature-gated-test-inventory.md`](../evidence/cargo-feature-gated-test-inventory.md).
+This does not claim that either explicit feature suite was executed on this
+documentation-only checkpoint.
 
 The Phase 1 progress-wait class is closed. First-party tests contain no
 remaining wall-clock sleep or scheduler-yield call; candidate loops wait on

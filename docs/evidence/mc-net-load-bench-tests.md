@@ -14,8 +14,8 @@ Comparing the two Cargo test lists yields no additional tests:
 
 | Configuration | Unit-test entries | Doc-test entries | Feature-only entries |
 | --- | ---: | ---: | ---: |
-| default | 1,853 | 3 | 0 |
-| `--features load-bench` | 1,853 | 3 | 0 |
+| default | 1,857 | 3 | 0 |
+| `--features load-bench` | 1,857 | 3 | 0 |
 
 There is no test module, `#[test]`, or `#[tokio::test]` gated only by
 `load-bench`. The five ignored tests present in both lists are the already
@@ -40,11 +40,14 @@ execution does not run that workload.
 
 ## Current disposition
 
-The current tree produced the same result in both configurations:
+The original classification run passed both configurations with 1,848 unit
+tests passing, five ignored, and three passing doc tests. Four default-visible
+unit tests were added later.
 
-- default: `1,848 passed; 0 failed; 5 ignored`, plus `3` passing doc tests;
-- `--features load-bench`: `1,848 passed; 0 failed; 5 ignored`, plus `3`
-  passing doc tests.
+The 2026-07-30 current-tree inventory at
+`a20bfd6179d9942093b4eabfbefff02b46937e70` listed 1,857 unit tests and three
+doc tests in both configurations, with an empty sorted set difference. It did
+not execute either suite and therefore makes no new pass claim.
 
 The sorted set difference between the two complete test lists is empty. A
 default-only package run is insufficient after editing code behind

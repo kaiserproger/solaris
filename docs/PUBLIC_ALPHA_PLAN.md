@@ -289,10 +289,15 @@ Benchmark reproduction happens at that feature boundary, not after every edit:
   [`evidence/mc-script-lua-runtime-tests.md`](evidence/mc-script-lua-runtime-tests.md).
 - [x] Classify the `mc-net` `load-bench` gate as a performance-harness build
   boundary, not a hidden test class. Default and feature configurations expose
-  the same 1,853 unit tests and three doc tests; the gated server API,
+  the same 1,857 unit tests and three doc tests; the gated server API,
   seeding/readiness surface, and timing diagnostics are owned by the explicit
   feature suite and recorded in
   [`evidence/mc-net-load-bench-tests.md`](evidence/mc-net-load-bench-tests.md).
+- [x] Close the workspace Cargo feature-gated test inventory. `lua-runtime`
+  adds the already classified 80 `mc-script` tests, `load-bench` changes no
+  `mc-net` test discovery, and no other local or `required-features` test gate
+  exists. Current lists, ownership, and evidence boundaries are recorded in
+  [`evidence/cargo-feature-gated-test-inventory.md`](evidence/cargo-feature-gated-test-inventory.md).
 - [x] Move natural-spawn DTOs, bounded rotating scheduler, capacity/distance,
   terrain, collision, and candidate planning into `mc-entity`. `mc-net`
   retains live session/world snapshots, owner commit, visibility publication,
