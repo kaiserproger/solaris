@@ -295,12 +295,15 @@ Benchmark reproduction happens at that feature boundary, not after every edit:
   the overworld clock instead of accidentally treating `game_time` as day time.
 - [x] Pass focused and affected-package Rust/TCP validation for the clock change.
 - [x] Pass the single independent read-only clock-diff review.
-- [ ] Run the graphical 26.1.2 clock gate. The current CodexPro execution
-  environment exposes no `DISPLAY`, `WAYLAND_DISPLAY`, or `XDG_RUNTIME_DIR`; the
-  attempted NeoForge client failed with `glfwInit failed`. No visual sun-movement
-  claim is made from this environment.
-- [ ] Observe at least 600 advancing client clock ticks and one complete
-  24,000-tick visual cycle on a graphical host.
+- [x] Run the graphical 26.1.2 clock gate. The 2026-07-30 agent-run used the
+  embedded NeoForge client on `DISPLAY=:1`, reached pushed `in_play=true`, and
+  recorded `/time set day`, `/time set night`, restart, and rendered clock
+  evidence in
+  [`evidence/world-clock-26.1.2.md`](evidence/world-clock-26.1.2.md#graphical-client-gate).
+- [x] Observe at least 600 advancing client clock ticks and one complete
+  24,000-tick visual cycle on a graphical host. Structured client observations
+  recorded a 766-tick first interval and matching `game_time` and overworld-clock
+  deltas of 24,003 ticks across the complete rendered cycle.
 - [x] Split production item-drop owner commit from session publication.
 - [x] Stage production item pickup across immutable planning, an owner-owned runtime
   claim token, independent session/player validation, exact owner resolution, and
@@ -353,7 +356,7 @@ Benchmark reproduction happens at that feature boundary, not after every edit:
 
 ## Confirmed findings
 
-### P0 — Client day/night clock (wire implementation complete; graphical gate pending)
+### P0 — Client day/night clock (wire and graphical gates complete; policy pending)
 
 `v0.0.1-alpha.1` sent `game_time` followed by an empty clock-update map.
 Minecraft 26.1.2 uses that map for client-visible clocks such as time of day, so
@@ -367,7 +370,7 @@ Required change:
 3. [x] Publish both the monotonic game clock and the overworld time-of-day clock.
 4. [x] Preserve immediate `/time set` updates and persisted world time in the TCP
    contract.
-5. [ ] Close the graphical daylight-cycle and restart gate.
+5. [x] Close the graphical daylight-cycle and restart gate.
 6. [ ] Add an explicit daylight-cycle policy instead of relying on a permanently
    hard-coded rate.
 

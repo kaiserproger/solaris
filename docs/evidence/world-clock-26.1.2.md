@@ -67,3 +67,73 @@ For the current single-overworld runtime Solaris sends:
 Focused protocol and TCP tests verify the complete map payload. A real 26.1.2
 client gate must additionally observe `overworld_clock_time` advancing; packet
 unit tests alone do not prove the rendered sun moved.
+
+## Graphical client gate
+
+Date: 2026-07-30
+
+This was an agent-run gate against tree
+`1e2fcc62101c65a5d06dcfa7431dd962f0f62022`, not an owner-played subjective
+gate. The host exposed a working X display at `DISPLAY=:1`. The repository's
+fixed launcher started the real Minecraft `26.1.2` client with NeoForge
+`26.1.2.76`, username `ClockGate`, and an isolated game directory. The client
+MCP reported pushed `in_play=true` before observations began.
+
+The server used the debug binary and an ignored config copied directly from
+`playable.toml`. The only meaningful test-only change was granting `ClockGate`
+operator access so the client could issue the required time commands, enter
+spectator mode, and hold an unobstructed sky view at `(0, 180, 0)`. This is
+clock-rendering evidence only; it is not no-operator survival evidence.
+
+### Observations
+
+| Point | `game_time` | Overworld clock | Client-visible result |
+| --- | ---: | ---: | --- |
+| `/time set night` | 4,533 | 13,019 | Chat confirmed `Set time to 13000`; the screenshot shows the moon and stars. |
+| `/time set day`; cycle start | 4,554 | 1,020 | Chat confirmed `Set time to 1000`; the screenshot shows the morning sun. |
+| First advancing interval | 5,320 | 1,786 | Both clocks advanced 766 ticks, exceeding the required 600. The rendered sun moved from its start position. |
+| Day sky | 10,676 | 7,142 | Both clocks advanced 6,122 ticks; the sun rendered high overhead. |
+| Sunset | 16,796 | 13,262 | Both clocks advanced 12,242 ticks; the sun rendered at the red western horizon. |
+| Natural late night | 26,762 | 23,228 | The open-screen recovery capture shows a dark star field before dawn. |
+| Dawn, day 1 | 27,786 | 24,252 | Both clocks advanced 23,232 ticks; the rising sun rendered in the east. |
+| Complete cycle, day 1 | 28,557 | 25,023 | Both clocks advanced 24,003 ticks; the rendered view returned to daytime. |
+
+The scheduled 18,000-tick screenshot was discarded because Minecraft's
+`PauseScreen` was open. Its structured time observation remained valid, but it
+is not counted as visual evidence. The gate closed from the valid command-night,
+day, sunset, recovered natural-night, dawn, and complete-cycle captures.
+
+Before the restart, the client observed overworld time `25,260`. The execution
+controller recorded the first server process handling `SIGINT`, completing its
+final world-metadata save, and exiting with status 0; the structured controller
+witness is preserved with the artifacts below. The restarted server loaded
+persisted `world_time=25357`; after the same real client returned to pushed
+Play state it observed overworld time `25,540`, day `1`, with no screen open.
+The restart screenshot shows the expected early-day sun instead of a reset or
+frozen noon.
+
+### Local artifacts
+
+All runtime artifacts remain ignored under `.analysis/`; no Mojang bytes or
+screenshots enter Git.
+
+- Structured cycle observations:
+  `.analysis/clock-gate-20260730/observations.jsonl`
+  (`SHA-256 be4188d796b79dcfbc2970756f1f44c677445b9b268144ff5ed21ebcf5e3ea85`).
+- Restart observation:
+  `.analysis/clock-gate-20260730/restart-observation.json`.
+- First-process clean-shutdown controller witness:
+  `.analysis/clock-gate-20260730/first-server-clean-shutdown.json`
+  (`SHA-256 95ab16694efc249a071b288bdcc404ef3f1c415b7b907114309e69a1ee1087c2`).
+- Discarded/recovered screen classification:
+  `.analysis/clock-gate-20260730/night-recovery-observation.json`.
+- Valid screenshots:
+  `.analysis/clock-gate-20260730/screenshots/{command-night-east,cycle-start-east,cycle-600-east,cycle-noon-up,cycle-sunset-west,cycle-midnight-up-recovered,cycle-dawn-east,cycle-complete-east,restart-east}.png`.
+- Client log:
+  `.analysis/minecraft-clock-gate-20260730/logs/latest.log`.
+- Restart server log:
+  `.analysis/clock-gate-20260730/server-restart.log`.
+
+This closes the public-alpha graphical clock gate on the recorded tree. It
+does not close the separate owner-observed movement, combat, water, terrain, or
+overall-session feel gate.

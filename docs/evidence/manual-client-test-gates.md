@@ -37,17 +37,18 @@ The M94 catalog also names three rows with no complete route:
 
 | Gate | Automation level | Owner, reason, and exact close condition |
 | --- | --- | --- |
-| 24,000-tick day/night, `/time set`, and restart | Graphical and automatable, but no exact manifest scenario currently exists | `mc-protocol` clock payload and `mc-net` world-clock publication. Close on the candidate tree with a real 26.1.2 client observing at least 600 advancing ticks, a complete visual day, `/time set day`, `/time set night`, and the expected visual time after restart. Record structured clock observations, screenshots, client/server logs, and commit. |
+| 24,000-tick day/night, `/time set`, and restart | Agent-run graphical gate passed 2026-07-30; no exact manifest scenario exists | `mc-protocol` clock payload and `mc-net` world-clock publication. Closed on the candidate tree with a real 26.1.2 client: 766 advancing ticks in the first interval, matching 24,003-tick `game_time` and overworld-clock deltas, rendered day/sunset/night/dawn/day evidence, `/time set day`, `/time set night`, and rendered day-one time after restart. Structured observations, screenshots, client/server logs, limits, and artifact paths are in [`world-clock-26.1.2.md`](world-clock-26.1.2.md#graphical-client-gate). |
 | Seed `712816` fresh-world visual/playable and restart gate | Partly automatable; terrain feel remains owner-observed | `mc-worldgen` plus the playable route. Close on a clean candidate world with the exact seed/config, rendered height/biome/vegetation evidence, ordinary client traversal, restart/rejoin, and an owner-recorded disposition of visual/playability findings. |
 | Twenty-minute no-operator survival with natural friendly and hostile spawning | Agent-run real-client route exists; release-candidate execution remains required | Playable route. Close on the exact candidate tree with the manifest-backed 20-minute run, no operator or deterministic fixture, natural progression and populations, restart/reconnect, structured observations, screenshots, and client/server logs. A prior-tree pass is regression evidence, not release evidence. |
 | Server-only and client-required plugin matrix | Graphical and automatable through the real-client and Loader adapters | `mc-script`, server adapters, and the client Loader. Close on the candidate tree with a server-only plugin accepting an unmodified client, a client-required fixture clearly rejecting an unmodified client, and every claimed supported Loader completing the exact bundle acknowledgement and Play transition. |
 | Subjective movement, combat, water, terrain, and overall-session feel | Genuinely owner-observed | Playable route and repository owner. Close only with an owner-played candidate-tree session recording client version, config, duration, restart/rejoin, concrete observations, and disposition. Deterministic client automation remains the functional fence but cannot replace this judgment. |
 
-The current environment previously failed graphical startup because it exposed
-no `DISPLAY`, `WAYLAND_DISPLAY`, or `XDG_RUNTIME_DIR`; the NeoForge client
-reported `glfwInit failed`. This is a host prerequisite failure, not a passing
-or failing Solaris result. No graphical or owner gate was run in this
-classification checkpoint.
+A prior environment failed graphical startup because it exposed no `DISPLAY`,
+`WAYLAND_DISPLAY`, or `XDG_RUNTIME_DIR`; the NeoForge client reported
+`glfwInit failed`. That remains a host prerequisite failure, not a Solaris
+result. The 2026-07-30 candidate-tree clock checkpoint instead had a working
+`DISPLAY=:1` and completed the agent-run graphical clock gate. It was not an
+owner-played subjective gate.
 
 ## Disposition
 

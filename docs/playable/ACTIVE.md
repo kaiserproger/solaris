@@ -1252,6 +1252,18 @@ scenario exists. Record whether a result is owner-run, agent-run, prepared
 only, or not run. Screenshots may support a visual finding, but world/protocol
 state should come from structured client observations when available.
 
+- The graphical 26.1.2 world-clock gate is agent-run and closed on tree
+  `1e2fcc62101c65a5d06dcfa7431dd962f0f62022`. A real client reached pushed
+  `in_play=true`, proved a 766-tick first interval, and advanced matching
+  `game_time` and overworld-clock deltas by 24,003 ticks while valid captures
+  showed day, sunset, natural night, dawn, and the next day. `/time set day`
+  and `/time set night` produced the expected rendered sky. A clean stop/save
+  followed by restart loaded world time `25,357`; the rejoined client observed
+  day-one time `25,540` and the expected sun. Exact observations, artifact
+  paths, and the discarded pause-screen capture are recorded in
+  `docs/evidence/world-clock-26.1.2.md`. This is agent-run clock evidence, not
+  an owner-played subjective gate or no-operator survival evidence.
+
 ## Stop Conditions
 
 - Do not update readiness or validation-ledger rows in Playable Spike Mode
