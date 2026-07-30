@@ -23,18 +23,25 @@ replacement-readiness claims.
 ## Active Checkpoint
 
 Next autonomous goal checkpoint: route `playable`; mechanically move the
-`fifteen_bookshelves_expose_and_apply_sharpness_to_swords`
+`fifteen_bookshelves_keep_efficiency_as_the_first_pickaxe_offer`
 test from aggregate `crates/mc-net/src/play/tests.rs` to a focused sibling
 module. Preserve the Solaris-required items and item-facts registries;
-stone-sword and lapis ids; `minecraft:sharpness` id and registry clue; window
-id/position and sword input; XP level `30`, progress `0.25`, total `1_395`, and
-seed `123`; the exact fifteen-bookshelf values `(0, 1)`, `(1, 10)`, `(2, 30)`,
-`(3, 123)`, `(4..=6, sharpness clue)`, `(7, 1)`, `(8, 2)`, and `(9, 3)`;
-candidate application from `enchanting_offer(15, 2)`; sharpness level `3`;
-empty lapis input; and final XP level `27`. Leave the preceding
-`fifteen_bookshelves_keep_efficiency_as_the_first_pickaxe_offer` test and
-following `state` helper aggregate-owned, and use explicit imports rather than
-a new `use super::*`.
+stone-pickaxe and lapis ids; window id/position and pickaxe input; XP level
+`30`, progress `0.25`, total `1_395`, and seed `123`; the exact
+fifteen-bookshelf values `(0, 1)`, `(1, 10)`, `(2, 30)`, `(3, 123)`,
+`(4..=6, 8)`, `(7, 1)`, `(8, 2)`, and `(9, 3)`; candidate application from
+`enchanting_offer(15, 0)`; exactly `minecraft:efficiency` level `1`; remaining
+lapis count `2`; and final XP level `29`, progress `0.25`, and total `1_395`.
+Leave the preceding
+`fifteen_bookshelves_keep_efficiency_clue_and_add_silk_touch_to_pickaxes` test
+and following `state` helper aggregate-owned, and use explicit imports rather
+than a new `use super::*`.
+
+The complete fifteen-bookshelf sharpness test has moved to
+`crates/mc-net/src/play/tests/enchanting_sharpness.rs`. Its unchanged
+registries, sword/lapis ids, sharpness clue and data values, slot-two offer
+result, consumed lapis, and final XP are recorded in
+[`../evidence/mc-net-enchanting-sharpness-test-extraction.md`](../evidence/mc-net-enchanting-sharpness-test-extraction.md).
 
 The complete fifteen-bookshelf protection test has moved to
 `crates/mc-net/src/play/tests/enchanting_protection.rs`. Its unchanged
