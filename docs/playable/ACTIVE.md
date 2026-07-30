@@ -23,13 +23,20 @@ replacement-readiness claims.
 ## Active Checkpoint
 
 Next autonomous goal checkpoint: route `playable`; mechanically move the
-`crafting_table_open_does_not_wait_for_world_writer` test out of aggregate
+`movement_block_reads_do_not_wait_for_world_writer` test out of aggregate
 `crates/mc-net/src/play/tests.rs` into a focused sibling module. Preserve its
-complete loaded-crafting-table, published-world, exact pose/position/sequence,
-successful-open, and writer-lock-independence coverage and production behavior,
-leave the preceding `movement_block_reads_do_not_wait_for_world_writer` test
-and following `button_test_registry` helper aggregate-owned, and use explicit
-imports rather than a new `use super::*`.
+complete published-world solid-collision and water-overlap reads, exact block
+states and player poses, ready-future results, and writer-lock-independence
+coverage and production behavior, leave the preceding
+`collision_correction_applies_powder_snow_movement_context` test and following
+`button_test_registry` helper aggregate-owned, and use explicit imports rather
+than a new `use super::*`.
+
+The complete crafting-table-open writer-lock test has moved to
+`crates/mc-net/src/play/tests/crafting_table_open.rs`. Its loaded-table,
+published-world, exact pose/position/sequence, successful-open, and
+writer-lock-independence coverage is recorded in
+[`../evidence/mc-net-crafting-table-open-test-extraction.md`](../evidence/mc-net-crafting-table-open-test-extraction.md).
 
 The complete stonecutter-open writer-lock test has moved into the existing
 `crates/mc-net/src/play/tests/stonecutter.rs` module. Its published-world,

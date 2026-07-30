@@ -232,6 +232,11 @@ not replace functional, package, workspace, or real-client gates.
    active-window, open-screen packet, and no-recipe-resend coverage is recorded
    in
    [`evidence/mc-net-stonecutter-open-test-extraction.md`](evidence/mc-net-stonecutter-open-test-extraction.md).
+   The following crafting-table-open writer-lock test now lives in focused
+   `play/tests/crafting_table_open.rs`; its loaded-table, published-world,
+   exact pose/position/sequence, successful-open, and writer-lock-independence
+   coverage is recorded in
+   [`evidence/mc-net-crafting-table-open-test-extraction.md`](evidence/mc-net-crafting-table-open-test-extraction.md).
 4. [ ] Separate behavioral tests from structural tripwires. Structural checks may
    enforce crate ownership and dependency direction, but may not assert Rust
    statement order or source-text layout.
