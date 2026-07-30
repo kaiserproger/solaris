@@ -217,6 +217,11 @@ not replace functional, package, workspace, or real-client gates.
    `play/tests/entity_tick_cadence.rs`; its 50 ms owner period, 0.05-second
    physics step, and three-tick move-publication cadence are recorded in
    [`evidence/mc-net-entity-tick-cadence-test-extraction.md`](evidence/mc-net-entity-tick-cadence-test-extraction.md).
+   The following toggle-planning writer-lock test now lives in focused
+   `play/tests/toggle_planning.rs`; its published-world, mutation-token, edit,
+   precondition, scheduled-tick, and writer-lock-independence coverage is
+   recorded in
+   [`evidence/mc-net-toggle-planning-test-extraction.md`](evidence/mc-net-toggle-planning-test-extraction.md).
 4. [ ] Separate behavioral tests from structural tripwires. Structural checks may
    enforce crate ownership and dependency direction, but may not assert Rust
    statement order or source-text layout.

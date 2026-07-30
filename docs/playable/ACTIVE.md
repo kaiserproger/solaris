@@ -23,13 +23,19 @@ replacement-readiness claims.
 ## Active Checkpoint
 
 Next autonomous goal checkpoint: route `playable`; mechanically move the
-`toggle_planning_does_not_wait_for_world_writer` test out of aggregate
+`block_placement_planning_does_not_wait_for_world_writer` test out of aggregate
 `crates/mc-net/src/play/tests.rs` into a focused sibling module. Preserve its
-complete published-world, mutation-token, edit, precondition, scheduled-tick,
-and writer-lock independence coverage and production behavior, leave the
-preceding `block_placement_planning_does_not_wait_for_world_writer` test and
+complete loaded-world, placement-edit, pose, direction, hit-position, and
+writer-lock-independence coverage and production behavior, leave the preceding
+`stonecutter_open_uses_proved_menu_type_and_published_world_view` test and
 following `button_test_registry` helper aggregate-owned, and use explicit
 imports rather than a new `use super::*`.
+
+The complete toggle-planning writer-lock test has moved to
+`crates/mc-net/src/play/tests/toggle_planning.rs`. Its published-world,
+mutation-token, edit, precondition, scheduled-tick, and writer-lock-independence
+coverage is recorded in
+[`../evidence/mc-net-toggle-planning-test-extraction.md`](../evidence/mc-net-toggle-planning-test-extraction.md).
 
 The complete entity-tick cadence matrix has moved to
 `crates/mc-net/src/play/tests/entity_tick_cadence.rs`. Its 50 ms owner period,
