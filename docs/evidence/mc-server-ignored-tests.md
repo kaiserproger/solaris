@@ -2,11 +2,14 @@
 
 Scope: Phase 1 test inventory for `crates/mc-server`.
 
-The crate has exactly four ignored tests, all in
+This inventory covers four process-level ignored tests in
 `tests/generated_world_startup.rs`. Every gate starts the real `mc-server`
 binary against a temporary disk-backed world and requires the local 26.1.2
 `data/vanilla` sidecars. Missing prerequisites fail immediately through
 `assert_required_sidecars`; none of these tests self-skips as a green result.
+The binary unit target now has two additional ignored structure-sidecar gates,
+classified separately in
+[`mc-server-structure-local-artifact-tests.md`](mc-server-structure-local-artifact-tests.md).
 
 ## Inventory
 
@@ -19,9 +22,11 @@ binary against a temporary disk-backed world and requires the local 26.1.2
 
 ## Current disposition
 
-The bounded inventory command compiled the integration target and listed these
-four tests and no others. The available local sidecar reports identify
-Minecraft `26.1.2`, world version `4790`, and protocol version `775`.
+The original bounded inventory command compiled the integration target and
+listed these four process gates. The current package also lists the two
+separately classified structure-sidecar unit gates. The available local
+sidecar reports identify Minecraft `26.1.2`, world version `4790`, and protocol
+version `775`.
 
 No ignored gate was executed during this classification checkpoint. The two
 startup budget tests are feature-boundary/release performance evidence, so

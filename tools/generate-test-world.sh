@@ -6,9 +6,9 @@
 # Usage:
 #   tools/generate-test-world.sh
 #
-# Idempotent: if .analysis/test-world/region/r.0.0.mca already exists
-# the script exits early. Delete .analysis/test-world/ to force a
-# regeneration.
+# Idempotent: if .analysis/test-world contains a non-empty region file and
+# level.dat, the script exits early. Delete .analysis/test-world/ to force a
+# regeneration or repair a partial fixture.
 #
 # Override OUT_DIR=... to write another local oracle world, and
 # REGION_FILE_COMPRESSION=... to set vanilla's region-file-compression.
@@ -23,9 +23,15 @@ BUNDLE_JAR="${1:-$REPO_ROOT/.analysis/server.jar}"
 OUT_DIR="${OUT_DIR:-$REPO_ROOT/.analysis/test-world}"
 JAVA="${JAVA:-/home/user/.sdkman/candidates/java/25.0.2-graalce/bin/java}"
 
-if [[ -f "$OUT_DIR/region/r.0.0.mca" ]]; then
-  echo "[skip] $OUT_DIR/region/r.0.0.mca already exists"
+OUTPUT_REGION="$OUT_DIR/region/r.0.0.mca"
+OUTPUT_LEVEL="$OUT_DIR/level.dat"
+if [[ -s "$OUTPUT_REGION" && -s "$OUTPUT_LEVEL" ]]; then
+  echo "[skip] complete test world already exists at $OUT_DIR"
   exit 0
+fi
+if [[ -e "$OUTPUT_REGION" || -e "$OUTPUT_LEVEL" ]]; then
+  echo "error: partial test world at $OUT_DIR; remove it before regenerating" >&2
+  exit 1
 fi
 if [[ ! -f "$BUNDLE_JAR" ]]; then
   echo "error: bundle jar not found at $BUNDLE_JAR" >&2

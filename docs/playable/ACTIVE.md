@@ -22,12 +22,27 @@ replacement-readiness claims.
 
 ## Active Checkpoint
 
-Next autonomous goal checkpoint: classify the two `mc-server/src/main.rs`
-tests that currently return success when the local plains-fountain template is
-absent, convert them to explicit fail-closed opt-in gates, and record their
-owner and close condition. The owner-run subjective fresh-world seed-`712816`
-playtest remains queued; ordinary traversal, terrain/playability disposition,
-restart, and release-host throughput are not closed by test-policy work.
+Next autonomous goal checkpoint: route `playable`; mechanically move the
+remaining plant/crop/cactus/bamboo/sapling/bonemeal adapter-test class and its
+test-only helpers out of aggregate `crates/mc-net/src/play/tests.rs` into the
+focused sibling `crates/mc-net/src/play/tests/plants.rs`. Preserve every test
+and production behavior, use explicit imports rather than a new `use super::*`,
+and record the before/after test concentration. The production plant-rules
+crate extraction is already complete in
+[`../evidence/plant-rules-crate-boundary.md`](../evidence/plant-rules-crate-boundary.md).
+The owner-run subjective fresh-world seed-`712816` playtest and
+release-candidate performance gates remain queued at their declared
+boundaries.
+
+The remaining Phase 1 flaky/self-skip inventory is closed. Two `mc-server`
+structure tests are now explicit fail-closed local-sidecar gates, and the
+test-world generator accepts only a non-empty region-plus-`level.dat` cache
+shape while rejecting partial output. Together with the preceding worldgen and
+block-drop closures, the bounded Rust and 72-file non-Rust scan found no
+remaining unexplained retry, quarantine, serial-only, disabled, or
+environment-sensitive success class. Scope, reproduction, and the explicit
+release/manual boundary are in
+[`../evidence/phase1-flaky-test-inventory.md`](../evidence/phase1-flaky-test-inventory.md).
 
 The `mc-worldgen::structures` local-artifact class is closed. Three tests that
 previously returned success when the local blocks report or plains-fountain NBT

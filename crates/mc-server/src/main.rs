@@ -2533,13 +2533,16 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "requires the local extracted plains_fountain_01.nbt Mojang sidecar"]
     fn settlement_profile_loads_the_extracted_prototype_when_present() {
         let vanilla_data_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../data/vanilla");
         let fountain = vanilla_data_dir
             .join("data/minecraft/structure/village/plains/town_centers/plains_fountain_01.nbt");
-        if !fountain.exists() {
-            return;
-        }
+        assert!(
+            fountain.is_file(),
+            "required local structure sidecar is missing: {}",
+            fountain.display()
+        );
         let blocks = mc_world::BlockRegistry::from_report(
             &mc_data::blocks::solaris_required_blocks_report(),
         )
@@ -2563,13 +2566,16 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "requires the local extracted plains_fountain_01.nbt Mojang sidecar"]
     fn extracted_village_prototype_generates_deterministically_when_present() {
         let vanilla_data_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../data/vanilla");
         let fountain = vanilla_data_dir
             .join("data/minecraft/structure/village/plains/town_centers/plains_fountain_01.nbt");
-        if !fountain.exists() {
-            return;
-        }
+        assert!(
+            fountain.is_file(),
+            "required local structure sidecar is missing: {}",
+            fountain.display()
+        );
         let blocks =
             Arc::new(
                 mc_world::BlockRegistry::from_report(

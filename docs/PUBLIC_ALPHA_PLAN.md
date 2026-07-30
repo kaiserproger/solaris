@@ -37,9 +37,11 @@ not replace functional, package, workspace, or real-client gates.
 
 ### Phase 1 — Finish and trust the tests
 
-1. [ ] Inventory every failing, ignored, flaky, feature-gated, and manual-only
+1. [x] Inventory every failing, ignored, flaky, feature-gated, and manual-only
    workspace test. Give each non-green gate an owner, reason, and exact close
-   condition; do not silently delete or weaken it.
+   condition; do not silently delete or weaken it. The final retry, quarantine,
+   serial-only, disabled, and environment-sensitive pass is recorded in
+   [`evidence/phase1-flaky-test-inventory.md`](evidence/phase1-flaky-test-inventory.md).
 2. [x] Replace wall-clock sleeps and polling with the exact packet, notification,
    process, world-state, or simulation event that proves progress.
 3. [ ] Keep substantial tests beside their focused domain in `*_tests.rs`; stop
@@ -308,15 +310,31 @@ Benchmark reproduction happens at that feature boundary, not after every edit:
   hook or require a serial-only mutex; the observed closed-receiver race,
   focused coverage, and limits are recorded in
   [`evidence/mc-net-block-drop-await-probe.md`](evidence/mc-net-block-drop-await-probe.md).
+- [x] Classify two `mc-server` binary-unit tests whose plains-fountain sidecar
+  prerequisite returned success when absent. They are now explicit fail-closed
+  opt-in gates with ownership and close conditions recorded in
+  [`evidence/mc-server-structure-local-artifact-tests.md`](evidence/mc-server-structure-local-artifact-tests.md).
+- [x] Make the local test-world generator reject partial cached fixtures. A
+  cache hit now requires a non-empty region file and `level.dat`; synthetic
+  complete, partial, and zero-byte cases are recorded in
+  [`evidence/test-world-cache-guard.md`](evidence/test-world-cache-guard.md).
+- [x] Close the remaining retry, quarantine, serial-only, disabled, and
+  environment-sensitive success inventory outside already classified gates.
+  The bounded Rust and 72-file Java/Gradle/Python/shell scan, all exposed
+  closures, limits, and the next test-placement cursor are recorded in
+  [`evidence/phase1-flaky-test-inventory.md`](evidence/phase1-flaky-test-inventory.md).
 - [x] Move natural-spawn DTOs, bounded rotating scheduler, capacity/distance,
   terrain, collision, and candidate planning into `mc-entity`. `mc-net`
   retains live session/world snapshots, owner commit, visibility publication,
   and dispatch. The exact boundary and validation are recorded in
   [`evidence/natural-spawn-crate-boundary.md`](evidence/natural-spawn-crate-boundary.md).
 - [x] Measure current `mc-net` size, test concentration, domain state machines,
-  dependency edges, and structural exceptions. The inventory selects
-  deterministic plant planning as the next bounded lower-crate cut rather than
-  treating root line count as an extraction order:
+  dependency edges, and structural exceptions. The inventory selected
+  deterministic plant planning as the bounded lower-crate cut rather than
+  treating root line count as an extraction order; that cut was subsequently
+  completed in
+  [`evidence/plant-rules-crate-boundary.md`](evidence/plant-rules-crate-boundary.md).
+  The original measured inventory remains in
   [`evidence/mc-net-ownership-inventory.md`](evidence/mc-net-ownership-inventory.md).
 - [x] Inventory the manual and graphical client gate class. The 108
   `manual-pending` manifest scenarios are fail-closed declarations with
