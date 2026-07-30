@@ -37,6 +37,48 @@ fn register_test_player_state(
 }
 
 #[test]
+fn daylight_cycle_policy_change_publishes_current_clock_rate() {
+    let registry = SessionRegistry::new();
+    let profile = LoggedInProfile {
+        uuid: crate::login::offline_uuid("DaylightPolicy"),
+        name: "DaylightPolicy".to_owned(),
+    };
+    let (outbound, mut receiver) = mpsc::channel(8);
+    registry.register(
+        &profile,
+        (0, 0),
+        2,
+        HashSet::new(),
+        outbound,
+        PlayerPose::new(0.5, 64.0, 0.5),
+    );
+    registry.set_world_time(6_000);
+
+    registry.set_daylight_cycle_enabled(false);
+
+    assert!(matches!(
+        receiver.try_recv(),
+        Ok(OutboundCommand::WorldTime {
+            world_time: 6_000,
+            rate: 0.0,
+        })
+    ));
+    registry.advance_world_time(20);
+    assert_eq!(registry.world_time(), 6_000);
+    assert_eq!(registry.simulation_tick(), 20);
+
+    registry.set_daylight_cycle_enabled(true);
+
+    assert!(matches!(
+        receiver.try_recv(),
+        Ok(OutboundCommand::WorldTime {
+            world_time: 6_000,
+            rate: 1.0,
+        })
+    ));
+}
+
+#[test]
 fn owner_time_change_that_completes_sleep_publishes_morning_once() {
     let registry = SessionRegistry::new();
     let sleeper = register_test_session(&registry, "SleepOwnerTime");
@@ -53,7 +95,10 @@ fn owner_time_change_that_completes_sleep_publishes_morning_once() {
         .filter(|dispatch| {
             matches!(
                 dispatch.command,
-                OutboundCommand::WorldTime { world_time: 24_000 }
+                OutboundCommand::WorldTime {
+                    world_time: 24_000,
+                    ..
+                }
             )
         })
         .count();
@@ -77,7 +122,10 @@ fn owner_day_change_wakes_sleeper_and_publishes_requested_time_once() {
         .filter(|dispatch| {
             matches!(
                 dispatch.command,
-                OutboundCommand::WorldTime { world_time: 1_000 }
+                OutboundCommand::WorldTime {
+                    world_time: 1_000,
+                    ..
+                }
             )
         })
         .count();

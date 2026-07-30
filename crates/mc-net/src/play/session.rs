@@ -379,7 +379,7 @@ struct PlaySession {
     script_operator: bool,
     dimension: String,
     loader_session: Option<crate::LoaderSession>,
-    last_broadcast_world_time: Option<u64>,
+    last_broadcast_world_time: Option<(u64, bool)>,
 }
 
 #[derive(Debug, Clone)]
@@ -542,6 +542,7 @@ pub(crate) struct SessionRegistry {
     pressure_observation: Arc<SessionPressureObservation>,
     outbound_pressure: Arc<OutboundPressureMetrics>,
     world_time: AtomicU64,
+    daylight_cycle_enabled: AtomicBool,
     scheduled_block_tick_in_flight: AtomicBool,
     players_sleeping_percentage: AtomicU32,
     entity_lifecycle_tick: AtomicU64,
@@ -857,6 +858,7 @@ impl SessionRegistry {
             pressure_observation,
             outbound_pressure: Arc::new(OutboundPressureMetrics::default()),
             world_time: AtomicU64::new(0),
+            daylight_cycle_enabled: AtomicBool::new(true),
             scheduled_block_tick_in_flight: AtomicBool::new(false),
             players_sleeping_percentage: AtomicU32::new(DEFAULT_PLAYERS_SLEEPING_PERCENTAGE),
             entity_lifecycle_tick: AtomicU64::new(0),

@@ -2755,7 +2755,10 @@ fn multiplayer_sleep_quorum_skips_once_and_disconnect_recomputes_waiters() {
     assert_eq!(registry.world_time(), 24_000);
     assert!(completed.iter().any(|dispatch| matches!(
         dispatch.command,
-        OutboundCommand::WorldTime { world_time: 24_000 }
+        OutboundCommand::WorldTime {
+            world_time: 24_000,
+            ..
+        }
     )));
     assert_eq!(registry.begin_sleep(alice), SleepOutcome::Daytime);
 
@@ -2771,7 +2774,10 @@ fn multiplayer_sleep_quorum_skips_once_and_disconnect_recomputes_waiters() {
     assert!(disconnect_dispatches.iter().any(|dispatch| {
         matches!(
             dispatch.command,
-            OutboundCommand::WorldTime { world_time: 48_000 }
+            OutboundCommand::WorldTime {
+                world_time: 48_000,
+                ..
+            }
         )
     }));
     let alice_bed = registry
@@ -2848,7 +2854,10 @@ fn multiplayer_sleep_uses_vanilla_percentage_spectators_and_deep_sleep_delay() {
     assert_eq!(registry.world_time(), 24_000);
     assert!(dispatches.iter().any(|dispatch| matches!(
         dispatch.command,
-        OutboundCommand::WorldTime { world_time: 24_000 }
+        OutboundCommand::WorldTime {
+            world_time: 24_000,
+            ..
+        }
     )));
     assert!(
         dispatches
@@ -3000,7 +3009,10 @@ fn spectator_transition_pushes_deep_sleep_quorum_completion() {
     assert_eq!(registry.sleeping_session_count_for_test(), 0);
     assert!(dispatches.iter().any(|dispatch| matches!(
         dispatch.command,
-        OutboundCommand::WorldTime { world_time: 24_000 }
+        OutboundCommand::WorldTime {
+            world_time: 24_000,
+            ..
+        }
     )));
 }
 

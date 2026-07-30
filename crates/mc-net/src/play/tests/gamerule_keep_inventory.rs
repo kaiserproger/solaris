@@ -16,7 +16,7 @@ fn keep_inventory_gamerule_parses_queries_updates_and_rejections() {
     assert_eq!(
         parse_admin_command("/gamerule keep_inventory yes", op),
         Err(CommandError::Usage(
-            "Usage: /gamerule <keep_inventory|players_sleeping_percentage> [value]"
+            "Usage: /gamerule <do_daylight_cycle|keep_inventory|players_sleeping_percentage> [value]"
         ))
     );
 

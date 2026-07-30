@@ -85,6 +85,14 @@ where
     };
 
     match command {
+        AdminCommand::DaylightCycle(value) => {
+            if let Some(value) = value {
+                sessions.set_daylight_cycle_enabled(value);
+            }
+            let value = sessions.daylight_cycle_enabled();
+            send_command_feedback(writer, compression, &format!("do_daylight_cycle = {value}"))
+                .await
+        }
         AdminCommand::GameMode(mode) => {
             prepare_game_mode_transition(interaction.as_deref_mut(), *game_mode, mode, permissions);
             apply_game_mode(
@@ -410,14 +418,22 @@ where
 }
 
 pub(super) fn clientbound_session_world_time(sessions: &SessionRegistry) -> ClientboundSetTime {
-    clientbound_world_time(sessions.simulation_tick(), sessions.world_time())
+    clientbound_world_time(
+        sessions.simulation_tick(),
+        sessions.world_time(),
+        sessions.daylight_cycle_rate(),
+    )
 }
 
-pub(super) fn clientbound_world_time(game_time: u64, world_time: u64) -> ClientboundSetTime {
+pub(super) fn clientbound_world_time(
+    game_time: u64,
+    world_time: u64,
+    rate: f32,
+) -> ClientboundSetTime {
     ClientboundSetTime::overworld(
         i64::try_from(game_time).unwrap_or(i64::MAX),
         i64::try_from(world_time).unwrap_or(i64::MAX),
-        1.0,
+        rate,
     )
 }
 

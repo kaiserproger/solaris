@@ -3585,6 +3585,16 @@ pub(crate) async fn execute_console_command(
             }
             false
         }
+        Ok(play::commands::AdminCommand::DaylightCycle(value)) => {
+            if let Some(value) = value {
+                sessions.set_daylight_cycle_enabled(value);
+            }
+            info!(
+                value = sessions.daylight_cycle_enabled(),
+                "console read daylight cycle"
+            );
+            false
+        }
         Ok(play::commands::AdminCommand::PlayersSleepingPercentage(value)) => {
             if let Some(value) = value {
                 sessions.set_players_sleeping_percentage(value);
@@ -4759,10 +4769,12 @@ async fn bind_internal(
                         ));
                     }
                     simulation_owner.restore_world_time(&sessions, metadata.world_time);
+                    sessions.set_daylight_cycle_enabled(metadata.daylight_cycle_enabled);
                     sessions.set_players_sleeping_percentage(metadata.players_sleeping_percentage);
                     sessions.set_keep_inventory(metadata.keep_inventory);
                     info!(
                         world_time = metadata.world_time,
+                        daylight_cycle_enabled = metadata.daylight_cycle_enabled,
                         players_sleeping_percentage = metadata.players_sleeping_percentage,
                         keep_inventory = metadata.keep_inventory,
                         "loaded world metadata"
@@ -5101,6 +5113,7 @@ async fn save_all_with_context_snapshot_locked(
         entity_journal_phases,
         world_chunk_journal_watermark,
         world_time,
+        daylight_cycle_enabled,
         players_sleeping_percentage,
         keep_inventory,
         mut world_flush_plan,
@@ -5112,6 +5125,7 @@ async fn save_all_with_context_snapshot_locked(
             snapshot.entity_journal_phases,
             snapshot.world_chunk_journal_watermark,
             snapshot.world_time,
+            snapshot.daylight_cycle_enabled,
             snapshot.players_sleeping_percentage,
             snapshot.keep_inventory,
             snapshot.world_flush_plan,
@@ -5125,6 +5139,7 @@ async fn save_all_with_context_snapshot_locked(
                 entity_journal_phases,
                 sessions.world_chunk_journal_watermark(),
                 sessions.world_time(),
+                sessions.daylight_cycle_enabled(),
                 sessions.players_sleeping_percentage(),
                 sessions.keep_inventory(),
                 None,
@@ -5349,6 +5364,7 @@ async fn save_all_with_context_snapshot_locked(
     let started = Instant::now();
     let metadata = play::persistence::WorldPersistedMetadata {
         world_time,
+        daylight_cycle_enabled,
         players_sleeping_percentage,
         keep_inventory,
         world_identity: play::persistence::world_identity(&root),
@@ -9407,6 +9423,7 @@ end
         let entity_types = canonical_entity_types();
         let sessions = play::SessionRegistry::new();
         sessions.set_world_time(99);
+        sessions.set_daylight_cycle_enabled(false);
         sessions.set_players_sleeping_percentage(50);
         let mut retained = mc_entity::EntityRetainedState::default();
         retained.item_pickup_ready_tick = Some(12);
@@ -9457,6 +9474,7 @@ end
         .await
         .unwrap();
         assert_eq!(bound.sessions.world_time(), 99);
+        assert!(!bound.sessions.daylight_cycle_enabled());
         assert_eq!(bound.sessions.players_sleeping_percentage(), 50);
         let records = bound.sessions.persisted_entity_records();
         assert_eq!(records.len(), 1);
@@ -9745,6 +9763,7 @@ end
             tmp.path(),
             &play::persistence::WorldPersistedMetadata {
                 world_time: 77,
+                daylight_cycle_enabled: true,
                 players_sleeping_percentage: 100,
                 keep_inventory: false,
                 world_identity: "different-world".into(),

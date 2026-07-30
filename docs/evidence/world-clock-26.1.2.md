@@ -61,12 +61,34 @@ For the current single-overworld runtime Solaris sends:
 - monotonic simulation tick as packet `game_time`;
 - server-owned persisted world time as clock id `0` `total_ticks`;
 - `partial_tick = 0.0`;
-- `rate = 1.0`;
+- `rate = 1.0` while the daylight cycle is enabled and `0.0` while frozen;
 - no End clock update until Solaris owns an active End dimension clock.
 
 Focused protocol and TCP tests verify the complete map payload. A real 26.1.2
 client gate must additionally observe `overworld_clock_time` advancing; packet
 unit tests alone do not prove the rendered sun moved.
+
+## Daylight-cycle policy
+
+Date: 2026-07-30
+
+The operator gamerule `/gamerule do_daylight_cycle [true|false]` now owns the
+daylight-cycle policy. It defaults to `true`, persists in the world metadata,
+and is restored before players join. Changing it publishes the current
+overworld clock immediately with the corresponding wire rate, so connected
+clients start or stop interpolation without waiting for a separate time change.
+
+When disabled, the persisted overworld clock stops advancing while the
+monotonic simulation clock continues. Entity lifecycles, scheduled work, and
+other tick-based systems therefore keep running. `/time set` remains
+authoritative in either policy state and publishes the requested time at the
+current rate.
+
+Focused tests cover the running and frozen packet payloads, monotonic simulation
+ticks while frozen, parser/suggestion exposure, legacy metadata defaulting,
+metadata round-trip, and save/rebind restoration. The real-client observations
+below remain the graphical proof for the default enabled policy; this
+checkpoint did not repeat that already-closed gate.
 
 ## Graphical client gate
 

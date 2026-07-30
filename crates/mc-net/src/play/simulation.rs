@@ -263,6 +263,7 @@ pub(crate) struct SimulationSaveSnapshot {
     pub(crate) entity_journal_phases: Vec<mc_entity::RegionPhase>,
     pub(crate) world_chunk_journal_watermark: Option<u64>,
     pub(crate) world_time: u64,
+    pub(crate) daylight_cycle_enabled: bool,
     pub(crate) players_sleeping_percentage: u32,
     pub(crate) keep_inventory: bool,
     pub(crate) simulation_tick: u64,
@@ -276,6 +277,7 @@ impl std::fmt::Debug for SimulationSaveSnapshot {
             .field("players", &self.players.len())
             .field("entities", &self.entities.records.len())
             .field("world_time", &self.world_time)
+            .field("daylight_cycle_enabled", &self.daylight_cycle_enabled)
             .field(
                 "players_sleeping_percentage",
                 &self.players_sleeping_percentage,
@@ -4860,6 +4862,7 @@ impl SimulationOwner {
                             entity_journal_phases,
                             world_chunk_journal_watermark: sessions.world_chunk_journal_watermark(),
                             world_time: sessions.world_time(),
+                            daylight_cycle_enabled: sessions.daylight_cycle_enabled(),
                             players_sleeping_percentage: sessions.players_sleeping_percentage(),
                             keep_inventory: sessions.keep_inventory(),
                             simulation_tick,

@@ -228,6 +228,25 @@ impl SessionRegistry {
         );
     }
 
+    pub(crate) fn daylight_cycle_enabled(&self) -> bool {
+        self.daylight_cycle_enabled.load(Ordering::Acquire)
+    }
+
+    pub(crate) fn daylight_cycle_rate(&self) -> f32 {
+        if self.daylight_cycle_enabled() {
+            1.0
+        } else {
+            0.0
+        }
+    }
+
+    pub(crate) fn set_daylight_cycle_enabled(&self, enabled: bool) {
+        let previous = self.daylight_cycle_enabled.swap(enabled, Ordering::AcqRel);
+        if previous != enabled {
+            dispatch_visibility_commands(self.broadcast_world_time(self.world_time()));
+        }
+    }
+
     pub(in crate::play) fn begin_sleep_at(
         &self,
         id: SessionId,
@@ -553,13 +572,13 @@ impl SessionRegistry {
             let mut inner = self.lock_inner("advance world time and claim pending hostiles");
             let previous_world_time = self.world_time();
             let world_time = self.advance_world_time_core(ticks);
-            let pending =
-                if super::super::world_time_advance_crosses_night_start(previous_world_time, ticks)
-                {
-                    claim_loaded_pending_hostiles_locked(&mut inner)
-                } else {
-                    ClaimedPendingHostiles::default()
-                };
+            let pending = if self.daylight_cycle_enabled()
+                && super::super::world_time_advance_crosses_night_start(previous_world_time, ticks)
+            {
+                claim_loaded_pending_hostiles_locked(&mut inner)
+            } else {
+                ClaimedPendingHostiles::default()
+            };
             (world_time, pending)
         };
         #[cfg(test)]
@@ -581,10 +600,13 @@ impl SessionRegistry {
     }
 
     pub(in crate::play::session) fn advance_world_time_core(&self, ticks: u64) -> u64 {
-        let world_time = self
-            .world_time
-            .fetch_add(ticks, Ordering::AcqRel)
-            .wrapping_add(ticks);
+        let world_time = if self.daylight_cycle_enabled() {
+            self.world_time
+                .fetch_add(ticks, Ordering::AcqRel)
+                .wrapping_add(ticks)
+        } else {
+            self.world_time()
+        };
         let previous_tick = self
             .entity_lifecycle_tick
             .fetch_update(Ordering::AcqRel, Ordering::Acquire, |tick| {
@@ -601,21 +623,28 @@ impl SessionRegistry {
     }
 
     pub(in crate::play) fn broadcast_world_time(&self, world_time: u64) -> Vec<VisibilityDispatch> {
+        let daylight_cycle_enabled = self.daylight_cycle_enabled();
+        let rate = if daylight_cycle_enabled { 1.0 } else { 0.0 };
         let recipients = {
             let mut inner = self.lock_inner("broadcast world time");
             let recipients = inner
                 .sessions
                 .iter_mut()
                 .filter_map(|(&id, session)| {
-                    if session.last_broadcast_world_time == Some(world_time) {
+                    if session.last_broadcast_world_time
+                        == Some((world_time, daylight_cycle_enabled))
+                    {
                         return None;
                     }
-                    session.last_broadcast_world_time = Some(world_time);
+                    session.last_broadcast_world_time = Some((world_time, daylight_cycle_enabled));
                     Some(id)
                 })
                 .collect::<Vec<_>>();
             session_recipients(&inner, recipients)
         };
-        visibility_dispatches(recipients, || OutboundCommand::WorldTime { world_time })
+        visibility_dispatches(recipients, || OutboundCommand::WorldTime {
+            world_time,
+            rate,
+        })
     }
 }

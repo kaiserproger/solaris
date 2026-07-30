@@ -356,7 +356,7 @@ Benchmark reproduction happens at that feature boundary, not after every edit:
 
 ## Confirmed findings
 
-### P0 — Client day/night clock (wire and graphical gates complete; policy pending)
+### P0 — Client day/night clock (complete)
 
 `v0.0.1-alpha.1` sent `game_time` followed by an empty clock-update map.
 Minecraft 26.1.2 uses that map for client-visible clocks such as time of day, so
@@ -371,8 +371,9 @@ Required change:
 4. [x] Preserve immediate `/time set` updates and persisted world time in the TCP
    contract.
 5. [x] Close the graphical daylight-cycle and restart gate.
-6. [ ] Add an explicit daylight-cycle policy instead of relying on a permanently
+6. [x] Add an explicit daylight-cycle policy instead of relying on a permanently
    hard-coded rate.
+   Evidence: `docs/evidence/world-clock-26.1.2.md`.
 
 Acceptance:
 

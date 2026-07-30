@@ -323,7 +323,25 @@ fn clientbound_session_world_time_separates_monotonic_and_overworld_clocks() {
         })
     );
 
-    assert_eq!(clientbound_world_time(u64::MAX, 1).game_time, i64::MAX);
+    sessions.set_daylight_cycle_enabled(false);
+    sessions.advance_world_time(5);
+    let frozen = clientbound_session_world_time(&sessions);
+    assert_eq!(frozen.game_time, 12);
+    assert_eq!(
+        frozen.overworld_clock,
+        Some(mc_protocol::packets::play::WorldClockUpdate {
+            total_ticks: 12_352,
+            partial_tick: 0.0,
+            rate: 0.0,
+        })
+    );
+
+    sessions.set_daylight_cycle_enabled(true);
+    sessions.advance_world_time(3);
+    assert_eq!(sessions.world_time(), 12_355);
+    assert_eq!(sessions.simulation_tick(), 15);
+
+    assert_eq!(clientbound_world_time(u64::MAX, 1, 1.0).game_time, i64::MAX);
 }
 
 #[test]
@@ -4746,6 +4764,14 @@ fn admin_dispatcher_parses_slash_commands_and_permissions() {
         Ok(AdminCommand::PlayersSleepingPercentage(Some(50)))
     );
     assert_eq!(
+        parse_admin_command("/gamerule do_daylight_cycle", op),
+        Ok(AdminCommand::DaylightCycle(None))
+    );
+    assert_eq!(
+        parse_admin_command("/gamerule do_daylight_cycle false", op),
+        Ok(AdminCommand::DaylightCycle(Some(false)))
+    );
+    assert_eq!(
         parse_admin_command("/gamemode creative", not_op),
         Err(CommandError::PermissionDenied)
     );
@@ -4778,7 +4804,7 @@ fn admin_dispatcher_parses_slash_commands_and_permissions() {
     assert_eq!(
         parse_admin_command("/gamerule players_sleeping_percentage -1", op),
         Err(CommandError::Usage(
-            "Usage: /gamerule <keep_inventory|players_sleeping_percentage> [value]"
+            "Usage: /gamerule <do_daylight_cycle|keep_inventory|players_sleeping_percentage> [value]"
         ))
     );
 }
@@ -4793,6 +4819,12 @@ fn command_tree_and_suggestions_are_permission_aware() {
     assert_eq!(
         tree.nodes[0].children,
         vec![1, 6, 8, 10, 11, 12, 13, 15, 17, 19, 20]
+    );
+    assert_eq!(tree.nodes[20].children, vec![21, 23, 25]);
+    assert_eq!(
+        tree.nodes[23],
+        mc_protocol::packets::play::CommandNode::literal("do_daylight_cycle", vec![24], true,)
+            .restricted(true)
     );
     assert_eq!(
         command_tree_packet(not_op).nodes[0].children,
@@ -4822,6 +4854,10 @@ fn command_tree_and_suggestions_are_permission_aware() {
     assert_eq!(
         gamerules.suggestions,
         vec!["players_sleeping_percentage".to_string()]
+    );
+    assert_eq!(
+        command_suggestions("/gamerule d", op).suggestions,
+        vec!["do_daylight_cycle".to_string()]
     );
 
     let status = command_suggestions("/st", op);

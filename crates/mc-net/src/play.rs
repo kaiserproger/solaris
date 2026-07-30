@@ -12726,10 +12726,14 @@ where
                         )
                         .await?;
                     }
-                    Some(OutboundCommand::WorldTime { world_time }) => {
+                    Some(OutboundCommand::WorldTime { world_time, rate }) => {
                         write_packet(
                             writer,
-                            &clientbound_world_time(sessions.simulation_tick(), world_time),
+                            &clientbound_world_time(
+                                sessions.simulation_tick(),
+                                world_time,
+                                rate,
+                            ),
                             compression,
                         )
                         .await?;

@@ -894,6 +894,7 @@ fn sync_regional_journal_directory(_path: &Path) -> Result<(), RegionalDecisionJ
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct WorldPersistedMetadata {
     pub(crate) world_time: u64,
+    pub(crate) daylight_cycle_enabled: bool,
     pub(crate) players_sleeping_percentage: u32,
     pub(crate) keep_inventory: bool,
     pub(crate) world_identity: String,
@@ -2215,8 +2216,19 @@ pub(crate) fn load_world_metadata(
             });
         }
     };
+    let daylight_cycle_enabled = match field(&fields, "SolarisDaylightCycleEnabled") {
+        Some(Tag::Byte(0)) => false,
+        Some(Tag::Byte(1)) | None => true,
+        _ => {
+            return Err(PlayerPersistenceError::InvalidValue {
+                path: path.clone(),
+                field: "SolarisDaylightCycleEnabled",
+            });
+        }
+    };
     Ok(Some(WorldPersistedMetadata {
         world_time: long_field(&fields, "SolarisWorldTime").unwrap_or(0) as u64,
+        daylight_cycle_enabled,
         players_sleeping_percentage,
         keep_inventory,
         world_identity: string_field(&fields, "SolarisWorldIdentity")
@@ -2238,6 +2250,10 @@ pub(crate) fn save_world_metadata(
         (
             "SolarisWorldIdentity".into(),
             Tag::String(metadata.world_identity.clone()),
+        ),
+        (
+            "SolarisDaylightCycleEnabled".into(),
+            Tag::Byte(i8::from(metadata.daylight_cycle_enabled)),
         ),
         (
             "SolarisPlayersSleepingPercentage".into(),
@@ -4301,6 +4317,7 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let metadata = WorldPersistedMetadata {
             world_time: 12345,
+            daylight_cycle_enabled: false,
             players_sleeping_percentage: 50,
             keep_inventory: true,
             world_identity: world_identity(tmp.path()),
@@ -4328,5 +4345,6 @@ mod tests {
 
         assert_eq!(loaded.players_sleeping_percentage, 100);
         assert!(!loaded.keep_inventory);
+        assert!(loaded.daylight_cycle_enabled);
     }
 }

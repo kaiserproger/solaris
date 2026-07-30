@@ -53,6 +53,7 @@ pub(crate) enum DebugCommand {
 
 #[derive(Debug, Clone, PartialEq)]
 pub(crate) enum AdminCommand {
+    DaylightCycle(Option<bool>),
     GameMode(GameMode),
     KeepInventory(Option<bool>),
     PlayersSleepingPercentage(Option<u32>),
@@ -97,7 +98,11 @@ const ROOT_COMMANDS: &[&str] = &[
     "time", "tp",
 ];
 const GAME_MODES: &[&str] = &["survival", "creative", "adventure", "spectator"];
-const GAME_RULES: &[&str] = &["keep_inventory", "players_sleeping_percentage"];
+const GAME_RULES: &[&str] = &[
+    "do_daylight_cycle",
+    "keep_inventory",
+    "players_sleeping_percentage",
+];
 const MAX_DEBUG_OUTBOUND_PRESSURE_BURST: usize = 256;
 
 #[cfg(test)]
@@ -172,7 +177,7 @@ pub(crate) fn command_tree_packet_with_plugin_roots(
                 )
                 .restricted(true),
                 CommandNode::literal("status", Vec::new(), true).restricted(true),
-                CommandNode::literal("gamerule", vec![21, 23], false).restricted(true),
+                CommandNode::literal("gamerule", vec![21, 23, 25], false).restricted(true),
                 CommandNode::literal("players_sleeping_percentage", vec![22], true)
                     .restricted(true),
                 CommandNode::argument(
@@ -182,7 +187,15 @@ pub(crate) fn command_tree_packet_with_plugin_roots(
                     true,
                 )
                 .restricted(true),
-                CommandNode::literal("keep_inventory", vec![24], true).restricted(true),
+                CommandNode::literal("do_daylight_cycle", vec![24], true).restricted(true),
+                CommandNode::argument(
+                    "value",
+                    CommandArgumentParser::String(CommandStringKind::SingleWord),
+                    Vec::new(),
+                    true,
+                )
+                .restricted(true),
+                CommandNode::literal("keep_inventory", vec![26], true).restricted(true),
                 CommandNode::argument(
                     "value",
                     CommandArgumentParser::String(CommandStringKind::SingleWord),
@@ -235,7 +248,7 @@ fn parse_admin_command_inner(command: &str) -> Result<AdminCommand, CommandError
     }
     if command.starts_with("gamerule") {
         return Err(CommandError::Usage(
-            "Usage: /gamerule <keep_inventory|players_sleeping_percentage> [value]",
+            "Usage: /gamerule <do_daylight_cycle|keep_inventory|players_sleeping_percentage> [value]",
         ));
     }
     if let Some(mode) = parse_gamemode_command(command) {
@@ -423,6 +436,10 @@ fn parse_gamerule_command(command: &str) -> Option<AdminCommand> {
         return None;
     }
     match rule {
+        "do_daylight_cycle" => {
+            let value = value.map(str::parse::<bool>).transpose().ok()?;
+            Some(AdminCommand::DaylightCycle(value))
+        }
         "keep_inventory" => {
             let value = value.map(str::parse::<bool>).transpose().ok()?;
             Some(AdminCommand::KeepInventory(value))

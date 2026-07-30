@@ -137,6 +137,7 @@ pub(in crate::play) enum OutboundCommand {
     },
     WorldTime {
         world_time: u64,
+        rate: f32,
     },
     WakeFromBed {
         bed: mc_world::BlockPos,
