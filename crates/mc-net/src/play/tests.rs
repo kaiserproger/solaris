@@ -42,6 +42,7 @@ mod debug_commands;
 mod direct_response_write_stall;
 mod door_toggles;
 mod enchanting_bookshelf_geometry;
+mod enchanting_efficiency_offer;
 mod enchanting_first_pickaxe_offer;
 mod enchanting_fortune;
 mod enchanting_owner_commit;
@@ -1141,37 +1142,6 @@ fn enchanting_selection_consumes_lapis_and_level_but_preserves_total_xp() {
     assert_eq!(xp.progress, 0.5);
     assert_eq!(xp.total, 12);
     assert_ne!(xp.seed, 123);
-}
-
-#[test]
-fn enchanting_data_exposes_the_supported_efficiency_offer() {
-    let items = mc_data::items::solaris_required_items();
-    let item_facts = mc_data::item_components::solaris_required_item_facts();
-    let pickaxe = items
-        .id_of(&Identifier::parse("minecraft:stone_pickaxe").unwrap())
-        .unwrap();
-    let mut window = EnchantingTableWindow::at_position(7, mc_world::BlockPos { x: 0, y: 0, z: 0 });
-    window.inputs[0] = ItemStack::new(pickaxe, 1);
-    let xp = XpState {
-        seed: 123,
-        ..XpState::default()
-    };
-
-    assert_eq!(
-        enchanting_data_values(&items, &item_facts, &window, &xp, 0),
-        [
-            (0, 1),
-            (1, 0),
-            (2, 0),
-            (3, 123),
-            (4, 8),
-            (5, -1),
-            (6, -1),
-            (7, 1),
-            (8, -1),
-            (9, -1),
-        ]
-    );
 }
 
 fn state(id: u32, default: bool, properties: &[(&str, &str)]) -> BlockStateReport {

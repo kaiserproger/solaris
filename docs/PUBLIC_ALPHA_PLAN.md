@@ -441,6 +441,10 @@ not replace functional, package, workspace, or real-client gates.
    `play/tests/enchanting_fortune.rs`; its offer clues, ordered efficiency and
    fortune result, consumed lapis, XP, and changed seed are recorded in
    [`evidence/mc-net-enchanting-fortune-test-extraction.md`](evidence/mc-net-enchanting-fortune-test-extraction.md).
+   The following zero-bookshelf efficiency-offer data test now lives in
+   focused `play/tests/enchanting_efficiency_offer.rs`; its registry, table,
+   XP-seed, and exact ten-property payload are recorded in
+   [`evidence/mc-net-enchanting-efficiency-offer-test-extraction.md`](evidence/mc-net-enchanting-efficiency-offer-test-extraction.md).
 4. [ ] Separate behavioral tests from structural tripwires. Structural checks may
    enforce crate ownership and dependency direction, but may not assert Rust
    statement order or source-text layout.
