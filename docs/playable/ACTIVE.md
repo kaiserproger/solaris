@@ -23,15 +23,21 @@ replacement-readiness claims.
 ## Active Checkpoint
 
 Next autonomous goal checkpoint: route `playable`; mechanically move the
-`pending_teleport_confirm_clears_only_matching_id`
+`teleport_id_allocator_advances_and_wraps_to_positive_ids`
 test from aggregate `crates/mc-net/src/play/tests.rs` to a focused sibling
 module.
-Preserve its pending teleport id `7` at sent tick `0`, mismatched confirmation
-id `8` with expected id `7` and retained pending state, successful
-confirmation id `7`, cleared pending state, and production behavior. Leave the
-preceding `teleport_id_allocator_advances_and_wraps_to_positive_ids` test and
+Preserve its initial next id `2`, returned ids `2` then `3`, resulting next id
+`4`, reset to `i32::MAX`, returned ids `i32::MAX` then `1`, and production
+behavior. Leave the preceding
+`container_title_nbt_reports_oversized_text_instead_of_panicking` test and
 following `state` helper aggregate-owned, and use explicit imports rather than
 a new `use super::*`.
+
+The complete matching pending-teleport confirmation test has moved to
+`crates/mc-net/src/play/tests/pending_teleport_matching_confirm.rs`. Its
+unchanged pending id, mismatched confirmation and retained state, matching
+confirmation, and cleared state are recorded in
+[`../evidence/mc-net-pending-teleport-matching-confirm-test-extraction.md`](../evidence/mc-net-pending-teleport-matching-confirm-test-extraction.md).
 
 The complete unexpected pending-teleport confirmation test has moved to
 `crates/mc-net/src/play/tests/pending_teleport_unexpected_confirm.rs`. Its

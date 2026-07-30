@@ -365,6 +365,11 @@ not replace functional, package, workspace, or real-client gates.
    pending state, confirmation id, `Unexpected` result, and still-absent state
    are recorded in
    [`evidence/mc-net-pending-teleport-unexpected-confirm-test-extraction.md`](evidence/mc-net-pending-teleport-unexpected-confirm-test-extraction.md).
+   The following matching pending-teleport confirmation test now lives in
+   focused `play/tests/pending_teleport_matching_confirm.rs`; its pending id,
+   mismatched and matching confirmation ids, retained then cleared state, and
+   exact results are recorded in
+   [`evidence/mc-net-pending-teleport-matching-confirm-test-extraction.md`](evidence/mc-net-pending-teleport-matching-confirm-test-extraction.md).
 4. [ ] Separate behavioral tests from structural tripwires. Structural checks may
    enforce crate ownership and dependency direction, but may not assert Rust
    statement order or source-text layout.

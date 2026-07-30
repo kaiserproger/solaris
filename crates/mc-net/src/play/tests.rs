@@ -56,6 +56,7 @@ mod natural_random_ticks;
 mod oracle_aabb_deflation_boundary;
 mod oriented_stair_collision;
 mod pending_teleport_confirm_behaviour;
+mod pending_teleport_matching_confirm;
 mod pending_teleport_movement_gate;
 mod pending_teleport_movement_guard;
 mod pending_teleport_resend;
@@ -1970,23 +1971,6 @@ fn teleport_id_allocator_advances_and_wraps_to_positive_ids() {
     next = i32::MAX;
     assert_eq!(next_player_teleport_id(&mut next), i32::MAX);
     assert_eq!(next_player_teleport_id(&mut next), 1);
-}
-
-#[test]
-fn pending_teleport_confirm_clears_only_matching_id() {
-    let mut pending = Some(PendingTeleport::new(7, 0));
-
-    assert_eq!(
-        confirm_pending_teleport(&mut pending, 8),
-        TeleportConfirmResult::Mismatched { expected: 7 }
-    );
-    assert!(pending.is_some());
-
-    assert_eq!(
-        confirm_pending_teleport(&mut pending, 7),
-        TeleportConfirmResult::Confirmed
-    );
-    assert!(pending.is_none());
 }
 
 fn state(id: u32, default: bool, properties: &[(&str, &str)]) -> BlockStateReport {
