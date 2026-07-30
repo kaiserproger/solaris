@@ -23,16 +23,24 @@ replacement-readiness claims.
 ## Active Checkpoint
 
 Next autonomous goal checkpoint: route `playable`; mechanically move the
-`play_loop_exits_when_outbound_channel_closes` test from aggregate
-`crates/mc-net/src/play/tests.rs` to a focused sibling module. Preserve the
-64-byte duplex reader, sink writer, buffer, session registry, simulation
-channel, slow-client test config, capacity-one outbound channel and dropped
-sender, exact pose and overworld survival respawn, 250 ms timeout, complete
-`play_loop` argument list with both `"ClosedOutbound"` names, exact timeout
-expectation, and clean-close result expectation. Leave the preceding
-`play_loop_closes_session_when_direct_response_write_stalls` test and following
+`play_loop_closes_session_when_direct_response_write_stalls` test from
+aggregate `crates/mc-net/src/play/tests.rs` to a focused sibling module.
+Preserve the 256-byte duplex client/reader, command-suggestion id `7` and
+`"/"` command, packet body/frame encoding and client write, three-write
+`AllowThenStallWriter`, buffer, session/simulation fixtures and starting
+write-timeout count, slow-client config, capacity-one outbound channel, exact
+pose and overworld survival respawn, 250 ms timeout, complete `play_loop`
+argument list with both `"DirectWriter"` names, exact timeout and clean-close
+expectations, and final `start_timeouts + 1` assertion. Leave the preceding
+`play_loop_closes_session_when_outbound_write_stalls` test and following
 `state` helper aggregate-owned, and use explicit imports rather than a new
 `use super::*`.
+
+The complete closed-outbound-channel play-loop test has moved to
+`crates/mc-net/src/play/tests/outbound_channel_close.rs`. Its unchanged dropped
+sender, exact pose/respawn and play-loop arguments, timeout, and clean-close
+expectations are recorded in
+[`../evidence/mc-net-outbound-channel-close-test-extraction.md`](../evidence/mc-net-outbound-channel-close-test-extraction.md).
 
 The complete bounded outbound-pressure draining test has moved to
 `crates/mc-net/src/play/tests/outbound_pressure_draining.rs`. Its unchanged

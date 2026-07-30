@@ -388,6 +388,11 @@ not replace functional, package, workspace, or real-client gates.
    play-loop fixtures and arguments, timeout/result expectations, and unchanged
    pressure counters are recorded in
    [`evidence/mc-net-outbound-pressure-draining-test-extraction.md`](evidence/mc-net-outbound-pressure-draining-test-extraction.md).
+   The following closed-outbound-channel play-loop test now lives in focused
+   `play/tests/outbound_channel_close.rs`; its dropped sender, exact
+   pose/respawn and play-loop arguments, timeout, and clean-close expectations
+   are recorded in
+   [`evidence/mc-net-outbound-channel-close-test-extraction.md`](evidence/mc-net-outbound-channel-close-test-extraction.md).
 4. [ ] Separate behavioral tests from structural tripwires. Structural checks may
    enforce crate ownership and dependency direction, but may not assert Rust
    statement order or source-text layout.
