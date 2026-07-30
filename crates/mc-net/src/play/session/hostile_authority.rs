@@ -4,9 +4,9 @@ use std::sync::atomic::Ordering;
 
 use mc_data::mob_behavior_26_1_2::{MobBehaviorTable, MobCombatPolicy};
 use mc_entity::{
-    AttributeKind, EntityCrossbowAttackPhase, EntityCrossbowAttackState, EntityId, EntityLifecycle,
-    EntityPrimedTntState, EntitySimulationProjection, EntitySnapshot, GoalState, Rotation,
-    SpawnEntity, Vec3,
+    AttributeKind, EntityCrossbowAttackPhase, EntityCrossbowAttackState, EntityGuardianBeamPhase,
+    EntityGuardianBeamState, EntityId, EntityLifecycle, EntityPrimedTntState,
+    EntitySimulationProjection, EntitySnapshot, GoalState, Rotation, SpawnEntity, Vec3,
 };
 use mc_world::BlockStateId;
 
@@ -31,9 +31,9 @@ use super::outbound::ServerEntitySnapshot;
 use super::outbound::{OutboundCommand, VisibilityDispatch};
 use super::projectiles::{initial_arrow_state, projectile_identity};
 use super::visibility::{
-    initialize_entity_wire_state_from_snapshot_locked, server_entity_snapshot_from,
-    session_recipients, spawn_entity_visibility_from_snapshot_locked, visibility_dispatches,
-    visible_entity_observers_locked,
+    entity_event_dispatches_locked, initialize_entity_wire_state_from_snapshot_locked,
+    server_entity_snapshot_from, session_recipients, spawn_entity_visibility_from_snapshot_locked,
+    visibility_dispatches, visible_entity_observers_locked,
 };
 use super::{
     SessionRegistry, apply_entity_facts, is_hostile_entity, record_entity_dispatches_locked,
@@ -47,16 +47,27 @@ const PILLAGER_CROSSBOW_ATTACK_DELAY_MIN_TICKS: u64 = 20;
 const PILLAGER_CROSSBOW_ATTACK_DELAY_SPAN_TICKS: u64 = 20;
 const PLAYER_CROSSBOW_TARGET_Y_OFFSET: f64 = 0.6;
 
+// Exact local 26.1.2 GuardianAttackGoal defaults. Solaris currently advertises EASY.
+const GUARDIAN_BEAM_WARMUP_TICKS: u64 = 10;
+const GUARDIAN_BEAM_DURATION_TICKS: u64 = 80;
+const ELDER_GUARDIAN_BEAM_DURATION_TICKS: u64 = 60;
+const GUARDIAN_MIN_TARGET_DISTANCE_SQ: f64 = 9.0;
+const GUARDIAN_BEAM_START_EVENT: i8 = 21;
+const GUARDIAN_EASY_MAGIC_DAMAGE: f32 = 1.0;
+
 struct HostileAttackTickEntity {
     id: EntityId,
     kind: HostileAttackKind,
     position: Vec3,
     rotation: Rotation,
+    goal: GoalState,
     crossbow_attack: Option<EntityCrossbowAttackState>,
+    guardian_beam: Option<EntityGuardianBeamState>,
 }
 
 struct HostileTargetTickSession {
     id: super::SessionId,
+    entity_id: i32,
     position: Vec3,
     visible_entities: Arc<HashSet<EntityId>>,
 }
@@ -71,7 +82,14 @@ enum HostileAttackKind {
     Creeper,
     Skeleton,
     Crossbow,
-    Melee { attack_damage: f32 },
+    GuardianBeam {
+        elder: bool,
+        follow_range: f64,
+        attack_damage: f32,
+    },
+    Melee {
+        attack_damage: f32,
+    },
 }
 
 #[derive(Debug, Clone)]
@@ -89,6 +107,22 @@ struct PlannedCrossbowTransition {
     expected: Option<EntityCrossbowAttackState>,
     next: Option<EntityCrossbowAttackState>,
     shot: Option<PlannedArrowAttack>,
+}
+
+struct PlannedGuardianBeamTransition {
+    hostile_id: EntityId,
+    expected: Option<EntityGuardianBeamState>,
+    next: Option<EntityGuardianBeamState>,
+    beam_started: bool,
+    attack: Option<PlannedGuardianBeamAttack>,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct PlannedGuardianBeamAttack {
+    hostile_id: EntityId,
+    target_session: super::SessionId,
+    magic_damage: f32,
+    attack_damage: f32,
 }
 
 struct PlannedMeleeAttack {
@@ -219,6 +253,99 @@ fn plan_crossbow_transition(
         expected,
         next,
         shot,
+    })
+}
+
+fn plan_guardian_beam_transition(
+    hostile: &HostileAttackTickEntity,
+    elder: bool,
+    follow_range: f64,
+    attack_damage: f32,
+    targets: &[HostileTargetTickSession],
+    tick: u64,
+) -> Option<PlannedGuardianBeamTransition> {
+    let expected = hostile.guardian_beam;
+    let duration = if elder {
+        ELDER_GUARDIAN_BEAM_DURATION_TICKS
+    } else {
+        GUARDIAN_BEAM_DURATION_TICKS
+    };
+    let target_valid = |target: &HostileTargetTickSession, continuing: bool| {
+        if !target.visible_entities.contains(&hostile.id) {
+            return false;
+        }
+        let distance = distance_sq(hostile.position, target.position);
+        let beyond_minimum = distance > GUARDIAN_MIN_TARGET_DISTANCE_SQ;
+        distance <= follow_range * follow_range && (beyond_minimum || (continuing && elder))
+    };
+
+    let (next, beam_started, attack) = match expected {
+        None => {
+            let target = targets
+                .iter()
+                .filter(|target| target_valid(target, false))
+                .min_by(|left, right| {
+                    distance_sq(hostile.position, left.position)
+                        .total_cmp(&distance_sq(hostile.position, right.position))
+                })?;
+            (
+                Some(EntityGuardianBeamState::new(
+                    EntityGuardianBeamPhase::Warmup,
+                    target.id,
+                    target.entity_id,
+                    tick.saturating_add(GUARDIAN_BEAM_WARMUP_TICKS),
+                )),
+                false,
+                None,
+            )
+        }
+        Some(state) => {
+            let target = targets.iter().find(|target| {
+                target.id == state.target_session
+                    && target.entity_id == state.target_entity_id
+                    && target_valid(target, true)
+            });
+            let Some(target) = target else {
+                return Some(PlannedGuardianBeamTransition {
+                    hostile_id: hostile.id,
+                    expected,
+                    next: None,
+                    beam_started: false,
+                    attack: None,
+                });
+            };
+            match state.phase {
+                EntityGuardianBeamPhase::Warmup if tick >= state.deadline_tick => (
+                    Some(EntityGuardianBeamState::new(
+                        EntityGuardianBeamPhase::Beam,
+                        state.target_session,
+                        state.target_entity_id,
+                        tick.saturating_add(duration),
+                    )),
+                    true,
+                    None,
+                ),
+                EntityGuardianBeamPhase::Beam if tick >= state.deadline_tick => (
+                    None,
+                    false,
+                    Some(PlannedGuardianBeamAttack {
+                        hostile_id: hostile.id,
+                        target_session: target.id,
+                        magic_damage: GUARDIAN_EASY_MAGIC_DAMAGE + if elder { 2.0 } else { 0.0 },
+                        attack_damage,
+                    }),
+                ),
+                _ if hostile.goal != GoalState::Idle => (Some(state), false, None),
+                _ => return None,
+            }
+        }
+    };
+    Some(PlannedGuardianBeamTransition {
+        hostile_id: hostile.id,
+        expected,
+        next,
+        beam_started,
+        attack,
     })
 }
 
@@ -364,6 +491,23 @@ impl SessionRegistry {
                     MobCombatPolicy::CreeperFuse => HostileAttackKind::Creeper,
                     MobCombatPolicy::Arrow => HostileAttackKind::Skeleton,
                     MobCombatPolicy::Crossbow => HostileAttackKind::Crossbow,
+                    MobCombatPolicy::GuardianBeam => HostileAttackKind::GuardianBeam {
+                        elder: entity.type_name == "minecraft:elder_guardian",
+                        follow_range: entity
+                            .attributes
+                            .base(&AttributeKind::FollowRange)
+                            .unwrap_or(16.0)
+                            .clamp(1.0, 2_048.0),
+                        attack_damage: entity
+                            .attributes
+                            .base(&AttributeKind::AttackDamage)
+                            .filter(|damage| damage.is_finite() && *damage > 0.0)
+                            .unwrap_or(if entity.type_name == "minecraft:elder_guardian" {
+                                8.0
+                            } else {
+                                6.0
+                            }) as f32,
+                    },
                     MobCombatPolicy::Melee => HostileAttackKind::Melee {
                         attack_damage: entity
                             .attributes
@@ -373,7 +517,9 @@ impl SessionRegistry {
                     MobCombatPolicy::None | MobCombatPolicy::UnsupportedSpecial => return,
                 };
                 let period = match kind {
-                    HostileAttackKind::Creeper | HostileAttackKind::Crossbow => 1,
+                    HostileAttackKind::Creeper
+                    | HostileAttackKind::Crossbow
+                    | HostileAttackKind::GuardianBeam { .. } => 1,
                     HostileAttackKind::Skeleton => SKELETON_SHOT_PERIOD_TICKS,
                     HostileAttackKind::Melee { .. } => HOSTILE_MELEE_PERIOD_TICKS,
                 };
@@ -386,7 +532,9 @@ impl SessionRegistry {
                     kind,
                     position: entity.position,
                     rotation: entity.rotation,
+                    goal: entity.goal.clone(),
                     crossbow_attack: entity.retained.crossbow_attack,
+                    guardian_beam: entity.retained.guardian_beam,
                 });
             });
         }
@@ -405,6 +553,7 @@ impl SessionRegistry {
                 let (target, visible_entities) = publication.combat_target_snapshot()?;
                 target.is_targetable().then_some(HostileTargetTickSession {
                     id: publication.id(),
+                    entity_id: publication.entity_id(),
                     position: Vec3::new(target.pose().x, target.pose().y, target.pose().z),
                     visible_entities,
                 })
@@ -416,6 +565,7 @@ impl SessionRegistry {
         let mut creeper_fuses = Vec::new();
         let mut arrow_attacks = Vec::new();
         let mut crossbow_transitions = Vec::new();
+        let mut guardian_beam_transitions = Vec::new();
         let mut melee_attacks = Vec::new();
         for hostile in hostiles {
             match hostile.kind {
@@ -470,6 +620,22 @@ impl SessionRegistry {
                         plan_crossbow_transition(&hostile, target, arrow_entity_type_id, tick)
                     {
                         crossbow_transitions.push(transition);
+                    }
+                }
+                HostileAttackKind::GuardianBeam {
+                    elder,
+                    follow_range,
+                    attack_damage,
+                } => {
+                    if let Some(transition) = plan_guardian_beam_transition(
+                        &hostile,
+                        elder,
+                        follow_range,
+                        attack_damage,
+                        &targets,
+                        tick,
+                    ) {
+                        guardian_beam_transitions.push(transition);
                     }
                 }
                 HostileAttackKind::Melee {
@@ -606,10 +772,68 @@ impl SessionRegistry {
             };
         arrow_attacks.extend(committed_crossbow_attacks);
 
+        let (guardian_state_updates, guardian_beam_started, committed_guardian_attacks) =
+            if guardian_beam_transitions.is_empty() {
+                (Vec::new(), HashSet::new(), Vec::new())
+            } else {
+                let guardian_ids = guardian_beam_transitions
+                    .iter()
+                    .map(|transition| transition.hostile_id)
+                    .collect::<HashSet<_>>();
+                let mut entities = self.lock_entities("commit hostile guardian beam states");
+                entities.prefetch(&guardian_ids);
+                let mut updates = Vec::new();
+                let mut started = HashSet::new();
+                let mut attacks = Vec::new();
+                for transition in guardian_beam_transitions {
+                    let Some(expected) = entities.snapshot(transition.hostile_id) else {
+                        continue;
+                    };
+                    if expected.lifecycle != EntityLifecycle::Alive
+                        || !matches!(
+                            expected.type_name.as_str(),
+                            "minecraft:guardian" | "minecraft:elder_guardian"
+                        )
+                        || expected.retained.guardian_beam != transition.expected
+                    {
+                        continue;
+                    }
+                    let previous_target = transition
+                        .expected
+                        .map_or(0, EntityGuardianBeamState::active_target_entity_id);
+                    let next_target = transition
+                        .next
+                        .map_or(0, EntityGuardianBeamState::active_target_entity_id);
+                    let mut next = expected.clone();
+                    next.retained.guardian_beam = transition.next;
+                    if transition.next.is_some() {
+                        next.goal = GoalState::Idle;
+                    }
+                    if !entities.replace_snapshot_if_current(expected, next.clone()) {
+                        continue;
+                    }
+                    if previous_target != next_target {
+                        updates.push(next);
+                    }
+                    if transition.beam_started {
+                        started.insert(transition.hostile_id);
+                    }
+                    if let Some(attack) = transition.attack {
+                        attacks.push(attack);
+                    }
+                }
+                (updates, started, attacks)
+            };
+
         let crossbow_state_updates = if crossbow_state_updates.is_empty() {
             Vec::new()
         } else {
             self.current_expected_entity_snapshots(crossbow_state_updates)
+        };
+        let guardian_state_updates = if guardian_state_updates.is_empty() {
+            Vec::new()
+        } else {
+            self.current_expected_entity_snapshots(guardian_state_updates)
         };
         let mut dispatches = Vec::new();
         if !crossbow_state_updates.is_empty() {
@@ -629,8 +853,37 @@ impl SessionRegistry {
                 dispatches.extend(updates);
             }
         }
+        if !guardian_state_updates.is_empty() {
+            let mut inner = self.lock_inner("publish hostile guardian beam state");
+            for entity in guardian_state_updates {
+                let published = server_entity_snapshot_from(entity);
+                let entity_id = published.id;
+                inner
+                    .published_entity_snapshots
+                    .insert(entity_id, published.clone());
+                let recipients =
+                    session_recipients(&inner, visible_entity_observers_locked(&inner, entity_id));
+                let updates = visibility_dispatches(recipients, || {
+                    OutboundCommand::UpdateEntityData(published.clone())
+                });
+                record_entity_dispatches_locked(&mut inner, &updates);
+                dispatches.extend(updates);
+                if guardian_beam_started.contains(&entity_id) {
+                    let events = entity_event_dispatches_locked(
+                        &inner,
+                        entity_id,
+                        GUARDIAN_BEAM_START_EVENT,
+                    );
+                    record_entity_dispatches_locked(&mut inner, &events);
+                    dispatches.extend(events);
+                }
+            }
+        }
 
-        if arrow_attacks.is_empty() && melee_attacks.is_empty() {
+        if arrow_attacks.is_empty()
+            && melee_attacks.is_empty()
+            && committed_guardian_attacks.is_empty()
+        {
             return (creeper_ignitions, dispatches);
         }
 
@@ -737,6 +990,114 @@ impl SessionRegistry {
                         }
                     }));
                 }
+                attacks += 1;
+            }
+        }
+
+        if !committed_guardian_attacks.is_empty() {
+            let guardian_ids = committed_guardian_attacks
+                .iter()
+                .map(|attack| attack.hostile_id)
+                .collect::<HashSet<_>>();
+            let current_guardians = {
+                let entities = self.lock_entities("validate hostile guardian beam attackers");
+                entities.prefetch(&guardian_ids);
+                guardian_ids
+                    .iter()
+                    .filter_map(|&entity_id| {
+                        entities
+                            .snapshot(entity_id)
+                            .map(|entity| (entity_id, entity))
+                    })
+                    .collect::<HashMap<_, _>>()
+            };
+            let recipients = self.movement_recipients.load_full();
+            let mut reserved_attacks = Vec::with_capacity(committed_guardian_attacks.len());
+            for attack in committed_guardian_attacks {
+                if attack.magic_damage <= 0.0 || attack.attack_damage <= 0.0 {
+                    continue;
+                }
+                let Some(guardian) = current_guardians.get(&attack.hostile_id) else {
+                    continue;
+                };
+                let elder = guardian.type_name == "minecraft:elder_guardian";
+                if guardian.lifecycle != EntityLifecycle::Alive
+                    || !matches!(
+                        guardian.type_name.as_str(),
+                        "minecraft:guardian" | "minecraft:elder_guardian"
+                    )
+                    || guardian.retained.guardian_beam.is_some()
+                {
+                    continue;
+                }
+                let follow_range = guardian
+                    .attributes
+                    .base(&AttributeKind::FollowRange)
+                    .unwrap_or(16.0)
+                    .clamp(1.0, 2_048.0);
+                let Some(target_publication) = recipients.get(&attack.target_session) else {
+                    continue;
+                };
+                let Some((_, damage_recipients)) = target_publication.reserve_combat_recipients_if(
+                    2,
+                    |target, visible_entities| {
+                        if !target.is_targetable() || !visible_entities.contains(&attack.hostile_id)
+                        {
+                            return false;
+                        }
+                        let target_pose = target.pose();
+                        let target_position =
+                            Vec3::new(target_pose.x, target_pose.y, target_pose.z);
+                        let distance = distance_sq(guardian.position, target_position);
+                        distance <= follow_range * follow_range
+                            && (elder || distance > GUARDIAN_MIN_TARGET_DISTANCE_SQ)
+                    },
+                ) else {
+                    continue;
+                };
+                reserved_attacks.push((attack, guardian.clone(), damage_recipients));
+            }
+            let current_attacker_ids = self
+                .current_expected_entity_snapshots(
+                    reserved_attacks
+                        .iter()
+                        .map(|(_, guardian, _)| guardian.clone()),
+                )
+                .into_iter()
+                .filter(|guardian| guardian.retained.guardian_beam.is_none())
+                .map(|guardian| guardian.id)
+                .collect::<HashSet<_>>();
+            for (attack, guardian, damage_recipients) in reserved_attacks {
+                if !current_attacker_ids.contains(&attack.hostile_id) {
+                    continue;
+                }
+                let mut damage_recipients = damage_recipients.into_iter();
+                let magic_recipient = damage_recipients
+                    .next()
+                    .expect("two guardian beam recipients were reserved");
+                let mob_recipient = damage_recipients
+                    .next()
+                    .expect("two guardian beam recipients were reserved");
+                dispatches.push(VisibilityDispatch {
+                    recipient: magic_recipient,
+                    command: OutboundCommand::DamagePlayer {
+                        damage: PlayerDamageRequest {
+                            kind: PlayerDamageKind::IndirectMagic,
+                            amount: attack.magic_damage,
+                            source_origin: Some(guardian.position),
+                        },
+                    },
+                });
+                dispatches.push(VisibilityDispatch {
+                    recipient: mob_recipient,
+                    command: OutboundCommand::DamagePlayer {
+                        damage: PlayerDamageRequest {
+                            kind: PlayerDamageKind::MobAttack,
+                            amount: attack.attack_damage,
+                            source_origin: Some(guardian.position),
+                        },
+                    },
+                });
                 attacks += 1;
             }
         }
@@ -933,6 +1294,7 @@ fn hostile_target_candidate_from_projection(
             profile.combat,
             MobCombatPolicy::Arrow
                 | MobCombatPolicy::Crossbow
+                | MobCombatPolicy::GuardianBeam
                 | MobCombatPolicy::UnsupportedSpecial
         ),
         is_creeper: profile.combat == MobCombatPolicy::CreeperFuse,
@@ -1037,6 +1399,7 @@ pub(super) fn update_hostile_targets(
                 profile.combat,
                 MobCombatPolicy::Arrow
                     | MobCombatPolicy::Crossbow
+                    | MobCombatPolicy::GuardianBeam
                     | MobCombatPolicy::UnsupportedSpecial
             ),
             is_creeper: profile.combat == MobCombatPolicy::CreeperFuse,

@@ -75,6 +75,12 @@ fn canonical_sources_match_the_local_26_1_2_damage_type_tags() {
     assert!(generic.contains(DamageFlags::NO_KNOCKBACK));
     assert!(!generic.contains(DamageFlags::BYPASSES_INVULNERABILITY));
 
+    let indirect_magic = DamageSource::vanilla(DamageSourceKind::IndirectMagic).flags();
+    assert!(indirect_magic.contains(DamageFlags::BYPASSES_ARMOR));
+    assert!(!indirect_magic.contains(DamageFlags::BYPASSES_EFFECTS));
+    assert!(!indirect_magic.contains(DamageFlags::BYPASSES_RESISTANCE));
+    assert!(!indirect_magic.contains(DamageFlags::NO_KNOCKBACK));
+
     let melee = DamageSource::vanilla(DamageSourceKind::Melee).flags();
     assert_eq!(melee, DamageFlags::NONE);
 
@@ -95,6 +101,7 @@ fn common_damage_sources_share_reduction_and_immunity_boundaries() {
     for (kind, armor_bypassed, no_knockback) in [
         (DamageSourceKind::Melee, false, false),
         (DamageSourceKind::Projectile, false, false),
+        (DamageSourceKind::IndirectMagic, true, false),
         (DamageSourceKind::Fire, false, true),
         (DamageSourceKind::Lava, false, true),
         (DamageSourceKind::Fall, true, true),

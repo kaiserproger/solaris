@@ -2076,6 +2076,333 @@ fn pillager_crossbow_cancels_when_target_becomes_non_targetable() {
 }
 
 #[test]
+fn guardian_beam_warms_up_publishes_target_then_deals_ordered_damage() {
+    let registry = SessionRegistry::new();
+    let player = register_test_session(&registry, "GuardianBeamAlice");
+    assert!(registry.mark_loaded(player, (0, 0)).is_empty());
+    let target_entity_id = registry
+        .lock_inner("read guardian target entity id")
+        .sessions[&player]
+        .entity_id;
+    registry.spawn_command_entity(
+        &SimulationAuthority::for_test(),
+        63,
+        "minecraft:guardian".to_owned(),
+        Vec3::new(0.5, 64.0, 6.5),
+    );
+    let guardian_id = registry
+        .persisted_entity_records()
+        .into_iter()
+        .find(|record| record.snapshot.type_name == "minecraft:guardian")
+        .expect("spawned guardian")
+        .snapshot
+        .id;
+    let (attacks, dispatches) = registry.tick_hostile_attacks(
+        &SimulationAuthority::for_test(),
+        1,
+        mc_world::BlockStateId(0),
+    );
+    assert_eq!(attacks, 0);
+    assert!(dispatches.is_empty());
+    let warmup = registry
+        .lock_entities("read guardian warmup")
+        .snapshot(guardian_id)
+        .unwrap()
+        .retained
+        .guardian_beam
+        .expect("guardian starts warmup");
+    assert_eq!(warmup.phase, mc_entity::EntityGuardianBeamPhase::Warmup);
+    assert_eq!(warmup.target_session, player);
+    assert_eq!(warmup.target_entity_id, target_entity_id);
+    assert_eq!(warmup.deadline_tick, 11);
+
+    let (attacks, dispatches) = registry.tick_hostile_attacks(
+        &SimulationAuthority::for_test(),
+        warmup.deadline_tick,
+        mc_world::BlockStateId(0),
+    );
+    assert_eq!(attacks, 0);
+    let beam = registry
+        .lock_entities("read active guardian beam")
+        .snapshot(guardian_id)
+        .unwrap()
+        .retained
+        .guardian_beam
+        .expect("guardian beam becomes active");
+    assert_eq!(beam.phase, mc_entity::EntityGuardianBeamPhase::Beam);
+    assert_eq!(beam.deadline_tick, 91);
+    assert!(dispatches.iter().any(|dispatch| {
+        matches!(
+            &dispatch.command,
+            OutboundCommand::UpdateEntityData(snapshot)
+                if snapshot.id == guardian_id
+                    && snapshot.guardian_attack_target_entity_id == target_entity_id
+        )
+    }));
+    assert!(dispatches.iter().any(|dispatch| {
+        matches!(
+            dispatch.command,
+            OutboundCommand::EntityEvent { entity_id, event_id }
+                if entity_id == guardian_id.0 && event_id == 21
+        )
+    }));
+
+    assert_eq!(
+        registry
+            .tick_hostile_attacks(
+                &SimulationAuthority::for_test(),
+                beam.deadline_tick - 1,
+                mc_world::BlockStateId(0),
+            )
+            .0,
+        0
+    );
+    let (attacks, dispatches) = registry.tick_hostile_attacks(
+        &SimulationAuthority::for_test(),
+        beam.deadline_tick,
+        mc_world::BlockStateId(0),
+    );
+    assert_eq!(attacks, 1);
+    assert!(
+        registry
+            .lock_entities("read completed guardian beam")
+            .snapshot(guardian_id)
+            .unwrap()
+            .retained
+            .guardian_beam
+            .is_none()
+    );
+    assert!(dispatches.iter().any(|dispatch| {
+        matches!(
+            &dispatch.command,
+            OutboundCommand::UpdateEntityData(snapshot)
+                if snapshot.id == guardian_id
+                    && snapshot.guardian_attack_target_entity_id == 0
+        )
+    }));
+    let damage = dispatches
+        .iter()
+        .filter_map(|dispatch| match &dispatch.command {
+            OutboundCommand::DamagePlayer { damage } => Some((damage.kind, damage.amount)),
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(
+        damage,
+        vec![
+            (super::super::combat::PlayerDamageKind::IndirectMagic, 1.0),
+            (super::super::combat::PlayerDamageKind::MobAttack, 6.0),
+        ]
+    );
+    assert_eq!(
+        registry
+            .tick_hostile_attacks(
+                &SimulationAuthority::for_test(),
+                beam.deadline_tick + 1,
+                mc_world::BlockStateId(0),
+            )
+            .0,
+        0
+    );
+}
+
+#[test]
+fn guardian_does_not_start_beam_at_exact_three_block_boundary() {
+    let registry = SessionRegistry::new();
+    let player = register_test_session(&registry, "GuardianBeamBoundary");
+    assert!(registry.mark_loaded(player, (0, 0)).is_empty());
+    registry.spawn_command_entity(
+        &SimulationAuthority::for_test(),
+        63,
+        "minecraft:guardian".to_owned(),
+        Vec3::new(0.5, 64.0, 3.5),
+    );
+    let guardian_id = registry
+        .persisted_entity_records()
+        .into_iter()
+        .find(|record| record.snapshot.type_name == "minecraft:guardian")
+        .unwrap()
+        .snapshot
+        .id;
+
+    let (attacks, dispatches) = registry.tick_hostile_attacks(
+        &SimulationAuthority::for_test(),
+        1,
+        mc_world::BlockStateId(0),
+    );
+    assert_eq!(attacks, 0);
+    assert!(dispatches.is_empty());
+    assert!(
+        registry
+            .lock_entities("read guardian boundary state")
+            .snapshot(guardian_id)
+            .unwrap()
+            .retained
+            .guardian_beam
+            .is_none()
+    );
+}
+
+#[test]
+fn guardian_beam_cancels_and_resets_metadata_when_target_becomes_spectator() {
+    let registry = SessionRegistry::new();
+    let player = register_test_session(&registry, "GuardianBeamGone");
+    assert!(registry.mark_loaded(player, (0, 0)).is_empty());
+    registry.spawn_command_entity(
+        &SimulationAuthority::for_test(),
+        63,
+        "minecraft:guardian".to_owned(),
+        Vec3::new(0.5, 64.0, 6.5),
+    );
+    let guardian_id = registry
+        .persisted_entity_records()
+        .into_iter()
+        .find(|record| record.snapshot.type_name == "minecraft:guardian")
+        .unwrap()
+        .snapshot
+        .id;
+    registry.tick_hostile_attacks(
+        &SimulationAuthority::for_test(),
+        1,
+        mc_world::BlockStateId(0),
+    );
+    let warmup = registry
+        .lock_entities("read cancelling guardian warmup")
+        .snapshot(guardian_id)
+        .unwrap()
+        .retained
+        .guardian_beam
+        .unwrap();
+    registry.tick_hostile_attacks(
+        &SimulationAuthority::for_test(),
+        warmup.deadline_tick,
+        mc_world::BlockStateId(0),
+    );
+    {
+        let mut inner = registry.lock_inner("make guardian target spectator");
+        inner.spectator_sessions.insert(player);
+        inner.publish_combat_target(player);
+    }
+    let (attacks, dispatches) = registry.tick_hostile_attacks(
+        &SimulationAuthority::for_test(),
+        warmup.deadline_tick + 1,
+        mc_world::BlockStateId(0),
+    );
+    assert_eq!(attacks, 0);
+    assert!(
+        registry
+            .lock_entities("read cancelled guardian beam")
+            .snapshot(guardian_id)
+            .unwrap()
+            .retained
+            .guardian_beam
+            .is_none()
+    );
+    assert!(dispatches.iter().any(|dispatch| {
+        matches!(
+            &dispatch.command,
+            OutboundCommand::UpdateEntityData(snapshot)
+                if snapshot.id == guardian_id
+                    && snapshot.guardian_attack_target_entity_id == 0
+        )
+    }));
+    assert!(
+        !dispatches
+            .iter()
+            .any(|dispatch| { matches!(dispatch.command, OutboundCommand::DamagePlayer { .. }) })
+    );
+}
+
+#[test]
+fn elder_guardian_uses_sixty_tick_beam_and_easy_magic_bonus() {
+    let registry = SessionRegistry::new();
+    let player = register_test_session(&registry, "ElderGuardianBeam");
+    assert!(registry.mark_loaded(player, (0, 0)).is_empty());
+    registry.spawn_command_entity(
+        &SimulationAuthority::for_test(),
+        40,
+        "minecraft:elder_guardian".to_owned(),
+        Vec3::new(0.5, 64.0, 6.5),
+    );
+    let guardian_id = registry
+        .persisted_entity_records()
+        .into_iter()
+        .find(|record| record.snapshot.type_name == "minecraft:elder_guardian")
+        .unwrap()
+        .snapshot
+        .id;
+    registry.tick_hostile_attacks(
+        &SimulationAuthority::for_test(),
+        1,
+        mc_world::BlockStateId(0),
+    );
+    let warmup = registry
+        .lock_entities("read elder guardian warmup")
+        .snapshot(guardian_id)
+        .unwrap()
+        .retained
+        .guardian_beam
+        .unwrap();
+    registry.tick_hostile_attacks(
+        &SimulationAuthority::for_test(),
+        warmup.deadline_tick,
+        mc_world::BlockStateId(0),
+    );
+    let beam = registry
+        .lock_entities("read elder guardian beam")
+        .snapshot(guardian_id)
+        .unwrap()
+        .retained
+        .guardian_beam
+        .unwrap();
+    assert_eq!(beam.deadline_tick, warmup.deadline_tick + 60);
+    {
+        let mut inner = registry.lock_inner("move elder guardian target inside three blocks");
+        inner.sessions.get_mut(&player).unwrap().pose = PlayerPose::new(0.5, 64.0, 4.5);
+        inner.publish_combat_target(player);
+    }
+    assert_eq!(
+        registry
+            .tick_hostile_attacks(
+                &SimulationAuthority::for_test(),
+                warmup.deadline_tick + 1,
+                mc_world::BlockStateId(0),
+            )
+            .0,
+        0
+    );
+    assert_eq!(
+        registry
+            .lock_entities("read close elder guardian beam")
+            .snapshot(guardian_id)
+            .unwrap()
+            .retained
+            .guardian_beam,
+        Some(beam)
+    );
+    let (attacks, dispatches) = registry.tick_hostile_attacks(
+        &SimulationAuthority::for_test(),
+        beam.deadline_tick,
+        mc_world::BlockStateId(0),
+    );
+    assert_eq!(attacks, 1);
+    let damage = dispatches
+        .iter()
+        .filter_map(|dispatch| match &dispatch.command {
+            OutboundCommand::DamagePlayer { damage } => Some((damage.kind, damage.amount)),
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(
+        damage,
+        vec![
+            (super::super::combat::PlayerDamageKind::IndirectMagic, 3.0),
+            (super::super::combat::PlayerDamageKind::MobAttack, 8.0),
+        ]
+    );
+}
+
+#[test]
 fn hostile_commit_releases_both_locks_before_arrow_publication() {
     let registry = Arc::new(SessionRegistry::new());
     registry.configure_arrow_kill_rewards(

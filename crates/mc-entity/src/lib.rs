@@ -459,6 +459,9 @@ pub struct EntityRetainedState {
     pub primed_tnt: Option<EntityPrimedTntState>,
     #[serde(default)]
     pub crossbow_attack: Option<EntityCrossbowAttackState>,
+    /// Runtime attack-goal state. Vanilla does not persist the active beam target.
+    #[serde(skip)]
+    pub guardian_beam: Option<EntityGuardianBeamState>,
     #[serde(default)]
     pub villager: Option<VillagerData>,
     #[serde(default)]
@@ -498,6 +501,45 @@ impl EntityCrossbowAttackState {
     #[must_use]
     pub const fn is_charging(self) -> bool {
         matches!(self.phase, EntityCrossbowAttackPhase::Charging)
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum EntityGuardianBeamPhase {
+    Warmup,
+    Beam,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct EntityGuardianBeamState {
+    pub phase: EntityGuardianBeamPhase,
+    pub target_session: u64,
+    pub target_entity_id: i32,
+    pub deadline_tick: u64,
+}
+
+impl EntityGuardianBeamState {
+    #[must_use]
+    pub const fn new(
+        phase: EntityGuardianBeamPhase,
+        target_session: u64,
+        target_entity_id: i32,
+        deadline_tick: u64,
+    ) -> Self {
+        Self {
+            phase,
+            target_session,
+            target_entity_id,
+            deadline_tick,
+        }
+    }
+
+    #[must_use]
+    pub const fn active_target_entity_id(self) -> i32 {
+        match self.phase {
+            EntityGuardianBeamPhase::Warmup => 0,
+            EntityGuardianBeamPhase::Beam => self.target_entity_id,
+        }
     }
 }
 

@@ -151,6 +151,7 @@ struct GameplayDecisionState {
     item_pickup_claim: Option<u64>,
     primed_tnt: Option<crate::EntityPrimedTntState>,
     crossbow_attack: Option<crate::EntityCrossbowAttackState>,
+    guardian_beam: Option<crate::EntityGuardianBeamState>,
     villager: Option<crate::VillagerData>,
     villager_brain: Option<crate::villager_26_1_2::VillagerBrainState>,
     villager_gossip: Option<crate::villager_gossip_26_1_2::VillagerGossipState>,
@@ -1326,6 +1327,7 @@ fn insert_snapshot_into_world(world: &mut World, snapshot: EntitySnapshot) -> bo
         item_pickup_claim,
         primed_tnt,
         crossbow_attack,
+        guardian_beam,
         villager,
         villager_brain,
         villager_gossip,
@@ -1380,6 +1382,7 @@ fn insert_snapshot_into_world(world: &mut World, snapshot: EntitySnapshot) -> bo
             item_pickup_claim,
             primed_tnt,
             crossbow_attack,
+            guardian_beam,
             villager,
             villager_brain,
             villager_gossip,
@@ -1495,6 +1498,7 @@ fn restore_snapshot_in_world(
         item_pickup_claim,
         primed_tnt,
         crossbow_attack,
+        guardian_beam,
         villager,
         villager_brain,
         villager_gossip,
@@ -1547,6 +1551,7 @@ fn restore_snapshot_in_world(
                 item_pickup_claim,
                 primed_tnt,
                 crossbow_attack,
+                guardian_beam,
                 villager,
                 villager_brain,
                 villager_gossip,
@@ -1657,6 +1662,7 @@ fn snapshot_from_world(world: &World, id: EntityId) -> Option<EntitySnapshot> {
             item_pickup_claim: gameplay.item_pickup_claim,
             primed_tnt: gameplay.primed_tnt,
             crossbow_attack: gameplay.crossbow_attack,
+            guardian_beam: gameplay.guardian_beam,
             villager: gameplay.villager,
             villager_brain: gameplay.villager_brain.clone(),
             villager_gossip: gameplay.villager_gossip.clone(),
@@ -1804,6 +1810,7 @@ fn entity_view_from_world(world: &World, id: EntityId) -> Option<EntityView<'_>>
             item_pickup_claim: gameplay.item_pickup_claim,
             primed_tnt: gameplay.primed_tnt,
             crossbow_attack: gameplay.crossbow_attack,
+            guardian_beam: gameplay.guardian_beam,
             villager: gameplay.villager,
             villager_brain: gameplay.villager_brain.clone(),
             villager_gossip: gameplay.villager_gossip.clone(),
@@ -2444,8 +2451,8 @@ mod tests {
     use crate::effects_26_1_2::{EffectFlags, EffectKind};
     use crate::{
         AttributeKind, AttributeSet, EntityCrossbowAttackPhase, EntityCrossbowAttackState,
-        EntityId, EntityItemStack, EntityLifecycle, EntitySnapshot, GoalState, Rotation, Vec3,
-        VehicleKind, VehicleState,
+        EntityGuardianBeamPhase, EntityGuardianBeamState, EntityId, EntityItemStack,
+        EntityLifecycle, EntitySnapshot, GoalState, Rotation, Vec3, VehicleKind, VehicleState,
     };
     use uuid::Uuid;
 
@@ -2497,6 +2504,12 @@ mod tests {
         hostile.retained.crossbow_attack = Some(EntityCrossbowAttackState::new(
             EntityCrossbowAttackPhase::Charging,
             125,
+        ));
+        hostile.retained.guardian_beam = Some(EntityGuardianBeamState::new(
+            EntityGuardianBeamPhase::Beam,
+            17,
+            99,
+            205,
         ));
 
         let arrow = snapshot(4, 4, "minecraft:arrow");

@@ -1930,14 +1930,16 @@ current special-case growth under a larger name.
 # 7. Current development cursor
 
 The next active engineering task remains outside this backlog and is owned by
-[`playable/ACTIVE.md`](playable/ACTIVE.md). Pillager crossbow combat and the
-bounded iron-golem panic-defence slice are closed; neither activated any API 1.0
-task. The current cursor is:
+[`playable/ACTIVE.md`](playable/ACTIVE.md) and
+[`PUBLIC_ALPHA_PLAN.md`](PUBLIC_ALPHA_PLAN.md). Pillager crossbow, bounded
+iron-golem panic defence and guardian beam combat are closed; none activated any
+API 1.0 task. The current cursor is:
 
-1. continue raids with one bounded authoritative vertical slice, or select the
-   next reachable `UnsupportedSpecial` profile when a smaller honest slice is
-   available;
-2. implement the real species-specific path or keep it visibly unsupported;
-3. add the exact authoritative and client-visible evidence required by the
-   existing vanilla-parity workflow;
-4. repeat the vanilla-parity queue before activating any task above.
+1. close periodic natural spawning with bounded loaded-chunk scheduling,
+   independent category cadences, admission rules, refill and metrics;
+2. close derived plugin deployment reporting in check/log/docs and the Loader
+   handshake failure path;
+3. run release-closeout validation that is possible in this workspace and leave
+   graphical owner-host gates explicitly external;
+4. do not activate any task above until the vanilla/public-alpha gate is closed
+   and the owner explicitly opens API 1.0 work.

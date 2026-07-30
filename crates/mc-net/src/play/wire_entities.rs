@@ -10,6 +10,15 @@ use mc_protocol::packets::play::{
 
 // Entity 0..7, LivingEntity 8..14, Mob 15, Raider 16, Pillager charging flag 17.
 const PILLAGER_ENTITY_DATA_CHARGING_CROSSBOW_INDEX_26_1_2: u8 = 17;
+// Entity 0..7, LivingEntity 8..14, Mob 15, Guardian moving flag 16, target id 17.
+const GUARDIAN_ENTITY_DATA_ATTACK_TARGET_INDEX_26_1_2: u8 = 17;
+
+fn is_guardian_type(entity_type: &str) -> bool {
+    matches!(
+        entity_type,
+        "minecraft:guardian" | "minecraft:elder_guardian"
+    )
+}
 
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub(in crate::play) enum ServerEntityWireMove {
@@ -383,6 +392,12 @@ where
             value: true,
         });
     }
+    if is_guardian_type(&entity.type_name) && entity.guardian_attack_target_entity_id != 0 {
+        values.push(EntityDataValue::Int {
+            index: GUARDIAN_ENTITY_DATA_ATTACK_TARGET_INDEX_26_1_2,
+            value: entity.guardian_attack_target_entity_id,
+        });
+    }
     if values.is_empty() {
         return Ok(());
     }
@@ -442,6 +457,12 @@ where
         values.push(EntityDataValue::Boolean {
             index: PILLAGER_ENTITY_DATA_CHARGING_CROSSBOW_INDEX_26_1_2,
             value: entity.crossbow_charging,
+        });
+    }
+    if is_guardian_type(&entity.type_name) {
+        values.push(EntityDataValue::Int {
+            index: GUARDIAN_ENTITY_DATA_ATTACK_TARGET_INDEX_26_1_2,
+            value: entity.guardian_attack_target_entity_id,
         });
     }
     if values.is_empty() {
@@ -727,6 +748,7 @@ mod tests {
             villager_baby: false,
             main_hand_item: Some(EntityItemStack::new(321, 1)),
             crossbow_charging: charging,
+            guardian_attack_target_entity_id: 0,
         }
     }
 
@@ -782,6 +804,89 @@ mod tests {
         }
     }
 
+    fn guardian_snapshot(target_entity_id: i32) -> ServerEntitySnapshot {
+        ServerEntitySnapshot {
+            id: EntityId(44),
+            uuid: uuid::Uuid::from_u128(44),
+            type_id: 62,
+            type_name: "minecraft:guardian".to_owned(),
+            position: Vec3::new(1.5, 64.0, 1.5),
+            rotation: Rotation::ZERO,
+            velocity: Vec3::ZERO,
+            on_ground: false,
+            health: Some(30.0),
+            item_stack: None,
+            experience_value: None,
+            block_state: None,
+            animal: None,
+            villager: None,
+            villager_baby: false,
+            main_hand_item: None,
+            crossbow_charging: false,
+            guardian_attack_target_entity_id: target_entity_id,
+        }
+    }
+
+    #[tokio::test]
+    async fn guardian_metadata_encodes_beam_target_and_reset() {
+        for target_entity_id in [123, 0] {
+            let entity = guardian_snapshot(target_entity_id);
+            let mut writer = Vec::new();
+
+            send_entity_data(&mut writer, Compression::Disabled, &entity)
+                .await
+                .unwrap();
+
+            let mut bytes = BytesMut::from(writer.as_slice());
+            let mut frame = mc_protocol::frame::try_decode_frame(&mut bytes, Compression::Disabled)
+                .unwrap()
+                .expect("set guardian entity data frame");
+            assert_eq!(frame.id, ClientboundSetEntityData::ID);
+            let packet = ClientboundSetEntityData::decode(&mut frame.body).unwrap();
+            assert_eq!(packet.entity_id, entity.id.0);
+            assert!(packet.values.iter().any(|value| {
+                matches!(
+                    value,
+                    EntityDataValue::Int { index, value }
+                        if *index == GUARDIAN_ENTITY_DATA_ATTACK_TARGET_INDEX_26_1_2
+                            && *value == target_entity_id
+                )
+            }));
+            assert!(bytes.is_empty());
+        }
+    }
+
+    #[tokio::test]
+    async fn guardian_pairing_metadata_includes_only_active_beam_target() {
+        for target_entity_id in [123, 0] {
+            let entity = guardian_snapshot(target_entity_id);
+            let mut writer = Vec::new();
+
+            send_entity_pairing_data(&mut writer, Compression::Disabled, &entity)
+                .await
+                .unwrap();
+
+            let mut bytes = BytesMut::from(writer.as_slice());
+            let mut frame = mc_protocol::frame::try_decode_frame(&mut bytes, Compression::Disabled)
+                .unwrap()
+                .expect("guardian pairing metadata frame");
+            assert_eq!(frame.id, ClientboundSetEntityData::ID);
+            let packet = ClientboundSetEntityData::decode(&mut frame.body).unwrap();
+            assert_eq!(
+                packet.values.iter().find_map(|value| match value {
+                    EntityDataValue::Int { index, value }
+                        if *index == GUARDIAN_ENTITY_DATA_ATTACK_TARGET_INDEX_26_1_2 =>
+                    {
+                        Some(*value)
+                    }
+                    _ => None,
+                }),
+                (target_entity_id != 0).then_some(target_entity_id)
+            );
+            assert!(bytes.is_empty());
+        }
+    }
+
     #[tokio::test]
     async fn sheep_spawn_metadata_encodes_authoritative_color() {
         let entity = ServerEntitySnapshot {
@@ -804,6 +909,7 @@ mod tests {
             villager_baby: false,
             main_hand_item: None,
             crossbow_charging: false,
+            guardian_attack_target_entity_id: 0,
         };
         let mut writer = Vec::new();
 

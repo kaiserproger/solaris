@@ -14,6 +14,7 @@ pub enum DamageSourceKind {
     Starvation,
     Void,
     Generic,
+    IndirectMagic,
     Melee,
     Projectile,
     Unsupported,
@@ -85,6 +86,7 @@ impl DamageSource {
             DamageSourceKind::Generic => {
                 DamageFlags::BYPASSES_ARMOR.union(DamageFlags::NO_KNOCKBACK)
             }
+            DamageSourceKind::IndirectMagic => DamageFlags::BYPASSES_ARMOR,
             DamageSourceKind::Projectile => DamageFlags::IS_PROJECTILE,
             DamageSourceKind::Melee | DamageSourceKind::Unsupported => DamageFlags::NONE,
         };

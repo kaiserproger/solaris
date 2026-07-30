@@ -398,6 +398,24 @@ fn independently_sourced_attributes_and_loot(
             },
             static_id("minecraft:entities/spider"),
         ),
+        "minecraft:guardian" => (
+            EntityAttributeFacts {
+                max_health: Some(30.0),
+                movement_speed: Some(0.5),
+                follow_range: Some(35.0),
+                attack_damage: Some(6.0),
+            },
+            static_id("minecraft:entities/guardian"),
+        ),
+        "minecraft:elder_guardian" => (
+            EntityAttributeFacts {
+                max_health: Some(80.0),
+                movement_speed: Some(0.300_000_011_920_928_96),
+                follow_range: Some(35.0),
+                attack_damage: Some(8.0),
+            },
+            static_id("minecraft:entities/elder_guardian"),
+        ),
         "minecraft:cod" | "minecraft:salmon" | "minecraft:tropical_fish" => (
             EntityAttributeFacts {
                 max_health: Some(3.0),
@@ -466,6 +484,20 @@ mod tests {
             .unwrap();
         assert!(skeleton.category.is_hostile());
         assert_eq!(skeleton.attributes.attack_damage, Some(2.0));
+
+        let guardian = registry
+            .facts_of(&Identifier::parse("minecraft:guardian").unwrap())
+            .unwrap();
+        assert_eq!(guardian.attributes.max_health, Some(30.0));
+        assert_eq!(guardian.attributes.movement_speed, Some(0.5));
+        assert_eq!(guardian.attributes.follow_range, Some(35.0));
+        assert_eq!(guardian.attributes.attack_damage, Some(6.0));
+
+        let elder = registry
+            .facts_of(&Identifier::parse("minecraft:elder_guardian").unwrap())
+            .unwrap();
+        assert_eq!(elder.attributes.max_health, Some(80.0));
+        assert_eq!(elder.attributes.attack_damage, Some(8.0));
 
         let item = registry
             .facts_of(&Identifier::parse("minecraft:item").unwrap())

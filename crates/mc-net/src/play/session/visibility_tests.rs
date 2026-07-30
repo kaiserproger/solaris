@@ -266,6 +266,7 @@ fn physics_motion_publication_preserves_non_kinematic_state() {
         villager_baby: false,
         main_hand_item: None,
         crossbow_charging: false,
+        guardian_attack_target_entity_id: 0,
     };
     let motion = EntityMotionState {
         id: snapshot.id,

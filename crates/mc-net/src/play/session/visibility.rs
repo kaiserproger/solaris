@@ -4,8 +4,8 @@ use std::sync::{Arc, LazyLock};
 
 use mc_data::Identifier;
 use mc_entity::{
-    EntityCrossbowAttackState, EntityId, EntityItemStack, EntityLifecycle, EntityMotionState,
-    EntitySnapshot, Rotation, Vec3,
+    EntityCrossbowAttackState, EntityGuardianBeamState, EntityId, EntityItemStack, EntityLifecycle,
+    EntityMotionState, EntitySnapshot, Rotation, Vec3,
 };
 use mc_protocol::packets::play::MoveEntityPosRot;
 
@@ -277,6 +277,10 @@ pub(in crate::play) fn server_entity_snapshot_from(entity: EntitySnapshot) -> Se
         .retained
         .crossbow_attack
         .is_some_and(EntityCrossbowAttackState::is_charging);
+    let guardian_attack_target_entity_id = entity
+        .retained
+        .guardian_beam
+        .map_or(0, EntityGuardianBeamState::active_target_entity_id);
     ServerEntitySnapshot {
         id: entity.id,
         uuid: entity.uuid,
@@ -299,6 +303,7 @@ pub(in crate::play) fn server_entity_snapshot_from(entity: EntitySnapshot) -> Se
             .is_some_and(|population| population.age_ticks < 0),
         main_hand_item,
         crossbow_charging,
+        guardian_attack_target_entity_id,
     }
 }
 

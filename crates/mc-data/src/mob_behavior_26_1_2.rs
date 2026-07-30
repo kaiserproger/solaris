@@ -31,6 +31,7 @@ pub enum MobCombatPolicy {
     Melee,
     Arrow,
     Crossbow,
+    GuardianBeam,
     CreeperFuse,
     UnsupportedSpecial,
 }
@@ -197,9 +198,7 @@ fn combat_policy(name: &'static str, hostile: bool) -> (MobCombatPolicy, Option<
         }
         "minecraft:blaze" => (MobCombatPolicy::UnsupportedSpecial, Some("small_fireball")),
         "minecraft:breeze" => (MobCombatPolicy::UnsupportedSpecial, Some("wind_charge")),
-        "minecraft:elder_guardian" | "minecraft:guardian" => {
-            (MobCombatPolicy::UnsupportedSpecial, Some("guardian_beam"))
-        }
+        "minecraft:elder_guardian" | "minecraft:guardian" => (MobCombatPolicy::GuardianBeam, None),
         "minecraft:ender_dragon" => (MobCombatPolicy::UnsupportedSpecial, Some("dragon_boss")),
         "minecraft:evoker" => (MobCombatPolicy::UnsupportedSpecial, Some("evoker_spell")),
         "minecraft:ghast" => (MobCombatPolicy::UnsupportedSpecial, Some("large_fireball")),
@@ -270,13 +269,11 @@ mod tests {
             table.get_by_name("minecraft:mannequin").unwrap().movement,
             MobMovementPolicy::Immobile
         );
-        assert_eq!(
-            table
-                .get_by_name("minecraft:guardian")
-                .unwrap()
-                .special_attack,
-            Some("guardian_beam")
-        );
+        for guardian in ["minecraft:guardian", "minecraft:elder_guardian"] {
+            let profile = table.get_by_name(guardian).unwrap();
+            assert_eq!(profile.combat, MobCombatPolicy::GuardianBeam);
+            assert_eq!(profile.special_attack, None);
+        }
         assert!(table.get_by_name("minecraft:player").is_none());
     }
 

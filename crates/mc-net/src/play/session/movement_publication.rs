@@ -178,6 +178,7 @@ impl Deref for PublishedEntityVisibility {
 #[derive(Debug, Clone)]
 pub(super) struct MovementRecipientPublication {
     id: SessionId,
+    entity_id: i32,
     tx: tokio::sync::mpsc::Sender<OutboundCommand>,
     pressure: Arc<OutboundPressureMetrics>,
     ordered_dispatch: Arc<OrderedDispatchState>,
@@ -190,6 +191,7 @@ impl MovementRecipientPublication {
     fn from_session(id: SessionId, session: &PlaySession) -> Self {
         Self {
             id,
+            entity_id: session.entity_id,
             tx: session.tx.clone(),
             pressure: Arc::clone(&session.pressure),
             ordered_dispatch: Arc::clone(&session.ordered_dispatch),
@@ -201,6 +203,10 @@ impl MovementRecipientPublication {
 
     pub(super) fn id(&self) -> SessionId {
         self.id
+    }
+
+    pub(super) fn entity_id(&self) -> i32 {
+        self.entity_id
     }
 
     pub(super) fn recipient(&self) -> SessionRecipient {
@@ -236,8 +242,22 @@ impl MovementRecipientPublication {
         &self,
         validate: impl FnOnce(PublishedCombatTargetState, &HashSet<EntityId>) -> bool,
     ) -> Option<(PublishedCombatTargetState, SessionRecipient)> {
+        let (target, mut recipients) = self.reserve_combat_recipients_if(1, validate)?;
+        Some((
+            target,
+            recipients
+                .pop()
+                .expect("one requested combat recipient is reserved"),
+        ))
+    }
+
+    pub(super) fn reserve_combat_recipients_if(
+        &self,
+        count: usize,
+        validate: impl FnOnce(PublishedCombatTargetState, &HashSet<EntityId>) -> bool,
+    ) -> Option<(PublishedCombatTargetState, Vec<SessionRecipient>)> {
         let before = self.publication_epoch.load();
-        if !before.is_multiple_of(2) {
+        if count == 0 || !before.is_multiple_of(2) {
             return None;
         }
         let target = *self.combat_target();
@@ -245,11 +265,11 @@ impl MovementRecipientPublication {
         if !validate(target, &visible_entities) {
             return None;
         }
-        let recipient = self.recipient();
+        let recipients = (0..count).map(|_| self.recipient()).collect();
         if self.publication_epoch.load() != before {
             return None;
         }
-        Some((target, recipient))
+        Some((target, recipients))
     }
 
     pub(super) fn reserve_observer_if_visible(

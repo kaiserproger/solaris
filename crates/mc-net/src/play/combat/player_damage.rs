@@ -9,6 +9,7 @@ pub(in crate::play) enum PlayerDamageKind {
     MobAttack,
     PlayerAttack,
     Projectile,
+    IndirectMagic,
     Fall,
     Campfire,
     Fire,
@@ -35,6 +36,7 @@ impl PlayerDamageKind {
         match self {
             Self::MobAttack | Self::PlayerAttack => DamageSource::vanilla(DamageSourceKind::Melee),
             Self::Projectile => DamageSource::vanilla(DamageSourceKind::Projectile),
+            Self::IndirectMagic => DamageSource::vanilla(DamageSourceKind::IndirectMagic),
             Self::Fall => DamageSource::vanilla(DamageSourceKind::Fall),
             Self::Campfire | Self::Fire => DamageSource::vanilla(DamageSourceKind::Fire),
             Self::Lava => DamageSource::vanilla(DamageSourceKind::Lava),
@@ -224,6 +226,12 @@ mod source_policy_tests {
                 DamageSourceKind::Projectile,
                 true,
                 true,
+            ),
+            (
+                PlayerDamageKind::IndirectMagic,
+                DamageSourceKind::IndirectMagic,
+                false,
+                false,
             ),
             (PlayerDamageKind::Fall, DamageSourceKind::Fall, false, false),
             (

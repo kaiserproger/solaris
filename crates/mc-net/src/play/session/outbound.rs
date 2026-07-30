@@ -55,6 +55,7 @@ pub(in crate::play) struct ServerEntitySnapshot {
     pub(in crate::play) villager_baby: bool,
     pub(in crate::play) main_hand_item: Option<EntityItemStack>,
     pub(in crate::play) crossbow_charging: bool,
+    pub(in crate::play) guardian_attack_target_entity_id: i32,
 }
 
 #[derive(Debug, Clone, Copy)]

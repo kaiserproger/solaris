@@ -9,7 +9,7 @@ and is not startup context.
 
 - Date: 2026-07-30.
 - Branch: `main`.
-- Checkpoint head: `feat(villages): add iron golem defence`.
+- Checkpoint head: guardian beam combat pending commit.
   The first owner-run public-alpha session remains the routing authority for the
   next stabilization release; its exact plan is `docs/PUBLIC_ALPHA_PLAN.md`.
 - The future full Luau addon platform is frozen in
@@ -17,16 +17,17 @@ and is not startup context.
   `docs/LUAU_ADDON_API_1_0_TASKS.md`. Only the two documentation tasks are
   complete and all 143 runtime tasks remain `BLOCKED-VP` until scoped vanilla
   parity and explicit owner activation.
-- The latest bounded parity slice closes iron-golem panic defence. Adult villagers
-  persist a bounded recent-sleep projection plus the exact inclusive 599-tick
-  golem-detected memory; three eligible villagers can create one block- and
-  entity-collision-validated persisted golem, and save/restart preserves the
-  villagers, memory and golem without duplication. The golem pursues nearby
-  hostiles except creepers and reuses ordinary goal, damage, death, loot,
-  velocity and tracking-event authority. Actual bed pose, five-villager gossip
-  spawning, exact Java RNG, player anger/reputation, repair/crackiness, Hero
-  pricing and raids remain open. The next cursor is raids or the next reachable
-  `UnsupportedSpecial` species-specific path.
+- The latest bounded parity slice closes guardian beam combat. Guardian and elder
+  guardian now carry runtime-only warmup/beam state, exact 10-tick warmup and
+  80/60-tick beam durations, target metadata index 17, event 21, and ordered
+  indirect-magic then mob-attack damage. Canonical attributes are now present in
+  the entity facts table. The current slice targets players through tracking
+  visibility; full LOS, squid/axolotl targets, thorns, elder fatigue and runtime
+  difficulty selection remain open.
+- The active cursor is no longer broad mob growth. Close `PUBLIC_ALPHA_PLAN.md`
+  release blockers in order: periodic natural spawning, plugin deployment
+  reporting, then release-closeout validation. Graphical owner-host evidence
+  remains external and must not be claimed from this headless workspace.
 - The strong baseline must be preserved: seed `712816`, VD16 and one local player
   pre-generated 225 chunks at 929.473 chunks/s, streamed every requested chunk
   without degradation or memory-pressure shedding, used roughly 300 MiB by owner

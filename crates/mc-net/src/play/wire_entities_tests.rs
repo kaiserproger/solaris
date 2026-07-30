@@ -51,6 +51,7 @@ fn entity_snapshot(type_id: i32, type_name: &str) -> ServerEntitySnapshot {
         villager_baby: false,
         main_hand_item: None,
         crossbow_charging: false,
+        guardian_attack_target_entity_id: 0,
     }
 }
 
