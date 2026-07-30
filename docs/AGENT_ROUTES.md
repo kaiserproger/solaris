@@ -21,7 +21,8 @@ Additional exact surfaces:
 - Protocol packet ids/layouts: ADR 0002, `.analysis/protocol-dump.txt`, `tools/dump-vanilla-protocol.sh`, and `crates/mc-test-harness/src/bin/wire_probe.rs`.
 - Build/run: `README.md` and `example.toml`.
 - Owner-facing core explanation: `docs/CORE_INTERNALS_FOR_OWNER.md`.
-- Proposed runtime `/goal` transport: `docs/GOAL_WRAPPER_V2.md`.
+- CodexPro `/goal` launch, checkpoint granularity, and runtime wrapper:
+  `docs/GOAL_WRAPPER_V2.md`.
 
 ## Playable Route
 
