@@ -23,15 +23,21 @@ replacement-readiness claims.
 ## Active Checkpoint
 
 Next autonomous goal checkpoint: route `playable`; mechanically move the
-`pending_teleport_movement_gate_waits_without_duplicate_sync_packets`
+`pending_teleport_reports_unexpected_confirm_without_pending_state`
 test from aggregate `crates/mc-net/src/play/tests.rs` to a focused sibling
 module.
-Preserve its pending teleport id `12` at sent tick `0`, four consecutive true
-movement guards for the exact `ServerboundMovePlayerPos` packet name, retained
-pending id `12`, and production behavior. Leave the preceding
-`pending_teleport_reports_unexpected_confirm_without_pending_state` test and
+Preserve its absent pending state, confirmation id `1`,
+`TeleportConfirmResult::Unexpected` result, still-absent pending state, and
+production behavior. Leave the preceding
+`pending_teleport_confirm_clears_only_matching_id` test and
 following `state` helper aggregate-owned, and use explicit imports rather than
 a new `use super::*`.
+
+The complete repeated pending-teleport movement-gate test has moved to
+`crates/mc-net/src/play/tests/pending_teleport_movement_gate.rs`. Its unchanged
+pending id, four exact move-packet guard calls, true guard results, and
+retained pending state are recorded in
+[`../evidence/mc-net-pending-teleport-movement-gate-test-extraction.md`](../evidence/mc-net-pending-teleport-movement-gate-test-extraction.md).
 
 The complete post-movement pending-teleport confirmation test has moved to
 `crates/mc-net/src/play/tests/pending_teleport_confirm_behaviour.rs`. Its

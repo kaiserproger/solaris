@@ -56,6 +56,7 @@ mod natural_random_ticks;
 mod oracle_aabb_deflation_boundary;
 mod oriented_stair_collision;
 mod pending_teleport_confirm_behaviour;
+mod pending_teleport_movement_gate;
 mod pending_teleport_movement_guard;
 mod pending_teleport_resend;
 mod pickup;
@@ -1996,20 +1997,6 @@ fn pending_teleport_reports_unexpected_confirm_without_pending_state() {
         TeleportConfirmResult::Unexpected
     );
     assert!(pending.is_none());
-}
-
-#[test]
-fn pending_teleport_movement_gate_waits_without_duplicate_sync_packets() {
-    let pending = Some(PendingTeleport::new(12, 0));
-
-    for _ in 0..4 {
-        assert!(guard_pending_teleport_movement(
-            &pending,
-            "ServerboundMovePlayerPos"
-        ));
-    }
-
-    assert!(matches!(pending, Some(PendingTeleport { id: 12, .. })));
 }
 
 fn state(id: u32, default: bool, properties: &[(&str, &str)]) -> BlockStateReport {
