@@ -219,6 +219,11 @@ Benchmark reproduction happens at that feature boundary, not after every edit:
 ## Execution status
 
 - [x] Consolidate the `v0.0.2-alpha.1` plan in this canonical file.
+- [x] Classify all six ignored `mc-entity` tests. They are explicit opt-in
+  performance reports, not hidden behavioral regressions; their workloads,
+  executable correctness coverage, owner, and close conditions are recorded in
+  [`evidence/mc-entity-ignored-tests.md`](evidence/mc-entity-ignored-tests.md).
+  None was reproduced during this classification checkpoint.
 - [x] Record the exact local 26.1.2 world-clock oracle in
   [`evidence/world-clock-26.1.2.md`](evidence/world-clock-26.1.2.md).
 - [x] Implement the typed world-clock map, separating monotonic `game_time` from
