@@ -237,6 +237,11 @@ not replace functional, package, workspace, or real-client gates.
    exact pose/position/sequence, successful-open, and writer-lock-independence
    coverage is recorded in
    [`evidence/mc-net-crafting-table-open-test-extraction.md`](evidence/mc-net-crafting-table-open-test-extraction.md).
+   The following movement block-read writer-lock test now lives in focused
+   `play/tests/movement_block_reads.rs`; its solid-collision, water-overlap,
+   exact block/pose, ready-result, and writer-lock-independence coverage is
+   recorded in
+   [`evidence/mc-net-movement-block-reads-test-extraction.md`](evidence/mc-net-movement-block-reads-test-extraction.md).
 4. [ ] Separate behavioral tests from structural tripwires. Structural checks may
    enforce crate ownership and dependency direction, but may not assert Rust
    statement order or source-text layout.

@@ -23,14 +23,20 @@ replacement-readiness claims.
 ## Active Checkpoint
 
 Next autonomous goal checkpoint: route `playable`; mechanically move the
-`movement_block_reads_do_not_wait_for_world_writer` test out of aggregate
-`crates/mc-net/src/play/tests.rs` into a focused sibling module. Preserve its
-complete published-world solid-collision and water-overlap reads, exact block
-states and player poses, ready-future results, and writer-lock-independence
-coverage and production behavior, leave the preceding
-`collision_correction_applies_powder_snow_movement_context` test and following
-`button_test_registry` helper aggregate-owned, and use explicit imports rather
-than a new `use super::*`.
+`collision_correction_applies_powder_snow_movement_context` test out of
+aggregate `crates/mc-net/src/play/tests.rs` into a focused sibling module.
+Preserve its complete leather-boots entry correction, Shift descent, long-fall
+0.9F landing-shape, teleport-sequence, and published collision-context coverage
+and production behavior, leave the preceding
+`powder_snow_dynamic_shape_requires_exact_vanilla_state_identity` test and
+following `button_test_registry` helper aggregate-owned, and use explicit
+imports rather than a new `use super::*`.
+
+The complete movement block-read writer-lock test has moved to
+`crates/mc-net/src/play/tests/movement_block_reads.rs`. Its solid-collision,
+water-overlap, exact block/pose, ready-result, and writer-lock-independence
+coverage is recorded in
+[`../evidence/mc-net-movement-block-reads-test-extraction.md`](../evidence/mc-net-movement-block-reads-test-extraction.md).
 
 The complete crafting-table-open writer-lock test has moved to
 `crates/mc-net/src/play/tests/crafting_table_open.rs`. Its loaded-table,
