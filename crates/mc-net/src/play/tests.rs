@@ -33,6 +33,7 @@ mod death_xp;
 mod debug_commands;
 mod door_toggles;
 mod enchanting_recipe_settlement;
+mod entity_tick_cadence;
 mod falling_blocks;
 mod fluid_runtime;
 mod furnace;
@@ -3412,13 +3413,6 @@ async fn toggle_planning_does_not_wait_for_world_writer() {
     assert_eq!(plan.preconditions[0].expected_token, expected_token);
     assert_eq!(plan.scheduled_block_ticks[0].trigger_tick, 120);
     drop(world_writer);
-}
-
-#[test]
-fn entity_tick_cadence_matches_vanilla_cow_tracking() {
-    assert_eq!(ENTITY_TICK_PERIOD, Duration::from_millis(50));
-    assert_eq!(mc_physics::TICK_SECONDS, 0.05);
-    assert_eq!(ENTITY_MOVE_SEND_INTERVAL_TICKS, 3);
 }
 
 fn button_test_registry() -> mc_world::BlockRegistry {

@@ -23,13 +23,19 @@ replacement-readiness claims.
 ## Active Checkpoint
 
 Next autonomous goal checkpoint: route `playable`; mechanically move the
-`entity_tick_cadence_matches_vanilla_cow_tracking` test out of aggregate
+`toggle_planning_does_not_wait_for_world_writer` test out of aggregate
 `crates/mc-net/src/play/tests.rs` into a focused sibling module. Preserve its
-complete wall-clock period, physics-step, and move-publication cadence matrix
-and production behavior, leave the preceding
-`toggle_planning_does_not_wait_for_world_writer` test and following
-`button_test_registry` helper aggregate-owned, and use explicit imports rather
-than a new `use super::*`.
+complete published-world, mutation-token, edit, precondition, scheduled-tick,
+and writer-lock independence coverage and production behavior, leave the
+preceding `block_placement_planning_does_not_wait_for_world_writer` test and
+following `button_test_registry` helper aggregate-owned, and use explicit
+imports rather than a new `use super::*`.
+
+The complete entity-tick cadence matrix has moved to
+`crates/mc-net/src/play/tests/entity_tick_cadence.rs`. Its 50 ms owner period,
+0.05-second physics step, and three-tick move-publication cadence are recorded
+in
+[`../evidence/mc-net-entity-tick-cadence-test-extraction.md`](../evidence/mc-net-entity-tick-cadence-test-extraction.md).
 
 The complete arrow launch spawn-position and draw-power velocity matrix has
 moved to `crates/mc-net/src/play/tests/arrow_launch.rs`. Its yaw/pitch-derived

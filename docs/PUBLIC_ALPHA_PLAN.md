@@ -213,6 +213,10 @@ not replace functional, package, workspace, or real-client gates.
    focused `play/tests/arrow_launch.rs`; its spawn-position and three-axis
    velocity coverage is recorded in
    [`evidence/mc-net-arrow-launch-test-extraction.md`](evidence/mc-net-arrow-launch-test-extraction.md).
+   The following entity-tick cadence test now lives in focused
+   `play/tests/entity_tick_cadence.rs`; its 50 ms owner period, 0.05-second
+   physics step, and three-tick move-publication cadence are recorded in
+   [`evidence/mc-net-entity-tick-cadence-test-extraction.md`](evidence/mc-net-entity-tick-cadence-test-extraction.md).
 4. [ ] Separate behavioral tests from structural tripwires. Structural checks may
    enforce crate ownership and dependency direction, but may not assert Rust
    statement order or source-text layout.
