@@ -23,19 +23,19 @@ replacement-readiness claims.
 ## Active Checkpoint
 
 Next autonomous goal checkpoint: route `playable`; mechanically move the full
-six-test chest quick-move, stack-limit, menu-revision, crafting-revision, and
-persistent-container claim class beginning with
-`chest_quick_move_places_player_stack_in_first_empty_storage_slot` and ending
-with `persistent_container_claim_check_covers_furnace_and_both_chest_halves`
-out of aggregate `crates/mc-net/src/play/tests.rs` into a focused sibling
-module. Preserve every test and production behavior, leave the preceding
-`debug_give_zero_count_clears_hotbar_slot_before_item_lookup` test in the
-aggregate file, and use explicit imports rather than a new `use super::*`. The
-complete four-test admin-command parsing, permission-aware command-tree,
-runtime-control status, and local-development permission class has already
-moved to `crates/mc-net/src/play/tests/admin_commands.rs`; its concentration
-and validation are recorded in
-[`../evidence/mc-net-admin-commands-test-extraction.md`](../evidence/mc-net-admin-commands-test-extraction.md).
+three-test debug-command parsing, water-corridor fixture, and zero-count give
+execution class beginning with
+`debug_commands_parse_survival_mutations_and_give` and ending with
+`debug_give_zero_count_clears_hotbar_slot_before_item_lookup` out of aggregate
+`crates/mc-net/src/play/tests.rs` into a focused sibling module. Preserve every
+test and production behavior, leave the preceding
+`recoverable_death_xp_uses_level_cap` test in the aggregate file, and use
+explicit imports rather than a new `use super::*`. The complete six-test chest
+quick-move, stack-limit, menu/crafting revision, and persistent-container
+claim class has already moved to
+`crates/mc-net/src/play/tests/container_inventory.rs`; its concentration and
+validation are recorded in
+[`../evidence/mc-net-container-inventory-test-extraction.md`](../evidence/mc-net-container-inventory-test-extraction.md).
 The owner-run subjective fresh-world seed-`712816` playtest and
 release-candidate performance gates remain queued at their declared
 boundaries.

@@ -172,6 +172,11 @@ not replace functional, package, workspace, or real-client gates.
    lives in focused `play/tests/admin_commands.rs`; its preserved parsing,
    suggestion, control-status, and permission coverage is recorded in
    [`evidence/mc-net-admin-commands-test-extraction.md`](evidence/mc-net-admin-commands-test-extraction.md).
+   The following six-test chest quick-move, stack-limit, menu/crafting
+   revision, and persistent-container claim class now lives in focused
+   `play/tests/container_inventory.rs`; its preserved storage transfer,
+   inventory accounting, revision, and claim coverage is recorded in
+   [`evidence/mc-net-container-inventory-test-extraction.md`](evidence/mc-net-container-inventory-test-extraction.md).
 4. [ ] Separate behavioral tests from structural tripwires. Structural checks may
    enforce crate ownership and dependency direction, but may not assert Rust
    statement order or source-text layout.
