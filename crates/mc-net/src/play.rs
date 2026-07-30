@@ -352,8 +352,7 @@ use containers::{
 };
 #[cfg(test)]
 use containers::{
-    BLAST_FURNACE_MENU_TYPE_ID, DOUBLE_CHEST_MENU_TYPE_ID, FURNACE_MENU_TYPE_ID,
-    SINGLE_CHEST_STORAGE_SLOTS, SMOKER_MENU_TYPE_ID,
+    DOUBLE_CHEST_MENU_TYPE_ID, SINGLE_CHEST_STORAGE_SLOTS,
     apply_quick_move_click as chest_apply_quick_move_click,
     apply_swap_click as chest_apply_swap_click, apply_throw_click as chest_apply_throw_click,
     chest_player_slot, crafting_result_from_input, furnace_experience_award,

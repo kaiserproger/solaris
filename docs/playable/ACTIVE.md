@@ -23,17 +23,18 @@ replacement-readiness claims.
 ## Active Checkpoint
 
 Next autonomous goal checkpoint: route `playable`; mechanically move the
-two-test common-container and cauldron safe-interaction class beginning with
-`common_container_paper_cuts_resolve_to_existing_menus` and ending with
-`cauldron_variants_are_safe_interaction_targets` out of aggregate
-`crates/mc-net/src/play/tests.rs` into a focused sibling module. Preserve every
-test and production behavior, leave the preceding bed/sleep class and
-following `interaction_state_for_items` helper in their current modules, and
-use explicit imports rather than a new `use super::*`. The twelve-test bed
-interaction and sleep-planning class has already moved to
-`crates/mc-net/src/play/tests/bed_sleep.rs`; its concentration and validation
-are recorded in
-[`../evidence/mc-net-bed-sleep-test-extraction.md`](../evidence/mc-net-bed-sleep-test-extraction.md).
+fourteen-test inventory settlement, recovery, checkpoint, and publication
+class beginning with
+`disconnected_cursor_is_preserved_when_simulation_owner_is_unavailable` and
+ending with `inventory_result_paths_publish_only_after_owner_commit` out of
+aggregate `crates/mc-net/src/play/tests.rs` into a focused sibling module.
+Preserve every test and production behavior, leave the preceding shared
+`interaction_state_for_items` helper and following `stonecutter_test_recipe`
+helper class in the aggregate file, and use explicit imports rather than a new
+`use super::*`. The two-test common-container and cauldron safe-interaction
+class has already moved to `crates/mc-net/src/play/tests/container_safety.rs`;
+its concentration and validation are recorded in
+[`../evidence/mc-net-container-safety-test-extraction.md`](../evidence/mc-net-container-safety-test-extraction.md).
 The owner-run subjective fresh-world seed-`712816` playtest and
 release-candidate performance gates remain queued at their declared
 boundaries.

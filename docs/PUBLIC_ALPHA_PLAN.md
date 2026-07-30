@@ -92,6 +92,10 @@ not replace functional, package, workspace, or real-client gates.
    obstruction, monster, wake-position, and morning-skip coverage is recorded
    in
    [`evidence/mc-net-bed-sleep-test-extraction.md`](evidence/mc-net-bed-sleep-test-extraction.md).
+   The following two-test common-container and cauldron safe-interaction class
+   now lives in focused `play/tests/container_safety.rs`; its menu mapping and
+   safe-rejection coverage is recorded in
+   [`evidence/mc-net-container-safety-test-extraction.md`](evidence/mc-net-container-safety-test-extraction.md).
 4. [ ] Separate behavioral tests from structural tripwires. Structural checks may
    enforce crate ownership and dependency direction, but may not assert Rust
    statement order or source-text layout.
