@@ -46,6 +46,10 @@ not replace functional, package, workspace, or real-client gates.
    process, world-state, or simulation event that proves progress.
 3. [ ] Keep substantial tests beside their focused domain in `*_tests.rs`; stop
    growing aggregate `play.rs`, `session.rs`, and inline production test modules.
+   The complete 76-test plant adapter class now lives in focused
+   `play/tests/plants.rs`; aggregate concentration and the preserved test set are
+   recorded in
+   [`evidence/mc-net-plant-adapter-test-extraction.md`](evidence/mc-net-plant-adapter-test-extraction.md).
 4. [ ] Separate behavioral tests from structural tripwires. Structural checks may
    enforce crate ownership and dependency direction, but may not assert Rust
    statement order or source-text layout.

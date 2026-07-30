@@ -23,13 +23,16 @@ replacement-readiness claims.
 ## Active Checkpoint
 
 Next autonomous goal checkpoint: route `playable`; mechanically move the
-remaining plant/crop/cactus/bamboo/sapling/bonemeal adapter-test class and its
-test-only helpers out of aggregate `crates/mc-net/src/play/tests.rs` into the
-focused sibling `crates/mc-net/src/play/tests/plants.rs`. Preserve every test
-and production behavior, use explicit imports rather than a new `use super::*`,
-and record the before/after test concentration. The production plant-rules
-crate extraction is already complete in
-[`../evidence/plant-rules-crate-boundary.md`](../evidence/plant-rules-crate-boundary.md).
+natural random-tick/leaves/grass/fire test cluster beginning with
+`natural_random_tick_helpers_cover_leaves_grass_and_fire` and ending with
+`natural_leaf_decay_uses_vanilla_base_drop_pools` out of aggregate
+`crates/mc-net/src/play/tests.rs` into a focused sibling module. Preserve every
+test and production behavior, keep the following toggle helper class in the
+aggregate file, and use explicit imports rather than a new `use super::*`.
+The complete 76-test plant adapter class has already moved to
+`crates/mc-net/src/play/tests/plants.rs`; its concentration and validation are
+recorded in
+[`../evidence/mc-net-plant-adapter-test-extraction.md`](../evidence/mc-net-plant-adapter-test-extraction.md).
 The owner-run subjective fresh-world seed-`712816` playtest and
 release-candidate performance gates remain queued at their declared
 boundaries.
