@@ -23,17 +23,21 @@ replacement-readiness claims.
 ## Active Checkpoint
 
 Next autonomous goal checkpoint: route `playable`; mechanically move the
-`pending_teleport_confirm_behaviour_after_unconfirmed_movement`
+`pending_teleport_movement_gate_waits_without_duplicate_sync_packets`
 test from aggregate `crates/mc-net/src/play/tests.rs` to a focused sibling
 module.
-Preserve its pending teleport id `7` at sent tick `0`, initial movement guard
-for the exact `ServerboundMovePlayerPos` packet name, mismatched confirmation
-id `8` with expected id `7` and retained pending id `7`, successful
-confirmation id `7`, cleared pending state, final false movement guard for the
-same packet name, and production behavior. Leave the preceding
-`pending_teleport_movement_gate_waits_without_duplicate_sync_packets` test and
+Preserve its pending teleport id `12` at sent tick `0`, four consecutive true
+movement guards for the exact `ServerboundMovePlayerPos` packet name, retained
+pending id `12`, and production behavior. Leave the preceding
+`pending_teleport_reports_unexpected_confirm_without_pending_state` test and
 following `state` helper aggregate-owned, and use explicit imports rather than
 a new `use super::*`.
+
+The complete post-movement pending-teleport confirmation test has moved to
+`crates/mc-net/src/play/tests/pending_teleport_confirm_behaviour.rs`. Its
+unchanged initial guard, mismatched and successful confirmation ids, retained
+then cleared pending state, and final false guard are recorded in
+[`../evidence/mc-net-pending-teleport-confirm-behaviour-test-extraction.md`](../evidence/mc-net-pending-teleport-confirm-behaviour-test-extraction.md).
 
 The complete pending-teleport resend-window test has moved to
 `crates/mc-net/src/play/tests/pending_teleport_resend.rs`. Its unchanged pose,

@@ -350,6 +350,11 @@ not replace functional, package, workspace, or real-client gates.
    no-resend boundary, tick `121` position-sync resend, and pending/next
    teleport-id transitions are recorded in
    [`evidence/mc-net-pending-teleport-resend-window-test-extraction.md`](evidence/mc-net-pending-teleport-resend-window-test-extraction.md).
+   The following post-movement pending-teleport confirmation test now lives in
+   focused `play/tests/pending_teleport_confirm_behaviour.rs`; its exact move
+   packet, mismatched and successful confirmation ids, retained then cleared
+   pending state, and guard transitions are recorded in
+   [`evidence/mc-net-pending-teleport-confirm-behaviour-test-extraction.md`](evidence/mc-net-pending-teleport-confirm-behaviour-test-extraction.md).
 4. [ ] Separate behavioral tests from structural tripwires. Structural checks may
    enforce crate ownership and dependency direction, but may not assert Rust
    statement order or source-text layout.

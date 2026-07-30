@@ -55,6 +55,7 @@ mod movement_block_reads;
 mod natural_random_ticks;
 mod oracle_aabb_deflation_boundary;
 mod oriented_stair_collision;
+mod pending_teleport_confirm_behaviour;
 mod pending_teleport_movement_guard;
 mod pending_teleport_resend;
 mod pickup;
@@ -2009,32 +2010,6 @@ fn pending_teleport_movement_gate_waits_without_duplicate_sync_packets() {
     }
 
     assert!(matches!(pending, Some(PendingTeleport { id: 12, .. })));
-}
-
-#[test]
-fn pending_teleport_confirm_behaviour_after_unconfirmed_movement() {
-    let mut pending = Some(PendingTeleport::new(7, 0));
-
-    assert!(guard_pending_teleport_movement(
-        &pending,
-        "ServerboundMovePlayerPos"
-    ));
-
-    assert_eq!(
-        confirm_pending_teleport(&mut pending, 8),
-        TeleportConfirmResult::Mismatched { expected: 7 }
-    );
-    assert_eq!(pending.unwrap().id, 7);
-
-    assert_eq!(
-        confirm_pending_teleport(&mut pending, 7),
-        TeleportConfirmResult::Confirmed
-    );
-    assert!(pending.is_none());
-    assert!(!guard_pending_teleport_movement(
-        &pending,
-        "ServerboundMovePlayerPos"
-    ));
 }
 
 fn state(id: u32, default: bool, properties: &[(&str, &str)]) -> BlockStateReport {
