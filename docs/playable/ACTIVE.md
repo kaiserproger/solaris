@@ -23,15 +23,22 @@ replacement-readiness claims.
 ## Active Checkpoint
 
 Next autonomous goal checkpoint: route `playable`; mechanically move the
-`teleport_id_allocator_advances_and_wraps_to_positive_ids`
+`container_title_nbt_reports_oversized_text_instead_of_panicking`
 test from aggregate `crates/mc-net/src/play/tests.rs` to a focused sibling
 module.
-Preserve its initial next id `2`, returned ids `2` then `3`, resulting next id
-`4`, reset to `i32::MAX`, returned ids `i32::MAX` then `1`, and production
-behavior. Leave the preceding
-`container_title_nbt_reports_oversized_text_instead_of_panicking` test and
+Preserve its text length of `usize::from(u16::MAX) + 1`, exact
+`"oversized NBT title should fail"` expectation, resulting
+`mc_protocol::CodecError::Nbt` variant, and production behavior. Leave the
+preceding
+`entity_movement_write_turn_preserves_order_across_the_budget_boundary` test and
 following `state` helper aggregate-owned, and use explicit imports rather than
 a new `use super::*`.
+
+The complete teleport-id allocator test has moved to
+`crates/mc-net/src/play/tests/teleport_id_allocator.rs`. Its unchanged initial
+id, sequential returned ids, resulting next id, maximum-id boundary, and
+positive wrap are recorded in
+[`../evidence/mc-net-teleport-id-allocator-test-extraction.md`](../evidence/mc-net-teleport-id-allocator-test-extraction.md).
 
 The complete matching pending-teleport confirmation test has moved to
 `crates/mc-net/src/play/tests/pending_teleport_matching_confirm.rs`. Its

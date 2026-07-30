@@ -370,6 +370,10 @@ not replace functional, package, workspace, or real-client gates.
    mismatched and matching confirmation ids, retained then cleared state, and
    exact results are recorded in
    [`evidence/mc-net-pending-teleport-matching-confirm-test-extraction.md`](evidence/mc-net-pending-teleport-matching-confirm-test-extraction.md).
+   The following teleport-id allocator test now lives in focused
+   `play/tests/teleport_id_allocator.rs`; its sequential ids, resulting next
+   id, maximum-id boundary, and positive wrap are recorded in
+   [`evidence/mc-net-teleport-id-allocator-test-extraction.md`](evidence/mc-net-teleport-id-allocator-test-extraction.md).
 4. [ ] Separate behavioral tests from structural tripwires. Structural checks may
    enforce crate ownership and dependency direction, but may not assert Rust
    statement order or source-text layout.

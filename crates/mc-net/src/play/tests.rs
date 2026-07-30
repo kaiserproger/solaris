@@ -80,6 +80,7 @@ mod stonecutter;
 mod synthetic_slab_identity_collision;
 mod tall_narrow_fence_collision;
 mod teleport_command_pending_confirmation;
+mod teleport_id_allocator;
 mod toggle_planning;
 mod top_slab_collision;
 mod torch_campfire_collision;
@@ -1958,19 +1959,6 @@ fn container_title_nbt_reports_oversized_text_instead_of_panicking() {
     let err = chest_menu_title_nbt(&oversized).expect_err("oversized NBT title should fail");
 
     assert!(matches!(err, mc_protocol::CodecError::Nbt(_)));
-}
-
-#[test]
-fn teleport_id_allocator_advances_and_wraps_to_positive_ids() {
-    let mut next = 2;
-
-    assert_eq!(next_player_teleport_id(&mut next), 2);
-    assert_eq!(next_player_teleport_id(&mut next), 3);
-    assert_eq!(next, 4);
-
-    next = i32::MAX;
-    assert_eq!(next_player_teleport_id(&mut next), i32::MAX);
-    assert_eq!(next_player_teleport_id(&mut next), 1);
 }
 
 fn state(id: u32, default: bool, properties: &[(&str, &str)]) -> BlockStateReport {
