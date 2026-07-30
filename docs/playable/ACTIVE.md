@@ -23,17 +23,19 @@ replacement-readiness claims.
 ## Active Checkpoint
 
 Next autonomous goal checkpoint: route `playable`; mechanically move the full
-four-test registry-derived item-to-block and standing/wall sign mapping class
-beginning with `item_to_block_table_is_registry_derived` and ending with
-`sign_items_choose_floor_or_wall_sign_for_clicked_face` out of aggregate
+four-test admin-command parsing, permission-aware command-tree, runtime-control
+status, and local-development permission class beginning with
+`admin_dispatcher_parses_slash_commands_and_permissions` and ending with
+`local_dev_profiles_are_op_capable_for_now` out of aggregate
 `crates/mc-net/src/play/tests.rs` into a focused sibling module. Preserve every
 test and production behavior, leave the preceding
-`local_dev_profiles_are_op_capable_for_now` test in the aggregate file, and
-use explicit imports rather than a new `use super::*`. The complete ten-test
-bucket-source, fluid-tick, decay, scheduling, and lava-water interaction class
-has already moved to `crates/mc-net/src/play/tests/fluid_runtime.rs`; its
-concentration and validation are recorded in
-[`../evidence/mc-net-fluid-runtime-test-extraction.md`](../evidence/mc-net-fluid-runtime-test-extraction.md).
+`persistent_container_claim_check_covers_furnace_and_both_chest_halves` test
+in the aggregate file, and use explicit imports rather than a new
+`use super::*`. The complete four-test registry-derived item-to-block and
+standing/wall sign mapping class has already moved to
+`crates/mc-net/src/play/tests/item_block_mapping.rs`; its concentration and
+validation are recorded in
+[`../evidence/mc-net-item-block-mapping-test-extraction.md`](../evidence/mc-net-item-block-mapping-test-extraction.md).
 The owner-run subjective fresh-world seed-`712816` playtest and
 release-candidate performance gates remain queued at their declared
 boundaries.
