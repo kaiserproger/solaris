@@ -196,6 +196,11 @@ not replace functional, package, workspace, or real-client gates.
    two-block toggle plan, selected local-sidecar execution, and ownership
    boundary are recorded in
    [`evidence/mc-net-real-door-sidecar-test-extraction.md`](evidence/mc-net-real-door-sidecar-test-extraction.md).
+   The following two-test play custom-payload classification class now lives
+   in focused `play/tests/play_custom_payload.rs`; its oversized-payload fence,
+   Loader interaction-channel ownership, and preserved classification coverage
+   are recorded in
+   [`evidence/mc-net-play-custom-payload-test-extraction.md`](evidence/mc-net-play-custom-payload-test-extraction.md).
 4. [ ] Separate behavioral tests from structural tripwires. Structural checks may
    enforce crate ownership and dependency direction, but may not assert Rust
    statement order or source-text layout.

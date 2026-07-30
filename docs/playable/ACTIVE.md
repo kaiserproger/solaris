@@ -23,14 +23,19 @@ replacement-readiness claims.
 ## Active Checkpoint
 
 Next autonomous goal checkpoint: route `playable`; mechanically move the
-complete two-test play custom-payload classification class, beginning with
-`oversized_play_custom_payload_is_rejected_before_decode` and ending with
-`loader_interaction_channel_is_claimed_before_extension_forwarding`, out of
-aggregate `crates/mc-net/src/play/tests.rs` into a focused sibling module.
-Preserve every assertion and production behavior, leave the preceding
-`client_view_distance_is_clamped_to_server_policy` test and following
+`client_view_distance_is_clamped_to_server_policy` test out of aggregate
+`crates/mc-net/src/play/tests.rs` into a focused sibling module. Preserve its
+complete server-policy clamp matrix and production behavior, leave the
+preceding `gamemode_command_rejects_unknown_or_extra_args` test and following
 `button_test_registry` helper aggregate-owned, and use explicit imports rather
 than a new `use super::*`.
+
+The complete two-test play custom-payload classification class, beginning with
+`oversized_play_custom_payload_is_rejected_before_decode` and ending with
+`loader_interaction_channel_is_claimed_before_extension_forwarding`, has moved
+to `crates/mc-net/src/play/tests/play_custom_payload.rs`. Its oversized-payload
+fence and Loader interaction-channel ownership coverage are recorded in
+[`../evidence/mc-net-play-custom-payload-test-extraction.md`](../evidence/mc-net-play-custom-payload-test-extraction.md).
 
 The ignored real-door local-sidecar parity gate
 `real_door_states_plan_hand_toggle_when_sidecar_is_present` has moved to

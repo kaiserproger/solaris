@@ -40,6 +40,7 @@ mod leaf_distance_ticks;
 mod natural_random_ticks;
 mod pickup;
 mod plants;
+mod play_custom_payload;
 mod player_damage;
 mod real_door_sidecar;
 mod redstone_pistons;
@@ -3474,35 +3475,6 @@ fn client_view_distance_is_clamped_to_server_policy() {
     assert_eq!(clamp_client_view_distance(0, 10), 2);
     assert_eq!(clamp_client_view_distance(-8, 1), 2);
     assert_eq!(clamp_client_view_distance(i8::MAX, i32::MAX), 32);
-}
-
-#[test]
-fn oversized_play_custom_payload_is_rejected_before_decode() {
-    let body = Bytes::from(vec![0x80; DEFAULT_MAX_CUSTOM_PAYLOAD_BYTES + 1]);
-
-    let action = classify_play_custom_payload(body).unwrap();
-
-    assert_eq!(
-        action,
-        PlayCustomPayloadAction::Oversized {
-            len: DEFAULT_MAX_CUSTOM_PAYLOAD_BYTES + 1
-        }
-    );
-}
-
-#[test]
-fn loader_interaction_channel_is_claimed_before_extension_forwarding() {
-    let channel = b"solaris:loader/interaction";
-    let payload = b"action";
-    let mut body = Vec::with_capacity(1 + channel.len() + payload.len());
-    body.push(channel.len() as u8);
-    body.extend_from_slice(channel);
-    body.extend_from_slice(payload);
-
-    assert_eq!(
-        classify_play_custom_payload(Bytes::from(body)).unwrap(),
-        PlayCustomPayloadAction::LoaderInteraction(Bytes::from_static(payload))
-    );
 }
 
 fn button_test_registry() -> mc_world::BlockRegistry {
