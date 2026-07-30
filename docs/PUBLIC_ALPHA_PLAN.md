@@ -257,6 +257,12 @@ Benchmark reproduction happens at that feature boundary, not after every edit:
   `mc-server` enables the runtime. Both the 85-test default suite and 165-test
   feature suite are green, with ownership and close conditions recorded in
   [`evidence/mc-script-lua-runtime-tests.md`](evidence/mc-script-lua-runtime-tests.md).
+- [x] Classify the `mc-net` `load-bench` gate as a performance-harness build
+  boundary, not a hidden test class. Default and feature configurations expose
+  the same 1,853 unit tests and three doc tests; the gated server API,
+  seeding/readiness surface, and timing diagnostics are owned by the explicit
+  feature suite and recorded in
+  [`evidence/mc-net-load-bench-tests.md`](evidence/mc-net-load-bench-tests.md).
 - [x] Record the exact local 26.1.2 world-clock oracle in
   [`evidence/world-clock-26.1.2.md`](evidence/world-clock-26.1.2.md).
 - [x] Implement the typed world-clock map, separating monotonic `game_time` from
