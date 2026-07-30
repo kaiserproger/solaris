@@ -23,18 +23,30 @@ replacement-readiness claims.
 ## Active Checkpoint
 
 Next autonomous goal checkpoint: route `playable`; mechanically move the
-`enchanting_selection_consumes_lapis_and_level_but_preserves_total_xp`
-test from aggregate `crates/mc-net/src/play/tests.rs` to a focused sibling
-module. Preserve the Solaris-required items and item-facts registries;
-`minecraft:stone_pickaxe` and `minecraft:lapis_lazuli` ids; the resolved
-pickaxe registry name and efficiency-enchantable assertion; pickaxe count `1`
-and lapis count `2`; XP level `1`, progress `0.5`, total `12`, and seed `123`;
-candidate application from `enchanting_offer(0, 0)`; exact applied
-`minecraft:efficiency` level `1`; remaining lapis count `1`; final XP level
-`0`, progress `0.5`, and total `12`; and changed seed. Leave the preceding
 `stale_inventory_drag_resyncs_exact_owner_state_without_loss_or_publication`
-test and following `state` helper aggregate-owned, and use explicit imports
-rather than a new `use super::*`.
+test from aggregate `crates/mc-net/src/play/tests.rs` to a focused sibling
+module. Preserve the dirt item report at protocol id `10`; carried dirt count
+`3`; pose `(0.5, 64.0, 0.5)`; `StaleInventoryDrag` offline profile; capacity
+`8` outbound channel; registered session and player persistence; owner
+simulation/probe; default XP; script player identity/context; actual hashed
+carried stack with item id `10`, count `3`,
+and empty component hashes; two opening quick-craft clicks `(0, -999)` and
+`(1, 9)` with no immediate write; pending closing click `(-999, 2)` and queued
+depth `1`; owner-side replacement with slot `10` holding item `10` count `1`
+and carried item `10` count `2`; one processed owner command; final slot `9`
+empty, slot `10` holding item `10` count `1`, carried item `10` count `2`, and
+total count `3`; one container-content packet with state id `1` and exact
+items/carried state; empty outbound queue; and no persisted entity records.
+Leave the preceding
+`rejected_inventory_drag_resyncs_without_mutation_or_owner_publication` test
+and following `state` helper aggregate-owned, and use explicit imports rather
+than a new `use super::*`.
+
+The complete enchanting-selection test has moved to
+`crates/mc-net/src/play/tests/enchanting_selection.rs`. Its unchanged
+registries, enchantable pickaxe, lapis and XP consumption, exact efficiency
+result, preserved total XP, and changed seed are recorded in
+[`../evidence/mc-net-enchanting-selection-test-extraction.md`](../evidence/mc-net-enchanting-selection-test-extraction.md).
 
 The complete zero-bookshelf efficiency-offer data test has moved to
 `crates/mc-net/src/play/tests/enchanting_efficiency_offer.rs`. Its unchanged
