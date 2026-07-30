@@ -23,19 +23,19 @@ replacement-readiness claims.
 ## Active Checkpoint
 
 Next autonomous goal checkpoint: route `playable`; mechanically move the full
-four-test admin-command parsing, permission-aware command-tree, runtime-control
-status, and local-development permission class beginning with
-`admin_dispatcher_parses_slash_commands_and_permissions` and ending with
-`local_dev_profiles_are_op_capable_for_now` out of aggregate
-`crates/mc-net/src/play/tests.rs` into a focused sibling module. Preserve every
-test and production behavior, leave the preceding
-`persistent_container_claim_check_covers_furnace_and_both_chest_halves` test
-in the aggregate file, and use explicit imports rather than a new
-`use super::*`. The complete four-test registry-derived item-to-block and
-standing/wall sign mapping class has already moved to
-`crates/mc-net/src/play/tests/item_block_mapping.rs`; its concentration and
-validation are recorded in
-[`../evidence/mc-net-item-block-mapping-test-extraction.md`](../evidence/mc-net-item-block-mapping-test-extraction.md).
+six-test chest quick-move, stack-limit, menu-revision, crafting-revision, and
+persistent-container claim class beginning with
+`chest_quick_move_places_player_stack_in_first_empty_storage_slot` and ending
+with `persistent_container_claim_check_covers_furnace_and_both_chest_halves`
+out of aggregate `crates/mc-net/src/play/tests.rs` into a focused sibling
+module. Preserve every test and production behavior, leave the preceding
+`debug_give_zero_count_clears_hotbar_slot_before_item_lookup` test in the
+aggregate file, and use explicit imports rather than a new `use super::*`. The
+complete four-test admin-command parsing, permission-aware command-tree,
+runtime-control status, and local-development permission class has already
+moved to `crates/mc-net/src/play/tests/admin_commands.rs`; its concentration
+and validation are recorded in
+[`../evidence/mc-net-admin-commands-test-extraction.md`](../evidence/mc-net-admin-commands-test-extraction.md).
 The owner-run subjective fresh-world seed-`712816` playtest and
 release-candidate performance gates remain queued at their declared
 boundaries.

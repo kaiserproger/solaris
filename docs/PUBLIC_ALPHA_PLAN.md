@@ -167,6 +167,11 @@ not replace functional, package, workspace, or real-client gates.
    its preserved direct, use-on, torch, and sign-face mapping coverage is
    recorded in
    [`evidence/mc-net-item-block-mapping-test-extraction.md`](evidence/mc-net-item-block-mapping-test-extraction.md).
+   The following four-test admin-command parsing, permission-aware command
+   tree, runtime-control status, and local-development permission class now
+   lives in focused `play/tests/admin_commands.rs`; its preserved parsing,
+   suggestion, control-status, and permission coverage is recorded in
+   [`evidence/mc-net-admin-commands-test-extraction.md`](evidence/mc-net-admin-commands-test-extraction.md).
 4. [ ] Separate behavioral tests from structural tripwires. Structural checks may
    enforce crate ownership and dependency direction, but may not assert Rust
    statement order or source-text layout.

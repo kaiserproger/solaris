@@ -304,7 +304,7 @@ use chunk_stream::{
 };
 use chunk_stream::{ChunkStreamState, ChunkStreamStep, PreparedChunkFrame, desired_chunk_set};
 #[cfg(test)]
-use command_execution::{apply_debug_command, runtime_control_status_message};
+use command_execution::apply_debug_command;
 use command_execution::{
     apply_game_mode, clientbound_session_world_time, clientbound_world_time, command_error_message,
     execute_player_command, handle_client_command, prepare_game_mode_transition,
@@ -312,8 +312,7 @@ use command_execution::{
 };
 #[cfg(test)]
 use commands::{
-    AdminCommand, DebugCommand, SurvivalCommand, command_suggestions, command_tree_packet,
-    parse_admin_command,
+    AdminCommand, DebugCommand, SurvivalCommand, command_suggestions, parse_admin_command,
 };
 use commands::{
     CommandError, CommandPermissions, command_suggestions_with_plugin_roots,
