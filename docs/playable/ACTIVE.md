@@ -23,13 +23,20 @@ replacement-readiness claims.
 ## Active Checkpoint
 
 Next autonomous goal checkpoint: route `playable`; mechanically move the
-`powder_snow_uses_falling_collision_shape_after_long_fall` test out of
+`powder_snow_collision_uses_player_equipment_and_movement_context` test out of
 aggregate `crates/mc-net/src/play/tests.rs` into a focused sibling module.
-Preserve its complete long-fall origin, exact `0.9F` boundary, outside/inside
-poses, and published collision-context coverage and production behavior, leave
-the preceding `powder_snow_collision_uses_player_equipment_and_movement_context`
-test and following `button_test_registry` helper aggregate-owned, and use
-explicit imports rather than a new `use super::*`.
+Preserve its complete no-boots sinking, leather-boots support, Shift descent,
+already-inside behavior, and published collision-context coverage and
+production behavior, leave the preceding
+`player_collision_uses_exact_shapes_for_torch_and_campfire` test and following
+`button_test_registry` helper aggregate-owned, and use explicit imports rather
+than a new `use super::*`.
+
+The complete powder-snow long-fall shape test has moved to
+`crates/mc-net/src/play/tests/powder_snow_long_fall.rs`. Its long-fall origin,
+exact `0.9F` boundary, outside/inside poses, and published collision-context
+coverage is recorded in
+[`../evidence/mc-net-powder-snow-long-fall-test-extraction.md`](../evidence/mc-net-powder-snow-long-fall-test-extraction.md).
 
 The complete powder-snow exact-state identity test has moved to
 `crates/mc-net/src/play/tests/powder_snow_dynamic_shape.rs`. Its

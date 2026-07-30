@@ -251,6 +251,10 @@ not replace functional, package, workspace, or real-client gates.
    `play/tests/powder_snow_dynamic_shape.rs`; its altered-fingerprint, dense
    state-id, leather-boots, and conservative-fallback coverage is recorded in
    [`evidence/mc-net-powder-snow-dynamic-shape-test-extraction.md`](evidence/mc-net-powder-snow-dynamic-shape-test-extraction.md).
+   The following powder-snow long-fall shape test now lives in focused
+   `play/tests/powder_snow_long_fall.rs`; its long-fall origin, exact `0.9F`
+   boundary, and outside/inside pose coverage is recorded in
+   [`evidence/mc-net-powder-snow-long-fall-test-extraction.md`](evidence/mc-net-powder-snow-long-fall-test-extraction.md).
 4. [ ] Separate behavioral tests from structural tripwires. Structural checks may
    enforce crate ownership and dependency direction, but may not assert Rust
    statement order or source-text layout.
