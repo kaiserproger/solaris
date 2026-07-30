@@ -1,6 +1,6 @@
-# Solaris v0.0.2-alpha.1 Stabilization Plan
+# Solaris v0.0.2-alpha.1 Long-Running Public Alpha Plan
 
-Date: 2026-07-28
+Date: 2026-07-30
 
 Target: `v0.0.2-alpha.1`
 
@@ -8,9 +8,213 @@ This plan is based on the first owner-run public-alpha session with an unmodifie
 Minecraft Java Edition 26.1.2 client, seed `712816`, `view_distance = 16`, one
 local player and the server running on the same i5-12600 host.
 
-The release goal is not broad feature growth. It is to fix the first public
-alpha's concrete client-visible failures while preserving its strong generation,
-streaming and memory baseline.
+The original session evidence and concrete defects remain part of the release
+contract. This file now also defines the longer engineering program needed to
+reach the second public alpha: finish the test baseline, enforce crate boundaries,
+remove measured bottlenecks, close ordinary-play vanilla parity, and deliver the
+first production Luau runtime API.
+
+This is a `/goal` north star, not permission to work on the whole repository in
+one continuation. Each continuation owns one finite checkpoint, names one route
+from [`AGENT_ROUTES.md`](AGENT_ROUTES.md), validates that slice, records the next
+cursor, and, while owner/runtime commit authorization is active, closes with one
+local Conventional Commit when its gates are green. Without that authorization,
+it records the base tree, diff hash, changed files, validation, and next action as
+required by `AGENTS.md`. Current code and runtime evidence override stale
+checkboxes.
+
+## Long-running program
+
+Work proceeds in this owner-defined order. A later phase may supply a narrowly
+required test or interface for the current phase, but it must not displace the
+active phase merely because its code is interesting.
+
+The numbered items are phase outcomes, not permission to combine a whole phase
+into one checkpoint. A finite checkpoint closes one crate's test class, one
+vertical-domain extraction, one measured bottleneck, one parity row, or one Luau
+API vertical. Validation tiers still follow `AGENTS.md`; benchmark evidence does
+not replace functional, package, workspace, or real-client gates.
+
+### Phase 1 — Finish and trust the tests
+
+1. [ ] Inventory every failing, ignored, flaky, feature-gated, and manual-only
+   workspace test. Give each non-green gate an owner, reason, and exact close
+   condition; do not silently delete or weaken it.
+2. [ ] Replace wall-clock sleeps and polling with the exact packet, notification,
+   process, world-state, or simulation event that proves progress.
+3. [ ] Keep substantial tests beside their focused domain in `*_tests.rs`; stop
+   growing aggregate `play.rs`, `session.rs`, and inline production test modules.
+4. [ ] Separate behavioral tests from structural tripwires. Structural checks may
+   enforce crate ownership and dependency direction, but may not assert Rust
+   statement order or source-text layout.
+5. [ ] Make the common debug development loop deterministic across affected-crate
+   tests, TCP/harness tests, persistence/restart tests, and the exact real-client
+   scenarios named by the active feature.
+6. [ ] Close the phase with one clean L2 run and no unexplained ignored, flaky, or
+   manual-pending gate. Graphical gates must be reported as graphical evidence,
+   never inferred from unit or raw-TCP success.
+
+### Phase 2 — Enforce crate and module boundaries
+
+`mc-net` is transport and orchestration, not the default home for gameplay. It
+may own connection state, packet decoding, session routing, immutable authority
+snapshots, commit adapters, publication adapters, and outbound delivery. New or
+touched domain rules belong in the lowest existing crate that owns the domain:
+
+- `mc-protocol`: packet ids, layouts, codecs, and wire DTOs;
+- `mc-data`: immutable vanilla-derived tables and identifiers;
+- `mc-physics`: reusable geometry, collision, and motion calculations;
+- `mc-world`: world state, chunk/block authority, and world persistence contracts;
+- `mc-worldgen`: deterministic terrain and feature generation;
+- `mc-entity`: entity state, lifecycle, simulation, combat, AI, and spawn rules;
+- `mc-script`: Luau runtime, sandbox, plugin lifecycle, and typed plugin API;
+- `mc-net`: network/session orchestration and wire publication only;
+- `mc-server`: composition root, configuration, startup, and shutdown only.
+
+Required migration:
+
+1. [ ] Generate a measured ownership inventory for `mc-net`: large files, domain
+   state machines, dependency edges, test concentration, and code-health
+   exceptions. This inventory selects work; line count alone is not a reason to
+   extract code.
+2. [ ] Extract pure natural-spawn scheduling and planning into `mc-entity`.
+   `mc-net` retains session snapshots, regional-owner commit, visibility
+   publication, and wire adapters.
+3. [ ] Continue one touched vertical domain at a time: move request/result types and
+   pure rules first, keep authority mutation in its accepted owner, then narrow the
+   adapter. Do not create generic service traits without two real implementations.
+4. [ ] Remove superseded in-crate APIs, compatibility shims, duplicate authorities,
+   feature flags, and fallbacks after all callers move.
+5. [ ] Reject dependency cycles and reverse edges into `mc-net`. Semantic domain
+   results must not contain `OutboundCommand`, connection handles, packet writers,
+   or session internals.
+6. [ ] Keep root orchestration files small and behavioral-free. A touched legacy
+   domain is mechanically split when bounded; unrelated domains are not rewritten
+   in the same checkpoint.
+7. [ ] Extend `xtask code-health` with stable ownership/dependency tripwires for
+   each completed extraction, and update ADR 0006 or the actual authority ADR in
+   the same commit when the policy changes.
+8. [ ] Close the phase only when remaining `mc-net` domain logic is explicitly
+   listed and justified as an adapter or a queued extraction, not merely hidden in
+   child modules with `use super::*`.
+
+### Phase 3 — Find and remove measured performance bottlenecks
+
+1. [ ] Reproduce the public-alpha generation, chunk streaming, memory, tick, and
+   M39 lock baselines on a documented host and exact tree.
+2. [ ] Profile before optimizing. Rank hotspots by player-visible latency, tick
+   budget, allocation/memory, lock hold/wait, and throughput; keep the raw profile
+   or benchmark artifact outside Git and the compact result in the owning evidence
+   document.
+3. [ ] Close the known break/drop/pickup lock gate, worldgen throughput gate, chunk
+   streaming gate, and autoscale startup-hysteresis investigation before selecting
+   lower-impact micro-optimizations.
+4. [ ] For every accepted optimization, document the bottleneck, ownership
+   boundary, correctness fence, measured effect, and fallback/removal path.
+5. [ ] Reject optimization claims based only on code shape, synthetic counters, or
+   a different environment. A regression outside the feature's accepted threshold
+   remains open even when functional tests pass.
+6. [ ] Close the phase with a fresh ranked profile. Every remaining ordinary-play
+   hotspot must have a metric, workload, and explicit threshold in
+   the [`benchmark matrix`](performance/2026-07-27-benchmark-matrix.md); its
+   mapped benchmark must meet that threshold or record the owner's explicit
+   acceptance of the measured tradeoff. An unnamed general "budget" is not
+   closeout evidence.
+
+### Phase 4 — Close common vanilla parity
+
+Parity targets unmodified Minecraft Java Edition 26.1.2 behavior used in an
+ordinary multiplayer survival session. Rare bug-for-bug compatibility remains
+below common play, persistence safety, and plugin progress.
+
+1. [ ] Complete the clock, worldgen, natural-spawn, item transaction, restart, and
+   real-client acceptance gates already specified below.
+2. [ ] Build an evidence-backed common-play matrix for movement, block interaction,
+   inventory/crafting/containers, combat, projectiles, fluids, redstone essentials,
+   status/effects, death/respawn, weather/time, and persistence.
+3. [ ] Finish common entity behavior and AI, including villagers, village defence,
+   guardians, friendly/hostile population, navigation, combat, despawn, drops, and
+   restart identity.
+4. [ ] Prove multiplayer authority and publication behavior with at least two
+   clients for shared blocks, containers, combat, pickups, entity visibility,
+   disconnect, and reconnect.
+5. [ ] Derive packet ids/layouts and behavioral rules only from the local
+   26.1.2 oracle, decompiled source, vanilla capture, or side-by-side harness.
+   Record deliberate Solaris bug fixes explicitly.
+6. [ ] Close the phase with a clean fresh-world 20-minute survival run, restart and
+   reconnect, without operator setup, unexplained warnings, duplicated entities,
+   lost state, or a manual-pending common-play row.
+
+### Phase 5 — Deliver the production Luau runtime API
+
+[`PLUGINS.md`](PLUGINS.md) and ADR 0009 own the detailed contract. The first
+production API must preserve regional/simulation authority rather than exposing
+internal locks or mutable registries to scripts.
+
+1. [ ] Finish plugin discovery and derived deployment reporting:
+   `server_only | server_and_client`, permissions, loader support, bundle
+   identities, and artifact sizes.
+2. [ ] Implement deterministic runtime lifecycle, sandboxing, capability checks,
+   resource budgets, failure isolation, reload/shutdown semantics, and actionable
+   diagnostics.
+3. [ ] Expose versioned typed events and cancellable/transactional commands for the
+   common player, world, block, inventory, combat, and entity surfaces.
+4. [ ] Route plugin mutations through accepted simulation/regional commands with
+   semantic results. Scripts must not receive lock guards, authority internals,
+   network DTOs, or direct persistence writers.
+5. [ ] Add tick/event scheduling, plugin storage, command registration, and the
+   first gameplay adapters required by menus, economy, zones, and colonies.
+6. [ ] Preserve deterministic event ordering, cancellation, rollback,
+   disconnect/reload behavior, and persistence across restart.
+7. [ ] Ship server-only and client-required fixtures, API documentation, permission
+   examples, harness coverage, and vanilla-client/Loader compatibility gates.
+8. [ ] Close the phase with a real plugin implementing a small end-to-end gameplay
+   loop using only the public API and no Solaris-private imports.
+
+## Subagents and independent review
+
+Subagents accelerate bounded work; they do not replace ownership or validation:
+
+1. Give every implementation subagent one disjoint responsibility, exact owned
+   paths, base commit, acceptance criteria, and required evidence. It must not
+   revert or reformat another slice.
+2. Keep the immediate blocker with the primary agent. Do not delegate it and idle.
+   Never fork the full parent history; pass only the finite task and relevant diff.
+3. Use no more than two concurrent subagents, and only where useful work can
+   continue independently. The primary agent integrates and creates the checkpoint
+   commit after validation.
+4. After self-check, run exactly one independent read-only second-POV review for
+   every checkpoint. The reviewer checks correctness, authority/module boundaries,
+   evidence validity, scope, and regressions; it does not edit or spawn agents.
+5. Record `verdict: pass | changes | blocked`, at most eight findings, reviewed
+   files, and validation evidence. Address actionable findings and self-validate
+   the fixes; do not create an unbounded reviewer cascade.
+6. A timeout or missing verdict is not a pass. Record it honestly and leave the
+   affected close condition open for a later finite checkpoint.
+
+## Feature completion and benchmark reproduction
+
+A feature or feature-sized refactor is complete only when its behavior,
+ownership boundary, focused tests, affected-crate tests, documentation/ADR,
+second-POV disposition, and mapped evidence are complete on the same tree.
+
+Benchmark reproduction happens at that feature boundary, not after every edit:
+
+1. During implementation, run focused functional and correctness checks only.
+2. When a feature with an existing performance contract becomes complete,
+   reproduce exactly its mapped benchmark once on the candidate tree and record
+   command, commit, environment, workload, result, threshold, and artifact path.
+3. For an optimization, compare base and candidate under the same environment and
+   workload. Do not substitute an old result from a different host or configuration.
+4. Do not run the full benchmark suite for formatting, review-only fixes, test-only
+   corrections, or intermediate extraction commits. Record `benchmark: not
+   applicable` with a short reason when the completed feature has no performance
+   contract.
+5. A later code change that materially touches the measured path invalidates that
+   feature's benchmark evidence and requires reproduction at the next feature
+   boundary, not immediately on each intermediate edit.
+6. Release closeout reproduces the complete release benchmark/evidence matrix once
+   on the exact release-candidate tree.
 
 ## Execution status
 
@@ -317,18 +521,26 @@ Acceptance:
 
 ## Checkpoint order
 
-1. **Clock correctness** — exact 26.1.2 clock payload and real-client day cycle.
-2. **Item transaction lock boundary** — eliminate blocking owner waits under
-   session/player locks and close the 200-action gate.
-3. **Worldgen revision 10** — remove fixtures, add seed-driven spawn location,
-   make Earth-like mode the public default and improve macro terrain/biomes/details.
-4. **Periodic natural spawning** — category cadences, loaded-chunk scheduler,
-   darkness/support rules and configuration comments.
-5. **Plugin deployment reporting** — derived classification in check/log/docs.
-6. **Release closeout** — one complete owner-equivalent playtest and L2 validation.
+The `/goal` runner selects one finite checkpoint from the first incomplete phase:
 
-Do not parallelize the worldgen and lock-authority edits in the same files. The
-clock and plugin-reporting slices are bounded and may be reviewed independently.
+1. **Test completion** — classify and close unstable/missing gates; preserve the
+   already-green clock, item, worldgen, natural-spawn, villager, guardian, and
+   village-defence coverage.
+2. **Crate boundaries** — begin with natural-spawn scheduler/planning extraction,
+   then select the next measured `mc-net` domain without overlapping write sets.
+3. **Performance** — close the item lock, worldgen, streaming, memory, tick, and
+   autoscale measurements in player-visible impact order.
+4. **Vanilla parity** — close the ordinary survival/multiplayer matrix with exact
+   oracle and real-client evidence.
+5. **Luau runtime API** — deliver deployment reporting, safe runtime foundations,
+   typed API surfaces, persistence, gameplay adapters, and fixtures.
+6. **Release closeout** — reproduce the full benchmark/evidence matrix, run one
+   owner-equivalent fresh-world playtest plus restart, run L2 once, and build/smoke
+   the release artifacts.
+
+Do not parallelize overlapping worldgen, lock-authority, session-root, or runtime
+composition edits. Disjoint tests, evidence capture, and isolated lower-crate work
+may proceed in parallel under the subagent rules above.
 
 ## Release gates
 
