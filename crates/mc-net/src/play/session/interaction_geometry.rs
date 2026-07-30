@@ -1,6 +1,4 @@
-use std::sync::OnceLock;
-
-use mc_data::entity_types::{EntityTypeFacts, EntityTypeRegistry};
+use mc_data::entity_types::EntityTypeFacts;
 use mc_data::item_components::AttackRangeFacts;
 use mc_entity::{AnimalBreedingState, Vec3};
 use mc_physics::Aabb;
@@ -31,23 +29,12 @@ pub(super) fn distance_sq(a: Vec3, b: Vec3) -> f64 {
     dx * dx + dy * dy + dz * dz
 }
 
-fn canonical_entity_registry() -> &'static EntityTypeRegistry {
-    static REGISTRY: OnceLock<EntityTypeRegistry> = OnceLock::new();
-    REGISTRY.get_or_init(mc_data::entity_types::solaris_required_entity_types)
-}
-
 pub(super) fn canonical_entity_facts(type_name: &str) -> Option<&'static EntityTypeFacts> {
-    let id = mc_data::Identifier::parse(type_name.to_string()).ok()?;
-    canonical_entity_registry().facts_of(&id)
+    mc_entity::natural_spawn_26_1_2::entity_type_facts(type_name)
 }
 
 pub(in crate::play) fn entity_aabb(type_name: &str) -> Aabb {
-    let facts = canonical_entity_facts(type_name)
-        .expect("entity AABB requires a canonical 26.1.2 entity type");
-    Aabb {
-        half_width: facts.dimensions.half_width(),
-        height: facts.dimensions.height,
-    }
+    mc_entity::natural_spawn_26_1_2::entity_aabb(type_name)
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]

@@ -1796,6 +1796,8 @@ version = "0.0.1-alpha.1"
 dependencies = [
  "bevy_ecs",
  "mc-data",
+ "mc-physics",
+ "mc-world",
  "rayon",
  "serde",
  "uuid",

@@ -152,6 +152,12 @@ mod script_gameplay_events;
 mod script_gameplay_events_tests;
 
 use client_load::ClientLoadGate;
+pub(super) use mc_entity::natural_spawn_26_1_2::HerdSpawn;
+#[cfg(test)]
+pub(super) use mc_entity::natural_spawn_26_1_2::{
+    MAX_HOSTILE_SPAWNS_PER_CHUNK, MAX_PASSIVE_SPAWNS_PER_CHUNK,
+    MIN_ENTITY_SPAWN_DISTANCE_FROM_PLAYER, herd_uuid,
+};
 use merchant_adapter::{handle_select_trade, open_merchant_container};
 use player_breathing::{PlayerBreathingState, player_can_drown};
 // Router and storage-owner wiring land separately; keep the bounded adapter
@@ -299,9 +305,7 @@ use bucket_interactions::plan_bucket_replacement;
 use chunk_stream::{
     ChunkBuildTiming, ChunkWriteTiming, passable_block_name, plan_passive_herd, spiral_chunks,
 };
-use chunk_stream::{
-    ChunkStreamState, ChunkStreamStep, PreparedChunkFrame, desired_chunk_set, herd_uuid,
-};
+use chunk_stream::{ChunkStreamState, ChunkStreamStep, PreparedChunkFrame, desired_chunk_set};
 #[cfg(test)]
 use command_execution::{apply_debug_command, runtime_control_status_message};
 use command_execution::{
@@ -790,10 +794,6 @@ const SKELETON_ARROW_SPEED: f64 = 1.6;
 const HOSTILE_FOLLOW_SPEED: f64 = 1.25;
 #[cfg(test)]
 const PASSIVE_WANDER_SPEED: f64 = 0.8;
-const MAX_PASSIVE_SPAWNS_PER_CHUNK: usize = 6;
-const MAX_HOSTILE_SPAWNS_PER_CHUNK: usize = 3;
-const MIN_ENTITY_SPAWN_DISTANCE_FROM_PLAYER: f64 = 24.0;
-
 fn world_time_is_night(world_time: u64) -> bool {
     world_time % DAY_LENGTH_TICKS >= NIGHT_START_TICK
 }
@@ -919,17 +919,6 @@ pub(crate) struct ScheduledBlockTickReport {
     pub(crate) applied: usize,
     pub(crate) budget: usize,
     pub(crate) budget_exhausted: bool,
-}
-
-#[derive(Debug, Clone, PartialEq)]
-pub(super) struct HerdSpawn {
-    chunk: (i32, i32),
-    slot: u8,
-    entity_type_id: i32,
-    entity_type_name: String,
-    position: Vec3,
-    hostile: bool,
-    sheep_color: Option<mc_entity::SheepColor>,
 }
 
 #[derive(Debug, Clone, PartialEq)]

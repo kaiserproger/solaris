@@ -1,5 +1,9 @@
 use std::collections::{HashMap, HashSet};
 
+use mc_entity::natural_spawn_26_1_2::{
+    MAX_NATURAL_TEMPLATES_PER_CHUNK, NaturalSpawnCapacities, NaturalSpawnCategory,
+    NaturalSpawnReport, NaturalSpawnScheduler, plan_periodic_category,
+};
 use mc_entity::{SpawnEntity, Vec3};
 use mc_physics::{Aabb, BlockMaterialIds};
 use mc_world::{ChunkPos, WorldReadView};
@@ -10,10 +14,6 @@ use crate::play::{HerdSpawn, is_hostile_entity, world_time_is_night};
 use super::super::SessionRegistry;
 use super::super::outbound::{VisibilityDispatch, dispatch_visibility_commands};
 use super::commit::install_committed_herd_spawns_locked;
-use super::planning::{
-    MAX_NATURAL_TEMPLATES_PER_CHUNK, NaturalSpawnCapacities, plan_periodic_category,
-};
-use super::scheduler::{NaturalSpawnCategory, NaturalSpawnReport, NaturalSpawnScheduler};
 
 #[derive(Clone, Copy)]
 pub(crate) struct NaturalSpawnTickInput<'a> {
@@ -81,7 +81,7 @@ impl SessionRegistry {
                 .collect::<Vec<_>>()
         };
         if player_positions.is_empty() {
-            scheduler.record(tick, report);
+            record_natural_spawn_report(scheduler, tick, report);
             return (report, Vec::new());
         }
 
@@ -115,7 +115,7 @@ impl SessionRegistry {
             .copied()
             .collect::<HashSet<_>>();
         if selected_chunks.is_empty() {
-            scheduler.record(tick, report);
+            record_natural_spawn_report(scheduler, tick, report);
             return (report, Vec::new());
         }
 
@@ -200,7 +200,7 @@ impl SessionRegistry {
         }
 
         if planned.is_empty() {
-            scheduler.record(tick, report);
+            record_natural_spawn_report(scheduler, tick, report);
             return (report, Vec::new());
         }
         let active_before_commit = self.simulation_inputs.active_chunks();
@@ -216,7 +216,7 @@ impl SessionRegistry {
             .count();
         let planned_hostile = planned.len().saturating_sub(planned_friendly);
         if planned.is_empty() {
-            scheduler.record(tick, report);
+            record_natural_spawn_report(scheduler, tick, report);
             return (report, Vec::new());
         }
 
@@ -231,7 +231,7 @@ impl SessionRegistry {
                     .hostile
                     .rejected_duplicate_or_stale
                     .saturating_add(planned_hostile as u64);
-                scheduler.record(tick, report);
+                record_natural_spawn_report(scheduler, tick, report);
                 return (report, Vec::new());
             }
         };
@@ -270,7 +270,7 @@ impl SessionRegistry {
             let mut inner = self.lock_inner("publish periodic natural spawns");
             install_committed_herd_spawns_locked(&mut inner, stable, tick)
         };
-        scheduler.record(tick, report);
+        record_natural_spawn_report(scheduler, tick, report);
         (report, dispatches)
     }
 
@@ -283,4 +283,34 @@ impl SessionRegistry {
         dispatch_visibility_commands(dispatches);
         report
     }
+}
+
+fn record_natural_spawn_report(
+    scheduler: &mut NaturalSpawnScheduler,
+    tick: u64,
+    report: NaturalSpawnReport,
+) {
+    let Some(cumulative) = scheduler.record(tick, report) else {
+        return;
+    };
+    tracing::info!(
+        tick,
+        friendly_attempts = cumulative.friendly.attempts,
+        friendly_chunks = cumulative.friendly.chunks_sampled,
+        friendly_committed = cumulative.friendly.committed,
+        friendly_rejected_player_distance = cumulative.friendly.rejected_player_distance,
+        friendly_rejected_block_or_fluid = cumulative.friendly.rejected_block_or_fluid,
+        friendly_rejected_collision = cumulative.friendly.rejected_collision,
+        friendly_rejected_cap = cumulative.friendly.rejected_cap,
+        hostile_attempts = cumulative.hostile.attempts,
+        hostile_chunks = cumulative.hostile.chunks_sampled,
+        hostile_committed = cumulative.hostile.committed,
+        hostile_rejected_time = cumulative.hostile.rejected_time,
+        hostile_rejected_darkness = cumulative.hostile.rejected_darkness,
+        hostile_rejected_player_distance = cumulative.hostile.rejected_player_distance,
+        hostile_rejected_block_or_fluid = cumulative.hostile.rejected_block_or_fluid,
+        hostile_rejected_collision = cumulative.hostile.rejected_collision,
+        hostile_rejected_cap = cumulative.hostile.rejected_cap,
+        "periodic natural spawn metrics"
+    );
 }

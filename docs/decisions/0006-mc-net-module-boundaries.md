@@ -259,12 +259,17 @@ Other accepted concrete boundaries in this staged migration are:
   commit, durability, relight, invalidation, broadcasts, and publication. A
   narrow parent wrapper performs `ServerConfig` normalization; the child has
   no async, packet, direct-send, or lock backedge.
-- `play::session::herd_spawn_authority` is the narrow herd-spawn facade.
-  Its `scheduler` child owns only cadence, bounded rotating chunk selection,
-  reports, and cumulative metrics; it cannot depend on session, entity, world,
-  physics, or outbound types. `planning` owns read-only distance, cap,
-  block/fluid, darkness, collision, and candidate rules. `periodic` snapshots
-  session authority and coordinates the periodic plan. Its steady-state
+- `mc_entity::natural_spawn_26_1_2` owns the caller-neutral herd template,
+  deterministic identity, vanilla caps, bounded rotating scheduler, reports,
+  distance, block/fluid, darkness, collision, and candidate planning. It uses
+  `mc-data`, `mc-physics`, and read-only `mc-world` snapshots and has no
+  session, async, outbound, or commit dependency. Shared spawn facts, default
+  goals, geometry, and aquatic classification now have their single pure
+  authority there; staged `mc-net` adapters delegate to it for other entity
+  call sites.
+  `play::session::herd_spawn_authority` remains the narrow authority facade.
+  Its `periodic` child snapshots session authority and coordinates the
+  lower-crate plan. Its steady-state
   scheduler identifies an unchanged active ring by publication identity,
   snapshots templates only for the selected chunks, and projects collision
   candidates only from their one-chunk halo; it must not pre-scan every active
@@ -275,11 +280,11 @@ Other accepted concrete boundaries in this staged migration are:
   normalized intervals, delegates once through the facade, and owns no
   eligibility, cap, selection, commit, or dispatch rules. Generic entity
   defaults live in `session::entity_spawn_facts` instead of the session root.
-  Code-health pins these owners and rejects wildcard backedges, direct sends,
-  production async, session/lock/outbound dependencies in pure planning and
-  scheduler code, and domain-rule dependencies in the server ticker. Existing
-  lock order, journal outcomes, UUID dedupe, and stable batch publication are
-  unchanged.
+  Code-health pins the lower-crate and adapter owners and rejects wildcard
+  backedges, direct sends, production async, session/lock/outbound dependencies
+  in the entity domain, and domain-rule dependencies in the server ticker.
+  Existing lock order, journal outcomes, UUID dedupe, metric publication, and
+  stable batch publication are unchanged.
 - `play::lighting` owns incremental source capture and currentness, light
   computation, full-fallback collection, outbound light value construction,
   cache seeding, and baked-light persistence. Async world-lock orchestration,

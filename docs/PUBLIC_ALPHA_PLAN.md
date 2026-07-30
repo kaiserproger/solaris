@@ -77,9 +77,10 @@ Required migration:
    state machines, dependency edges, test concentration, and code-health
    exceptions. This inventory selects work; line count alone is not a reason to
    extract code.
-2. [ ] Extract pure natural-spawn scheduling and planning into `mc-entity`.
+2. [x] Extract pure natural-spawn scheduling and planning into `mc-entity`.
    `mc-net` retains session snapshots, regional-owner commit, visibility
    publication, and wire adapters.
+   Evidence: [`evidence/natural-spawn-crate-boundary.md`](evidence/natural-spawn-crate-boundary.md).
 3. [ ] Continue one touched vertical domain at a time: move request/result types and
    pure rules first, keep authority mutation in its accepted owner, then narrow the
    adapter. Do not create generic service traits without two real implementations.
@@ -263,6 +264,11 @@ Benchmark reproduction happens at that feature boundary, not after every edit:
   seeding/readiness surface, and timing diagnostics are owned by the explicit
   feature suite and recorded in
   [`evidence/mc-net-load-bench-tests.md`](evidence/mc-net-load-bench-tests.md).
+- [x] Move natural-spawn DTOs, bounded rotating scheduler, capacity/distance,
+  terrain, collision, and candidate planning into `mc-entity`. `mc-net`
+  retains live session/world snapshots, owner commit, visibility publication,
+  and dispatch. The exact boundary and validation are recorded in
+  [`evidence/natural-spawn-crate-boundary.md`](evidence/natural-spawn-crate-boundary.md).
 - [x] Inventory the manual and graphical client gate class. The 108
   `manual-pending` manifest scenarios are fail-closed declarations with
   agent-run real-client paths, not 108 owner-only tests. The exact graphical,

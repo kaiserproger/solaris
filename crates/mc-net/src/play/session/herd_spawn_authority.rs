@@ -8,8 +8,6 @@ mod commit;
 #[cfg(test)]
 mod legacy;
 mod periodic;
-mod planning;
-mod scheduler;
 
 #[cfg(test)]
 pub(in crate::play::session) use commit::install_committed_herd_spawns_locked;
@@ -17,16 +15,16 @@ pub(in crate::play::session) use commit::install_committed_herd_spawns_locked;
 pub(in crate::play::session) use legacy::{
     ChunkHerdClaimProbe, ClaimedPendingHostiles, claim_loaded_pending_hostiles_locked,
 };
+#[cfg(test)]
+pub(crate) use mc_entity::natural_spawn_26_1_2::NaturalSpawnReport;
+pub(crate) use mc_entity::natural_spawn_26_1_2::NaturalSpawnScheduler;
+#[cfg(test)]
+pub(super) use mc_entity::natural_spawn_26_1_2::spawn_far_enough_from_players;
+#[cfg(test)]
+pub(super) use mc_entity::natural_spawn_26_1_2::{
+    VANILLA_CREATURE_MOB_CAP, VANILLA_HOSTILE_MOB_CAP, VANILLA_WATER_CREATURE_MOB_CAP,
+};
 pub(crate) use periodic::NaturalSpawnTickInput;
-#[cfg(test)]
-pub(super) use planning::spawn_far_enough_from_players;
-#[cfg(test)]
-pub(crate) use scheduler::NaturalSpawnReport;
-pub(crate) use scheduler::NaturalSpawnScheduler;
-
-pub(super) const VANILLA_HOSTILE_MOB_CAP: usize = 70;
-pub(super) const VANILLA_CREATURE_MOB_CAP: usize = 10;
-pub(super) const VANILLA_WATER_CREATURE_MOB_CAP: usize = 20;
 
 #[derive(Debug)]
 pub(in crate::play) struct HerdSpawnOutcome {

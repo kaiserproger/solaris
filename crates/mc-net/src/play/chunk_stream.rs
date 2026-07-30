@@ -4,6 +4,7 @@ use super::session::{
     toolsmith_merchant_state,
 };
 use super::*;
+use mc_entity::natural_spawn_26_1_2::herd_hash;
 use mc_world::light::compute_chunk_light_in;
 use std::sync::OnceLock;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -296,19 +297,6 @@ pub(super) fn hostile_chunk_spawns(chunk: (i32, i32)) -> bool {
     h.is_multiple_of(8)
 }
 
-fn herd_hash(chunk: (i32, i32), slot: u8, salt: u64) -> u64 {
-    let mut h = salt;
-    h ^= (chunk.0 as i64 as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15);
-    h = h.rotate_left(23);
-    h ^= (chunk.1 as i64 as u64).wrapping_mul(0xC2B2_AE3D_27D4_EB4F);
-    h = h.rotate_left(17);
-    h ^= (slot as u64).wrapping_mul(0x1656_67B1_9E37_79F9);
-    h ^= h >> 30;
-    h = h.wrapping_mul(0xBF58_476D_1CE4_E5B9);
-    h ^= h >> 27;
-    h.wrapping_mul(0x94D0_49BB_1331_11EB) ^ (h >> 31)
-}
-
 fn natural_sheep_color(
     climate: mc_data::biomes::SheepColorClimate,
     chunk: (i32, i32),
@@ -359,12 +347,6 @@ fn sheep_color_for_rolls(
             _ => common(SheepColor::Black),
         },
     }
-}
-
-pub(super) fn herd_uuid(chunk: (i32, i32), slot: u8) -> uuid::Uuid {
-    let hi = herd_hash(chunk, slot, 0x434F_575F_4845_5244);
-    let lo = herd_hash(chunk, slot, 0x5041_5353_4956_4500);
-    uuid::Uuid::from_u128(((hi as u128) << 64) | lo as u128)
 }
 
 pub(super) fn plan_passive_herd(

@@ -20,6 +20,7 @@ mod entity_scale_26_1_2;
 pub mod equipment_26_1_2;
 pub mod living_26_1_2;
 pub mod mob_control_26_1_2;
+pub mod natural_spawn_26_1_2;
 pub mod navigation_26_1_2;
 pub mod projectile_26_1_2;
 mod regional;
@@ -35,6 +36,10 @@ pub mod zombie_villager_26_1_2;
 #[cfg(test)]
 #[path = "entity_scale_26_1_2_tests.rs"]
 mod entity_scale_26_1_2_tests;
+
+#[cfg(test)]
+#[path = "natural_spawn_26_1_2_tests.rs"]
+mod natural_spawn_26_1_2_tests;
 
 pub use entity_scale_26_1_2::{EntityScale26_1_2, EntityScaleError};
 pub use regional::VillagerBindingClaim;

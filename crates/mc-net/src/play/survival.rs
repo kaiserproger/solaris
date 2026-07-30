@@ -600,15 +600,7 @@ pub(super) fn arrow_entity_type_id(entity_types: &EntityTypeRegistry) -> Option<
 }
 
 pub(super) fn is_hostile_entity(entity_type: &str) -> bool {
-    static ENTITY_TYPES: std::sync::OnceLock<mc_data::entity_types::EntityTypeRegistry> =
-        std::sync::OnceLock::new();
-    let Ok(entity_type) = mc_data::Identifier::parse(entity_type.to_string()) else {
-        return false;
-    };
-    ENTITY_TYPES
-        .get_or_init(mc_data::entity_types::solaris_required_entity_types)
-        .facts_of(&entity_type)
-        .is_some_and(|facts| facts.category.is_hostile())
+    mc_entity::natural_spawn_26_1_2::is_hostile_entity(entity_type)
 }
 
 #[cfg(test)]

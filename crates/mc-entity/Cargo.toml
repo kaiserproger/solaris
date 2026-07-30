@@ -14,6 +14,8 @@ workspace = true
 [dependencies]
 bevy_ecs = { workspace = true }
 mc-data = { path = "../mc-data" }
+mc-physics = { path = "../mc-physics" }
+mc-world = { path = "../mc-world" }
 rayon = { workspace = true }
 serde = { workspace = true }
 uuid = { workspace = true }

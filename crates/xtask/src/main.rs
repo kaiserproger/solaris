@@ -1316,28 +1316,36 @@ const MC_NET_OWNERSHIP: &[OwnershipRule] = &[
         definition_anchor: "pub(in crate::play) fn activate_pending_hostiles_owned",
     },
     OwnershipRule {
+        name: "natural spawn domain",
+        module_file: "crates/mc-entity/src/natural_spawn_26_1_2.rs",
+        parent_file: "crates/mc-entity/src/lib.rs",
+        mod_declaration: "pub mod natural_spawn_26_1_2;",
+        definition_file: "crates/mc-entity/src/natural_spawn_26_1_2.rs",
+        definition_anchor: "pub struct HerdSpawn",
+    },
+    OwnershipRule {
         name: "herd candidate planning",
-        module_file: "crates/mc-net/src/play/session/herd_spawn_authority/planning.rs",
-        parent_file: "crates/mc-net/src/play/session/herd_spawn_authority.rs",
+        module_file: "crates/mc-entity/src/natural_spawn_26_1_2/planning.rs",
+        parent_file: "crates/mc-entity/src/natural_spawn_26_1_2.rs",
         mod_declaration: "mod planning;",
-        definition_file: "crates/mc-net/src/play/session/herd_spawn_authority/planning.rs",
-        definition_anchor: "pub(super) fn build_herd_spawn_candidates",
+        definition_file: "crates/mc-entity/src/natural_spawn_26_1_2/planning.rs",
+        definition_anchor: "pub fn build_herd_spawn_candidates",
     },
     OwnershipRule {
         name: "periodic natural spawn scheduler",
-        module_file: "crates/mc-net/src/play/session/herd_spawn_authority/scheduler.rs",
-        parent_file: "crates/mc-net/src/play/session/herd_spawn_authority.rs",
+        module_file: "crates/mc-entity/src/natural_spawn_26_1_2/scheduler.rs",
+        parent_file: "crates/mc-entity/src/natural_spawn_26_1_2.rs",
         mod_declaration: "mod scheduler;",
-        definition_file: "crates/mc-net/src/play/session/herd_spawn_authority/scheduler.rs",
-        definition_anchor: "pub(crate) struct NaturalSpawnScheduler",
+        definition_file: "crates/mc-entity/src/natural_spawn_26_1_2/scheduler.rs",
+        definition_anchor: "pub struct NaturalSpawnScheduler",
     },
     OwnershipRule {
         name: "periodic natural spawn planning",
-        module_file: "crates/mc-net/src/play/session/herd_spawn_authority/planning.rs",
-        parent_file: "crates/mc-net/src/play/session/herd_spawn_authority.rs",
+        module_file: "crates/mc-entity/src/natural_spawn_26_1_2/planning.rs",
+        parent_file: "crates/mc-entity/src/natural_spawn_26_1_2.rs",
         mod_declaration: "mod planning;",
-        definition_file: "crates/mc-net/src/play/session/herd_spawn_authority/planning.rs",
-        definition_anchor: "pub(super) fn plan_periodic_category",
+        definition_file: "crates/mc-entity/src/natural_spawn_26_1_2/planning.rs",
+        definition_anchor: "pub fn plan_periodic_category",
     },
     OwnershipRule {
         name: "periodic natural spawn authority",
@@ -1708,10 +1716,10 @@ fn scan_explicit_play_boundaries(path: &Path, lines: &[&str], findings: &mut Vec
     let herd_spawn_authority_submodule =
         path_text.contains("mc-net/src/play/session/herd_spawn_authority/");
     let natural_spawn_ticker = path.ends_with("mc-net/src/server/natural_spawn_ticker.rs");
-    let natural_spawn_planning =
-        path.ends_with("mc-net/src/play/session/herd_spawn_authority/planning.rs");
-    let natural_spawn_scheduler =
-        path.ends_with("mc-net/src/play/session/herd_spawn_authority/scheduler.rs");
+    let natural_spawn_planning = path.ends_with("mc-entity/src/natural_spawn_26_1_2/planning.rs");
+    let natural_spawn_scheduler = path.ends_with("mc-entity/src/natural_spawn_26_1_2/scheduler.rs");
+    let natural_spawn_domain = path.ends_with("mc-entity/src/natural_spawn_26_1_2.rs")
+        || path_text.contains("mc-entity/src/natural_spawn_26_1_2/");
     let entity_spawn_facts = path.ends_with("mc-net/src/play/session/entity_spawn_facts.rs");
     let forbid_toggle_runtime = path.ends_with("mc-net/src/play/toggles.rs");
     let forbid_random_runtime = path.ends_with("mc-net/src/play/random_ticks.rs");
@@ -1794,6 +1802,8 @@ fn scan_explicit_play_boundaries(path: &Path, lines: &[&str], findings: &mut Vec
             ("explosion session authority", false, false, true)
         } else if path.ends_with("mc-net/src/play/session/hostile_authority.rs") {
             ("hostile session authority", false, false, true)
+        } else if natural_spawn_domain {
+            ("natural spawn entity domain", true, false, true)
         } else if path.ends_with("mc-net/src/play/session/herd_spawn_authority.rs") {
             ("herd spawn authority", false, false, true)
         } else if herd_spawn_authority_submodule {
@@ -1947,15 +1957,35 @@ fn scan_explicit_play_boundaries(path: &Path, lines: &[&str], findings: &mut Vec
                 ]
                 .iter()
                 .any(|forbidden| normalized.contains(forbidden)))
-            || (natural_spawn_scheduler
+            || (natural_spawn_domain
                 && [
-                    "mc_entity",
-                    "mc_physics",
-                    "mc_world",
-                    "crate::play::session",
+                    "mc_net",
+                    "crate::play",
+                    "SessionRegistry",
+                    "SessionRegistryInner",
+                    "OutboundCommand",
+                    "VisibilityDispatch",
+                    "dispatch_visibility_commands",
+                    "WorldStorage",
+                    "WorldMutationView",
+                    "Mutex",
+                    "RwLock",
+                    "parking_lot",
+                    ".lock(",
+                    "asyncfn",
+                    ".await",
+                    "tokio::",
+                    "mpsc",
+                    "Sender<",
+                    "Receiver<",
+                    "mc_protocol::",
                 ]
                 .iter()
                 .any(|forbidden| normalized.contains(forbidden)))
+            || (natural_spawn_scheduler
+                && ["mc_net", "crate::play", "mc_physics", "mc_world"]
+                    .iter()
+                    .any(|forbidden| normalized.contains(forbidden)))
             || (forbid_scheduled_block_runtime
                 && [
                     "Mutex",

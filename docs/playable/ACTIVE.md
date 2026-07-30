@@ -22,24 +22,18 @@ replacement-readiness claims.
 
 ## Active Checkpoint
 
-Next: move the already-separated natural-spawn scheduler and pure planning rules out of
-`mc-net` into a dedicated lower-level crate, leaving session snapshots, owner commit and
-wire publication in `mc-net`. Enforce the one-way dependency with code-health before
-starting another extraction. The periodic natural-spawning runtime, its common-biome
-baseline and the previously failing `player_body_push` and crossing-prewarm package gates
-are green. After the crate-boundary checkpoint, continue measured performance work,
-ordinary-play vanilla parity, the planned production Luau API and the release closeout
-matrix in the owner's requested order. The first bounded population slice, merchant
-trading/restock, all five gossip types, zombie-villager curing,
-pillager crossbow combat, iron-golem panic defence and guardian beam combat are closed.
-Guardian and elder guardian now use a dedicated runtime-only beam state, exact 10-tick
-warmup, 80/60-tick beam durations, target metadata index 17, entity event 21 and ordered
-indirect-magic then mob-attack damage. This guardian slice targets players only and uses
-tracking visibility rather than a complete vanilla line-of-sight raycast; squid/axolotl
-selection, thorns, elder mining fatigue and difficulty selection remain open. Remaining
-`UnsupportedSpecial` profiles stay visibly blocked rather than falling through to generic
-melee. Graphical owner-host gates remain external release evidence and must not be marked
-complete from this headless workspace.
+Next: generate the measured `mc-net` ownership inventory required by Phase 2
+item 1: large files, domain state machines, dependency edges, test
+concentration, and code-health exceptions. Use it to select the next bounded
+vertical extraction before entering measured performance work.
+
+The natural-spawn crate boundary is closed. `mc-entity` now owns the herd DTO,
+deterministic identity, caps, rotating scheduler, metrics, terrain/darkness,
+collision, distance, and candidate planning. `mc-net` retains live
+session/world snapshots, regional owner commit, visibility publication,
+dispatch, and the server ticker. Code-health pins the one-way boundary.
+Graphical owner-host gates remain external release evidence and are not implied
+by this mechanical cutover.
 
 ## Recent Checkpoints — through 2026-07-30
 

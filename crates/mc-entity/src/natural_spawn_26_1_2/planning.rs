@@ -1,33 +1,32 @@
 use std::collections::HashMap;
 
-use mc_entity::{EntityLifecycle, EntitySimulationProjection, SpawnEntity, Vec3};
 use mc_physics::{Aabb, BlockMaterial, BlockMaterialIds};
 use mc_world::light::ChunkLight;
 use mc_world::{BlockPos, ChunkPos, WorldReadSnapshot};
 
-use crate::play::{
-    HerdSpawn, MAX_HOSTILE_SPAWNS_PER_CHUNK, MAX_PASSIVE_SPAWNS_PER_CHUNK,
-    MIN_ENTITY_SPAWN_DISTANCE_FROM_PLAYER, herd_uuid, is_hostile_entity,
+use crate::{
+    EntityLifecycle, EntitySimulationProjection, SpawnEntity, Vec3,
+    natural_spawn_26_1_2::{
+        HerdSpawn, MAX_HOSTILE_SPAWNS_PER_CHUNK, MAX_PASSIVE_SPAWNS_PER_CHUNK,
+        MIN_ENTITY_SPAWN_DISTANCE_FROM_PLAYER, VANILLA_CREATURE_MOB_CAP, VANILLA_HOSTILE_MOB_CAP,
+        VANILLA_WATER_CREATURE_MOB_CAP, apply_default_mob_goal, apply_entity_facts, entity_aabb,
+        entity_type_uses_aquatic_physics, herd_uuid, is_hostile_entity,
+    },
 };
 
-use super::super::entity_goal_defaults::apply_default_mob_goal;
-use super::super::entity_physics_class::entity_type_uses_aquatic_physics;
-use super::super::entity_spawn_facts::apply_entity_facts;
-use super::super::interaction_geometry::{distance_sq, entity_aabb};
 use super::scheduler::{NaturalSpawnCategory, NaturalSpawnCategoryReport};
-use super::{VANILLA_CREATURE_MOB_CAP, VANILLA_HOSTILE_MOB_CAP, VANILLA_WATER_CREATURE_MOB_CAP};
 
-pub(super) const MAX_NATURAL_TEMPLATES_PER_CHUNK: usize = 16;
+pub const MAX_NATURAL_TEMPLATES_PER_CHUNK: usize = 16;
 
 #[derive(Debug, Clone, Copy)]
-pub(super) struct NaturalSpawnCapacities {
+pub struct NaturalSpawnCapacities {
     hostile: usize,
     ground: usize,
     aquatic: usize,
 }
 
 impl NaturalSpawnCapacities {
-    pub(super) fn from_counts(hostile: usize, ground: usize, aquatic: usize) -> Self {
+    pub fn from_counts(hostile: usize, ground: usize, aquatic: usize) -> Self {
         Self {
             hostile: VANILLA_HOSTILE_MOB_CAP.saturating_sub(hostile),
             ground: VANILLA_CREATURE_MOB_CAP.saturating_sub(ground),
@@ -35,10 +34,10 @@ impl NaturalSpawnCapacities {
         }
     }
 
-    fn admit(&mut self, type_name: &str) -> bool {
-        let remaining = if is_hostile_entity(type_name) {
+    fn admit(&mut self, spawn: &HerdSpawn) -> bool {
+        let remaining = if is_hostile_entity(&spawn.entity_type_name) {
             &mut self.hostile
-        } else if entity_type_uses_aquatic_physics(type_name) {
+        } else if entity_type_uses_aquatic_physics(&spawn.entity_type_name) {
             &mut self.aquatic
         } else {
             &mut self.ground
@@ -59,7 +58,7 @@ enum SpawnTerrainRejection {
 }
 
 #[allow(clippy::too_many_arguments)]
-pub(super) fn plan_periodic_category(
+pub fn plan_periodic_category(
     category: NaturalSpawnCategory,
     chunks: &[(i32, i32)],
     templates: &HashMap<(i32, i32), Vec<HerdSpawn>>,
@@ -141,7 +140,7 @@ pub(super) fn plan_periodic_category(
                 report.rejected_collision = report.rejected_collision.saturating_add(1);
                 continue;
             }
-            if !capacities.admit(&template.entity_type_name) {
+            if !capacities.admit(template) {
                 report.rejected_cap = report.rejected_cap.saturating_add(1);
                 continue;
             }
@@ -254,7 +253,7 @@ fn entity_aabbs_intersect(
         && right_position.z - right.half_width < left_position.z + left.half_width
 }
 
-pub(super) fn build_herd_spawn_candidates(
+pub fn build_herd_spawn_candidates(
     chunk: (i32, i32),
     spawns: &[HerdSpawn],
     player_positions: &[Vec3],
@@ -288,7 +287,7 @@ pub(super) fn build_herd_spawn_candidates(
         apply_entity_facts(&mut entity);
         if let Some(color) = spawn.sheep_color {
             debug_assert_eq!(entity.type_name, "minecraft:sheep");
-            entity.animal = Some(mc_entity::AnimalBreedingState::adult_sheep(color));
+            entity.animal = Some(crate::AnimalBreedingState::adult_sheep(color));
         }
         apply_default_mob_goal(&mut entity, mob_behaviors);
         entities.push(entity);
@@ -301,7 +300,7 @@ pub(super) fn build_herd_spawn_candidates(
     entities
 }
 
-pub(in crate::play::session) fn spawn_far_enough_from_players(
+pub fn spawn_far_enough_from_players(
     player_positions: &[Vec3],
     position: Vec3,
     minimum_distance: f64,
@@ -310,4 +309,11 @@ pub(in crate::play::session) fn spawn_far_enough_from_players(
     player_positions
         .iter()
         .all(|player| distance_sq(position, *player) > min_distance_sq)
+}
+
+fn distance_sq(a: Vec3, b: Vec3) -> f64 {
+    let dx = a.x - b.x;
+    let dy = a.y - b.y;
+    let dz = a.z - b.z;
+    dx * dx + dy * dy + dz * dz
 }

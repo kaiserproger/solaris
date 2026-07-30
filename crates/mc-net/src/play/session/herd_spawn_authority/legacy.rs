@@ -1,5 +1,6 @@
 use std::sync::mpsc::{Receiver, SyncSender};
 
+use mc_entity::natural_spawn_26_1_2::build_herd_spawn_candidates;
 use mc_entity::{SpawnEntity, Vec3};
 use tracing::debug;
 
@@ -11,7 +12,6 @@ use crate::play::{
 use super::super::entity_physics_class::entity_type_uses_aquatic_physics;
 use super::super::{SessionRegistry, SessionRegistryInner};
 use super::commit::install_committed_herd_spawns_locked;
-use super::planning::build_herd_spawn_candidates;
 use super::{
     HerdSpawnOutcome, VANILLA_CREATURE_MOB_CAP, VANILLA_HOSTILE_MOB_CAP,
     VANILLA_WATER_CREATURE_MOB_CAP,
