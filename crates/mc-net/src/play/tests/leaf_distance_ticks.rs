@@ -1,9 +1,8 @@
 use super::{
     BlockEdit, BlockEditPrecondition, BlockStateId, Chunk, ChunkPos, Identifier,
-    ScheduledBlockTick, ScheduledBlockTickReport, ServerConfig, SessionRegistry,
-    in_memory_button_world, leaf_distance_test_registry, play_loop_slow_client_test_config,
-    register_loaded_button_session, register_ticketed_button_session, run_scheduled_block_ticks,
-    simulation_channel,
+    ScheduledBlockTick, ServerConfig, SessionRegistry, in_memory_button_world,
+    leaf_distance_test_registry, play_loop_slow_client_test_config, register_loaded_button_session,
+    register_ticketed_button_session, run_scheduled_block_ticks, simulation_channel,
 };
 use std::sync::Arc;
 use std::task::{Context, Poll};
@@ -110,19 +109,6 @@ async fn removed_log_pushes_leaf_distance_updates_through_scheduled_ticks() {
         Some(mc_world::BlockStateId(4)),
         "the second leaf should move from distance 1 to 3"
     );
-}
-
-pub(super) async fn run_scheduled_block_ticks_for_range(
-    config: &ServerConfig,
-    sessions: &SessionRegistry,
-    start: u64,
-    end: u64,
-) -> ScheduledBlockTickReport {
-    let mut report = ScheduledBlockTickReport::default();
-    for tick in start..=end {
-        report = run_scheduled_block_ticks(config, sessions, tick).await;
-    }
-    report
 }
 
 #[tokio::test]

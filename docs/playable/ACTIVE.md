@@ -22,24 +22,19 @@ replacement-readiness claims.
 
 ## Active Checkpoint
 
-Next autonomous goal checkpoint: route `playable`; mechanically move the full
-twenty-test scheduled-hopper transfer/persistence class beginning with
-`scheduled_hopper_tick_pulls_one_item_into_hopper_before_ejecting_without_generating_neighbors`
-and ending with
-`scheduled_hopper_transfer_preserves_hopper_slot_when_target_has_no_room` out
-of aggregate `crates/mc-net/src/play/tests.rs` into a focused sibling module.
-Preserve every test and production behavior, move
-`run_scheduled_block_ticks_for_range` from `leaf_distance_ticks.rs` into the
-new hopper module because all of its remaining callers belong to this class,
-remove the temporary aggregate import, leave the preceding ignored
+Next autonomous goal checkpoint: route `playable`; mechanically move the
+five-test scheduled-button loaded/ABA/adjacent-power class beginning with
+`scheduled_button_tick_ignores_ticketed_chunk_until_loaded` and ending with
+`scheduled_button_release_keeps_piston_extended_when_head_is_protected` out of
+aggregate `crates/mc-net/src/play/tests.rs` into a focused sibling module.
+Preserve every test and production behavior, leave the preceding ignored
 `real_door_states_plan_hand_toggle_when_sidecar_is_present` sidecar gate and
-the following `scheduled_button_tick_ignores_ticketed_chunk_until_loaded`
-button class in the aggregate file, and use explicit imports rather than a new
-`use super::*`. The two-test leaf-distance scheduled-tick class has already
-moved to `crates/mc-net/src/play/tests/leaf_distance_ticks.rs`; the shared
-range helper is temporarily colocated there until the hopper class moves. Its
+the following `button_test_registry` helper class in the aggregate file, and
+use explicit imports rather than a new `use super::*`. The full twenty-test
+scheduled-hopper transfer/persistence class and its range helper have already
+moved to `crates/mc-net/src/play/tests/scheduled_hoppers.rs`; their
 concentration and validation are recorded in
-[`../evidence/mc-net-leaf-distance-tick-test-extraction.md`](../evidence/mc-net-leaf-distance-tick-test-extraction.md).
+[`../evidence/mc-net-scheduled-hopper-test-extraction.md`](../evidence/mc-net-scheduled-hopper-test-extraction.md).
 The owner-run subjective fresh-world seed-`712816` playtest and
 release-candidate performance gates remain queued at their declared
 boundaries.
