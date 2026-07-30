@@ -117,6 +117,11 @@ not replace functional, package, workspace, or real-client gates.
    world-writer independence, exact block-update, and acknowledgement coverage
    is recorded in
    [`evidence/mc-net-block-resync-test-extraction.md`](evidence/mc-net-block-resync-test-extraction.md).
+   The following fourteen-test furnace menu, cooking, experience, ticking,
+   publication, and stale-click class now lives in focused
+   `play/tests/furnace.rs`; its preserved container, resident-state,
+   world-writer, observer, and owner-commit coverage is recorded in
+   [`evidence/mc-net-furnace-test-extraction.md`](evidence/mc-net-furnace-test-extraction.md).
 4. [ ] Separate behavioral tests from structural tripwires. Structural checks may
    enforce crate ownership and dependency direction, but may not assert Rust
    statement order or source-text layout.

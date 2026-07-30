@@ -22,19 +22,18 @@ replacement-readiness claims.
 
 ## Active Checkpoint
 
-Next autonomous goal checkpoint: route `playable`; mechanically move the full
-fourteen-test furnace class beginning with
-`furnace_window_swap_and_throw_mutate_menu_slots` and ending with
-`stale_furnace_click_after_peer_mutation_resyncs_without_mutating_storage` out
-of aggregate `crates/mc-net/src/play/tests.rs` into a focused sibling module.
+Next autonomous goal checkpoint: route `playable`; mechanically move the
+contiguous four-test chest class beginning with
+`chest_window_swap_and_throw_mutate_storage_slots` and ending with
+`shared_chest_same_version_click_commits_once_and_conserves_items` out of
+aggregate `crates/mc-net/src/play/tests.rs` into a focused sibling module.
 Preserve every test and production behavior, leave the preceding shared
 `decode_player_position_sync_packets` helper and following
-`chest_window_swap_and_throw_mutate_storage_slots` test in the aggregate file,
-and use explicit imports rather than a new `use super::*`. The complete
-two-test authoritative block-resync class has already moved to
-`crates/mc-net/src/play/tests/block_resync.rs`; its concentration and
-validation are recorded in
-[`../evidence/mc-net-block-resync-test-extraction.md`](../evidence/mc-net-block-resync-test-extraction.md).
+`spawn_test_simulation_owner` helper in the aggregate file, and use explicit
+imports rather than a new `use super::*`. The complete fourteen-test furnace
+class has already moved to `crates/mc-net/src/play/tests/furnace.rs`; its
+concentration and validation are recorded in
+[`../evidence/mc-net-furnace-test-extraction.md`](../evidence/mc-net-furnace-test-extraction.md).
 The owner-run subjective fresh-world seed-`712816` playtest and
 release-candidate performance gates remain queued at their declared
 boundaries.
