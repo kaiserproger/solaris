@@ -23,20 +23,22 @@ replacement-readiness claims.
 ## Active Checkpoint
 
 Next autonomous goal checkpoint: route `playable`; mechanically move the
-`enchanting_button_commits_xp_through_owner_before_mutating_table_inputs` test
-from aggregate `crates/mc-net/src/play/tests.rs` to a focused sibling module.
-Preserve the required item/facts registries and stone-pickaxe/lapis ids,
-interaction state and simulation owner, exact pose/profile/session registration,
-persisted XP and enchanting inputs, table window id/position/inputs, active
-container, cloned session/world authority, survival/XP/writer fixtures, pinned
-container-button request, pending-before-owner-commit assertion and exact
-message, one processed owner command, final XP/table/input,
-`minecraft:efficiency`, and persistence assertions, exact atomic-commit
-message, and non-empty writer.
-Leave the preceding
 `enchanting_bookshelf_geometry_requires_clear_midpoints_and_caps_at_fifteen`
-test and following `state` helper aggregate-owned, and use explicit imports
-rather than a new `use super::*`.
+test from aggregate `crates/mc-net/src/play/tests.rs` to a focused sibling
+module. Preserve the exact table, two provider, and two gap positions; provider
+and clear-gap sets; first count with both clear gaps equal to `2`; second count
+with only the first gap clear equal to `1`; and all-provider/all-clear cap equal
+to `15`. Leave the preceding
+`held_sharpness_uses_the_vanilla_26_1_2_damage_formula` test and following
+`state` helper aggregate-owned, and use explicit imports rather than a new
+`use super::*`.
+
+The complete enchanting owner-commit test has moved to
+`crates/mc-net/src/play/tests/enchanting_owner_commit.rs`. Its unchanged
+registry/session/persistence fixtures, pending-before-owner boundary, one owner
+command, XP/input atomicity, exact `minecraft:efficiency` result, and writer
+output are recorded in
+[`../evidence/mc-net-enchanting-owner-commit-test-extraction.md`](../evidence/mc-net-enchanting-owner-commit-test-extraction.md).
 
 The complete outbound write-stall play-loop test has moved to
 `crates/mc-net/src/play/tests/outbound_write_stall.rs`. Its unchanged queued

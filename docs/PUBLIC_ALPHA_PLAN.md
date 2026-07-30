@@ -403,6 +403,11 @@ not replace functional, package, workspace, or real-client gates.
    exact play-loop arguments and expectations, and timeout counter are
    recorded in
    [`evidence/mc-net-outbound-write-stall-test-extraction.md`](evidence/mc-net-outbound-write-stall-test-extraction.md).
+   The following enchanting owner-commit test now lives in focused
+   `play/tests/enchanting_owner_commit.rs`; its pending-before-owner boundary,
+   one processed owner command, atomic XP/input persistence, exact efficiency
+   result, and writer output are recorded in
+   [`evidence/mc-net-enchanting-owner-commit-test-extraction.md`](evidence/mc-net-enchanting-owner-commit-test-extraction.md).
 4. [ ] Separate behavioral tests from structural tripwires. Structural checks may
    enforce crate ownership and dependency direction, but may not assert Rust
    statement order or source-text layout.
