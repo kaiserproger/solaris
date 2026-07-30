@@ -517,16 +517,18 @@ mod tests {
     use super::*;
 
     #[test]
+    #[ignore = "requires local 26.1.2 data/vanilla biome sidecars"]
     fn loads_real_plains_spawns_when_present() {
         let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
             .parent()
             .and_then(Path::parent)
             .unwrap()
             .join("data/vanilla/data/minecraft/worldgen/biome");
-        if !root.is_dir() {
-            eprintln!("skipping: {} missing", root.display());
-            return;
-        }
+        assert!(
+            root.is_dir(),
+            "{} missing; run tools/extract-vanilla-data.sh",
+            root.display()
+        );
 
         let rules = load_biome_spawn_rules(root).unwrap();
         let plains = Identifier::parse("minecraft:plains").unwrap();
@@ -692,6 +694,7 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "requires local 26.1.2 data/vanilla biome and tag sidecars"]
     fn real_sidecar_sheep_color_climates_match_resolved_variant_tags_when_present() {
         let data_root = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
             .parent()
@@ -700,10 +703,12 @@ mod tests {
             .join("data/vanilla/data/minecraft");
         let biome_dir = data_root.join("worldgen/biome");
         let tags_dir = data_root.join("tags/worldgen/biome");
-        if !biome_dir.is_dir() || !tags_dir.is_dir() {
-            eprintln!("skipping: local vanilla biome data missing");
-            return;
-        }
+        assert!(
+            biome_dir.is_dir() && tags_dir.is_dir(),
+            "need both {} and {}; run tools/extract-vanilla-data.sh",
+            biome_dir.display(),
+            tags_dir.display()
+        );
 
         let rules = load_biome_spawn_rules(&biome_dir).unwrap();
         let embedded = solaris_required_biome_spawn_rules();
@@ -805,6 +810,7 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "requires local 26.1.2 data/vanilla biome and tag sidecars"]
     fn loads_real_overworld_biome_tags_when_present() {
         let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
             .parent()
@@ -813,10 +819,12 @@ mod tests {
             .join("data/vanilla/data/minecraft");
         let biome_dir = root.join("worldgen/biome");
         let tags_dir = root.join("tags/worldgen/biome");
-        if !biome_dir.is_dir() || !tags_dir.is_dir() {
-            eprintln!("skipping: biome sidecar missing under {}", root.display());
-            return;
-        }
+        assert!(
+            biome_dir.is_dir() && tags_dir.is_dir(),
+            "need both {} and {}; run tools/extract-vanilla-data.sh",
+            biome_dir.display(),
+            tags_dir.display()
+        );
 
         let data = load_biome_worldgen_data(&biome_dir, &tags_dir).unwrap();
         let overworld = data.tag(&Identifier::parse("minecraft:is_overworld").unwrap());

@@ -2287,12 +2287,14 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "requires local 26.1.2 loot table sidecars"]
     fn loads_real_vanilla_subset_when_present() {
         let path = workspace_path("data/vanilla/data/minecraft/loot_table");
-        if !path.is_dir() {
-            eprintln!("skipping: {} not present", path.display());
-            return;
-        }
+        assert!(
+            path.is_dir(),
+            "{} not present; run tools/extract-vanilla-data.sh",
+            path.display()
+        );
 
         let loot = load_vanilla_subset(path).unwrap();
 
@@ -2639,12 +2641,14 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "requires local 26.1.2 carrots loot table sidecar"]
     fn real_binomial_fixture_has_expected_parameters_when_present() {
         let path = workspace_path("data/vanilla/data/minecraft/loot_table/blocks/carrots.json");
-        if !path.is_file() {
-            eprintln!("skipping: {} not present", path.display());
-            return;
-        }
+        assert!(
+            path.is_file(),
+            "{} not present; run tools/extract-vanilla-data.sh",
+            path.display()
+        );
 
         let carrots: serde_json::Value =
             serde_json::from_str(&fs::read_to_string(path).unwrap()).unwrap();
@@ -2661,11 +2665,21 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "requires local 26.1.2 crop loot table sidecars"]
     fn real_crop_fixtures_load_state_conditioned_pools_when_present() {
         let root = workspace_path("data/vanilla/data/minecraft/loot_table");
-        if !root.join("blocks/wheat.json").is_file() {
-            eprintln!("skipping: {} not present", root.display());
-            return;
+        for fixture in [
+            "blocks/wheat.json",
+            "blocks/carrots.json",
+            "blocks/potatoes.json",
+            "blocks/beetroots.json",
+        ] {
+            let path = root.join(fixture);
+            assert!(
+                path.is_file(),
+                "{} not present; run tools/extract-vanilla-data.sh",
+                path.display()
+            );
         }
 
         let loot = load_vanilla_subset(&root).unwrap();
@@ -2750,12 +2764,15 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "requires local 26.1.2 sheep loot table sidecars"]
     fn completes_real_vanilla_sheep_table_when_present() {
         let path = workspace_path("data/vanilla/data/minecraft/loot_table");
-        if !path.is_dir() {
-            eprintln!("skipping: {} not present", path.display());
-            return;
-        }
+        let sheep_path = path.join("entities/sheep.json");
+        assert!(
+            sheep_path.is_file(),
+            "{} not present; run tools/extract-vanilla-data.sh",
+            sheep_path.display()
+        );
         let sheep = Identifier::parse("minecraft:sheep").unwrap();
         let mut loot = load_vanilla_subset(path).unwrap();
 

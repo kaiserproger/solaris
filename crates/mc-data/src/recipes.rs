@@ -1605,16 +1605,18 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "requires local 26.1.2 recipe sidecars"]
     fn loads_real_recipe_sidecar_when_present() {
         let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
             .parent()
             .and_then(Path::parent)
             .unwrap()
             .join("data/vanilla/data/minecraft/recipe");
-        if !root.is_dir() {
-            eprintln!("skipping: {} missing", root.display());
-            return;
-        }
+        assert!(
+            root.is_dir(),
+            "{} missing; run tools/extract-vanilla-data.sh",
+            root.display()
+        );
 
         let recipes = load_recipes(root).unwrap();
         assert!(recipes.len() > 100, "vanilla has many crafting recipes");

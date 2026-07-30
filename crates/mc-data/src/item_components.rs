@@ -805,12 +805,14 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "requires local 26.1.2 item component reports"]
     fn loads_real_apple_and_bread_components_when_present() {
         let path = workspace_path("data/vanilla/reports/minecraft/components/item");
-        if !path.is_dir() {
-            eprintln!("skipping: {} not present", path.display());
-            return;
-        }
+        assert!(
+            path.is_dir(),
+            "{} not present; run tools/extract-vanilla-data.sh",
+            path.display()
+        );
 
         let facts = load_item_facts(path).unwrap();
 
@@ -842,12 +844,14 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "requires local 26.1.2 item component reports"]
     fn loads_real_combat_components_when_present() {
         let path = workspace_path("data/vanilla/reports/minecraft/components/item");
-        if !path.is_dir() {
-            eprintln!("skipping: {} not present", path.display());
-            return;
-        }
+        assert!(
+            path.is_dir(),
+            "{} not present; run tools/extract-vanilla-data.sh",
+            path.display()
+        );
 
         let facts = load_item_facts(path).unwrap();
 
@@ -903,12 +907,14 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "requires local 26.1.2 item component reports"]
     fn loads_real_ordered_tool_rules_when_present() {
         let path = workspace_path("data/vanilla/reports/minecraft/components/item");
-        if !path.is_dir() {
-            eprintln!("skipping: {} not present", path.display());
-            return;
-        }
+        assert!(
+            path.is_dir(),
+            "{} not present; run tools/extract-vanilla-data.sh",
+            path.display()
+        );
 
         let facts = load_item_facts(path).unwrap();
         let pickaxe = facts

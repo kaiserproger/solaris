@@ -722,17 +722,16 @@ mod tests {
     /// `blocks.json` so the test survives state-id reshuffles
     /// between Mojang patches.
     #[test]
+    #[ignore = "requires local 26.1.2 block light and blocks reports"]
     fn real_table_matches_known_blocks() {
         let blocks_path = workspace_path("data/vanilla/reports/blocks.json");
         let light_path = workspace_path("data/vanilla/reports/block_light.json");
-        if !blocks_path.is_file() || !light_path.is_file() {
-            eprintln!(
-                "skipping: need both {} and {}",
-                blocks_path.display(),
-                light_path.display(),
-            );
-            return;
-        }
+        assert!(
+            blocks_path.is_file() && light_path.is_file(),
+            "need both {} and {}; run tools/extract-vanilla-data.sh",
+            blocks_path.display(),
+            light_path.display()
+        );
 
         let blocks = crate::blocks::load_blocks_report(&blocks_path).unwrap();
         let table = load(&light_path).unwrap();

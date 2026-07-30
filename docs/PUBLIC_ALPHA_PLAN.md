@@ -275,6 +275,12 @@ Benchmark reproduction happens at that feature boundary, not after every edit:
   shape; the ordinary suite no longer treats a successful early return as a
   pass. Owners and close conditions are recorded in
   [`evidence/mc-world-local-artifact-tests.md`](evidence/mc-world-local-artifact-tests.md).
+- [x] Classify 25 `mc-data` tests that depended on ignored local Mojang reports
+  or data-pack sidecars. They are now explicit opt-in gates and fail closed
+  when deliberately invoked without their prerequisite; the ordinary suite no
+  longer treats a successful early return as a pass. Owners and close
+  conditions are recorded in
+  [`evidence/mc-data-local-artifact-tests.md`](evidence/mc-data-local-artifact-tests.md).
 - [x] Record the exact local 26.1.2 world-clock oracle in
   [`evidence/world-clock-26.1.2.md`](evidence/world-clock-26.1.2.md).
 - [x] Implement the typed world-clock map, separating monotonic `game_time` from

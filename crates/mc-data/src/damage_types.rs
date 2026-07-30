@@ -262,12 +262,14 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "requires local 26.1.2 damage type sidecars"]
     fn loads_real_damage_types_when_present() {
         let path = workspace_path("data/vanilla/data/minecraft/damage_type");
-        if !path.is_dir() {
-            eprintln!("skipping: {} not present", path.display());
-            return;
-        }
+        assert!(
+            path.is_dir(),
+            "{} not present; run tools/extract-vanilla-data.sh",
+            path.display()
+        );
 
         let table = load_damage_type_facts(path).unwrap();
 

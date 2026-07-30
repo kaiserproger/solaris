@@ -205,6 +205,7 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "requires local 26.1.2 block mining and blocks reports"]
     fn real_table_matches_vanilla_2612_blocks() {
         let workspace = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
             .parent()
@@ -213,10 +214,12 @@ mod tests {
             .to_path_buf();
         let blocks_path = workspace.join("data/vanilla/reports/blocks.json");
         let mining_path = workspace.join("data/vanilla/reports/block_mining.json");
-        if !blocks_path.is_file() || !mining_path.is_file() {
-            eprintln!("skipping: local block-mining oracle is absent");
-            return;
-        }
+        assert!(
+            blocks_path.is_file() && mining_path.is_file(),
+            "need both {} and {}; run tools/extract-vanilla-data.sh",
+            blocks_path.display(),
+            mining_path.display()
+        );
 
         let blocks = crate::blocks::load_blocks_report(blocks_path).unwrap();
         let table = load(mining_path).unwrap();

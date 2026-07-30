@@ -753,20 +753,22 @@ mod tests {
         assert_eq!(nested.as_str(), "minecraft:nether/warped_forest");
     }
 
-    /// If a real vanilla extraction is present locally, sanity-check the
-    /// loader against it. Skipped otherwise so CI without
-    /// `.analysis/server.jar` still passes.
+    /// Opt-in sanity check against a real local vanilla extraction. The
+    /// ignored gate keeps ordinary CI independent of `.analysis/server.jar`.
     #[test]
+    #[ignore = "requires populated local 26.1.2 data/vanilla sidecars"]
     fn loads_real_vanilla_sidecar_when_present() {
         let path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
             .join("..")
             .join("..")
             .join("data")
             .join("vanilla");
-        if !path.join("data").join("minecraft").is_dir() {
-            eprintln!("skipping: {} not populated", path.display());
-            return;
-        }
+        let minecraft_data = path.join("data").join("minecraft");
+        assert!(
+            minecraft_data.is_dir(),
+            "{} not populated; run tools/extract-vanilla-data.sh",
+            minecraft_data.display()
+        );
         let data = load(&path).expect("real vanilla data should load");
         assert!(data.registry_count() >= KNOWN_REGISTRIES.len());
         let dim = data.registry("dimension_type").unwrap();

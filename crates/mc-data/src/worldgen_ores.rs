@@ -405,16 +405,18 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "requires local 26.1.2 worldgen sidecars"]
     fn loads_real_diamond_ore_when_present() {
         let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
             .parent()
             .and_then(Path::parent)
             .unwrap()
             .join("data/vanilla/data/minecraft/worldgen");
-        if !root.is_dir() {
-            eprintln!("skipping: {} missing", root.display());
-            return;
-        }
+        assert!(
+            root.is_dir(),
+            "{} missing; run tools/extract-vanilla-data.sh",
+            root.display()
+        );
 
         let features = load_ore_features(root).unwrap();
         let diamond = features

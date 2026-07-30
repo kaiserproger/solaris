@@ -186,20 +186,17 @@ mod tests {
         );
     }
 
-    /// Smoke test against the real vanilla report when one is present.
-    /// Skips silently in CI / fresh checkouts where the sidecar is
-    /// absent. The numbers are pinned to 26.1.2; update if the bundled
-    /// server.jar is upgraded.
+    /// Opt-in smoke test against the real vanilla report. The numbers are
+    /// pinned to 26.1.2; update if the bundled server.jar is upgraded.
     #[test]
+    #[ignore = "requires local 26.1.2 blocks report"]
     fn loads_real_blocks_report_if_present() {
         let path = workspace_path("data/vanilla/reports/blocks.json");
-        if !path.is_file() {
-            eprintln!(
-                "skipping: {} not present (run tools/extract-vanilla-data.sh)",
-                path.display()
-            );
-            return;
-        }
+        assert!(
+            path.is_file(),
+            "{} not present; run tools/extract-vanilla-data.sh",
+            path.display()
+        );
         let report = load_blocks_report(&path).unwrap();
         assert_eq!(report.len(), 1168, "block count for 26.1.2");
         let total_states: usize = report.iter().map(|b| b.states.len()).sum();

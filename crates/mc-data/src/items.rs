@@ -166,12 +166,14 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "requires local 26.1.2 registries report"]
     fn loads_real_item_registry_when_present() {
         let path = workspace_path("data/vanilla/reports/registries.json");
-        if !path.is_file() {
-            eprintln!("skipping: {} not present", path.display());
-            return;
-        }
+        assert!(
+            path.is_file(),
+            "{} not present; run tools/extract-vanilla-data.sh",
+            path.display()
+        );
         let report = load_items_report(&path).unwrap();
         assert!(report.len() > 1000, "vanilla has > 1k item kinds");
         let reg = ItemRegistry::from_report(&report);

@@ -426,16 +426,18 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "requires local 26.1.2 worldgen sidecars"]
     fn loads_real_grass_feature_facts_when_present() {
         let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
             .parent()
             .and_then(Path::parent)
             .unwrap()
             .join("data/vanilla/data/minecraft/worldgen");
-        if !root.is_dir() {
-            eprintln!("skipping: worldgen sidecar missing at {}", root.display());
-            return;
-        }
+        assert!(
+            root.is_dir(),
+            "{} missing; run tools/extract-vanilla-data.sh",
+            root.display()
+        );
 
         let features = load_feature_facts(root).unwrap();
         let grass = features

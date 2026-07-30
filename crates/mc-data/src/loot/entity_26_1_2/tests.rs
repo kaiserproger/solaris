@@ -1184,13 +1184,12 @@ fn weighted_candidate_selection_second_scan_consumes_operations() {
 }
 
 #[test]
+#[ignore = "requires a local 26.1.2 entity loot-table sidecar"]
 fn local_26_1_2_entity_corpus_has_closed_references_when_sidecar_is_present() {
-    let Some(data_root) = local_data_root() else {
-        eprintln!(
-            "skipping local evidence: a 26.1.2 sidecar data root is not present; synthetic closure tests still ran"
-        );
-        return;
-    };
+    let data_root = local_data_root().expect(
+        "a 26.1.2 sidecar data root is required under .analysis/client-automation, \
+         .analysis/decompiled, or data/vanilla",
+    );
     let entity_dir = data_root.join("minecraft/loot_table/entities");
     let roots = resource_ids_below(&data_root, &entity_dir);
     let catalog = EntityLootCatalog::compile_resources(&data_root, roots).unwrap();

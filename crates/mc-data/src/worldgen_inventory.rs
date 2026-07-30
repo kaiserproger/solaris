@@ -250,19 +250,19 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "requires local 26.1.2 worldgen sidecars"]
     fn inventories_real_worldgen_sidecar_when_present() {
         let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
             .parent()
             .and_then(Path::parent)
             .unwrap()
             .join("data/vanilla");
-        if !root.join("data/minecraft/worldgen").is_dir() {
-            eprintln!(
-                "skipping: worldgen sidecar missing under {}",
-                root.display()
-            );
-            return;
-        }
+        let worldgen_path = root.join("data/minecraft/worldgen");
+        assert!(
+            worldgen_path.is_dir(),
+            "{} missing; run tools/extract-vanilla-data.sh",
+            worldgen_path.display()
+        );
 
         let inventory = load_worldgen_inventory(root).unwrap();
 

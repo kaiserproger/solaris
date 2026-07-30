@@ -383,13 +383,17 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "requires local 26.1.2 registries and item tag sidecars"]
     fn full_local_2612_tags_match_embedded_snapshot_when_available() {
         let root = workspace_path("data/vanilla");
         let report_path = root.join("reports/registries.json");
-        if !report_path.is_file() {
-            eprintln!("skipping: {} not present", report_path.display());
-            return;
-        }
+        let tags_path = root.join("data/minecraft/tags");
+        assert!(
+            report_path.is_file() && tags_path.is_dir(),
+            "need both {} and {}; run tools/extract-vanilla-data.sh",
+            report_path.display(),
+            tags_path.display()
+        );
         let items = ItemRegistry::from_report(&load_items_report(report_path).unwrap());
         let tags = crate::tags::load(&root, &VanillaData::from_registries("", vec![])).unwrap();
         let from_tags = FuelValues::from_resolved_tags_26_1_2(&items, &tags);

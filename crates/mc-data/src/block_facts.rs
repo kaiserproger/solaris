@@ -344,15 +344,14 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "requires local 26.1.2 blocks report"]
     fn loads_real_random_tick_families_when_present() {
         let path = workspace_path("data/vanilla/reports/blocks.json");
-        if !path.is_file() {
-            eprintln!(
-                "skipping: {} not present (run tools/extract-vanilla-data.sh)",
-                path.display()
-            );
-            return;
-        }
+        assert!(
+            path.is_file(),
+            "{} not present; run tools/extract-vanilla-data.sh",
+            path.display()
+        );
         let report = crate::blocks::load_blocks_report(&path).unwrap();
         let table = BlockFactsTable::from_blocks_report(&report);
         assert!(table.eligible_states() > 0);
@@ -425,15 +424,14 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "requires local 26.1.2 blocks report"]
     fn loads_real_fluid_facts_when_present() {
         let path = workspace_path("data/vanilla/reports/blocks.json");
-        if !path.is_file() {
-            eprintln!(
-                "skipping: {} not present (run tools/extract-vanilla-data.sh)",
-                path.display()
-            );
-            return;
-        }
+        assert!(
+            path.is_file(),
+            "{} not present; run tools/extract-vanilla-data.sh",
+            path.display()
+        );
         let report = crate::blocks::load_blocks_report(&path).unwrap();
         let table = BlockFactsTable::from_blocks_report(&report);
         let water = report

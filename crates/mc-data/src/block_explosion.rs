@@ -307,14 +307,17 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "requires local 26.1.2 block explosion and blocks reports"]
     fn real_2612_sidecar_has_expected_cardinal_resistances() {
         let reports = workspace_path("data/vanilla/reports");
         let explosion_path = reports.join("block_explosion.json");
         let blocks_path = reports.join("blocks.json");
-        if !explosion_path.is_file() || !blocks_path.is_file() {
-            eprintln!("skipping: run tools/extract-vanilla-data.sh for the real sidecar test");
-            return;
-        }
+        assert!(
+            explosion_path.is_file() && blocks_path.is_file(),
+            "need both {} and {}; run tools/extract-vanilla-data.sh",
+            explosion_path.display(),
+            blocks_path.display()
+        );
 
         let table = load_block_explosion_report(explosion_path).unwrap();
         let blocks = crate::blocks::load_blocks_report(blocks_path).unwrap();
