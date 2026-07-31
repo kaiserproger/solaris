@@ -63,6 +63,30 @@ const MAX_IGNORED_CONFIGURATION_PACKETS: usize = 32;
 const MAX_LOADER_DISCONNECT_BUNDLES: usize = 8;
 const LOADER_HANDSHAKE_READ_TIMEOUT: Duration = Duration::from_secs(120);
 
+fn decode_configuration_exact<P: Packet>(id: i32, mut body: Bytes) -> Result<P, ConnectionError> {
+    let packet = P::decode(&mut body)?;
+    let trailing = body.remaining();
+    if trailing != 0 {
+        return Err(ConnectionError::TrailingBytes {
+            state: State::Configuration,
+            id,
+            trailing,
+        });
+    }
+    Ok(packet)
+}
+
+fn expect_empty_configuration_body(id: i32, body: &Bytes) -> Result<(), ConnectionError> {
+    if body.is_empty() {
+        return Ok(());
+    }
+    Err(ConnectionError::TrailingBytes {
+        state: State::Configuration,
+        id,
+        trailing: body.len(),
+    })
+}
+
 fn override_overworld_dimension_geometry(
     payload: Arc<[u8]>,
     geometry: ChunkGeometry,
@@ -219,8 +243,7 @@ where
         )
         .await?;
         if frame.id == ServerboundKnownPacks::ID {
-            let mut body = frame.body;
-            let parsed = ServerboundKnownPacks::decode(&mut body)?;
+            let parsed = decode_configuration_exact::<ServerboundKnownPacks>(frame.id, frame.body)?;
             break parsed.packs;
         }
         ignored_packets += 1;
@@ -231,8 +254,9 @@ where
             });
         }
         if frame.id == ServerboundClientInformation::ID {
-            let mut body = frame.body;
-            let information = ServerboundClientInformation::decode(&mut body)?.information;
+            let information =
+                decode_configuration_exact::<ServerboundClientInformation>(frame.id, frame.body)?
+                    .information;
             debug!(
                 language = %information.language,
                 requested_view_distance = information.view_distance,
@@ -261,8 +285,8 @@ where
             continue;
         }
         if frame.id == ServerboundResourcePack::ID {
-            let mut body = frame.body;
-            let status = ServerboundResourcePack::decode(&mut body)?.status;
+            let status =
+                decode_configuration_exact::<ServerboundResourcePack>(frame.id, frame.body)?.status;
             debug!(
                 id = %status.id,
                 action = ?status.action,
@@ -433,6 +457,7 @@ where
         )
         .await?;
         if frame.id == AcknowledgeFinishConfiguration::ID {
+            expect_empty_configuration_body(frame.id, &frame.body)?;
             if !loader_acknowledged {
                 return Err(ConnectionError::LoaderHandshake {
                     reason: "client finished Configuration without acknowledging the Solaris Loader manifest"
@@ -442,8 +467,9 @@ where
             break;
         }
         if frame.id == ServerboundClientInformation::ID {
-            let mut body = frame.body;
-            let information = ServerboundClientInformation::decode(&mut body)?.information;
+            let information =
+                decode_configuration_exact::<ServerboundClientInformation>(frame.id, frame.body)?
+                    .information;
             debug!(
                 language = %information.language,
                 requested_view_distance = information.view_distance,
@@ -479,8 +505,8 @@ where
             continue;
         }
         if frame.id == ServerboundResourcePack::ID {
-            let mut body = frame.body;
-            let status = ServerboundResourcePack::decode(&mut body)?.status;
+            let status =
+                decode_configuration_exact::<ServerboundResourcePack>(frame.id, frame.body)?.status;
             debug!(
                 id = %status.id,
                 action = ?status.action,
@@ -603,8 +629,9 @@ where
         )
         .await?;
         if frame.id == ServerboundClientInformation::ID {
-            let mut body = frame.body;
-            let information = ServerboundClientInformation::decode(&mut body)?.information;
+            let information =
+                decode_configuration_exact::<ServerboundClientInformation>(frame.id, frame.body)?
+                    .information;
             debug!(
                 language = %information.language,
                 requested_view_distance = information.view_distance,
@@ -632,8 +659,8 @@ where
             continue;
         }
         if frame.id == ServerboundResourcePack::ID {
-            let mut body = frame.body;
-            let status = ServerboundResourcePack::decode(&mut body)?.status;
+            let status =
+                decode_configuration_exact::<ServerboundResourcePack>(frame.id, frame.body)?.status;
             debug!(
                 id = %status.id,
                 action = ?status.action,
@@ -687,6 +714,7 @@ fn handle_configuration_custom_payload(
     let channel = body.read_identifier()?;
     if channel == *CustomPayload::brand_channel() {
         let brand = body.read_string(DEFAULT_MAX_STRING_LEN)?;
+        expect_empty_configuration_body(ServerboundCustomPayload::ID, &body)?;
         debug!(brand = %brand, context, "client brand noted during Configuration");
         return Ok(None);
     }
@@ -866,6 +894,103 @@ mod tests {
     use crate::{
         LOADER_PROTOCOL_VERSION, LoaderBundle, LoaderContentKind, LoaderPermission, LoaderPlatform,
     };
+    use mc_protocol::packets::{
+        ChatVisibility, ClientInformation, MainHand, ParticleStatus, ResourcePackAction,
+        ResourcePackStatus,
+    };
+    use uuid::Uuid;
+
+    fn encoded_with_trailing<P: Packet>(packet: &P) -> Bytes {
+        let mut body = Vec::new();
+        packet.encode(&mut body).unwrap();
+        body.push(0xff);
+        Bytes::from(body)
+    }
+
+    #[test]
+    fn exact_configuration_decoder_rejects_known_packet_trailing_bytes() {
+        let known_packs = ServerboundKnownPacks { packs: Vec::new() };
+        assert!(matches!(
+            decode_configuration_exact::<ServerboundKnownPacks>(
+                ServerboundKnownPacks::ID,
+                encoded_with_trailing(&known_packs),
+            ),
+            Err(ConnectionError::TrailingBytes { trailing: 1, .. })
+        ));
+
+        let client_information = ServerboundClientInformation {
+            information: ClientInformation {
+                language: "en_us".to_owned(),
+                view_distance: 8,
+                chat_visibility: ChatVisibility::Full,
+                chat_colors: true,
+                model_customisation: 0,
+                main_hand: MainHand::Right,
+                text_filtering_enabled: false,
+                allows_listing: true,
+                particle_status: ParticleStatus::All,
+            },
+        };
+        assert!(matches!(
+            decode_configuration_exact::<ServerboundClientInformation>(
+                ServerboundClientInformation::ID,
+                encoded_with_trailing(&client_information),
+            ),
+            Err(ConnectionError::TrailingBytes { trailing: 1, .. })
+        ));
+
+        let resource_pack = ServerboundResourcePack {
+            status: ResourcePackStatus {
+                id: Uuid::nil(),
+                action: ResourcePackAction::Accepted,
+            },
+        };
+        assert!(matches!(
+            decode_configuration_exact::<ServerboundResourcePack>(
+                ServerboundResourcePack::ID,
+                encoded_with_trailing(&resource_pack),
+            ),
+            Err(ConnectionError::TrailingBytes { trailing: 1, .. })
+        ));
+    }
+
+    #[test]
+    fn finish_ack_requires_an_empty_body() {
+        assert!(
+            expect_empty_configuration_body(AcknowledgeFinishConfiguration::ID, &Bytes::new(),)
+                .is_ok()
+        );
+        assert!(matches!(
+            expect_empty_configuration_body(
+                AcknowledgeFinishConfiguration::ID,
+                &Bytes::from_static(&[0]),
+            ),
+            Err(ConnectionError::TrailingBytes { trailing: 1, .. })
+        ));
+    }
+
+    #[test]
+    fn brand_payload_rejects_trailing_bytes() {
+        let mut body = Vec::new();
+        CustomPayload::Brand("vanilla".to_owned())
+            .encode_serverbound(&mut body)
+            .unwrap();
+        body.push(0xff);
+
+        assert!(matches!(
+            handle_configuration_custom_payload(
+                Bytes::from(body),
+                "test",
+                None,
+                &mut Vec::new(),
+                None,
+                &mut false,
+                &mut None,
+                &mut BTreeSet::new(),
+            ),
+            Err(ConnectionError::TrailingBytes { trailing: 1, .. })
+        ));
+    }
 
     fn dimension_payload(min_y: i32, height: i32, logical_height: i32) -> Arc<[u8]> {
         let root = Tag::Compound(vec![

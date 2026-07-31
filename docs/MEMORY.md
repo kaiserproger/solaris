@@ -22,7 +22,8 @@ and is not startup context.
   `SOL-015` Anvil sector/checksum integrity, `SOL-020` chunk-position identity,
   `SOL-017` writable-world process leasing, `SOL-027` resident/dirty byte
   backpressure, `SOL-040` portable atomic replace, and `SOL-001` exact Play
-  liveness accounting are complete; `SOL-004` exact Configuration bodies is next.
+  liveness accounting and `SOL-004` exact Configuration bodies are complete;
+  `SOL-003` absolute pre-Play deadlines and admission permits is next.
 - The first owner-run public-alpha session remains the routing authority for the
   next stabilization release; its exact plan is `docs/PUBLIC_ALPHA_PLAN.md`.
 - The future full Luau addon platform is frozen in
