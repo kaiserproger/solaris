@@ -29,9 +29,7 @@ pub enum StructureError {
         #[source]
         source: mc_nbt::NbtError,
     },
-    #[error(
-        "structure template {kind} at {path} is at least {bytes} bytes, exceeding limit {max}"
-    )]
+    #[error("structure template {kind} at {path} is at least {bytes} bytes, exceeding limit {max}")]
     DataTooLarge {
         path: String,
         kind: &'static str,
