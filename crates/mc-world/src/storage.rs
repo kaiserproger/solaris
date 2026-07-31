@@ -569,8 +569,13 @@ impl WorldStorage {
             return true;
         }
         let (resident_bytes, dirty_bytes) = self.chunk_byte_usage();
-        self.resident.len() < self.capacity
-            && resident_bytes < self.resident_byte_budget
+        let clean_evictable = self
+            .resident
+            .snapshots()
+            .into_iter()
+            .any(|(_, chunk)| !chunk.dirty);
+        (clean_evictable
+            || self.resident.len() < self.capacity && resident_bytes < self.resident_byte_budget)
             && dirty_bytes < self.dirty_byte_budget
             && (self.save_healthy || dirty_bytes == 0)
     }
