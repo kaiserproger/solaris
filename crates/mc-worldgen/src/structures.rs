@@ -1,8 +1,8 @@
-use std::io::Read;
+use std::fs::File;
+use std::io::{Cursor, Read, Seek, SeekFrom};
 use std::path::Path;
 
-use bytes::Bytes;
-use flate2::read::GzDecoder;
+use flate2::bufread::GzDecoder;
 use mc_data::Identifier;
 use mc_data::items::ItemRegistry;
 use mc_data::worldgen_structures::{
@@ -11,6 +11,9 @@ use mc_data::worldgen_structures::{
 use mc_nbt::{ListTag, Tag};
 use mc_world::{BlockRegistry, BlockStateId, ChestBlockEntity, FurnaceSlot};
 use thiserror::Error;
+
+const MAX_STRUCTURE_COMPRESSED_NBT_BYTES: usize = mc_nbt::MAX_NBT_TOTAL_BYTES;
+const MAX_STRUCTURE_DECOMPRESSED_NBT_BYTES: usize = mc_nbt::MAX_NBT_TOTAL_BYTES;
 
 #[derive(Debug, Error)]
 pub enum StructureError {
@@ -25,6 +28,21 @@ pub enum StructureError {
         path: String,
         #[source]
         source: mc_nbt::NbtError,
+    },
+    #[error(
+        "structure template {kind} at {path} is at least {bytes} bytes, exceeding limit {max}"
+    )]
+    DataTooLarge {
+        path: String,
+        kind: &'static str,
+        bytes: usize,
+        max: usize,
+    },
+    #[error("structure template {kind} at {path} has {bytes} trailing byte(s)")]
+    TrailingData {
+        path: String,
+        kind: &'static str,
+        bytes: usize,
     },
     #[error("structure template {path} is missing {field}")]
     MissingField { path: String, field: &'static str },
@@ -64,6 +82,172 @@ pub struct TemplateChest {
     pub chest: ChestBlockEntity,
 }
 
+enum BoundedLength {
+    Exact(usize),
+    TooLarge { at_least: usize },
+}
+
+fn count_bounded_bytes(reader: &mut impl Read, max: usize) -> std::io::Result<BoundedLength> {
+    let mut total = 0_usize;
+    let mut scratch = [0_u8; 8192];
+    loop {
+        let remaining = max.saturating_sub(total);
+        if remaining == 0 {
+            let mut extra = [0_u8; 1];
+            return if reader.read(&mut extra)? == 0 {
+                Ok(BoundedLength::Exact(total))
+            } else {
+                Ok(BoundedLength::TooLarge {
+                    at_least: max.saturating_add(1),
+                })
+            };
+        }
+
+        let chunk_len = remaining.min(scratch.len());
+        let read = reader.read(&mut scratch[..chunk_len])?;
+        if read == 0 {
+            return Ok(BoundedLength::Exact(total));
+        }
+        total = total.saturating_add(read);
+    }
+}
+
+fn allocate_exact_bytes(len: usize, context: &'static str) -> std::io::Result<Vec<u8>> {
+    let mut bytes = Vec::new();
+    bytes.try_reserve_exact(len).map_err(|error| {
+        std::io::Error::other(format!("reserve exact {context} buffer: {error}"))
+    })?;
+    bytes.resize(len, 0);
+    Ok(bytes)
+}
+
+fn read_bounded_structure_file(path: &Path, max: usize) -> Result<Vec<u8>, StructureError> {
+    let display = path.display().to_string();
+    // The opened descriptor pins the file object; later path replacement cannot
+    // switch this read to a different inode, and concurrent growth is caught by
+    // the one-byte-over-limit probe.
+    let mut file = File::open(path).map_err(|source| StructureError::Io {
+        path: display.clone(),
+        source,
+    })?;
+    let len = match count_bounded_bytes(&mut file, max).map_err(|source| StructureError::Io {
+        path: display.clone(),
+        source,
+    })? {
+        BoundedLength::Exact(len) => len,
+        BoundedLength::TooLarge { at_least } => {
+            return Err(StructureError::DataTooLarge {
+                path: display,
+                kind: "compressed or raw NBT",
+                bytes: at_least,
+                max,
+            });
+        }
+    };
+    file.seek(SeekFrom::Start(0))
+        .map_err(|source| StructureError::Io {
+            path: display.clone(),
+            source,
+        })?;
+    let mut bytes =
+        allocate_exact_bytes(len, "structure input").map_err(|source| StructureError::Io {
+            path: display.clone(),
+            source,
+        })?;
+    file.read_exact(&mut bytes)
+        .map_err(|source| StructureError::Io {
+            path: display.clone(),
+            source,
+        })?;
+    let mut extra = [0_u8; 1];
+    if file.read(&mut extra).map_err(|source| StructureError::Io {
+        path: display.clone(),
+        source,
+    })? != 0
+    {
+        return Err(StructureError::Io {
+            path: display,
+            source: std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "structure file changed while being read",
+            ),
+        });
+    }
+    Ok(bytes)
+}
+
+fn decode_single_structure_gzip_member(
+    display: &str,
+    compressed: &[u8],
+    max: usize,
+) -> Result<Vec<u8>, StructureError> {
+    let mut decoder = GzDecoder::new(Cursor::new(compressed));
+    let decoded_len =
+        match count_bounded_bytes(&mut decoder, max).map_err(|source| StructureError::Io {
+            path: display.to_owned(),
+            source,
+        })? {
+            BoundedLength::Exact(len) => len,
+            BoundedLength::TooLarge { at_least } => {
+                return Err(StructureError::DataTooLarge {
+                    path: display.to_owned(),
+                    kind: "decompressed NBT",
+                    bytes: at_least,
+                    max,
+                });
+            }
+        };
+    let consumed = decoder.into_inner().position() as usize;
+    if consumed != compressed.len() {
+        return Err(StructureError::TrailingData {
+            path: display.to_owned(),
+            kind: "compressed gzip member",
+            bytes: compressed.len().saturating_sub(consumed),
+        });
+    }
+
+    let mut decoded =
+        allocate_exact_bytes(decoded_len, "decompressed structure NBT").map_err(|source| {
+            StructureError::Io {
+                path: display.to_owned(),
+                source,
+            }
+        })?;
+    let mut decoder = GzDecoder::new(Cursor::new(compressed));
+    decoder
+        .read_exact(&mut decoded)
+        .map_err(|source| StructureError::Io {
+            path: display.to_owned(),
+            source,
+        })?;
+    let mut extra = [0_u8; 1];
+    if decoder
+        .read(&mut extra)
+        .map_err(|source| StructureError::Io {
+            path: display.to_owned(),
+            source,
+        })?
+        != 0
+    {
+        return Err(StructureError::Io {
+            path: display.to_owned(),
+            source: std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "gzip output changed between bounded passes",
+            ),
+        });
+    }
+    let consumed = decoder.into_inner().position() as usize;
+    if consumed != compressed.len() {
+        return Err(StructureError::TrailingData {
+            path: display.to_owned(),
+            kind: "compressed gzip member",
+            bytes: compressed.len().saturating_sub(consumed),
+        });
+    }
+    Ok(decoded)
+}
+
 impl StructureTemplate {
     #[must_use]
     pub fn new(size: [i32; 3], blocks: Vec<TemplateBlock>) -> Self {
@@ -87,28 +271,30 @@ impl StructureTemplate {
     ) -> Result<Self, StructureError> {
         let path = path.as_ref();
         let display = path.display().to_string();
-        let raw = std::fs::read(path).map_err(|source| StructureError::Io {
-            path: display.clone(),
-            source,
-        })?;
-        let mut decoded = Vec::new();
-        if raw.starts_with(&[0x1f, 0x8b]) {
-            GzDecoder::new(raw.as_slice())
-                .read_to_end(&mut decoded)
-                .map_err(|source| StructureError::Io {
-                    path: display.clone(),
-                    source,
-                })?;
+        let raw = read_bounded_structure_file(path, MAX_STRUCTURE_COMPRESSED_NBT_BYTES)?;
+        let decoded = if raw.starts_with(&[0x1f, 0x8b]) {
+            decode_single_structure_gzip_member(
+                &display,
+                &raw,
+                MAX_STRUCTURE_DECOMPRESSED_NBT_BYTES,
+            )?
         } else {
-            decoded = raw;
-        }
+            raw
+        };
 
-        let mut bytes = Bytes::from(decoded);
+        let mut bytes = decoded.as_slice();
         let (_name, root) =
             mc_nbt::read_named(&mut bytes).map_err(|source| StructureError::Nbt {
                 path: display.clone(),
                 source,
             })?;
+        if !bytes.is_empty() {
+            return Err(StructureError::TrailingData {
+                path: display.clone(),
+                kind: "decompressed NBT",
+                bytes: bytes.len(),
+            });
+        }
         Self::from_tag(&display, &root, registry)
     }
 
@@ -678,7 +864,34 @@ fn expect_int_triplet(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use flate2::Compression;
+    use flate2::write::GzEncoder;
+    use std::io::Write;
     use std::path::{Path, PathBuf};
+
+    fn gzip_bytes(payload: &[u8]) -> Vec<u8> {
+        let mut encoder = GzEncoder::new(Vec::new(), Compression::default());
+        encoder.write_all(payload).unwrap();
+        encoder.finish().unwrap()
+    }
+
+    fn named_nbt_bytes(root: &Tag) -> Vec<u8> {
+        let mut bytes = Vec::new();
+        mc_nbt::write_named(&mut bytes, "", root).unwrap();
+        bytes
+    }
+
+    fn deterministic_noise(len: usize) -> Vec<u8> {
+        let mut state = 0x9E37_79B9_u32;
+        (0..len)
+            .map(|_| {
+                state ^= state << 13;
+                state ^= state >> 17;
+                state ^= state << 5;
+                state as u8
+            })
+            .collect()
+    }
 
     fn workspace_path(rel: &str) -> PathBuf {
         PathBuf::from(env!("CARGO_MANIFEST_DIR"))
@@ -686,6 +899,91 @@ mod tests {
             .and_then(Path::parent)
             .unwrap()
             .join(rel)
+    }
+
+    #[test]
+    fn structure_file_and_gzip_limits_fail_before_unbounded_growth() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("bounded.nbt");
+        std::fs::write(&path, vec![0; 9]).unwrap();
+        assert!(matches!(
+            read_bounded_structure_file(&path, 8),
+            Err(StructureError::DataTooLarge {
+                kind: "compressed or raw NBT",
+                bytes: 9,
+                max: 8,
+                ..
+            })
+        ));
+
+        let exact = vec![0xA5; 8];
+        assert_eq!(
+            decode_single_structure_gzip_member("test.nbt", &gzip_bytes(&exact), 8).unwrap(),
+            exact
+        );
+        assert!(matches!(
+            decode_single_structure_gzip_member("test.nbt", &gzip_bytes(&[0xA5; 9]), 8),
+            Err(StructureError::DataTooLarge {
+                kind: "decompressed NBT",
+                bytes: 9,
+                max: 8,
+                ..
+            })
+        ));
+    }
+
+    #[test]
+    fn structure_loader_rejects_second_gzip_member_and_truncated_stream() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("members.nbt");
+        let payload = named_nbt_bytes(&Tag::Compound(vec![(
+            "blob".into(),
+            Tag::ByteArray(
+                deterministic_noise(128 * 1024)
+                    .into_iter()
+                    .map(|byte| byte as i8)
+                    .collect(),
+            ),
+        )]));
+        let mut concatenated = gzip_bytes(&payload);
+        concatenated.extend_from_slice(&gzip_bytes(&payload));
+        std::fs::write(&path, concatenated).unwrap();
+        let registry = BlockRegistry::from_report(&[]).unwrap();
+        assert!(matches!(
+            StructureTemplate::from_nbt_file(&path, &registry),
+            Err(StructureError::TrailingData {
+                kind: "compressed gzip member",
+                bytes,
+                ..
+            }) if bytes > 0
+        ));
+
+        let mut truncated = gzip_bytes(&payload);
+        truncated.truncate(truncated.len() - 4);
+        std::fs::write(&path, truncated).unwrap();
+        assert!(matches!(
+            StructureTemplate::from_nbt_file(&path, &registry),
+            Err(StructureError::Io { .. })
+        ));
+    }
+
+    #[test]
+    fn structure_loader_rejects_decompressed_trailing_bytes() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("trailing.nbt");
+        let mut payload = named_nbt_bytes(&Tag::Compound(Vec::new()));
+        payload.push(0xA5);
+        std::fs::write(&path, gzip_bytes(&payload)).unwrap();
+        let registry = BlockRegistry::from_report(&[]).unwrap();
+
+        assert!(matches!(
+            StructureTemplate::from_nbt_file(&path, &registry),
+            Err(StructureError::TrailingData {
+                kind: "decompressed NBT",
+                bytes: 1,
+                ..
+            })
+        ));
     }
 
     #[test]

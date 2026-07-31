@@ -18,3 +18,6 @@ mc-data = { path = "../mc-data" }
 mc-nbt = { path = "../mc-nbt" }
 mc-world = { path = "../mc-world" }
 thiserror = { workspace = true }
+
+[dev-dependencies]
+tempfile = "3"

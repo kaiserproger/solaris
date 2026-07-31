@@ -1,12 +1,12 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
 use std::fs::{File, OpenOptions};
-use std::io::{Read, Write};
+use std::io::{Cursor, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use flate2::Compression as GzipCompression;
-use flate2::read::GzDecoder;
+use flate2::bufread::GzDecoder;
 use flate2::write::GzEncoder;
 use mc_entity::{
     EntityStore, RegionPhase, RegionalCommitDecision, RegionalDecisionJournal,
@@ -19,6 +19,8 @@ use thiserror::Error;
 use super::*;
 
 const PLAYERDATA_DIR: &str = "playerdata";
+const MAX_PERSISTENCE_COMPRESSED_NBT_BYTES: usize = mc_nbt::MAX_NBT_TOTAL_BYTES;
+const MAX_PERSISTENCE_DECOMPRESSED_NBT_BYTES: usize = mc_nbt::MAX_NBT_TOTAL_BYTES;
 const SOLARIS_DIR: &str = "solaris";
 const ENTITIES_FILE: &str = "entities.dat";
 const ENTITY_FORMAT_VERSION_FIELD: &str = "SolarisEntityFormatVersion";
@@ -1233,6 +1235,19 @@ pub(crate) enum PlayerPersistenceError {
     Nbt {
         path: PathBuf,
         source: mc_nbt::NbtError,
+    },
+    #[error("persistence {kind} at {path} is at least {bytes} bytes, exceeding limit {max}")]
+    DataTooLarge {
+        path: PathBuf,
+        kind: &'static str,
+        bytes: usize,
+        max: usize,
+    },
+    #[error("persistence {kind} at {path} has {bytes} trailing byte(s)")]
+    TrailingData {
+        path: PathBuf,
+        kind: &'static str,
+        bytes: usize,
     },
     #[error("persistence root at {path} is not a compound")]
     RootNotCompound { path: PathBuf },
@@ -2466,24 +2481,196 @@ fn playerdata_path(world_root: &Path, uuid: uuid::Uuid) -> PathBuf {
         .join(format!("{}.dat", uuid.hyphenated()))
 }
 
-fn read_player_root(path: &Path) -> Result<(String, Tag), PlayerPersistenceError> {
-    let file = File::open(path).map_err(|source| PlayerPersistenceError::Io {
+enum BoundedLength {
+    Exact(usize),
+    TooLarge { at_least: usize },
+}
+
+fn count_bounded_bytes(reader: &mut impl Read, max: usize) -> std::io::Result<BoundedLength> {
+    let mut total = 0_usize;
+    let mut scratch = [0_u8; 8192];
+    loop {
+        let remaining = max.saturating_sub(total);
+        if remaining == 0 {
+            let mut extra = [0_u8; 1];
+            return if reader.read(&mut extra)? == 0 {
+                Ok(BoundedLength::Exact(total))
+            } else {
+                Ok(BoundedLength::TooLarge {
+                    at_least: max.saturating_add(1),
+                })
+            };
+        }
+
+        let chunk_len = remaining.min(scratch.len());
+        let read = reader.read(&mut scratch[..chunk_len])?;
+        if read == 0 {
+            return Ok(BoundedLength::Exact(total));
+        }
+        total = total.saturating_add(read);
+    }
+}
+
+fn allocate_exact_bytes(len: usize, context: &'static str) -> std::io::Result<Vec<u8>> {
+    let mut bytes = Vec::new();
+    bytes.try_reserve_exact(len).map_err(|error| {
+        std::io::Error::other(format!("reserve exact {context} buffer: {error}"))
+    })?;
+    bytes.resize(len, 0);
+    Ok(bytes)
+}
+
+fn read_bounded_persistence_file(
+    path: &Path,
+    max: usize,
+) -> Result<Vec<u8>, PlayerPersistenceError> {
+    // The opened descriptor pins the file object; later path replacement cannot
+    // switch this read to a different inode, and concurrent growth is caught by
+    // the one-byte-over-limit probe.
+    let mut file = File::open(path).map_err(|source| PlayerPersistenceError::Io {
         path: path.to_path_buf(),
         source,
     })?;
-    let mut decoder = GzDecoder::new(file);
-    let mut bytes = Vec::new();
-    decoder
-        .read_to_end(&mut bytes)
+    let len =
+        match count_bounded_bytes(&mut file, max).map_err(|source| PlayerPersistenceError::Io {
+            path: path.to_path_buf(),
+            source,
+        })? {
+            BoundedLength::Exact(len) => len,
+            BoundedLength::TooLarge { at_least } => {
+                return Err(PlayerPersistenceError::DataTooLarge {
+                    path: path.to_path_buf(),
+                    kind: "compressed NBT",
+                    bytes: at_least,
+                    max,
+                });
+            }
+        };
+    file.seek(SeekFrom::Start(0))
         .map_err(|source| PlayerPersistenceError::Io {
             path: path.to_path_buf(),
             source,
         })?;
-    let mut slice = bytes.as_slice();
-    mc_nbt::read_named(&mut slice).map_err(|source| PlayerPersistenceError::Nbt {
+    let mut bytes = allocate_exact_bytes(len, "compressed NBT").map_err(|source| {
+        PlayerPersistenceError::Io {
+            path: path.to_path_buf(),
+            source,
+        }
+    })?;
+    file.read_exact(&mut bytes)
+        .map_err(|source| PlayerPersistenceError::Io {
+            path: path.to_path_buf(),
+            source,
+        })?;
+    let mut extra = [0_u8; 1];
+    if file
+        .read(&mut extra)
+        .map_err(|source| PlayerPersistenceError::Io {
+            path: path.to_path_buf(),
+            source,
+        })?
+        != 0
+    {
+        return Err(PlayerPersistenceError::Io {
+            path: path.to_path_buf(),
+            source: std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "persistence file changed while being read",
+            ),
+        });
+    }
+    Ok(bytes)
+}
+
+fn decode_single_gzip_member(
+    path: &Path,
+    compressed: &[u8],
+    max: usize,
+) -> Result<Vec<u8>, PlayerPersistenceError> {
+    let mut decoder = GzDecoder::new(Cursor::new(compressed));
+    let decoded_len = match count_bounded_bytes(&mut decoder, max).map_err(|source| {
+        PlayerPersistenceError::Io {
+            path: path.to_path_buf(),
+            source,
+        }
+    })? {
+        BoundedLength::Exact(len) => len,
+        BoundedLength::TooLarge { at_least } => {
+            return Err(PlayerPersistenceError::DataTooLarge {
+                path: path.to_path_buf(),
+                kind: "decompressed NBT",
+                bytes: at_least,
+                max,
+            });
+        }
+    };
+    let consumed = decoder.into_inner().position() as usize;
+    if consumed != compressed.len() {
+        return Err(PlayerPersistenceError::TrailingData {
+            path: path.to_path_buf(),
+            kind: "compressed gzip member",
+            bytes: compressed.len().saturating_sub(consumed),
+        });
+    }
+
+    let mut decoded = allocate_exact_bytes(decoded_len, "decompressed NBT").map_err(|source| {
+        PlayerPersistenceError::Io {
+            path: path.to_path_buf(),
+            source,
+        }
+    })?;
+    let mut decoder = GzDecoder::new(Cursor::new(compressed));
+    decoder
+        .read_exact(&mut decoded)
+        .map_err(|source| PlayerPersistenceError::Io {
+            path: path.to_path_buf(),
+            source,
+        })?;
+    let mut extra = [0_u8; 1];
+    if decoder
+        .read(&mut extra)
+        .map_err(|source| PlayerPersistenceError::Io {
+            path: path.to_path_buf(),
+            source,
+        })?
+        != 0
+    {
+        return Err(PlayerPersistenceError::Io {
+            path: path.to_path_buf(),
+            source: std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "gzip output changed between bounded passes",
+            ),
+        });
+    }
+    let consumed = decoder.into_inner().position() as usize;
+    if consumed != compressed.len() {
+        return Err(PlayerPersistenceError::TrailingData {
+            path: path.to_path_buf(),
+            kind: "compressed gzip member",
+            bytes: compressed.len().saturating_sub(consumed),
+        });
+    }
+    Ok(decoded)
+}
+
+fn read_player_root(path: &Path) -> Result<(String, Tag), PlayerPersistenceError> {
+    let compressed = read_bounded_persistence_file(path, MAX_PERSISTENCE_COMPRESSED_NBT_BYTES)?;
+    let decoded =
+        decode_single_gzip_member(path, &compressed, MAX_PERSISTENCE_DECOMPRESSED_NBT_BYTES)?;
+    let mut slice = decoded.as_slice();
+    let root = mc_nbt::read_named(&mut slice).map_err(|source| PlayerPersistenceError::Nbt {
         path: path.to_path_buf(),
         source,
-    })
+    })?;
+    if !slice.is_empty() {
+        return Err(PlayerPersistenceError::TrailingData {
+            path: path.to_path_buf(),
+            kind: "decompressed NBT",
+            bytes: slice.len(),
+        });
+    }
+    Ok(root)
 }
 
 fn write_player_root(
@@ -3041,6 +3228,30 @@ mod tests {
         VehicleKind, VehicleState,
     };
     use mc_nbt::Tag;
+
+    fn gzip_bytes(payload: &[u8]) -> Vec<u8> {
+        let mut encoder = GzEncoder::new(Vec::new(), GzipCompression::default());
+        encoder.write_all(payload).unwrap();
+        encoder.finish().unwrap()
+    }
+
+    fn named_nbt_bytes(root: &Tag) -> Vec<u8> {
+        let mut bytes = Vec::new();
+        mc_nbt::write_named(&mut bytes, "", root).unwrap();
+        bytes
+    }
+
+    fn deterministic_noise(len: usize) -> Vec<u8> {
+        let mut state = 0x9E37_79B9_u32;
+        (0..len)
+            .map(|_| {
+                state ^= state << 13;
+                state ^= state >> 17;
+                state ^= state << 5;
+                state as u8
+            })
+            .collect()
+    }
 
     fn items() -> ItemRegistry {
         let reports = vec![
@@ -3697,6 +3908,77 @@ mod tests {
             percentile(&total_samples, 99),
             total_samples.last().copied().unwrap_or_default(),
         );
+    }
+
+    #[test]
+    fn persistence_file_and_gzip_limits_fail_before_unbounded_growth() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("bounded.dat");
+        std::fs::write(&path, vec![0; 9]).unwrap();
+        assert!(matches!(
+            read_bounded_persistence_file(&path, 8),
+            Err(PlayerPersistenceError::DataTooLarge {
+                kind: "compressed NBT",
+                bytes: 9,
+                max: 8,
+                ..
+            })
+        ));
+
+        let exact = vec![0xA5; 8];
+        assert_eq!(
+            decode_single_gzip_member(&path, &gzip_bytes(&exact), 8).unwrap(),
+            exact
+        );
+        assert!(matches!(
+            decode_single_gzip_member(&path, &gzip_bytes(&[0xA5; 9]), 8),
+            Err(PlayerPersistenceError::DataTooLarge {
+                kind: "decompressed NBT",
+                bytes: 9,
+                max: 8,
+                ..
+            })
+        ));
+    }
+
+    #[test]
+    fn persistence_gzip_rejects_second_member_and_truncated_stream() {
+        let path = Path::new("test.dat");
+        let mut concatenated = gzip_bytes(&deterministic_noise(128 * 1024));
+        concatenated.extend_from_slice(&gzip_bytes(b"second"));
+        assert!(matches!(
+            decode_single_gzip_member(path, &concatenated, 256 * 1024),
+            Err(PlayerPersistenceError::TrailingData {
+                kind: "compressed gzip member",
+                bytes,
+                ..
+            }) if bytes > 0
+        ));
+
+        let mut truncated = gzip_bytes(b"payload");
+        truncated.truncate(truncated.len() - 4);
+        assert!(matches!(
+            decode_single_gzip_member(path, &truncated, 64),
+            Err(PlayerPersistenceError::Io { .. })
+        ));
+    }
+
+    #[test]
+    fn player_root_rejects_decompressed_trailing_bytes() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("trailing.dat");
+        let mut payload = named_nbt_bytes(&Tag::Compound(Vec::new()));
+        payload.push(0xA5);
+        std::fs::write(&path, gzip_bytes(&payload)).unwrap();
+
+        assert!(matches!(
+            read_player_root(&path),
+            Err(PlayerPersistenceError::TrailingData {
+                kind: "decompressed NBT",
+                bytes: 1,
+                ..
+            })
+        ));
     }
 
     #[test]

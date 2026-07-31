@@ -1967,6 +1967,7 @@ dependencies = [
  "mc-data",
  "mc-nbt",
  "mc-world",
+ "tempfile",
  "thiserror",
 ]
 
