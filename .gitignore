@@ -53,5 +53,7 @@
 # Local decompile/oracle and repository snapshots.
 /net/
 /patches/
+/tmp/
 /repomix-*.md
 /repomix-output.md
+/repomix-output.xml
