@@ -25,6 +25,7 @@ mc-protocol = { path = "../mc-protocol" }
 mc-script = { path = "../mc-script" }
 mc-world = { path = "../mc-world" }
 bytes = { workspace = true }
+fd-lock = { workspace = true }
 flate2 = { workspace = true }
 tokio = { workspace = true }
 serde = { workspace = true }

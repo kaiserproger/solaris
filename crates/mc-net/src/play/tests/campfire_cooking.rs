@@ -666,12 +666,8 @@ async fn campfire_tick_does_not_load_cold_chunks_and_is_durable_when_resident() 
             .ticks_remaining,
         1
     );
-    let (reopened, pending) = WorldChunkJournal::open(
-        tmp.path(),
-        Arc::clone(&config.blocks),
-        Arc::clone(&config.items),
-    )
-    .unwrap();
+    let reopened = sessions.world_chunk_journal().unwrap();
+    let pending = reopened.pending_decisions_for_test();
     assert_eq!(pending.len(), 1, "one campfire pass uses one WAL decision");
     let restored = reopened.decode_pending(&pending).unwrap();
     assert_eq!(restored.len(), 1);

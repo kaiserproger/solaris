@@ -14067,7 +14067,28 @@ mod campfire_output_recovery_tests {
         let items = Arc::new(mc_data::items::solaris_required_items());
         let (journal, pending) =
             world_journal::WorldChunkJournal::open(root, blocks, Arc::clone(&items)).unwrap();
-        let chunks = journal.decode_pending(&pending).unwrap();
+        pending_output_from_decisions(&journal, &pending, &items, position)
+    }
+
+    fn pending_output_from_live_world_journal(
+        sessions: &SessionRegistry,
+        position: mc_world::BlockPos,
+    ) -> PendingCampfireOutput {
+        let journal = sessions
+            .world_chunk_journal()
+            .expect("campfire runtime has a world journal");
+        let pending = journal.pending_decisions_for_test();
+        let items = mc_data::items::solaris_required_items();
+        pending_output_from_decisions(&journal, &pending, &items, position)
+    }
+
+    fn pending_output_from_decisions(
+        journal: &world_journal::WorldChunkJournal,
+        pending: &[world_journal::WorldChunkDecision],
+        items: &mc_data::items::ItemRegistry,
+        position: mc_world::BlockPos,
+    ) -> PendingCampfireOutput {
+        let chunks = journal.decode_pending(pending).unwrap();
         let bytes = chunks
             .iter()
             .rev()
@@ -14076,7 +14097,7 @@ mod campfire_output_recovery_tests {
         let cooking = campfire_cooking_state_from_persistent_nbt_strict(
             bytes,
             &[],
-            &items,
+            items,
             &TagsData::default(),
         )
         .unwrap()
@@ -14213,6 +14234,7 @@ mod campfire_output_recovery_tests {
         runtime
             .sessions
             .install_campfire_d1_probe_for_test(reached_tx, resume_rx);
+        let live_sessions = Arc::clone(&runtime.sessions);
         let task = tokio::spawn({
             let config = Arc::clone(&runtime.config);
             let sessions = Arc::clone(&runtime.sessions);
@@ -14228,8 +14250,10 @@ mod campfire_output_recovery_tests {
             .await
             .expect("D1 gate was not reached")
             .expect("D1 gate sender dropped");
-        let output =
-            pending_output_from_world_journal(tmp.path(), mc_world::BlockPos { x: 1, y: 64, z: 1 });
+        let output = pending_output_from_live_world_journal(
+            live_sessions.as_ref(),
+            mc_world::BlockPos { x: 1, y: 64, z: 1 },
+        );
         let (_, entity_pending) =
             persistence::FileRegionalDecisionJournal::open(tmp.path()).unwrap();
         assert!(entity_pending.is_empty());
@@ -14319,26 +14343,22 @@ mod campfire_output_recovery_tests {
                 .expect("campfire output item stack"),
         };
 
-        let (_, world_pending) = world_journal::WorldChunkJournal::open(
-            tmp.path(),
-            Arc::clone(&runtime.config.blocks),
-            Arc::clone(&runtime.config.items),
-        )
-        .unwrap();
+        let journal = runtime.sessions.world_chunk_journal().unwrap();
+        let world_pending = journal.pending_decisions_for_test();
         assert_eq!(world_pending.len(), 2, "D1 and D2 must precede checkpoint");
+        drop(world_pending);
+        drop(journal);
         let (_, entity_pending) =
             persistence::FileRegionalDecisionJournal::open(tmp.path()).unwrap();
         assert_eq!(entity_pending.len(), 1, "E must precede checkpoint");
 
         checkpoint_campfire_runtime(&mut runtime).await;
 
-        let (_, world_pending) = world_journal::WorldChunkJournal::open(
-            tmp.path(),
-            Arc::clone(&runtime.config.blocks),
-            Arc::clone(&runtime.config.items),
-        )
-        .unwrap();
+        let journal = runtime.sessions.world_chunk_journal().unwrap();
+        let world_pending = journal.pending_decisions_for_test();
         assert!(world_pending.is_empty());
+        drop(world_pending);
+        drop(journal);
         let (_, entity_pending) =
             persistence::FileRegionalDecisionJournal::open(tmp.path()).unwrap();
         assert_eq!(

@@ -7097,9 +7097,8 @@ mod tests {
         ));
         assert!(!world.lock().await.plan_dirty_flush().unwrap().is_empty());
 
-        let (reopened, pending) =
-            super::super::world_journal::WorldChunkJournal::open(temp.path(), blocks, items)
-                .unwrap();
+        let reopened = sessions.world_chunk_journal().unwrap();
+        let pending = reopened.pending_decisions_for_test();
         let restored = reopened.decode_pending(&pending).unwrap();
         assert_eq!(restored.len(), 1);
         assert_eq!(
@@ -7213,9 +7212,8 @@ mod tests {
                 .get(&entity_position),
             Some(&bytes)
         );
-        let (reopened, pending) =
-            super::super::world_journal::WorldChunkJournal::open(temp.path(), blocks, items)
-                .unwrap();
+        let reopened = sessions.world_chunk_journal().unwrap();
+        let pending = reopened.pending_decisions_for_test();
         let restored = reopened.decode_pending(&pending).unwrap();
         assert_eq!(restored.len(), 1);
         assert_eq!(restored[0].get_block(1, 64, 1), Some(BlockStateId(0)));
@@ -7302,10 +7300,9 @@ mod tests {
         tokio::task::spawn_blocking(move || entered_rx.recv().unwrap())
             .await
             .unwrap();
-        let solaris_directory = temp.path().join("solaris");
-        std::fs::remove_file(solaris_directory.join("world-chunk-journal.bin")).unwrap();
-        std::fs::remove_dir(&solaris_directory).unwrap();
-        std::fs::write(&solaris_directory, b"blocks journal directory").unwrap();
+        let journal_path = temp.path().join("solaris/world-chunk-journal.bin");
+        std::fs::remove_file(&journal_path).unwrap();
+        std::fs::create_dir(&journal_path).unwrap();
         release_tx.send(()).unwrap();
 
         assert_eq!(owner_task.await.unwrap().processed, 1);

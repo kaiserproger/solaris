@@ -1830,6 +1830,7 @@ dependencies = [
  "bytes",
  "cfb8",
  "crc32fast",
+ "fd-lock",
  "flate2",
  "mc-data",
  "mc-entity",

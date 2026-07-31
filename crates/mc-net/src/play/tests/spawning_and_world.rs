@@ -2294,12 +2294,8 @@ async fn checkpoint_only_random_ticks_in_distinct_regions_do_not_wait_for_world_
                 })
         );
     }
-    let (reopened, pending) = super::world_journal::WorldChunkJournal::open(
-        temp.path(),
-        Arc::clone(&config.blocks),
-        Arc::clone(&config.items),
-    )
-    .unwrap();
+    let reopened = sessions.world_chunk_journal().unwrap();
+    let pending = reopened.pending_decisions_for_test();
     assert!(reopened.decode_pending(&pending).unwrap().is_empty());
 }
 
@@ -2344,12 +2340,8 @@ async fn resident_random_tick_uses_periodic_checkpoint_instead_of_per_tick_wal()
         world_read.get_cached_block(sample.pos),
         Some(mc_world::BlockStateId(12))
     );
-    let (reopened, pending) = super::world_journal::WorldChunkJournal::open(
-        temp.path(),
-        Arc::clone(&config.blocks),
-        Arc::clone(&config.items),
-    )
-    .unwrap();
+    let reopened = sessions.world_chunk_journal().unwrap();
+    let pending = reopened.pending_decisions_for_test();
     assert!(reopened.decode_pending(&pending).unwrap().is_empty());
 
     drop(world_writer);
@@ -2436,12 +2428,8 @@ async fn boundary_random_tick_coordinator_fallback_uses_periodic_checkpoint() {
         world_read.get_cached_block(sample.pos),
         Some(BlockStateId(12))
     );
-    let (reopened, pending) = super::world_journal::WorldChunkJournal::open(
-        temp.path(),
-        Arc::clone(&config.blocks),
-        Arc::clone(&config.items),
-    )
-    .unwrap();
+    let reopened = sessions.world_chunk_journal().unwrap();
+    let pending = reopened.pending_decisions_for_test();
     assert!(reopened.decode_pending(&pending).unwrap().is_empty());
 }
 

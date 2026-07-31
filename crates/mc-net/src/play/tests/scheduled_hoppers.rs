@@ -252,12 +252,8 @@ async fn scheduled_hopper_tick_pulls_one_item_into_hopper_before_ejecting_withou
     }
     assert!(target_rx.try_recv().is_err());
 
-    let (reopened, pending) = super::world_journal::WorldChunkJournal::open(
-        temp.path(),
-        Arc::clone(&config.blocks),
-        Arc::clone(&config.items),
-    )
-    .unwrap();
+    let reopened = sessions.world_chunk_journal().unwrap();
+    let pending = reopened.pending_decisions_for_test();
     let restored = reopened.decode_pending(&pending).unwrap();
     assert_eq!(restored.len(), 1);
     let source = restored[0]
@@ -1002,12 +998,8 @@ async fn scheduled_hopper_cooldown_tick_uses_resident_commit() {
     assert_eq!(scheduled[0].pos, hopper_pos);
     assert_eq!(scheduled[0].trigger_tick, 21);
 
-    let (reopened, pending) = super::world_journal::WorldChunkJournal::open(
-        temp.path(),
-        Arc::clone(&config.blocks),
-        Arc::clone(&config.items),
-    )
-    .unwrap();
+    let reopened = sessions.world_chunk_journal().unwrap();
+    let pending = reopened.pending_decisions_for_test();
     let restored = reopened.decode_pending(&pending).unwrap();
     assert_eq!(restored.len(), 1);
     assert_eq!(
@@ -1093,12 +1085,8 @@ async fn scheduled_hopper_cooldowns_share_one_wal_decision() {
     let report = run_scheduled_block_ticks(&config, &sessions, 20).await;
 
     assert_eq!(report.drained, 2);
-    let (reopened, pending) = super::world_journal::WorldChunkJournal::open(
-        temp.path(),
-        Arc::clone(&config.blocks),
-        Arc::clone(&config.items),
-    )
-    .unwrap();
+    let reopened = sessions.world_chunk_journal().unwrap();
+    let pending = reopened.pending_decisions_for_test();
     assert_eq!(pending.len(), 1, "one hopper pass uses one WAL decision");
     let restored = reopened.decode_pending(&pending).unwrap();
     assert_eq!(restored.len(), 1);

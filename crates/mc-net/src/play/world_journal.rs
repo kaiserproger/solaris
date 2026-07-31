@@ -11,6 +11,7 @@ use thiserror::Error;
 
 const SOLARIS_DIRECTORY: &str = "solaris";
 const JOURNAL_FILE: &str = "world-chunk-journal.bin";
+const JOURNAL_LOCK_FILE: &str = "world-chunk-journal.lock";
 const JOURNAL_MAGIC: &[u8] = b"SOLARIS_WORLD_CHUNK_JOURNAL";
 const JOURNAL_VERSION: u32 = 3;
 const JOURNAL_HEADER_BYTES: usize = JOURNAL_MAGIC.len() + size_of::<u32>() + size_of::<u64>() * 2;
@@ -18,7 +19,13 @@ const MAX_JOURNAL_ID: u64 = i64::MAX as u64;
 const FRAME_MAGIC: &[u8; 4] = b"WCF1";
 const FRAME_PREFIX_BYTES: usize = FRAME_MAGIC.len() + size_of::<u64>();
 const FRAME_SUFFIX_BYTES: usize = size_of::<u32>();
-const MAX_FRAME_BYTES: u64 = 1024 * 1024 * 1024;
+const DECISION_FIXED_BYTES: usize = size_of::<u64>() * 2 + size_of::<u32>();
+const IMAGE_PREFIX_BYTES: usize = size_of::<i32>() * 2 + size_of::<u32>();
+const MAX_IMAGES_PER_DECISION: usize = 512;
+const MAX_PENDING_DECISIONS: usize = 65_536;
+const MAX_IMAGE_NBT_BYTES: usize = mc_nbt::MAX_NBT_LENGTH;
+const MAX_FRAME_BYTES: u64 = 64 * 1024 * 1024;
+const MAX_JOURNAL_FILE_BYTES: u64 = 256 * 1024 * 1024;
 const WRITER_QUEUE_CAPACITY: usize = 16;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -44,6 +51,9 @@ pub(crate) struct WorldChunkDecision {
     current_tick: u64,
     images: Vec<WorldChunkImage>,
 }
+
+type JournalRecovery = (u64, u64, Vec<WorldChunkDecision>);
+type JournalInitialization = Result<JournalRecovery, WorldChunkJournalError>;
 
 impl WorldChunkDecision {
     #[must_use]
@@ -88,6 +98,14 @@ pub(crate) enum WorldChunkJournalError {
     Corrupt { offset: u64, reason: String },
     #[error("world chunk journal frame is too large: {0} bytes")]
     FrameTooLarge(u64),
+    #[error("world chunk journal file is too large: {0} bytes")]
+    JournalTooLarge(u64),
+    #[error("world chunk journal could not reserve {0} bytes")]
+    AllocationFailed(usize),
+    #[error("world chunk journal decision has too many images: {0}")]
+    TooManyImages(usize),
+    #[error("world chunk journal image {position:?} is too large: {bytes} bytes")]
+    ImageTooLarge { position: ChunkPos, bytes: usize },
     #[cfg(test)]
     #[error("cannot journal an empty chunk snapshot group")]
     EmptySnapshotGroup,
@@ -225,13 +243,20 @@ impl fmt::Debug for WorldChunkJournal {
 
 impl Drop for JournalState {
     fn drop(&mut self) {
-        let (reply, completion) = std::sync::mpsc::channel();
-        let _ = self.requests.send(WriterRequest::Shutdown { reply });
-        let _ = completion.recv();
         if let Some(worker) = self.worker.take() {
-            let _ = worker.join();
+            shutdown_writer(&self.requests, worker);
         }
     }
+}
+
+fn shutdown_writer(
+    requests: &std::sync::mpsc::SyncSender<WriterRequest>,
+    worker: std::thread::JoinHandle<()>,
+) {
+    let (reply, completion) = std::sync::mpsc::channel();
+    let _ = requests.send(WriterRequest::Shutdown { reply });
+    let _ = completion.recv();
+    let _ = worker.join();
 }
 
 impl WorldChunkJournal {
@@ -241,7 +266,35 @@ impl WorldChunkJournal {
         items: Arc<ItemRegistry>,
     ) -> Result<(Self, Vec<WorldChunkDecision>), WorldChunkJournalError> {
         let path = world_root.join(SOLARIS_DIRECTORY).join(JOURNAL_FILE);
-        let (base_id, allocated_high, pending) = read_and_repair_journal(&path)?;
+        let (requests, receiver) = std::sync::mpsc::sync_channel(WRITER_QUEUE_CAPACITY);
+        let (initialized, initialization) = std::sync::mpsc::sync_channel(1);
+        let writer_path = path.clone();
+        let worker = std::thread::Builder::new()
+            .name("solaris-world-chunk-journal".to_owned())
+            .spawn(move || run_writer(writer_path, receiver, initialized))
+            .map_err(|source| WorldChunkJournalError::Io {
+                operation: "spawn writer",
+                path: path.clone(),
+                source,
+            })?;
+        let (base_id, allocated_high, pending) = match initialization.recv() {
+            Ok(Ok(recovered)) => recovered,
+            Ok(Err(error)) => {
+                let _ = worker.join();
+                return Err(error);
+            }
+            Err(_) => {
+                let _ = worker.join();
+                return Err(WorldChunkJournalError::Io {
+                    operation: "initialize writer",
+                    path: path.clone(),
+                    source: std::io::Error::new(
+                        std::io::ErrorKind::BrokenPipe,
+                        "world chunk journal writer exited before initialization",
+                    ),
+                });
+            }
+        };
         let next_id = pending
             .iter()
             .map(WorldChunkDecision::id)
@@ -249,22 +302,13 @@ impl WorldChunkJournal {
             .unwrap_or(allocated_high)
             .max(base_id)
             .max(allocated_high);
-        if next_id > MAX_JOURNAL_ID {
-            return Err(WorldChunkJournalError::RecordIdExhausted);
-        }
-        let next_append_id = next_id
-            .checked_add(1)
-            .ok_or(WorldChunkJournalError::RecordIdExhausted)?;
-        let (requests, receiver) = std::sync::mpsc::sync_channel(WRITER_QUEUE_CAPACITY);
-        let writer_path = path.clone();
-        let worker = std::thread::Builder::new()
-            .name("solaris-world-chunk-journal".to_owned())
-            .spawn(move || run_writer(&writer_path, receiver))
-            .map_err(|source| WorldChunkJournalError::Io {
-                operation: "spawn writer",
-                path: path.clone(),
-                source,
-            })?;
+        let next_append_id = match next_id.checked_add(1).filter(|_| next_id <= MAX_JOURNAL_ID) {
+            Some(next) => next,
+            None => {
+                shutdown_writer(&requests, worker);
+                return Err(WorldChunkJournalError::RecordIdExhausted);
+            }
+        };
         let journal = Self {
             shared: Arc::new(JournalShared {
                 blocks,
@@ -482,6 +526,16 @@ impl WorldChunkJournal {
             .map(WorldChunkDecision::id)
     }
 
+    #[cfg(test)]
+    pub(crate) fn pending_decisions_for_test(&self) -> Vec<WorldChunkDecision> {
+        self.shared
+            .state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .pending
+            .clone()
+    }
+
     pub(crate) fn checkpoint_through(&self, watermark: u64) -> Result<(), WorldChunkJournalError> {
         let mut state = self
             .shared
@@ -515,6 +569,9 @@ impl WorldChunkJournal {
         }
         match completion.recv() {
             Ok(Ok(())) => {}
+            Ok(Err(WriterFailure::JournalTooLarge(bytes))) => {
+                return Err(WorldChunkJournalError::JournalTooLarge(bytes));
+            }
             Ok(Err(WriterFailure::Io(source))) => {
                 state.poisoned = true;
                 let error = WorldChunkJournalError::CheckpointOutcomeUnknown {
@@ -617,6 +674,9 @@ fn reserve_ids_locked(
     }
     match completion.recv() {
         Ok(Ok(())) => {}
+        Ok(Err(WriterFailure::JournalTooLarge(bytes))) => {
+            return Err(WorldChunkJournalError::JournalTooLarge(bytes));
+        }
         Ok(Err(WriterFailure::Io(source))) => {
             state.poisoned = true;
             return Err(WorldChunkJournalError::ReservationOutcomeUnknown {
@@ -637,10 +697,24 @@ fn append_decisions(
     state: &mut JournalState,
     decisions: Vec<WorldChunkDecision>,
 ) -> Result<(), WorldChunkJournalError> {
-    let mut bytes = Vec::new();
-    for decision in &decisions {
-        bytes.extend_from_slice(&encode_frame(decision)?);
-    }
+    let bytes = (|| {
+        let encoded_len = encoded_decisions_len(&decisions, 0)?;
+        let mut bytes = Vec::new();
+        bytes
+            .try_reserve_exact(encoded_len)
+            .map_err(|_| WorldChunkJournalError::AllocationFailed(encoded_len))?;
+        for decision in &decisions {
+            bytes.extend_from_slice(&encode_frame(decision)?);
+        }
+        Ok(bytes)
+    })();
+    let bytes = match bytes {
+        Ok(bytes) => bytes,
+        Err(error) => {
+            state.poisoned = true;
+            return Err(error);
+        }
+    };
     let (reply, completion) = std::sync::mpsc::channel();
     if state
         .requests
@@ -656,6 +730,10 @@ fn append_decisions(
         Ok(Ok(())) => {
             state.pending.extend(decisions);
             Ok(())
+        }
+        Ok(Err(WriterFailure::JournalTooLarge(bytes))) => {
+            state.poisoned = true;
+            Err(WorldChunkJournalError::JournalTooLarge(bytes))
         }
         Ok(Err(WriterFailure::Io(source))) => {
             state.poisoned = true;
@@ -688,33 +766,107 @@ pub(super) enum WriterRequest {
 #[derive(Debug)]
 pub(super) enum WriterFailure {
     Io(std::io::Error),
+    JournalTooLarge(u64),
 }
 
-fn run_writer(path: &Path, receiver: std::sync::mpsc::Receiver<WriterRequest>) {
-    while let Ok(request) = receiver.recv() {
-        match request {
-            WriterRequest::Append { bytes, reply } => {
-                let result = append_frames(path, &bytes).map_err(WriterFailure::Io);
-                let _ = reply.send(result);
-            }
-            WriterRequest::Replace { replacement, reply } => {
-                let result = replace_journal(path, &replacement).map_err(WriterFailure::Io);
-                let _ = reply.send(result);
-            }
-            WriterRequest::Shutdown { reply } => {
-                let _ = reply.send(());
-                return;
-            }
-        }
+impl From<std::io::Error> for WriterFailure {
+    fn from(source: std::io::Error) -> Self {
+        Self::Io(source)
     }
 }
 
-fn append_frames(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
+fn run_writer(
+    path: PathBuf,
+    receiver: std::sync::mpsc::Receiver<WriterRequest>,
+    initialized: std::sync::mpsc::SyncSender<JournalInitialization>,
+) {
+    let directory = path.parent().expect("journal path has a parent");
+    if let Err(source) = ensure_journal_directory(directory) {
+        let _ = initialized.send(Err(WorldChunkJournalError::Io {
+            operation: "create journal directory",
+            path: directory.to_path_buf(),
+            source,
+        }));
+        return;
+    }
+    let lock_path = directory.join(JOURNAL_LOCK_FILE);
+    let lock_file = match OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .read(true)
+        .write(true)
+        .open(&lock_path)
+    {
+        Ok(file) => file,
+        Err(source) => {
+            let _ = initialized.send(Err(WorldChunkJournalError::Io {
+                operation: "open journal lease",
+                path: lock_path,
+                source,
+            }));
+            return;
+        }
+    };
+    let mut lease = fd_lock::RwLock::new(lock_file);
+    let guard = match lease.try_write() {
+        Ok(guard) => guard,
+        Err(source) => {
+            let _ = initialized.send(Err(WorldChunkJournalError::Io {
+                operation: "acquire journal lease",
+                path: lock_path,
+                source,
+            }));
+            return;
+        }
+    };
+    let recovered = match read_and_repair_journal(&path) {
+        Ok(recovered) => recovered,
+        Err(error) => {
+            let _ = initialized.send(Err(error));
+            return;
+        }
+    };
+    if initialized.send(Ok(recovered)).is_err() {
+        return;
+    }
+
+    while let Ok(request) = receiver.recv() {
+        match request {
+            WriterRequest::Append { bytes, reply } => {
+                let _ = reply.send(append_frames(&path, &bytes));
+            }
+            WriterRequest::Replace { replacement, reply } => {
+                let _ = reply.send(replace_journal(&path, &replacement));
+            }
+            WriterRequest::Shutdown { reply } => {
+                let _ = reply.send(());
+                break;
+            }
+        }
+    }
+    drop(guard);
+}
+
+fn append_frames(path: &Path, bytes: &[u8]) -> Result<(), WriterFailure> {
     let directory = path.parent().expect("journal path has a parent");
     ensure_journal_directory(directory)?;
     let existed = path.is_file();
     let mut file = OpenOptions::new().create(true).append(true).open(path)?;
-    if file.metadata()?.len() == 0 {
+    let current_len = file.metadata()?.len();
+    let header_len = if current_len == 0 {
+        u64::try_from(JOURNAL_HEADER_BYTES).expect("journal header length fits u64")
+    } else {
+        0
+    };
+    let appended_len = u64::try_from(bytes.len()).expect("usize always fits u64");
+    let final_len = current_len
+        .checked_add(header_len)
+        .and_then(|len| len.checked_add(appended_len))
+        .ok_or(WriterFailure::JournalTooLarge(u64::MAX))?;
+    if final_len > MAX_JOURNAL_FILE_BYTES {
+        return Err(WriterFailure::JournalTooLarge(final_len));
+    }
+    if current_len == 0 {
         write_header(&mut file, 0, 0)?;
     }
     file.write_all(bytes)?;
@@ -726,7 +878,11 @@ fn append_frames(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
     Ok(())
 }
 
-fn replace_journal(path: &Path, replacement: &[u8]) -> std::io::Result<()> {
+fn replace_journal(path: &Path, replacement: &[u8]) -> Result<(), WriterFailure> {
+    let replacement_len = u64::try_from(replacement.len()).expect("usize always fits u64");
+    if replacement_len > MAX_JOURNAL_FILE_BYTES {
+        return Err(WriterFailure::JournalTooLarge(replacement_len));
+    }
     let directory = path.parent().expect("journal path has a parent");
     ensure_journal_directory(directory)?;
     let temporary = path.with_extension("bin.tmp");
@@ -745,7 +901,7 @@ fn replace_journal(path: &Path, replacement: &[u8]) -> std::io::Result<()> {
     if result.is_err() {
         let _ = std::fs::remove_file(temporary);
     }
-    result
+    result.map_err(WriterFailure::Io)
 }
 
 fn ensure_journal_directory(directory: &Path) -> std::io::Result<()> {
@@ -770,16 +926,8 @@ fn sync_directory(_path: &Path) -> std::io::Result<()> {
 fn read_and_repair_journal(
     path: &Path,
 ) -> Result<(u64, u64, Vec<WorldChunkDecision>), WorldChunkJournalError> {
-    let mut bytes = Vec::new();
-    match File::open(path) {
-        Ok(mut file) => {
-            file.read_to_end(&mut bytes)
-                .map_err(|source| WorldChunkJournalError::Io {
-                    operation: "read",
-                    path: path.to_path_buf(),
-                    source,
-                })?;
-        }
+    let mut file = match OpenOptions::new().read(true).write(true).open(path) {
+        Ok(file) => file,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
             return Ok((0, 0, Vec::new()));
         }
@@ -790,17 +938,47 @@ fn read_and_repair_journal(
                 source,
             });
         }
+    };
+    let file_len = file
+        .metadata()
+        .map_err(|source| WorldChunkJournalError::Io {
+            operation: "stat",
+            path: path.to_path_buf(),
+            source,
+        })?
+        .len();
+    if file_len > MAX_JOURNAL_FILE_BYTES {
+        return Err(WorldChunkJournalError::JournalTooLarge(file_len));
+    }
+    let capacity =
+        usize::try_from(file_len).map_err(|_| WorldChunkJournalError::JournalTooLarge(file_len))?;
+    let mut bytes = Vec::new();
+    bytes
+        .try_reserve_exact(capacity)
+        .map_err(|_| WorldChunkJournalError::AllocationFailed(capacity))?;
+    bytes.resize(capacity, 0);
+    file.read_exact(&mut bytes)
+        .map_err(|source| WorldChunkJournalError::Io {
+            operation: "read",
+            path: path.to_path_buf(),
+            source,
+        })?;
+    let observed_len = file
+        .metadata()
+        .map_err(|source| WorldChunkJournalError::Io {
+            operation: "restat",
+            path: path.to_path_buf(),
+            source,
+        })?
+        .len();
+    if observed_len != file_len {
+        return Err(corrupt(
+            0,
+            format!("journal length changed during recovery: {file_len} -> {observed_len}"),
+        ));
     }
     let (base_id, allocated_high, pending, valid_len) = decode_journal(&bytes)?;
     if valid_len < bytes.len() {
-        let file = OpenOptions::new()
-            .write(true)
-            .open(path)
-            .map_err(|source| WorldChunkJournalError::Io {
-                operation: "open for tail repair",
-                path: path.to_path_buf(),
-                source,
-            })?;
         file.set_len(valid_len as u64)
             .and_then(|()| file.sync_all())
             .map_err(|source| WorldChunkJournalError::Io {
@@ -868,6 +1046,12 @@ fn decode_journal(
                     return Err(corrupt(
                         offset,
                         "record id exceeds the durable allocation high watermark",
+                    ));
+                }
+                if pending.len() >= MAX_PENDING_DECISIONS {
+                    return Err(corrupt(
+                        offset,
+                        format!("pending decision count exceeds limit {MAX_PENDING_DECISIONS}"),
                     ));
                 }
                 pending.push(decision);
@@ -969,7 +1153,11 @@ fn encode_journal(
     allocated_high: u64,
     decisions: &[WorldChunkDecision],
 ) -> Result<Vec<u8>, WorldChunkJournalError> {
+    let encoded_len = encoded_decisions_len(decisions, JOURNAL_HEADER_BYTES)?;
     let mut bytes = Vec::new();
+    bytes
+        .try_reserve_exact(encoded_len)
+        .map_err(|_| WorldChunkJournalError::AllocationFailed(encoded_len))?;
     write_header(&mut bytes, base_id, allocated_high).map_err(|source| {
         WorldChunkJournalError::Io {
             operation: "encode header",
@@ -991,12 +1179,13 @@ fn write_header(writer: &mut impl Write, base_id: u64, allocated_high: u64) -> s
 }
 
 fn encode_frame(decision: &WorldChunkDecision) -> Result<Vec<u8>, WorldChunkJournalError> {
+    let frame_len = encoded_frame_len(decision)?;
     let payload = encode_decision_payload(decision)?;
     let payload_len = u64::try_from(payload.len()).expect("usize always fits u64");
-    if payload_len > MAX_FRAME_BYTES {
-        return Err(WorldChunkJournalError::FrameTooLarge(payload_len));
-    }
-    let mut frame = Vec::with_capacity(FRAME_PREFIX_BYTES + payload.len() + FRAME_SUFFIX_BYTES);
+    let mut frame = Vec::new();
+    frame
+        .try_reserve_exact(frame_len)
+        .map_err(|_| WorldChunkJournalError::AllocationFailed(frame_len))?;
     frame.extend_from_slice(FRAME_MAGIC);
     frame.extend_from_slice(&payload_len.to_le_bytes());
     frame.extend_from_slice(&payload);
@@ -1004,24 +1193,84 @@ fn encode_frame(decision: &WorldChunkDecision) -> Result<Vec<u8>, WorldChunkJour
     Ok(frame)
 }
 
+fn encoded_frame_len(decision: &WorldChunkDecision) -> Result<usize, WorldChunkJournalError> {
+    FRAME_PREFIX_BYTES
+        .checked_add(decision_payload_len(decision)?)
+        .and_then(|len| len.checked_add(FRAME_SUFFIX_BYTES))
+        .ok_or(WorldChunkJournalError::FrameTooLarge(u64::MAX))
+}
+
+fn encoded_decisions_len(
+    decisions: &[WorldChunkDecision],
+    initial: usize,
+) -> Result<usize, WorldChunkJournalError> {
+    let mut total = checked_journal_len(0, initial)?;
+    for decision in decisions {
+        total = checked_journal_len(total, encoded_frame_len(decision)?)?;
+    }
+    Ok(total)
+}
+
+fn checked_journal_len(current: usize, additional: usize) -> Result<usize, WorldChunkJournalError> {
+    let total = current
+        .checked_add(additional)
+        .ok_or(WorldChunkJournalError::JournalTooLarge(u64::MAX))?;
+    let total_u64 = u64::try_from(total).expect("usize always fits u64");
+    if total_u64 > MAX_JOURNAL_FILE_BYTES {
+        return Err(WorldChunkJournalError::JournalTooLarge(total_u64));
+    }
+    Ok(total)
+}
+
 fn encode_decision_payload(
     decision: &WorldChunkDecision,
 ) -> Result<Vec<u8>, WorldChunkJournalError> {
+    let payload_len = decision_payload_len(decision)?;
     let image_count = u32::try_from(decision.images.len())
-        .map_err(|_| WorldChunkJournalError::FrameTooLarge(u64::MAX))?;
+        .map_err(|_| WorldChunkJournalError::TooManyImages(decision.images.len()))?;
     let mut bytes = Vec::new();
+    bytes
+        .try_reserve_exact(payload_len)
+        .map_err(|_| WorldChunkJournalError::AllocationFailed(payload_len))?;
     bytes.extend_from_slice(&decision.id.to_le_bytes());
     bytes.extend_from_slice(&decision.current_tick.to_le_bytes());
     bytes.extend_from_slice(&image_count.to_le_bytes());
     for image in &decision.images {
-        let nbt_len = u32::try_from(image.nbt.len())
-            .map_err(|_| WorldChunkJournalError::FrameTooLarge(image.nbt.len() as u64))?;
+        let nbt_len =
+            u32::try_from(image.nbt.len()).map_err(|_| WorldChunkJournalError::ImageTooLarge {
+                position: image.position,
+                bytes: image.nbt.len(),
+            })?;
         bytes.extend_from_slice(&image.position.x.to_le_bytes());
         bytes.extend_from_slice(&image.position.z.to_le_bytes());
         bytes.extend_from_slice(&nbt_len.to_le_bytes());
         bytes.extend_from_slice(&image.nbt);
     }
     Ok(bytes)
+}
+
+fn decision_payload_len(decision: &WorldChunkDecision) -> Result<usize, WorldChunkJournalError> {
+    if decision.images.len() > MAX_IMAGES_PER_DECISION {
+        return Err(WorldChunkJournalError::TooManyImages(decision.images.len()));
+    }
+    let mut payload_len = DECISION_FIXED_BYTES;
+    for image in &decision.images {
+        if image.nbt.len() > MAX_IMAGE_NBT_BYTES {
+            return Err(WorldChunkJournalError::ImageTooLarge {
+                position: image.position,
+                bytes: image.nbt.len(),
+            });
+        }
+        payload_len = payload_len
+            .checked_add(IMAGE_PREFIX_BYTES)
+            .and_then(|len| len.checked_add(image.nbt.len()))
+            .ok_or(WorldChunkJournalError::FrameTooLarge(u64::MAX))?;
+    }
+    let payload_len_u64 = u64::try_from(payload_len).expect("usize always fits u64");
+    if payload_len_u64 > MAX_FRAME_BYTES {
+        return Err(WorldChunkJournalError::FrameTooLarge(payload_len_u64));
+    }
+    Ok(payload_len)
 }
 
 fn decode_decision_payload(payload: &[u8]) -> Result<WorldChunkDecision, String> {
@@ -1031,14 +1280,32 @@ fn decode_decision_payload(payload: &[u8]) -> Result<WorldChunkDecision, String>
         return Err("record id must be non-zero".to_owned());
     }
     let current_tick = reader.u64("current tick")?;
-    let image_count = reader.u32("image count")?;
-    let mut images = Vec::with_capacity(image_count as usize);
+    let image_count = usize::try_from(reader.u32("image count")?)
+        .map_err(|_| "image count does not fit this platform".to_owned())?;
+    if image_count > MAX_IMAGES_PER_DECISION {
+        return Err(format!(
+            "image count {image_count} exceeds limit {MAX_IMAGES_PER_DECISION}"
+        ));
+    }
+    let max_by_remaining = reader.remaining().len() / IMAGE_PREFIX_BYTES;
+    if image_count > max_by_remaining {
+        return Err(format!(
+            "image count {image_count} exceeds payload feasibility {max_by_remaining}"
+        ));
+    }
+    let mut images = Vec::with_capacity(image_count);
     for _ in 0..image_count {
         let position = ChunkPos {
             x: reader.i32("chunk x")?,
             z: reader.i32("chunk z")?,
         };
-        let nbt_len = reader.u32("NBT length")? as usize;
+        let nbt_len = usize::try_from(reader.u32("NBT length")?)
+            .map_err(|_| "NBT length does not fit this platform".to_owned())?;
+        if nbt_len > MAX_IMAGE_NBT_BYTES {
+            return Err(format!(
+                "NBT length {nbt_len} exceeds limit {MAX_IMAGE_NBT_BYTES}"
+            ));
+        }
         let nbt = reader.bytes(nbt_len, "NBT payload")?.to_vec();
         images.push(WorldChunkImage { position, nbt });
     }
@@ -1144,7 +1411,7 @@ fn corrupt(offset: usize, reason: impl Into<String>) -> WorldChunkJournalError {
 
 #[cfg(test)]
 mod tests {
-    use std::fs::OpenOptions;
+    use std::fs::{File, OpenOptions};
     use std::io::{Seek, SeekFrom, Write};
     use std::sync::Arc;
 
@@ -1375,6 +1642,193 @@ mod tests {
         flip_byte(&path, first_payload_byte);
         let error = WorldChunkJournal::open(temp.path(), blocks, items).unwrap_err();
         assert!(matches!(error, WorldChunkJournalError::Corrupt { .. }));
+    }
+
+    #[test]
+    fn rejects_impossible_image_count_before_allocation() {
+        let mut payload = Vec::new();
+        payload.extend_from_slice(&1_u64.to_le_bytes());
+        payload.extend_from_slice(&0_u64.to_le_bytes());
+        payload.extend_from_slice(&u32::MAX.to_le_bytes());
+
+        let error = decode_decision_payload(&payload).unwrap_err();
+        assert!(error.contains("image count"), "{error}");
+        assert!(error.contains("exceeds limit"), "{error}");
+    }
+
+    #[test]
+    fn rejects_infeasible_image_count_before_allocation() {
+        let mut payload = Vec::new();
+        payload.extend_from_slice(&1_u64.to_le_bytes());
+        payload.extend_from_slice(&0_u64.to_le_bytes());
+        payload.extend_from_slice(&1_u32.to_le_bytes());
+
+        let error = decode_decision_payload(&payload).unwrap_err();
+        assert!(error.contains("payload feasibility"), "{error}");
+    }
+
+    #[test]
+    fn rejects_oversized_image_nbt_before_copy() {
+        let mut payload = Vec::new();
+        payload.extend_from_slice(&1_u64.to_le_bytes());
+        payload.extend_from_slice(&0_u64.to_le_bytes());
+        payload.extend_from_slice(&1_u32.to_le_bytes());
+        payload.extend_from_slice(&0_i32.to_le_bytes());
+        payload.extend_from_slice(&0_i32.to_le_bytes());
+        payload.extend_from_slice(
+            &u32::try_from(MAX_IMAGE_NBT_BYTES + 1)
+                .expect("test NBT limit fits u32")
+                .to_le_bytes(),
+        );
+
+        let error = decode_decision_payload(&payload).unwrap_err();
+        assert!(error.contains("NBT length"), "{error}");
+        assert!(error.contains("exceeds limit"), "{error}");
+    }
+
+    #[test]
+    fn encoder_rejects_too_many_images_before_building_payload() {
+        let image = WorldChunkImage {
+            position: ChunkPos { x: 0, z: 0 },
+            nbt: Vec::new(),
+        };
+        let decision = WorldChunkDecision {
+            id: 1,
+            current_tick: 0,
+            images: vec![image; MAX_IMAGES_PER_DECISION + 1],
+        };
+
+        assert!(matches!(
+            encode_decision_payload(&decision),
+            Err(WorldChunkJournalError::TooManyImages(count))
+                if count == MAX_IMAGES_PER_DECISION + 1
+        ));
+    }
+
+    #[test]
+    fn aggregate_preflight_rejects_file_budget_without_allocation() {
+        let maximum = usize::try_from(MAX_JOURNAL_FILE_BYTES).unwrap();
+        assert_eq!(checked_journal_len(0, maximum).unwrap(), maximum);
+        assert!(matches!(
+            checked_journal_len(maximum, 1),
+            Err(WorldChunkJournalError::JournalTooLarge(bytes))
+                if bytes == MAX_JOURNAL_FILE_BYTES + 1
+        ));
+    }
+
+    #[test]
+    fn open_rejects_oversized_sparse_journal_before_reading() {
+        let temp = tempfile::tempdir().unwrap();
+        let (blocks, items) = registries();
+        let directory = temp.path().join(SOLARIS_DIRECTORY);
+        std::fs::create_dir_all(&directory).unwrap();
+        let path = directory.join(JOURNAL_FILE);
+        let file = File::create(&path).unwrap();
+        file.set_len(MAX_JOURNAL_FILE_BYTES + 1).unwrap();
+
+        let error = WorldChunkJournal::open(temp.path(), blocks, items).unwrap_err();
+        assert!(matches!(
+            error,
+            WorldChunkJournalError::JournalTooLarge(bytes)
+                if bytes == MAX_JOURNAL_FILE_BYTES + 1
+        ));
+    }
+
+    #[test]
+    fn append_rejects_growth_beyond_file_budget_without_writing() {
+        let temp = tempfile::tempdir().unwrap();
+        let directory = temp.path().join(SOLARIS_DIRECTORY);
+        std::fs::create_dir_all(&directory).unwrap();
+        let path = directory.join(JOURNAL_FILE);
+        let file = File::create(&path).unwrap();
+        file.set_len(MAX_JOURNAL_FILE_BYTES).unwrap();
+
+        assert!(matches!(
+            append_frames(&path, b"x"),
+            Err(WriterFailure::JournalTooLarge(bytes))
+                if bytes == MAX_JOURNAL_FILE_BYTES + 1
+        ));
+        assert_eq!(
+            std::fs::metadata(path).unwrap().len(),
+            MAX_JOURNAL_FILE_BYTES
+        );
+    }
+
+    #[test]
+    fn writer_lease_rejects_a_second_journal_instance() {
+        let temp = tempfile::tempdir().unwrap();
+        let (blocks, items) = registries();
+        let (first, _) =
+            WorldChunkJournal::open(temp.path(), Arc::clone(&blocks), Arc::clone(&items)).unwrap();
+
+        let error = WorldChunkJournal::open(temp.path(), blocks, items).unwrap_err();
+        assert!(matches!(
+            error,
+            WorldChunkJournalError::Io {
+                operation: "acquire journal lease",
+                ..
+            }
+        ));
+        drop(first);
+    }
+
+    #[tokio::test]
+    async fn append_budget_failure_poisons_and_wakes_later_reserved_waiter() {
+        let temp = tempfile::tempdir().unwrap();
+        let (blocks, items) = registries();
+        let (requests, receiver) = std::sync::mpsc::sync_channel(1);
+        let worker = std::thread::spawn(move || {
+            let WriterRequest::Replace { reply, .. } = receiver.recv().unwrap() else {
+                panic!("expected reservation request");
+            };
+            reply.send(Ok(())).unwrap();
+            let WriterRequest::Append { reply, .. } = receiver.recv().unwrap() else {
+                panic!("expected append request");
+            };
+            reply
+                .send(Err(WriterFailure::JournalTooLarge(
+                    MAX_JOURNAL_FILE_BYTES + 1,
+                )))
+                .unwrap();
+            let WriterRequest::Shutdown { reply } = receiver.recv().unwrap() else {
+                panic!("expected shutdown request");
+            };
+            reply.send(()).unwrap();
+        });
+        let journal = WorldChunkJournal::from_parts_for_test(
+            temp.path().join("solaris/world-chunk-journal.bin"),
+            blocks,
+            items,
+            requests,
+            worker,
+        );
+        assert_eq!(journal.reserve_decision_ids(2).unwrap(), vec![1, 2]);
+
+        let (started_tx, started_rx) = tokio::sync::oneshot::channel();
+        let waiter = tokio::spawn({
+            let journal = journal.clone();
+            async move {
+                started_tx.send(()).unwrap();
+                journal.wait_for_append_turn(2).await
+            }
+        });
+        started_rx.await.unwrap();
+
+        let append = tokio::task::spawn_blocking({
+            let journal = journal.clone();
+            move || journal.record_reserved_snapshot_groups(10, vec![(1, Vec::new())])
+        })
+        .await
+        .unwrap();
+        assert!(matches!(
+            append,
+            Err(WorldChunkJournalError::JournalTooLarge(bytes))
+                if bytes == MAX_JOURNAL_FILE_BYTES + 1
+        ));
+        assert!(matches!(
+            waiter.await.unwrap(),
+            Err(WorldChunkJournalError::PoisonedOutcomeUnknown)
+        ));
     }
 
     #[test]

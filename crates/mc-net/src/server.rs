@@ -7627,7 +7627,7 @@ end
         );
         let shutdown = config.shutdown.clone();
         let bound = bind(config).await.expect("bind");
-        std::fs::write(tmp.path().join("solaris"), b"blocks save directory").unwrap();
+        std::fs::create_dir(tmp.path().join("solaris/world.dat")).unwrap();
         shutdown.request();
 
         let error = serve_then_final_save(bound)

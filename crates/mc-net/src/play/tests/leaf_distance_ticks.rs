@@ -171,6 +171,7 @@ async fn stable_leaf_tick_is_checkpoint_only_without_world_journal_decision() {
         "the no-op tick is consumed in resident state"
     );
     drop(storage);
+    drop(sessions);
     let (_reopened, pending) = super::world_journal::WorldChunkJournal::open(
         temp.path(),
         Arc::clone(&config.blocks),

@@ -399,10 +399,9 @@ async fn journaled_resident_block_drop_append_failure_rejects_before_drop_public
     tokio::task::spawn_blocking(move || entered_rx.recv().unwrap())
         .await
         .unwrap();
-    let solaris_directory = temp.path().join("solaris");
-    std::fs::remove_file(solaris_directory.join("world-chunk-journal.bin")).unwrap();
-    std::fs::remove_dir(&solaris_directory).unwrap();
-    std::fs::write(&solaris_directory, b"block drops journal directory").unwrap();
+    let journal_path = temp.path().join("solaris/world-chunk-journal.bin");
+    std::fs::remove_file(&journal_path).unwrap();
+    std::fs::create_dir(&journal_path).unwrap();
     release_tx.send(()).unwrap();
 
     assert_eq!(owner_task.await.unwrap().processed, 1);

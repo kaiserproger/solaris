@@ -169,12 +169,8 @@ async fn scheduled_buttons_in_distinct_regions_do_not_wait_for_world_writer() {
 
     assert_eq!(report.drained, 2);
     assert_eq!(report.applied, 2);
-    let (reopened, pending) = super::world_journal::WorldChunkJournal::open(
-        temp.path(),
-        Arc::clone(&config.blocks),
-        Arc::clone(&config.items),
-    )
-    .unwrap();
+    let reopened = sessions.world_chunk_journal().unwrap();
+    let pending = reopened.pending_decisions_for_test();
     assert_eq!(pending.len(), 1, "one regional wave uses one WAL decision");
     let restored = reopened.decode_pending(&pending).unwrap();
     assert_eq!(restored.len(), 2);
@@ -421,12 +417,8 @@ async fn scheduled_button_crossing_region_boundary_commits_without_world_storage
 
     assert_eq!(report.drained, 1);
     assert_eq!(report.applied, 3);
-    let (reopened, pending) = super::world_journal::WorldChunkJournal::open(
-        temp.path(),
-        Arc::clone(&config.blocks),
-        Arc::clone(&config.items),
-    )
-    .unwrap();
+    let reopened = sessions.world_chunk_journal().unwrap();
+    let pending = reopened.pending_decisions_for_test();
     assert_eq!(pending.len(), 1, "boundary commit uses one WAL decision");
     let restored = reopened.decode_pending(&pending).unwrap();
     assert_eq!(restored.len(), 2);
@@ -987,12 +979,8 @@ async fn stale_resident_journal_commit_does_not_block_the_next_decision() {
     .expect("same-region current decision has an outcome");
     assert_eq!(second.applied.len(), 1);
 
-    let (reopened, pending) = super::world_journal::WorldChunkJournal::open(
-        temp.path(),
-        Arc::clone(&config.blocks),
-        Arc::clone(&config.items),
-    )
-    .unwrap();
+    let reopened = sessions.world_chunk_journal().unwrap();
+    let pending = reopened.pending_decisions_for_test();
     let restored = reopened.decode_pending(&pending).unwrap();
     assert_eq!(restored.len(), 1);
     assert_eq!(
