@@ -6,7 +6,8 @@
 //! of any wire concern. `mc-protocol` re-exports the type so existing
 //! `mc_protocol::codec::Identifier` paths keep working.
 
-use serde::{Deserialize, Serialize};
+use serde::de::Error as _;
+use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use thiserror::Error;
 
 /// A validated `namespace:path` identifier.
@@ -14,8 +15,22 @@ use thiserror::Error;
 /// Stored as a single owned string and an index pointing at the colon.
 /// We don't intern here; if interning turns out to matter for the
 /// data-pack loader we'll revisit (PROJECT_SPEC §3.2 leaves room).
-#[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub struct Identifier {
+    full: String,
+    colon: usize,
+}
+
+#[derive(Deserialize)]
+#[serde(untagged)]
+enum IdentifierRepr {
+    Canonical(String),
+    Legacy(LegacyIdentifier),
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct LegacyIdentifier {
     full: String,
     colon: usize,
 }
@@ -59,6 +74,35 @@ impl Identifier {
     #[must_use]
     pub fn path(&self) -> &str {
         &self.full[self.colon + 1..]
+    }
+}
+
+impl Serialize for Identifier {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        serializer.serialize_str(self.as_str())
+    }
+}
+
+impl<'de> Deserialize<'de> for Identifier {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        match IdentifierRepr::deserialize(deserializer)? {
+            IdentifierRepr::Canonical(value) => Self::parse(value).map_err(D::Error::custom),
+            IdentifierRepr::Legacy(LegacyIdentifier { full, colon }) => {
+                let parsed = Self::parse(full.clone()).map_err(D::Error::custom)?;
+                if parsed.as_str() != full || parsed.colon != colon {
+                    return Err(D::Error::custom(
+                        "legacy identifier fields do not match the canonical identifier",
+                    ));
+                }
+                Ok(parsed)
+            }
+        }
     }
 }
 
@@ -114,5 +158,36 @@ mod tests {
     #[test]
     fn rejects_empty_path() {
         assert!(Identifier::parse("minecraft:").is_err());
+    }
+
+    #[test]
+    fn serde_writes_one_canonical_string() {
+        let id = Identifier::parse("stone").unwrap();
+        assert_eq!(serde_json::to_string(&id).unwrap(), r#""minecraft:stone""#);
+    }
+
+    #[test]
+    fn serde_reads_canonical_string_and_strict_legacy_object() {
+        let canonical: Identifier = serde_json::from_str(r#""stone""#).unwrap();
+        assert_eq!(canonical.as_str(), "minecraft:stone");
+
+        let legacy: Identifier =
+            serde_json::from_str(r#"{"full":"minecraft:stone","colon":9}"#).unwrap();
+        assert_eq!(legacy, canonical);
+    }
+
+    #[test]
+    fn serde_rejects_impossible_legacy_state() {
+        for value in [
+            r#"{"full":"x","colon":999}"#,
+            r#"{"full":"minecraft:stone","colon":8}"#,
+            r#"{"full":"Minecraft:stone","colon":9}"#,
+            r#"{"full":"minecraft:stone","colon":9,"extra":true}"#,
+        ] {
+            assert!(
+                serde_json::from_str::<Identifier>(value).is_err(),
+                "accepted invalid legacy identifier {value}"
+            );
+        }
     }
 }

@@ -9,6 +9,12 @@ and is not startup context.
 
 - Date: 2026-07-31.
 - Branch: `main`.
+- A 2026-07-31 Pro static-review bundle is now tracked through
+  `docs/CODE_REVIEW_REMEDIATION_2026-07-31.md`: 42 findings are grouped into
+  parser/data, persistence, network, ownership, authority, and loader/architecture
+  waves. Every item requires current-tree confirmation and focused evidence before
+  it is treated as complete. `SOL-023` canonical `Identifier` serde is complete;
+  `SOL-024` validated resource paths is the next active checkpoint.
 - The first owner-run public-alpha session remains the routing authority for the
   next stabilization release; its exact plan is `docs/PUBLIC_ALPHA_PLAN.md`.
 - The future full Luau addon platform is frozen in
