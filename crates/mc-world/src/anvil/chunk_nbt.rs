@@ -74,11 +74,35 @@ pub fn chunk_to_payload_with_items_at_tick(
     timestamp: u32,
     current_tick: u64,
 ) -> Result<ChunkPayload, ChunkNbtError> {
+    chunk_to_payload_with_items_at_tick_for_position(
+        chunk,
+        chunk.pos,
+        registry,
+        items,
+        timestamp,
+        current_tick,
+    )
+}
+
+/// Serialize a chunk for one externally owned cache/region key.
+///
+/// Persistence callers must supply the expected absolute position separately so
+/// a corrupted resident snapshot cannot select a different region slot through
+/// its internal `Chunk::pos`.
+pub fn chunk_to_payload_with_items_at_tick_for_position(
+    chunk: &Chunk,
+    expected_pos: ChunkPos,
+    registry: &BlockRegistry,
+    items: Option<&ItemRegistry>,
+    timestamp: u32,
+    current_tick: u64,
+) -> Result<ChunkPayload, ChunkNbtError> {
+    ensure_chunk_position(expected_pos, chunk.pos)?;
     let nbt = chunk_to_nbt_with_items_at_tick(chunk, registry, items, current_tick)?;
     let mut buf: Vec<u8> = Vec::with_capacity(8 * 1024);
     mc_nbt::write_named(&mut buf, "", &nbt)?;
-    let local_x = chunk.pos.x.rem_euclid(REGION_AXIS_CHUNKS) as u8;
-    let local_z = chunk.pos.z.rem_euclid(REGION_AXIS_CHUNKS) as u8;
+    let local_x = expected_pos.x.rem_euclid(REGION_AXIS_CHUNKS) as u8;
+    let local_z = expected_pos.z.rem_euclid(REGION_AXIS_CHUNKS) as u8;
     Ok(ChunkPayload {
         local_x,
         local_z,
@@ -134,6 +158,17 @@ pub enum ChunkNbtError {
     NegativeTickDelay(i32),
     #[error("scheduled block tick delay {0} does not fit in Anvil int")]
     TickDelayOutOfRange(u64),
+    #[error(
+        "chunk position mismatch: expected ({expected_x},{expected_z}), decoded/held ({actual_x},{actual_z})"
+    )]
+    PositionMismatch {
+        expected_x: i32,
+        expected_z: i32,
+        actual_x: i32,
+        actual_z: i32,
+    },
+    #[error("trailing bytes after complete chunk NBT root: {trailing}")]
+    TrailingNbtBytes { trailing: usize },
 }
 
 // ---------------------------------------------------------------------
@@ -149,10 +184,53 @@ pub fn chunk_from_nbt_with_items(
     registry: &BlockRegistry,
     items: Option<&ItemRegistry>,
 ) -> Result<Chunk, ChunkNbtError> {
+    chunk_from_nbt_with_items_impl(nbt, registry, items, None)
+}
+
+/// Decode a parsed Anvil chunk only when its embedded coordinates match the
+/// externally selected absolute cache/region key.
+pub fn chunk_from_nbt_with_items_at_position(
+    nbt: &Tag,
+    expected_pos: ChunkPos,
+    registry: &BlockRegistry,
+    items: Option<&ItemRegistry>,
+) -> Result<Chunk, ChunkNbtError> {
+    chunk_from_nbt_with_items_impl(nbt, registry, items, Some(expected_pos))
+}
+
+/// Parse one exact unnamed Anvil NBT root and enforce its external position.
+pub fn chunk_from_payload_with_items_at_position(
+    bytes: &[u8],
+    expected_pos: ChunkPos,
+    registry: &BlockRegistry,
+    items: Option<&ItemRegistry>,
+) -> Result<Chunk, ChunkNbtError> {
+    let mut cursor = Cursor::new(bytes);
+    let (_, root) = mc_nbt::read_named(&mut cursor)?;
+    let consumed = usize::try_from(cursor.position())
+        .expect("cursor position over an in-memory slice fits usize");
+    if consumed != bytes.len() {
+        return Err(ChunkNbtError::TrailingNbtBytes {
+            trailing: bytes.len() - consumed,
+        });
+    }
+    chunk_from_nbt_with_items_at_position(&root, expected_pos, registry, items)
+}
+
+fn chunk_from_nbt_with_items_impl(
+    nbt: &Tag,
+    registry: &BlockRegistry,
+    items: Option<&ItemRegistry>,
+    expected_pos: Option<ChunkPos>,
+) -> Result<Chunk, ChunkNbtError> {
     let root = expect_compound(nbt, "root")?;
 
     let x = get_int(root, "xPos")?;
     let z = get_int(root, "zPos")?;
+    let actual_pos = ChunkPos { x, z };
+    if let Some(expected_pos) = expected_pos {
+        ensure_chunk_position(expected_pos, actual_pos)?;
+    }
     let status = get_string(root, "Status")?.to_string();
 
     let air = registry
@@ -321,6 +399,63 @@ pub fn chunk_from_nbt_with_items(
     }
 
     Ok(chunk)
+}
+
+/// Explicit offline repair primitive for a parsed chunk root.
+///
+/// This function is never called by runtime loading. Tooling may use it to
+/// canonicalize missing, wrongly typed, duplicated, or mismatched `xPos`/`zPos`
+/// fields to the region slot selected by the operator.
+pub fn repair_chunk_nbt_position(
+    nbt: &mut Tag,
+    expected_pos: ChunkPos,
+) -> Result<bool, ChunkNbtError> {
+    let Tag::Compound(root) = nbt else {
+        return Err(ChunkNbtError::NotCompound(nbt.type_id()));
+    };
+    let repaired_x = repair_position_field(root, "xPos", expected_pos.x);
+    let repaired_z = repair_position_field(root, "zPos", expected_pos.z);
+    Ok(repaired_x || repaired_z)
+}
+
+fn repair_position_field(root: &mut Vec<(String, Tag)>, field: &'static str, value: i32) -> bool {
+    let mut changed = false;
+    let mut first = None;
+    let mut index = 0_usize;
+    while index < root.len() {
+        if root[index].0 != field {
+            index += 1;
+            continue;
+        }
+        if first.is_some() {
+            root.remove(index);
+            changed = true;
+            continue;
+        }
+        first = Some(index);
+        if !matches!(root[index].1, Tag::Int(current) if current == value) {
+            root[index].1 = Tag::Int(value);
+            changed = true;
+        }
+        index += 1;
+    }
+    if first.is_none() {
+        root.push((field.to_string(), Tag::Int(value)));
+        changed = true;
+    }
+    changed
+}
+
+fn ensure_chunk_position(expected: ChunkPos, actual: ChunkPos) -> Result<(), ChunkNbtError> {
+    if expected != actual {
+        return Err(ChunkNbtError::PositionMismatch {
+            expected_x: expected.x,
+            expected_z: expected.z,
+            actual_x: actual.x,
+            actual_z: actual.z,
+        });
+    }
+    Ok(())
 }
 
 /// Root-level NBT keys `chunk_from_nbt` decodes into typed fields.
@@ -2100,6 +2235,123 @@ mod tests {
             },
         ];
         BlockRegistry::from_report(&report).unwrap()
+    }
+
+    #[test]
+    fn strict_position_decode_rejects_same_and_cross_region_mismatch() {
+        let registry = tiny_registry();
+        for (expected, actual) in [
+            (ChunkPos { x: 0, z: 0 }, ChunkPos { x: 1, z: 0 }),
+            (ChunkPos { x: 31, z: -1 }, ChunkPos { x: 32, z: -1 }),
+        ] {
+            let mut root = build_chunk_root_with_sections(Vec::new());
+            let Tag::Compound(entries) = &mut root else {
+                unreachable!("chunk root fixture is a compound");
+            };
+            for (name, value) in entries {
+                match name.as_str() {
+                    "xPos" => *value = Tag::Int(actual.x),
+                    "zPos" => *value = Tag::Int(actual.z),
+                    _ => {}
+                }
+            }
+
+            assert!(matches!(
+                chunk_from_nbt_with_items_at_position(&root, expected, &registry, None),
+                Err(ChunkNbtError::PositionMismatch {
+                    expected_x,
+                    expected_z,
+                    actual_x,
+                    actual_z,
+                }) if expected_x == expected.x
+                    && expected_z == expected.z
+                    && actual_x == actual.x
+                    && actual_z == actual.z
+            ));
+        }
+    }
+
+    #[test]
+    fn strict_payload_decode_requires_exact_nbt_consumption() {
+        let registry = tiny_registry();
+        let expected = ChunkPos { x: -4, z: 7 };
+        let chunk = Chunk::empty(
+            expected,
+            BlockStateId(0),
+            Identifier::parse("minecraft:plains").unwrap(),
+        );
+        let payload = chunk_to_payload(&chunk, &registry, 0).unwrap();
+
+        let decoded = chunk_from_payload_with_items_at_position(
+            &payload.uncompressed_nbt,
+            expected,
+            &registry,
+            None,
+        )
+        .unwrap();
+        assert_eq!(decoded.pos, expected);
+
+        let mut trailing = payload.uncompressed_nbt;
+        trailing.push(0x7F);
+        assert!(matches!(
+            chunk_from_payload_with_items_at_position(&trailing, expected, &registry, None),
+            Err(ChunkNbtError::TrailingNbtBytes { trailing: 1 })
+        ));
+    }
+
+    #[test]
+    fn strict_payload_serializer_rejects_a_foreign_expected_key() {
+        let registry = tiny_registry();
+        let chunk = Chunk::empty(
+            ChunkPos { x: 9, z: 10 },
+            BlockStateId(0),
+            Identifier::parse("minecraft:plains").unwrap(),
+        );
+
+        assert!(matches!(
+            chunk_to_payload_with_items_at_tick_for_position(
+                &chunk,
+                ChunkPos { x: 8, z: 10 },
+                &registry,
+                None,
+                0,
+                0,
+            ),
+            Err(ChunkNbtError::PositionMismatch {
+                expected_x: 8,
+                expected_z: 10,
+                actual_x: 9,
+                actual_z: 10,
+            })
+        ));
+    }
+
+    #[test]
+    fn offline_position_repair_canonicalizes_required_coordinate_fields() {
+        let registry = tiny_registry();
+        let expected = ChunkPos { x: 17, z: -33 };
+        let mut root = build_chunk_root_with_sections(Vec::new());
+        let Tag::Compound(entries) = &mut root else {
+            unreachable!("chunk root fixture is a compound");
+        };
+        entries.retain(|(name, _)| name != "zPos");
+        let x = entries
+            .iter_mut()
+            .find(|(name, _)| name == "xPos")
+            .expect("fixture xPos");
+        x.1 = Tag::String("wrong type".into());
+        entries.push(("xPos".into(), Tag::Int(999)));
+
+        assert!(repair_chunk_nbt_position(&mut root, expected).unwrap());
+        assert!(!repair_chunk_nbt_position(&mut root, expected).unwrap());
+        let Tag::Compound(entries) = &root else {
+            unreachable!("repaired root remains a compound");
+        };
+        assert_eq!(entries.iter().filter(|(name, _)| name == "xPos").count(), 1);
+        assert_eq!(entries.iter().filter(|(name, _)| name == "zPos").count(), 1);
+        let decoded =
+            chunk_from_nbt_with_items_at_position(&root, expected, &registry, None).unwrap();
+        assert_eq!(decoded.pos, expected);
     }
 
     #[test]

@@ -381,6 +381,7 @@ impl ResidentChunkStore {
     }
 
     pub(crate) fn insert_if_absent(&self, position: ChunkPos, chunk: Chunk) -> bool {
+        debug_assert_eq!(position, chunk.pos);
         let publication = self.read_view.publication_state();
         let _mutation = publication.mutation();
         let region = self.region_or_create(position);
@@ -397,6 +398,7 @@ impl ResidentChunkStore {
     }
 
     pub(crate) fn replace(&self, position: ChunkPos, chunk: ChunkSnapshot) {
+        debug_assert_eq!(position, chunk.pos);
         let publication = self.read_view.publication_state();
         let _mutation = publication.mutation();
         let region = self.region_or_create(position);

@@ -1,5 +1,9 @@
-use super::super::test_support::{air_stone_furnace_registry, air_stone_hopper_registry};
+use super::super::test_support::{
+    air_stone_furnace_registry, air_stone_hopper_registry, single_air_registry,
+    write_chunk_payload_at_slot,
+};
 use super::*;
+use crate::anvil::ChunkNbtError;
 use crate::block::{BlockRegistry, BlockStateId};
 use crate::chunk::{
     BlockPos, Chunk, ChunkGenerator, ChunkPos, FurnaceBlockEntity, HopperBlockEntity,
@@ -96,6 +100,30 @@ fn chunk_source_view_recognizes_region_file() {
             .source_for(ChunkPos { x: 17, z: 4 }),
         ChunkPrepareSource::RegionFile
     );
+}
+
+#[test]
+fn chunk_disk_load_plan_rejects_foreign_embedded_position() {
+    let tmp = tempfile::tempdir().unwrap();
+    let registry = single_air_registry();
+    let expected = ChunkPos { x: 5, z: -2 };
+    let actual = ChunkPos { x: 6, z: -2 };
+    write_chunk_payload_at_slot(tmp.path(), expected, actual, &registry, &[]);
+    let world = WorldStorage::open(tmp.path(), registry).unwrap();
+
+    let ChunkSnapshotPlan::Load(plan) = world.plan_chunk_snapshot_without_generation(expected)
+    else {
+        panic!("disk-backed uncached chunk must produce a load plan");
+    };
+    assert!(matches!(
+        plan.load(),
+        Err(WorldError::ChunkNbt(ChunkNbtError::PositionMismatch {
+            expected_x: 5,
+            expected_z: -2,
+            actual_x: 6,
+            actual_z: -2,
+        }))
+    ));
 }
 
 #[test]

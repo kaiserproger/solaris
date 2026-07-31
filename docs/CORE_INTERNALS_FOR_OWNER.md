@@ -722,9 +722,15 @@ Writer собирает и синхронно записывает полный 
 create-new защищает recovery path от перезаписи чужого временного решения.
 
 `chunk_from_nbt*` декодирует sections, palettes, light, heightmaps, scheduled
-ticks и block entities. `chunk_to_nbt*` делает обратное преобразование; варианты
-`with_items_at_tick` получают item registry и текущий tick явно, чтобы disk
-формат не зависел от скрытого global state.
+ticks и block entities. Production storage передаёт decoder'у абсолютный
+requested chunk key, требует полного потребления NBT payload и до публикации в
+cache сверяет его с `xPos/zPos`. Dirty-flush отдельно передаёт serializer'у
+expected resident key и выбирает region slot только из него; mismatch не создаёт
+temp file. `repair_chunk_nbt_position` — явный offline primitive для
+канонизации повреждённых coordinate fields и никогда не вызывается runtime load.
+`chunk_to_nbt*` делает обратное преобразование; варианты `with_items_at_tick`
+получают item registry и текущий tick явно, чтобы disk формат не зависел от
+скрытого global state.
 
 ## 13. `mc-worldgen`
 

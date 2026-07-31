@@ -7,6 +7,57 @@ use mc_data::block_light::BlockLightTable;
 use mc_nbt::Tag;
 
 #[test]
+fn dirty_flush_rejects_snapshot_position_mismatch_before_writing() {
+    let tmp_world = tempfile::tempdir().unwrap();
+    let region_dir = tmp_world.path().join("region");
+    std::fs::create_dir_all(&region_dir).unwrap();
+    let region_path = region_dir.join("r.0.0.mca");
+    crate::anvil::write_region(&region_path, &[]).unwrap();
+    let baseline = std::fs::read(&region_path).unwrap();
+    let registry = single_air_registry();
+    let expected = ChunkPos { x: 0, z: 0 };
+    let actual = ChunkPos { x: 1, z: 0 };
+    let mut chunk = Chunk::empty(
+        actual,
+        BlockStateId(0),
+        Identifier::parse("minecraft:plains").unwrap(),
+    );
+    chunk.mark_dirty();
+    let snapshot = Arc::new(chunk);
+    let plan = DirtyFlushPlan {
+        regions: vec![DirtyFlushRegionPlan {
+            region: (0, 0),
+            region_path: region_path.clone(),
+            expected_version: region_file_version(&region_path).unwrap(),
+            dirty_payloads: vec![PlannedChunkPayload {
+                pos: expected,
+                current_tick: 0,
+                dirty_generation: snapshot.dirty_generation,
+                snapshot,
+            }],
+        }],
+        chunks: 1,
+        dirty_chunks_at_capture: 1,
+        registry,
+        item_registry: None,
+        unix_time: 0,
+        payload_encode_count: Arc::new(AtomicU64::new(0)),
+    };
+
+    assert!(matches!(
+        plan.write(),
+        Err(WorldError::ChunkPositionMismatch {
+            expected_x: 0,
+            expected_z: 0,
+            actual_x: 1,
+            actual_z: 0,
+        })
+    ));
+    assert_eq!(std::fs::read(&region_path).unwrap(), baseline);
+    assert_eq!(std::fs::read_dir(&region_dir).unwrap().count(), 1);
+}
+
+#[test]
 fn dirty_flush_uses_unique_region_tmp_without_clobbering_stale_fixed_tmp() {
     use crate::chunk::ChunkGenerator;
     use mc_data::Identifier;

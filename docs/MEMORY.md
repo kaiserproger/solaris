@@ -19,8 +19,8 @@ and is not startup context.
   budgets with atomic writer preflight, and `SOL-021` bounded exact gzip/NBT
   loading, `SOL-032` bounded sidecar traversal, `SOL-013` bounded Anvil
   region/chunk decompression, `SOL-014` atomic Anvil writer preflight, and
-  `SOL-015` Anvil sector/checksum integrity are complete; `SOL-020`
-  chunk-position identity is next.
+  `SOL-015` Anvil sector/checksum integrity and `SOL-020` chunk-position
+  identity are complete; `SOL-017` writable-world locking is next.
 - The first owner-run public-alpha session remains the routing authority for the
   next stabilization release; its exact plan is `docs/PUBLIC_ALPHA_PLAN.md`.
 - The future full Luau addon platform is frozen in

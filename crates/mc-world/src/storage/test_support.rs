@@ -3,10 +3,11 @@ use std::sync::Arc;
 
 use mc_data::Identifier;
 
+use crate::anvil::{chunk_to_payload, write_region};
 use crate::block::{BlockRegistry, BlockStateId};
-use crate::chunk::{BlockPos, MAX_Y, MIN_Y};
+use crate::chunk::{BlockPos, Chunk, ChunkPos, MAX_Y, MIN_Y};
 
-use super::WorldStorage;
+use super::{REGION_AXIS_CHUNKS, WorldStorage, region_of};
 
 pub(super) fn workspace_path(rel: &str) -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR"))
@@ -194,4 +195,28 @@ pub(super) fn air_stone_hopper_registry() -> Arc<BlockRegistry> {
         ])
         .unwrap(),
     )
+}
+
+pub(super) fn write_chunk_payload_at_slot(
+    world_root: &Path,
+    slot_pos: ChunkPos,
+    embedded_pos: ChunkPos,
+    registry: &BlockRegistry,
+    trailing_bytes: &[u8],
+) -> PathBuf {
+    let region_root = world_root.join("region");
+    std::fs::create_dir_all(&region_root).unwrap();
+    let chunk = Chunk::empty(
+        embedded_pos,
+        air_state_id(registry),
+        Identifier::parse("minecraft:plains").unwrap(),
+    );
+    let mut payload = chunk_to_payload(&chunk, registry, 1_700_000_000).unwrap();
+    payload.local_x = slot_pos.x.rem_euclid(REGION_AXIS_CHUNKS) as u8;
+    payload.local_z = slot_pos.z.rem_euclid(REGION_AXIS_CHUNKS) as u8;
+    payload.uncompressed_nbt.extend_from_slice(trailing_bytes);
+    let (rx, rz) = region_of(slot_pos);
+    let path = region_root.join(format!("r.{rx}.{rz}.mca"));
+    write_region(&path, &[payload]).unwrap();
+    path
 }

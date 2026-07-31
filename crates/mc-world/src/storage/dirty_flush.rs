@@ -8,14 +8,14 @@ use std::time::SystemTime;
 use mc_data::items::ItemRegistry;
 
 use crate::anvil::{
-    ChunkPayload, RegionError, chunk_to_payload_with_items_at_tick, read_region,
+    ChunkPayload, RegionError, chunk_to_payload_with_items_at_tick_for_position, read_region,
     write_region_create_new,
 };
 use crate::block::BlockRegistry;
 use crate::chunk::{Chunk, ChunkPos};
 
 use super::read_view::ChunkSnapshot;
-use super::{REGION_AXIS_CHUNKS, WorldError, WorldStorage, region_of};
+use super::{REGION_AXIS_CHUNKS, WorldError, WorldStorage, ensure_chunk_position, region_of};
 
 const DIRTY_FLUSH_STALE_REGION_RETRIES: usize = 3;
 static REGION_TMP_COUNTER: AtomicU64 = AtomicU64::new(0);
@@ -148,6 +148,7 @@ fn chunk_snapshot_token(chunk: &ChunkSnapshot) -> ChunkSnapshotToken {
 #[cfg(test)]
 fn encode_dirty_flush_chunk_payload(
     chunk: &Chunk,
+    expected_pos: ChunkPos,
     registry: &BlockRegistry,
     item_registry: Option<&ItemRegistry>,
     now: u32,
@@ -155,20 +156,35 @@ fn encode_dirty_flush_chunk_payload(
     payload_encode_count: &AtomicU64,
 ) -> Result<ChunkPayload, WorldError> {
     payload_encode_count.fetch_add(1, Ordering::Relaxed);
-    chunk_to_payload_with_items_at_tick(chunk, registry, item_registry, now, current_tick)
-        .map_err(WorldError::from)
+    chunk_to_payload_with_items_at_tick_for_position(
+        chunk,
+        expected_pos,
+        registry,
+        item_registry,
+        now,
+        current_tick,
+    )
+    .map_err(WorldError::from)
 }
 
 #[cfg(not(test))]
 fn encode_dirty_flush_chunk_payload(
     chunk: &Chunk,
+    expected_pos: ChunkPos,
     registry: &BlockRegistry,
     item_registry: Option<&ItemRegistry>,
     now: u32,
     current_tick: u64,
 ) -> Result<ChunkPayload, WorldError> {
-    chunk_to_payload_with_items_at_tick(chunk, registry, item_registry, now, current_tick)
-        .map_err(WorldError::from)
+    chunk_to_payload_with_items_at_tick_for_position(
+        chunk,
+        expected_pos,
+        registry,
+        item_registry,
+        now,
+        current_tick,
+    )
+    .map_err(WorldError::from)
 }
 
 impl DirtyFlushPlan {
@@ -221,9 +237,11 @@ impl DirtyFlushPlan {
 
             let mut committed_chunks = Vec::with_capacity(region.dirty_payloads.len());
             for planned in region.dirty_payloads {
+                ensure_chunk_position(planned.pos, planned.snapshot.pos)?;
                 #[cfg(test)]
                 let payload = encode_dirty_flush_chunk_payload(
                     &planned.snapshot,
+                    planned.pos,
                     &registry,
                     item_registry.as_deref(),
                     unix_time,
@@ -233,12 +251,18 @@ impl DirtyFlushPlan {
                 #[cfg(not(test))]
                 let payload = encode_dirty_flush_chunk_payload(
                     &planned.snapshot,
+                    planned.pos,
                     &registry,
                     item_registry.as_deref(),
                     unix_time,
                     planned.current_tick,
                 )?;
-                by_slot.insert((payload.local_x, payload.local_z), payload.clone());
+                let local = (
+                    planned.pos.x.rem_euclid(REGION_AXIS_CHUNKS) as u8,
+                    planned.pos.z.rem_euclid(REGION_AXIS_CHUNKS) as u8,
+                );
+                debug_assert_eq!(local, (payload.local_x, payload.local_z));
+                by_slot.insert(local, payload);
                 committed_chunks.push(CommittedChunkPayload {
                     pos: planned.pos,
                     dirty_generation: planned.dirty_generation,
@@ -456,6 +480,7 @@ impl WorldStorage {
         }
         let mut by_region: HashMap<(i32, i32), Vec<(ChunkPos, ChunkSnapshot)>> = HashMap::new();
         for (pos, chunk) in dirty_snapshots {
+            ensure_chunk_position(pos, chunk.pos)?;
             by_region
                 .entry(region_of(pos))
                 .or_default()

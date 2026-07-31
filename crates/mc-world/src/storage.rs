@@ -21,7 +21,8 @@ use mc_data::block_light::BlockLightTable;
 use mc_data::items::ItemRegistry;
 
 use crate::anvil::{
-    ChunkNbtError, ChunkPayload, RegionError, chunk_from_nbt_with_items, read_region,
+    ChunkNbtError, ChunkPayload, RegionError, chunk_from_payload_with_items_at_position,
+    read_region,
 };
 use crate::block::{BlockRegistry, BlockStateId};
 use crate::chunk::{
@@ -74,6 +75,15 @@ pub enum WorldError {
     #[error("region changed before replace: {0}")]
     StaleRegion(PathBuf),
     #[error(
+        "chunk position mismatch: expected ({expected_x},{expected_z}), held ({actual_x},{actual_z})"
+    )]
+    ChunkPositionMismatch {
+        expected_x: i32,
+        expected_z: i32,
+        actual_x: i32,
+        actual_z: i32,
+    },
+    #[error(
         "resident chunks kept changing during dirty flush after {attempts} attempts; {remaining_dirty} chunks remain dirty"
     )]
     ResidentChangedDuringFlush {
@@ -87,6 +97,18 @@ pub enum WorldError {
         dirty_chunks: usize,
         flushable_chunks: usize,
     },
+}
+
+fn ensure_chunk_position(expected: ChunkPos, actual: ChunkPos) -> Result<(), WorldError> {
+    if expected != actual {
+        return Err(WorldError::ChunkPositionMismatch {
+            expected_x: expected.x,
+            expected_z: expected.z,
+            actual_x: actual.x,
+            actual_z: actual.z,
+        });
+    }
+    Ok(())
 }
 
 /// Handle to a world's chunk data, generated chunks, and dirty flush state.
@@ -396,6 +418,7 @@ impl WorldStorage {
         cpos: ChunkPos,
         chunk: Chunk,
     ) -> Result<ChunkSnapshot, WorldError> {
+        ensure_chunk_position(cpos, chunk.pos)?;
         if !self.resident.contains(cpos) {
             self.insert_chunk(cpos, chunk)?;
         } else {
@@ -946,10 +969,12 @@ impl WorldStorage {
         let payload = region.and_then(|r| r.get(&(local_x, local_z)).cloned());
 
         if let Some(payload) = payload {
-            let mut cursor = std::io::Cursor::new(&payload.uncompressed_nbt[..]);
-            let (_, root) = mc_nbt::read_named(&mut cursor)?;
-            let chunk =
-                chunk_from_nbt_with_items(&root, &self.registry, self.item_registry.as_deref())?;
+            let chunk = chunk_from_payload_with_items_at_position(
+                &payload.uncompressed_nbt,
+                cpos,
+                &self.registry,
+                self.item_registry.as_deref(),
+            )?;
             self.insert_chunk(cpos, chunk)?;
             return Ok(self.resident.snapshot(cpos));
         }
@@ -1012,6 +1037,7 @@ impl WorldStorage {
     }
 
     fn insert_chunk(&mut self, cpos: ChunkPos, chunk: Chunk) -> Result<(), WorldError> {
+        ensure_chunk_position(cpos, chunk.pos)?;
         if self.resident.contains(cpos) {
             self.touch(cpos);
             return Ok(());
@@ -1222,6 +1248,91 @@ mod tests {
         assert_eq!(
             chunk_pos_of(BlockPos { x: -16, y: 0, z: 0 }),
             ChunkPos { x: -1, z: 0 }
+        );
+    }
+
+    #[test]
+    fn disk_load_rejects_same_and_cross_region_position_mismatch_without_caching() {
+        let registry = single_air_registry();
+        for (slot_pos, embedded_pos) in [
+            (ChunkPos { x: 0, z: 0 }, ChunkPos { x: 1, z: 0 }),
+            (ChunkPos { x: 31, z: -1 }, ChunkPos { x: 32, z: -1 }),
+        ] {
+            let tmp_world = tempfile::tempdir().unwrap();
+            write_chunk_payload_at_slot(tmp_world.path(), slot_pos, embedded_pos, &registry, &[]);
+            let mut world =
+                WorldStorage::open_with_capacity(tmp_world.path(), Arc::clone(&registry), 4)
+                    .unwrap();
+
+            assert!(matches!(
+                world.get_chunk_without_generation(slot_pos),
+                Err(WorldError::ChunkNbt(ChunkNbtError::PositionMismatch {
+                    expected_x,
+                    expected_z,
+                    actual_x,
+                    actual_z,
+                })) if expected_x == slot_pos.x
+                    && expected_z == slot_pos.z
+                    && actual_x == embedded_pos.x
+                    && actual_z == embedded_pos.z
+            ));
+            assert!(world.cached_chunk_snapshot(slot_pos).is_none());
+            assert_eq!(world.cache_len(), 0);
+        }
+    }
+
+    #[test]
+    fn disk_load_rejects_trailing_chunk_nbt_without_caching() {
+        let registry = single_air_registry();
+        let pos = ChunkPos { x: -2, z: 3 };
+        let tmp_world = tempfile::tempdir().unwrap();
+        write_chunk_payload_at_slot(tmp_world.path(), pos, pos, &registry, &[0x7F]);
+        let mut world = WorldStorage::open_with_capacity(tmp_world.path(), registry, 4).unwrap();
+
+        assert!(matches!(
+            world.get_chunk_without_generation(pos),
+            Err(WorldError::ChunkNbt(ChunkNbtError::TrailingNbtBytes {
+                trailing: 1
+            }))
+        ));
+        assert!(world.cached_chunk_snapshot(pos).is_none());
+    }
+
+    #[test]
+    fn cache_insert_and_commit_reject_foreign_chunk_positions() {
+        let registry = single_air_registry();
+        let expected = ChunkPos { x: 0, z: 0 };
+        let actual = ChunkPos { x: 1, z: 0 };
+        let biome = mc_data::Identifier::parse("minecraft:plains").unwrap();
+        let foreign = Chunk::empty(actual, BlockStateId(0), biome.clone());
+        let mut empty_world = WorldStorage::in_memory(Arc::clone(&registry));
+        assert!(matches!(
+            empty_world.insert_generated_chunk(expected, foreign.clone()),
+            Err(WorldError::ChunkPositionMismatch {
+                expected_x: 0,
+                expected_z: 0,
+                actual_x: 1,
+                actual_z: 0,
+            })
+        ));
+        assert_eq!(empty_world.cache_len(), 0);
+
+        let mut resident_world = WorldStorage::in_memory(registry);
+        resident_world
+            .insert_generated_chunk(expected, Chunk::empty(expected, BlockStateId(0), biome))
+            .unwrap();
+        assert!(matches!(
+            resident_world.commit_chunk_snapshot(expected, foreign),
+            Err(WorldError::ChunkPositionMismatch {
+                expected_x: 0,
+                expected_z: 0,
+                actual_x: 1,
+                actual_z: 0,
+            })
+        ));
+        assert_eq!(
+            resident_world.cached_chunk_snapshot(expected).unwrap().pos,
+            expected
         );
     }
 

@@ -5,7 +5,7 @@ use std::sync::{Arc, RwLock, RwLockReadGuard, RwLockWriteGuard};
 
 use mc_data::items::ItemRegistry;
 
-use crate::anvil::chunk_from_nbt_with_items;
+use crate::anvil::chunk_from_payload_with_items_at_position;
 use crate::anvil::region::read_chunk;
 use crate::block::{BlockRegistry, BlockStateId};
 use crate::chunk::{BlockPos, Chunk, ChunkPos, FurnaceBlockEntity};
@@ -660,6 +660,7 @@ pub enum ChunkSnapshotPlan {
 }
 
 pub struct ChunkDiskLoadPlan {
+    expected_pos: ChunkPos,
     local: (u8, u8),
     region_path: PathBuf,
     disk_backed: bool,
@@ -689,11 +690,14 @@ impl ChunkDiskLoadPlan {
         let Some(payload) = payload else {
             return Ok(None);
         };
-        let mut cursor = std::io::Cursor::new(&payload.uncompressed_nbt[..]);
-        let (_, root) = mc_nbt::read_named(&mut cursor)?;
-        chunk_from_nbt_with_items(&root, &self.registry, self.item_registry.as_deref())
-            .map(Some)
-            .map_err(WorldError::from)
+        chunk_from_payload_with_items_at_position(
+            &payload.uncompressed_nbt,
+            self.expected_pos,
+            &self.registry,
+            self.item_registry.as_deref(),
+        )
+        .map(Some)
+        .map_err(WorldError::from)
     }
 }
 
@@ -731,6 +735,7 @@ impl WorldStorage {
         let local_x = cpos.x.rem_euclid(REGION_AXIS_CHUNKS) as u8;
         let local_z = cpos.z.rem_euclid(REGION_AXIS_CHUNKS) as u8;
         ChunkSnapshotPlan::Load(ChunkDiskLoadPlan {
+            expected_pos: cpos,
             local: (local_x, local_z),
             region_path: self.region_root.join(format!("r.{rx}.{rz}.mca")),
             disk_backed: self.world_root.is_some(),
