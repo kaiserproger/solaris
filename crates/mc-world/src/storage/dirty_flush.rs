@@ -456,6 +456,7 @@ impl WorldStorage {
         current_tick: u64,
         max_chunks: usize,
     ) -> Result<DirtyFlushPlan, WorldError> {
+        self.ensure_writable()?;
         let (dirty_chunks_at_capture, mut dirty_snapshots) = self.resident.dirty_flush_snapshot();
         dirty_snapshots.sort_by_key(|(pos, _)| {
             (

@@ -37,6 +37,9 @@ mod dirty_flush;
 mod read_view;
 #[cfg(test)]
 mod test_support;
+mod world_lease;
+
+use world_lease::{WorldRootLease, acquire_world_root_lease};
 
 pub use dirty_flush::{
     DirtyFlushCommit, DirtyFlushFinalize, DirtyFlushInstall, DirtyFlushPlan, DirtyFlushSynced,
@@ -74,6 +77,17 @@ pub enum WorldError {
     Nbt(#[from] mc_nbt::NbtError),
     #[error("region changed before replace: {0}")]
     StaleRegion(PathBuf),
+    #[error("writable world root is already leased: {root}; holder metadata: {metadata}")]
+    WorldLocked { root: PathBuf, metadata: String },
+    #[error("world lease {operation} failed at {path}: {source}")]
+    WorldLeaseIo {
+        operation: &'static str,
+        path: PathBuf,
+        #[source]
+        source: std::io::Error,
+    },
+    #[error("world was opened read-only and cannot be flushed: {0}")]
+    ReadOnlyWorld(PathBuf),
     #[error(
         "chunk position mismatch: expected ({expected_x},{expected_z}), held ({actual_x},{actual_z})"
     )]
@@ -114,6 +128,8 @@ fn ensure_chunk_position(expected: ChunkPos, actual: ChunkPos) -> Result<(), Wor
 /// Handle to a world's chunk data, generated chunks, and dirty flush state.
 pub struct WorldStorage {
     world_root: Option<PathBuf>,
+    _world_lease: Option<Arc<WorldRootLease>>,
+    read_only: bool,
     region_root: PathBuf,
     registry: Arc<BlockRegistry>,
     /// Canonical resident chunks, partitioned into independently locked 8x8 regions.
@@ -213,6 +229,21 @@ impl WorldStorage {
         Self::open_with_capacity(world_dir, registry, DEFAULT_LRU_CAPACITY)
     }
 
+    /// Open a world for tooling that performs no persistent mutation.
+    /// Read-only opens do not acquire the process-wide writable lease.
+    pub fn open_read_only(
+        world_dir: impl AsRef<Path>,
+        registry: Arc<BlockRegistry>,
+    ) -> Result<Self, WorldError> {
+        Self::open_with_capacities_mode(
+            world_dir,
+            registry,
+            DEFAULT_LRU_CAPACITY,
+            DEFAULT_REGION_LRU_CAPACITY,
+            true,
+        )
+    }
+
     pub fn open_with_capacity(
         world_dir: impl AsRef<Path>,
         registry: Arc<BlockRegistry>,
@@ -227,10 +258,25 @@ impl WorldStorage {
         capacity: usize,
         region_capacity: usize,
     ) -> Result<Self, WorldError> {
+        Self::open_with_capacities_mode(world_dir, registry, capacity, region_capacity, false)
+    }
+
+    fn open_with_capacities_mode(
+        world_dir: impl AsRef<Path>,
+        registry: Arc<BlockRegistry>,
+        capacity: usize,
+        region_capacity: usize,
+        read_only: bool,
+    ) -> Result<Self, WorldError> {
         let dir = world_dir.as_ref();
         if !dir.is_dir() {
             return Err(WorldError::Missing(dir.to_path_buf()));
         }
+        let world_lease = if read_only {
+            None
+        } else {
+            Some(acquire_world_root_lease(dir)?)
+        };
         let candidate_modern = dir
             .join("dimensions")
             .join("minecraft")
@@ -256,6 +302,8 @@ impl WorldStorage {
         );
         Ok(Self {
             world_root: Some(dir.to_path_buf()),
+            _world_lease: world_lease,
+            read_only,
             region_root,
             registry,
             resident,
@@ -294,6 +342,8 @@ impl WorldStorage {
         );
         Self {
             world_root: None,
+            _world_lease: None,
+            read_only: false,
             region_root: PathBuf::new(),
             registry,
             resident,
@@ -309,6 +359,15 @@ impl WorldStorage {
             generator_available: Arc::new(AtomicBool::new(false)),
             borrowed_chunk: None,
         }
+    }
+
+    pub(crate) fn ensure_writable(&self) -> Result<(), WorldError> {
+        if self.read_only {
+            return Err(WorldError::ReadOnlyWorld(
+                self.world_root.clone().unwrap_or_default(),
+            ));
+        }
+        Ok(())
     }
 
     #[must_use]

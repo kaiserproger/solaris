@@ -642,7 +642,8 @@ per-block object allocation.
 
 | Функция | Ответственность |
 | --- | --- |
-| `open*` | открыть root/region cache с явными capacity и registry |
+| `open*` | открыть writable root/region cache и удерживать process-wide OS lease |
+| `open_read_only` | открыть tooling view без writable lease; flush запрещён |
 | `in_memory*` | deterministic test/in-memory world без disk side effects |
 | `with_item_registry` | добавить item decode context для block entities |
 | `with_generator` / `set_generator` | установить chunk generator; generator не получает mutable storage |
@@ -653,6 +654,13 @@ per-block object allocation.
 | `try_commit_chunk_snapshot` | revision/CAS apply после внешнего compute |
 | journal restore/replay | восстановить durable decision и не задвоить уже примененный chunk |
 | cache/resident snapshots | создать immutable views для network/compute/save |
+
+Writable open canonicalizes root and locks `.solaris-world.lock` through the
+standard-library file lease. Same-process storage handles share one guard;
+another process gets holder `pid/start/instance` diagnostics. Metadata may remain
+after a crash, but the OS releases the lease with the process and the next writer
+overwrites it. The guard stays inside `WorldStorage`, so world journal,
+playerdata, plugin storage, and region flush run while the process owns the root.
 
 `WorldMutationView` является узким mutation boundary поверх resident store. Он
 дает conditional operations, а не raw `&mut Chunk`.
