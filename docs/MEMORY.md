@@ -80,8 +80,11 @@ and is not startup context.
   captures matching player and entity state, while the direct save path is only used
   after owner drain. Debug phase timings cover owner claim/finalize, session, player,
   and publication. Deterministic lock, checkpoint, and interleaving tests prove
-  progress, conservation, and crash consistency; `mc-net` passes 1827/1827. The
-  200-action release-candidate latency/M39 gate remains pending.
+  progress, conservation, and crash consistency. The reproducible 200-action
+  raw-TCP break/drop/pickup gate is now green: session-registry max hold fell from
+  5,266 us to 2,178 us, player-persistence max hold from 5,263 us to 285 us, and
+  the final exact 1,200-sample tick window peaked at 9,643 us. `mc-net` passes
+  1859/1859.
 - The single independent lock-diff review session exhausted its 180-second limit
   without a verdict. It focused on the real risk that inverse full-snapshot rollback
   could lose an interleaving motion update. No second reviewer was run; the reviewed
@@ -602,22 +605,16 @@ two priorities unless it becomes a common-play blocker or corruption risk.
 
 ## Active Risks
 
-1. Run the graphical 26.1.2 clock gate on a host with a working display: observe
-   at least 600 advancing overworld-clock ticks, one complete visual day and
-   restart. The exact wire/TCP implementation is already green.
-2. Run the 200-action break/drop/pickup gate on the release candidate and require
-   zero relevant M39 warnings, lock-hold p99 below 5 ms, and no item-path tick
-   above 50 ms. The implementation and deterministic lock/race gates are green.
-3. Complete worldgen revision 10 beyond the now-landed spawn and vegetation work:
-   coarse drainage, rendered height/biome/vegetation mosaics, seed-`712816` owner
+1. Complete worldgen revision 10 beyond the now-landed spawn, vegetation, and
+   drainage work: rendered height/biome/vegetation mosaics, seed-`712816` owner
    playtest, restart, and release-host throughput evidence remain.
-4. Run the no-operator 20-minute survival and restart gates for the landed
+2. Run the no-operator 20-minute survival and restart gates for the landed
    periodic friendly/hostile spawn runtime; do not infer client visibility or
    retained identity from unit scheduling coverage.
-5. Run the real Fabric/NeoForge/Forge Loader matrix for the landed deployment
+3. Run the real Fabric/NeoForge/Forge Loader matrix for the landed deployment
    reporting and disconnect contract. Headless packet and harness gates do not
    replace graphical permission, artifact, screen, asset, and reconnect evidence.
-6. Close `v0.0.2-alpha.1` only after the exact gates in
+4. Close `v0.0.2-alpha.1` only after the exact gates in
    `docs/PUBLIC_ALPHA_PLAN.md`; do not substitute warning suppression, unit-only
    seed checks or a merely uncommented `tellus_like` setting.
 

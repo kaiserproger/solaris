@@ -11121,12 +11121,20 @@ mod tests {
     async fn survival_break_transaction_commits_block_tool_and_drop_together() {
         let (storage, pos, token) = test_block_storage();
         let world = Arc::new(tokio::sync::Mutex::new(storage));
-        let registry = SessionRegistry::new();
+        let commits = Arc::new(AtomicUsize::new(0));
+        let registry = SessionRegistry::new_with_entity_owner_journal(
+            1,
+            Box::new(FailOnceEntityCommitJournal {
+                failure: None,
+                commits: Arc::clone(&commits),
+            }),
+        );
         let session = register_test_session(&registry, "AtomicBreakMiner");
         let mut inventory = PlayerInventory::empty();
         let tool_slot = PlayerInventory::HOTBAR_BASE;
         inventory.slots[tool_slot] = ItemStack::new(42, 1);
         let player_state = register_test_player_state(&registry, session, inventory);
+        let durable_before = commits.load(Ordering::Relaxed);
         let (handle, mut owner) = simulation_channel_with_capacity(1);
         let session_handle = handle.for_session(session);
         let plan = test_survival_break_plan(pos, token, 42, 7);
@@ -11144,6 +11152,11 @@ mod tests {
             .expect("break response")
             .expect("matching break commits");
 
+        assert_eq!(
+            commits.load(Ordering::Relaxed),
+            durable_before,
+            "break item spawn must wait for the shared simulation checkpoint"
+        );
         assert_eq!(
             world.lock().await.get_cached_block(pos),
             Some(BlockStateId(0))

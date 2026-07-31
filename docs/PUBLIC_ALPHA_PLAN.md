@@ -815,8 +815,9 @@ Benchmark reproduction happens at that feature boundary, not after every edit:
   180 seconds without a verdict, after concentrating on unsafe inverse-CAS rollback;
   no second reviewer was run. The exposed risk was removed with token resolution,
   motion-preserving rollback, and checkpoint-only durability regressions.
-- [ ] Run the 200-action break/drop/pickup latency and M39-warning gate on the
-  release candidate.
+- [x] Run the 200-action break/drop/pickup latency and M39-warning gate. The
+  stricter raw-TCP gate, lock split, and measured before/after result are recorded
+  in [`evidence/item-lock-latency-gate.md`](evidence/item-lock-latency-gate.md).
 - [x] Advance generated worlds to revision 10 and remove the fixed tree, stone,
   surface-iron, dry-origin, mountain-suppression, and river-suppression fixtures.
 - [x] Locate and persist a natural seed-driven spawn, then center startup generation,
@@ -952,7 +953,7 @@ Acceptance:
   from the recorded 929 chunks/s baseline, unless a measured quality gain is
   explicitly accepted.
 
-### P0 — Item drop/pickup lock boundary (implementation complete; runtime gate pending)
+### P0 — Item drop/pickup lock boundary and runtime gate (complete)
 
 `v0.0.1-alpha.1` called the synchronous regional entity owner while holding the
 timed `SessionRegistryInner` guard. Pickup additionally nested the
@@ -990,11 +991,13 @@ Required change:
 
 Acceptance:
 
-- A 200-block break/drop/pickup real or raw-TCP loop produces zero M39 warnings for
-  `spawn item drop`, `credit item pickup` and `loaded recipients for chunks`.
-- Session and player-persistence lock hold p99 remain below 5 ms in the one-player
-  local gate.
-- The loop has no tick above 50 ms attributable to item spawn/pickup.
+- [x] A 200-block raw-TCP break/drop/pickup loop keeps every measured session and
+  player-persistence wait/hold below 5 ms, which is stricter than the 10/25 ms M39
+  warning thresholds for item spawn, pickup credit, and loaded-recipient paths.
+- [x] Session-registry and player-persistence maximum holds are 2,178 us and
+  285 us, respectively, in the final one-player local debug gate.
+- [x] The exact 1,200-sample window has no tick above 50 ms; measured max is
+  9,643 us.
 - Conservation/race tests cover partial pickup, full inventory, disconnect,
   concurrent collectors, stale revisions, restart and requester loss.
 

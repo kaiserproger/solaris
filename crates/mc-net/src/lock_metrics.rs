@@ -68,6 +68,16 @@ impl LockMetric {
             max_hold_us: self.max_hold_us.load(Ordering::Relaxed),
         }
     }
+
+    #[cfg(feature = "load-bench")]
+    fn reset(&self) {
+        self.wait_count.store(0, Ordering::Relaxed);
+        self.wait_us.store(0, Ordering::Relaxed);
+        self.max_wait_us.store(0, Ordering::Relaxed);
+        self.hold_count.store(0, Ordering::Relaxed);
+        self.hold_us.store(0, Ordering::Relaxed);
+        self.max_hold_us.store(0, Ordering::Relaxed);
+    }
 }
 
 static WORLD_STORAGE: LockMetric = LockMetric::new();
@@ -119,6 +129,20 @@ pub(crate) fn snapshot() -> LockMetricsSnapshot {
 
 pub fn lock_pressure_snapshot() -> LockMetricsSnapshot {
     snapshot()
+}
+
+/// Reset global lock-pressure counters for one isolated load-bench gate.
+///
+/// Production builds do not expose this operation. Callers must ensure no other
+/// measurement shares the process while the gate is running.
+#[cfg(feature = "load-bench")]
+pub fn reset_lock_pressure_metrics() {
+    WORLD_STORAGE.reset();
+    SESSION_REGISTRY.reset();
+    CONTAINER_REGISTRY.reset();
+    SAVE_ALL_FLUSH.reset();
+    CHUNK_PREPARE.reset();
+    PLAYER_PERSISTENCE.reset();
 }
 
 impl<G: Deref> Deref for TimedGuard<G> {

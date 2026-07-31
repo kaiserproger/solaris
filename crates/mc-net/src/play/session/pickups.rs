@@ -498,6 +498,70 @@ impl SessionRegistry {
         dispatches
     }
 
+    pub(in crate::play) fn spawn_item_drops_owned(
+        &self,
+        _authority: &SimulationAuthority,
+        drops: impl IntoIterator<Item = (i32, Vec3, EntityItemStack)>,
+    ) -> Vec<VisibilityDispatch> {
+        let lifecycle_tick = self.simulation_tick();
+        let entities = drops
+            .into_iter()
+            .filter_map(|(entity_type_id, position, stack)| {
+                (!stack.is_empty())
+                    .then(|| item_drop_entity(entity_type_id, position, stack, lifecycle_tick))
+            })
+            .collect::<Vec<_>>();
+        if entities.is_empty() {
+            return Vec::new();
+        }
+        let committed = {
+            let mut owner = self.lock_entities("spawn survival break drop entities");
+            entities
+                .into_iter()
+                .filter_map(|entity| {
+                    let entity_id = owner.spawn_deferred_journal(entity);
+                    owner.snapshot(entity_id)
+                })
+                .collect::<Vec<_>>()
+        };
+        let current = self.current_expected_entity_snapshots(committed);
+        if current.is_empty() {
+            return Vec::new();
+        }
+        let item_aabb = entity_aabb("minecraft:item");
+        let publications = current
+            .into_iter()
+            .map(|entity| {
+                let spawn_tick = entity.retained.spawn_tick;
+                let ready_tick = entity
+                    .retained
+                    .item_pickup_ready_tick
+                    .expect("item drop carries pickup readiness");
+                (server_entity_snapshot_from(entity), spawn_tick, ready_tick)
+            })
+            .collect::<Vec<_>>();
+        let mut inner = self.lock_inner("publish survival break drops");
+        let mut dispatches = Vec::new();
+        for (snapshot, spawn_tick, ready_tick) in publications {
+            schedule_item_despawn_locked(&mut inner, snapshot.id, spawn_tick);
+            inner
+                .item_pickup_ready
+                .entry(ready_tick)
+                .or_default()
+                .push(snapshot.id);
+            inner
+                .entity_type_aabbs
+                .entry(snapshot.type_id)
+                .or_insert(item_aabb);
+            track_entity_chunk_locked(&mut inner, snapshot.id, snapshot.position);
+            initialize_entity_wire_state_from_snapshot_locked(&mut inner, &snapshot);
+            dispatches.extend(spawn_entity_visibility_from_snapshot_locked(
+                &mut inner, snapshot,
+            ));
+        }
+        dispatches
+    }
+
     pub(in crate::play) fn spawn_item_drop_checkpoint_only_owned(
         &self,
         _authority: &SimulationAuthority,
@@ -621,7 +685,12 @@ impl SessionRegistry {
         {
             return None;
         }
-        let plan = {
+        let (
+            expected_game_mode,
+            expected_survival,
+            expected_inventory,
+            expected_selected_hotbar_slot,
+        ) = {
             let wait_started = Instant::now();
             let guard = player_state.lock().unwrap_or_else(|poisoned| {
                 warn!(
@@ -632,46 +701,52 @@ impl SessionRegistry {
             });
             let player = crate::lock_metrics::timed_guard(
                 crate::lock_metrics::LockMetricKind::PlayerPersistence,
-                "plan item pickup",
+                "snapshot item pickup player",
                 wait_started,
                 guard,
             );
             if player.game_mode == GameMode::Spectator || player.survival.is_dead() {
                 return None;
             }
-            let mut updated_inventory = player.inventory.clone();
-            let probe = ItemStack {
-                item_id: stack.item_id,
-                count: stack.count,
-                damage: stack.damage,
-                enchantments: stack.enchantments.clone(),
-                custom_name: stack.custom_name.as_deref().cloned(),
-                item_model: stack.item_model.as_deref().cloned().map(Arc::new),
-            };
-            let (remaining, changed_slots) = updated_inventory.merge_pickup_stack(
-                probe,
-                max_stack,
+            (
+                player.game_mode,
+                player.survival,
+                player.inventory.clone(),
                 player.selected_hotbar_slot,
-            )?;
-            let remaining_count = if remaining.is_empty() {
-                0
-            } else {
-                remaining.count
-            };
-            let credited_count = stack.count.checked_sub(remaining_count)?;
-            if credited_count <= 0 || changed_slots.is_empty() {
-                return None;
-            }
-            ItemPickupPlayerPlan {
-                player_state: Arc::clone(&player_state),
-                expected_game_mode: player.game_mode,
-                expected_survival: player.survival,
-                expected_inventory: player.inventory.clone(),
-                expected_selected_hotbar_slot: player.selected_hotbar_slot,
-                updated_inventory,
-                changed_slots,
-                credited_count,
-            }
+            )
+        };
+        let mut updated_inventory = expected_inventory.clone();
+        let probe = ItemStack {
+            item_id: stack.item_id,
+            count: stack.count,
+            damage: stack.damage,
+            enchantments: stack.enchantments.clone(),
+            custom_name: stack.custom_name.as_deref().cloned(),
+            item_model: stack.item_model.as_deref().cloned().map(Arc::new),
+        };
+        let (remaining, changed_slots) = updated_inventory.merge_pickup_stack(
+            probe,
+            max_stack,
+            expected_selected_hotbar_slot,
+        )?;
+        let remaining_count = if remaining.is_empty() {
+            0
+        } else {
+            remaining.count
+        };
+        let credited_count = stack.count.checked_sub(remaining_count)?;
+        if credited_count <= 0 || changed_slots.is_empty() {
+            return None;
+        }
+        let plan = ItemPickupPlayerPlan {
+            player_state: Arc::clone(&player_state),
+            expected_game_mode,
+            expected_survival,
+            expected_inventory,
+            expected_selected_hotbar_slot,
+            updated_inventory,
+            changed_slots,
+            credited_count,
         };
         #[cfg(test)]
         self.pause_after_item_pickup_plan_for_test();
@@ -719,6 +794,7 @@ impl SessionRegistry {
             );
             return None;
         }
+        let committed_inventory = plan.updated_inventory.clone();
         let player_started = Instant::now();
         let player_committed = {
             let wait_started = Instant::now();
@@ -742,7 +818,7 @@ impl SessionRegistry {
             {
                 false
             } else {
-                player.replace_inventory(plan.updated_inventory.clone());
+                player.replace_inventory(committed_inventory);
                 true
             }
         };

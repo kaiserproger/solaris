@@ -52,6 +52,7 @@ const VIEW_DISTANCE: i32 = 2;
 include!("block_edit/container_support.rs");
 include!("block_edit/block_breaking.rs");
 include!("block_edit/survival_inventory.rs");
+include!("block_edit/item_lock_gate.rs");
 include!("block_edit/survival_pickup_overflow.rs");
 include!("block_edit/campfire.rs");
 include!("block_edit/cauldron.rs");

@@ -59,6 +59,8 @@ pub use loader::{
     LoaderPlatform, LoaderSession, loader_ack_channel, loader_artifact_channel,
     loader_manifest_channel, loader_open_screen_channel, loader_request_channel,
 };
+#[cfg(feature = "load-bench")]
+pub use lock_metrics::reset_lock_pressure_metrics;
 pub use lock_metrics::{LockMetricSnapshot, LockMetricsSnapshot, lock_pressure_snapshot};
 pub use login::{LoginAccessConfig, offline_uuid};
 pub use play::{

@@ -1,3 +1,4 @@
+use std::sync::Arc;
 use std::time::Instant;
 
 use mc_data::block_light::BlockLightTable;
@@ -15,62 +16,111 @@ use crate::play::simulation::{
     SimulationAuthority, SimulationRequestError, SurvivalBreakPlan, SurvivalPlacementPlan,
     placement_inventory_debit,
 };
+use crate::play::{BlockEdit, BlockEditBatchOutcome, BlockEditPrecondition};
 
-use super::pickups::spawn_item_drop_locked;
 use super::transactions::{
     BucketUseTransaction, SurvivalBreakTransaction, SurvivalPlacementTransaction,
 };
 use super::{SessionId, SessionRegistry};
 
+fn rollback_survival_break(
+    storage: &mut mc_world::WorldStorage,
+    block_light: Option<&BlockLightTable>,
+    committed: &BlockEditBatchOutcome,
+) -> Result<(), SimulationRequestError> {
+    let mut edits = Vec::with_capacity(committed.applied.len());
+    let mut preconditions = Vec::with_capacity(committed.applied.len());
+    for applied in committed.applied.iter().rev() {
+        let Some(expected_token) = committed.resulting_tokens.get(&applied.pos).copied() else {
+            warn!(pos = ?applied.pos, "survival break rollback is missing the committed mutation token");
+            return Err(SimulationRequestError::WorldMutationFailed);
+        };
+        edits.push(BlockEdit {
+            pos: applied.pos,
+            new_state: applied.previous,
+        });
+        preconditions.push(BlockEditPrecondition {
+            pos: applied.pos,
+            expected_state: applied.new_state,
+            expected_token,
+        });
+    }
+    let Some(rollback) = apply_block_edit_batch_to_storage_conditionally(
+        storage,
+        block_light,
+        &edits,
+        &preconditions,
+    ) else {
+        warn!("survival break rollback lost its exact world precondition");
+        return Err(SimulationRequestError::WorldMutationFailed);
+    };
+    if rollback.applied.len() != edits.len() {
+        warn!(
+            expected = edits.len(),
+            applied = rollback.applied.len(),
+            "survival break rollback produced a partial world edit"
+        );
+        return Err(SimulationRequestError::WorldMutationFailed);
+    }
+    Ok(())
+}
+
 impl SessionRegistry {
     pub(in crate::play) fn commit_survival_break(
         &self,
-        _authority: &SimulationAuthority,
+        authority: &SimulationAuthority,
         storage: &mut mc_world::WorldStorage,
         block_light: Option<&BlockLightTable>,
         actor_session: SessionId,
         plan: &SurvivalBreakPlan,
     ) -> Result<Option<CommittedSurvivalBreak>, SimulationRequestError> {
-        let mut inner = self.lock_session_entities("commit survival break");
-        let Some(player_state) = inner.player_persistence.get(&actor_session).cloned() else {
-            return Ok(None);
+        let player_state = {
+            let inner = self.lock_inner("prepare survival break");
+            let Some(player_state) = inner.player_persistence.get(&actor_session).cloned() else {
+                return Ok(None);
+            };
+            player_state
         };
-        let wait_started = Instant::now();
-        let guard = player_state.lock().unwrap_or_else(|poisoned| {
-            warn!(
-                session_id = actor_session,
-                "player persistence mutex was poisoned during survival break; recovering state"
-            );
-            poisoned.into_inner()
-        });
-        let mut player_state = crate::lock_metrics::timed_guard(
-            crate::lock_metrics::LockMetricKind::PlayerPersistence,
-            "commit survival break",
-            wait_started,
-            guard,
-        );
-        if player_state.selected_hotbar_slot != plan.held.hotbar_slot {
-            return Ok(None);
-        }
         let tool_slot = PlayerInventory::HOTBAR_BASE + usize::from(plan.held.hotbar_slot);
-        if player_state.inventory.slots[tool_slot] != plan.held.expected {
-            return Ok(None);
-        }
-        let mut inventory = player_state.inventory.clone();
-        let mut changed_slots = Vec::new();
-        if let Some(max_damage) = plan.held.max_damage {
-            if plan.held.expected.is_empty() {
-                return Err(SimulationRequestError::InvalidCommand);
+        let (expected_inventory, updated_inventory, changed_slots) = {
+            let wait_started = Instant::now();
+            let guard = player_state.lock().unwrap_or_else(|poisoned| {
+                warn!(
+                    session_id = actor_session,
+                    "player persistence mutex was poisoned while snapshotting survival break; recovering state"
+                );
+                poisoned.into_inner()
+            });
+            let player = crate::lock_metrics::timed_guard(
+                crate::lock_metrics::LockMetricKind::PlayerPersistence,
+                "snapshot survival break inventory",
+                wait_started,
+                guard,
+            );
+            if player.selected_hotbar_slot != plan.held.hotbar_slot
+                || player.inventory.slots[tool_slot] != plan.held.expected
+            {
+                return Ok(None);
             }
-            let held = &mut inventory.slots[tool_slot];
-            let new_damage = held.damage.unwrap_or(0).saturating_add(1);
-            if new_damage >= max_damage {
-                *held = ItemStack::EMPTY;
+            let expected_inventory = player.inventory.clone();
+            let mut updated_inventory = expected_inventory.clone();
+            let changed_slots = if let Some(max_damage) = plan.held.max_damage {
+                if plan.held.expected.is_empty() {
+                    return Err(SimulationRequestError::InvalidCommand);
+                }
+                let held = &mut updated_inventory.slots[tool_slot];
+                let new_damage = held.damage.unwrap_or(0).saturating_add(1);
+                if new_damage >= max_damage {
+                    *held = ItemStack::EMPTY;
+                } else {
+                    held.damage = Some(new_damage);
+                }
+                vec![(tool_slot, held.clone())]
             } else {
-                held.damage = Some(new_damage);
-            }
-            changed_slots.push((tool_slot, held.clone()));
-        }
+                Vec::new()
+            };
+            (expected_inventory, updated_inventory, changed_slots)
+        };
 
         let Some(block) = apply_block_edit_batch_to_storage_conditionally(
             storage,
@@ -90,16 +140,51 @@ impl SessionRegistry {
             return Err(SimulationRequestError::WorldMutationFailed);
         }
 
-        player_state.replace_inventory(inventory.clone());
-        let mut dispatches = Vec::new();
-        for drop in &plan.drops {
-            dispatches.extend(spawn_item_drop_locked(
-                &mut inner,
-                drop.entity_type_id,
-                drop.position,
-                drop.stack.clone(),
-            ));
+        let committed_inventory = updated_inventory.clone();
+        let inventory_committed = {
+            let inner = self.lock_inner("commit survival break session");
+            let session_is_current = inner
+                .player_persistence
+                .get(&actor_session)
+                .is_some_and(|current| Arc::ptr_eq(current, &player_state));
+            if !session_is_current {
+                false
+            } else {
+                let wait_started = Instant::now();
+                let guard = player_state.lock().unwrap_or_else(|poisoned| {
+                    warn!(
+                        session_id = actor_session,
+                        "player persistence mutex was poisoned during survival break; recovering state"
+                    );
+                    poisoned.into_inner()
+                });
+                let mut player = crate::lock_metrics::timed_guard(
+                    crate::lock_metrics::LockMetricKind::PlayerPersistence,
+                    "publish survival break inventory",
+                    wait_started,
+                    guard,
+                );
+                if player.selected_hotbar_slot != plan.held.hotbar_slot
+                    || player.inventory.slots != expected_inventory.slots
+                {
+                    false
+                } else {
+                    player.replace_inventory(committed_inventory);
+                    true
+                }
+            }
+        };
+        if !inventory_committed {
+            rollback_survival_break(storage, block_light, &block)?;
+            return Ok(None);
         }
+        let inventory = updated_inventory;
+        let dispatches = self.spawn_item_drops_owned(
+            authority,
+            plan.drops
+                .iter()
+                .map(|drop| (drop.entity_type_id, drop.position, drop.stack.clone())),
+        );
         Ok(Some(CommittedSurvivalBreak {
             block,
             inventory,
