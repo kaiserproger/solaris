@@ -711,8 +711,11 @@ arrays для protocol.
 ### 12.7 Anvil и NBT
 
 `read_region` проверяет location/timestamp tables, sectors, compression и
-bounds. `write_region` собирает и синхронно записывает полный новый image, но
-сам по себе не является atomic replace. Production dirty-flush пишет его через
+bounds. `write_region` до открытия output проверяет local coordinates,
+duplicate slots, decoded budgets и точный sector count: 255 sectors допустимы,
+а более крупный chunk возвращает ошибку вместо обрезания count до `u8`.
+Writer собирает и синхронно записывает полный новый image, но сам по себе не
+является atomic replace. Production dirty-flush пишет его через
 `write_region_create_new` во временный файл и только затем делает rename;
 create-new защищает recovery path от перезаписи чужого временного решения.
 

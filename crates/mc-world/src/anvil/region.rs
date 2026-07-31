@@ -36,6 +36,8 @@ const REGION_CHUNK_COUNT: usize = CHUNKS_PER_REGION_AXIS * CHUNKS_PER_REGION_AXI
 const SECTOR_SIZE: usize = 4096;
 const HEADER_SECTORS: usize = 2; // locations + timestamps
 const HEADER_BYTES: usize = HEADER_SECTORS * SECTOR_SIZE;
+const MAX_SECTORS_PER_CHUNK: usize = u8::MAX as usize;
+const MAX_COMPRESSED_CHUNK_BYTES: usize = MAX_SECTORS_PER_CHUNK * SECTOR_SIZE - 5;
 const MAX_REGION_FILE_BYTES: u64 =
     (HEADER_SECTORS as u64 + REGION_CHUNK_COUNT as u64 * u8::MAX as u64) * SECTOR_SIZE as u64;
 const MAX_DECOMPRESSED_CHUNK_BYTES: usize = 64 * 1024 * 1024;
@@ -92,8 +94,21 @@ pub enum RegionError {
     TooShort { needed: usize, got: usize },
     #[error("region file is {bytes} bytes, exceeding limit {max}")]
     RegionTooLarge { bytes: u64, max: u64 },
+    #[error("region image size arithmetic overflow")]
+    RegionSizeOverflow,
     #[error("chunk coordinates ({cx},{cz}) are outside the local region range 0..32")]
     InvalidChunkCoordinates { cx: u8, cz: u8 },
+    #[error("chunk slot ({cx},{cz}) appears more than once in the write set")]
+    DuplicateChunkSlot { cx: u8, cz: u8 },
+    #[error(
+        "chunk ({cx},{cz}) requires {sectors} sectors, exceeding the Anvil limit {max_sectors}"
+    )]
+    ChunkTooLarge {
+        cx: u8,
+        cz: u8,
+        sectors: usize,
+        max_sectors: usize,
+    },
     #[error(
         "chunk slot ({cx},{cz}) points at sector {sector} which is past the file's {sector_count} sectors"
     )]
@@ -405,18 +420,17 @@ fn write_region_with_options(
     chunks: &[ChunkPayload],
     create_new: bool,
 ) -> Result<(), RegionError> {
-    let mut locations = vec![0u32; REGION_CHUNK_COUNT];
-    let mut timestamps = vec![0u32; REGION_CHUNK_COUNT];
+    validate_write_chunks(chunks, DEFAULT_REGION_LIMITS)?;
+
+    let mut locations = [0_u32; REGION_CHUNK_COUNT];
+    let mut timestamps = [0_u32; REGION_CHUNK_COUNT];
     // Body begins at sector HEADER_SECTORS; next_sector tracks growth.
     let mut next_sector = HEADER_SECTORS as u32;
     let mut body: Vec<u8> = Vec::new();
 
     for c in chunks {
-        let slot = (c.local_z as usize) * CHUNKS_PER_REGION_AXIS + (c.local_x as usize);
-        let mut zlib = ZlibEncoder::new(
-            Vec::with_capacity(c.uncompressed_nbt.len()),
-            Compression::default(),
-        );
+        let slot = usize::from(c.local_z) * CHUNKS_PER_REGION_AXIS + usize::from(c.local_x);
+        let mut zlib = ZlibEncoder::new(Vec::new(), Compression::default());
         zlib.write_all(&c.uncompressed_nbt)
             .map_err(|e| RegionError::Io {
                 path: path.to_path_buf(),
@@ -428,23 +442,38 @@ fn write_region_with_options(
         })?;
 
         // [len:4][comp:1][payload …] padded to a sector.
-        let len = compressed.len() as u32 + 1; // +1 for compression byte
-        let raw_len = 4 + 1 + compressed.len();
-        let padded_len = raw_len.div_ceil(SECTOR_SIZE) * SECTOR_SIZE;
+        let (len, padded_len, sectors_used) =
+            encoded_chunk_layout(compressed.len(), c.local_x, c.local_z)?;
+        let raw_len = 5 + compressed.len();
         let pad = padded_len - raw_len;
+        reserve_region_bytes(&mut body, padded_len, path, "region body")?;
 
         body.extend_from_slice(&len.to_be_bytes());
         body.push(CompressionType::Zlib as u8);
         body.extend_from_slice(&compressed);
         body.extend(std::iter::repeat_n(0u8, pad));
 
-        let sectors_used = (padded_len / SECTOR_SIZE) as u32;
-        locations[slot] = (next_sector << 8) | (sectors_used & 0xFF);
+        let following_sector = next_sector
+            .checked_add(sectors_used)
+            .ok_or(RegionError::RegionSizeOverflow)?;
+        let following_bytes = u64::from(following_sector) * SECTOR_SIZE as u64;
+        if following_bytes > MAX_REGION_FILE_BYTES {
+            return Err(RegionError::RegionTooLarge {
+                bytes: following_bytes,
+                max: MAX_REGION_FILE_BYTES,
+            });
+        }
+        debug_assert!(next_sector < (1 << 24));
+        locations[slot] = (next_sector << 8) | sectors_used;
         timestamps[slot] = c.timestamp;
-        next_sector += sectors_used;
+        next_sector = following_sector;
     }
 
-    let mut out = Vec::with_capacity(HEADER_SECTORS * SECTOR_SIZE + body.len());
+    let out_len = HEADER_BYTES
+        .checked_add(body.len())
+        .ok_or(RegionError::RegionSizeOverflow)?;
+    let mut out = Vec::new();
+    reserve_region_bytes(&mut out, out_len, path, "region image")?;
     for &loc in &locations {
         out.extend_from_slice(&loc.to_be_bytes());
     }
@@ -471,6 +500,81 @@ fn write_region_with_options(
         source: e,
     })?;
     Ok(())
+}
+
+fn validate_write_chunks(chunks: &[ChunkPayload], limits: RegionLimits) -> Result<(), RegionError> {
+    let mut seen = [false; REGION_CHUNK_COUNT];
+    let mut decoded_total = 0_usize;
+    for chunk in chunks {
+        if usize::from(chunk.local_x) >= CHUNKS_PER_REGION_AXIS
+            || usize::from(chunk.local_z) >= CHUNKS_PER_REGION_AXIS
+        {
+            return Err(RegionError::InvalidChunkCoordinates {
+                cx: chunk.local_x,
+                cz: chunk.local_z,
+            });
+        }
+        let slot = usize::from(chunk.local_z) * CHUNKS_PER_REGION_AXIS + usize::from(chunk.local_x);
+        if std::mem::replace(&mut seen[slot], true) {
+            return Err(RegionError::DuplicateChunkSlot {
+                cx: chunk.local_x,
+                cz: chunk.local_z,
+            });
+        }
+        if chunk.uncompressed_nbt.len() > limits.max_chunk_bytes {
+            return Err(RegionError::DecompressedChunkTooLarge {
+                cx: chunk.local_x,
+                cz: chunk.local_z,
+                bytes: chunk.uncompressed_nbt.len(),
+                max: limits.max_chunk_bytes,
+            });
+        }
+        decoded_total = decoded_total.saturating_add(chunk.uncompressed_nbt.len());
+        if decoded_total > limits.max_region_bytes {
+            return Err(RegionError::DecompressedRegionTooLarge {
+                bytes: decoded_total,
+                max: limits.max_region_bytes,
+            });
+        }
+    }
+    Ok(())
+}
+
+fn encoded_chunk_layout(
+    compressed_len: usize,
+    cx: u8,
+    cz: u8,
+) -> Result<(u32, usize, u32), RegionError> {
+    let sectors = compressed_len.saturating_add(5).div_ceil(SECTOR_SIZE);
+    if compressed_len > MAX_COMPRESSED_CHUNK_BYTES {
+        return Err(RegionError::ChunkTooLarge {
+            cx,
+            cz,
+            sectors,
+            max_sectors: MAX_SECTORS_PER_CHUNK,
+        });
+    }
+    let len = u32::try_from(compressed_len + 1)
+        .expect("a chunk within the 255-sector limit has a u32 payload length");
+    let padded_len = sectors * SECTOR_SIZE;
+    let sectors = u32::try_from(sectors).expect("a bounded sector count fits u32");
+    Ok((len, padded_len, sectors))
+}
+
+fn reserve_region_bytes(
+    buffer: &mut Vec<u8>,
+    additional: usize,
+    path: &Path,
+    context: &'static str,
+) -> Result<(), RegionError> {
+    buffer
+        .try_reserve_exact(additional)
+        .map_err(|error| RegionError::Io {
+            path: path.to_path_buf(),
+            source: std::io::Error::other(format!(
+                "reserve {context} buffer by {additional} bytes: {error}"
+            )),
+        })
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1007,6 +1111,25 @@ mod tests {
         encoder.finish().unwrap()
     }
 
+    fn deterministic_incompressible(len: usize) -> Vec<u8> {
+        let mut out = vec![0_u8; len];
+        let mut state = 0x9E37_79B9_7F4A_7C15_u64;
+        for bytes in out.chunks_mut(8) {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            bytes.copy_from_slice(&state.to_le_bytes()[..bytes.len()]);
+        }
+        out
+    }
+
+    fn encoded_zlib_sectors(raw: &[u8]) -> usize {
+        zlib_payload(raw)
+            .len()
+            .saturating_add(5)
+            .div_ceil(SECTOR_SIZE)
+    }
+
     fn lz4_block_payload(method: u8, block: &[u8], decompressed_len: usize) -> Vec<u8> {
         let mut payload = Vec::new();
         payload.extend_from_slice(LZ4_BLOCK_MAGIC);
@@ -1061,6 +1184,172 @@ mod tests {
             assert_eq!(got.timestamp, orig.timestamp);
             assert_eq!(got.uncompressed_nbt, orig.uncompressed_nbt);
         }
+    }
+
+    #[test]
+    fn encoded_chunk_layout_enforces_255_sector_boundary() {
+        let (_, padded_len, sectors) =
+            encoded_chunk_layout(MAX_COMPRESSED_CHUNK_BYTES, 3, 4).unwrap();
+        assert_eq!(padded_len, MAX_SECTORS_PER_CHUNK * SECTOR_SIZE);
+        assert_eq!(sectors, u32::from(u8::MAX));
+
+        for (compressed_len, expected_sectors) in [
+            (MAX_COMPRESSED_CHUNK_BYTES + 1, 256),
+            (256 * SECTOR_SIZE - 4, 257),
+        ] {
+            assert!(matches!(
+                encoded_chunk_layout(compressed_len, 3, 4),
+                Err(RegionError::ChunkTooLarge {
+                    cx: 3,
+                    cz: 4,
+                    sectors,
+                    max_sectors: MAX_SECTORS_PER_CHUNK,
+                }) if sectors == expected_sectors
+            ));
+        }
+    }
+
+    #[test]
+    fn write_region_accepts_255_sector_incompressible_chunk() {
+        let raw = deterministic_incompressible(1_043_500);
+        assert_eq!(encoded_zlib_sectors(&raw), 255);
+        let payload = ChunkPayload {
+            local_x: 7,
+            local_z: 9,
+            timestamp: 1_700_000_700,
+            uncompressed_nbt: raw.clone(),
+        };
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+
+        write_region(tmp.path(), &[payload]).unwrap();
+
+        let bytes = std::fs::read(tmp.path()).unwrap();
+        let slot = 9 * CHUNKS_PER_REGION_AXIS + 7;
+        let loc_off = slot * 4;
+        let location = u32::from_be_bytes(
+            bytes[loc_off..loc_off + 4]
+                .try_into()
+                .expect("4-byte location"),
+        );
+        assert_eq!(location & 0xFF, u32::from(u8::MAX));
+        let read = read_region(tmp.path()).unwrap();
+        assert_eq!(read.len(), 1);
+        assert_eq!(read[0].uncompressed_nbt, raw);
+    }
+
+    #[test]
+    fn write_region_rejects_invalid_and_duplicate_slots_without_touching_output() {
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        let sentinel = b"owner bytes must remain unchanged";
+        let base = ChunkPayload {
+            local_x: 1,
+            local_z: 2,
+            timestamp: 1,
+            uncompressed_nbt: b"valid".to_vec(),
+        };
+
+        for invalid in [
+            ChunkPayload {
+                local_x: 32,
+                ..base.clone()
+            },
+            ChunkPayload {
+                local_z: 32,
+                ..base.clone()
+            },
+        ] {
+            std::fs::write(tmp.path(), sentinel).unwrap();
+            assert!(matches!(
+                write_region(tmp.path(), &[invalid]),
+                Err(RegionError::InvalidChunkCoordinates { .. })
+            ));
+            assert_eq!(std::fs::read(tmp.path()).unwrap(), sentinel);
+        }
+
+        std::fs::write(tmp.path(), sentinel).unwrap();
+        assert!(matches!(
+            write_region(tmp.path(), &[base.clone(), base.clone()]),
+            Err(RegionError::DuplicateChunkSlot { cx: 1, cz: 2 })
+        ));
+        assert_eq!(std::fs::read(tmp.path()).unwrap(), sentinel);
+
+        let dir = tempfile::tempdir().unwrap();
+        let absent = dir.path().join("invalid.mca");
+        assert!(matches!(
+            write_region_create_new(
+                &absent,
+                &[ChunkPayload {
+                    local_x: 32,
+                    ..base
+                }]
+            ),
+            Err(RegionError::InvalidChunkCoordinates { cx: 32, cz: 2 })
+        ));
+        assert!(!absent.exists());
+    }
+
+    #[test]
+    fn write_region_rejects_256_and_257_sector_chunks_without_touching_output() {
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        let sentinel = b"existing region image";
+        for (raw_len, expected_sectors) in [(1_045_000, 256), (1_049_000, 257)] {
+            let raw = deterministic_incompressible(raw_len);
+            assert_eq!(encoded_zlib_sectors(&raw), expected_sectors);
+            std::fs::write(tmp.path(), sentinel).unwrap();
+
+            assert!(matches!(
+                write_region(
+                    tmp.path(),
+                    &[ChunkPayload {
+                        local_x: 5,
+                        local_z: 6,
+                        timestamp: 2,
+                        uncompressed_nbt: raw,
+                    }]
+                ),
+                Err(RegionError::ChunkTooLarge {
+                    cx: 5,
+                    cz: 6,
+                    sectors,
+                    max_sectors: MAX_SECTORS_PER_CHUNK,
+                }) if sectors == expected_sectors
+            ));
+            assert_eq!(std::fs::read(tmp.path()).unwrap(), sentinel);
+        }
+    }
+
+    #[test]
+    fn write_preflight_enforces_reader_decode_budgets() {
+        let one = ChunkPayload {
+            local_x: 0,
+            local_z: 0,
+            timestamp: 0,
+            uncompressed_nbt: vec![0; 5],
+        };
+        assert!(matches!(
+            validate_write_chunks(std::slice::from_ref(&one), test_limits(4, 16)),
+            Err(RegionError::DecompressedChunkTooLarge {
+                cx: 0,
+                cz: 0,
+                bytes: 5,
+                max: 4,
+            })
+        ));
+        assert!(matches!(
+            validate_write_chunks(
+                &[
+                    one,
+                    ChunkPayload {
+                        local_x: 1,
+                        local_z: 0,
+                        timestamp: 0,
+                        uncompressed_nbt: vec![0; 5],
+                    },
+                ],
+                test_limits(8, 9),
+            ),
+            Err(RegionError::DecompressedRegionTooLarge { bytes: 10, max: 9 })
+        ));
     }
 
     #[test]

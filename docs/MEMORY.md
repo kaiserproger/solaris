@@ -17,9 +17,9 @@ and is not startup context.
   validated resource paths, `SOL-016` world-journal parser/file budgets,
   `SOL-035` count-prefixed protocol allocation safety, `SOL-009` aggregate NBT
   budgets with atomic writer preflight, and `SOL-021` bounded exact gzip/NBT
-  loading, `SOL-032` bounded sidecar traversal, and `SOL-013` bounded Anvil
-  region/chunk decompression are complete; `SOL-014` oversized/invalid Anvil
-  writes is next.
+  loading, `SOL-032` bounded sidecar traversal, `SOL-013` bounded Anvil
+  region/chunk decompression, and `SOL-014` atomic Anvil writer preflight are
+  complete; `SOL-015` Anvil sector/checksum integrity is next.
 - The first owner-run public-alpha session remains the routing authority for the
   next stabilization release; its exact plan is `docs/PUBLIC_ALPHA_PLAN.md`.
 - The future full Luau addon platform is frozen in
