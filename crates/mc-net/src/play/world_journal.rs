@@ -895,7 +895,7 @@ fn replace_journal(path: &Path, replacement: &[u8]) -> Result<(), WriterFailure>
         file.write_all(replacement)?;
         file.flush()?;
         file.sync_all()?;
-        std::fs::rename(&temporary, path)?;
+        mc_world::atomic_file::replace_file(&temporary, path)?;
         sync_directory(directory)
     })();
     if result.is_err() {

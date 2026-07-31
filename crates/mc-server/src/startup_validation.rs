@@ -322,7 +322,7 @@ fn write_world_contract(
                 temporary.display()
             )
         })?;
-    std::fs::rename(&temporary, path).with_context(|| {
+    mc_world::atomic_file::replace_file(&temporary, path).with_context(|| {
         format!(
             "installing persisted world contract {} from {}",
             path.display(),

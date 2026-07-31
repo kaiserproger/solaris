@@ -20,6 +20,9 @@ thiserror = { workspace = true }
 bytemuck = { workspace = true }
 wide = { workspace = true }
 
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.61", features = ["Win32_Storage_FileSystem"] }
+
 [dev-dependencies]
 criterion = "0.5"
 tempfile = "3"

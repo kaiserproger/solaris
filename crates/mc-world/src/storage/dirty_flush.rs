@@ -11,6 +11,7 @@ use crate::anvil::{
     ChunkPayload, RegionError, chunk_to_payload_with_items_at_tick_for_position, read_region,
     write_region_create_new,
 };
+use crate::atomic_file;
 use crate::block::BlockRegistry;
 use crate::chunk::{Chunk, ChunkPos};
 
@@ -302,17 +303,6 @@ fn install_region_file(
         return Err(WorldError::StaleRegion(region_path.to_path_buf()));
     }
 
-    #[cfg(windows)]
-    if expected_version.is_some() {
-        return Err(WorldError::Region(RegionError::Io {
-            path: region_path.to_path_buf(),
-            source: std::io::Error::new(
-                ErrorKind::Unsupported,
-                "atomic replacement of existing region files is unsupported on Windows",
-            ),
-        }));
-    }
-
     if expected_version.is_some() {
         install_existing_region_file(region_path, tmp_path, expected_version)?;
     } else {
@@ -331,11 +321,10 @@ fn install_existing_region_file(
         return Err(WorldError::StaleRegion(region_path.to_path_buf()));
     }
 
-    std::fs::rename(tmp_path, region_path).map_err(|e| {
-        let _ = std::fs::remove_file(tmp_path);
+    atomic_file::replace_file(tmp_path, region_path).map_err(|source| {
         WorldError::Region(RegionError::Io {
             path: region_path.to_path_buf(),
-            source: e,
+            source,
         })
     })
 }
@@ -404,33 +393,15 @@ fn unique_region_tmp_path(region_path: &Path) -> PathBuf {
 }
 
 fn sync_parent_dir(path: &Path) -> Result<(), WorldError> {
-    let Some(parent) = path.parent() else {
-        return Ok(());
-    };
-    let dir = match std::fs::File::open(parent) {
-        Ok(dir) => dir,
-        Err(e) if is_unsupported_dir_sync_error(e.kind()) => {
-            return Ok(());
-        }
-        Err(e) => {
-            return Err(WorldError::Region(RegionError::Io {
-                path: parent.to_path_buf(),
-                source: e,
-            }));
-        }
-    };
-    match dir.sync_all() {
-        Ok(()) => Ok(()),
-        Err(e) if is_unsupported_dir_sync_error(e.kind()) => Ok(()),
-        Err(e) => Err(WorldError::Region(RegionError::Io {
-            path: parent.to_path_buf(),
-            source: e,
-        })),
-    }
-}
-
-fn is_unsupported_dir_sync_error(kind: ErrorKind) -> bool {
-    kind == ErrorKind::Unsupported || cfg!(windows) && kind == ErrorKind::PermissionDenied
+    atomic_file::sync_parent_dir(path).map_err(|source| {
+        WorldError::Region(RegionError::Io {
+            path: path
+                .parent()
+                .unwrap_or_else(|| Path::new("."))
+                .to_path_buf(),
+            source,
+        })
+    })
 }
 
 impl WorldStorage {

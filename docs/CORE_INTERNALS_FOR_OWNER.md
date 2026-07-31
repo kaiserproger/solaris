@@ -732,8 +732,11 @@ decoded budgets и точный sector count: 255 sectors допустимы,
 а более крупный chunk возвращает ошибку вместо обрезания count до `u8`.
 Writer собирает и синхронно записывает полный новый image, но сам по себе не
 является atomic replace. Production dirty-flush пишет его через
-`write_region_create_new` во временный файл и только затем делает rename;
-create-new защищает recovery path от перезаписи чужого временного решения.
+`write_region_create_new` во временный файл, затем устанавливает через общую
+`atomic_file` boundary. Existing target заменяется атомарно на Unix и через
+`MoveFileExW(REPLACE_EXISTING|WRITE_THROUGH)` на Windows; new-region path
+сохраняет no-overwrite hard-link semantics. Эта же boundary используется
+playerdata, journals и persisted world contract.
 
 `chunk_from_nbt*` декодирует sections, palettes, light, heightmaps, scheduled
 ticks и block entities. Production storage передаёт decoder'у абсолютный

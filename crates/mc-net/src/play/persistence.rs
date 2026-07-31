@@ -366,9 +366,11 @@ fn persist_regional_decisions(
             path: temporary.clone(),
             source,
         })?;
-    std::fs::rename(&temporary, path).map_err(|source| RegionalDecisionJournalOpenError::Io {
-        path: path.to_path_buf(),
-        source,
+    mc_world::atomic_file::replace_file(&temporary, path).map_err(|source| {
+        RegionalDecisionJournalOpenError::Io {
+            path: path.to_path_buf(),
+            source,
+        }
     })?;
     sync_regional_journal_directory(parent)
 }
@@ -2711,9 +2713,11 @@ fn write_player_root(
             path: tmp_path.clone(),
             source,
         })?;
-    std::fs::rename(&tmp_path, path).map_err(|source| PlayerPersistenceError::Io {
-        path: path.to_path_buf(),
-        source,
+    mc_world::atomic_file::replace_file(&tmp_path, path).map_err(|source| {
+        PlayerPersistenceError::Io {
+            path: path.to_path_buf(),
+            source,
+        }
     })?;
     if let Some(parent) = path.parent() {
         sync_directory(parent)?;
