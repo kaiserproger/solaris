@@ -1,5 +1,9 @@
 # Loader Live-Gate Fixture
 
+**Deployment: Requires Solaris Loader on client.** An unmodified vanilla client
+is rejected during Configuration with the supported loader platforms and
+required bundle identities.
+
 This is the isolated two-owner input for the Solaris Loader real-client gate.
 It uses production plugin discovery and artifact transfer; it does not alter a
 PrismLauncher instance.

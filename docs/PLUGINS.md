@@ -14,10 +14,10 @@ current API `0.6.0` behavior.
 
 `mc-net` provides the `0.6.0` plugin-storage, zone, inventory-menu,
 inventory/storage transaction, player-inventory transaction, player-teleport,
-connected-player query, colony-record, villager-binding, and bounded
-villager-order adapters. It also
-publishes committed player block breaks and owner-targeted zone membership
-transitions.
+connected-player query, generic villager-binding, and bounded villager-goal
+adapters. It also publishes committed player block breaks and owner-targeted
+zone membership transitions. Colony identity, roles, orders, and persistence
+remain plugin-owned Luau policy rather than Rust API concepts.
 
 ## Package And Manifest
 
@@ -52,6 +52,21 @@ The available bundled ids are `basic-economy`, `colony-villager-scaffold`,
 `settlement-prototype`. They are disabled unless explicitly listed. Duplicate
 plugin ids across either source fail startup before command, Loader, or worldgen
 metadata can diverge. Ore and settlement ownership conflicts remain fail-fast.
+
+Every currently shipped bundled example is **Server-only** and accepts an
+ordinary vanilla 26.1.2 client. The separate
+`examples/loader-live-gate` fixture is **Requires Solaris Loader on client** and
+exists for the Fabric/NeoForge/Forge compatibility matrix.
+
+| Example | Deployment |
+| --- | --- |
+| `basic-economy` | **Server-only** |
+| `colony-villager-scaffold` | **Server-only** |
+| `geological-mines` | **Server-only** |
+| `land-claims` | **Server-only** |
+| `online-roster` | **Server-only** |
+| `settlement-prototype` | **Server-only** |
+| `loader-live-gate` | **Requires Solaris Loader on client** |
 
 ```toml
 id = "basic-economy"
@@ -168,6 +183,15 @@ platform and loader version, all required permissions, and every cache identity
 before the server accepts `AcknowledgeFinishConfiguration`. A server with no
 client bundles sends no Solaris Loader payload and preserves the vanilla
 configuration path.
+
+`solaris --check` and startup discovery logs derive deployment requirements from
+the validated manifest. For every plugin they report `server_only` or
+`server_and_client`, the sorted supported-loader and permission sets, client
+bundle identities (`id`, `version`, artifact path and SHA-256), each artifact
+size, and the total artifact bytes. There is no duplicate deployment flag. When
+a required Loader handshake fails, Solaris sends a Configuration-state
+disconnect naming the supported loaders and required bundle identities before
+closing the connection.
 
 The Fabric, NeoForge, and Forge clients register these Configuration payloads
 through their native 26.1.2 networking APIs and delegate the received bytes to

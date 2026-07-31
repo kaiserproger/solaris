@@ -230,8 +230,31 @@ fn check_reports_derived_deployment_for_every_plugin() {
     assert_eq!(
         check["discovered_plugins"],
         serde_json::json!([
-            {"id": "server-and-client", "deployment": "server_and_client"},
-            {"id": "server-only", "deployment": "server_only"}
+            {
+                "id": "server-and-client",
+                "deployment": "server_and_client",
+                "supported_loaders": ["fabric"],
+                "permissions": ["load_assets"],
+                "total_artifact_bytes": 1,
+                "client_bundles": [{
+                    "id": "assets",
+                    "version": "1",
+                    "artifact": "client/assets.zip",
+                    "sha256": "2d711642b726b04401627ca9fbac32f5c8530fb1903cc4db02258717921a4881",
+                    "size_bytes": 1,
+                    "loaders": ["fabric"],
+                    "content": ["assets"],
+                    "permissions": ["load_assets"]
+                }]
+            },
+            {
+                "id": "server-only",
+                "deployment": "server_only",
+                "supported_loaders": [],
+                "permissions": [],
+                "total_artifact_bytes": 0,
+                "client_bundles": []
+            }
         ])
     );
 }

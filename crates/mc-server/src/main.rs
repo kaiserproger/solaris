@@ -572,6 +572,11 @@ async fn serve(path: &Path) -> Result<()> {
         tracing::info!(
             plugin_id = plugin.id(),
             deployment = plugin.deployment().contract_name(),
+            supported_loaders = ?plugin.supported_loaders(),
+            permissions = ?plugin.permissions(),
+            bundle_count = plugin.client_bundles().len(),
+            client_bundles = ?plugin.client_bundles(),
+            artifact_bytes = plugin.total_artifact_bytes(),
             "Luau plugin discovered"
         );
     }

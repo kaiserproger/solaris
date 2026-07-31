@@ -18,8 +18,9 @@ use mc_protocol::codec::{Identifier, WriteMc};
 use mc_protocol::frame::{Compression, encode_frame, try_decode_frame};
 use mc_protocol::packets::configuration::{
     AcknowledgeFinishConfiguration, ClientboundCustomPayload, ClientboundKnownPacks,
-    FinishConfiguration, KnownPackEntry, RegistryData, ServerboundClientInformation,
-    ServerboundCustomPayload, ServerboundKnownPacks, UpdateEnabledFeatures, UpdateTags,
+    ConfigurationDisconnect, FinishConfiguration, KnownPackEntry, RegistryData,
+    ServerboundClientInformation, ServerboundCustomPayload, ServerboundKnownPacks,
+    UpdateEnabledFeatures, UpdateTags,
 };
 use mc_protocol::packets::handshake::{Handshake, NextState};
 use mc_protocol::packets::login::{LoginAcknowledged, LoginStart, LoginSuccess, SetCompression};
@@ -690,10 +691,21 @@ async fn configuration_loader_manifest_rejects_missing_ack() {
     )
     .await
     .expect("server did not reject a missing Solaris Loader ack within 2s");
-    assert!(
-        next.is_none(),
-        "server advanced to Play without a loader ack"
+    let mut frame = next.expect("server closed without a Configuration disconnect");
+    assert_eq!(frame.id, ConfigurationDisconnect::ID);
+    let disconnect = ConfigurationDisconnect::decode(&mut frame.body).unwrap();
+    let mut reason = disconnect.reason_nbt.as_slice();
+    assert_eq!(
+        mc_nbt::read_network(&mut reason).unwrap(),
+        mc_nbt::Tag::Compound(vec![(
+            "text".to_owned(),
+            mc_nbt::Tag::String(
+                "This server requires Solaris Loader. Supported loaders: Fabric, NeoForge, Forge. Required bundles: example:screen@1. Install Solaris Loader and reconnect."
+                    .to_owned(),
+            ),
+        )])
     );
+    assert!(reason.is_empty());
 }
 
 #[tokio::test]

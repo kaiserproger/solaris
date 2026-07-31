@@ -40,9 +40,10 @@ use mc_protocol::packets::CustomPayload;
 use mc_protocol::packets::Packet;
 use mc_protocol::packets::configuration::{
     AcknowledgeFinishConfiguration, ClientboundCustomPayload, ClientboundKnownPacks,
-    FinishConfiguration, KnownPackEntry, RegistryData, RegistryEntry, ServerboundClientInformation,
-    ServerboundCustomPayload, ServerboundKnownPacks, ServerboundResourcePack,
-    UpdateEnabledFeatures, UpdateTags, UpdateTagsEntry, UpdateTagsRegistry,
+    ConfigurationDisconnect, FinishConfiguration, KnownPackEntry, RegistryData, RegistryEntry,
+    ServerboundClientInformation, ServerboundCustomPayload, ServerboundKnownPacks,
+    ServerboundResourcePack, UpdateEnabledFeatures, UpdateTags, UpdateTagsEntry,
+    UpdateTagsRegistry,
 };
 use mc_protocol::{CodecError, State, TARGET_RELEASE};
 use mc_world::{ChunkGeometry, OVERWORLD_GEOMETRY};
@@ -59,6 +60,7 @@ use crate::loader::{
 use crate::login::LoggedInProfile;
 
 const MAX_IGNORED_CONFIGURATION_PACKETS: usize = 32;
+const MAX_LOADER_DISCONNECT_BUNDLES: usize = 8;
 const LOADER_HANDSHAKE_READ_TIMEOUT: Duration = Duration::from_secs(120);
 
 fn override_overworld_dimension_geometry(
@@ -396,7 +398,7 @@ where
             protocol = manifest.protocol,
             "sent Solaris Loader manifest"
         );
-        complete_loader_handshake(
+        if let Err(error) = complete_loader_handshake(
             reader,
             writer,
             buf,
@@ -408,7 +410,11 @@ where
             &mut loader_session,
             &mut loader_requests,
         )
-        .await?;
+        .await
+        {
+            send_loader_disconnect(writer, compression, manifest).await;
+            return Err(error);
+        }
     }
 
     // Step 4: tell the client we are done configuring.
@@ -501,6 +507,72 @@ where
         custom_payloads,
         loader_session,
     })
+}
+
+async fn send_loader_disconnect<W>(
+    writer: &mut W,
+    compression: Compression,
+    manifest: &LoaderManifest,
+) where
+    W: AsyncWriteExt + Unpin,
+{
+    let reason = loader_disconnect_reason(manifest);
+    let reason_nbt = match text_component_nbt(&reason) {
+        Ok(reason_nbt) => reason_nbt,
+        Err(error) => {
+            warn!(?error, "failed to encode Solaris Loader disconnect reason");
+            return;
+        }
+    };
+    if let Err(error) =
+        write_packet(writer, &ConfigurationDisconnect { reason_nbt }, compression).await
+    {
+        debug!(
+            ?error,
+            "failed to send Solaris Loader Configuration disconnect"
+        );
+    }
+}
+
+fn loader_disconnect_reason(manifest: &LoaderManifest) -> String {
+    let loaders = manifest
+        .bundles
+        .iter()
+        .flat_map(|bundle| bundle.loaders.iter().copied())
+        .collect::<BTreeSet<_>>()
+        .into_iter()
+        .map(|loader| match loader {
+            crate::LoaderPlatform::Fabric => "Fabric",
+            crate::LoaderPlatform::NeoForge => "NeoForge",
+            crate::LoaderPlatform::Forge => "Forge",
+        })
+        .collect::<Vec<_>>()
+        .join(", ");
+    let mut bundle_identities = manifest
+        .bundles
+        .iter()
+        .take(MAX_LOADER_DISCONNECT_BUNDLES)
+        .map(|bundle| format!("{}:{}@{}", bundle.owner, bundle.id, bundle.version))
+        .collect::<Vec<_>>();
+    if manifest.bundles.len() > MAX_LOADER_DISCONNECT_BUNDLES {
+        bundle_identities.push(format!(
+            "and {} more",
+            manifest.bundles.len() - MAX_LOADER_DISCONNECT_BUNDLES
+        ));
+    }
+    let bundles = bundle_identities.join(", ");
+    format!(
+        "This server requires Solaris Loader. Supported loaders: {loaders}. Required bundles: {bundles}. Install Solaris Loader and reconnect."
+    )
+}
+
+fn text_component_nbt(text: &str) -> Result<Vec<u8>, CodecError> {
+    let mut out = Vec::new();
+    mc_nbt::write_network(
+        &mut out,
+        &Tag::Compound(vec![("text".to_owned(), Tag::String(text.to_owned()))]),
+    )?;
+    Ok(out)
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1021,5 +1093,47 @@ mod tests {
             ),
             Err(ConnectionError::LoaderHandshake { .. })
         ));
+    }
+
+    #[test]
+    fn loader_disconnect_reason_names_supported_loaders_and_required_bundle() {
+        let manifest = loader_manifest();
+
+        assert_eq!(
+            loader_disconnect_reason(&manifest),
+            "This server requires Solaris Loader. Supported loaders: Fabric, NeoForge, Forge. Required bundles: example:screen@1. Install Solaris Loader and reconnect."
+        );
+    }
+
+    #[tokio::test]
+    async fn loader_handshake_failure_sends_configuration_disconnect() {
+        let manifest = loader_manifest();
+        let (mut server, mut client) = tokio::io::duplex(4_096);
+
+        send_loader_disconnect(&mut server, Compression::Disabled, &manifest).await;
+        let mut buf = BytesMut::new();
+        let frame = read_frame_with_timeout(
+            &mut client,
+            &mut buf,
+            Compression::Disabled,
+            State::Configuration,
+            Duration::from_secs(1),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(frame.id, ConfigurationDisconnect::ID);
+        let mut body = frame.body;
+        let disconnect = ConfigurationDisconnect::decode(&mut body).unwrap();
+        let mut reason = disconnect.reason_nbt.as_slice();
+        let decoded = mc_nbt::read_network(&mut reason).unwrap();
+        assert_eq!(
+            decoded,
+            Tag::Compound(vec![(
+                "text".to_owned(),
+                Tag::String(loader_disconnect_reason(&manifest))
+            )])
+        );
+        assert!(reason.is_empty());
     }
 }

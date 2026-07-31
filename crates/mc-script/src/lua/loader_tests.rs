@@ -70,6 +70,34 @@ permissions = [
     assert_eq!(bundle.owner_plugin_id(), "loader-test");
     assert_eq!(plugin.id(), "loader-test");
     assert_eq!(plugin.deployment(), LuaPluginDeployment::ServerAndClient);
+    assert_eq!(plugin.supported_loaders(), &["fabric", "forge", "neoforge"]);
+    assert_eq!(
+        plugin.permissions(),
+        &[
+            "load_assets",
+            "open_screens",
+            "register_blocks",
+            "register_items",
+            "send_interactions"
+        ]
+    );
+    assert_eq!(plugin.total_artifact_bytes(), 1);
+    assert_eq!(plugin.client_bundles().len(), 1);
+    assert_eq!(plugin.client_bundles()[0].id(), "rich-content");
+    assert_eq!(plugin.client_bundles()[0].version(), "1.2.3");
+    assert_eq!(
+        plugin.client_bundles()[0].artifact(),
+        "client/rich-content.zip"
+    );
+    assert_eq!(plugin.client_bundles()[0].size_bytes(), 1);
+    assert_eq!(
+        plugin.client_bundles()[0].loaders(),
+        &["fabric", "neoforge", "forge"]
+    );
+    assert_eq!(
+        plugin.client_bundles()[0].content(),
+        &["blocks", "items", "screens", "assets", "interactions"]
+    );
     assert_eq!(bundle.id(), "rich-content");
     assert_eq!(
         bundle.loaders(),
@@ -111,6 +139,10 @@ fn plugin_without_client_bundles_is_discovered_as_server_only() {
     assert_eq!(plugins.len(), 1);
     assert_eq!(plugins[0].id(), "loader-test");
     assert_eq!(plugins[0].deployment(), LuaPluginDeployment::ServerOnly);
+    assert!(plugins[0].supported_loaders().is_empty());
+    assert!(plugins[0].permissions().is_empty());
+    assert_eq!(plugins[0].total_artifact_bytes(), 0);
+    assert!(plugins[0].client_bundles().is_empty());
     fs::remove_dir_all(root).unwrap();
 }
 

@@ -304,21 +304,99 @@ impl LuaPluginDeployment {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
-pub struct LuaPluginDiscovery<'a> {
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct LuaClientBundleDiscovery<'a> {
     id: &'a str,
-    deployment: LuaPluginDeployment,
+    version: &'a str,
+    artifact: &'a str,
+    sha256: &'a str,
+    size_bytes: u64,
+    loaders: Vec<&'static str>,
+    content: Vec<&'static str>,
+    permissions: Vec<&'static str>,
 }
 
-impl<'a> LuaPluginDiscovery<'a> {
+impl<'a> LuaClientBundleDiscovery<'a> {
     #[must_use]
-    pub const fn id(self) -> &'a str {
+    pub const fn id(&self) -> &'a str {
         self.id
     }
 
     #[must_use]
-    pub const fn deployment(self) -> LuaPluginDeployment {
+    pub const fn version(&self) -> &'a str {
+        self.version
+    }
+
+    #[must_use]
+    pub const fn artifact(&self) -> &'a str {
+        self.artifact
+    }
+
+    #[must_use]
+    pub const fn sha256(&self) -> &'a str {
+        self.sha256
+    }
+
+    #[must_use]
+    pub const fn size_bytes(&self) -> u64 {
+        self.size_bytes
+    }
+
+    #[must_use]
+    pub fn loaders(&self) -> &[&'static str] {
+        &self.loaders
+    }
+
+    #[must_use]
+    pub fn content(&self) -> &[&'static str] {
+        &self.content
+    }
+
+    #[must_use]
+    pub fn permissions(&self) -> &[&'static str] {
+        &self.permissions
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct LuaPluginDiscovery<'a> {
+    id: &'a str,
+    deployment: LuaPluginDeployment,
+    supported_loaders: Vec<&'static str>,
+    permissions: Vec<&'static str>,
+    total_artifact_bytes: u64,
+    client_bundles: Vec<LuaClientBundleDiscovery<'a>>,
+}
+
+impl<'a> LuaPluginDiscovery<'a> {
+    #[must_use]
+    pub const fn id(&self) -> &'a str {
+        self.id
+    }
+
+    #[must_use]
+    pub const fn deployment(&self) -> LuaPluginDeployment {
         self.deployment
+    }
+
+    #[must_use]
+    pub fn supported_loaders(&self) -> &[&'static str] {
+        &self.supported_loaders
+    }
+
+    #[must_use]
+    pub fn permissions(&self) -> &[&'static str] {
+        &self.permissions
+    }
+
+    #[must_use]
+    pub const fn total_artifact_bytes(&self) -> u64 {
+        self.total_artifact_bytes
+    }
+
+    #[must_use]
+    pub fn client_bundles(&self) -> &[LuaClientBundleDiscovery<'a>] {
+        &self.client_bundles
     }
 }
 
@@ -645,13 +723,70 @@ impl PreparedLuaPlugins {
     }
 
     pub fn discovered_plugins(&self) -> impl ExactSizeIterator<Item = LuaPluginDiscovery<'_>> + '_ {
-        self.sources.iter().map(|source| LuaPluginDiscovery {
-            id: source.manifest.plugin_id(),
-            deployment: if source.client_bundles.is_empty() {
-                LuaPluginDeployment::ServerOnly
-            } else {
-                LuaPluginDeployment::ServerAndClient
-            },
+        self.sources.iter().map(|source| {
+            let supported_loaders = source
+                .client_bundles
+                .iter()
+                .flat_map(|bundle| bundle.loaders.iter().copied())
+                .map(LuaClientLoader::contract_name)
+                .collect::<BTreeSet<_>>()
+                .into_iter()
+                .collect();
+            let permissions = source
+                .client_bundles
+                .iter()
+                .flat_map(|bundle| bundle.permissions.iter().copied())
+                .map(LuaClientPermission::contract_name)
+                .collect::<BTreeSet<_>>()
+                .into_iter()
+                .collect();
+            let total_artifact_bytes = source
+                .client_bundles
+                .iter()
+                .map(LuaClientBundle::size_bytes)
+                .sum();
+            let client_bundles = source
+                .client_bundles
+                .iter()
+                .map(|bundle| LuaClientBundleDiscovery {
+                    id: bundle.id(),
+                    version: bundle.version(),
+                    artifact: bundle.artifact(),
+                    sha256: bundle.sha256(),
+                    size_bytes: bundle.size_bytes(),
+                    loaders: bundle
+                        .loaders()
+                        .iter()
+                        .copied()
+                        .map(LuaClientLoader::contract_name)
+                        .collect(),
+                    content: bundle
+                        .content()
+                        .iter()
+                        .copied()
+                        .map(LuaClientContentKind::contract_name)
+                        .collect(),
+                    permissions: bundle
+                        .permissions()
+                        .iter()
+                        .copied()
+                        .map(LuaClientPermission::contract_name)
+                        .collect(),
+                })
+                .collect();
+
+            LuaPluginDiscovery {
+                id: source.manifest.plugin_id(),
+                deployment: if source.client_bundles.is_empty() {
+                    LuaPluginDeployment::ServerOnly
+                } else {
+                    LuaPluginDeployment::ServerAndClient
+                },
+                supported_loaders,
+                permissions,
+                total_artifact_bytes,
+                client_bundles,
+            }
         })
     }
 

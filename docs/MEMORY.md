@@ -7,26 +7,28 @@ and is not startup context.
 
 ## Current Checkpoint
 
-- Date: 2026-07-30.
+- Date: 2026-07-31.
 - Branch: `main`.
-- Checkpoint head: guardian beam combat pending commit.
-  The first owner-run public-alpha session remains the routing authority for the
+- The first owner-run public-alpha session remains the routing authority for the
   next stabilization release; its exact plan is `docs/PUBLIC_ALPHA_PLAN.md`.
 - The future full Luau addon platform is frozen in
   `docs/LUAU_ADDON_API_1_0_SPEC.md`; its 145-task decomposition is in
   `docs/LUAU_ADDON_API_1_0_TASKS.md`. Only the two documentation tasks are
   complete and all 143 runtime tasks remain `BLOCKED-VP` until scoped vanilla
   parity and explicit owner activation.
-- The latest bounded parity slice closes guardian beam combat. Guardian and elder
-  guardian now carry runtime-only warmup/beam state, exact 10-tick warmup and
-  80/60-tick beam durations, target metadata index 17, event 21, and ordered
-  indirect-magic then mob-attack damage. Canonical attributes are now present in
-  the entity facts table. The current slice targets players through tracking
-  visibility; full LOS, squid/axolotl targets, thorns, elder fatigue and runtime
-  difficulty selection remain open.
-- The active cursor is no longer broad mob growth. Close `PUBLIC_ALPHA_PLAN.md`
-  release blockers in order: periodic natural spawning, plugin deployment
-  reporting, then release-closeout validation. Graphical owner-host evidence
+- The interrupted colony checkpoint is already complete in `4902a3d`: colony
+  identity, roles, orders, and persistence live in Luau/plugin storage, while
+  Rust exposes only generic villager binding and movement/idle goal primitives.
+- Periodic natural spawning is implemented with independent friendly/hostile
+  cadences, bounded rotating loaded-chunk work, admission fences, refill after
+  movement/despawn, common-biome rules, and metrics. The no-operator 20-minute
+  client observation and restart-identity acceptance gates remain open.
+- Plugin deployment requirements are now fully operator-visible. Discovery,
+  startup logs, and `--check` derive deployment class, supported loaders,
+  permissions, bundle identities, artifact sizes, and totals from validated
+  manifests. Shipped examples carry explicit deployment labels, and a failed
+  required-Loader handshake receives a Configuration disconnect naming the
+  supported platforms and required bundles. The full graphical Loader matrix
   remains external and must not be claimed from this headless workspace.
 - The strong baseline must be preserved: seed `712816`, VD16 and one local player
   pre-generated 225 chunks at 929.473 chunks/s, streamed every requested chunk
@@ -85,14 +87,12 @@ and is not startup context.
   could lose an interleaving motion update. No second reviewer was run; the reviewed
   design was replaced by current-snapshot token resolution and checkpoint-only
   durability, with dedicated regressions for both findings.
-- P1 natural spawning remains a chunk-load materialization path with sparse
-  deterministic chunk admission, global category caps and no complete continuing
-  loaded-chunk spawn cycle. Add independent friendly/hostile attempt cadences,
-  bounded rotating loaded-chunk work, exact conditions and observable metrics.
-- Plugin deployment is already inferable from the manifest: no `[client]` bundles
-  is server-only; any bundle requires Solaris Loader on client and server. Surface
-  that derived classification in `--check`, startup logs and example documentation
-  instead of adding a second manually maintained flag.
+- P1 natural spawning no longer relies on one-shot chunk materialization. The
+  periodic scheduler and common-biome rules are implemented; only the real-client
+  observation and restart-identity acceptance rows remain open.
+- Plugin deployment reporting is complete without a duplicate manifest flag.
+  Remaining Loader work is the external Fabric/NeoForge/Forge visual matrix and
+  any future addon-platform scope explicitly activated by the owner.
 - The worktree may contain unrelated owner files and local artifacts. Inspect
   exact ownership before editing; never clean or stage them by accident.
 - Fresh-player spawn now chooses the nearest non-hazardous collidable support
@@ -611,11 +611,12 @@ two priorities unless it becomes a common-play blocker or corruption risk.
 3. Complete worldgen revision 10 beyond the now-landed spawn and vegetation work:
    coarse drainage, rendered height/biome/vegetation mosaics, seed-`712816` owner
    playtest, restart, and release-host throughput evidence remain.
-4. Replace one-shot chunk-herd materialization with bounded periodic friendly and
-   hostile spawn attempts, independently configurable in ticks and observable in
-   a no-operator survival session.
-5. Expose derived Lua plugin deployment requirements in `--check`, startup logs
-   and example docs: server-only or Solaris Loader required on both sides.
+4. Run the no-operator 20-minute survival and restart gates for the landed
+   periodic friendly/hostile spawn runtime; do not infer client visibility or
+   retained identity from unit scheduling coverage.
+5. Run the real Fabric/NeoForge/Forge Loader matrix for the landed deployment
+   reporting and disconnect contract. Headless packet and harness gates do not
+   replace graphical permission, artifact, screen, asset, and reconnect evidence.
 6. Close `v0.0.2-alpha.1` only after the exact gates in
    `docs/PUBLIC_ALPHA_PLAN.md`; do not substitute warning suppression, unit-only
    seed checks or a merely uncommented `tellus_like` setting.

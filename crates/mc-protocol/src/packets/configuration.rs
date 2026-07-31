@@ -206,6 +206,30 @@ impl Packet for ClientboundCustomPayload {
     }
 }
 
+/// Clientbound Configuration-state disconnect. The reason is the same binary
+/// NBT `Component` payload used by the Play-state disconnect packet.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ConfigurationDisconnect {
+    pub reason_nbt: Vec<u8>,
+}
+
+impl Packet for ConfigurationDisconnect {
+    // `data/vanilla/reports/packets.json`: configuration clientbound
+    // `minecraft:disconnect` is wire id 0x02 for 26.1.2.
+    const ID: i32 = 0x02;
+
+    fn encode<B: BufMut>(&self, buf: &mut B) -> Result<(), CodecError> {
+        buf.put_slice(&self.reason_nbt);
+        Ok(())
+    }
+
+    fn decode<B: Buf>(buf: &mut B) -> Result<Self, CodecError> {
+        let mut reason_nbt = vec![0; buf.remaining()];
+        buf.copy_to_slice(&mut reason_nbt);
+        Ok(Self { reason_nbt })
+    }
+}
+
 /// Serverbound 0x07 — client tells the server which of the advertised
 /// known packs it also has bundled.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -559,6 +583,15 @@ mod tests {
             packet
         );
         assert!(cursor.is_empty());
+    }
+
+    #[test]
+    fn configuration_disconnect_id_and_payload_match_26_1_2() {
+        let packet = ConfigurationDisconnect {
+            reason_nbt: vec![0x0A, 0x00, 0x08, b't', b'e', b'x', b't', 0x00],
+        };
+        assert_eq!(ConfigurationDisconnect::ID, 0x02);
+        round_trip(packet);
     }
 
     #[test]

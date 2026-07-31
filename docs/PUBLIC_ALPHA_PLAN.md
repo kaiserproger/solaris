@@ -578,9 +578,10 @@ below common play, persistence safety, and plugin progress.
 production API must preserve regional/simulation authority rather than exposing
 internal locks or mutable registries to scripts.
 
-1. [ ] Finish plugin discovery and derived deployment reporting:
+1. [x] Finish plugin discovery and derived deployment reporting:
    `server_only | server_and_client`, permissions, loader support, bundle
-   identities, and artifact sizes.
+   identities, and artifact sizes. The operator-visible contract is recorded in
+   [`evidence/plugin-deployment-reporting.md`](evidence/plugin-deployment-reporting.md).
 2. [ ] Implement deterministic runtime lifecycle, sandboxing, capability checks,
    resource budgets, failure isolation, reload/shutdown semantics, and actionable
    diagnostics.
@@ -1052,7 +1053,7 @@ Acceptance:
   loaded simulation chunks.
 - [ ] Restart does not duplicate deterministic identities or lose retained entities.
 
-### P1 — Plugin deployment requirements are implicit instead of operator-visible
+### P1 — Plugin deployment requirements are operator-visible (complete)
 
 The manifest already provides the authoritative distinction:
 
@@ -1070,12 +1071,13 @@ Required change:
 2. [x] Show it in startup logs and `solaris --check` JSON for every plugin. The
    implementation and focused validation are recorded in
    [`evidence/plugin-deployment-reporting.md`](evidence/plugin-deployment-reporting.md).
-3. [ ] For client-required plugins, report supported loaders, bundle identities,
+3. [x] For client-required plugins, report supported loaders, bundle identities,
    permissions and total artifact bytes.
-4. [ ] Label every shipped example plugin README and the main plugin documentation as
+4. [x] Label every shipped example plugin README and the main plugin documentation as
    **Server-only** or **Requires Solaris Loader on client**.
-5. [ ] Use a precise disconnect message when a client-required plugin cannot complete
-   the Loader handshake.
+5. [x] Use a precise Configuration-state disconnect message when a client-required
+   plugin cannot complete the Loader handshake; name supported platforms and
+   required bundle identities.
 
 Acceptance:
 
