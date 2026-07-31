@@ -179,6 +179,17 @@ impl ChunkSection {
             BlockStorage::Indirect { palette, .. } => Some(palette),
         }
     }
+
+    #[must_use]
+    pub(crate) fn estimated_heap_bytes(&self) -> usize {
+        match &self.storage {
+            BlockStorage::Single(_) => 0,
+            BlockStorage::Indirect { palette, indices } => palette
+                .capacity()
+                .saturating_mul(std::mem::size_of::<BlockStateId>())
+                .saturating_add(indices.estimated_heap_bytes()),
+        }
+    }
 }
 
 /// Promote a previously single-valued section to indirect mode after
@@ -319,6 +330,13 @@ impl PackedBitArray {
     #[must_use]
     pub fn words(&self) -> &[u64] {
         &self.data
+    }
+
+    #[must_use]
+    pub(crate) fn estimated_heap_bytes(&self) -> usize {
+        self.data
+            .capacity()
+            .saturating_mul(std::mem::size_of::<u64>())
     }
 }
 

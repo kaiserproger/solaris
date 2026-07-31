@@ -20,8 +20,8 @@ and is not startup context.
   loading, `SOL-032` bounded sidecar traversal, `SOL-013` bounded Anvil
   region/chunk decompression, `SOL-014` atomic Anvil writer preflight, and
   `SOL-015` Anvil sector/checksum integrity, `SOL-020` chunk-position identity,
-  and `SOL-017` writable-world process leasing are complete; `SOL-027`
-  resident/dirty byte backpressure is next.
+  `SOL-017` writable-world process leasing, and `SOL-027` resident/dirty byte
+  backpressure are complete; `SOL-040` portable atomic replace is next.
 - The first owner-run public-alpha session remains the routing authority for the
   next stabilization release; its exact plan is `docs/PUBLIC_ALPHA_PLAN.md`.
 - The future full Luau addon platform is frozen in

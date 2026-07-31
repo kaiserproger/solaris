@@ -662,6 +662,12 @@ after a crash, but the OS releases the lease with the process and the next write
 overwrites it. The guard stays inside `WorldStorage`, so world journal,
 playerdata, plugin storage, and region flush run while the process owns the root.
 
+Resident admission ограничен одновременно count и консервативной heap-byte
+оценкой chunk payload. Dirty budget ниже resident budget и оставляет reserve для
+flush work; при all-dirty pressure или unhealthy save новый chunk получает typed
+`ChunkCachePressure`, а не расширяет cache. `WorldStorageStats` публикует оба
+byte counters, budgets и save-health state.
+
 `WorldMutationView` является узким mutation boundary поверх resident store. Он
 дает conditional operations, а не raw `&mut Chunk`.
 

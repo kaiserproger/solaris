@@ -480,7 +480,7 @@ fn multi_region_commit_installs_stable_region_and_skips_changed_region() {
     let tmp = tempfile::tempdir().unwrap();
     std::fs::create_dir_all(tmp.path().join("region")).unwrap();
     let registry = air_stone_registry();
-    let mut world = WorldStorage::open_with_capacity(tmp.path(), Arc::clone(&registry), 2).unwrap();
+    let mut world = WorldStorage::open_with_capacity(tmp.path(), Arc::clone(&registry), 3).unwrap();
     let biome = Identifier::parse("minecraft:plains").unwrap();
     let changed_region_first = ChunkPos { x: 0, z: 0 };
     let changed_region_second = ChunkPos { x: 1, z: 0 };

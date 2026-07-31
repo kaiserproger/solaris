@@ -686,14 +686,22 @@ impl WorldStorage {
         let mut stale_retries = 0usize;
         let mut flushed_chunks = 0usize;
         loop {
-            let plan = self.plan_dirty_flush_at_tick(current_tick)?;
+            let plan = match self.plan_dirty_flush_at_tick(current_tick) {
+                Ok(plan) => plan,
+                Err(error) => {
+                    self.mark_save_unhealthy();
+                    return Err(error);
+                }
+            };
             if !plan.captures_all_dirty_chunks() {
+                self.mark_save_unhealthy();
                 return Err(WorldError::JournalPendingDirtyChunks {
                     dirty_chunks: plan.dirty_chunks_at_capture(),
                     flushable_chunks: plan.chunk_count(),
                 });
             }
             if plan.is_empty() {
+                self.mark_save_healthy();
                 return Ok(flushed_chunks);
             }
             let planned_chunks = plan.chunk_count();
@@ -705,12 +713,14 @@ impl WorldStorage {
                 Ok(cleaned) => {
                     flushed_chunks = flushed_chunks.saturating_add(cleaned);
                     if cleaned == planned_chunks {
+                        self.mark_save_healthy();
                         return Ok(flushed_chunks);
                     }
                     if stale_retries < DIRTY_FLUSH_STALE_REGION_RETRIES {
                         stale_retries += 1;
                         continue;
                     }
+                    self.mark_save_unhealthy();
                     return Err(WorldError::ResidentChangedDuringFlush {
                         attempts: stale_retries.saturating_add(1),
                         remaining_dirty: self.dirty_count(),
@@ -721,7 +731,10 @@ impl WorldStorage {
                 {
                     stale_retries += 1;
                 }
-                Err(err) => return Err(err),
+                Err(err) => {
+                    self.mark_save_unhealthy();
+                    return Err(err);
+                }
             }
         }
     }

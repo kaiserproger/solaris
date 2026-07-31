@@ -33,6 +33,7 @@ use crate::light::ChunkLight;
 use crate::resident::{ResidentChunkStore, WorldMutationView};
 use crate::section::SECTION_DIM;
 
+mod budget;
 mod dirty_flush;
 mod read_view;
 #[cfg(test)]
@@ -58,6 +59,8 @@ const DEFAULT_LRU_CAPACITY: usize = 16;
 /// pragmatic default that covers the M3.e view-distance ring around
 /// a single player without growing unboundedly.
 const DEFAULT_REGION_LRU_CAPACITY: usize = 4;
+const DEFAULT_RESIDENT_BYTES_PER_CHUNK: usize = 8 * 1024 * 1024;
+const DEFAULT_FLUSH_RESERVE_BYTES: usize = 16 * 1024 * 1024;
 /// A decoded region: per-chunk payload bytes ready for
 /// `mc_nbt::read_named`, keyed by the chunk's local-to-region
 /// coordinates `(local_x, local_z)`. Wrapped in an `Arc` in
@@ -88,6 +91,22 @@ pub enum WorldError {
     },
     #[error("world was opened read-only and cannot be flushed: {0}")]
     ReadOnlyWorld(PathBuf),
+    #[error(
+        "chunk cache pressure: request {requested_bytes} bytes, resident {resident_bytes}/{resident_budget}, dirty {dirty_bytes}/{dirty_budget}, save_healthy={save_healthy}"
+    )]
+    ChunkCachePressure {
+        requested_bytes: usize,
+        resident_bytes: usize,
+        resident_budget: usize,
+        dirty_bytes: usize,
+        dirty_budget: usize,
+        save_healthy: bool,
+    },
+    #[error("invalid chunk-cache byte budgets: resident={resident_budget}, dirty={dirty_budget}")]
+    InvalidChunkCacheBudgets {
+        resident_budget: usize,
+        dirty_budget: usize,
+    },
     #[error(
         "chunk position mismatch: expected ({expected_x},{expected_z}), held ({actual_x},{actual_z})"
     )]
@@ -125,6 +144,14 @@ fn ensure_chunk_position(expected: ChunkPos, actual: ChunkPos) -> Result<(), Wor
     Ok(())
 }
 
+fn default_chunk_byte_budgets(capacity: usize) -> (usize, usize) {
+    let resident = capacity
+        .max(1)
+        .saturating_mul(DEFAULT_RESIDENT_BYTES_PER_CHUNK);
+    let reserve = DEFAULT_FLUSH_RESERVE_BYTES.min(resident / 4);
+    (resident, resident.saturating_sub(reserve).max(1))
+}
+
 /// Handle to a world's chunk data, generated chunks, and dirty flush state.
 pub struct WorldStorage {
     world_root: Option<PathBuf>,
@@ -144,6 +171,9 @@ pub struct WorldStorage {
     /// the accessed key to the back.
     lru: VecDeque<ChunkPos>,
     capacity: usize,
+    resident_byte_budget: usize,
+    dirty_byte_budget: usize,
+    save_healthy: bool,
     /// LRU of *decoded* region files, keyed by region coordinates.
     /// Each entry maps `(local_x, local_z)` → already-decompressed
     /// chunk payload (raw NBT bytes ready for `mc_nbt::read_named`).
@@ -169,9 +199,14 @@ pub struct WorldStorage {
 pub struct WorldStorageStats {
     pub chunk_cache_len: usize,
     pub chunk_cache_capacity: usize,
+    pub resident_bytes: usize,
+    pub resident_byte_budget: usize,
     pub region_cache_len: usize,
     pub region_cache_capacity: usize,
     pub dirty_chunks: usize,
+    pub dirty_bytes: usize,
+    pub dirty_byte_budget: usize,
+    pub save_healthy: bool,
     pub dirty_chunk_cache_saturated: bool,
 }
 
@@ -292,6 +327,7 @@ impl WorldStorage {
         };
 
         let capacity = capacity.max(1);
+        let (resident_byte_budget, dirty_byte_budget) = default_chunk_byte_budgets(capacity);
         let read_view = WorldReadView::with_capacity(capacity);
         let scheduled_tick_view =
             ScheduledTickView::with_publication(read_view.publication_state());
@@ -311,6 +347,9 @@ impl WorldStorage {
             scheduled_tick_view,
             lru: VecDeque::new(),
             capacity,
+            resident_byte_budget,
+            dirty_byte_budget,
+            save_healthy: true,
             regions: HashMap::new(),
             region_lru: VecDeque::new(),
             region_capacity: region_capacity.max(1),
@@ -332,6 +371,7 @@ impl WorldStorage {
     #[must_use]
     pub fn in_memory_with_capacity(registry: Arc<BlockRegistry>, capacity: usize) -> Self {
         let capacity = capacity.max(1);
+        let (resident_byte_budget, dirty_byte_budget) = default_chunk_byte_budgets(capacity);
         let read_view = WorldReadView::with_capacity(capacity);
         let scheduled_tick_view =
             ScheduledTickView::with_publication(read_view.publication_state());
@@ -351,6 +391,9 @@ impl WorldStorage {
             scheduled_tick_view,
             lru: VecDeque::new(),
             capacity,
+            resident_byte_budget,
+            dirty_byte_budget,
+            save_healthy: true,
             regions: HashMap::new(),
             region_lru: VecDeque::new(),
             region_capacity: DEFAULT_REGION_LRU_CAPACITY,
@@ -499,10 +542,7 @@ impl WorldStorage {
             return Ok(false);
         }
         chunk.mark_dirty();
-        while !self.resident.contains(position)
-            && self.resident.len() >= self.capacity
-            && self.evict_clean_chunk()
-        {}
+        self.prepare_new_chunk_admission(position, &chunk)?;
         self.resident.replace(position, Arc::new(chunk));
         self.lru.retain(|cached| *cached != position);
         self.lru.push_back(position);
@@ -525,7 +565,14 @@ impl WorldStorage {
 
     #[must_use]
     pub fn can_cache_new_chunk(&self, cpos: ChunkPos) -> bool {
-        self.resident.contains(cpos) || !self.dirty_chunk_cache_saturated()
+        if self.resident.contains(cpos) {
+            return true;
+        }
+        let (resident_bytes, dirty_bytes) = self.chunk_byte_usage();
+        self.resident.len() < self.capacity
+            && resident_bytes < self.resident_byte_budget
+            && dirty_bytes < self.dirty_byte_budget
+            && (self.save_healthy || dirty_bytes == 0)
     }
 
     /// Clone a resident chunk without disk IO or generation.
@@ -1101,11 +1148,7 @@ impl WorldStorage {
             self.touch(cpos);
             return Ok(());
         }
-        // Dirty chunks are never evicted here: flushing them can rewrite
-        // region files while callers hold the shared world mutex. If every
-        // resident chunk is dirty, the cache grows until the save pipeline
-        // commits them clean.
-        while self.resident.len() >= self.capacity && self.evict_clean_chunk() {}
+        self.prepare_new_chunk_admission(cpos, &chunk)?;
         self.resident.insert_if_absent(cpos, chunk);
         self.lru.push_back(cpos);
         Ok(())
@@ -1177,19 +1220,29 @@ impl WorldStorage {
 
     #[must_use]
     pub fn stats(&self) -> WorldStorageStats {
+        let (resident_bytes, dirty_bytes) = self.chunk_byte_usage();
         WorldStorageStats {
             chunk_cache_len: self.resident.len(),
             chunk_cache_capacity: self.capacity,
+            resident_bytes,
+            resident_byte_budget: self.resident_byte_budget,
             region_cache_len: self.regions.len(),
             region_cache_capacity: self.region_capacity,
             dirty_chunks: self.dirty_count(),
+            dirty_bytes,
+            dirty_byte_budget: self.dirty_byte_budget,
+            save_healthy: self.save_healthy,
             dirty_chunk_cache_saturated: self.dirty_chunk_cache_saturated(),
         }
     }
 
     #[must_use]
     pub fn dirty_chunk_cache_saturated(&self) -> bool {
-        self.resident.len() >= self.capacity && self.resident.dirty_count() == self.resident.len()
+        let (resident_bytes, dirty_bytes) = self.chunk_byte_usage();
+        (self.resident.len() >= self.capacity && self.resident.dirty_count() == self.resident.len())
+            || resident_bytes >= self.resident_byte_budget
+            || dirty_bytes >= self.dirty_byte_budget
+            || (!self.save_healthy && dirty_bytes != 0)
     }
 }
 
@@ -3834,7 +3887,7 @@ mod tests {
     }
 
     #[test]
-    fn dirty_lru_eviction_does_not_flush_under_insert() {
+    fn dirty_lru_pressure_rejects_growth_without_flushing_under_insert() {
         use crate::chunk::ChunkGenerator;
         use mc_data::Identifier;
 
@@ -3885,13 +3938,16 @@ mod tests {
         );
         assert_eq!(world.dirty_count(), 1);
 
-        assert_eq!(
-            world.get_block(BlockPos { x: 16, y: 0, z: 0 }).unwrap(),
-            Some(BlockStateId(1))
-        );
+        assert!(matches!(
+            world.get_block(BlockPos { x: 16, y: 0, z: 0 }),
+            Err(WorldError::ChunkCachePressure {
+                save_healthy: true,
+                ..
+            })
+        ));
 
-        assert_eq!(world.cache_len(), 2);
-        assert_eq!(world.dirty_count(), 2);
+        assert_eq!(world.cache_len(), 1);
+        assert_eq!(world.dirty_count(), 1);
         assert!(!tmp_world.path().join("region/r.0.0.mca").exists());
     }
 

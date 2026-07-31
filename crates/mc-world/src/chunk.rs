@@ -382,6 +382,23 @@ impl BiomeSection {
             BiomeSection::Indirect { palette, .. } => palette,
         }
     }
+
+    #[must_use]
+    fn estimated_heap_bytes(&self) -> usize {
+        match self {
+            BiomeSection::Single(id) => id.as_str().len(),
+            BiomeSection::Indirect { palette, indices } => palette
+                .capacity()
+                .saturating_mul(std::mem::size_of::<Identifier>())
+                .saturating_add(
+                    palette
+                        .iter()
+                        .map(|identifier| identifier.as_str().len())
+                        .sum::<usize>(),
+                )
+                .saturating_add(indices.estimated_heap_bytes()),
+        }
+    }
 }
 
 /// One named heightmap (e.g. `MOTION_BLOCKING`, `WORLD_SURFACE`).
@@ -436,6 +453,11 @@ impl Heightmap {
     #[must_use]
     pub fn words(&self) -> &[u64] {
         self.data.words()
+    }
+
+    #[must_use]
+    fn estimated_heap_bytes(&self) -> usize {
+        self.data.estimated_heap_bytes()
     }
 }
 
@@ -529,6 +551,41 @@ pub struct Chunk {
     block_mutation_versions: HashMap<u32, u64>,
 }
 
+fn furnace_slot_heap_bytes(slot: &FurnaceSlot) -> usize {
+    slot.enchantments
+        .capacity()
+        .saturating_mul(std::mem::size_of::<mc_data::ItemEnchantment>())
+}
+
+fn tag_heap_bytes(tag: &Tag) -> usize {
+    match tag {
+        Tag::Byte(_)
+        | Tag::Short(_)
+        | Tag::Int(_)
+        | Tag::Long(_)
+        | Tag::Float(_)
+        | Tag::Double(_) => 0,
+        Tag::ByteArray(values) => values.capacity().saturating_mul(std::mem::size_of::<i8>()),
+        Tag::String(value) => value.capacity(),
+        Tag::List(list) => list
+            .elements
+            .capacity()
+            .saturating_mul(std::mem::size_of::<Tag>())
+            .saturating_add(list.elements.iter().map(tag_heap_bytes).sum::<usize>()),
+        Tag::Compound(entries) => entries
+            .capacity()
+            .saturating_mul(std::mem::size_of::<(String, Tag)>())
+            .saturating_add(
+                entries
+                    .iter()
+                    .map(|(name, value)| name.capacity().saturating_add(tag_heap_bytes(value)))
+                    .sum::<usize>(),
+            ),
+        Tag::IntArray(values) => values.capacity().saturating_mul(std::mem::size_of::<i32>()),
+        Tag::LongArray(values) => values.capacity().saturating_mul(std::mem::size_of::<i64>()),
+    }
+}
+
 /// M7: production interface every chunk generator implements. Lives
 /// in `mc-world` rather than `mc-worldgen` so `WorldStorage` can hold
 /// an `Arc<dyn ChunkGenerator>` without taking a dep cycle. The
@@ -547,6 +604,163 @@ pub trait ChunkGenerator: Send + Sync {
 }
 
 impl Chunk {
+    /// Conservative heap-accounting estimate used for resident-cache admission.
+    /// It counts owned allocation capacities and nested payloads, not allocator
+    /// metadata, so callers should retain headroom rather than treating it as RSS.
+    #[must_use]
+    pub fn estimated_heap_bytes(&self) -> usize {
+        let mut bytes = std::mem::size_of::<Self>();
+        bytes = bytes
+            .saturating_add(
+                self.sections
+                    .capacity()
+                    .saturating_mul(std::mem::size_of::<ChunkSection>()),
+            )
+            .saturating_add(
+                self.sections
+                    .iter()
+                    .map(ChunkSection::estimated_heap_bytes)
+                    .sum::<usize>(),
+            )
+            .saturating_add(
+                self.biomes
+                    .capacity()
+                    .saturating_mul(std::mem::size_of::<BiomeSection>()),
+            )
+            .saturating_add(
+                self.biomes
+                    .iter()
+                    .map(BiomeSection::estimated_heap_bytes)
+                    .sum::<usize>(),
+            )
+            .saturating_add(self.highest_opaque.estimated_heap_bytes())
+            .saturating_add(self.status.capacity())
+            .saturating_add(
+                self.block_mutation_versions
+                    .capacity()
+                    .saturating_mul(std::mem::size_of::<(u32, u64)>()),
+            );
+        bytes = bytes.saturating_add(
+            self.heightmaps
+                .capacity()
+                .saturating_mul(std::mem::size_of::<(String, Heightmap)>())
+                .saturating_add(
+                    self.heightmaps
+                        .iter()
+                        .map(|(name, map)| {
+                            name.capacity().saturating_add(map.estimated_heap_bytes())
+                        })
+                        .sum::<usize>(),
+                ),
+        );
+        bytes = bytes.saturating_add(
+            self.block_entities
+                .capacity()
+                .saturating_mul(std::mem::size_of::<(BlockPos, Vec<u8>)>())
+                .saturating_add(
+                    self.block_entities
+                        .values()
+                        .map(Vec::capacity)
+                        .sum::<usize>(),
+                ),
+        );
+        bytes = bytes.saturating_add(
+            self.furnaces
+                .capacity()
+                .saturating_mul(std::mem::size_of::<(BlockPos, FurnaceBlockEntity)>())
+                .saturating_add(
+                    self.furnaces
+                        .values()
+                        .map(|furnace| {
+                            furnace
+                                .slots
+                                .iter()
+                                .map(furnace_slot_heap_bytes)
+                                .sum::<usize>()
+                                .saturating_add(
+                                    furnace
+                                        .recipes_used
+                                        .keys()
+                                        .map(|name| name.capacity())
+                                        .sum::<usize>(),
+                                )
+                        })
+                        .sum::<usize>(),
+                ),
+        );
+        bytes = bytes.saturating_add(
+            self.chests
+                .capacity()
+                .saturating_mul(std::mem::size_of::<(BlockPos, ChestBlockEntity)>())
+                .saturating_add(
+                    self.chests
+                        .values()
+                        .flat_map(|chest| chest.slots.iter())
+                        .map(furnace_slot_heap_bytes)
+                        .sum::<usize>(),
+                ),
+        );
+        bytes = bytes.saturating_add(
+            self.hoppers
+                .capacity()
+                .saturating_mul(std::mem::size_of::<(BlockPos, HopperBlockEntity)>())
+                .saturating_add(
+                    self.hoppers
+                        .values()
+                        .flat_map(|hopper| hopper.slots.iter())
+                        .map(furnace_slot_heap_bytes)
+                        .sum::<usize>(),
+                ),
+        );
+        bytes = bytes.saturating_add(
+            self.scheduled_block_ticks
+                .capacity()
+                .saturating_mul(std::mem::size_of::<ScheduledBlockTick>())
+                .saturating_add(
+                    self.scheduled_block_ticks
+                        .iter()
+                        .map(|tick| tick.block.as_str().len())
+                        .sum::<usize>(),
+                ),
+        );
+        bytes = bytes.saturating_add(
+            self.scheduled_fluid_ticks
+                .capacity()
+                .saturating_mul(std::mem::size_of::<ScheduledFluidTick>())
+                .saturating_add(
+                    self.scheduled_fluid_ticks
+                        .iter()
+                        .map(|tick| tick.fluid.as_str().len())
+                        .sum::<usize>(),
+                ),
+        );
+        bytes = bytes.saturating_add(
+            self.section_lights
+                .capacity()
+                .saturating_mul(std::mem::size_of::<SectionLight>())
+                .saturating_add(
+                    self.section_lights
+                        .iter()
+                        .map(|light| {
+                            light.block.as_ref().map_or(0, Vec::capacity)
+                                + light.sky.as_ref().map_or(0, Vec::capacity)
+                        })
+                        .sum::<usize>(),
+                ),
+        );
+        bytes.saturating_add(
+            self.extras
+                .capacity()
+                .saturating_mul(std::mem::size_of::<(String, Tag)>())
+                .saturating_add(
+                    self.extras
+                        .iter()
+                        .map(|(name, value)| name.capacity().saturating_add(tag_heap_bytes(value)))
+                        .sum::<usize>(),
+                ),
+        )
+    }
+
     /// A column filled with `air` blocks and `biome` everywhere, no
     /// block entities, no heightmaps, status `"full"`.
     #[must_use]
