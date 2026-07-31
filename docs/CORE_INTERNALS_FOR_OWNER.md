@@ -710,9 +710,11 @@ arrays для protocol.
 
 ### 12.7 Anvil и NBT
 
-`read_region` проверяет location/timestamp tables, sectors, compression и
-bounds. `write_region` до открытия output проверяет local coordinates,
-duplicate slots, decoded budgets и точный sector count: 255 sectors допустимы,
+`read_region` до decode проверяет всю location table: ссылки на reserved header
+sectors, полный extent каждого allocation и overlap между chunk slots. LZ4Block
+дополнительно проверяет xxHash32 checksum каждого decoded block и end marker.
+`write_region` до открытия output проверяет local coordinates, duplicate slots,
+decoded budgets и точный sector count: 255 sectors допустимы,
 а более крупный chunk возвращает ошибку вместо обрезания count до `u8`.
 Writer собирает и синхронно записывает полный новый image, но сам по себе не
 является atomic replace. Production dirty-flush пишет его через

@@ -46,6 +46,12 @@ const LZ4_BLOCK_MAGIC: &[u8; 8] = b"LZ4Block";
 const LZ4_BLOCK_HEADER_LEN: usize = 21;
 const LZ4_BLOCK_METHOD_RAW: u8 = 0x10;
 const LZ4_BLOCK_METHOD_COMPRESSED: u8 = 0x20;
+const LZ4_CHECKSUM_SEED: u32 = 0x9747_B28C;
+const XXH32_PRIME1: u32 = 0x9E37_79B1;
+const XXH32_PRIME2: u32 = 0x85EB_CA77;
+const XXH32_PRIME3: u32 = 0xC2B2_AE3D;
+const XXH32_PRIME4: u32 = 0x27D4_EB2F;
+const XXH32_PRIME5: u32 = 0x1656_67B1;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(u8)]
@@ -109,17 +115,38 @@ pub enum RegionError {
         sectors: usize,
         max_sectors: usize,
     },
-    #[error(
-        "chunk slot ({cx},{cz}) points at sector {sector} which is past the file's {sector_count} sectors"
-    )]
-    SectorOutOfRange {
+    #[error("region {path} chunk slot ({cx},{cz}) points into reserved header sector {sector}")]
+    ReservedSector {
+        path: PathBuf,
         cx: u8,
         cz: u8,
         sector: u32,
-        sector_count: usize,
     },
-    #[error("chunk slot ({cx},{cz}) has nonzero offset but zero sector count")]
-    ZeroSectorCount { cx: u8, cz: u8 },
+    #[error(
+        "region {path} chunk slot ({cx},{cz}) extent [{sector},{end_sector}) exceeds file length {file_bytes} bytes"
+    )]
+    SectorExtentOutOfRange {
+        path: PathBuf,
+        cx: u8,
+        cz: u8,
+        sector: u32,
+        end_sector: u32,
+        file_bytes: u64,
+    },
+    #[error(
+        "region {path} chunk slot ({cx},{cz}) overlaps slot ({other_cx},{other_cz}) in sectors [{overlap_start},{overlap_end})"
+    )]
+    OverlappingChunkSectors {
+        path: PathBuf,
+        cx: u8,
+        cz: u8,
+        other_cx: u8,
+        other_cz: u8,
+        overlap_start: u32,
+        overlap_end: u32,
+    },
+    #[error("region {path} chunk slot ({cx},{cz}) has nonzero offset but zero sector count")]
+    ZeroSectorCount { path: PathBuf, cx: u8, cz: u8 },
     #[error(
         "chunk slot ({cx},{cz}) declared length {len} runs past its allocated {bytes_available} bytes"
     )]
@@ -166,12 +193,17 @@ const DEFAULT_REGION_LIMITS: RegionLimits = RegionLimits {
     max_region_bytes: MAX_DECOMPRESSED_REGION_BYTES,
 };
 
+#[derive(Debug, Clone, Copy)]
+struct ChunkLocation {
+    sector: u32,
+    count: u8,
+}
+
 struct RegionReader {
     path: PathBuf,
     file: File,
-    file_len: u64,
-    total_sectors: usize,
     header: [u8; HEADER_BYTES],
+    locations: [Option<ChunkLocation>; REGION_CHUNK_COUNT],
 }
 
 impl RegionReader {
@@ -206,14 +238,12 @@ impl RegionReader {
                 path: path.to_path_buf(),
                 source,
             })?;
-        let total_sectors = usize::try_from(file_len.div_ceil(SECTOR_SIZE as u64))
-            .expect("bounded region sector count fits usize");
+        let locations = validate_location_table(path, &header, file_len)?;
         Ok(Self {
             path: path.to_path_buf(),
             file,
-            file_len,
-            total_sectors,
             header,
+            locations,
         })
     }
 
@@ -225,44 +255,11 @@ impl RegionReader {
     ) -> Result<Option<ChunkPayload>, RegionError> {
         let cx = (slot % CHUNKS_PER_REGION_AXIS) as u8;
         let cz = (slot / CHUNKS_PER_REGION_AXIS) as u8;
-        let loc_off = slot * 4;
-        let loc = u32::from_be_bytes(
-            self.header[loc_off..loc_off + 4]
-                .try_into()
-                .expect("4-byte slice"),
-        );
-        let sector = loc >> 8;
-        let count = (loc & 0xFF) as u8;
-        if sector == 0 && count == 0 {
+        let Some(location) = self.locations[slot] else {
             return Ok(None);
-        }
-        if count == 0 {
-            return Err(RegionError::ZeroSectorCount { cx, cz });
-        }
-
-        let start = u64::from(sector) * SECTOR_SIZE as u64;
-        if start >= self.file_len {
-            return Err(RegionError::SectorOutOfRange {
-                cx,
-                cz,
-                sector,
-                sector_count: self.total_sectors,
-            });
-        }
-        let allocated_end = start
-            .checked_add(u64::from(count) * SECTOR_SIZE as u64)
-            .expect("u24 sector offset plus u8 count fits u64");
-        let end = allocated_end.min(self.file_len);
-        let bytes_available =
-            usize::try_from(end - start).expect("one Anvil chunk allocation fits usize");
-        if bytes_available < 5 {
-            return Err(RegionError::LengthOverrun {
-                cx,
-                cz,
-                len: 0,
-                bytes_available,
-            });
-        }
+        };
+        let start = u64::from(location.sector) * SECTOR_SIZE as u64;
+        let bytes_available = usize::from(location.count) * SECTOR_SIZE;
 
         self.file
             .seek(SeekFrom::Start(start))
@@ -337,6 +334,84 @@ impl RegionReader {
             uncompressed_nbt,
         }))
     }
+}
+
+fn validate_location_table(
+    path: &Path,
+    header: &[u8; HEADER_BYTES],
+    file_len: u64,
+) -> Result<[Option<ChunkLocation>; REGION_CHUNK_COUNT], RegionError> {
+    let mut locations: [Option<ChunkLocation>; REGION_CHUNK_COUNT] = [None; REGION_CHUNK_COUNT];
+    for slot in 0..REGION_CHUNK_COUNT {
+        let cx = (slot % CHUNKS_PER_REGION_AXIS) as u8;
+        let cz = (slot / CHUNKS_PER_REGION_AXIS) as u8;
+        let loc_off = slot * 4;
+        let loc = u32::from_be_bytes(
+            header[loc_off..loc_off + 4]
+                .try_into()
+                .expect("4-byte location entry"),
+        );
+        let sector = loc >> 8;
+        let count = (loc & 0xFF) as u8;
+        if sector == 0 && count == 0 {
+            continue;
+        }
+        if count == 0 {
+            return Err(RegionError::ZeroSectorCount {
+                path: path.to_path_buf(),
+                cx,
+                cz,
+            });
+        }
+        if sector < HEADER_SECTORS as u32 {
+            return Err(RegionError::ReservedSector {
+                path: path.to_path_buf(),
+                cx,
+                cz,
+                sector,
+            });
+        }
+
+        let end_sector = sector
+            .checked_add(u32::from(count))
+            .ok_or(RegionError::RegionSizeOverflow)?;
+        let extent_bytes = u64::from(end_sector)
+            .checked_mul(SECTOR_SIZE as u64)
+            .ok_or(RegionError::RegionSizeOverflow)?;
+        if extent_bytes > file_len {
+            return Err(RegionError::SectorExtentOutOfRange {
+                path: path.to_path_buf(),
+                cx,
+                cz,
+                sector,
+                end_sector,
+                file_bytes: file_len,
+            });
+        }
+
+        for (other_slot, other) in locations[..slot].iter().enumerate() {
+            let Some(other) = other else {
+                continue;
+            };
+            let other_end = other.sector + u32::from(other.count);
+            let overlap_start = sector.max(other.sector);
+            let overlap_end = end_sector.min(other_end);
+            if overlap_start < overlap_end {
+                return Err(RegionError::OverlappingChunkSectors {
+                    path: path.to_path_buf(),
+                    cx,
+                    cz,
+                    other_cx: (other_slot % CHUNKS_PER_REGION_AXIS) as u8,
+                    other_cz: (other_slot / CHUNKS_PER_REGION_AXIS) as u8,
+                    overlap_start,
+                    overlap_end,
+                });
+            }
+        }
+
+        locations[slot] = Some(ChunkLocation { sector, count });
+    }
+    Ok(locations)
 }
 
 /// Read every populated chunk out of a region file. Empty slots are
@@ -872,12 +947,21 @@ fn allocate_exact_bytes(len: usize, context: &'static str) -> Result<Vec<u8>, st
     Ok(bytes)
 }
 
+#[derive(Debug, Clone, Copy)]
+struct Lz4BlockHeader {
+    token: u8,
+    compressed_len: usize,
+    decompressed_len: usize,
+    checksum: u32,
+}
+
 fn count_lz4_bytes(payload: &[u8], max: usize) -> Result<BoundedLength, std::io::Error> {
     let mut pos = 0_usize;
     let mut total = 0_usize;
     loop {
-        let (token, compressed_len, decompressed_len) = read_lz4_block_header(payload, &mut pos)?;
-        if compressed_len == 0 && decompressed_len == 0 {
+        let header = read_lz4_block_header(payload, &mut pos)?;
+        if header.compressed_len == 0 && header.decompressed_len == 0 {
+            validate_lz4_end_marker(header)?;
             if pos != payload.len() {
                 return Err(std::io::Error::new(
                     std::io::ErrorKind::InvalidData,
@@ -886,8 +970,8 @@ fn count_lz4_bytes(payload: &[u8], max: usize) -> Result<BoundedLength, std::io:
             }
             return Ok(BoundedLength::Exact(total));
         }
-        validate_lz4_method(token, compressed_len, decompressed_len)?;
-        total = total.checked_add(decompressed_len).ok_or_else(|| {
+        validate_lz4_method(header.token, header.compressed_len, header.decompressed_len)?;
+        total = total.checked_add(header.decompressed_len).ok_or_else(|| {
             std::io::Error::new(
                 std::io::ErrorKind::InvalidData,
                 "LZ4 decompressed length overflow",
@@ -896,13 +980,16 @@ fn count_lz4_bytes(payload: &[u8], max: usize) -> Result<BoundedLength, std::io:
         if total > max {
             return Ok(BoundedLength::TooLarge { at_least: total });
         }
-        if payload.len() - pos < compressed_len {
+        if payload.len() - pos < header.compressed_len {
             return Err(std::io::Error::new(
                 std::io::ErrorKind::UnexpectedEof,
                 "truncated LZ4 block payload",
             ));
         }
-        pos += compressed_len;
+        if header.token & 0xF0 == LZ4_BLOCK_METHOD_RAW {
+            verify_lz4_checksum(&payload[pos..pos + header.compressed_len], header.checksum)?;
+        }
+        pos += header.compressed_len;
     }
 }
 
@@ -911,8 +998,9 @@ fn decompress_lz4_exact(payload: &[u8], decoded_len: usize) -> Result<Vec<u8>, s
     let mut pos = 0_usize;
     let mut out_pos = 0_usize;
     loop {
-        let (token, compressed_len, decompressed_len) = read_lz4_block_header(payload, &mut pos)?;
-        if compressed_len == 0 && decompressed_len == 0 {
+        let header = read_lz4_block_header(payload, &mut pos)?;
+        if header.compressed_len == 0 && header.decompressed_len == 0 {
+            validate_lz4_end_marker(header)?;
             if pos != payload.len() || out_pos != decoded_len {
                 return Err(std::io::Error::new(
                     std::io::ErrorKind::InvalidData,
@@ -921,34 +1009,36 @@ fn decompress_lz4_exact(payload: &[u8], decoded_len: usize) -> Result<Vec<u8>, s
             }
             return Ok(out);
         }
-        validate_lz4_method(token, compressed_len, decompressed_len)?;
-        if payload.len() - pos < compressed_len {
+        validate_lz4_method(header.token, header.compressed_len, header.decompressed_len)?;
+        if payload.len() - pos < header.compressed_len {
             return Err(std::io::Error::new(
                 std::io::ErrorKind::UnexpectedEof,
                 "truncated LZ4 block payload",
             ));
         }
-        let out_end = out_pos.checked_add(decompressed_len).ok_or_else(|| {
-            std::io::Error::new(
-                std::io::ErrorKind::InvalidData,
-                "LZ4 output length overflow",
-            )
-        })?;
+        let out_end = out_pos
+            .checked_add(header.decompressed_len)
+            .ok_or_else(|| {
+                std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    "LZ4 output length overflow",
+                )
+            })?;
         if out_end > out.len() {
             return Err(std::io::Error::new(
                 std::io::ErrorKind::InvalidData,
                 "LZ4 output changed between bounded passes",
             ));
         }
-        let block = &payload[pos..pos + compressed_len];
-        match token & 0xF0 {
+        let block = &payload[pos..pos + header.compressed_len];
+        match header.token & 0xF0 {
             LZ4_BLOCK_METHOD_RAW => out[out_pos..out_end].copy_from_slice(block),
             LZ4_BLOCK_METHOD_COMPRESSED => {
                 let written = lz4_flex::block::decompress_into(block, &mut out[out_pos..out_end])
                     .map_err(|error| {
                     std::io::Error::new(std::io::ErrorKind::InvalidData, error)
                 })?;
-                if written != decompressed_len {
+                if written != header.decompressed_len {
                     return Err(std::io::Error::new(
                         std::io::ErrorKind::InvalidData,
                         "LZ4 block decompressed length mismatch",
@@ -957,7 +1047,8 @@ fn decompress_lz4_exact(payload: &[u8], decoded_len: usize) -> Result<Vec<u8>, s
             }
             _ => unreachable!("LZ4 method validated before decode"),
         }
-        pos += compressed_len;
+        verify_lz4_checksum(&out[out_pos..out_end], header.checksum)?;
+        pos += header.compressed_len;
         out_pos = out_end;
     }
 }
@@ -965,7 +1056,7 @@ fn decompress_lz4_exact(payload: &[u8], decoded_len: usize) -> Result<Vec<u8>, s
 fn read_lz4_block_header(
     payload: &[u8],
     pos: &mut usize,
-) -> Result<(u8, usize, usize), std::io::Error> {
+) -> Result<Lz4BlockHeader, std::io::Error> {
     if payload.len() - *pos < LZ4_BLOCK_HEADER_LEN {
         return Err(std::io::Error::new(
             std::io::ErrorKind::UnexpectedEof,
@@ -989,8 +1080,28 @@ fn read_lz4_block_header(
             .try_into()
             .expect("4-byte slice"),
     ) as usize;
+    let checksum = u32::from_le_bytes(
+        payload[*pos + 17..*pos + 21]
+            .try_into()
+            .expect("4-byte slice"),
+    );
     *pos += LZ4_BLOCK_HEADER_LEN;
-    Ok((token, compressed_len, decompressed_len))
+    Ok(Lz4BlockHeader {
+        token,
+        compressed_len,
+        decompressed_len,
+        checksum,
+    })
+}
+
+fn validate_lz4_end_marker(header: Lz4BlockHeader) -> Result<(), std::io::Error> {
+    if header.token & 0xF0 != LZ4_BLOCK_METHOD_RAW || header.checksum != 0 {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "invalid LZ4 end marker",
+        ));
+    }
+    Ok(())
 }
 
 fn validate_lz4_method(
@@ -1010,6 +1121,77 @@ fn validate_lz4_method(
             format!("unknown LZ4 block token {token:#04x}"),
         )),
     }
+}
+
+fn verify_lz4_checksum(bytes: &[u8], expected: u32) -> Result<(), std::io::Error> {
+    let actual = xxhash32(bytes, LZ4_CHECKSUM_SEED);
+    if actual != expected {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            format!("LZ4 block checksum mismatch: expected {expected:#010x}, got {actual:#010x}"),
+        ));
+    }
+    Ok(())
+}
+
+fn xxhash32(bytes: &[u8], seed: u32) -> u32 {
+    let mut pos = 0_usize;
+    let mut hash = if bytes.len() >= 16 {
+        let mut v1 = seed.wrapping_add(XXH32_PRIME1).wrapping_add(XXH32_PRIME2);
+        let mut v2 = seed.wrapping_add(XXH32_PRIME2);
+        let mut v3 = seed;
+        let mut v4 = seed.wrapping_sub(XXH32_PRIME1);
+        while bytes.len() - pos >= 16 {
+            v1 = xxhash32_round(v1, read_u32_le(bytes, pos));
+            v2 = xxhash32_round(v2, read_u32_le(bytes, pos + 4));
+            v3 = xxhash32_round(v3, read_u32_le(bytes, pos + 8));
+            v4 = xxhash32_round(v4, read_u32_le(bytes, pos + 12));
+            pos += 16;
+        }
+        v1.rotate_left(1)
+            .wrapping_add(v2.rotate_left(7))
+            .wrapping_add(v3.rotate_left(12))
+            .wrapping_add(v4.rotate_left(18))
+    } else {
+        seed.wrapping_add(XXH32_PRIME5)
+    };
+
+    hash = hash.wrapping_add(bytes.len() as u32);
+    while bytes.len() - pos >= 4 {
+        hash = hash
+            .wrapping_add(read_u32_le(bytes, pos).wrapping_mul(XXH32_PRIME3))
+            .rotate_left(17)
+            .wrapping_mul(XXH32_PRIME4);
+        pos += 4;
+    }
+    while pos < bytes.len() {
+        hash = hash
+            .wrapping_add(u32::from(bytes[pos]).wrapping_mul(XXH32_PRIME5))
+            .rotate_left(11)
+            .wrapping_mul(XXH32_PRIME1);
+        pos += 1;
+    }
+
+    hash ^= hash >> 15;
+    hash = hash.wrapping_mul(XXH32_PRIME2);
+    hash ^= hash >> 13;
+    hash = hash.wrapping_mul(XXH32_PRIME3);
+    hash ^ (hash >> 16)
+}
+
+fn xxhash32_round(accumulator: u32, input: u32) -> u32 {
+    accumulator
+        .wrapping_add(input.wrapping_mul(XXH32_PRIME2))
+        .rotate_left(13)
+        .wrapping_mul(XXH32_PRIME1)
+}
+
+fn read_u32_le(bytes: &[u8], offset: usize) -> u32 {
+    u32::from_le_bytes(
+        bytes[offset..offset + 4]
+            .try_into()
+            .expect("caller checks four input bytes"),
+    )
 }
 
 #[cfg(test)]
@@ -1082,6 +1264,16 @@ mod tests {
         tmp
     }
 
+    fn overwrite_location(path: &Path, slot: usize, sector: u32, count: u8) {
+        assert!(slot < REGION_CHUNK_COUNT);
+        assert!(sector < (1 << 24));
+        let mut bytes = std::fs::read(path).unwrap();
+        let location = (sector << 8) | u32::from(count);
+        let offset = slot * 4;
+        bytes[offset..offset + 4].copy_from_slice(&location.to_be_bytes());
+        std::fs::write(path, bytes).unwrap();
+    }
+
     fn collect_with_limits(
         path: &Path,
         limits: RegionLimits,
@@ -1130,13 +1322,18 @@ mod tests {
             .div_ceil(SECTOR_SIZE)
     }
 
-    fn lz4_block_payload(method: u8, block: &[u8], decompressed_len: usize) -> Vec<u8> {
+    fn lz4_block_payload(
+        method: u8,
+        block: &[u8],
+        decompressed_len: usize,
+        checksum: u32,
+    ) -> Vec<u8> {
         let mut payload = Vec::new();
         payload.extend_from_slice(LZ4_BLOCK_MAGIC);
         payload.push(method);
         payload.extend_from_slice(&(block.len() as u32).to_le_bytes());
         payload.extend_from_slice(&(decompressed_len as u32).to_le_bytes());
-        payload.extend_from_slice(&0_u32.to_le_bytes());
+        payload.extend_from_slice(&checksum.to_le_bytes());
         payload.extend_from_slice(block);
         payload.extend_from_slice(LZ4_BLOCK_MAGIC);
         payload.push(LZ4_BLOCK_METHOD_RAW);
@@ -1147,12 +1344,22 @@ mod tests {
     }
 
     fn raw_lz4_block_payload(raw: &[u8]) -> Vec<u8> {
-        lz4_block_payload(LZ4_BLOCK_METHOD_RAW, raw, raw.len())
+        lz4_block_payload(
+            LZ4_BLOCK_METHOD_RAW,
+            raw,
+            raw.len(),
+            xxhash32(raw, LZ4_CHECKSUM_SEED),
+        )
     }
 
     fn compressed_lz4_block_payload(raw: &[u8]) -> Vec<u8> {
         let compressed = lz4_flex::block::compress(raw);
-        lz4_block_payload(LZ4_BLOCK_METHOD_COMPRESSED, &compressed, raw.len())
+        lz4_block_payload(
+            LZ4_BLOCK_METHOD_COMPRESSED,
+            &compressed,
+            raw.len(),
+            xxhash32(raw, LZ4_CHECKSUM_SEED),
+        )
     }
 
     #[test]
@@ -1378,6 +1585,46 @@ mod tests {
     }
 
     #[test]
+    fn xxhash32_matches_published_zero_seed_vectors() {
+        assert_eq!(xxhash32(b"", 0), 0x02CC_5D05);
+        assert_eq!(xxhash32(b"a", 0), 0x550D_7456);
+        assert_eq!(xxhash32(b"abc", 0), 0x32D1_53FF);
+    }
+
+    #[test]
+    fn rejects_raw_and_compressed_lz4_checksum_mismatch() {
+        let raw = b"checksum-protected LZ4 payload";
+        for mut payload in [
+            raw_lz4_block_payload(raw),
+            compressed_lz4_block_payload(raw),
+        ] {
+            payload[17] ^= 0x01;
+            let region = synthetic_region(CompressionType::Lz4 as u8, &payload);
+            let error = read_region(region.path()).unwrap_err();
+            assert!(matches!(
+                error,
+                RegionError::Decompress { cx: 0, cz: 0, .. }
+            ));
+            assert!(error.to_string().contains("checksum mismatch"));
+        }
+    }
+
+    #[test]
+    fn rejects_lz4_end_marker_with_nonzero_checksum() {
+        let mut payload = raw_lz4_block_payload(b"payload");
+        let end_marker = payload.len() - LZ4_BLOCK_HEADER_LEN;
+        payload[end_marker + 17..end_marker + 21].copy_from_slice(&1_u32.to_le_bytes());
+        let region = synthetic_region(CompressionType::Lz4 as u8, &payload);
+
+        let error = read_region(region.path()).unwrap_err();
+        assert!(matches!(
+            error,
+            RegionError::Decompress { cx: 0, cz: 0, .. }
+        ));
+        assert!(error.to_string().contains("invalid LZ4 end marker"));
+    }
+
+    #[test]
     fn slot_reader_and_visitor_do_not_require_retaining_the_region() {
         let region = synthetic_region_chunks(&[
             (0, CompressionType::Uncompressed as u8, b"zero".to_vec()),
@@ -1419,6 +1666,108 @@ mod tests {
     }
 
     #[test]
+    fn location_table_rejects_reserved_zero_count_and_overlap_before_decode() {
+        let reserved = synthetic_region(CompressionType::Uncompressed as u8, b"payload");
+        overwrite_location(reserved.path(), 0, 1, 1);
+        assert!(matches!(
+            read_region(reserved.path()),
+            Err(RegionError::ReservedSector {
+                cx: 0,
+                cz: 0,
+                sector: 1,
+                ..
+            })
+        ));
+
+        let zero_count = synthetic_region(CompressionType::Uncompressed as u8, b"payload");
+        overwrite_location(zero_count.path(), 0, 2, 0);
+        assert!(matches!(
+            read_region(zero_count.path()),
+            Err(RegionError::ZeroSectorCount { cx: 0, cz: 0, .. })
+        ));
+
+        let overlap = synthetic_region_chunks(&[
+            (0, CompressionType::Uncompressed as u8, b"first".to_vec()),
+            (1, CompressionType::Uncompressed as u8, b"second".to_vec()),
+        ]);
+        overwrite_location(overlap.path(), 1, 2, 1);
+        let mut visited = 0_usize;
+        let error = visit_region(overlap.path(), |_| visited += 1).unwrap_err();
+        assert_eq!(visited, 0, "structural validation must precede visitors");
+        assert!(matches!(
+            error,
+            RegionError::OverlappingChunkSectors {
+                cx: 1,
+                cz: 0,
+                other_cx: 0,
+                other_cz: 0,
+                overlap_start: 2,
+                overlap_end: 3,
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn location_table_fuzz_matches_interval_oracle() {
+        const FILE_SECTORS: u32 = 16;
+        let mut state = 0xD1B5_4A32_D192_ED03_u64;
+        for case in 0..512 {
+            let mut header = [0_u8; HEADER_BYTES];
+            for _ in 0..12 {
+                state ^= state << 13;
+                state ^= state >> 7;
+                state ^= state << 17;
+                let slot = (state as usize) % REGION_CHUNK_COUNT;
+                let sector = ((state >> 16) as u32) % 20;
+                let count = ((state >> 32) as u8) % 4;
+                let location = (sector << 8) | u32::from(count);
+                let offset = slot * 4;
+                header[offset..offset + 4].copy_from_slice(&location.to_be_bytes());
+            }
+
+            let mut expected_valid = true;
+            let mut intervals = Vec::new();
+            for slot in 0..REGION_CHUNK_COUNT {
+                let offset = slot * 4;
+                let location = u32::from_be_bytes(
+                    header[offset..offset + 4]
+                        .try_into()
+                        .expect("4-byte location"),
+                );
+                let sector = location >> 8;
+                let count = (location & 0xFF) as u8;
+                if sector == 0 && count == 0 {
+                    continue;
+                }
+                let end = sector + u32::from(count);
+                if count == 0
+                    || sector < HEADER_SECTORS as u32
+                    || end > FILE_SECTORS
+                    || intervals
+                        .iter()
+                        .any(|&(start, previous_end)| sector < previous_end && start < end)
+                {
+                    expected_valid = false;
+                    break;
+                }
+                intervals.push((sector, end));
+            }
+
+            let result = validate_location_table(
+                Path::new("fuzz-region.mca"),
+                &header,
+                u64::from(FILE_SECTORS) * SECTOR_SIZE as u64,
+            );
+            assert_eq!(
+                result.is_ok(),
+                expected_valid,
+                "location-table fuzz case {case} disagreed with interval oracle"
+            );
+        }
+    }
+
+    #[test]
     fn rejects_region_file_above_sector_geometry_limit_before_body_read() {
         let region = tempfile::NamedTempFile::new().unwrap();
         region.as_file().set_len((HEADER_BYTES + 1) as u64).unwrap();
@@ -1439,7 +1788,7 @@ mod tests {
     #[test]
     fn rejects_decompression_bombs_for_every_codec_before_output_allocation() {
         let raw = vec![0xA5; 65];
-        let declared_lz4_bomb = lz4_block_payload(LZ4_BLOCK_METHOD_COMPRESSED, &[0], raw.len());
+        let declared_lz4_bomb = lz4_block_payload(LZ4_BLOCK_METHOD_COMPRESSED, &[0], raw.len(), 0);
         for (compression, payload) in [
             (CompressionType::Gzip as u8, gzip_payload(&raw)),
             (CompressionType::Zlib as u8, zlib_payload(&raw)),
@@ -1545,10 +1894,11 @@ mod tests {
 
         assert!(matches!(
             read_region(region.path()),
-            Err(RegionError::LengthOverrun {
+            Err(RegionError::SectorExtentOutOfRange {
                 cx: 0,
                 cz: 0,
-                bytes_available: 6,
+                sector: 2,
+                end_sector: 3,
                 ..
             })
         ));
