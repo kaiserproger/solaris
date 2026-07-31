@@ -3466,6 +3466,117 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "release-host public-alpha 225-chunk Tellus worker-scaling gate"]
+    fn tellus_seed_712816_spawn_window_reports_worker_scaling() {
+        const SEED: i64 = 712_816;
+        const VIEW_DISTANCE: i32 = 6;
+
+        if cfg!(debug_assertions)
+            && std::env::var_os("SOLARIS_WORLDGEN_ALLOW_DEBUG_PROBE").is_none()
+        {
+            panic!("the public-alpha throughput gate must run with --release");
+        }
+        let available = std::thread::available_parallelism()
+            .map(std::num::NonZeroUsize::get)
+            .unwrap_or(1);
+        let automatic_workers = mc_net::automatic_worker_limits(available).1;
+        let requested_workers = std::env::var("SOLARIS_WORLDGEN_WORKERS").ok().map(|raw| {
+            raw.parse::<usize>()
+                .unwrap_or_else(|error| panic!("invalid SOLARIS_WORLDGEN_WORKERS={raw:?}: {error}"))
+                .max(1)
+        });
+        let minimum_chunks_per_second = std::env::var("SOLARIS_WORLDGEN_MIN_CHUNKS_PER_SECOND")
+            .ok()
+            .map(|raw| {
+                raw.parse::<f64>().unwrap_or_else(|error| {
+                    panic!("invalid SOLARIS_WORLDGEN_MIN_CHUNKS_PER_SECOND={raw:?}: {error}")
+                })
+            });
+        assert!(
+            minimum_chunks_per_second.is_none() || requested_workers.is_some(),
+            "a throughput minimum requires SOLARIS_WORLDGEN_WORKERS so the compared topology is explicit"
+        );
+        let mut worker_counts = vec![1, automatic_workers, available];
+        if let Some(workers) = requested_workers {
+            worker_counts.push(workers);
+        }
+        worker_counts.sort_unstable();
+        worker_counts.dedup();
+
+        let report = mc_data::blocks::solaris_required_blocks_report();
+        let blocks = Arc::new(
+            mc_world::BlockRegistry::from_report(&report).expect("embedded block registry"),
+        );
+        let generator = build_terrain_generator(
+            SEED,
+            mc_worldgen::WorldgenMode::TellusLike(mc_worldgen::TellusWorldgenSettings::default()),
+            mc_world::OVERWORLD_GEOMETRY,
+            Arc::clone(&blocks),
+            mc_worldgen::StructureRules::none(),
+            None,
+        )
+        .expect("build production Tellus generator");
+        let located_spawn = generator
+            .locate_safe_spawn()
+            .expect("seed 712816 has a bounded natural spawn");
+        let spawn = mc_world::WorldSpawn::new(located_spawn.block_x, located_spawn.block_z);
+        const SAMPLES_PER_WORKER_COUNT: usize = 3;
+        let mut requested_result = None;
+
+        for workers in worker_counts {
+            let mut samples = Vec::with_capacity(SAMPLES_PER_WORKER_COUNT);
+            for sample in 1..=SAMPLES_PER_WORKER_COUNT {
+                let mut storage = mc_world::WorldStorage::in_memory_with_capacity(
+                    Arc::clone(&blocks),
+                    chunk_cache_size_for_view_distance(VIEW_DISTANCE),
+                )
+                .with_spawn(spawn);
+                let started = Instant::now();
+                let generated = generate_spawn_window(
+                    &mut storage,
+                    Arc::clone(&generator) as Arc<dyn mc_world::ChunkGenerator>,
+                    VIEW_DISTANCE,
+                    workers,
+                    startup_light_bake_worker_threads(workers),
+                    None,
+                )
+                .expect("generate exact public-alpha spawn window");
+                let elapsed = started.elapsed();
+                let chunks_per_second = generated as f64 / elapsed.as_secs_f64().max(0.001);
+
+                assert_eq!(generated, 225);
+                assert_eq!(storage.cache_len(), 225);
+                eprintln!(
+                    "PUBLIC_ALPHA_WORLDGEN_SAMPLE seed={SEED} chunks={generated} requested_workers={workers} effective_workers={} available_parallelism={available} sample={sample}/{SAMPLES_PER_WORKER_COUNT} elapsed_ms={} chunks_per_second={chunks_per_second:.3}",
+                    workers.min(generated),
+                    elapsed.as_millis(),
+                );
+                samples.push(chunks_per_second);
+            }
+            samples.sort_by(f64::total_cmp);
+            let minimum = samples[0];
+            let median = samples[SAMPLES_PER_WORKER_COUNT / 2];
+            let maximum = samples[SAMPLES_PER_WORKER_COUNT - 1];
+            eprintln!(
+                "PUBLIC_ALPHA_WORLDGEN_SUMMARY seed={SEED} chunks=225 requested_workers={workers} effective_workers={} available_parallelism={available} samples={SAMPLES_PER_WORKER_COUNT} min_chunks_per_second={minimum:.3} median_chunks_per_second={median:.3} max_chunks_per_second={maximum:.3}",
+                workers.min(225),
+            );
+            if requested_workers == Some(workers) {
+                requested_result = Some(median);
+            }
+        }
+
+        if let Some(minimum) = minimum_chunks_per_second {
+            let workers = requested_workers.expect("minimum requires explicit workers");
+            let measured = requested_result.expect("requested worker count was measured");
+            assert!(
+                measured >= minimum,
+                "revision-10 throughput for {workers} workers was {measured:.3} chunks/s, below explicit minimum {minimum:.3} chunks/s"
+            );
+        }
+    }
+
+    #[test]
     fn generate_spawn_window_rejects_worker_panic() {
         struct PanicGen;
 

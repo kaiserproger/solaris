@@ -53,6 +53,37 @@ fn neighbour_samples_are_continuous() {
 }
 
 #[test]
+fn two_octave_grid_matches_scalar_noise_bits() {
+    for (min_x, min_z, y, divisors, seed) in [
+        (-129, -65, -32, [240.0, 120.0, 240.0], 29),
+        (-17, 31, -7, [34.0, 8.0, 34.0], -91),
+        (2_047, -2_049, 18, [40.0, 10.0, 40.0], i64::MAX),
+    ] {
+        let side = 18;
+        let grid = Fbm3dTwoOctaveGrid::new(min_x, min_z, side, y, divisors, seed);
+        for z in 0..side {
+            for x in 0..side {
+                let world_x = min_x + x as i32;
+                let world_z = min_z + z as i32;
+                let scalar = fbm_3d(
+                    f64::from(world_x) / divisors[0],
+                    f64::from(y) / divisors[1],
+                    f64::from(world_z) / divisors[2],
+                    seed,
+                    2,
+                    0.5,
+                );
+                assert_eq!(
+                    grid.sample(x, z).to_bits(),
+                    scalar.to_bits(),
+                    "grid changed scalar noise at ({world_x}, {y}, {world_z})"
+                );
+            }
+        }
+    }
+}
+
+#[test]
 fn three_dimensional_noise_is_bounded_deterministic_and_continuous() {
     for x in -8..=8 {
         for y in -8..=8 {

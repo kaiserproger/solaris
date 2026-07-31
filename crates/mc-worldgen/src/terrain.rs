@@ -14,7 +14,8 @@
 //! Output is deterministic in `(seed, world_x, world_z)` and independent of
 //! chunk generation order.
 
-use std::sync::Arc;
+use std::collections::HashMap;
+use std::sync::{Arc, Mutex};
 
 use mc_data::Identifier;
 use mc_world::chunk::{Chunk, ChunkGeometry, ChunkPos, Heightmap, OVERWORLD_GEOMETRY};
@@ -73,6 +74,8 @@ const SPAWN_SEARCH_STEP_BLOCKS: i32 = 64;
 const SPAWN_SEARCH_MAX_RADIUS_BLOCKS: i32 = 8_192;
 const SPAWN_SITE_SAMPLE_RADIUS_BLOCKS: i32 = 8;
 const SPAWN_SITE_MAX_RELIEF: i32 = 3;
+const DIAGNOSTIC_CACHE_SHARDS: usize = 64;
+const DIAGNOSTIC_CACHE_ENTRIES_PER_SHARD: usize = 2_048;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct SpawnLocation {
@@ -88,6 +91,52 @@ pub struct TerrainDiagnosticSample {
     pub biome: Identifier,
     /// The production vegetation density for biomes that support land vegetation.
     pub vegetation_density: Option<f64>,
+}
+
+struct DiagnosticCache {
+    shards: [Mutex<HashMap<(i32, i32), TerrainDiagnosticSample>>; DIAGNOSTIC_CACHE_SHARDS],
+}
+
+impl Default for DiagnosticCache {
+    fn default() -> Self {
+        Self {
+            shards: std::array::from_fn(|_| Mutex::new(HashMap::new())),
+        }
+    }
+}
+
+impl DiagnosticCache {
+    fn shard_index(world_x: i32, world_z: i32) -> usize {
+        let mixed = (world_x as u32 as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15)
+            ^ (world_z as u32 as u64).wrapping_mul(0xC2B2_AE3D_27D4_EB4F);
+        (mixed as usize) & (DIAGNOSTIC_CACHE_SHARDS - 1)
+    }
+
+    fn get(&self, world_x: i32, world_z: i32) -> Option<TerrainDiagnosticSample> {
+        let shard = self.shards[Self::shard_index(world_x, world_z)]
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        shard.get(&(world_x, world_z)).cloned()
+    }
+
+    fn insert(
+        &self,
+        world_x: i32,
+        world_z: i32,
+        sample: TerrainDiagnosticSample,
+    ) -> TerrainDiagnosticSample {
+        let mut shard = self.shards[Self::shard_index(world_x, world_z)]
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if let Some(existing) = shard.get(&(world_x, world_z)) {
+            return existing.clone();
+        }
+        if shard.len() >= DIAGNOSTIC_CACHE_ENTRIES_PER_SHARD {
+            shard.clear();
+        }
+        shard.insert((world_x, world_z), sample.clone());
+        sample
+    }
 }
 
 impl SpawnLocation {
@@ -164,6 +213,7 @@ pub struct TerrainGenerator {
     structures: StructureRules,
     decorations: DecorationBlocks,
     worldgen_mode: WorldgenMode,
+    diagnostic_cache: DiagnosticCache,
 }
 
 #[derive(Clone)]
@@ -190,6 +240,7 @@ struct OreColumnCache {
     cave_min_y: i32,
     cave_layers: usize,
     cave_samples: Vec<u8>,
+    raw_cave_samples: Vec<u8>,
 }
 
 impl OreColumnCache {
@@ -224,6 +275,50 @@ impl OreColumnCache {
         self.columns[index].as_ref()
     }
 
+    fn cave_sample_index(&self, world_x: i32, sample_y: i32, world_z: i32) -> Option<usize> {
+        let column_index = self.column_index(world_x, world_z)?;
+        let delta_y = sample_y.saturating_sub(self.cave_min_y);
+        if delta_y < 0 || delta_y % CAVE_VERTICAL_SAMPLE_STEP != 0 {
+            return None;
+        }
+        let layer = usize::try_from(delta_y / CAVE_VERTICAL_SAMPLE_STEP).ok()?;
+        if layer >= self.cave_layers {
+            return None;
+        }
+        Some(layer * self.side * self.side + column_index)
+    }
+
+    fn record_raw_cave(&mut self, world_x: i32, sample_y: i32, world_z: i32, cave: bool) {
+        if let Some(index) = self.cave_sample_index(world_x, sample_y, world_z) {
+            self.raw_cave_samples[index] = if cave { 2 } else { 1 };
+        }
+    }
+
+    fn get_or_raw_cave(
+        &mut self,
+        generator: &TerrainGenerator,
+        world_x: i32,
+        sample_y: i32,
+        world_z: i32,
+    ) -> bool {
+        let Some(index) = self.cave_sample_index(world_x, sample_y, world_z) else {
+            return generator
+                .density_router()
+                .raw_cave(world_x, sample_y, world_z);
+        };
+        match self.raw_cave_samples[index] {
+            1 => false,
+            2 => true,
+            _ => {
+                let cave = generator
+                    .density_router()
+                    .raw_cave(world_x, sample_y, world_z);
+                self.raw_cave_samples[index] = if cave { 2 } else { 1 };
+                cave
+            }
+        }
+    }
+
     fn get_or_cave(
         &mut self,
         generator: &TerrainGenerator,
@@ -232,52 +327,29 @@ impl OreColumnCache {
         world_z: i32,
         surface_y: i32,
     ) -> bool {
-        let Some(column_index) = self.column_index(world_x, world_z) else {
+        let Some(index) = self.cave_sample_index(world_x, sample_y, world_z) else {
             return generator.is_cave_cell(world_x, sample_y, world_z, surface_y);
         };
-        let delta_y = sample_y.saturating_sub(self.cave_min_y);
-        if delta_y < 0 || delta_y % CAVE_VERTICAL_SAMPLE_STEP != 0 {
-            return generator.is_cave_cell(world_x, sample_y, world_z, surface_y);
-        }
-        let layer = usize::try_from(delta_y / CAVE_VERTICAL_SAMPLE_STEP).unwrap_or(usize::MAX);
-        if layer >= self.cave_layers {
-            return generator.is_cave_cell(world_x, sample_y, world_z, surface_y);
-        }
-        let index = layer * self.side * self.side + column_index;
         match self.cave_samples[index] {
             1 => false,
             2 => true,
             _ => {
-                let cave = generator.is_cave_cell(world_x, sample_y, world_z, surface_y);
+                let cave = sample_y > generator.geometry.min_y().saturating_add(10)
+                    && sample_y < surface_y.saturating_sub(CAVE_SURFACE_CLEARANCE).min(32)
+                    && self.get_or_raw_cave(generator, world_x, sample_y, world_z)
+                    && [(-1, 0), (1, 0), (0, -1), (0, 1)]
+                        .into_iter()
+                        .any(|(dx, dz)| {
+                            world_x
+                                .checked_add(dx)
+                                .zip(world_z.checked_add(dz))
+                                .is_some_and(|(x, z)| {
+                                    self.get_or_raw_cave(generator, x, sample_y, z)
+                                })
+                        });
                 self.cave_samples[index] = if cave { 2 } else { 1 };
                 cave
             }
-        }
-    }
-}
-
-fn cached_raw_cave(
-    cache: &mut [u8],
-    side: usize,
-    router: OverworldRouter,
-    chunk_min: (i64, i64),
-    sample_y: i32,
-    raw: (usize, usize),
-) -> bool {
-    let (raw_x, raw_z) = raw;
-    let index = raw_z * side + raw_x;
-    match cache[index] {
-        1 => false,
-        2 => true,
-        _ => {
-            let world_x = chunk_min.0 + raw_x as i64 - 1;
-            let world_z = chunk_min.1 + raw_z as i64 - 1;
-            let cave = i32::try_from(world_x)
-                .ok()
-                .zip(i32::try_from(world_z).ok())
-                .is_some_and(|(world_x, world_z)| router.raw_cave(world_x, sample_y, world_z));
-            cache[index] = if cave { 2 } else { 1 };
-            cave
         }
     }
 }
@@ -475,6 +547,7 @@ impl TerrainGenerator {
     #[must_use]
     pub fn with_mode(mut self, mode: WorldgenMode) -> Self {
         self.worldgen_mode = mode;
+        self.diagnostic_cache = DiagnosticCache::default();
         self
     }
 
@@ -536,6 +609,7 @@ impl TerrainGenerator {
             structures: StructureRules::none(),
             decorations: DecorationBlocks::new(registry.as_ref()),
             worldgen_mode: WorldgenMode::VanillaLike,
+            diagnostic_cache: DiagnosticCache::default(),
         })
     }
 
@@ -564,6 +638,7 @@ impl TerrainGenerator {
     #[must_use]
     pub fn with_geometry(mut self, geometry: ChunkGeometry) -> Self {
         self.geometry = geometry;
+        self.diagnostic_cache = DiagnosticCache::default();
         self
     }
 
@@ -579,6 +654,14 @@ impl TerrainGenerator {
     /// generated column, without constructing or mutating a chunk.
     #[must_use]
     pub fn diagnostic_sample(&self, world_x: i32, world_z: i32) -> TerrainDiagnosticSample {
+        if let Some(sample) = self.diagnostic_cache.get(world_x, world_z) {
+            return sample;
+        }
+        let sample = self.diagnostic_sample_uncached(world_x, world_z);
+        self.diagnostic_cache.insert(world_x, world_z, sample)
+    }
+
+    fn diagnostic_sample_uncached(&self, world_x: i32, world_z: i32) -> TerrainDiagnosticSample {
         let sample = self.density_router().sample(world_x, world_z);
         let surface_y = sample.surface_y;
         let biome = match self.worldgen_mode {
@@ -1028,6 +1111,15 @@ impl TerrainGenerator {
     }
 
     fn apply_caves(&self, chunk: &mut Chunk, columns: &[ColumnPlan; 256]) {
+        self.apply_caves_with_cache(chunk, columns, None);
+    }
+
+    fn apply_caves_with_cache(
+        &self,
+        chunk: &mut Chunk,
+        columns: &[ColumnPlan; 256],
+        mut ore_cache: Option<&mut OreColumnCache>,
+    ) {
         const RAW_SIDE: usize = 18;
         let cave_min_y = self.geometry.min_y().saturating_add(8);
         let cave_max_y = columns
@@ -1042,21 +1134,34 @@ impl TerrainGenerator {
 
         let chunk_min_x = i64::from(chunk.pos.x) * 16;
         let chunk_min_z = i64::from(chunk.pos.z) * 16;
-        let chunk_min = (chunk_min_x, chunk_min_z);
         let router = self.density_router();
+        let raw_min_x = chunk_min_x - 1;
+        let raw_min_z = chunk_min_z - 1;
+        let raw_max_x = chunk_min_x + 16;
+        let raw_max_z = chunk_min_z + 16;
+        let raw_grid_bounds = i32::try_from(raw_min_x)
+            .ok()
+            .zip(i32::try_from(raw_min_z).ok())
+            .zip(i32::try_from(raw_max_x).ok())
+            .zip(i32::try_from(raw_max_z).ok());
         let mut raw = [0_u8; RAW_SIDE * RAW_SIDE];
         for sample_y in (cave_min_y..=cave_max_y).step_by(CAVE_VERTICAL_SAMPLE_STEP as usize) {
-            raw.fill(0);
-            for raw_z in 1..=16 {
-                for raw_x in 1..=16 {
-                    let _ = cached_raw_cave(
-                        &mut raw,
-                        RAW_SIDE,
-                        router,
-                        chunk_min,
-                        sample_y,
-                        (raw_x, raw_z),
-                    );
+            if let Some((((raw_min_x, raw_min_z), _), _)) = raw_grid_bounds {
+                router.fill_raw_cave_layer(raw_min_x, raw_min_z, RAW_SIDE, sample_y, &mut raw);
+            } else {
+                raw.fill(1);
+                for raw_z in 0..RAW_SIDE {
+                    for raw_x in 0..RAW_SIDE {
+                        let world_x = chunk_min_x + raw_x as i64 - 1;
+                        let world_z = chunk_min_z + raw_z as i64 - 1;
+                        let cave = i32::try_from(world_x)
+                            .ok()
+                            .zip(i32::try_from(world_z).ok())
+                            .is_some_and(|(world_x, world_z)| {
+                                router.raw_cave(world_x, sample_y, world_z)
+                            });
+                        raw[raw_z * RAW_SIDE + raw_x] = if cave { 2 } else { 1 };
+                    }
                 }
             }
 
@@ -1074,35 +1179,10 @@ impl TerrainGenerator {
                 if raw[center] != 2 {
                     continue;
                 }
-                let connected = cached_raw_cave(
-                    &mut raw,
-                    RAW_SIDE,
-                    router,
-                    chunk_min,
-                    sample_y,
-                    (raw_x - 1, raw_z),
-                ) || cached_raw_cave(
-                    &mut raw,
-                    RAW_SIDE,
-                    router,
-                    chunk_min,
-                    sample_y,
-                    (raw_x + 1, raw_z),
-                ) || cached_raw_cave(
-                    &mut raw,
-                    RAW_SIDE,
-                    router,
-                    chunk_min,
-                    sample_y,
-                    (raw_x, raw_z - 1),
-                ) || cached_raw_cave(
-                    &mut raw,
-                    RAW_SIDE,
-                    router,
-                    chunk_min,
-                    sample_y,
-                    (raw_x, raw_z + 1),
-                );
+                let connected = raw[raw_z * RAW_SIDE + raw_x - 1] == 2
+                    || raw[raw_z * RAW_SIDE + raw_x + 1] == 2
+                    || raw[(raw_z - 1) * RAW_SIDE + raw_x] == 2
+                    || raw[(raw_z + 1) * RAW_SIDE + raw_x] == 2;
                 if !connected {
                     continue;
                 }
@@ -1111,6 +1191,23 @@ impl TerrainGenerator {
                         break;
                     }
                     let _ = chunk.set_block(plan.lx, y, plan.lz, self.air);
+                }
+            }
+            if let Some(cache) = ore_cache.as_deref_mut() {
+                for raw_z in 0..RAW_SIDE {
+                    for raw_x in 0..RAW_SIDE {
+                        let state = raw[raw_z * RAW_SIDE + raw_x];
+                        if state == 0 {
+                            continue;
+                        }
+                        let world_x = chunk_min_x + raw_x as i64 - 1;
+                        let world_z = chunk_min_z + raw_z as i64 - 1;
+                        if let (Ok(world_x), Ok(world_z)) =
+                            (i32::try_from(world_x), i32::try_from(world_z))
+                        {
+                            cache.record_raw_cave(world_x, sample_y, world_z, state == 2);
+                        }
+                    }
                 }
             }
         }
@@ -1152,6 +1249,7 @@ impl TerrainGenerator {
             cave_min_y,
             cave_layers,
             cave_samples: vec![0; side * side * cave_layers],
+            raw_cave_samples: vec![0; side * side * cave_layers],
         };
         let center_offset = usize::try_from(ORE_COLUMN_HALO).expect("ore halo fits usize");
         for plan in chunk_columns {
@@ -1168,6 +1266,11 @@ impl TerrainGenerator {
             return;
         }
         let mut column_cache = self.ore_column_cache(chunk, chunk_columns);
+        self.apply_ores_with_cache(chunk, &mut column_cache);
+    }
+
+    fn apply_ores_with_cache(&self, chunk: &mut Chunk, column_cache: &mut OreColumnCache) {
+        debug_assert!(self.geological_ores.is_none());
         let chunk_min_x = i64::from(chunk.pos.x) * 16;
         let chunk_min_z = i64::from(chunk.pos.z) * 16;
         // Re-evaluate nearby anchors so a vein crossing a chunk edge is derived
@@ -1261,7 +1364,7 @@ impl TerrainGenerator {
                             );
                             self.place_ore_vein(
                                 chunk,
-                                &mut column_cache,
+                                column_cache,
                                 rule,
                                 [anchor_x, anchor_y, anchor_z],
                                 vein_hash,
@@ -2371,8 +2474,14 @@ impl ChunkGenerator for TerrainGenerator {
             }
             chunk.highest_opaque.set(plan.lx, plan.lz, motion_blocking);
         }
-        self.apply_caves(&mut chunk, &columns);
-        self.apply_ores(&mut chunk, &columns);
+        if self.geological_ores.is_some() {
+            self.apply_caves(&mut chunk, &columns);
+            self.apply_ores(&mut chunk, &columns);
+        } else {
+            let mut ore_cache = self.ore_column_cache(&chunk, &columns);
+            self.apply_caves_with_cache(&mut chunk, &columns, Some(&mut ore_cache));
+            self.apply_ores_with_cache(&mut chunk, &mut ore_cache);
+        }
         self.assign_biomes(&mut chunk, &columns);
         self.apply_structures(&mut chunk);
         self.apply_decorations(&mut chunk, &columns);

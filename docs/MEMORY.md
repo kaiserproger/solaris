@@ -34,12 +34,12 @@ and is not startup context.
   pre-generated 225 chunks at 929.473 chunks/s, streamed every requested chunk
   without degradation or memory-pressure shedding, used roughly 300 MiB by owner
   observation, and shut down with zero dirty chunks.
-- The current P0 clock checkpoint replaces the empty 26.1.2 clock-update map with
-  a typed overworld update: monotonic simulation tick remains packet `game_time`,
-  while persisted world time is the separate registry-id-0 clock at rate `1.0`.
-  Exact protocol, package, server, command and sleep gates pass. The graphical
-  client gate is host-blocked because this CodexPro environment has no display and
-  NeoForge exits with `glfwInit failed`; no rendered sun claim is made yet.
+- The P0 clock checkpoint is complete. The empty 26.1.2 clock-update map was
+  replaced by a typed overworld update: monotonic simulation tick remains packet
+  `game_time`, while persisted world time is the separate registry-id-0 clock at
+  rate `1.0`. Exact protocol/package/server/command/sleep gates and the real-client
+  day/sunset/night/dawn/restart graphical gate pass; evidence is in
+  `docs/evidence/world-clock-26.1.2.md`.
 - Worldgen revision 10 now removes the 384-block origin blend, forced stone/iron
   outcrops, and starter-tree anchor. A bounded 32-seed Tellus gate, including seed
   `712816`, finds distinct dry low-relief terrain; schema 3 persists the selected

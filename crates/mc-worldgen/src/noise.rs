@@ -78,6 +78,7 @@ fn lerp(a: f64, b: f64, t: f64) -> f64 {
 /// deterministic field variants. The input period is `2^31` cells, far beyond
 /// any reasonable world size.
 #[must_use]
+#[inline(always)]
 pub fn value_noise_2d(x: f64, z: f64, seed: i64) -> f64 {
     let xi = x.floor();
     let zi = z.floor();
@@ -103,6 +104,7 @@ pub fn value_noise_2d(x: f64, z: f64, seed: i64) -> f64 {
 /// and halves the amplitude. Useful when a single octave looks too
 /// blobby. `octaves=1` is equivalent to [`value_noise_2d`].
 #[must_use]
+#[inline(always)]
 pub fn fbm_2d(x: f64, z: f64, seed: i64, octaves: u32, persistence: f64) -> f64 {
     let mut total = 0.0;
     let mut amplitude = 1.0;
@@ -159,6 +161,177 @@ pub fn value_noise_3d(x: f64, y: f64, z: f64, seed: i64) -> f64 {
         u,
     );
     lerp(lerp(x00, x10, v), lerp(x01, x11, v), w)
+}
+
+#[derive(Clone, Copy)]
+struct GridAxisPoint {
+    lattice_offset: usize,
+    fade: f64,
+}
+
+struct ValueNoise3dGrid {
+    x: Vec<GridAxisPoint>,
+    z: Vec<GridAxisPoint>,
+    lattice_width: usize,
+    lower_y: Vec<f64>,
+    upper_y: Vec<f64>,
+    y_fade: f64,
+}
+
+impl ValueNoise3dGrid {
+    fn new(
+        min_world_x: i32,
+        min_world_z: i32,
+        side: usize,
+        world_y: i32,
+        divisors: [f64; 3],
+        frequency: f64,
+        seed: i64,
+    ) -> Self {
+        let (x, min_lattice_x, max_lattice_x) =
+            grid_axis(min_world_x, side, divisors[0], frequency);
+        let (z, min_lattice_z, max_lattice_z) =
+            grid_axis(min_world_z, side, divisors[2], frequency);
+        let lattice_width = usize::try_from(max_lattice_x - min_lattice_x + 2)
+            .expect("bounded noise lattice width fits usize");
+        let lattice_height = usize::try_from(max_lattice_z - min_lattice_z + 2)
+            .expect("bounded noise lattice height fits usize");
+        let y = (f64::from(world_y) / divisors[1]) * frequency;
+        let lattice_y = y.floor();
+        let y_fade = fade(y - lattice_y);
+        let lattice_y = lattice_y as i32;
+        let mut lower_y = Vec::with_capacity(lattice_width * lattice_height);
+        let mut upper_y = Vec::with_capacity(lattice_width * lattice_height);
+        for z_offset in 0..lattice_height {
+            let lattice_z = min_lattice_z.wrapping_add(z_offset as i32);
+            for x_offset in 0..lattice_width {
+                let lattice_x = min_lattice_x.wrapping_add(x_offset as i32);
+                lower_y.push(lattice_3d(lattice_x, lattice_y, lattice_z, seed));
+                upper_y.push(lattice_3d(
+                    lattice_x,
+                    lattice_y.wrapping_add(1),
+                    lattice_z,
+                    seed,
+                ));
+            }
+        }
+        Self {
+            x,
+            z,
+            lattice_width,
+            lower_y,
+            upper_y,
+            y_fade,
+        }
+    }
+
+    #[inline]
+    fn sample(&self, x: usize, z: usize) -> f64 {
+        let x = self.x[x];
+        let z = self.z[z];
+        let lower_left = z.lattice_offset * self.lattice_width + x.lattice_offset;
+        let upper_left = lower_left + self.lattice_width;
+        let x00 = lerp(
+            self.lower_y[lower_left],
+            self.lower_y[lower_left + 1],
+            x.fade,
+        );
+        let x10 = lerp(
+            self.upper_y[lower_left],
+            self.upper_y[lower_left + 1],
+            x.fade,
+        );
+        let x01 = lerp(
+            self.lower_y[upper_left],
+            self.lower_y[upper_left + 1],
+            x.fade,
+        );
+        let x11 = lerp(
+            self.upper_y[upper_left],
+            self.upper_y[upper_left + 1],
+            x.fade,
+        );
+        lerp(
+            lerp(x00, x10, self.y_fade),
+            lerp(x01, x11, self.y_fade),
+            z.fade,
+        )
+    }
+}
+
+fn grid_axis(
+    min_world: i32,
+    side: usize,
+    divisor: f64,
+    frequency: f64,
+) -> (Vec<GridAxisPoint>, i32, i32) {
+    let mut points = Vec::with_capacity(side);
+    let mut min_lattice = i32::MAX;
+    let mut max_lattice = i32::MIN;
+    for offset in 0..side {
+        let world = i64::from(min_world) + offset as i64;
+        let world = i32::try_from(world).expect("noise grid stays inside i32 block coordinates");
+        let value = (f64::from(world) / divisor) * frequency;
+        let lattice = value.floor();
+        let lattice_i32 = lattice as i32;
+        min_lattice = min_lattice.min(lattice_i32);
+        max_lattice = max_lattice.max(lattice_i32);
+        points.push((lattice_i32, fade(value - lattice)));
+    }
+    let points = points
+        .into_iter()
+        .map(|(lattice, fade)| GridAxisPoint {
+            lattice_offset: usize::try_from(lattice - min_lattice)
+                .expect("noise lattice offset fits usize"),
+            fade,
+        })
+        .collect();
+    (points, min_lattice, max_lattice)
+}
+
+pub(crate) struct Fbm3dTwoOctaveGrid {
+    first: ValueNoise3dGrid,
+    second: ValueNoise3dGrid,
+}
+
+impl Fbm3dTwoOctaveGrid {
+    pub(crate) fn new(
+        min_world_x: i32,
+        min_world_z: i32,
+        side: usize,
+        world_y: i32,
+        divisors: [f64; 3],
+        seed: i64,
+    ) -> Self {
+        Self {
+            first: ValueNoise3dGrid::new(
+                min_world_x,
+                min_world_z,
+                side,
+                world_y,
+                divisors,
+                1.0,
+                seed ^ 1,
+            ),
+            second: ValueNoise3dGrid::new(
+                min_world_x,
+                min_world_z,
+                side,
+                world_y,
+                divisors,
+                2.0,
+                seed ^ 2,
+            ),
+        }
+    }
+
+    #[inline]
+    pub(crate) fn sample(&self, x: usize, z: usize) -> f64 {
+        let mut total = 0.0;
+        total += self.first.sample(x, z);
+        total += self.second.sample(x, z) * 0.5;
+        total / 1.5
+    }
 }
 
 /// Multi-octave 3D value noise with normalized amplitude.

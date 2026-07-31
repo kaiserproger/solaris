@@ -3163,11 +3163,12 @@ fn generated_spawn_window_debug_stage_profile() {
             fill += started.elapsed();
 
             let started = std::time::Instant::now();
-            g.apply_caves(&mut chunk, &columns);
+            let mut ore_cache = g.ore_column_cache(&chunk, &columns);
+            g.apply_caves_with_cache(&mut chunk, &columns, Some(&mut ore_cache));
             caves += started.elapsed();
 
             let started = std::time::Instant::now();
-            g.apply_ores(&mut chunk, &columns);
+            g.apply_ores_with_cache(&mut chunk, &mut ore_cache);
             ores += started.elapsed();
 
             let started = std::time::Instant::now();

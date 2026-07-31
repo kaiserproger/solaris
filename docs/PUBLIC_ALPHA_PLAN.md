@@ -840,12 +840,15 @@ Benchmark reproduction happens at that feature boundary, not after every edit:
   seed/order/border regressions. The mapped debug stage and 25-chunk throughput
   probes are recorded in
   [`evidence/worldgen-downhill-drainage.md`](evidence/worldgen-downhill-drainage.md).
-- [ ] Complete revision-10 drainage,
-  [rendered height/biome/vegetation mosaics](evidence/worldgen-mosaics.md),
-  clean seed-`712816` owner playtest, restart, and release-host throughput gates.
-  The exact-seed
+- [x] Complete revision-10 drainage, deterministic
+  [height/biome/vegetation mosaics](evidence/worldgen-mosaics.md), and the
+  topology-explicit 225-chunk release throughput/scaling gate. The measured
+  optimization and host matrix are recorded in
+  [`evidence/worldgen-throughput-scaling.md`](evidence/worldgen-throughput-scaling.md).
+- [ ] Complete the clean seed-`712816` owner traversal/disposition and
+  restart/rejoin gates. The exact-seed
   [agent-run graphical preflight](evidence/worldgen-seed-712816-preflight.md)
-  is complete; owner traversal and disposition remain open.
+  is complete but does not replace owner judgment.
 
 ## Observed baseline
 
@@ -943,15 +946,18 @@ Acceptance:
 - Seeds `0`, `712816`, `-1` and at least 29 generated regression seeds have
   different height, biome and feature fingerprints near their selected spawns.
 - No production branch checks fixed world coordinates to place starter resources.
-- Seed `712816` receives a clean fresh-world owner playtest and
-  [rendered height/biome/vegetation mosaics](evidence/worldgen-mosaics.md) for
-  at least a 2048x2048-block area.
+- [ ] Seed `712816` receives a clean fresh-world owner traversal/disposition and
+  restart/rejoin.
+- [x] Seed `712816` has deterministic rendered height/biome/vegetation mosaics for
+  a 2048x2048-block area.
 - Multi-seed metrics reject a single biome occupying an unreasonable share of the
   sampled land unless the seed naturally produces that result at a larger scale.
-- Chunk seams, cave surface shell, water fill, persistence and restart gates pass.
-- On the same i5-12600 host, generation throughput regresses by no more than 20%
-  from the recorded 929 chunks/s baseline, unless a measured quality gain is
-  explicitly accepted.
+- Chunk seams, cave surface shell, water fill and persistence gates pass; the
+  owner restart/rejoin row remains open above.
+- [x] A release 225-chunk seed-`712816` matrix records one, runtime-auto, available,
+  and optional explicit worker topology. The owner waived same-host comparison;
+  the current six-physical-core median is 2,461.979 chunks/s against the historical
+  743.578 chunks/s acceptance floor.
 
 ### P0 — Item drop/pickup lock boundary and runtime gate (complete)
 

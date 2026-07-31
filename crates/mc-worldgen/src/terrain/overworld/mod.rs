@@ -57,6 +57,17 @@ impl OverworldRouter {
         caves::raw(self, x, y, z)
     }
 
+    pub(in crate::terrain) fn fill_raw_cave_layer(
+        self,
+        min_world_x: i32,
+        min_world_z: i32,
+        side: usize,
+        y: i32,
+        output: &mut [u8],
+    ) {
+        caves::fill_raw_layer(self, min_world_x, min_world_z, side, y, output);
+    }
+
     #[cfg(test)]
     fn temperature(
         self,
