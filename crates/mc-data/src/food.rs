@@ -74,7 +74,7 @@ pub fn builtin() -> &'static FoodTable {
 
 pub fn load(path: impl AsRef<Path>) -> Result<FoodTable, FoodError> {
     let path = path.as_ref();
-    let bytes = std::fs::read_to_string(path).map_err(|source| FoodError::Io {
+    let bytes = crate::sidecar::read_string(path).map_err(|source| FoodError::Io {
         path: path.to_path_buf(),
         source,
     })?;

@@ -85,7 +85,7 @@ pub fn builtin() -> &'static ArmorTable {
 
 pub fn load(path: impl AsRef<Path>) -> Result<ArmorTable, ArmorError> {
     let path = path.as_ref();
-    let bytes = std::fs::read_to_string(path).map_err(|source| ArmorError::Io {
+    let bytes = crate::sidecar::read_string(path).map_err(|source| ArmorError::Io {
         path: path.to_path_buf(),
         source,
     })?;

@@ -740,7 +740,7 @@ pub fn builtin() -> &'static LootTables {
 
 pub fn load(path: impl AsRef<Path>) -> Result<LootTables, LootError> {
     let path = path.as_ref();
-    let bytes = std::fs::read_to_string(path).map_err(|source| LootError::Io {
+    let bytes = crate::sidecar::read_string(path).map_err(|source| LootError::Io {
         path: path.to_path_buf(),
         source,
     })?;

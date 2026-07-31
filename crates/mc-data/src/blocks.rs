@@ -56,7 +56,7 @@ pub fn load_blocks_report(path: impl AsRef<Path>) -> Result<Vec<BlockReport>, Bl
     if !path.is_file() {
         return Err(BlocksReportError::Missing(path.to_path_buf()));
     }
-    let bytes = std::fs::read(path)?;
+    let bytes = crate::sidecar::read_file(path)?;
     let raw: BTreeMap<String, RawBlock> = serde_json::from_slice(&bytes)?;
     raw_blocks_to_report(raw)
 }

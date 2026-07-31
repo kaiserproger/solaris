@@ -40,7 +40,7 @@ pub fn load_items_report(path: impl AsRef<Path>) -> Result<Vec<ItemReport>, Item
     if !path.is_file() {
         return Err(ItemsReportError::Missing(path.to_path_buf()));
     }
-    let bytes = std::fs::read(path)?;
+    let bytes = crate::sidecar::read_file(path)?;
     let raw: RawRegistries = serde_json::from_slice(&bytes)?;
     let items = raw
         .registries

@@ -41,7 +41,7 @@ pub fn load_entity_types_report(
     if !path.is_file() {
         return Err(EntityTypesReportError::Missing(path.to_path_buf()));
     }
-    let bytes = std::fs::read(path)?;
+    let bytes = crate::sidecar::read_file(path)?;
     let raw: RawRegistries = serde_json::from_slice(&bytes)?;
     let entity_types = raw
         .registries

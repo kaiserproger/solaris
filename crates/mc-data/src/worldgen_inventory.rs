@@ -145,12 +145,21 @@ pub fn load_worldgen_inventory(
     let mut areas = Vec::with_capacity(AREA_SPECS.len());
     for spec in AREA_SPECS {
         let path = root.join(spec.relative_path);
-        let mut files = Vec::new();
-        let present = path.is_dir();
-        if present {
-            collect_files(&path, spec.extension, spec.recursive, &mut files)?;
-        }
-        files.sort();
+        let present = crate::sidecar::directory_exists_under(root, &path).map_err(|error| {
+            WorldgenInventoryError::Io {
+                path: error.path,
+                source: error.source,
+            }
+        })?;
+        let files = if present {
+            crate::sidecar::collect_files_under(root, &path, spec.extension, spec.recursive)
+                .map_err(|error| WorldgenInventoryError::Io {
+                    path: error.path,
+                    source: error.source,
+                })?
+        } else {
+            Vec::new()
+        };
         let sample_files = files
             .iter()
             .take(8)
@@ -170,36 +179,6 @@ pub fn load_worldgen_inventory(
         root: root.to_path_buf(),
         areas,
     })
-}
-
-fn collect_files(
-    dir: &Path,
-    extension: &str,
-    recursive: bool,
-    out: &mut Vec<PathBuf>,
-) -> Result<(), WorldgenInventoryError> {
-    for entry in std::fs::read_dir(dir).map_err(|source| WorldgenInventoryError::Io {
-        path: dir.to_path_buf(),
-        source,
-    })? {
-        let entry = entry.map_err(|source| WorldgenInventoryError::Io {
-            path: dir.to_path_buf(),
-            source,
-        })?;
-        let path = entry.path();
-        let ty = entry
-            .file_type()
-            .map_err(|source| WorldgenInventoryError::Io {
-                path: path.clone(),
-                source,
-            })?;
-        if ty.is_dir() && recursive {
-            collect_files(&path, extension, recursive, out)?;
-        } else if ty.is_file() && path.extension().and_then(|ext| ext.to_str()) == Some(extension) {
-            out.push(path);
-        }
-    }
-    Ok(())
 }
 
 fn relative_slash_path(root: &Path, path: &Path) -> String {
@@ -247,6 +226,25 @@ mod tests {
         assert_eq!(templates.file_count, 1);
         assert_eq!(templates.extension, "nbt");
         assert!(!inventory.area("noise_settings").unwrap().present);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn rejects_symlinked_inventory_area() {
+        use std::os::unix::fs::symlink;
+
+        let root = tempfile::tempdir().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        write(&outside.path().join("registries.json"));
+        symlink(outside.path(), root.path().join("reports")).unwrap();
+
+        let error = load_worldgen_inventory(root.path()).unwrap_err();
+        assert!(matches!(
+            error,
+            WorldgenInventoryError::Io { path, source }
+                if path == root.path().join("reports")
+                    && source.kind() == std::io::ErrorKind::InvalidData
+        ));
     }
 
     #[test]

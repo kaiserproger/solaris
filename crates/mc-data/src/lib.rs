@@ -22,7 +22,6 @@
 //! exactly what vanilla uses on the wire.
 
 use std::collections::BTreeMap;
-use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, OnceLock};
 
@@ -30,6 +29,11 @@ use thiserror::Error;
 use tracing::{debug, trace};
 
 const REQUIRED_REGISTRY_INDEX: &str = include_str!("../data/required_registry_index.json");
+const MAX_JSON_WALK_DEPTH: usize = 32;
+const MAX_JSON_WALK_ENTRIES: usize = 131_072;
+const MAX_JSON_FILES: usize = 65_536;
+const MAX_JSON_FILE_BYTES: usize = 16 * 1024 * 1024;
+const MAX_JSON_TOTAL_BYTES: usize = 128 * 1024 * 1024;
 static REQUIRED_REGISTRY_ENTRIES: OnceLock<BTreeMap<String, Vec<Identifier>>> = OnceLock::new();
 
 pub mod armor;
@@ -53,6 +57,7 @@ pub mod loot;
 pub mod mob_behavior_26_1_2;
 pub mod recipes;
 pub mod resource_path;
+mod sidecar;
 pub mod tags;
 pub mod villager_trades_26_1_2;
 pub mod worldgen_features;
@@ -375,13 +380,11 @@ fn required_registry_entries() -> &'static BTreeMap<String, Vec<Identifier>> {
 }
 
 fn load_registry_payload(opened: OpenedResource) -> Result<Vec<u8>, DataError> {
-    let (path, mut file) = opened.into_parts();
-    let mut bytes = Vec::new();
-    file.read_to_end(&mut bytes)
-        .map_err(|source| DataError::Io {
-            path: path.clone(),
-            source,
-        })?;
+    let (path, file) = opened.into_parts();
+    let bytes = sidecar::read_opened_file(&path, file).map_err(|source| DataError::Io {
+        path: path.clone(),
+        source,
+    })?;
     let mut remaining = bytes.as_slice();
     let _ =
         mc_nbt::read_network(&mut remaining).map_err(|source| DataError::RegistryPayloadNbt {
@@ -420,7 +423,7 @@ pub fn load(path: impl Into<PathBuf>) -> Result<VanillaData, DataError> {
             });
         }
         let mut entries = Vec::new();
-        collect_entries(&dir, &mut entries)?;
+        collect_entries(&root, &dir, &mut entries)?;
         if entries.is_empty() {
             return Err(DataError::EmptyRegistry {
                 registry: (*registry_path).to_string(),
@@ -488,18 +491,10 @@ pub(crate) fn visit_json_files<E>(
     visitor: &mut impl FnMut(PathBuf) -> Result<(), E>,
     io_error: &impl Fn(PathBuf, std::io::Error) -> E,
 ) -> Result<(), E> {
-    let entries = std::fs::read_dir(dir).map_err(|source| io_error(dir.to_path_buf(), source))?;
-    for entry in entries {
-        let entry = entry.map_err(|source| io_error(dir.to_path_buf(), source))?;
-        let path = entry.path();
-        let ty = entry
-            .file_type()
-            .map_err(|source| io_error(path.clone(), source))?;
-        if ty.is_dir() {
-            visit_json_files(&path, visitor, io_error)?;
-        } else if ty.is_file() && path.extension().is_some_and(|ext| ext == "json") {
-            visitor(path)?;
-        }
+    let paths = sidecar::collect_files(dir, "json", true)
+        .map_err(|error| io_error(error.path, error.source))?;
+    for path in paths {
+        visitor(path)?;
     }
     Ok(())
 }
@@ -508,16 +503,7 @@ pub(crate) fn sorted_json_files<E>(
     dir: &Path,
     io_error: &impl Fn(PathBuf, std::io::Error) -> E,
 ) -> Result<Vec<PathBuf>, E> {
-    let mut paths = Vec::new();
-    for entry in std::fs::read_dir(dir).map_err(|source| io_error(dir.to_path_buf(), source))? {
-        let entry = entry.map_err(|source| io_error(dir.to_path_buf(), source))?;
-        let path = entry.path();
-        if path.extension().and_then(|ext| ext.to_str()) == Some("json") {
-            paths.push(path);
-        }
-    }
-    paths.sort();
-    Ok(paths)
+    sidecar::collect_files(dir, "json", false).map_err(|error| io_error(error.path, error.source))
 }
 
 pub(crate) fn read_json_file<T, E>(
@@ -528,7 +514,7 @@ pub(crate) fn read_json_file<T, E>(
 where
     T: for<'de> serde::Deserialize<'de>,
 {
-    let bytes = std::fs::read(path).map_err(|source| io_error(path.to_path_buf(), source))?;
+    let bytes = sidecar::read_file(path).map_err(|source| io_error(path.to_path_buf(), source))?;
     serde_json::from_slice(&bytes).map_err(|source| parse_error(path.to_path_buf(), source))
 }
 
@@ -540,42 +526,48 @@ pub(crate) fn read_json_resource<T, E>(
 where
     T: for<'de> serde::Deserialize<'de>,
 {
-    let (path, mut file) = opened.into_parts();
-    let mut bytes = Vec::new();
-    file.read_to_end(&mut bytes)
-        .map_err(|source| io_error(path.clone(), source))?;
+    let (path, file) = opened.into_parts();
+    let bytes =
+        sidecar::read_opened_file(&path, file).map_err(|source| io_error(path.clone(), source))?;
     serde_json::from_slice(&bytes).map_err(|source| parse_error(path, source))
 }
 
-fn collect_entries(root: &Path, out: &mut Vec<String>) -> Result<(), DataError> {
-    visit_json_files(
-        root,
-        &mut |path| {
-            let rel = path
-                .strip_prefix(root)
-                .expect("recursive walk yields paths under root");
-            let stem = rel.with_extension("");
-            let mut joined = String::new();
-            for component in stem.components() {
-                if !joined.is_empty() {
-                    joined.push('/');
-                }
-                match component.as_os_str().to_str() {
-                    Some(s) => joined.push_str(s),
-                    None => {
-                        return Err(DataError::InvalidEntry {
-                            entry: stem.to_string_lossy().into_owned(),
-                            path: path.clone(),
-                        });
-                    }
+fn collect_entries(
+    trusted_root: &Path,
+    root: &Path,
+    out: &mut Vec<String>,
+) -> Result<(), DataError> {
+    let paths =
+        sidecar::collect_files_under(trusted_root, root, "json", true).map_err(|error| {
+            DataError::Io {
+                path: error.path,
+                source: error.source,
+            }
+        })?;
+    for path in paths {
+        let rel = path
+            .strip_prefix(root)
+            .expect("recursive walk yields paths under root");
+        let stem = rel.with_extension("");
+        let mut joined = String::new();
+        for component in stem.components() {
+            if !joined.is_empty() {
+                joined.push('/');
+            }
+            match component.as_os_str().to_str() {
+                Some(s) => joined.push_str(s),
+                None => {
+                    return Err(DataError::InvalidEntry {
+                        entry: stem.to_string_lossy().into_owned(),
+                        path: path.clone(),
+                    });
                 }
             }
-            trace!(file = %path.display(), entry = %joined, "indexed");
-            out.push(joined);
-            Ok(())
-        },
-        &|path, source| DataError::Io { path, source },
-    )
+        }
+        trace!(file = %path.display(), entry = %joined, "indexed");
+        out.push(joined);
+    }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -667,6 +659,47 @@ mod tests {
                 ("source".into(), mc_nbt::Tag::String("captured".into())),
             ])
         );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn load_rejects_symlinked_registry_entry() {
+        use std::os::unix::fs::symlink;
+
+        let dir = make_minimal_layout();
+        let link = dir.path().join("data/minecraft/dimension_type/alpha.json");
+        fs::remove_file(&link).unwrap();
+        let outside = TempDir::new().unwrap();
+        let target = outside.path().join("alpha.json");
+        fs::write(&target, "{}").unwrap();
+        symlink(&target, &link).unwrap();
+
+        let error = load(dir.path()).expect_err("registry walk must not follow symlinks");
+        assert!(matches!(
+            error,
+            DataError::Io { path, source }
+                if path == link && source.kind() == std::io::ErrorKind::InvalidData
+        ));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn load_rejects_symlinked_registry_ancestor() {
+        use std::os::unix::fs::symlink;
+
+        let dir = make_minimal_layout();
+        let worldgen = dir.path().join("data/minecraft/worldgen");
+        let outside = TempDir::new().unwrap();
+        let target = outside.path().join("worldgen");
+        fs::rename(&worldgen, &target).unwrap();
+        symlink(&target, &worldgen).unwrap();
+
+        let error = load(dir.path()).expect_err("registry roots must not cross symlink ancestors");
+        assert!(matches!(
+            error,
+            DataError::Io { path, source }
+                if path == worldgen && source.kind() == std::io::ErrorKind::InvalidData
+        ));
     }
 
     #[cfg(unix)]
