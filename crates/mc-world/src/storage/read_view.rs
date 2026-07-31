@@ -5,7 +5,8 @@ use std::sync::{Arc, RwLock, RwLockReadGuard, RwLockWriteGuard};
 
 use mc_data::items::ItemRegistry;
 
-use crate::anvil::{chunk_from_nbt_with_items, read_region};
+use crate::anvil::chunk_from_nbt_with_items;
+use crate::anvil::region::read_chunk;
 use crate::block::{BlockRegistry, BlockStateId};
 use crate::chunk::{BlockPos, Chunk, ChunkPos, FurnaceBlockEntity};
 use crate::section::SECTION_DIM;
@@ -680,9 +681,7 @@ impl ChunkDiskLoadPlan {
         let payload = if let Some(region) = self.cached_region {
             region.get(&self.local).cloned()
         } else if self.disk_backed && self.region_path.is_file() {
-            read_region(&self.region_path)?
-                .into_iter()
-                .find(|payload| (payload.local_x, payload.local_z) == self.local)
+            read_chunk(&self.region_path, self.local.0, self.local.1)?
         } else {
             None
         };

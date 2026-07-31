@@ -20,6 +20,6 @@ pub use chunk_nbt::{
     chunk_to_payload_with_items, chunk_to_payload_with_items_at_tick,
 };
 pub use region::{
-    CHUNKS_PER_REGION_AXIS, ChunkPayload, CompressionType, RegionError, read_region, write_region,
-    write_region_create_new,
+    CHUNKS_PER_REGION_AXIS, ChunkPayload, CompressionType, RegionError, read_region, visit_region,
+    write_region, write_region_create_new,
 };

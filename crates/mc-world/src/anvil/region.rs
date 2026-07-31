@@ -22,12 +22,12 @@
 //! Locations table entry sits at `idx * 4`.
 
 use std::fs::{File, OpenOptions};
-use std::io::{Read, Write};
+use std::io::{Cursor, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 
-use flate2::Compression;
-use flate2::read::{GzDecoder, ZlibDecoder};
+use flate2::bufread::GzDecoder;
 use flate2::write::ZlibEncoder;
+use flate2::{Compression, Decompress, FlushDecompress, Status};
 use thiserror::Error;
 
 /// 32 × 32 chunks per region.
@@ -35,6 +35,11 @@ pub const CHUNKS_PER_REGION_AXIS: usize = 32;
 const REGION_CHUNK_COUNT: usize = CHUNKS_PER_REGION_AXIS * CHUNKS_PER_REGION_AXIS;
 const SECTOR_SIZE: usize = 4096;
 const HEADER_SECTORS: usize = 2; // locations + timestamps
+const HEADER_BYTES: usize = HEADER_SECTORS * SECTOR_SIZE;
+const MAX_REGION_FILE_BYTES: u64 =
+    (HEADER_SECTORS as u64 + REGION_CHUNK_COUNT as u64 * u8::MAX as u64) * SECTOR_SIZE as u64;
+const MAX_DECOMPRESSED_CHUNK_BYTES: usize = 64 * 1024 * 1024;
+const MAX_DECOMPRESSED_REGION_BYTES: usize = 256 * 1024 * 1024;
 const LZ4_BLOCK_MAGIC: &[u8; 8] = b"LZ4Block";
 const LZ4_BLOCK_HEADER_LEN: usize = 21;
 const LZ4_BLOCK_METHOD_RAW: u8 = 0x10;
@@ -85,6 +90,10 @@ pub enum RegionError {
     },
     #[error("region file too short: needs at least {needed} bytes, got {got}")]
     TooShort { needed: usize, got: usize },
+    #[error("region file is {bytes} bytes, exceeding limit {max}")]
+    RegionTooLarge { bytes: u64, max: u64 },
+    #[error("chunk coordinates ({cx},{cz}) are outside the local region range 0..32")]
+    InvalidChunkCoordinates { cx: u8, cz: u8 },
     #[error(
         "chunk slot ({cx},{cz}) points at sector {sector} which is past the file's {sector_count} sectors"
     )]
@@ -116,6 +125,203 @@ pub enum RegionError {
         #[source]
         source: std::io::Error,
     },
+    #[error(
+        "chunk ({cx},{cz}) decompressed payload is at least {bytes} bytes, exceeding limit {max}"
+    )]
+    DecompressedChunkTooLarge {
+        cx: u8,
+        cz: u8,
+        bytes: usize,
+        max: usize,
+    },
+    #[error("region decompressed payload total is {bytes} bytes, exceeding limit {max}")]
+    DecompressedRegionTooLarge { bytes: usize, max: usize },
+}
+
+#[derive(Debug, Clone, Copy)]
+struct RegionLimits {
+    max_file_bytes: u64,
+    max_chunk_bytes: usize,
+    max_region_bytes: usize,
+}
+
+const DEFAULT_REGION_LIMITS: RegionLimits = RegionLimits {
+    max_file_bytes: MAX_REGION_FILE_BYTES,
+    max_chunk_bytes: MAX_DECOMPRESSED_CHUNK_BYTES,
+    max_region_bytes: MAX_DECOMPRESSED_REGION_BYTES,
+};
+
+struct RegionReader {
+    path: PathBuf,
+    file: File,
+    file_len: u64,
+    total_sectors: usize,
+    header: [u8; HEADER_BYTES],
+}
+
+impl RegionReader {
+    fn open(path: &Path, limits: RegionLimits) -> Result<Self, RegionError> {
+        let mut file = File::open(path).map_err(|source| RegionError::Io {
+            path: path.to_path_buf(),
+            source,
+        })?;
+        let file_len = file
+            .metadata()
+            .map_err(|source| RegionError::Io {
+                path: path.to_path_buf(),
+                source,
+            })?
+            .len();
+        if file_len > limits.max_file_bytes {
+            return Err(RegionError::RegionTooLarge {
+                bytes: file_len,
+                max: limits.max_file_bytes,
+            });
+        }
+        if file_len < HEADER_BYTES as u64 {
+            return Err(RegionError::TooShort {
+                needed: HEADER_BYTES,
+                got: file_len as usize,
+            });
+        }
+
+        let mut header = [0_u8; HEADER_BYTES];
+        file.read_exact(&mut header)
+            .map_err(|source| RegionError::Io {
+                path: path.to_path_buf(),
+                source,
+            })?;
+        let total_sectors = usize::try_from(file_len.div_ceil(SECTOR_SIZE as u64))
+            .expect("bounded region sector count fits usize");
+        Ok(Self {
+            path: path.to_path_buf(),
+            file,
+            file_len,
+            total_sectors,
+            header,
+        })
+    }
+
+    fn read_slot(
+        &mut self,
+        slot: usize,
+        decoded_so_far: usize,
+        limits: RegionLimits,
+    ) -> Result<Option<ChunkPayload>, RegionError> {
+        let cx = (slot % CHUNKS_PER_REGION_AXIS) as u8;
+        let cz = (slot / CHUNKS_PER_REGION_AXIS) as u8;
+        let loc_off = slot * 4;
+        let loc = u32::from_be_bytes(
+            self.header[loc_off..loc_off + 4]
+                .try_into()
+                .expect("4-byte slice"),
+        );
+        let sector = loc >> 8;
+        let count = (loc & 0xFF) as u8;
+        if sector == 0 && count == 0 {
+            return Ok(None);
+        }
+        if count == 0 {
+            return Err(RegionError::ZeroSectorCount { cx, cz });
+        }
+
+        let start = u64::from(sector) * SECTOR_SIZE as u64;
+        if start >= self.file_len {
+            return Err(RegionError::SectorOutOfRange {
+                cx,
+                cz,
+                sector,
+                sector_count: self.total_sectors,
+            });
+        }
+        let allocated_end = start
+            .checked_add(u64::from(count) * SECTOR_SIZE as u64)
+            .expect("u24 sector offset plus u8 count fits u64");
+        let end = allocated_end.min(self.file_len);
+        let bytes_available =
+            usize::try_from(end - start).expect("one Anvil chunk allocation fits usize");
+        if bytes_available < 5 {
+            return Err(RegionError::LengthOverrun {
+                cx,
+                cz,
+                len: 0,
+                bytes_available,
+            });
+        }
+
+        self.file
+            .seek(SeekFrom::Start(start))
+            .map_err(|source| RegionError::Io {
+                path: self.path.clone(),
+                source,
+            })?;
+        let mut chunk_header = [0_u8; 5];
+        self.file
+            .read_exact(&mut chunk_header)
+            .map_err(|source| RegionError::Io {
+                path: self.path.clone(),
+                source,
+            })?;
+        let len = u32::from_be_bytes(chunk_header[..4].try_into().expect("4-byte slice"));
+        let comp_byte = chunk_header[4];
+        if comp_byte & 0x80 != 0 {
+            return Err(RegionError::Oversized);
+        }
+        let comp = CompressionType::from_byte(comp_byte)?;
+        let payload_len = usize::try_from(len)
+            .expect("u32 chunk length fits usize")
+            .checked_sub(1)
+            .ok_or(RegionError::LengthOverrun {
+                cx,
+                cz,
+                len,
+                bytes_available,
+            })?;
+        let encoded_len = 5_usize
+            .checked_add(payload_len)
+            .ok_or(RegionError::LengthOverrun {
+                cx,
+                cz,
+                len,
+                bytes_available,
+            })?;
+        if encoded_len > bytes_available {
+            return Err(RegionError::LengthOverrun {
+                cx,
+                cz,
+                len,
+                bytes_available,
+            });
+        }
+
+        let mut payload =
+            allocate_exact_bytes(payload_len, "compressed Anvil chunk").map_err(|source| {
+                RegionError::Io {
+                    path: self.path.clone(),
+                    source,
+                }
+            })?;
+        self.file
+            .read_exact(&mut payload)
+            .map_err(|source| RegionError::Io {
+                path: self.path.clone(),
+                source,
+            })?;
+
+        let uncompressed_nbt = decompress_bounded(comp, &payload, cx, cz, decoded_so_far, limits)?;
+        let ts_off = SECTOR_SIZE + slot * 4;
+        let timestamp = u32::from_be_bytes(
+            self.header[ts_off..ts_off + 4]
+                .try_into()
+                .expect("4-byte slice"),
+        );
+        Ok(Some(ChunkPayload {
+            local_x: cx,
+            local_z: cz,
+            timestamp,
+            uncompressed_nbt,
+        }))
+    }
 }
 
 /// Read every populated chunk out of a region file. Empty slots are
@@ -123,101 +329,60 @@ pub enum RegionError {
 /// `(cz * 32 + cx)`.
 pub fn read_region(path: impl AsRef<Path>) -> Result<Vec<ChunkPayload>, RegionError> {
     let path = path.as_ref();
-    let bytes = std::fs::read(path).map_err(|e| RegionError::Io {
-        path: path.to_path_buf(),
-        source: e,
-    })?;
-    if bytes.len() < HEADER_SECTORS * SECTOR_SIZE {
-        return Err(RegionError::TooShort {
-            needed: HEADER_SECTORS * SECTOR_SIZE,
-            got: bytes.len(),
-        });
-    }
-    // Vanilla allocates per-chunk in sector-sized chunks but the
-    // total file may not be padded to a sector boundary at EOF, so
-    // don't require alignment of the file as a whole. We still
-    // verify that every chunk's declared allocation fits inside.
-    let total_sectors = bytes.len().div_ceil(SECTOR_SIZE);
     let mut out = Vec::new();
-    for slot in 0..REGION_CHUNK_COUNT {
-        let cx = (slot % CHUNKS_PER_REGION_AXIS) as u8;
-        let cz = (slot / CHUNKS_PER_REGION_AXIS) as u8;
+    out.try_reserve_exact(REGION_CHUNK_COUNT)
+        .map_err(|error| RegionError::Io {
+            path: path.to_path_buf(),
+            source: std::io::Error::other(format!("reserve region chunk list: {error}")),
+        })?;
+    read_region_with_limits(path, DEFAULT_REGION_LIMITS, |payload| out.push(payload))?;
+    Ok(out)
+}
 
-        let loc_off = slot * 4;
-        let loc = u32::from_be_bytes(
-            bytes[loc_off..loc_off + 4]
-                .try_into()
-                .expect("4-byte slice"),
-        );
-        let sector = loc >> 8;
-        let count = (loc & 0xFF) as u8;
+/// Visit every populated chunk without retaining all decoded payloads.
+/// The same per-chunk and aggregate decode budgets as [`read_region`]
+/// are enforced before each output allocation.
+pub fn visit_region(
+    path: impl AsRef<Path>,
+    visitor: impl FnMut(ChunkPayload),
+) -> Result<(), RegionError> {
+    read_region_with_limits(path.as_ref(), DEFAULT_REGION_LIMITS, visitor)
+}
 
-        if sector == 0 && count == 0 {
-            continue;
-        }
-        if count == 0 {
-            return Err(RegionError::ZeroSectorCount { cx, cz });
-        }
-        let start = sector as usize * SECTOR_SIZE;
-        let end = (start + count as usize * SECTOR_SIZE).min(bytes.len());
-        if start >= bytes.len() {
-            return Err(RegionError::SectorOutOfRange {
-                cx,
-                cz,
-                sector,
-                sector_count: total_sectors,
-            });
-        }
-
-        // 4-byte length, 1-byte compression, payload, trailing pad.
-        let ts_off = SECTOR_SIZE + slot * 4;
-        let timestamp =
-            u32::from_be_bytes(bytes[ts_off..ts_off + 4].try_into().expect("4-byte slice"));
-
-        let chunk_bytes = &bytes[start..end];
-        if chunk_bytes.len() < 5 {
-            return Err(RegionError::LengthOverrun {
-                cx,
-                cz,
-                len: 0,
-                bytes_available: chunk_bytes.len(),
-            });
-        }
-        let len = u32::from_be_bytes(chunk_bytes[..4].try_into().expect("4-byte slice"));
-        let comp_byte = chunk_bytes[4];
-        if comp_byte & 0x80 != 0 {
-            return Err(RegionError::Oversized);
-        }
-        let comp = CompressionType::from_byte(comp_byte)?;
-        let payload_len = (len as usize)
-            .checked_sub(1)
-            .ok_or(RegionError::LengthOverrun {
-                cx,
-                cz,
-                len,
-                bytes_available: chunk_bytes.len(),
-            })?;
-        if 5 + payload_len > chunk_bytes.len() {
-            return Err(RegionError::LengthOverrun {
-                cx,
-                cz,
-                len,
-                bytes_available: chunk_bytes.len(),
-            });
-        }
-        let payload = &chunk_bytes[5..5 + payload_len];
-
-        let uncompressed =
-            decompress(comp, payload).map_err(|e| RegionError::Decompress { cx, cz, source: e })?;
-
-        out.push(ChunkPayload {
-            local_x: cx,
-            local_z: cz,
-            timestamp,
-            uncompressed_nbt: uncompressed,
+pub(crate) fn read_chunk(
+    path: impl AsRef<Path>,
+    local_x: u8,
+    local_z: u8,
+) -> Result<Option<ChunkPayload>, RegionError> {
+    if usize::from(local_x) >= CHUNKS_PER_REGION_AXIS
+        || usize::from(local_z) >= CHUNKS_PER_REGION_AXIS
+    {
+        return Err(RegionError::InvalidChunkCoordinates {
+            cx: local_x,
+            cz: local_z,
         });
     }
-    Ok(out)
+    let mut reader = RegionReader::open(path.as_ref(), DEFAULT_REGION_LIMITS)?;
+    let slot = usize::from(local_z) * CHUNKS_PER_REGION_AXIS + usize::from(local_x);
+    reader.read_slot(slot, 0, DEFAULT_REGION_LIMITS)
+}
+
+fn read_region_with_limits(
+    path: &Path,
+    limits: RegionLimits,
+    mut visitor: impl FnMut(ChunkPayload),
+) -> Result<(), RegionError> {
+    let mut reader = RegionReader::open(path, limits)?;
+    let mut decoded_total = 0_usize;
+    for slot in 0..REGION_CHUNK_COUNT {
+        if let Some(payload) = reader.read_slot(slot, decoded_total, limits)? {
+            decoded_total = decoded_total
+                .checked_add(payload.uncompressed_nbt.len())
+                .expect("aggregate limit prevents decoded byte overflow");
+            visitor(payload);
+        }
+    }
+    Ok(())
 }
 
 /// Write a fresh region file at `path`, packing each chunk with zlib.
@@ -308,52 +473,306 @@ fn write_region_with_options(
     Ok(())
 }
 
-fn decompress(comp: CompressionType, payload: &[u8]) -> Result<Vec<u8>, std::io::Error> {
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum BoundedLength {
+    Exact(usize),
+    TooLarge { at_least: usize },
+}
+
+fn decompress_bounded(
+    comp: CompressionType,
+    payload: &[u8],
+    cx: u8,
+    cz: u8,
+    decoded_so_far: usize,
+    limits: RegionLimits,
+) -> Result<Vec<u8>, RegionError> {
+    let decoded_len = match count_decoded_bytes(comp, payload, limits.max_chunk_bytes)
+        .map_err(|source| RegionError::Decompress { cx, cz, source })?
+    {
+        BoundedLength::Exact(len) => len,
+        BoundedLength::TooLarge { at_least } => {
+            return Err(RegionError::DecompressedChunkTooLarge {
+                cx,
+                cz,
+                bytes: at_least,
+                max: limits.max_chunk_bytes,
+            });
+        }
+    };
+    let aggregate = decoded_so_far.saturating_add(decoded_len);
+    if aggregate > limits.max_region_bytes {
+        return Err(RegionError::DecompressedRegionTooLarge {
+            bytes: aggregate,
+            max: limits.max_region_bytes,
+        });
+    }
+    decompress_exact(comp, payload, decoded_len).map_err(|source| RegionError::Decompress {
+        cx,
+        cz,
+        source,
+    })
+}
+
+fn count_decoded_bytes(
+    comp: CompressionType,
+    payload: &[u8],
+    max: usize,
+) -> Result<BoundedLength, std::io::Error> {
     match comp {
-        CompressionType::Uncompressed => Ok(payload.to_vec()),
-        CompressionType::Zlib => {
-            let mut out = Vec::with_capacity(payload.len() * 4);
-            ZlibDecoder::new(payload).read_to_end(&mut out)?;
-            Ok(out)
-        }
-        CompressionType::Gzip => {
-            let mut out = Vec::with_capacity(payload.len() * 4);
-            GzDecoder::new(payload).read_to_end(&mut out)?;
-            Ok(out)
-        }
-        CompressionType::Lz4 => decompress_lz4_block_stream(payload),
+        CompressionType::Uncompressed => Ok(if payload.len() > max {
+            BoundedLength::TooLarge {
+                at_least: payload.len(),
+            }
+        } else {
+            BoundedLength::Exact(payload.len())
+        }),
+        CompressionType::Zlib => count_zlib_bytes(payload, max),
+        CompressionType::Gzip => count_gzip_bytes(payload, max),
+        CompressionType::Lz4 => count_lz4_bytes(payload, max),
     }
 }
 
-fn decompress_lz4_block_stream(payload: &[u8]) -> Result<Vec<u8>, std::io::Error> {
-    let mut pos = 0;
-    let mut out = Vec::with_capacity(payload.len() * 4);
+fn count_zlib_bytes(payload: &[u8], max: usize) -> Result<BoundedLength, std::io::Error> {
+    let mut decoder = Decompress::new(true);
+    let mut input_pos = 0_usize;
+    let mut total = 0_usize;
+    let mut buffer = [0_u8; 8 * 1024];
     loop {
-        if payload.len() - pos < LZ4_BLOCK_HEADER_LEN {
+        let remaining = max.saturating_sub(total);
+        let output_cap = remaining.saturating_add(1).min(buffer.len());
+        let before_input = decoder.total_in();
+        let before_output = decoder.total_out();
+        let flush = if input_pos == payload.len() {
+            FlushDecompress::Finish
+        } else {
+            FlushDecompress::None
+        };
+        let status = decoder
+            .decompress(&payload[input_pos..], &mut buffer[..output_cap], flush)
+            .map_err(decompress_io_error)?;
+        let consumed = usize::try_from(decoder.total_in() - before_input)
+            .expect("bounded zlib input progress fits usize");
+        let produced = usize::try_from(decoder.total_out() - before_output)
+            .expect("bounded zlib output progress fits usize");
+        input_pos += consumed;
+        total = total.checked_add(produced).ok_or_else(|| {
+            std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "zlib decompressed length overflow",
+            )
+        })?;
+        if total > max {
+            return Ok(BoundedLength::TooLarge { at_least: total });
+        }
+        if status == Status::StreamEnd {
+            ensure_compressed_consumed(input_pos, payload.len(), "zlib stream")?;
+            return Ok(BoundedLength::Exact(total));
+        }
+        if consumed == 0 && produced == 0 {
             return Err(std::io::Error::new(
-                std::io::ErrorKind::UnexpectedEof,
-                "truncated LZ4 block header",
+                if input_pos == payload.len() {
+                    std::io::ErrorKind::UnexpectedEof
+                } else {
+                    std::io::ErrorKind::InvalidData
+                },
+                if input_pos == payload.len() {
+                    "truncated zlib stream"
+                } else {
+                    "zlib decoder made no progress"
+                },
             ));
         }
-        if &payload[pos..pos + LZ4_BLOCK_MAGIC.len()] != LZ4_BLOCK_MAGIC {
+    }
+}
+
+fn count_gzip_bytes(payload: &[u8], max: usize) -> Result<BoundedLength, std::io::Error> {
+    let mut decoder = GzDecoder::new(Cursor::new(payload));
+    let len = count_bounded_bytes(&mut decoder, max)?;
+    if matches!(len, BoundedLength::Exact(_)) {
+        ensure_compressed_consumed(
+            decoder.into_inner().position() as usize,
+            payload.len(),
+            "gzip member",
+        )?;
+    }
+    Ok(len)
+}
+
+fn count_bounded_bytes(
+    reader: &mut impl Read,
+    max: usize,
+) -> Result<BoundedLength, std::io::Error> {
+    let mut total = 0_usize;
+    let mut buffer = [0_u8; 8 * 1024];
+    loop {
+        let remaining = max.saturating_sub(total);
+        let read_cap = remaining.saturating_add(1).min(buffer.len());
+        let read = reader.read(&mut buffer[..read_cap])?;
+        if read == 0 {
+            return Ok(BoundedLength::Exact(total));
+        }
+        total = total.checked_add(read).ok_or_else(|| {
+            std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "decompressed Anvil length overflow",
+            )
+        })?;
+        if total > max {
+            return Ok(BoundedLength::TooLarge { at_least: total });
+        }
+    }
+}
+
+fn decompress_exact(
+    comp: CompressionType,
+    payload: &[u8],
+    decoded_len: usize,
+) -> Result<Vec<u8>, std::io::Error> {
+    match comp {
+        CompressionType::Uncompressed => {
+            let mut out = allocate_exact_bytes(decoded_len, "uncompressed Anvil chunk")?;
+            out.copy_from_slice(payload);
+            Ok(out)
+        }
+        CompressionType::Zlib => decompress_zlib_exact(payload, decoded_len),
+        CompressionType::Gzip => decompress_gzip_exact(payload, decoded_len),
+        CompressionType::Lz4 => decompress_lz4_exact(payload, decoded_len),
+    }
+}
+
+fn decompress_zlib_exact(payload: &[u8], decoded_len: usize) -> Result<Vec<u8>, std::io::Error> {
+    let mut out = allocate_exact_bytes(decoded_len, "decompressed zlib Anvil chunk")?;
+    let mut decoder = Decompress::new(true);
+    let mut input_pos = 0_usize;
+    let mut output_pos = 0_usize;
+    let mut extra = [0_u8; 1];
+    loop {
+        let before_input = decoder.total_in();
+        let before_output = decoder.total_out();
+        let flush = if input_pos == payload.len() {
+            FlushDecompress::Finish
+        } else {
+            FlushDecompress::None
+        };
+        let status = if output_pos < out.len() {
+            decoder.decompress(&payload[input_pos..], &mut out[output_pos..], flush)
+        } else {
+            decoder.decompress(&payload[input_pos..], &mut extra, flush)
+        }
+        .map_err(decompress_io_error)?;
+        let consumed = usize::try_from(decoder.total_in() - before_input)
+            .expect("bounded zlib input progress fits usize");
+        let produced = usize::try_from(decoder.total_out() - before_output)
+            .expect("bounded zlib output progress fits usize");
+        input_pos += consumed;
+        if output_pos == out.len() && produced != 0 {
             return Err(std::io::Error::new(
                 std::io::ErrorKind::InvalidData,
-                "missing LZ4Block magic",
+                "zlib output changed between bounded passes",
             ));
         }
+        output_pos = output_pos.checked_add(produced).ok_or_else(|| {
+            std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "zlib output length overflow",
+            )
+        })?;
+        if output_pos > out.len() {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "zlib output changed between bounded passes",
+            ));
+        }
+        if status == Status::StreamEnd {
+            ensure_compressed_consumed(input_pos, payload.len(), "zlib stream")?;
+            if output_pos != decoded_len {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    "zlib output changed between bounded passes",
+                ));
+            }
+            return Ok(out);
+        }
+        if consumed == 0 && produced == 0 {
+            return Err(std::io::Error::new(
+                if input_pos == payload.len() {
+                    std::io::ErrorKind::UnexpectedEof
+                } else {
+                    std::io::ErrorKind::InvalidData
+                },
+                if input_pos == payload.len() {
+                    "truncated zlib stream"
+                } else {
+                    "zlib decoder made no progress"
+                },
+            ));
+        }
+    }
+}
 
-        let token = payload[pos + 8];
-        let method = token & 0xF0;
-        let compressed_len =
-            u32::from_le_bytes(payload[pos + 9..pos + 13].try_into().expect("4-byte slice"))
-                as usize;
-        let decompressed_len = u32::from_le_bytes(
-            payload[pos + 13..pos + 17]
-                .try_into()
-                .expect("4-byte slice"),
-        ) as usize;
-        pos += LZ4_BLOCK_HEADER_LEN;
+fn decompress_gzip_exact(payload: &[u8], decoded_len: usize) -> Result<Vec<u8>, std::io::Error> {
+    let mut out = allocate_exact_bytes(decoded_len, "decompressed gzip Anvil chunk")?;
+    let mut decoder = GzDecoder::new(Cursor::new(payload));
+    decoder.read_exact(&mut out)?;
+    ensure_decoder_eof(&mut decoder, "gzip output changed between bounded passes")?;
+    ensure_compressed_consumed(
+        decoder.into_inner().position() as usize,
+        payload.len(),
+        "gzip member",
+    )?;
+    Ok(out)
+}
 
+fn ensure_decoder_eof(
+    decoder: &mut impl Read,
+    message: &'static str,
+) -> Result<(), std::io::Error> {
+    let mut extra = [0_u8; 1];
+    if decoder.read(&mut extra)? != 0 {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            message,
+        ));
+    }
+    Ok(())
+}
+
+fn ensure_compressed_consumed(
+    consumed: usize,
+    expected: usize,
+    kind: &'static str,
+) -> Result<(), std::io::Error> {
+    if consumed != expected {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            format!(
+                "trailing bytes after {kind}: {}",
+                expected.saturating_sub(consumed)
+            ),
+        ));
+    }
+    Ok(())
+}
+
+fn decompress_io_error(error: flate2::DecompressError) -> std::io::Error {
+    std::io::Error::new(std::io::ErrorKind::InvalidData, error)
+}
+
+fn allocate_exact_bytes(len: usize, context: &'static str) -> Result<Vec<u8>, std::io::Error> {
+    let mut bytes = Vec::new();
+    bytes.try_reserve_exact(len).map_err(|error| {
+        std::io::Error::other(format!("reserve {context} buffer of {len} bytes: {error}"))
+    })?;
+    bytes.resize(len, 0);
+    Ok(bytes)
+}
+
+fn count_lz4_bytes(payload: &[u8], max: usize) -> Result<BoundedLength, std::io::Error> {
+    let mut pos = 0_usize;
+    let mut total = 0_usize;
+    loop {
+        let (token, compressed_len, decompressed_len) = read_lz4_block_header(payload, &mut pos)?;
         if compressed_len == 0 && decompressed_len == 0 {
             if pos != payload.len() {
                 return Err(std::io::Error::new(
@@ -361,7 +780,17 @@ fn decompress_lz4_block_stream(payload: &[u8]) -> Result<Vec<u8>, std::io::Error
                     "trailing bytes after LZ4 end marker",
                 ));
             }
-            return Ok(out);
+            return Ok(BoundedLength::Exact(total));
+        }
+        validate_lz4_method(token, compressed_len, decompressed_len)?;
+        total = total.checked_add(decompressed_len).ok_or_else(|| {
+            std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "LZ4 decompressed length overflow",
+            )
+        })?;
+        if total > max {
+            return Ok(BoundedLength::TooLarge { at_least: total });
         }
         if payload.len() - pos < compressed_len {
             return Err(std::io::Error::new(
@@ -369,37 +798,113 @@ fn decompress_lz4_block_stream(payload: &[u8]) -> Result<Vec<u8>, std::io::Error
                 "truncated LZ4 block payload",
             ));
         }
+        pos += compressed_len;
+    }
+}
 
-        let block = &payload[pos..pos + compressed_len];
-        match method {
-            LZ4_BLOCK_METHOD_RAW => {
-                if compressed_len != decompressed_len {
-                    return Err(std::io::Error::new(
-                        std::io::ErrorKind::InvalidData,
-                        "raw LZ4 block length mismatch",
-                    ));
-                }
-                out.extend_from_slice(block);
+fn decompress_lz4_exact(payload: &[u8], decoded_len: usize) -> Result<Vec<u8>, std::io::Error> {
+    let mut out = allocate_exact_bytes(decoded_len, "decompressed LZ4 Anvil chunk")?;
+    let mut pos = 0_usize;
+    let mut out_pos = 0_usize;
+    loop {
+        let (token, compressed_len, decompressed_len) = read_lz4_block_header(payload, &mut pos)?;
+        if compressed_len == 0 && decompressed_len == 0 {
+            if pos != payload.len() || out_pos != decoded_len {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    "LZ4 output changed between bounded passes",
+                ));
             }
+            return Ok(out);
+        }
+        validate_lz4_method(token, compressed_len, decompressed_len)?;
+        if payload.len() - pos < compressed_len {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::UnexpectedEof,
+                "truncated LZ4 block payload",
+            ));
+        }
+        let out_end = out_pos.checked_add(decompressed_len).ok_or_else(|| {
+            std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "LZ4 output length overflow",
+            )
+        })?;
+        if out_end > out.len() {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "LZ4 output changed between bounded passes",
+            ));
+        }
+        let block = &payload[pos..pos + compressed_len];
+        match token & 0xF0 {
+            LZ4_BLOCK_METHOD_RAW => out[out_pos..out_end].copy_from_slice(block),
             LZ4_BLOCK_METHOD_COMPRESSED => {
-                let decompressed = lz4_flex::block::decompress(block, decompressed_len)
-                    .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
-                if decompressed.len() != decompressed_len {
+                let written = lz4_flex::block::decompress_into(block, &mut out[out_pos..out_end])
+                    .map_err(|error| {
+                    std::io::Error::new(std::io::ErrorKind::InvalidData, error)
+                })?;
+                if written != decompressed_len {
                     return Err(std::io::Error::new(
                         std::io::ErrorKind::InvalidData,
                         "LZ4 block decompressed length mismatch",
                     ));
                 }
-                out.extend_from_slice(&decompressed);
             }
-            _ => {
-                return Err(std::io::Error::new(
-                    std::io::ErrorKind::InvalidData,
-                    format!("unknown LZ4 block token {token:#04x}"),
-                ));
-            }
+            _ => unreachable!("LZ4 method validated before decode"),
         }
         pos += compressed_len;
+        out_pos = out_end;
+    }
+}
+
+fn read_lz4_block_header(
+    payload: &[u8],
+    pos: &mut usize,
+) -> Result<(u8, usize, usize), std::io::Error> {
+    if payload.len() - *pos < LZ4_BLOCK_HEADER_LEN {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::UnexpectedEof,
+            "truncated LZ4 block header",
+        ));
+    }
+    if &payload[*pos..*pos + LZ4_BLOCK_MAGIC.len()] != LZ4_BLOCK_MAGIC {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "missing LZ4Block magic",
+        ));
+    }
+    let token = payload[*pos + 8];
+    let compressed_len = u32::from_le_bytes(
+        payload[*pos + 9..*pos + 13]
+            .try_into()
+            .expect("4-byte slice"),
+    ) as usize;
+    let decompressed_len = u32::from_le_bytes(
+        payload[*pos + 13..*pos + 17]
+            .try_into()
+            .expect("4-byte slice"),
+    ) as usize;
+    *pos += LZ4_BLOCK_HEADER_LEN;
+    Ok((token, compressed_len, decompressed_len))
+}
+
+fn validate_lz4_method(
+    token: u8,
+    compressed_len: usize,
+    decompressed_len: usize,
+) -> Result<(), std::io::Error> {
+    match token & 0xF0 {
+        LZ4_BLOCK_METHOD_RAW if compressed_len == decompressed_len => Ok(()),
+        LZ4_BLOCK_METHOD_RAW => Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "raw LZ4 block length mismatch",
+        )),
+        LZ4_BLOCK_METHOD_COMPRESSED => Ok(()),
+        _ => Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            format!("unknown LZ4 block token {token:#04x}"),
+        )),
     }
 }
 
@@ -441,21 +946,53 @@ mod tests {
     }
 
     fn synthetic_region(compression: u8, payload: &[u8]) -> tempfile::NamedTempFile {
-        let body_len = 5 + payload.len();
-        let sectors = body_len.div_ceil(SECTOR_SIZE).max(1);
-        let mut bytes = vec![0u8; (HEADER_SECTORS + sectors) * SECTOR_SIZE];
-        let location = ((HEADER_SECTORS as u32) << 8) | sectors as u32;
-        bytes[0..4].copy_from_slice(&location.to_be_bytes());
-        bytes[SECTOR_SIZE..SECTOR_SIZE + 4].copy_from_slice(&1_700_000_000u32.to_be_bytes());
-        let chunk_start = HEADER_SECTORS * SECTOR_SIZE;
-        let declared_len = (payload.len() + 1) as u32;
-        bytes[chunk_start..chunk_start + 4].copy_from_slice(&declared_len.to_be_bytes());
-        bytes[chunk_start + 4] = compression;
-        bytes[chunk_start + 5..chunk_start + 5 + payload.len()].copy_from_slice(payload);
+        synthetic_region_chunks(&[(0, compression, payload.to_vec())])
+    }
+
+    fn synthetic_region_chunks(chunks: &[(usize, u8, Vec<u8>)]) -> tempfile::NamedTempFile {
+        let mut bytes = vec![0_u8; HEADER_BYTES];
+        let mut next_sector = HEADER_SECTORS;
+        for (slot, compression, payload) in chunks {
+            assert!(*slot < REGION_CHUNK_COUNT);
+            let body_len = 5 + payload.len();
+            let sectors = body_len.div_ceil(SECTOR_SIZE).max(1);
+            assert!(sectors <= usize::from(u8::MAX));
+            let location = ((next_sector as u32) << 8) | sectors as u32;
+            let loc_off = slot * 4;
+            bytes[loc_off..loc_off + 4].copy_from_slice(&location.to_be_bytes());
+            let ts_off = SECTOR_SIZE + slot * 4;
+            bytes[ts_off..ts_off + 4]
+                .copy_from_slice(&(1_700_000_000_u32 + *slot as u32).to_be_bytes());
+
+            let chunk_start = next_sector * SECTOR_SIZE;
+            bytes.resize((next_sector + sectors) * SECTOR_SIZE, 0);
+            let declared_len = (payload.len() + 1) as u32;
+            bytes[chunk_start..chunk_start + 4].copy_from_slice(&declared_len.to_be_bytes());
+            bytes[chunk_start + 4] = *compression;
+            bytes[chunk_start + 5..chunk_start + 5 + payload.len()].copy_from_slice(payload);
+            next_sector += sectors;
+        }
 
         let tmp = tempfile::NamedTempFile::new().unwrap();
         std::fs::write(tmp.path(), bytes).unwrap();
         tmp
+    }
+
+    fn collect_with_limits(
+        path: &Path,
+        limits: RegionLimits,
+    ) -> Result<Vec<ChunkPayload>, RegionError> {
+        let mut chunks = Vec::new();
+        read_region_with_limits(path, limits, |payload| chunks.push(payload))?;
+        Ok(chunks)
+    }
+
+    fn test_limits(max_chunk_bytes: usize, max_region_bytes: usize) -> RegionLimits {
+        RegionLimits {
+            max_file_bytes: MAX_REGION_FILE_BYTES,
+            max_chunk_bytes,
+            max_region_bytes,
+        }
     }
 
     fn gzip_payload(raw: &[u8]) -> Vec<u8> {
@@ -464,20 +1001,35 @@ mod tests {
         encoder.finish().unwrap()
     }
 
-    fn raw_lz4_block_payload(raw: &[u8]) -> Vec<u8> {
+    fn zlib_payload(raw: &[u8]) -> Vec<u8> {
+        let mut encoder = ZlibEncoder::new(Vec::new(), flate2::Compression::default());
+        encoder.write_all(raw).unwrap();
+        encoder.finish().unwrap()
+    }
+
+    fn lz4_block_payload(method: u8, block: &[u8], decompressed_len: usize) -> Vec<u8> {
         let mut payload = Vec::new();
         payload.extend_from_slice(LZ4_BLOCK_MAGIC);
-        payload.push(LZ4_BLOCK_METHOD_RAW);
-        payload.extend_from_slice(&(raw.len() as u32).to_le_bytes());
-        payload.extend_from_slice(&(raw.len() as u32).to_le_bytes());
-        payload.extend_from_slice(&0u32.to_le_bytes());
-        payload.extend_from_slice(raw);
+        payload.push(method);
+        payload.extend_from_slice(&(block.len() as u32).to_le_bytes());
+        payload.extend_from_slice(&(decompressed_len as u32).to_le_bytes());
+        payload.extend_from_slice(&0_u32.to_le_bytes());
+        payload.extend_from_slice(block);
         payload.extend_from_slice(LZ4_BLOCK_MAGIC);
         payload.push(LZ4_BLOCK_METHOD_RAW);
-        payload.extend_from_slice(&0u32.to_le_bytes());
-        payload.extend_from_slice(&0u32.to_le_bytes());
-        payload.extend_from_slice(&0u32.to_le_bytes());
+        payload.extend_from_slice(&0_u32.to_le_bytes());
+        payload.extend_from_slice(&0_u32.to_le_bytes());
+        payload.extend_from_slice(&0_u32.to_le_bytes());
         payload
+    }
+
+    fn raw_lz4_block_payload(raw: &[u8]) -> Vec<u8> {
+        lz4_block_payload(LZ4_BLOCK_METHOD_RAW, raw, raw.len())
+    }
+
+    fn compressed_lz4_block_payload(raw: &[u8]) -> Vec<u8> {
+        let compressed = lz4_flex::block::compress(raw);
+        lz4_block_payload(LZ4_BLOCK_METHOD_COMPRESSED, &compressed, raw.len())
     }
 
     #[test]
@@ -516,8 +1068,13 @@ mod tests {
         let raw = b"synthetic chunk payload bytes";
         for (compression, payload) in [
             (CompressionType::Gzip as u8, gzip_payload(raw)),
+            (CompressionType::Zlib as u8, zlib_payload(raw)),
             (CompressionType::Uncompressed as u8, raw.to_vec()),
             (CompressionType::Lz4 as u8, raw_lz4_block_payload(raw)),
+            (
+                CompressionType::Lz4 as u8,
+                compressed_lz4_block_payload(raw),
+            ),
         ] {
             let region = synthetic_region(compression, &payload);
 
@@ -529,6 +1086,183 @@ mod tests {
             assert_eq!(chunks[0].timestamp, 1_700_000_000);
             assert_eq!(chunks[0].uncompressed_nbt, raw);
         }
+    }
+
+    #[test]
+    fn slot_reader_and_visitor_do_not_require_retaining_the_region() {
+        let region = synthetic_region_chunks(&[
+            (0, CompressionType::Uncompressed as u8, b"zero".to_vec()),
+            (33, CompressionType::Uncompressed as u8, b"target".to_vec()),
+        ]);
+
+        let target = read_chunk(region.path(), 1, 1).unwrap().unwrap();
+        assert_eq!(target.uncompressed_nbt, b"target");
+        assert!(read_chunk(region.path(), 2, 2).unwrap().is_none());
+        assert!(matches!(
+            read_chunk(region.path(), 32, 0),
+            Err(RegionError::InvalidChunkCoordinates { cx: 32, cz: 0 })
+        ));
+
+        let mut visited = Vec::new();
+        visit_region(region.path(), |payload| {
+            visited.push((payload.local_x, payload.local_z, payload.uncompressed_nbt));
+        })
+        .unwrap();
+        assert_eq!(
+            visited,
+            vec![(0, 0, b"zero".to_vec()), (1, 1, b"target".to_vec())]
+        );
+    }
+
+    #[test]
+    fn slot_reader_isolated_from_unrelated_corrupt_slot() {
+        let region = synthetic_region_chunks(&[
+            (0, 0x7F, b"corrupt".to_vec()),
+            (33, CompressionType::Uncompressed as u8, b"target".to_vec()),
+        ]);
+
+        let target = read_chunk(region.path(), 1, 1).unwrap().unwrap();
+        assert_eq!(target.uncompressed_nbt, b"target");
+        assert!(matches!(
+            read_region(region.path()),
+            Err(RegionError::UnknownCompression(0x7F))
+        ));
+    }
+
+    #[test]
+    fn rejects_region_file_above_sector_geometry_limit_before_body_read() {
+        let region = tempfile::NamedTempFile::new().unwrap();
+        region.as_file().set_len((HEADER_BYTES + 1) as u64).unwrap();
+        let limits = RegionLimits {
+            max_file_bytes: HEADER_BYTES as u64,
+            max_chunk_bytes: 64,
+            max_region_bytes: 64,
+        };
+
+        let error = collect_with_limits(region.path(), limits).unwrap_err();
+        assert!(matches!(
+            error,
+            RegionError::RegionTooLarge { bytes, max }
+                if bytes == (HEADER_BYTES + 1) as u64 && max == HEADER_BYTES as u64
+        ));
+    }
+
+    #[test]
+    fn rejects_decompression_bombs_for_every_codec_before_output_allocation() {
+        let raw = vec![0xA5; 65];
+        let declared_lz4_bomb = lz4_block_payload(LZ4_BLOCK_METHOD_COMPRESSED, &[0], raw.len());
+        for (compression, payload) in [
+            (CompressionType::Gzip as u8, gzip_payload(&raw)),
+            (CompressionType::Zlib as u8, zlib_payload(&raw)),
+            (CompressionType::Uncompressed as u8, raw.clone()),
+            (CompressionType::Lz4 as u8, raw_lz4_block_payload(&raw)),
+            (CompressionType::Lz4 as u8, declared_lz4_bomb),
+        ] {
+            let region = synthetic_region(compression, &payload);
+            let error = collect_with_limits(region.path(), test_limits(64, 128)).unwrap_err();
+            assert!(matches!(
+                error,
+                RegionError::DecompressedChunkTooLarge {
+                    cx: 0,
+                    cz: 0,
+                    bytes: 65,
+                    max: 64,
+                }
+            ));
+        }
+    }
+
+    #[test]
+    fn accepts_exact_chunk_limit_for_every_codec() {
+        let raw = vec![0x5A; 64];
+        for (compression, payload) in [
+            (CompressionType::Gzip as u8, gzip_payload(&raw)),
+            (CompressionType::Zlib as u8, zlib_payload(&raw)),
+            (CompressionType::Uncompressed as u8, raw.clone()),
+            (CompressionType::Lz4 as u8, raw_lz4_block_payload(&raw)),
+            (
+                CompressionType::Lz4 as u8,
+                compressed_lz4_block_payload(&raw),
+            ),
+        ] {
+            let region = synthetic_region(compression, &payload);
+            let chunks = collect_with_limits(region.path(), test_limits(64, 64)).unwrap();
+            assert_eq!(chunks[0].uncompressed_nbt, raw);
+        }
+    }
+
+    #[test]
+    fn rejects_aggregate_many_chunk_payloads_before_second_allocation() {
+        let region = synthetic_region_chunks(&[
+            (0, CompressionType::Uncompressed as u8, vec![1; 40]),
+            (1, CompressionType::Uncompressed as u8, vec![2; 40]),
+        ]);
+        let mut visited = 0_usize;
+        let error = read_region_with_limits(region.path(), test_limits(64, 64), |_| {
+            visited += 1;
+        })
+        .unwrap_err();
+
+        assert_eq!(visited, 1);
+        assert!(matches!(
+            error,
+            RegionError::DecompressedRegionTooLarge { bytes: 80, max: 64 }
+        ));
+    }
+
+    #[test]
+    fn rejects_truncated_and_trailing_compressed_streams() {
+        let raw = b"bounded compressed stream";
+        let mut gzip = gzip_payload(raw);
+        gzip.truncate(gzip.len() / 2);
+        let mut zlib = zlib_payload(raw);
+        zlib.truncate(zlib.len() / 2);
+        let mut lz4 = raw_lz4_block_payload(raw);
+        lz4.pop();
+        for (compression, payload) in [
+            (CompressionType::Gzip as u8, gzip),
+            (CompressionType::Zlib as u8, zlib),
+            (CompressionType::Lz4 as u8, lz4),
+        ] {
+            let region = synthetic_region(compression, &payload);
+            let result = read_region(region.path());
+            assert!(
+                matches!(result, Err(RegionError::Decompress { cx: 0, cz: 0, .. })),
+                "compression {compression} unexpectedly returned {result:?}"
+            );
+        }
+
+        let mut gzip_trailing = gzip_payload(raw);
+        gzip_trailing.push(0);
+        let mut zlib_trailing = zlib_payload(raw);
+        zlib_trailing.push(0);
+        for (compression, payload) in [
+            (CompressionType::Gzip as u8, gzip_trailing),
+            (CompressionType::Zlib as u8, zlib_trailing),
+        ] {
+            let region = synthetic_region(compression, &payload);
+            let result = read_region(region.path());
+            assert!(
+                matches!(result, Err(RegionError::Decompress { cx: 0, cz: 0, .. })),
+                "compression {compression} unexpectedly returned {result:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn rejects_chunk_stream_truncated_inside_allocated_sector() {
+        let region = synthetic_region(CompressionType::Uncompressed as u8, b"payload");
+        region.as_file().set_len((HEADER_BYTES + 6) as u64).unwrap();
+
+        assert!(matches!(
+            read_region(region.path()),
+            Err(RegionError::LengthOverrun {
+                cx: 0,
+                cz: 0,
+                bytes_available: 6,
+                ..
+            })
+        ));
     }
 
     #[test]
@@ -635,7 +1369,13 @@ mod tests {
 
         let (compression, payload) = first_populated_chunk(&path).unwrap();
         assert_eq!(compression, CompressionType::Lz4 as u8);
-        let nbt = decompress_lz4_block_stream(&payload).unwrap();
+        let decoded_len = match count_lz4_bytes(&payload, MAX_DECOMPRESSED_CHUNK_BYTES).unwrap() {
+            BoundedLength::Exact(len) => len,
+            BoundedLength::TooLarge { at_least } => {
+                panic!("real LZ4 chunk unexpectedly exceeds limit: {at_least}")
+            }
+        };
+        let nbt = decompress_lz4_exact(&payload, decoded_len).unwrap();
         assert_eq!(nbt[0], 0x0A);
 
         let mut frame = lz4_flex::frame::FrameDecoder::new(payload.as_slice());
