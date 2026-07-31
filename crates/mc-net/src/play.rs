@@ -131,6 +131,7 @@ mod inhabited_time_tests;
 mod inventory;
 mod item_blocks;
 mod lighting;
+mod liveness;
 mod merchant_adapter;
 mod movement;
 #[cfg(test)]
@@ -13080,7 +13081,9 @@ where
             }
             result = read_frame(reader, buf, compression) => {
                 let frame = result?;
-                keepalive.record_inbound_activity();
+                if liveness::validate_serverbound_play_frame(frame.id, &frame.body)? {
+                    keepalive.record_inbound_activity();
+                }
                 if frame.id == ServerboundKeepAlive::ID {
                     let mut body = frame.body;
                     let echo = ServerboundKeepAlive::decode(&mut body)?;

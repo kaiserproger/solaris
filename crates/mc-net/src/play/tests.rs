@@ -760,6 +760,29 @@ fn keepalive_timeout_requires_the_whole_connection_to_be_idle() {
 }
 
 #[test]
+fn only_exact_recognized_packets_refresh_overdue_keepalive_activity() {
+    let mut keepalive = KeepAliveTracker::new();
+    keepalive.record_request().expect("first request");
+    keepalive.pending_since = Some(Instant::now() - KEEPALIVE_TIMEOUT - Duration::from_secs(1));
+    keepalive.last_inbound_at = Instant::now() - KEEPALIVE_TIMEOUT - Duration::from_secs(1);
+
+    let unknown = liveness::validate_serverbound_play_frame(0x7fff, &Bytes::new()).unwrap();
+    assert!(!unknown);
+    assert!(keepalive.timed_out(KEEPALIVE_TIMEOUT).is_some());
+
+    let mut valid = BytesMut::new();
+    ConfirmTeleportation { teleport_id: 7 }
+        .encode(&mut valid)
+        .unwrap();
+    assert!(
+        liveness::validate_serverbound_play_frame(ConfirmTeleportation::ID, &valid.freeze())
+            .unwrap()
+    );
+    keepalive.record_inbound_activity();
+    assert_eq!(keepalive.timed_out(KEEPALIVE_TIMEOUT), None);
+}
+
+#[test]
 fn dense_entity_movement_tracking_rotates_bounded_shards() {
     let entity_count = ENTITY_MOVEMENT_TARGET_UPDATES_PER_TRACKING_TURN * 10;
     let mut visits = vec![0; entity_count];
