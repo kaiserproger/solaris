@@ -23,7 +23,9 @@ use std::sync::Arc;
 use bytes::{Buf, BufMut};
 
 use super::{ClientInformation, CustomPayload, Packet, ResourcePackStatus};
-use crate::codec::{Identifier, ReadMc, WriteMc};
+use crate::codec::{
+    Identifier, ReadMc, WriteMc, bounded_vec, read_bounded_count, read_bounded_vec,
+};
 use crate::error::CodecError;
 
 const MAX_CLIENTBOUND_KNOWN_PACKS: usize = 1_024;
@@ -37,15 +39,7 @@ const MAX_TAGS_PER_REGISTRY: usize = 65_536;
 const MAX_TAG_ENTRIES: usize = 1_048_576;
 
 fn read_count<B: Buf>(buf: &mut B, max: usize) -> Result<usize, CodecError> {
-    let count = buf.read_varint()?;
-    if count < 0 {
-        return Err(CodecError::NegativeLength(count));
-    }
-    let count = count as usize;
-    if count > max {
-        return Err(CodecError::StringTooLong { len: count, max });
-    }
-    Ok(count)
+    read_bounded_count(buf, max, 1)
 }
 
 fn write_count<B: BufMut>(buf: &mut B, count: usize, max: usize) -> Result<(), CodecError> {
@@ -110,28 +104,16 @@ fn read_known_pack_array<B: Buf>(
     buf: &mut B,
     max: usize,
 ) -> Result<Vec<KnownPackEntry>, CodecError> {
-    let count = read_count(buf, max)?;
-    let minimum_body_bytes = count * MIN_KNOWN_PACK_ENTRY_BYTES;
-    let available = buf.remaining();
-    if available < minimum_body_bytes {
-        return Err(CodecError::Underflow {
-            needed: minimum_body_bytes - available,
-            available,
-        });
-    }
-
-    let mut entries = Vec::with_capacity(count);
-    for _ in 0..count {
+    read_bounded_vec(buf, max, MIN_KNOWN_PACK_ENTRY_BYTES, |buf| {
         let namespace = buf.read_string(MAX_KNOWN_PACK_STRING)?;
         let id = buf.read_string(MAX_KNOWN_PACK_STRING)?;
         let version = buf.read_string(MAX_KNOWN_PACK_STRING)?;
-        entries.push(KnownPackEntry {
+        Ok(KnownPackEntry {
             namespace,
             id,
             version,
-        });
-    }
-    Ok(entries)
+        })
+    })
 }
 
 /// Clientbound 0x0E — server advertises the data packs it knows about so
@@ -176,7 +158,7 @@ impl Packet for UpdateEnabledFeatures {
 
     fn decode<B: Buf>(buf: &mut B) -> Result<Self, CodecError> {
         let count = read_count(buf, MAX_ENABLED_FEATURES)?;
-        let mut features = Vec::with_capacity(count);
+        let mut features = bounded_vec(count);
         for _ in 0..count {
             features.push(buf.read_identifier()?);
         }
@@ -400,7 +382,7 @@ impl Packet for RegistryData {
     fn decode<B: Buf>(buf: &mut B) -> Result<Self, CodecError> {
         let registry_id = buf.read_identifier()?;
         let count = read_count(buf, MAX_REGISTRY_ENTRIES)?;
-        let mut entries = Vec::with_capacity(count);
+        let mut entries = bounded_vec(count);
         for _ in 0..count {
             let name = buf.read_identifier()?;
             let has_data = buf.read_bool()?;
@@ -494,15 +476,15 @@ impl Packet for UpdateTags {
 
     fn decode<B: Buf>(buf: &mut B) -> Result<Self, CodecError> {
         let reg_count = read_count(buf, MAX_TAG_REGISTRIES)?;
-        let mut registries = Vec::with_capacity(reg_count);
+        let mut registries = bounded_vec(reg_count);
         for _ in 0..reg_count {
             let registry = buf.read_identifier()?;
             let tag_count = read_count(buf, MAX_TAGS_PER_REGISTRY)?;
-            let mut tags = Vec::with_capacity(tag_count);
+            let mut tags = bounded_vec(tag_count);
             for _ in 0..tag_count {
                 let tag = buf.read_identifier()?;
                 let entry_count = read_count(buf, MAX_TAG_ENTRIES)?;
-                let mut entries = Vec::with_capacity(entry_count);
+                let mut entries = bounded_vec(entry_count);
                 for _ in 0..entry_count {
                     entries.push(buf.read_varint()?);
                 }
@@ -1019,6 +1001,27 @@ mod tests {
             CodecError::StringTooLong {
                 len: 1_048_577,
                 max: 1_048_576,
+            }
+        );
+    }
+
+    #[test]
+    fn update_tags_rejects_infeasible_large_entry_count_before_allocation() {
+        let mut body = Vec::new();
+        body.write_varint(1);
+        body.write_identifier(&Identifier::parse("minecraft:item").unwrap())
+            .unwrap();
+        body.write_varint(1);
+        body.write_identifier(&Identifier::parse("minecraft:test").unwrap())
+            .unwrap();
+        body.write_varint(MAX_TAG_ENTRIES as i32);
+        body.push(0);
+
+        assert_eq!(
+            UpdateTags::decode(&mut body.as_slice()).unwrap_err(),
+            CodecError::Underflow {
+                needed: MAX_TAG_ENTRIES - 1,
+                available: 1,
             }
         );
     }

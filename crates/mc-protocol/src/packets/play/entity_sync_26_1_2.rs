@@ -9,7 +9,7 @@ use bytes::{Buf, BufMut};
 
 use super::ItemStack;
 use crate::CodecError;
-use crate::codec::{Identifier, ReadMc, WriteMc};
+use crate::codec::{Identifier, ReadMc, WriteMc, read_bounded_vec};
 use crate::packets::Packet;
 
 /// `LivingEntity.DATA_HEALTH_ID` in the local vanilla 26.1.2 decompile.
@@ -31,18 +31,6 @@ fn write_bounded_count<B: BufMut>(buf: &mut B, len: usize, max: usize) -> Result
     let count = i32::try_from(len).map_err(|_| CodecError::StringTooLong { len, max })?;
     buf.write_varint(count);
     Ok(())
-}
-
-fn read_bounded_count<B: Buf>(buf: &mut B, max: usize) -> Result<usize, CodecError> {
-    let count = buf.read_varint()?;
-    if count < 0 {
-        return Err(CodecError::NegativeLength(count));
-    }
-    let count = count as usize;
-    if count > max {
-        return Err(CodecError::StringTooLong { len: count, max });
-    }
-    Ok(count)
 }
 
 /// A non-negative `minecraft:attribute` registry wire id.
@@ -178,11 +166,12 @@ impl EntityAttributeSnapshot {
     fn decode<B: Buf>(buf: &mut B) -> Result<Self, CodecError> {
         let attribute_id = AttributeId::decode(buf)?;
         let base = buf.read_f64()?;
-        let count = read_bounded_count(buf, MAX_ATTRIBUTE_MODIFIERS)?;
-        let mut modifiers = Vec::with_capacity(count);
-        for _ in 0..count {
-            modifiers.push(EntityAttributeModifier::decode(buf)?);
-        }
+        let modifiers = read_bounded_vec(
+            buf,
+            MAX_ATTRIBUTE_MODIFIERS,
+            10,
+            EntityAttributeModifier::decode,
+        )?;
         Ok(Self {
             attribute_id,
             base,
@@ -228,11 +217,12 @@ impl Packet for ClientboundUpdateEntityAttributes {
 
     fn decode<B: Buf>(buf: &mut B) -> Result<Self, CodecError> {
         let entity_id = buf.read_varint()?;
-        let count = read_bounded_count(buf, MAX_ENTITY_ATTRIBUTES)?;
-        let mut attributes = Vec::with_capacity(count);
-        for _ in 0..count {
-            attributes.push(EntityAttributeSnapshot::decode(buf)?);
-        }
+        let attributes = read_bounded_vec(
+            buf,
+            MAX_ENTITY_ATTRIBUTES,
+            1,
+            EntityAttributeSnapshot::decode,
+        )?;
         Ok(Self {
             entity_id,
             attributes,

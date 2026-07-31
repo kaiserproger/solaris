@@ -32,6 +32,10 @@ pub const MAX_VARLONG_BYTES: usize = 10;
 /// VarInt-prefixed strings cap at this many UTF-16 code units in vanilla.
 pub const DEFAULT_MAX_STRING_LEN: usize = 32_767;
 
+/// Count-prefixed collections grow beyond this only after elements are decoded.
+/// This prevents a valid large declared count from becoming an eager allocation.
+const MAX_INITIAL_COLLECTION_CAPACITY: usize = 1_024;
+
 fn utf16_code_units(s: &str) -> usize {
     s.encode_utf16().count()
 }
@@ -256,6 +260,65 @@ fn ensure_remaining<B: Buf + ?Sized>(buf: &B, needed: usize) -> Result<(), Codec
         });
     }
     Ok(())
+}
+
+/// Decode one VarInt-counted collection with allocation and wire-feasibility fences.
+///
+/// `min_wire_size` is a conservative lower bound for one encoded element. The
+/// body-size check runs before the first collection allocation or item callback.
+/// Large valid collections begin with a bounded allocation and grow only as
+/// their elements are successfully decoded.
+pub(crate) fn read_bounded_count<B: Buf>(
+    buf: &mut B,
+    semantic_max: usize,
+    min_wire_size: usize,
+) -> Result<usize, CodecError> {
+    assert!(
+        min_wire_size > 0,
+        "collection minimum wire size must be non-zero"
+    );
+    let count = buf.read_varint()?;
+    if count < 0 {
+        return Err(CodecError::NegativeLength(count));
+    }
+    let count = count as usize;
+    if count > semantic_max {
+        return Err(CodecError::StringTooLong {
+            len: count,
+            max: semantic_max,
+        });
+    }
+    let available = buf.remaining();
+    if count > available / min_wire_size {
+        let minimum_body_bytes = count.saturating_mul(min_wire_size);
+        return Err(CodecError::Underflow {
+            needed: minimum_body_bytes.saturating_sub(available),
+            available,
+        });
+    }
+    Ok(count)
+}
+
+pub(crate) fn bounded_vec<T>(count: usize) -> Vec<T> {
+    Vec::with_capacity(count.min(MAX_INITIAL_COLLECTION_CAPACITY))
+}
+
+pub(crate) fn read_bounded_vec<B, T, F>(
+    buf: &mut B,
+    semantic_max: usize,
+    min_wire_size: usize,
+    mut read_item: F,
+) -> Result<Vec<T>, CodecError>
+where
+    B: Buf,
+    F: FnMut(&mut B) -> Result<T, CodecError>,
+{
+    let count = read_bounded_count(buf, semantic_max, min_wire_size)?;
+    let mut values = bounded_vec(count);
+    for _ in 0..count {
+        values.push(read_item(buf)?);
+    }
+    Ok(values)
 }
 
 // -----------------------------------------------------------------------
@@ -674,6 +737,79 @@ mod tests {
         let mut buf = vec![2u8, 0xFF, 0xFF];
         let mut cursor: &[u8] = &mut buf;
         assert_eq!(cursor.read_string(32).unwrap_err(), CodecError::InvalidUtf8);
+    }
+
+    #[test]
+    fn bounded_vec_rejects_over_max_before_item_decode() {
+        let mut encoded = Vec::new();
+        encoded.write_varint(3);
+        encoded.extend_from_slice(&[1, 2, 3]);
+        let mut cursor = encoded.as_slice();
+        let mut decoded = 0;
+
+        assert_eq!(
+            read_bounded_vec(&mut cursor, 2, 1, |buf| {
+                decoded += 1;
+                buf.read_u8()
+            })
+            .unwrap_err(),
+            CodecError::StringTooLong { len: 3, max: 2 }
+        );
+        assert_eq!(decoded, 0);
+    }
+
+    #[test]
+    fn bounded_vec_rejects_tiny_body_before_item_decode() {
+        let mut encoded = Vec::new();
+        encoded.write_varint(100_000);
+        encoded.push(0);
+        let mut cursor = encoded.as_slice();
+        let mut decoded = 0;
+
+        assert!(matches!(
+            read_bounded_vec(&mut cursor, 100_000, 4, |buf| {
+                decoded += 1;
+                buf.read_u8()
+            }),
+            Err(CodecError::Underflow { .. })
+        ));
+        assert_eq!(decoded, 0);
+    }
+
+    #[test]
+    fn bounded_vec_feasibility_arithmetic_does_not_overflow() {
+        let mut encoded = Vec::new();
+        encoded.write_varint(2);
+        let mut cursor = encoded.as_slice();
+
+        assert!(matches!(
+            read_bounded_vec::<_, u8, _>(&mut cursor, 2, usize::MAX, |_| unreachable!()),
+            Err(CodecError::Underflow {
+                needed: usize::MAX,
+                available: 0,
+            })
+        ));
+    }
+
+    #[test]
+    fn bounded_vec_caps_initial_capacity() {
+        let values = bounded_vec::<u64>(1_000_000);
+        assert_eq!(values.capacity(), MAX_INITIAL_COLLECTION_CAPACITY);
+        assert!(values.is_empty());
+    }
+
+    #[test]
+    fn bounded_vec_accepts_a_large_complete_collection() {
+        let count = MAX_INITIAL_COLLECTION_CAPACITY * 2;
+        let mut encoded = Vec::new();
+        encoded.write_varint(i32::try_from(count).unwrap());
+        encoded.extend(std::iter::repeat_n(7, count));
+        let mut cursor = encoded.as_slice();
+
+        let decoded = read_bounded_vec(&mut cursor, count, 1, ReadMc::read_u8).unwrap();
+        assert_eq!(decoded.len(), count);
+        assert!(decoded.iter().all(|value| *value == 7));
+        assert!(cursor.is_empty());
     }
 
     #[test]

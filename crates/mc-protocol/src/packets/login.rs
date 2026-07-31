@@ -21,7 +21,7 @@ use bytes::{Buf, BufMut};
 use uuid::Uuid;
 
 use super::Packet;
-use crate::codec::{ReadMc, WriteMc};
+use crate::codec::{ReadMc, WriteMc, read_bounded_vec};
 use crate::error::CodecError;
 
 /// Maximum length of a player name, in characters, per vanilla.
@@ -29,6 +29,10 @@ pub const MAX_NAME_LEN: usize = 16;
 
 /// Maximum RSA ciphertext size accepted in each encrypted login response field.
 const MAX_ENCRYPTED_RESPONSE_BYTES: usize = 128;
+/// Vanilla-authenticated profiles carry a small signed property set; keep the
+/// same ceiling used by the Play player-info projection.
+const MAX_GAME_PROFILE_PROPERTIES: usize = 16;
+const MIN_GAME_PROFILE_PROPERTY_BYTES: usize = 3;
 
 // -----------------------------------------------------------------------
 // Serverbound
@@ -203,12 +207,18 @@ impl Packet for LoginSuccess {
     const ID: i32 = 0x02;
 
     fn encode<B: BufMut>(&self, buf: &mut B) -> Result<(), CodecError> {
+        if self.properties.len() > MAX_GAME_PROFILE_PROPERTIES {
+            return Err(CodecError::StringTooLong {
+                len: self.properties.len(),
+                max: MAX_GAME_PROFILE_PROPERTIES,
+            });
+        }
         buf.write_uuid(self.uuid);
         buf.write_string(&self.name, MAX_NAME_LEN)?;
         buf.write_varint(i32::try_from(self.properties.len()).map_err(|_| {
             CodecError::StringTooLong {
                 len: self.properties.len(),
-                max: i32::MAX as usize,
+                max: MAX_GAME_PROFILE_PROPERTIES,
             }
         })?);
         for property in &self.properties {
@@ -228,26 +238,26 @@ impl Packet for LoginSuccess {
     fn decode<B: Buf>(buf: &mut B) -> Result<Self, CodecError> {
         let uuid = buf.read_uuid()?;
         let name = buf.read_string(MAX_NAME_LEN)?;
-        let count = buf.read_varint()?;
-        if count < 0 {
-            return Err(CodecError::NegativeLength(count));
-        }
-        let mut properties = Vec::with_capacity(count as usize);
-        for _ in 0..count {
-            let name = buf.read_string(32_767)?;
-            let value = buf.read_string(32_767)?;
-            let signed = buf.read_bool()?;
-            let signature = if signed {
-                Some(buf.read_string(32_767)?)
-            } else {
-                None
-            };
-            properties.push(GameProfileProperty {
-                name,
-                value,
-                signature,
-            });
-        }
+        let properties = read_bounded_vec(
+            buf,
+            MAX_GAME_PROFILE_PROPERTIES,
+            MIN_GAME_PROFILE_PROPERTY_BYTES,
+            |buf| {
+                let name = buf.read_string(32_767)?;
+                let value = buf.read_string(32_767)?;
+                let signed = buf.read_bool()?;
+                let signature = if signed {
+                    Some(buf.read_string(32_767)?)
+                } else {
+                    None
+                };
+                Ok(GameProfileProperty {
+                    name,
+                    value,
+                    signature,
+                })
+            },
+        )?;
         Ok(Self {
             uuid,
             name,
@@ -519,6 +529,49 @@ mod tests {
                 },
             ],
         });
+    }
+
+    #[test]
+    fn login_success_rejects_infeasible_property_count_before_decode() {
+        let mut body = Vec::new();
+        body.write_uuid(Uuid::from_u128(3));
+        body.write_string("Player", MAX_NAME_LEN).unwrap();
+        body.write_varint(MAX_GAME_PROFILE_PROPERTIES as i32);
+        body.extend_from_slice(&[0, 0]);
+
+        assert_eq!(
+            LoginSuccess::decode(&mut body.as_slice()).unwrap_err(),
+            CodecError::Underflow {
+                needed: MAX_GAME_PROFILE_PROPERTIES * MIN_GAME_PROFILE_PROPERTY_BYTES - 2,
+                available: 2,
+            }
+        );
+    }
+
+    #[test]
+    fn login_success_encode_rejects_property_count_over_decode_cap() {
+        let packet = LoginSuccess {
+            uuid: Uuid::from_u128(4),
+            name: "Player".into(),
+            properties: vec![
+                GameProfileProperty {
+                    name: "x".into(),
+                    value: "y".into(),
+                    signature: None,
+                };
+                MAX_GAME_PROFILE_PROPERTIES + 1
+            ],
+        };
+        let mut body = Vec::new();
+
+        assert_eq!(
+            packet.encode(&mut body).unwrap_err(),
+            CodecError::StringTooLong {
+                len: MAX_GAME_PROFILE_PROPERTIES + 1,
+                max: MAX_GAME_PROFILE_PROPERTIES,
+            }
+        );
+        assert!(body.is_empty());
     }
 
     #[test]

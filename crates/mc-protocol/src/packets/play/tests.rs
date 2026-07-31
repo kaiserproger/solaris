@@ -72,6 +72,58 @@ fn login_play_round_trip_with_death_location() {
 }
 
 #[test]
+fn login_play_rejects_infeasible_dimension_count_before_decode() {
+    let mut body = Vec::new();
+    body.write_i32(1);
+    body.write_bool(false);
+    body.write_varint(MAX_DIMENSION_NAMES as i32);
+
+    assert_eq!(
+        LoginPlay::decode(&mut body.as_slice()).unwrap_err(),
+        CodecError::Underflow {
+            needed: MAX_DIMENSION_NAMES,
+            available: 0,
+        }
+    );
+}
+
+#[test]
+fn login_play_encode_rejects_dimension_count_over_decode_cap() {
+    let packet = LoginPlay {
+        entity_id: 1,
+        is_hardcore: false,
+        dimension_names: vec![sample_identifier("minecraft:overworld"); MAX_DIMENSION_NAMES + 1],
+        max_players: 20,
+        view_distance: 10,
+        simulation_distance: 10,
+        reduced_debug_info: false,
+        enable_respawn_screen: true,
+        do_limited_crafting: false,
+        dimension_type_id: 0,
+        dimension_name: sample_identifier("minecraft:overworld"),
+        hashed_seed: 0,
+        game_mode: 0,
+        previous_game_mode: -1,
+        is_debug: false,
+        is_flat: false,
+        death_location: None,
+        portal_cooldown: 0,
+        sea_level: 63,
+        enforces_secure_chat: false,
+    };
+    let mut body = Vec::new();
+
+    assert_eq!(
+        packet.encode(&mut body).unwrap_err(),
+        CodecError::StringTooLong {
+            len: MAX_DIMENSION_NAMES + 1,
+            max: MAX_DIMENSION_NAMES,
+        }
+    );
+    assert!(body.is_empty());
+}
+
+#[test]
 fn clientbound_custom_payload_id_and_layout_match_local_decompiled_sources() {
     assert_eq!(ClientboundCustomPayload::ID, 0x18);
     let packet = ClientboundCustomPayload {
@@ -1318,6 +1370,24 @@ fn level_chunk_with_light_empty_byte_layout() {
 #[test]
 fn level_chunk_with_light_round_trips_empty() {
     round_trip(minimal_chunk_packet());
+}
+
+#[test]
+fn level_chunk_with_light_rejects_infeasible_block_entity_count_before_decode() {
+    let mut body = Vec::new();
+    body.write_i32(0);
+    body.write_i32(0);
+    body.write_varint(0);
+    body.write_varint(0);
+    body.write_varint(MAX_CHUNK_BLOCK_ENTITIES as i32);
+
+    assert_eq!(
+        LevelChunkWithLight::decode(&mut body.as_slice()).unwrap_err(),
+        CodecError::Underflow {
+            needed: MAX_CHUNK_BLOCK_ENTITIES * MIN_BLOCK_ENTITY_BYTES,
+            available: 0,
+        }
+    );
 }
 
 #[test]

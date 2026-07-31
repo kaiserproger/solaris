@@ -38,7 +38,17 @@ impl MerchantItemCost {
                 "merchant item cost count must be positive",
             ));
         }
-        let components = read_count(buf, MAX_MERCHANT_COST_COMPONENTS)?;
+        let components = buf.read_varint()?;
+        if components < 0 {
+            return Err(CodecError::NegativeLength(components));
+        }
+        let components = components as usize;
+        if components > MAX_MERCHANT_COST_COMPONENTS {
+            return Err(CodecError::StringTooLong {
+                len: components,
+                max: MAX_MERCHANT_COST_COMPONENTS,
+            });
+        }
         if components != 0 {
             return Err(CodecError::NotSupported(
                 "merchant exact component predicates are unsupported",
@@ -164,7 +174,7 @@ impl Packet for ClientboundMerchantOffers {
             return Err(CodecError::NotSupported("invalid merchant container id"));
         }
         let offer_count = read_count(buf, MAX_MERCHANT_OFFERS)?;
-        let mut offers = Vec::with_capacity(offer_count);
+        let mut offers = bounded_vec(offer_count);
         for _ in 0..offer_count {
             offers.push(MerchantOffer::decode(buf)?);
         }

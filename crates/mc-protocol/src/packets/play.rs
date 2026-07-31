@@ -10,12 +10,17 @@
 //! `impl Packet for ... { const ID }` site cites the corresponding
 //! vanilla `PacketType` constant name.
 
+use std::mem::size_of;
+
 use bytes::{Buf, BufMut};
 use mc_nbt::Tag;
 use uuid::Uuid;
 
 use super::{ClientInformation, CustomPayload, MainHand, Packet, ResourcePackStatus};
-use crate::codec::{DEFAULT_MAX_STRING_LEN, Identifier, ReadMc, WriteMc};
+use crate::codec::{
+    DEFAULT_MAX_STRING_LEN, Identifier, ReadMc, WriteMc, bounded_vec, read_bounded_count,
+    read_bounded_vec,
+};
 use crate::error::CodecError;
 use crate::packets::login::GameProfileProperty;
 
@@ -55,6 +60,10 @@ const MAX_GAME_PROFILE_PROPERTY_NAME_LEN: usize = 64;
 const MAX_GAME_PROFILE_PROPERTY_VALUE_LEN: usize = 32_767;
 const MAX_GAME_PROFILE_PROPERTY_SIGNATURE_LEN: usize = 1024;
 const MAX_ENTITY_ID_LIST_LEN: usize = 1024;
+const MAX_DIMENSION_NAMES: usize = 1024;
+const MAX_CHUNK_HEIGHTMAPS: usize = 16;
+const MAX_CHUNK_BLOCK_ENTITIES: usize = 1_000_000;
+const MIN_BLOCK_ENTITY_BYTES: usize = 5;
 const MAX_ENTITY_DATA_VALUES: usize = 64;
 const MAX_CONTAINER_CLICK_CHANGED_SLOTS: usize = 128;
 const MAX_HASHED_STACK_COMPONENT_HASHES: usize = 256;
@@ -119,9 +128,15 @@ pub const DATA_COMPONENT_ITEM_MODEL_ID: i32 = 10;
 pub const DATA_COMPONENT_ENCHANTMENTS_ID: i32 = 13;
 
 fn write_long_array<B: BufMut>(buf: &mut B, longs: &[i64]) -> Result<(), CodecError> {
+    if longs.len() > MAX_LONG_ARRAY_LEN {
+        return Err(CodecError::StringTooLong {
+            len: longs.len(),
+            max: MAX_LONG_ARRAY_LEN,
+        });
+    }
     let len = i32::try_from(longs.len()).map_err(|_| CodecError::StringTooLong {
         len: longs.len(),
-        max: i32::MAX as usize,
+        max: MAX_LONG_ARRAY_LEN,
     })?;
     buf.write_varint(len);
     for &v in longs {
@@ -131,34 +146,11 @@ fn write_long_array<B: BufMut>(buf: &mut B, longs: &[i64]) -> Result<(), CodecEr
 }
 
 fn read_long_array<B: Buf>(buf: &mut B) -> Result<Vec<i64>, CodecError> {
-    let len_signed = buf.read_varint()?;
-    if len_signed < 0 {
-        return Err(CodecError::NegativeLength(len_signed));
-    }
-    let len = len_signed as usize;
-    if len > MAX_LONG_ARRAY_LEN {
-        return Err(CodecError::StringTooLong {
-            len,
-            max: MAX_LONG_ARRAY_LEN,
-        });
-    }
-    let mut out = Vec::with_capacity(len);
-    for _ in 0..len {
-        out.push(buf.read_i64()?);
-    }
-    Ok(out)
+    read_bounded_vec(buf, MAX_LONG_ARRAY_LEN, size_of::<i64>(), ReadMc::read_i64)
 }
 
 fn read_count<B: Buf>(buf: &mut B, max: usize) -> Result<usize, CodecError> {
-    let count = buf.read_varint()?;
-    if count < 0 {
-        return Err(CodecError::NegativeLength(count));
-    }
-    let count = count as usize;
-    if count > max {
-        return Err(CodecError::StringTooLong { len: count, max });
-    }
-    Ok(count)
+    read_bounded_count(buf, max, 1)
 }
 
 fn write_count<B: BufMut>(buf: &mut B, len: usize) -> Result<(), CodecError> {
@@ -332,12 +324,18 @@ impl Packet for LoginPlay {
     const ID: i32 = 0x31;
 
     fn encode<B: BufMut>(&self, buf: &mut B) -> Result<(), CodecError> {
+        if self.dimension_names.len() > MAX_DIMENSION_NAMES {
+            return Err(CodecError::StringTooLong {
+                len: self.dimension_names.len(),
+                max: MAX_DIMENSION_NAMES,
+            });
+        }
         buf.write_i32(self.entity_id);
         buf.write_bool(self.is_hardcore);
         buf.write_varint(i32::try_from(self.dimension_names.len()).map_err(|_| {
             CodecError::StringTooLong {
                 len: self.dimension_names.len(),
-                max: i32::MAX as usize,
+                max: MAX_DIMENSION_NAMES,
             }
         })?);
         for name in &self.dimension_names {
@@ -373,14 +371,8 @@ impl Packet for LoginPlay {
     fn decode<B: Buf>(buf: &mut B) -> Result<Self, CodecError> {
         let entity_id = buf.read_i32()?;
         let is_hardcore = buf.read_bool()?;
-        let count = buf.read_varint()?;
-        if count < 0 {
-            return Err(CodecError::NegativeLength(count));
-        }
-        let mut dimension_names = Vec::with_capacity(count as usize);
-        for _ in 0..count {
-            dimension_names.push(buf.read_identifier()?);
-        }
+        let dimension_names =
+            read_bounded_vec(buf, MAX_DIMENSION_NAMES, 1, ReadMc::read_identifier)?;
         let max_players = buf.read_varint()?;
         let view_distance = buf.read_varint()?;
         let simulation_distance = buf.read_varint()?;
@@ -773,9 +765,7 @@ impl Packet for ClientboundExplode {
         };
         let explosion_particle_id = validate_simple_explosion_particle_id(buf.read_varint()?)?;
         let sound_reference_id = read_explosion_sound_reference_holder(buf)?;
-        let block_particle_count = read_count(buf, MAX_EXPLOSION_BLOCK_PARTICLES)?;
-        let mut block_particles = Vec::with_capacity(block_particle_count);
-        for _ in 0..block_particle_count {
+        let block_particles = read_bounded_vec(buf, MAX_EXPLOSION_BLOCK_PARTICLES, 10, |buf| {
             let particle_id = validate_simple_explosion_particle_id(buf.read_varint()?)?;
             let scaling = buf.read_f32()?;
             let speed = buf.read_f32()?;
@@ -785,13 +775,13 @@ impl Packet for ClientboundExplode {
                     "negative explosion block particle weight",
                 ));
             }
-            block_particles.push(ExplosionBlockParticle {
+            Ok(ExplosionBlockParticle {
                 particle_id,
                 scaling,
                 speed,
                 weight,
-            });
-        }
+            })
+        })?;
         Ok(Self {
             center,
             radius,
@@ -1425,9 +1415,7 @@ impl Packet for PlayerInfoUpdate {
 
     fn decode<B: Buf>(buf: &mut B) -> Result<Self, CodecError> {
         let actions = PlayerInfoActions(buf.read_u8()?);
-        let count = read_count(buf, MAX_PLAYER_INFO_ENTRIES)?;
-        let mut entries = Vec::with_capacity(count);
-        for _ in 0..count {
+        let entries = read_bounded_vec(buf, MAX_PLAYER_INFO_ENTRIES, 16, |buf| {
             let profile_id = buf.read_uuid()?;
             let mut name = String::new();
             let mut properties = Vec::new();
@@ -1438,9 +1426,7 @@ impl Packet for PlayerInfoUpdate {
             let mut show_hat = false;
             if actions.contains(PlayerInfoActions::ADD_PLAYER) {
                 name = buf.read_string(16)?;
-                let property_count = read_count(buf, MAX_GAME_PROFILE_PROPERTIES)?;
-                properties.reserve(property_count);
-                for _ in 0..property_count {
+                properties = read_bounded_vec(buf, MAX_GAME_PROFILE_PROPERTIES, 3, |buf| {
                     let property_name = buf.read_string(MAX_GAME_PROFILE_PROPERTY_NAME_LEN)?;
                     let value = buf.read_string(MAX_GAME_PROFILE_PROPERTY_VALUE_LEN)?;
                     let signature = if buf.read_bool()? {
@@ -1448,12 +1434,12 @@ impl Packet for PlayerInfoUpdate {
                     } else {
                         None
                     };
-                    properties.push(GameProfileProperty {
+                    Ok(GameProfileProperty {
                         name: property_name,
                         value,
                         signature,
-                    });
-                }
+                    })
+                })?;
             }
             if actions.contains(PlayerInfoActions::INITIALIZE_CHAT) {
                 return Err(CodecError::NotSupported("player chat session data"));
@@ -1479,7 +1465,7 @@ impl Packet for PlayerInfoUpdate {
             if actions.contains(PlayerInfoActions::UPDATE_HAT) {
                 show_hat = buf.read_bool()?;
             }
-            entries.push(PlayerInfoEntry {
+            Ok(PlayerInfoEntry {
                 profile_id,
                 name,
                 properties,
@@ -1488,8 +1474,8 @@ impl Packet for PlayerInfoUpdate {
                 game_mode,
                 list_order,
                 show_hat,
-            });
-        }
+            })
+        })?;
         Ok(Self { actions, entries })
     }
 }
@@ -1513,11 +1499,7 @@ impl Packet for PlayerInfoRemove {
     }
 
     fn decode<B: Buf>(buf: &mut B) -> Result<Self, CodecError> {
-        let count = read_count(buf, MAX_PLAYER_INFO_ENTRIES)?;
-        let mut profile_ids = Vec::with_capacity(count);
-        for _ in 0..count {
-            profile_ids.push(buf.read_uuid()?);
-        }
+        let profile_ids = read_bounded_vec(buf, MAX_PLAYER_INFO_ENTRIES, 16, ReadMc::read_uuid)?;
         Ok(Self { profile_ids })
     }
 }
@@ -2489,11 +2471,7 @@ impl Packet for RemoveEntities {
     }
 
     fn decode<B: Buf>(buf: &mut B) -> Result<Self, CodecError> {
-        let count = read_count(buf, MAX_ENTITY_ID_LIST_LEN)?;
-        let mut entity_ids = Vec::with_capacity(count);
-        for _ in 0..count {
-            entity_ids.push(buf.read_varint()?);
-        }
+        let entity_ids = read_bounded_vec(buf, MAX_ENTITY_ID_LIST_LEN, 1, ReadMc::read_varint)?;
         Ok(Self { entity_ids })
     }
 }
@@ -2521,11 +2499,7 @@ impl Packet for ClientboundSetPassengers {
 
     fn decode<B: Buf>(buf: &mut B) -> Result<Self, CodecError> {
         let vehicle_id = buf.read_varint()?;
-        let count = read_count(buf, MAX_ENTITY_ID_LIST_LEN)?;
-        let mut passenger_ids = Vec::with_capacity(count);
-        for _ in 0..count {
-            passenger_ids.push(buf.read_varint()?);
-        }
+        let passenger_ids = read_bounded_vec(buf, MAX_ENTITY_ID_LIST_LEN, 1, ReadMc::read_varint)?;
         Ok(Self {
             vehicle_id,
             passenger_ids,
@@ -2687,34 +2661,36 @@ impl LightData {
     }
 
     fn encode_light_list<B: BufMut>(buf: &mut B, layers: &[Vec<u8>]) -> Result<(), CodecError> {
+        if layers.len() > 1024 {
+            return Err(CodecError::StringTooLong {
+                len: layers.len(),
+                max: 1024,
+            });
+        }
         let len = i32::try_from(layers.len()).map_err(|_| CodecError::StringTooLong {
             len: layers.len(),
-            max: i32::MAX as usize,
+            max: 1024,
         })?;
         buf.write_varint(len);
         for layer in layers {
+            if layer.len() > Self::LIGHT_LAYER_BYTES {
+                return Err(CodecError::StringTooLong {
+                    len: layer.len(),
+                    max: Self::LIGHT_LAYER_BYTES,
+                });
+            }
             buf.write_byte_array(layer);
         }
         Ok(())
     }
 
     fn decode_light_list<B: Buf>(buf: &mut B) -> Result<Vec<Vec<u8>>, CodecError> {
-        let len_signed = buf.read_varint()?;
-        if len_signed < 0 {
-            return Err(CodecError::NegativeLength(len_signed));
-        }
-        let len = len_signed as usize;
         // Each layer is at most LIGHT_LAYER_BYTES; cap collection length
         // at one entry per Y section in a 1024-block-tall column (huge
         // overshoot for vanilla's 26).
-        if len > 1024 {
-            return Err(CodecError::StringTooLong { len, max: 1024 });
-        }
-        let mut layers = Vec::with_capacity(len);
-        for _ in 0..len {
-            layers.push(buf.read_byte_array(Self::LIGHT_LAYER_BYTES)?);
-        }
-        Ok(layers)
+        read_bounded_vec(buf, 1024, 1, |buf| {
+            buf.read_byte_array(Self::LIGHT_LAYER_BYTES)
+        })
     }
 }
 
@@ -2750,13 +2726,25 @@ impl Packet for LevelChunkWithLight {
     const ID: i32 = 0x2D;
 
     fn encode<B: BufMut>(&self, buf: &mut B) -> Result<(), CodecError> {
+        if self.heightmaps.len() > MAX_CHUNK_HEIGHTMAPS {
+            return Err(CodecError::StringTooLong {
+                len: self.heightmaps.len(),
+                max: MAX_CHUNK_HEIGHTMAPS,
+            });
+        }
+        if self.block_entities.len() > MAX_CHUNK_BLOCK_ENTITIES {
+            return Err(CodecError::StringTooLong {
+                len: self.block_entities.len(),
+                max: MAX_CHUNK_BLOCK_ENTITIES,
+            });
+        }
         buf.write_i32(self.chunk_x);
         buf.write_i32(self.chunk_z);
 
         let hm_count =
             i32::try_from(self.heightmaps.len()).map_err(|_| CodecError::StringTooLong {
                 len: self.heightmaps.len(),
-                max: i32::MAX as usize,
+                max: MAX_CHUNK_HEIGHTMAPS,
             })?;
         buf.write_varint(hm_count);
         for hm in &self.heightmaps {
@@ -2775,7 +2763,7 @@ impl Packet for LevelChunkWithLight {
         let be_count =
             i32::try_from(self.block_entities.len()).map_err(|_| CodecError::StringTooLong {
                 len: self.block_entities.len(),
-                max: i32::MAX as usize,
+                max: MAX_CHUNK_BLOCK_ENTITIES,
             })?;
         buf.write_varint(be_count);
         for be in &self.block_entities {
@@ -2790,45 +2778,26 @@ impl Packet for LevelChunkWithLight {
         let chunk_x = buf.read_i32()?;
         let chunk_z = buf.read_i32()?;
 
-        let hm_count_signed = buf.read_varint()?;
-        if hm_count_signed < 0 {
-            return Err(CodecError::NegativeLength(hm_count_signed));
-        }
-        let hm_count = hm_count_signed as usize;
-        // Six entries in Heightmap$Types; cap at 16 to leave room.
-        if hm_count > 16 {
-            return Err(CodecError::StringTooLong {
-                len: hm_count,
-                max: 16,
-            });
-        }
-        let mut heightmaps = Vec::with_capacity(hm_count);
-        for _ in 0..hm_count {
-            heightmaps.push(ChunkHeightmap {
+        // Six entries in Heightmap$Types; cap at 16 to leave room. One
+        // heightmap contains at least a type-id and long-array count VarInt.
+        let heightmaps = read_bounded_vec(buf, MAX_CHUNK_HEIGHTMAPS, 2, |buf| {
+            Ok(ChunkHeightmap {
                 type_id: buf.read_varint()?,
                 data: read_long_array(buf)?,
-            });
-        }
+            })
+        })?;
 
         let data = buf.read_byte_array(MAX_CHUNK_DATA_LEN)?;
 
-        let be_count_signed = buf.read_varint()?;
-        if be_count_signed < 0 {
-            return Err(CodecError::NegativeLength(be_count_signed));
-        }
-        let be_count = be_count_signed as usize;
         // One block entity per block in a 16³ section × 24 sections =
-        // 98 304; cap one order of magnitude higher than that.
-        if be_count > 1_000_000 {
-            return Err(CodecError::StringTooLong {
-                len: be_count,
-                max: 1_000_000,
-            });
-        }
-        let mut block_entities = Vec::with_capacity(be_count);
-        for _ in 0..be_count {
-            block_entities.push(BlockEntityInfo::decode(buf)?);
-        }
+        // 98 304; cap one order of magnitude higher than that. The minimum
+        // wire body is packed-xz + y + type-id + one NBT tag byte.
+        let block_entities = read_bounded_vec(
+            buf,
+            MAX_CHUNK_BLOCK_ENTITIES,
+            MIN_BLOCK_ENTITY_BYTES,
+            BlockEntityInfo::decode,
+        )?;
 
         let light = LightData::decode(buf)?;
 
@@ -3280,9 +3249,7 @@ impl Packet for ClientboundCommandSuggestions {
         let id = buf.read_varint()?;
         let start = buf.read_varint()?;
         let length = buf.read_varint()?;
-        let count = read_count(buf, 256)?;
-        let mut suggestions = Vec::with_capacity(count);
-        for _ in 0..count {
+        let suggestions = read_bounded_vec(buf, 256, 2, |buf| {
             let text = buf.read_string(MAX_COMMAND_LEN)?;
             let tooltip_nbt = if buf.read_bool()? {
                 let mut tooltip = vec![0; buf.remaining()];
@@ -3291,8 +3258,8 @@ impl Packet for ClientboundCommandSuggestions {
             } else {
                 None
             };
-            suggestions.push(CommandSuggestionEntry { text, tooltip_nbt });
-        }
+            Ok(CommandSuggestionEntry { text, tooltip_nbt })
+        })?;
         Ok(Self {
             id,
             start,
@@ -3320,11 +3287,7 @@ impl Packet for ClientboundCommands {
     }
 
     fn decode<B: Buf>(buf: &mut B) -> Result<Self, CodecError> {
-        let count = read_count(buf, MAX_COMMAND_NODE_COUNT)?;
-        let mut nodes = Vec::with_capacity(count);
-        for _ in 0..count {
-            nodes.push(CommandNode::decode(buf)?);
-        }
+        let nodes = read_bounded_vec(buf, MAX_COMMAND_NODE_COUNT, 2, CommandNode::decode)?;
         Ok(Self {
             nodes,
             root_index: buf.read_varint()?,
@@ -3386,11 +3349,7 @@ impl CommandNode {
 
     fn decode<B: Buf>(buf: &mut B) -> Result<Self, CodecError> {
         let flags = buf.read_u8()?;
-        let child_count = read_count(buf, MAX_COMMAND_CHILD_COUNT)?;
-        let mut children = Vec::with_capacity(child_count);
-        for _ in 0..child_count {
-            children.push(buf.read_varint()?);
-        }
+        let children = read_bounded_vec(buf, MAX_COMMAND_CHILD_COUNT, 1, ReadMc::read_varint)?;
         let redirect = if flags & 8 != 0 {
             Some(buf.read_varint()?)
         } else {
@@ -3993,25 +3952,13 @@ impl Packet for SectionBlocksUpdate {
 
     fn decode<B: Buf>(buf: &mut B) -> Result<Self, CodecError> {
         let section_pos = buf.read_i64()?;
-        let count_signed = buf.read_varint()?;
-        if count_signed < 0 {
-            return Err(CodecError::NegativeLength(count_signed));
-        }
-        let count = count_signed as usize;
-        if count > MAX_SECTION_BLOCK_UPDATE_ENTRIES {
-            return Err(CodecError::StringTooLong {
-                len: count,
-                max: MAX_SECTION_BLOCK_UPDATE_ENTRIES,
-            });
-        }
-        let mut changes = Vec::with_capacity(count);
-        for _ in 0..count {
+        let changes = read_bounded_vec(buf, MAX_SECTION_BLOCK_UPDATE_ENTRIES, 1, |buf| {
             let value = buf.read_varlong()?;
-            changes.push(SectionBlockChange {
+            Ok(SectionBlockChange {
                 relative_pos: (value & 0xFFF) as u16,
                 state_id: (value >> 12) as i32,
-            });
-        }
+            })
+        })?;
         Ok(Self {
             section_pos,
             changes,
@@ -4705,9 +4652,7 @@ impl ItemStack {
                     item_model = Some(std::sync::Arc::new(buf.read_identifier()?));
                 }
                 DATA_COMPONENT_ENCHANTMENTS_ID if enchantments.is_empty() => {
-                    let count = read_count(buf, 256)?;
-                    enchantments.reserve(count);
-                    for _ in 0..count {
+                    enchantments = read_bounded_vec(buf, 256, 2, |buf| {
                         let protocol_id = buf.read_varint()?;
                         let protocol_id = u32::try_from(protocol_id).map_err(|_| {
                             CodecError::NotSupported("negative enchantment registry id")
@@ -4717,18 +4662,22 @@ impl ItemStack {
                                 "unknown enchantment registry entry",
                             ))?;
                         let level = buf.read_varint()?;
-                        if !(1..=255).contains(&level)
-                            || enchantments
-                                .iter()
-                                .any(|entry: &mc_data::ItemEnchantment| entry.id == id)
-                        {
+                        if !(1..=255).contains(&level) {
                             return Err(CodecError::NotSupported(
                                 "invalid ItemStack enchantments component",
                             ));
                         }
-                        enchantments.push(mc_data::ItemEnchantment { id, level });
-                    }
+                        Ok(mc_data::ItemEnchantment { id, level })
+                    })?;
                     enchantments.sort_unstable_by(|left, right| left.id.cmp(&right.id));
+                    if enchantments
+                        .windows(2)
+                        .any(|entries| entries[0].id == entries[1].id)
+                    {
+                        return Err(CodecError::NotSupported(
+                            "invalid ItemStack enchantments component",
+                        ));
+                    }
                 }
                 _ => {
                     return Err(CodecError::NotSupported(
@@ -5524,7 +5473,7 @@ impl RecipeBookSlotDisplay {
             6 => Ok(Self::Tag(buf.read_identifier()?)),
             10 => {
                 let count = read_count(buf, MAX_RECIPE_BOOK_SLOTS)?;
-                let mut displays = Vec::with_capacity(count);
+                let mut displays = bounded_vec(count);
                 for _ in 0..count {
                     displays.push(Self::decode_with_depth(buf, depth + 1)?);
                 }
@@ -5604,11 +5553,11 @@ impl Packet for ClientboundUpdateRecipes {
 
     fn decode<B: Buf>(buf: &mut B) -> Result<Self, CodecError> {
         let item_set_count = read_count(buf, MAX_RECIPE_BOOK_ENTRIES)?;
-        let mut item_sets = Vec::with_capacity(item_set_count);
+        let mut item_sets = bounded_vec(item_set_count);
         for _ in 0..item_set_count {
             let key = buf.read_identifier()?;
             let item_count = read_count(buf, MAX_RECIPE_BOOK_INGREDIENT_ITEMS)?;
-            let mut item_ids = Vec::with_capacity(item_count);
+            let mut item_ids = bounded_vec(item_count);
             for _ in 0..item_count {
                 let item_id = buf.read_varint()?;
                 if item_id < 0 {
@@ -5622,7 +5571,7 @@ impl Packet for ClientboundUpdateRecipes {
         }
 
         let recipe_count = read_count(buf, MAX_RECIPE_BOOK_ENTRIES)?;
-        let mut stonecutter_recipes = Vec::with_capacity(recipe_count);
+        let mut stonecutter_recipes = bounded_vec(recipe_count);
         for _ in 0..recipe_count {
             stonecutter_recipes.push(StonecutterRecipeEntry {
                 input: RecipeBookIngredient::decode(buf)?,
@@ -5694,7 +5643,7 @@ impl RecipeBookIngredient {
                 max: MAX_RECIPE_BOOK_INGREDIENT_ITEMS,
             });
         }
-        let mut items = Vec::with_capacity(count);
+        let mut items = bounded_vec(count);
         for _ in 0..count {
             let item_id = buf.read_varint()?;
             if item_id < 0 {
@@ -5801,7 +5750,7 @@ impl RecipeBookDisplay {
         match buf.read_varint()? {
             0 => {
                 let count = read_count(buf, MAX_RECIPE_BOOK_SLOTS)?;
-                let mut ingredients = Vec::with_capacity(count);
+                let mut ingredients = bounded_vec(count);
                 for _ in 0..count {
                     ingredients.push(RecipeBookSlotDisplay::decode(buf)?);
                 }
@@ -5821,7 +5770,7 @@ impl RecipeBookDisplay {
                         "recipe-book shaped ingredient count does not match dimensions",
                     ));
                 }
-                let mut ingredients = Vec::with_capacity(count);
+                let mut ingredients = bounded_vec(count);
                 for _ in 0..count {
                     ingredients.push(RecipeBookSlotDisplay::decode(buf)?);
                 }
@@ -5938,7 +5887,7 @@ impl RecipeBookEntry {
         }
         let crafting_requirements = if buf.read_bool()? {
             let count = read_count(buf, MAX_RECIPE_BOOK_REQUIREMENTS)?;
-            let mut requirements = Vec::with_capacity(count);
+            let mut requirements = bounded_vec(count);
             for _ in 0..count {
                 requirements.push(RecipeBookIngredient::decode(buf)?);
             }
@@ -5978,7 +5927,7 @@ impl Packet for ClientboundRecipeBookAdd {
 
     fn decode<B: Buf>(buf: &mut B) -> Result<Self, CodecError> {
         let count = read_count(buf, MAX_RECIPE_BOOK_ENTRIES)?;
-        let mut entries = Vec::with_capacity(count);
+        let mut entries = bounded_vec(count);
         for _ in 0..count {
             entries.push(RecipeBookEntry::decode(buf)?);
         }

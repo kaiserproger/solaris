@@ -14,8 +14,9 @@ and is not startup context.
   parser/data, persistence, network, ownership, authority, and loader/architecture
   waves. Every item requires current-tree confirmation and focused evidence before
   it is treated as complete. `SOL-023` canonical `Identifier` serde, `SOL-024`
-  validated resource paths, and `SOL-016` world-journal parser/file budgets are
-  complete; `SOL-035` count-prefixed protocol allocation safety is next.
+  validated resource paths, `SOL-016` world-journal parser/file budgets, and
+  `SOL-035` count-prefixed protocol allocation safety are complete; `SOL-009`
+  aggregate NBT budgets and writer rollback is next.
 - The first owner-run public-alpha session remains the routing authority for the
   next stabilization release; its exact plan is `docs/PUBLIC_ALPHA_PLAN.md`.
 - The future full Luau addon platform is frozen in
