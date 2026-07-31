@@ -11,7 +11,10 @@ use serde::Deserialize;
 use serde_json::Value;
 use thiserror::Error;
 
-use crate::{Identifier, read_json_file, sorted_json_files};
+use crate::{
+    Identifier, ResourcePath, ResourcePathError, read_json_file, read_json_resource,
+    sorted_json_files,
+};
 
 #[derive(Debug, Error)]
 pub enum FeatureDataError {
@@ -33,6 +36,8 @@ pub enum FeatureDataError {
     },
     #[error("invalid identifier {value:?} in {path}")]
     InvalidIdentifier { path: PathBuf, value: String },
+    #[error(transparent)]
+    ResourcePath(#[from] ResourcePathError),
     #[error("configured feature {feature} referenced by {placed} is missing at {path}")]
     MissingConfiguredFeature {
         placed: Identifier,
@@ -130,15 +135,17 @@ fn load_one_feature_fact(
         });
     }
 
-    let configured_path = configured_dir.join(format!("{}.json", configured_feature.path()));
-    if !configured_path.is_file() {
+    let mut configured_resource = ResourcePath::from_identifier_path(&configured_feature)?;
+    configured_resource.set_extension("json")?;
+    let Some(configured_file) = configured_resource.open_existing_under(configured_dir)? else {
         return Err(FeatureDataError::MissingConfiguredFeature {
             placed: placed_feature,
             feature: configured_feature,
-            path: configured_path,
+            path: configured_resource.lexical_under(configured_dir),
         });
-    }
-    let configured_value: Value = read_json_file(&configured_path, &io_error, &parse_error)?;
+    };
+    let configured_path = configured_file.path().to_path_buf();
+    let configured_value: Value = read_json_resource(configured_file, &io_error, &parse_error)?;
     let configured_type = configured_value
         .get("type")
         .and_then(Value::as_str)
@@ -423,6 +430,24 @@ mod tests {
             feature.tags,
             vec![Identifier::parse("minecraft:air").unwrap()]
         );
+    }
+
+    #[test]
+    fn rejects_unsafe_configured_feature_resource_path() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        std::fs::create_dir_all(root.join("configured_feature")).unwrap();
+        write(
+            &root.join("placed_feature/unsafe.json"),
+            r#"{"feature":"minecraft:../secret","placement":[]}"#,
+        );
+
+        let error = load_feature_facts(root)
+            .expect_err("configured feature traversal must fail before filesystem access");
+        assert!(matches!(
+            error,
+            FeatureDataError::ResourcePath(ResourcePathError::Unsafe { .. })
+        ));
     }
 
     #[test]

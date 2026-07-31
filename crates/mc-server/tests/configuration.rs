@@ -130,7 +130,7 @@ fn full_registry_sidecar() -> TempDir {
         )
         .unwrap();
         let payload_path =
-            mc_data::network_registry_payload_path(dir.path(), &registry_id, &entry_id);
+            mc_data::network_registry_payload_path(dir.path(), &registry_id, &entry_id).unwrap();
         fs::create_dir_all(payload_path.parent().unwrap()).unwrap();
         fs::write(payload_path, payload).unwrap();
     }

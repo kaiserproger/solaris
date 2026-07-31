@@ -22,6 +22,7 @@
 //! exactly what vanilla uses on the wire.
 
 use std::collections::BTreeMap;
+use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, OnceLock};
 
@@ -51,6 +52,7 @@ pub mod items;
 pub mod loot;
 pub mod mob_behavior_26_1_2;
 pub mod recipes;
+pub mod resource_path;
 pub mod tags;
 pub mod villager_trades_26_1_2;
 pub mod worldgen_features;
@@ -59,6 +61,7 @@ pub mod worldgen_ores;
 pub mod worldgen_structures;
 
 pub use identifier::{Identifier, IdentifierError};
+pub use resource_path::{OpenedResource, ResourcePath, ResourcePathError};
 
 /// Crate version, exposed so other crates and the binary can report it.
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");
@@ -103,17 +106,26 @@ pub const KNOWN_REGISTRIES: &[(&str, &str)] = &[
 /// Exact Network-NBT payloads captured from vanilla after declining its known pack.
 pub const NETWORK_REGISTRY_PAYLOAD_DIR: &str = "reports/registry_network_nbt";
 
-#[must_use]
 pub fn network_registry_payload_path(
     root: &Path,
     registry: &Identifier,
     entry: &Identifier,
-) -> PathBuf {
-    root.join(NETWORK_REGISTRY_PAYLOAD_DIR)
-        .join(registry.namespace())
-        .join(registry.path())
-        .join(entry.namespace())
-        .join(format!("{}.nbt", entry.path()))
+) -> Result<PathBuf, ResourcePathError> {
+    Ok(network_registry_payload_resource_path(registry, entry)?.lexical_under(root))
+}
+
+fn network_registry_payload_resource_path(
+    registry: &Identifier,
+    entry: &Identifier,
+) -> Result<ResourcePath, ResourcePathError> {
+    let mut resource = ResourcePath::new();
+    resource.push_static(NETWORK_REGISTRY_PAYLOAD_DIR)?;
+    resource.push_namespace(registry)?;
+    resource.push_identifier_path(registry)?;
+    resource.push_namespace(entry)?;
+    resource.push_identifier_path(entry)?;
+    resource.set_extension("nbt")?;
+    Ok(resource)
 }
 
 #[derive(Debug, Error)]
@@ -129,6 +141,9 @@ pub enum DataError {
 
     #[error("entry id {entry:?} (from {path}) is not a valid identifier path")]
     InvalidEntry { entry: String, path: PathBuf },
+
+    #[error(transparent)]
+    ResourcePath(#[from] ResourcePathError),
 
     #[error("filesystem error walking {path}: {source}")]
     Io {
@@ -359,21 +374,22 @@ fn required_registry_entries() -> &'static BTreeMap<String, Vec<Identifier>> {
     })
 }
 
-fn load_registry_payload(path: &Path) -> Result<Vec<u8>, DataError> {
-    let bytes = std::fs::read(path).map_err(|source| DataError::Io {
-        path: path.to_path_buf(),
-        source,
-    })?;
+fn load_registry_payload(opened: OpenedResource) -> Result<Vec<u8>, DataError> {
+    let (path, mut file) = opened.into_parts();
+    let mut bytes = Vec::new();
+    file.read_to_end(&mut bytes)
+        .map_err(|source| DataError::Io {
+            path: path.clone(),
+            source,
+        })?;
     let mut remaining = bytes.as_slice();
     let _ =
         mc_nbt::read_network(&mut remaining).map_err(|source| DataError::RegistryPayloadNbt {
-            path: path.to_path_buf(),
+            path: path.clone(),
             source,
         })?;
     if !remaining.is_empty() {
-        return Err(DataError::RegistryPayloadTrailing {
-            path: path.to_path_buf(),
-        });
+        return Err(DataError::RegistryPayloadTrailing { path });
     }
     Ok(bytes)
 }
@@ -425,8 +441,19 @@ pub fn load(path: impl Into<PathBuf>) -> Result<VanillaData, DataError> {
                     path: dir.clone(),
                 })?;
             if has_network_payloads {
-                let payload_path = network_registry_payload_path(&root, &registry_id, &identifier);
-                let payload = load_registry_payload(&payload_path)?;
+                let payload_resource =
+                    network_registry_payload_resource_path(&registry_id, &identifier)?;
+                let Some(payload_file) = payload_resource.open_existing_under(&root)? else {
+                    let path = payload_resource.lexical_under(&root);
+                    return Err(DataError::Io {
+                        path: path.clone(),
+                        source: std::io::Error::new(
+                            std::io::ErrorKind::NotFound,
+                            format!("captured registry payload missing at {}", path.display()),
+                        ),
+                    });
+                };
+                let payload = load_registry_payload(payload_file)?;
                 payloads.insert(identifier.as_str().to_string(), payload.into());
             }
             identifiers.push(identifier);
@@ -505,6 +532,21 @@ where
     serde_json::from_slice(&bytes).map_err(|source| parse_error(path.to_path_buf(), source))
 }
 
+pub(crate) fn read_json_resource<T, E>(
+    opened: OpenedResource,
+    io_error: &impl Fn(PathBuf, std::io::Error) -> E,
+    parse_error: &impl Fn(PathBuf, serde_json::Error) -> E,
+) -> Result<T, E>
+where
+    T: for<'de> serde::Deserialize<'de>,
+{
+    let (path, mut file) = opened.into_parts();
+    let mut bytes = Vec::new();
+    file.read_to_end(&mut bytes)
+        .map_err(|source| io_error(path.clone(), source))?;
+    serde_json::from_slice(&bytes).map_err(|source| parse_error(path, source))
+}
+
 fn collect_entries(root: &Path, out: &mut Vec<String>) -> Result<(), DataError> {
     visit_json_files(
         root,
@@ -572,7 +614,7 @@ mod tests {
                 };
                 let mut payload = Vec::new();
                 mc_nbt::write_network(&mut payload, &tag).unwrap();
-                let path = network_registry_payload_path(dir, &registry, &entry);
+                let path = network_registry_payload_path(dir, &registry, &entry).unwrap();
                 fs::create_dir_all(path.parent().unwrap()).unwrap();
                 fs::write(path, payload).unwrap();
             }
@@ -627,12 +669,38 @@ mod tests {
         );
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn captured_registry_payload_rejects_symlink_escape() {
+        use std::os::unix::fs::symlink;
+
+        let dir = make_minimal_layout();
+        write_captured_payloads(dir.path());
+        let registry = Identifier::parse("minecraft:dimension_type").unwrap();
+        let entry = Identifier::parse("minecraft:alpha").unwrap();
+        let path = network_registry_payload_path(dir.path(), &registry, &entry).unwrap();
+        fs::remove_file(&path).unwrap();
+
+        let outside = TempDir::new().unwrap();
+        let outside_path = outside.path().join("payload.nbt");
+        let mut payload = Vec::new();
+        mc_nbt::write_network(&mut payload, &mc_nbt::Tag::Compound(Vec::new())).unwrap();
+        fs::write(&outside_path, payload).unwrap();
+        symlink(&outside_path, &path).unwrap();
+
+        let error = load(dir.path()).expect_err("payload symlink must stay below data root");
+        assert!(matches!(
+            error,
+            DataError::ResourcePath(ResourcePathError::EscapesRoot { .. })
+        ));
+    }
+
     #[test]
     fn partial_captured_payload_directory_fails_closed() {
         let dir = make_minimal_layout();
         let registry = Identifier::parse("minecraft:dimension_type").unwrap();
         let entry = Identifier::parse("minecraft:alpha").unwrap();
-        let path = network_registry_payload_path(dir.path(), &registry, &entry);
+        let path = network_registry_payload_path(dir.path(), &registry, &entry).unwrap();
         fs::create_dir_all(path.parent().unwrap()).unwrap();
         let mut payload = Vec::new();
         mc_nbt::write_network(&mut payload, &mc_nbt::Tag::Compound(Vec::new())).unwrap();

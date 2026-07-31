@@ -9,7 +9,10 @@ use std::path::{Path, PathBuf};
 use serde::Deserialize;
 use thiserror::Error;
 
-use crate::{Identifier, read_json_file, sorted_json_files};
+use crate::{
+    Identifier, ResourcePath, ResourcePathError, read_json_file, read_json_resource,
+    sorted_json_files,
+};
 
 #[derive(Debug, Error)]
 pub enum OreDataError {
@@ -31,6 +34,8 @@ pub enum OreDataError {
     },
     #[error("invalid identifier {value:?} in {path}")]
     InvalidIdentifier { path: PathBuf, value: String },
+    #[error(transparent)]
+    ResourcePath(#[from] ResourcePathError),
     #[error("configured ore feature {feature} referenced by {placed} is missing at {path}")]
     MissingConfiguredFeature {
         placed: Identifier,
@@ -135,16 +140,18 @@ fn load_one_ore_feature(
             feature: configured_feature,
         });
     }
-    let configured_path = configured_dir.join(format!("{}.json", configured_feature.path()));
-    if !configured_path.is_file() {
+    let mut configured_resource = ResourcePath::from_identifier_path(&configured_feature)?;
+    configured_resource.set_extension("json")?;
+    let Some(configured_file) = configured_resource.open_existing_under(configured_dir)? else {
         return Err(OreDataError::MissingConfiguredFeature {
             placed: placed_feature,
             feature: configured_feature,
-            path: configured_path,
+            path: configured_resource.lexical_under(configured_dir),
         });
-    }
+    };
+    let configured_path = configured_file.path().to_path_buf();
     let configured: RawConfiguredFeature =
-        read_json_file(&configured_path, &io_error, &parse_error)?;
+        read_json_resource(configured_file, &io_error, &parse_error)?;
 
     let placement = parse_placement(placed_path, placed.placement)?;
     let targets = configured
@@ -402,6 +409,24 @@ mod tests {
             feature.placement.height.as_ref().unwrap().max,
             HeightAnchor::AboveBottom(80)
         );
+    }
+
+    #[test]
+    fn rejects_unsafe_configured_ore_resource_path() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        std::fs::create_dir_all(root.join("configured_feature")).unwrap();
+        write(
+            &root.join("placed_feature/ore_unsafe.json"),
+            r#"{"feature":"minecraft:../secret","placement":[]}"#,
+        );
+
+        let error = load_ore_features(root)
+            .expect_err("configured ore traversal must fail before filesystem access");
+        assert!(matches!(
+            error,
+            OreDataError::ResourcePath(ResourcePathError::Unsafe { .. })
+        ));
     }
 
     #[test]

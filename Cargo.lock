@@ -1783,6 +1783,7 @@ name = "mc-data"
 version = "0.0.1-alpha.1"
 dependencies = [
  "mc-nbt",
+ "same-file",
  "serde",
  "serde_json",
  "tempfile",

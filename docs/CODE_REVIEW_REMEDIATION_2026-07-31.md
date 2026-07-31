@@ -111,7 +111,7 @@ Exit condition: a client cannot choose arbitrary movement, while legitimate lag/
 | Finding | State | Evidence / next action |
 | --- | --- | --- |
 | `SOL-023` | complete | Derived serde was replaced by canonical string serialization. The legacy `{full,colon}` object is accepted only when both fields exactly match the value re-parsed through `Identifier::parse`; impossible indices, invalid characters, non-canonical bare paths, and extra fields fail closed. `mc-data`, `mc-protocol`, `mc-world`, `mc-script`, and `mc-worldgen` package tests plus workspace Clippy pass. |
-| `SOL-024` | next | Introduce a validated resource-path boundary and migrate direct `root.join(identifier.path())` callers with traversal/symlink regressions. |
+| `SOL-024` | complete | Added a shared `ResourcePath` boundary that rejects empty/dot/absolute/platform-ambiguous segments. Registry Network-NBT, entity-loot references, configured worldgen features, and ore features now read from an already-opened descriptor whose OS identity is compared with the post-open canonical target under the trusted root. The independent reviewer initially blocked the canonicalize-then-reopen TOCTOU; that path was removed and a deterministic symlink-swap regression now fails closed through `same-file` identity checks. Primitive plus real loader traversal/symlink tests pass; the only remaining direct `join(identifier.path())` occurrence is a trusted test fixture writer. No second reviewer was run, per `AGENTS.md`. |
 | Other findings | queued for current-tree triage | Confirm against current code before implementation; static bundle severity is not automatically treated as current runtime truth. |
 
 ## Validation policy

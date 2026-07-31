@@ -277,6 +277,54 @@ fn resource_loader_rejects_an_oversize_file_before_parse_or_partial_catalog() {
 }
 
 #[test]
+fn resource_loader_rejects_unsafe_identifier_paths_before_io() {
+    let temp = tempfile::tempdir().unwrap();
+    for raw in [
+        "minecraft:../secret",
+        "minecraft:entities/../../secret",
+        "minecraft:/absolute/secret",
+        "minecraft:entities//secret",
+    ] {
+        let error = EntityLootCatalog::compile_resources(temp.path(), [id(raw)])
+            .expect_err("unsafe resource identifier must fail before filesystem access");
+        assert!(
+            matches!(
+                error,
+                EntityLootLoadError::ResourcePath(crate::ResourcePathError::Unsafe { .. })
+            ),
+            "unexpected error for {raw}: {error}"
+        );
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn resource_loader_rejects_symlink_escape() {
+    use std::os::unix::fs::symlink;
+
+    let root = tempfile::tempdir().unwrap();
+    let outside = tempfile::tempdir().unwrap();
+    std::fs::write(
+        outside.path().join("secret.json"),
+        one_item_table(
+            "minecraft:entity",
+            r#"{"type":"minecraft:item","name":"minecraft:diamond"}"#,
+        ),
+    )
+    .unwrap();
+    let table_root = root.path().join("example/loot_table");
+    std::fs::create_dir_all(&table_root).unwrap();
+    symlink(outside.path(), table_root.join("linked")).unwrap();
+
+    let error = EntityLootCatalog::compile_resources(root.path(), [id("example:linked/secret")])
+        .expect_err("resource symlink must not escape the trusted data root");
+    assert!(matches!(
+        error,
+        EntityLootLoadError::ResourcePath(crate::ResourcePathError::EscapesRoot { .. })
+    ));
+}
+
+#[test]
 fn configured_roots_must_be_nonempty_and_present() {
     let empty = EntityLootCatalog::from_tables(
         std::iter::empty::<Identifier>(),

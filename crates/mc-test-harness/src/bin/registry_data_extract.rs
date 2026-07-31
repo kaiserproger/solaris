@@ -149,7 +149,7 @@ async fn capture_registry_payloads(
                     staging_root,
                     &registry.registry_id,
                     &entry.name,
-                );
+                )?;
                 let parent = path.parent().ok_or_else(|| {
                     anyhow::anyhow!("captured payload path has no parent: {}", path.display())
                 })?;

@@ -1,11 +1,11 @@
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::io::Read;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 
 use serde_json::{Map, Value};
 
 use super::model::*;
-use crate::Identifier;
+use crate::{Identifier, ResourcePath, ResourcePathError};
 
 #[derive(Clone, Copy)]
 pub(super) struct JsonBudgetLimits {
@@ -251,24 +251,19 @@ impl EntityLootCatalog {
             if tables.contains_key(&table_id) {
                 continue;
             }
-            let path = resource_path(data_root, &table_id);
-            let file = match std::fs::File::open(&path) {
-                Ok(file) => file,
-                Err(source) if source.kind() == std::io::ErrorKind::NotFound => {
-                    return Err(referenced_from.map_or_else(
-                        || EntityLootLoadError::MissingRoot {
-                            root: table_id.clone(),
-                        },
-                        |table| EntityLootLoadError::MissingReference {
-                            table,
-                            referenced: table_id.clone(),
-                        },
-                    ));
-                }
-                Err(source) => {
-                    return Err(EntityLootLoadError::Io { path, source });
-                }
+            let resource = resource_path(&table_id)?;
+            let Some(opened) = resource.open_existing_under(data_root)? else {
+                return Err(referenced_from.map_or_else(
+                    || EntityLootLoadError::MissingRoot {
+                        root: table_id.clone(),
+                    },
+                    |table| EntityLootLoadError::MissingReference {
+                        table,
+                        referenced: table_id.clone(),
+                    },
+                ));
             };
+            let (path, file) = opened.into_parts();
             let mut raw = Vec::new();
             file.take(MAX_SOURCE_BYTES as u64 + 1)
                 .read_to_end(&mut raw)
@@ -403,12 +398,13 @@ fn checked_load_count(
         })
 }
 
-fn resource_path(data_root: &Path, table: &Identifier) -> PathBuf {
-    data_root
-        .join(table.namespace())
-        .join("loot_table")
-        .join(table.path())
-        .with_extension("json")
+fn resource_path(table: &Identifier) -> Result<ResourcePath, ResourcePathError> {
+    let mut resource = ResourcePath::new();
+    resource.push_namespace(table)?;
+    resource.push_static("loot_table")?;
+    resource.push_identifier_path(table)?;
+    resource.set_extension("json")?;
+    Ok(resource)
 }
 
 fn validate_reference_graph(

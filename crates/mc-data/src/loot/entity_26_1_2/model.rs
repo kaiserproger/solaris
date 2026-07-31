@@ -5,7 +5,7 @@ use std::path::PathBuf;
 use thiserror::Error;
 
 use super::super::{LootContextItem, LootEnchantments, LootRandomBinding};
-use crate::Identifier;
+use crate::{Identifier, ResourcePathError};
 
 pub const MAX_COMPILE_NESTING_DEPTH: usize = 64;
 pub const MAX_SOURCE_BYTES: usize = 1_048_576;
@@ -236,6 +236,8 @@ pub enum EntityLootLoadError {
         #[source]
         source: std::io::Error,
     },
+    #[error(transparent)]
+    ResourcePath(#[from] ResourcePathError),
     #[error("failed to compile entity loot resource {path}: {source}")]
     Compile {
         path: PathBuf,
