@@ -936,6 +936,13 @@ iteration и может пропустить обычный broken package. Stri
 Проверка выполняется одинаково в `--check` и serve; host startup возвращает typed
 ошибку, если expected plugin не прошёл command-root registration или Lua compile.
 
+Один pushed event имеет общий 50 ms monotonic host budget. Scheduler вращает
+первого eligible plugin, делит оставшееся время между оставшимися plugins и
+ограничивает одну invocation десятью миллисекундами. `RuntimeControls.timeout`
+включает тот же deadline в Luau interrupt hook вместе с instruction fuel; timer и
+batch-rejection callbacks не получают отдельного времени. Timeout отключает
+виновный plugin, а aggregate exhaustion логирует число отложенных recipients.
+
 Owner-committed player-death/entity-kill events проходят отдельный bounded outbox
 на 256 envelopes. Каждый envelope явно `Required` или `BestEffort`: required
 переполнение/closure публикует fatal health signal, запрашивает shutdown и делает

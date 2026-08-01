@@ -7,6 +7,7 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread;
+use std::time::{Duration, Instant};
 
 use mlua::{Function, Lua, LuaOptions, LuaString, StdLib, Table, Value, VmState};
 use serde::{Deserialize, Serialize};
@@ -40,6 +41,8 @@ const COMMANDS_PER_EVENT: usize = 32;
 const MEMORY_BYTES_PER_PLUGIN: usize = 16 * 1024 * 1024;
 const INSTRUCTIONS_PER_EVENT: u64 = 100_000;
 const LUAU_INTERRUPT_FUEL_COST: u64 = 2;
+const HOST_EVENT_WALL_BUDGET: Duration = Duration::from_millis(50);
+const HOST_PLUGIN_MAX_WALL_SLICE: Duration = Duration::from_millis(10);
 const MAX_PLUGIN_MANIFEST_BYTES: usize = 64 * 1024;
 const MAX_PLUGIN_CONFIG_BYTES: usize = 64 * 1024;
 const MAX_PLUGIN_CONFIG_DEPTH: usize = 8;
@@ -1970,6 +1973,63 @@ fn parse_api_version(value: &str) -> Result<ScriptApiVersion, String> {
     ))
 }
 
+#[derive(Debug, Clone, Copy)]
+struct HostEventBudget {
+    deadline: Instant,
+}
+
+impl HostEventBudget {
+    fn new(started: Instant) -> Self {
+        Self {
+            deadline: started
+                .checked_add(HOST_EVENT_WALL_BUDGET)
+                .unwrap_or(started),
+        }
+    }
+
+    fn next_slot(self, remaining_plugins: usize) -> Option<HostInvocationSlot> {
+        self.next_slot_at(Instant::now(), remaining_plugins)
+    }
+
+    fn next_slot_at(self, now: Instant, remaining_plugins: usize) -> Option<HostInvocationSlot> {
+        if remaining_plugins == 0 || now >= self.deadline {
+            return None;
+        }
+        let remaining = self.deadline.duration_since(now);
+        let divisor = u32::try_from(remaining_plugins).unwrap_or(u32::MAX).max(1);
+        let fair_share = remaining / divisor;
+        let slice = fair_share.min(HOST_PLUGIN_MAX_WALL_SLICE);
+        if slice.is_zero() {
+            return None;
+        }
+        Some(HostInvocationSlot {
+            deadline: now
+                .checked_add(slice)
+                .unwrap_or(self.deadline)
+                .min(self.deadline),
+        })
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+struct HostInvocationSlot {
+    deadline: Instant,
+}
+
+impl HostInvocationSlot {
+    fn remaining(self) -> Option<Duration> {
+        self.remaining_at(Instant::now())
+    }
+
+    fn remaining_at(self, now: Instant) -> Option<Duration> {
+        (now < self.deadline).then(|| self.deadline.duration_since(now))
+    }
+}
+
+fn rotating_indices(len: usize, start: usize) -> impl Iterator<Item = usize> {
+    (0..len).map(move |offset| (start + offset) % len.max(1))
+}
+
 fn run_lua_host(
     mut endpoint: ScriptHostEndpoint,
     sources: Vec<PluginSource>,
@@ -2054,9 +2114,36 @@ fn run_lua_host_inner(
     }
     let _ = startup.send(Ok(plugins.len()));
 
+    let mut fairness_cursor = 0usize;
     while let Some(event) = endpoint.recv_event_blocking() {
-        for plugin in &mut plugins {
-            let batch = match plugin.handle_event(&event) {
+        let event_started = Instant::now();
+        let eligible = rotating_indices(plugins.len(), fairness_cursor)
+            .filter(|&index| plugins[index].accepts_event(&event))
+            .collect::<Vec<_>>();
+        if !plugins.is_empty() {
+            fairness_cursor = (fairness_cursor + 1) % plugins.len();
+        }
+        let event_budget = HostEventBudget::new(event_started);
+        for (position, index) in eligible.iter().copied().enumerate() {
+            let remaining_plugins = eligible.len() - position;
+            let Some(slot) = event_budget.next_slot(remaining_plugins) else {
+                warn!(
+                    event = event.event_name(),
+                    skipped_plugins = remaining_plugins,
+                    "Lua host aggregate wall-clock budget exhausted"
+                );
+                break;
+            };
+            let Some(timeout) = slot.remaining() else {
+                warn!(
+                    event = event.event_name(),
+                    skipped_plugins = remaining_plugins,
+                    "Lua host aggregate wall-clock budget exhausted before invocation"
+                );
+                break;
+            };
+            let plugin = &mut plugins[index];
+            let batch = match plugin.handle_event(&event, timeout) {
                 Ok(batch) => batch,
                 Err(error) => {
                     warn!(plugin = %plugin.id, ?error, "Lua plugin disabled after handler failure");
@@ -2070,7 +2157,16 @@ fn run_lua_host_inner(
                 Err(ScriptBatchSubmissionError::Full(batch)) => {
                     let command_count = batch.commands().len();
                     warn!(plugin = %plugin.id, command_count, "Lua command batch rejected because the queue is full");
-                    if let Err(error) = plugin.notify_batch_rejected("queue_full", command_count) {
+                    let Some(timeout) = slot.remaining() else {
+                        warn!(
+                            plugin = %plugin.id,
+                            "Lua batch-rejection callback skipped after wall-clock budget exhaustion"
+                        );
+                        continue;
+                    };
+                    if let Err(error) =
+                        plugin.notify_batch_rejected("queue_full", command_count, timeout)
+                    {
                         warn!(plugin = %plugin.id, ?error, "Lua plugin disabled after batch-rejection handler failure");
                         endpoint.unregister_player_commands(&plugin.id);
                         plugin.disabled = true;
@@ -2078,7 +2174,10 @@ fn run_lua_host_inner(
                 }
                 Err(ScriptBatchSubmissionError::Closed(batch)) => {
                     let command_count = batch.commands().len();
-                    let _ = plugin.notify_batch_rejected("queue_closed", command_count);
+                    if let Some(timeout) = slot.remaining() {
+                        let _ =
+                            plugin.notify_batch_rejected("queue_closed", command_count, timeout);
+                    }
                     return;
                 }
                 Err(ScriptBatchSubmissionError::Rejected { error, .. }) => {
@@ -2130,20 +2229,26 @@ impl LuaPlugin {
         })
     }
 
-    fn handle_event(&mut self, event: &ScriptEvent) -> RuntimeResult<CommandBatch> {
+    fn accepts_event(&self, event: &ScriptEvent) -> bool {
         if self.disabled {
-            return Ok(empty_lua_command_batch());
+            return false;
         }
         if let Some(target_plugin_id) = event.target_plugin_id() {
-            if target_plugin_id != self.id {
-                return Ok(empty_lua_command_batch());
-            }
-        } else if !matches!(event.kind(), ScriptEventKind::ServerTick { .. })
-            && !self.subscriptions.contains(event.event_name())
-        {
+            return target_plugin_id == self.id;
+        }
+        matches!(event.kind(), ScriptEventKind::ServerTick { .. })
+            || self.subscriptions.contains(event.event_name())
+    }
+
+    fn handle_event(
+        &mut self,
+        event: &ScriptEvent,
+        timeout: Duration,
+    ) -> RuntimeResult<CommandBatch> {
+        if !self.accepts_event(event) {
             return Ok(empty_lua_command_batch());
         }
-        let controls = crate::RuntimeControls::unrestricted();
+        let controls = crate::RuntimeControls::unrestricted().with_timeout(timeout);
         self.runtime.handle_event(
             event,
             RuntimeContext::new(
@@ -2157,8 +2262,11 @@ impl LuaPlugin {
         &mut self,
         reason: &'static str,
         command_count: usize,
+        timeout: Duration,
     ) -> RuntimeResult<()> {
-        self.runtime.notify_batch_rejected(reason, command_count)
+        let controls = crate::RuntimeControls::unrestricted().with_timeout(timeout);
+        self.runtime
+            .notify_batch_rejected(reason, command_count, &controls)
     }
 }
 
@@ -2287,6 +2395,7 @@ impl LuaScriptRuntime {
         &self,
         reason: &'static str,
         command_count: usize,
+        controls: &crate::RuntimeControls,
     ) -> RuntimeResult<()> {
         let handler = self
             .lua
@@ -2301,9 +2410,12 @@ impl LuaScriptRuntime {
         result
             .set("command_count", command_count)
             .map_err(runtime_error)?;
-        run_with_instruction_budget(&self.lua, self.limits.instructions_per_event, || {
-            handler.call::<()>(result)
-        })
+        run_with_runtime_budget(
+            &self.lua,
+            self.limits.instructions_per_event,
+            controls.timeout(),
+            || handler.call::<()>(result),
+        )
         .map_err(runtime_error)
     }
 
@@ -2401,9 +2513,19 @@ impl ScriptRuntime for LuaScriptRuntime {
             NonZeroU64::new(fuel.get().min(configured_budget.get()))
                 .expect("minimum of non-zero budgets is non-zero")
         });
-        install_instruction_budget_hook(&self.lua, budget).map_err(runtime_error)?;
+        let deadline = runtime_deadline(context.controls().timeout());
+        let timers_before = self.timers.clone();
+        let current_tick_before = self.current_tick;
+        install_runtime_budget_hook(&self.lua, budget, deadline).map_err(runtime_error)?;
         let result = self.dispatch_event(event, context);
         self.lua.remove_interrupt();
+        if deadline.is_some_and(|deadline| Instant::now() >= deadline) {
+            self.timers = timers_before;
+            self.current_tick = current_tick_before;
+            return Err(RuntimeError::Trap {
+                message: "wall-clock budget exceeded".to_owned(),
+            });
+        }
         result
     }
 }
@@ -3332,16 +3454,41 @@ fn run_with_instruction_budget<T>(
     budget: NonZeroU64,
     run: impl FnOnce() -> mlua::Result<T>,
 ) -> mlua::Result<T> {
-    install_instruction_budget_hook(lua, budget)?;
+    run_with_runtime_budget(lua, budget, None, run)
+}
+
+fn run_with_runtime_budget<T>(
+    lua: &Lua,
+    budget: NonZeroU64,
+    timeout: Option<Duration>,
+    run: impl FnOnce() -> mlua::Result<T>,
+) -> mlua::Result<T> {
+    let deadline = runtime_deadline(timeout);
+    install_runtime_budget_hook(lua, budget, deadline)?;
     let result = run();
     lua.remove_interrupt();
+    if deadline.is_some_and(|deadline| Instant::now() >= deadline) {
+        return Err(mlua::Error::runtime("wall-clock budget exceeded"));
+    }
     result
 }
 
-fn install_instruction_budget_hook(lua: &Lua, budget: NonZeroU64) -> mlua::Result<()> {
+fn runtime_deadline(timeout: Option<Duration>) -> Option<Instant> {
+    let started = Instant::now();
+    timeout.map(|timeout| started.checked_add(timeout).unwrap_or(started))
+}
+
+fn install_runtime_budget_hook(
+    lua: &Lua,
+    budget: NonZeroU64,
+    deadline: Option<Instant>,
+) -> mlua::Result<()> {
     let consumed = Arc::new(AtomicU64::new(0));
     let interrupt_consumed = Arc::clone(&consumed);
     lua.set_interrupt(move |_| {
+        if deadline.is_some_and(|deadline| Instant::now() >= deadline) {
+            return Err(mlua::Error::runtime("wall-clock budget exceeded"));
+        }
         let total = interrupt_consumed.fetch_add(LUAU_INTERRUPT_FUEL_COST, Ordering::Relaxed)
             + LUAU_INTERRUPT_FUEL_COST;
         if total >= budget.get() {
@@ -4491,6 +4638,187 @@ mod tests {
     }
 
     #[test]
+    fn runtime_timeout_stops_an_infinite_lua_handler_before_the_fuel_ceiling() {
+        let mut runtime = LuaScriptRuntime::from_source(
+            manifest(&["server.tick"]),
+            r#"
+                function on_server_tick(_event)
+                    while true do end
+                end
+            "#,
+            LuaRuntimeLimits {
+                instructions_per_event: NonZeroU64::new(1_000_000_000).unwrap(),
+                ..LuaRuntimeLimits::default()
+            },
+        )
+        .unwrap();
+        let controls = RuntimeControls::unrestricted().with_timeout(Duration::from_millis(5));
+
+        let error = runtime
+            .handle_event(
+                &ScriptEvent::server_tick(1),
+                RuntimeContext::new(&controls, NonZeroUsize::new(1).unwrap()),
+            )
+            .unwrap_err();
+
+        assert!(
+            matches!(error, RuntimeError::Trap { message } if message.contains("wall-clock budget"))
+        );
+    }
+
+    #[test]
+    fn elapsed_timeout_discards_trivial_handler_batch_and_timer_state() {
+        let mut runtime = LuaScriptRuntime::from_source(
+            manifest(&["server.tick"]),
+            r#"
+                function on_server_tick(_event)
+                    solaris.schedule_timer("late", 1)
+                    solaris.broadcast("must-not-publish")
+                end
+            "#,
+            LuaRuntimeLimits::default(),
+        )
+        .unwrap();
+        let controls = RuntimeControls::unrestricted().with_timeout(Duration::ZERO);
+
+        let error = runtime
+            .handle_event(
+                &ScriptEvent::server_tick(7),
+                RuntimeContext::new(&controls, NonZeroUsize::new(1).unwrap()),
+            )
+            .unwrap_err();
+
+        assert!(
+            matches!(error, RuntimeError::Trap { message } if message.contains("wall-clock budget"))
+        );
+        assert_eq!(runtime.pending_timer_count(), 0);
+        assert_eq!(runtime.current_tick, 0);
+    }
+
+    #[test]
+    fn runtime_timeout_stops_an_infinite_batch_rejection_callback() {
+        let runtime = LuaScriptRuntime::from_source(
+            manifest(&["server.tick"]),
+            r#"
+                function on_command_batch_rejected(_event)
+                    while true do end
+                end
+            "#,
+            LuaRuntimeLimits {
+                instructions_per_event: NonZeroU64::new(1_000_000_000).unwrap(),
+                ..LuaRuntimeLimits::default()
+            },
+        )
+        .unwrap();
+        let controls = RuntimeControls::unrestricted().with_timeout(Duration::from_millis(5));
+
+        let error = runtime
+            .notify_batch_rejected("queue_full", 1, &controls)
+            .unwrap_err();
+
+        assert!(
+            matches!(error, RuntimeError::Trap { message } if message.contains("wall-clock budget"))
+        );
+    }
+
+    #[test]
+    fn host_event_budget_divides_remaining_time_and_expires_at_one_deadline() {
+        let started = Instant::now();
+        let budget = HostEventBudget::new(started);
+
+        let first = budget.next_slot_at(started, 5).expect("first fair slot");
+        assert_eq!(first.remaining_at(started), Some(Duration::from_millis(10)));
+
+        let second_started = started + Duration::from_millis(10);
+        let second = budget
+            .next_slot_at(second_started, 4)
+            .expect("second fair slot");
+        assert_eq!(
+            second.remaining_at(second_started),
+            Some(Duration::from_millis(10))
+        );
+
+        let final_started = started + Duration::from_millis(49);
+        let final_slot = budget
+            .next_slot_at(final_started, 1)
+            .expect("remaining aggregate millisecond");
+        assert_eq!(
+            final_slot.remaining_at(final_started),
+            Some(Duration::from_millis(1))
+        );
+        assert!(
+            budget
+                .next_slot_at(started + HOST_EVENT_WALL_BUDGET, 1)
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn rotating_plugin_order_changes_the_first_admission_without_omissions() {
+        assert_eq!(rotating_indices(4, 0).collect::<Vec<_>>(), [0, 1, 2, 3]);
+        assert_eq!(rotating_indices(4, 1).collect::<Vec<_>>(), [1, 2, 3, 0]);
+        assert_eq!(rotating_indices(4, 3).collect::<Vec<_>>(), [3, 0, 1, 2]);
+        assert!(rotating_indices(0, 0).next().is_none());
+    }
+
+    #[tokio::test]
+    async fn lua_host_rotates_the_first_plugin_between_broadcast_events() {
+        let source = |id: &'static str| PluginSource {
+            manifest: ScriptPluginManifest::new(id, id, "0.1.0", SCRIPT_API_VERSION)
+                .subscribe_event("server.tick")
+                .validate()
+                .unwrap(),
+            config: toml::Table::new(),
+            source: format!("function on_server_tick(_event) solaris.broadcast('{id}') end"),
+            source_path: PathBuf::from(format!("{id}/main.lua")),
+            worldgen_ore_profile: None,
+            worldgen_settlement_plan: None,
+            client_bundles: Vec::new(),
+        };
+        let (boundary, endpoint) = script_boundary_pair(
+            NonZeroUsize::new(4).unwrap(),
+            NonZeroUsize::new(16).unwrap(),
+        );
+        let (startup_tx, startup_rx) = std::sync::mpsc::sync_channel(1);
+        let host = thread::spawn(move || {
+            run_lua_host(
+                endpoint,
+                vec![source("alpha"), source("bravo"), source("charlie")],
+                false,
+                startup_tx,
+            )
+        });
+        assert_eq!(startup_rx.recv().unwrap().unwrap(), 3);
+
+        let mut orders = Vec::new();
+        for tick in [1, 2] {
+            boundary
+                .try_enqueue_event(ScriptEvent::server_tick(tick))
+                .unwrap();
+            let mut order = Vec::new();
+            for _ in 0..3 {
+                let command = tokio::time::timeout(Duration::from_secs(1), boundary.recv_command())
+                    .await
+                    .expect("plugin command did not arrive")
+                    .expect("script command queue closed");
+                let ScriptCommand::HostAttached { provenance, .. } = command else {
+                    panic!("plugin command was not host attached");
+                };
+                order.push(provenance.plugin_id().to_owned());
+            }
+            orders.push(order);
+        }
+
+        assert_eq!(orders[0], ["alpha", "bravo", "charlie"]);
+        assert_eq!(orders[1], ["bravo", "charlie", "alpha"]);
+        drop(boundary);
+        tokio::task::spawn_blocking(move || host.join())
+            .await
+            .unwrap()
+            .unwrap();
+    }
+
+    #[test]
     fn lua_memory_exhaustion_fails_the_invocation_without_returning_its_partial_batch() {
         let mut runtime = LuaScriptRuntime::from_source(
             manifest(&["server.tick"]),
@@ -4534,7 +4862,9 @@ mod tests {
         )
         .unwrap();
 
-        runtime.notify_batch_rejected("queue_closed", 2).unwrap();
+        runtime
+            .notify_batch_rejected("queue_closed", 2, &RuntimeControls::unrestricted())
+            .unwrap();
 
         assert_eq!(
             runtime.lua.globals().get::<String>("rejection").unwrap(),
@@ -5760,7 +6090,9 @@ mod tests {
             first.commands(),
             [ScriptCommand::ListOnlinePlayers { .. }]
         ));
-        runtime.notify_batch_rejected("queue_full", 1).unwrap();
+        runtime
+            .notify_batch_rejected("queue_full", 1, &RuntimeControls::unrestricted())
+            .unwrap();
 
         let second = runtime
             .handle_event(

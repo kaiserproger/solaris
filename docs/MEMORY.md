@@ -30,9 +30,9 @@ and is not startup context.
   `SOL-002` close-safe async extension boundaries, `SOL-012` bounded committed
   script-event delivery with explicit required/best-effort policy, and `SOL-031`
   crash-only regional-owner supervision, `SOL-041` named poisoned-lock policy,
-  `SOL-037` RAII host-admission cancellation, and `SOL-039` strict exact plugin
-  deployment are complete; `SOL-038` aggregate plugin wall-clock/fairness budget
-  is next in the runtime-ownership series.
+  `SOL-037` RAII host-admission cancellation, `SOL-039` strict exact plugin
+  deployment, and `SOL-038` aggregate plugin wall-clock/fairness budgeting are
+  complete; `SOL-019` authority-side displacement validation is next.
 - The first owner-run public-alpha session remains the routing authority for the
   next stabilization release; its exact plan is `docs/PUBLIC_ALPHA_PLAN.md`.
 - The future full Luau addon platform is frozen in
