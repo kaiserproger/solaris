@@ -68,6 +68,9 @@ pub enum ConnectionError {
         violations: u32,
     },
 
+    #[error("compressed frame worker failed: {reason}")]
+    FrameDecodeWorker { reason: String },
+
     #[error("outbound socket write remained blocked for {timeout:?}")]
     WriteTimeout { timeout: Duration },
 

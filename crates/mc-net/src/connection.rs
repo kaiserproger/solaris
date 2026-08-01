@@ -6,14 +6,16 @@
 //! [`mc_protocol::Packet`] type to read.
 
 use bytes::{Buf, BytesMut};
-use mc_protocol::frame::{Compression, encode_frame, try_decode_frame};
+use mc_protocol::frame::{Compression, FrameDecodePlan, encode_frame, try_decode_frame_plan};
 use mc_protocol::packets::Packet;
 use mc_protocol::{RawFrame, State};
 use std::future::{Future, poll_fn};
 use std::pin::Pin;
+use std::sync::{Arc, OnceLock};
 use std::task::{Context, Poll};
 use std::time::Duration;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, ReadBuf};
+use tokio::sync::Semaphore;
 
 use crate::encryption::MinecraftCipher;
 use crate::error::ConnectionError;
@@ -34,6 +36,42 @@ pub(crate) const MAX_INBOUND_BUFFER_BYTES: usize = 1024 * 1024;
 pub(crate) const OUTBOUND_WRITE_STALL_TIMEOUT: Duration = Duration::from_secs(5);
 #[cfg(test)]
 pub(crate) const OUTBOUND_WRITE_STALL_TIMEOUT: Duration = Duration::from_millis(10);
+const MAX_CONCURRENT_FRAME_DECODES: usize = 8;
+static FRAME_DECODE_PERMITS: OnceLock<Arc<Semaphore>> = OnceLock::new();
+
+fn frame_decode_permits() -> &'static Arc<Semaphore> {
+    FRAME_DECODE_PERMITS.get_or_init(|| {
+        let permits = std::thread::available_parallelism()
+            .map(std::num::NonZeroUsize::get)
+            .unwrap_or(1)
+            .clamp(1, MAX_CONCURRENT_FRAME_DECODES);
+        Arc::new(Semaphore::new(permits))
+    })
+}
+
+async fn run_bounded_frame_decode<T, F>(task: F) -> Result<T, ConnectionError>
+where
+    T: Send + 'static,
+    F: FnOnce() -> Result<T, mc_protocol::FramingError> + Send + 'static,
+{
+    let permit = Arc::clone(frame_decode_permits())
+        .acquire_owned()
+        .await
+        .map_err(|error| ConnectionError::FrameDecodeWorker {
+            reason: error.to_string(),
+        })?;
+    match tokio::task::spawn_blocking(move || {
+        let _permit = permit;
+        task()
+    })
+    .await
+    {
+        Ok(result) => result.map_err(ConnectionError::from),
+        Err(error) => Err(ConnectionError::FrameDecodeWorker {
+            reason: error.to_string(),
+        }),
+    }
+}
 
 #[derive(Debug, Clone, Copy)]
 pub(crate) struct PrePlayBudget {
@@ -266,8 +304,12 @@ where
     R: AsyncReadExt + Unpin,
 {
     loop {
-        if let Some(frame) = try_decode_frame(buf, compression)? {
-            return Ok(frame);
+        match try_decode_frame_plan(buf, compression)? {
+            Some(FrameDecodePlan::Ready(frame)) => return Ok(frame),
+            Some(FrameDecodePlan::Compressed(frame)) => {
+                return run_bounded_frame_decode(move || frame.decode()).await;
+            }
+            None => {}
         }
         let remaining = MAX_INBOUND_BUFFER_BYTES.saturating_sub(buf.len());
         if remaining == 0 {
@@ -475,6 +517,35 @@ mod tests {
         .unwrap();
 
         assert_eq!(decoded, packet);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn compressed_frame_decode_runs_off_the_async_runtime_thread() {
+        let runtime_thread = std::thread::current().id();
+        let worker_thread = run_bounded_frame_decode(|| {
+            Ok::<_, mc_protocol::FramingError>(std::thread::current().id())
+        })
+        .await
+        .unwrap();
+
+        assert_ne!(worker_thread, runtime_thread);
+        assert!(frame_decode_permits().available_permits() <= MAX_CONCURRENT_FRAME_DECODES);
+    }
+
+    #[tokio::test]
+    async fn read_frame_decodes_compressed_payload_through_production_path() {
+        let (mut client, mut server) = tokio::io::duplex(8192);
+        let body = vec![0xAB; 4096];
+        let encoded = encode_frame(0x22, &body, Compression::Threshold(256)).unwrap();
+        client.write_all(&encoded).await.unwrap();
+        let mut buf = BytesMut::new();
+
+        let frame = read_frame(&mut server, &mut buf, Compression::Threshold(256))
+            .await
+            .unwrap();
+
+        assert_eq!(frame.id, 0x22);
+        assert_eq!(&frame.body[..], &body);
     }
 
     #[tokio::test]

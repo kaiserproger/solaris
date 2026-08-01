@@ -844,9 +844,13 @@ lookup. Полные collision boxes важнее одного height: stair/fen
 UUID, positions и NBT. Каждый decode обязан проверить оставшийся body и лимит
 до allocation. `read_varint_partial` отличает incomplete input от malformed.
 
-`try_decode_frame` разбирает length/compression и возвращает `None`, только если
-не хватает bytes. `encode_frame` применяет compression threshold и packet ID.
-`encoded_size_uncompressed` нужен для reservation, а не является вторым codec.
+`try_decode_frame_plan` разбирает length/compression и возвращает готовый frame
+либо owned compressed plan; `None` означает только нехватку bytes. Raw frame
+допустим строго ниже threshold. Compressed plan требует exact output length,
+zlib `StreamEnd` и полного consumption input; production `mc-net` исполняет его
+через bounded blocking pool, а не на Tokio connection worker. `encode_frame`
+применяет compression threshold и packet ID. `encoded_size_uncompressed`
+возвращает checked `Result` для reservation, а не является вторым codec.
 Workspace отключает default `miniz_oxide` backend у `flate2` и использует
 `zlib-rs`: инициализация miniz deflate state переполняла обычный 2 MiB stack
 runtime worker при сжатии chunk frame. Это не меняет zlib wire format; frame

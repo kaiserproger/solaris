@@ -31,9 +31,9 @@
 
 use bytes::{Buf, BufMut, Bytes, BytesMut};
 use flate2::Compression as ZlibLevel;
-use flate2::read::ZlibDecoder;
 use flate2::write::ZlibEncoder;
-use std::io::{Read, Write};
+use flate2::{Decompress, FlushDecompress, Status};
+use std::io::Write;
 use thiserror::Error;
 
 use crate::codec::{ReadMc, WriteMc, varint_encoded_len};
@@ -133,8 +133,41 @@ pub enum FramingError {
     #[error("compressed frame declared data_length {claimed} below threshold {threshold}")]
     CompressedBelowThreshold { claimed: usize, threshold: usize },
 
+    #[error("uncompressed frame contained {actual} bytes at or above threshold {threshold}")]
+    UncompressedAboveThreshold { actual: usize, threshold: usize },
+
+    #[error("compressed zlib stream did not reach its end marker")]
+    IncompleteCompressedStream,
+
+    #[error("compressed zlib stream left {trailing} trailing byte(s)")]
+    TrailingCompressedData { trailing: usize },
+
+    #[error("frame size arithmetic overflowed")]
+    LengthOverflow,
+
+    #[error("zlib decompression error: {0}")]
+    ZlibDecompress(#[from] flate2::DecompressError),
+
     #[error("zlib I/O error: {0}")]
     Zlib(#[from] std::io::Error),
+}
+
+#[derive(Debug)]
+pub enum FrameDecodePlan {
+    Ready(RawFrame),
+    Compressed(CompressedFrame),
+}
+
+#[derive(Debug)]
+pub struct CompressedFrame {
+    claimed_len: usize,
+    payload: Bytes,
+}
+
+impl CompressedFrame {
+    pub fn decode(self) -> Result<RawFrame, FramingError> {
+        decode_compressed_frame(self.claimed_len, self.payload)
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -164,30 +197,27 @@ fn read_packet_length(buf: &[u8]) -> Result<Option<(usize, usize)>, CodecError> 
 ///   left untouched so the caller can append more bytes and retry.
 /// - `Err(_)` if the bytes that ARE there are malformed; the connection
 ///   should be dropped.
-pub fn try_decode_frame(
+pub fn try_decode_frame_plan(
     buf: &mut BytesMut,
     compression: Compression,
-) -> Result<Option<RawFrame>, FramingError> {
-    // 1. Peek the leading packet_length VarInt21 without consuming it.
+) -> Result<Option<FrameDecodePlan>, FramingError> {
     let (packet_length, length_bytes) = match read_packet_length(buf)? {
         None => return Ok(None),
         Some(parts) => parts,
     };
-
-    // 2. Need all `packet_length` bytes after the length VarInt itself.
-    if buf.len() < length_bytes + packet_length {
+    let complete_len = length_bytes
+        .checked_add(packet_length)
+        .ok_or(FramingError::LengthOverflow)?;
+    if buf.len() < complete_len {
         return Ok(None);
     }
 
-    // We're committed now — consume.
     buf.advance(length_bytes);
     let mut body = buf.split_to(packet_length).freeze();
-
-    // 3. Either uncompressed or maybe-compressed; branch.
-    let frame = match compression {
+    let plan = match compression {
         Compression::Disabled => {
             let id = body.read_varint()?;
-            RawFrame { id, body }
+            FrameDecodePlan::Ready(RawFrame { id, body })
         }
         Compression::Threshold(threshold) | Compression::ThresholdWithLevel { threshold, .. } => {
             let data_length_signed = body.read_varint()?;
@@ -196,10 +226,12 @@ pub fn try_decode_frame(
             }
             let data_length = data_length_signed as usize;
             if data_length == 0 {
-                // Plaintext, just like the uncompressed case but with the
-                // extra data_length field already stripped.
+                let actual = body.len();
+                if actual >= threshold {
+                    return Err(FramingError::UncompressedAboveThreshold { actual, threshold });
+                }
                 let id = body.read_varint()?;
-                RawFrame { id, body }
+                FrameDecodePlan::Ready(RawFrame { id, body })
             } else {
                 if data_length < threshold {
                     return Err(FramingError::CompressedBelowThreshold {
@@ -213,31 +245,60 @@ pub fn try_decode_frame(
                         max: MAX_DECOMPRESSED_BYTES,
                     });
                 }
-                // `body` here is the compressed payload.
-                let decoder = ZlibDecoder::new(body.as_ref());
-                let mut decoder = decoder.take(data_length as u64 + 1);
-                let mut decompressed = Vec::with_capacity(data_length);
-                decoder.read_to_end(&mut decompressed)?;
-                if decompressed.len() != data_length {
-                    return Err(FramingError::DecompressedLengthMismatch {
-                        claimed: data_length,
-                        decompressed_at_least: decompressed.len(),
-                    });
-                }
-                let mut cursor: &[u8] = &decompressed;
-                let id = cursor.read_varint()?;
-                let payload_start = decompressed.len() - cursor.len();
-                let mut owned = BytesMut::with_capacity(cursor.len());
-                owned.put_slice(&decompressed[payload_start..]);
-                RawFrame {
-                    id,
-                    body: owned.freeze(),
-                }
+                FrameDecodePlan::Compressed(CompressedFrame {
+                    claimed_len: data_length,
+                    payload: body,
+                })
             }
         }
     };
+    Ok(Some(plan))
+}
 
-    Ok(Some(frame))
+fn decode_compressed_frame(claimed_len: usize, payload: Bytes) -> Result<RawFrame, FramingError> {
+    let output_len = claimed_len
+        .checked_add(1)
+        .ok_or(FramingError::LengthOverflow)?;
+    let mut decompressed = vec![0_u8; output_len];
+    let mut decoder = Decompress::new(true);
+    let status = decoder.decompress(
+        payload.as_ref(),
+        decompressed.as_mut_slice(),
+        FlushDecompress::Finish,
+    )?;
+    let produced =
+        usize::try_from(decoder.total_out()).map_err(|_| FramingError::LengthOverflow)?;
+    if produced != claimed_len {
+        return Err(FramingError::DecompressedLengthMismatch {
+            claimed: claimed_len,
+            decompressed_at_least: produced,
+        });
+    }
+    if status != Status::StreamEnd {
+        return Err(FramingError::IncompleteCompressedStream);
+    }
+    let consumed = usize::try_from(decoder.total_in()).map_err(|_| FramingError::LengthOverflow)?;
+    if consumed != payload.len() {
+        return Err(FramingError::TrailingCompressedData {
+            trailing: payload.len() - consumed,
+        });
+    }
+
+    decompressed.truncate(claimed_len);
+    let mut body = Bytes::from(decompressed);
+    let id = body.read_varint()?;
+    Ok(RawFrame { id, body })
+}
+
+pub fn try_decode_frame(
+    buf: &mut BytesMut,
+    compression: Compression,
+) -> Result<Option<RawFrame>, FramingError> {
+    match try_decode_frame_plan(buf, compression)? {
+        None => Ok(None),
+        Some(FrameDecodePlan::Ready(frame)) => Ok(Some(frame)),
+        Some(FrameDecodePlan::Compressed(frame)) => frame.decode().map(Some),
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -327,10 +388,20 @@ pub fn encode_frame(id: i32, body: &[u8], compression: Compression) -> Result<By
 
 /// Number of bytes [`encode_frame`] would emit for an uncompressed frame.
 /// Useful for the writer to reserve buffer space without serialising twice.
-#[must_use]
-pub fn encoded_size_uncompressed(id: i32, body_len: usize) -> usize {
-    let inner = varint_encoded_len(id) + body_len;
-    varint_encoded_len(inner as i32) + inner
+pub fn encoded_size_uncompressed(id: i32, body_len: usize) -> Result<usize, FramingError> {
+    let inner = varint_encoded_len(id)
+        .checked_add(body_len)
+        .ok_or(FramingError::LengthOverflow)?;
+    if inner > MAX_PACKET_LENGTH {
+        return Err(FramingError::FrameTooLarge {
+            got: inner,
+            max: MAX_PACKET_LENGTH,
+        });
+    }
+    let inner_i32 = i32::try_from(inner).map_err(|_| FramingError::LengthOverflow)?;
+    varint_encoded_len(inner_i32)
+        .checked_add(inner)
+        .ok_or(FramingError::LengthOverflow)
 }
 
 // ---------------------------------------------------------------------------
@@ -366,6 +437,19 @@ mod tests {
         })
         .take(len)
         .collect()
+    }
+
+    fn compressed_wire(plain: &[u8], claimed: usize, trailing: &[u8]) -> BytesMut {
+        let mut encoder = ZlibEncoder::new(Vec::new(), ZlibLevel::default());
+        encoder.write_all(plain).unwrap();
+        let mut compressed = encoder.finish().unwrap();
+        compressed.extend_from_slice(trailing);
+        let inner_len = varint_encoded_len(claimed as i32) + compressed.len();
+        let mut buf = BytesMut::new();
+        buf.write_varint(inner_len as i32);
+        buf.write_varint(claimed as i32);
+        buf.put_slice(&compressed);
+        buf
     }
 
     #[test]
@@ -418,6 +502,31 @@ mod tests {
         let id = 0x01; // 1 byte varint
         let body: Vec<u8> = vec![0xAB; threshold - 1]; // total = threshold
         round_trip(id, &body, Compression::Threshold(threshold));
+    }
+
+    #[test]
+    fn decoder_rejects_uncompressed_frame_at_threshold() {
+        let threshold = 16;
+        let raw_len = threshold;
+        let inner_len = 1 + raw_len;
+        let mut buf = BytesMut::new();
+        buf.write_varint(inner_len as i32);
+        buf.write_varint(0);
+        buf.write_varint(1);
+        buf.resize(buf.len() + raw_len - 1, 0xAB);
+
+        assert!(matches!(
+            try_decode_frame(&mut buf, Compression::Threshold(threshold)),
+            Err(FramingError::UncompressedAboveThreshold {
+                actual,
+                threshold: actual_threshold,
+            }) if actual == raw_len && actual_threshold == threshold
+        ));
+    }
+
+    #[test]
+    fn decoder_accepts_uncompressed_frame_below_threshold() {
+        round_trip(1, &[0xAB; 14], Compression::Threshold(16));
     }
 
     #[test]
@@ -650,17 +759,7 @@ mod tests {
         let mut plain = Vec::new();
         plain.write_varint(0);
         plain.extend_from_slice(&plain_body);
-
-        let mut compressed = Vec::new();
-        let mut encoder = ZlibEncoder::new(&mut compressed, ZlibLevel::default());
-        encoder.write_all(&plain).unwrap();
-        drop(encoder);
-
-        let inner_len = varint_encoded_len(50_i32) + compressed.len();
-        let mut buf = BytesMut::new();
-        buf.write_varint(inner_len as i32);
-        buf.write_varint(50); // lie: claim 50 bytes, actually 501
-        buf.put_slice(&compressed);
+        let mut buf = compressed_wire(&plain, 50, &[]);
 
         let err = try_decode_frame(&mut buf, Compression::Threshold(16)).unwrap_err();
         assert!(matches!(
@@ -673,14 +772,77 @@ mod tests {
     }
 
     #[test]
+    fn decoder_rejects_trailing_zlib_bytes() {
+        let mut plain = Vec::new();
+        plain.write_varint(0x22);
+        plain.extend_from_slice(b"strict stream");
+        let mut buf = compressed_wire(&plain, plain.len(), &[0xAA, 0xBB]);
+
+        assert!(matches!(
+            try_decode_frame(&mut buf, Compression::Threshold(1)),
+            Err(FramingError::TrailingCompressedData { trailing: 2 })
+        ));
+    }
+
+    #[test]
+    fn decoder_rejects_truncated_zlib_stream() {
+        let mut plain = Vec::new();
+        plain.write_varint(0x22);
+        plain.extend_from_slice(b"strict stream");
+        let mut buf = compressed_wire(&plain, plain.len(), &[]);
+        buf.truncate(buf.len() - 1);
+        // Rebuild the outer length after removing one compressed byte.
+        let (_, length_bytes) = read_packet_length(&buf).unwrap().unwrap();
+        let payload = buf.split_off(length_bytes);
+        let mut truncated = BytesMut::new();
+        truncated.write_varint(payload.len() as i32);
+        truncated.put_slice(&payload);
+
+        assert!(matches!(
+            try_decode_frame(&mut truncated, Compression::Threshold(1)),
+            Err(FramingError::IncompleteCompressedStream)
+                | Err(FramingError::DecompressedLengthMismatch { .. })
+                | Err(FramingError::ZlibDecompress(_))
+        ));
+    }
+
+    #[test]
+    fn decoder_rejects_decompression_bomb_over_declared_cap() {
+        let mut plain = vec![0_u8; EXPECTED_MAX_DECOMPRESSED_BYTES + 1];
+        plain[0] = 0;
+        let mut buf = compressed_wire(&plain, EXPECTED_MAX_DECOMPRESSED_BYTES, &[]);
+
+        assert!(matches!(
+            try_decode_frame(&mut buf, Compression::Threshold(0)),
+            Err(FramingError::DecompressedLengthMismatch {
+                claimed: EXPECTED_MAX_DECOMPRESSED_BYTES,
+                decompressed_at_least,
+            }) if decompressed_at_least == EXPECTED_MAX_DECOMPRESSED_BYTES + 1
+        ));
+    }
+
+    #[test]
     fn encoded_size_helper_matches_actual() {
         for (id, body_len) in [(0, 0), (1, 5), (255, 1024), (-1, 7)] {
             let body = vec![0u8; body_len];
             let actual = encode_frame(id, &body, Compression::Disabled)
                 .unwrap()
                 .len();
-            assert_eq!(actual, encoded_size_uncompressed(id, body_len));
+            assert_eq!(actual, encoded_size_uncompressed(id, body_len).unwrap());
         }
+    }
+
+    #[test]
+    fn encoded_size_helper_rejects_overflow_and_oversized_frames() {
+        assert!(matches!(
+            encoded_size_uncompressed(0, usize::MAX),
+            Err(FramingError::LengthOverflow)
+        ));
+        assert!(matches!(
+            encoded_size_uncompressed(0, MAX_PACKET_LENGTH),
+            Err(FramingError::FrameTooLarge { got, max })
+                if got == MAX_PACKET_LENGTH + 1 && max == MAX_PACKET_LENGTH
+        ));
     }
 
     // ---- Property tests -------------------------------------------------
