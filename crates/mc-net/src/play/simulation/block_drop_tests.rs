@@ -1085,6 +1085,6 @@ async fn block_drop_clear_mismatch_fail_stops_without_old_publication() {
             token,
             vec![test_drop(Vec3::new(0.5, 64.5, 0.5))],
         )),
-        Err(SimulationRequestError::Closed)
+        Err(SimulationRequestError::OwnerStopped)
     ));
 }

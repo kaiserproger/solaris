@@ -67,6 +67,7 @@ use std::sync::Arc;
 #[cfg(test)]
 use std::sync::atomic::AtomicUsize;
 use std::sync::atomic::Ordering;
+use std::time::Duration;
 #[cfg(feature = "load-bench")]
 use std::time::Instant;
 use tokio::sync::mpsc;
@@ -80,6 +81,7 @@ mod block_drop_tests;
 mod player_teleport_tests;
 mod queue;
 mod regional_mutation;
+mod request_wait;
 
 #[allow(unused_imports)]
 pub(crate) use queue::SIMULATION_COMMAND_QUEUE_CAPACITY;
@@ -97,6 +99,8 @@ pub(crate) type SimulationQueueSnapshot = queue::SimulationQueueSnapshot;
 const MAX_SURVIVAL_BREAK_EDITS: usize = 512;
 const MAX_SURVIVAL_BREAK_DROPS: usize = 512;
 const MAX_BLOCK_EDIT_COMMAND_EDITS: usize = 512;
+const SIMULATION_QUEUE_ADMISSION_TIMEOUT: Duration = Duration::from_millis(250);
+const SIMULATION_RESPONSE_TIMEOUT: Duration = Duration::from_secs(5);
 
 #[cfg(test)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -176,8 +180,10 @@ fn elapsed_us(started: std::time::Instant) -> u64 {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum SimulationRequestError {
     Full,
+    QueueAdmissionTimeout,
     Closed,
     OwnerStopped,
+    ResponseTimeout,
     ResponseMismatch,
     ShuttingDown,
     #[cfg(test)]
@@ -1886,11 +1892,14 @@ impl EntityEffectHandle {
 impl From<SimulationRequestError> for EntityEffectRequestError {
     fn from(error: SimulationRequestError) -> Self {
         match error {
-            SimulationRequestError::Full => Self::Busy,
+            SimulationRequestError::Full | SimulationRequestError::QueueAdmissionTimeout => {
+                Self::Busy
+            }
             SimulationRequestError::ShuttingDown => Self::ShuttingDown,
             SimulationRequestError::ResponseMismatch => Self::ResponseMismatch,
             SimulationRequestError::Closed
             | SimulationRequestError::OwnerStopped
+            | SimulationRequestError::ResponseTimeout
             | SimulationRequestError::WorldUnavailable
             | SimulationRequestError::WorldMutationFailed
             | SimulationRequestError::CrossRegion
@@ -7467,8 +7476,8 @@ mod tests {
         assert_eq!(notifications.load(Ordering::SeqCst), 0);
     }
 
-    #[test]
-    fn regional_block_edits_in_distinct_lanes_overlap() {
+    #[tokio::test]
+    async fn regional_block_edits_in_distinct_lanes_overlap() {
         let blocks = Arc::new(BlockRegistry::from_report(&test_block_reports()).unwrap());
         let mut storage = WorldStorage::in_memory(blocks);
         let biome = Identifier::parse("minecraft:plains").unwrap();
@@ -7569,15 +7578,14 @@ mod tests {
                 .all(|attribution| attribution.kind == "apply_block_edits")
         );
         for response in responses {
-            let SimulationResponse::BlockEdits(Ok(outcome)) =
-                response.blocking_recv().unwrap().unwrap()
+            let SimulationResponse::BlockEdits(Ok(outcome)) = response.await.unwrap().unwrap()
             else {
                 panic!("regional light-changing response mismatch");
             };
             let outcome = outcome.expect("regional light-changing commit");
             assert!(outcome.precomputed_light_updates.is_some());
         }
-        let world = world.blocking_lock();
+        let world = world.lock().await;
         for position in positions {
             assert_eq!(world.get_cached_block(position), Some(BlockStateId(0)));
             assert!(
@@ -9153,7 +9161,10 @@ mod tests {
 
         drop(owner);
 
-        assert!(matches!(waiting.await, Err(SimulationRequestError::Closed)));
+        assert!(matches!(
+            waiting.await,
+            Err(SimulationRequestError::OwnerStopped)
+        ));
         assert_eq!(handle.snapshot().depth, 0);
     }
 
@@ -9176,24 +9187,27 @@ mod tests {
 
         owner.shutdown();
 
-        assert!(matches!(waiting.await, Err(SimulationRequestError::Closed)));
+        assert!(matches!(
+            waiting.await,
+            Err(SimulationRequestError::ShuttingDown)
+        ));
         assert_eq!(handle.snapshot().depth, 0);
     }
 
-    #[test]
-    fn owner_drop_rejects_pending_response_and_closes_queue() {
+    #[tokio::test]
+    async fn owner_drop_rejects_pending_response_and_closes_queue() {
         let (handle, owner) = simulation_channel_with_capacity(1);
         let response = handle.enqueue(claim_xp(1, 10)).expect("command fits");
 
         drop(owner);
 
         assert!(matches!(
-            response.blocking_recv().expect("owner drop response"),
+            response.await.expect("owner drop response"),
             Err(SimulationRequestError::OwnerStopped)
         ));
         assert!(matches!(
             handle.enqueue(claim_xp(2, 11)),
-            Err(SimulationRequestError::Closed)
+            Err(SimulationRequestError::OwnerStopped)
         ));
         assert_eq!(handle.snapshot().depth, 0);
     }
@@ -9274,20 +9288,21 @@ mod tests {
         assert_eq!(batch[0].sequence, 1);
     }
 
-    #[test]
-    fn zero_budget_leaves_queued_command_unprocessed() {
+    #[tokio::test]
+    async fn zero_budget_leaves_queued_command_unprocessed() {
         let registry = SessionRegistry::new();
         let (handle, mut owner) = simulation_channel_with_capacity(1);
-        let mut response = handle.enqueue(claim_xp(1, 10)).expect("command fits");
+        let response = handle.enqueue(claim_xp(1, 10)).expect("command fits");
 
         let report = owner.process_tick(&registry, 0);
 
         assert_eq!(report.processed, 0);
         assert_eq!(report.remaining_depth, 1);
-        assert!(matches!(
-            response.try_recv(),
-            Err(oneshot::error::TryRecvError::Empty)
-        ));
+        assert!(
+            tokio::time::timeout(Duration::from_millis(1), response)
+                .await
+                .is_err()
+        );
         assert_eq!(handle.snapshot().max_batch, 0);
     }
 
@@ -9434,8 +9449,8 @@ mod tests {
         ));
     }
 
-    #[test]
-    fn item_pickup_owner_wait_releases_session_and_player_locks() {
+    #[tokio::test]
+    async fn item_pickup_owner_wait_releases_session_and_player_locks() {
         let (entered_tx, entered_rx) = std::sync::mpsc::channel();
         let (release_tx, release_rx) = std::sync::mpsc::channel();
         let registry = Arc::new(SessionRegistry::new());
@@ -9486,8 +9501,7 @@ mod tests {
         release_tx.send(()).expect("release regional item pickup");
         assert_eq!(owner_thread.join().expect("owner worker").processed, 1);
         assert!(progress.join().expect("session progress worker").is_empty());
-        let SimulationResponse::ItemPickupCredit(Some(outcome)) =
-            response.blocking_recv().unwrap().unwrap()
+        let SimulationResponse::ItemPickupCredit(Some(outcome)) = response.await.unwrap().unwrap()
         else {
             panic!("pickup credit response kind changed");
         };
@@ -9498,8 +9512,8 @@ mod tests {
         );
     }
 
-    #[test]
-    fn item_pickup_claim_and_finalize_are_checkpoint_only() {
+    #[tokio::test]
+    async fn item_pickup_claim_and_finalize_are_checkpoint_only() {
         let commits = Arc::new(AtomicUsize::new(0));
         let registry = SessionRegistry::new_with_entity_owner_journal(
             1,
@@ -9533,8 +9547,7 @@ mod tests {
             .expect("pickup command fits");
 
         assert_eq!(owner.process_tick(&registry, 1).processed, 1);
-        let SimulationResponse::ItemPickupCredit(Some(outcome)) =
-            response.blocking_recv().unwrap().unwrap()
+        let SimulationResponse::ItemPickupCredit(Some(outcome)) = response.await.unwrap().unwrap()
         else {
             panic!("pickup credit response kind changed");
         };
@@ -9567,8 +9580,8 @@ mod tests {
         assert_eq!(commits.load(Ordering::Relaxed), durable_before);
     }
 
-    #[test]
-    fn stale_player_rollback_preserves_motion_after_item_claim() {
+    #[tokio::test]
+    async fn stale_player_rollback_preserves_motion_after_item_claim() {
         let (claimed_tx, claimed_rx) = std::sync::mpsc::channel();
         let (resume_tx, resume_rx) = std::sync::mpsc::channel();
         let registry = Arc::new(SessionRegistry::new());
@@ -9608,7 +9621,7 @@ mod tests {
 
         assert_eq!(owner_thread.join().expect("owner worker").processed, 1);
         assert!(matches!(
-            response.blocking_recv().unwrap().unwrap(),
+            response.await.unwrap().unwrap(),
             SimulationResponse::ItemPickupCredit(None)
         ));
         let remaining = registry.nearby_item_entities(moved_position, 0.25);
@@ -9619,8 +9632,8 @@ mod tests {
         assert!(outbound.try_recv().is_err());
     }
 
-    #[test]
-    fn stale_player_inventory_after_pickup_plan_restores_entity_without_publication() {
+    #[tokio::test]
+    async fn stale_player_inventory_after_pickup_plan_restores_entity_without_publication() {
         let registry = Arc::new(SessionRegistry::new());
         let (session, mut outbound) =
             register_test_session_with_outbound(&registry, "StalePickupPlayerInventory");
@@ -9657,7 +9670,7 @@ mod tests {
         resume_tx.send(()).expect("release pickup owner claim");
         assert_eq!(owner_thread.join().expect("owner worker").processed, 1);
         assert!(matches!(
-            response.blocking_recv().unwrap().unwrap(),
+            response.await.unwrap().unwrap(),
             SimulationResponse::ItemPickupCredit(None)
         ));
 
@@ -9675,8 +9688,8 @@ mod tests {
         assert!(outbound.try_recv().is_err());
     }
 
-    #[test]
-    fn item_pickup_credit_is_conservative_under_partial_capacity() {
+    #[tokio::test]
+    async fn item_pickup_credit_is_conservative_under_partial_capacity() {
         let registry = SessionRegistry::new();
         let (session, mut outbound) =
             register_test_session_with_outbound(&registry, "PickupCreditBob");
@@ -9702,8 +9715,7 @@ mod tests {
             .expect("pickup command fits");
 
         assert_eq!(owner.process_tick(&registry, 1).processed, 1);
-        let SimulationResponse::ItemPickupCredit(Some(outcome)) =
-            response.blocking_recv().unwrap().unwrap()
+        let SimulationResponse::ItemPickupCredit(Some(outcome)) = response.await.unwrap().unwrap()
         else {
             panic!("pickup credit response kind changed");
         };
@@ -9732,8 +9744,8 @@ mod tests {
         assert!(outbound.try_recv().is_err());
     }
 
-    #[test]
-    fn full_inventory_rejects_pickup_without_removing_entity() {
+    #[tokio::test]
+    async fn full_inventory_rejects_pickup_without_removing_entity() {
         let registry = SessionRegistry::new();
         let session = register_test_session(&registry, "PickupCreditCarol");
         let mut inventory = PlayerInventory::empty();
@@ -9756,9 +9768,7 @@ mod tests {
             .expect("pickup command fits");
 
         assert_eq!(owner.process_tick(&registry, 1).processed, 1);
-        let SimulationResponse::ItemPickupCredit(outcome) =
-            response.blocking_recv().unwrap().unwrap()
-        else {
+        let SimulationResponse::ItemPickupCredit(outcome) = response.await.unwrap().unwrap() else {
             panic!("pickup credit response kind changed");
         };
 
@@ -9771,8 +9781,8 @@ mod tests {
         assert_eq!(remaining[0].item_stack.as_ref().unwrap().count, 3);
     }
 
-    #[test]
-    fn invalid_hotbar_rejects_pickup_without_inventory_or_entity_publication() {
+    #[tokio::test]
+    async fn invalid_hotbar_rejects_pickup_without_inventory_or_entity_publication() {
         let registry = SessionRegistry::new();
         let (session, mut outbound) =
             register_test_session_with_outbound(&registry, "InvalidHotbarPickup");
@@ -9796,7 +9806,7 @@ mod tests {
 
         assert_eq!(owner.process_tick(&registry, 1).processed, 1);
         assert!(matches!(
-            response.blocking_recv().unwrap().unwrap(),
+            response.await.unwrap().unwrap(),
             SimulationResponse::ItemPickupCredit(None)
         ));
 
@@ -9811,8 +9821,8 @@ mod tests {
         assert!(outbound.try_recv().is_err());
     }
 
-    #[test]
-    fn stale_item_stack_after_pickup_plan_preserves_inventory_entity_and_publication() {
+    #[tokio::test]
+    async fn stale_item_stack_after_pickup_plan_preserves_inventory_entity_and_publication() {
         let registry = Arc::new(SessionRegistry::new());
         let (session, mut outbound) =
             register_test_session_with_outbound(&registry, "StalePickupItemStack");
@@ -9857,7 +9867,7 @@ mod tests {
         resume_tx.send(()).expect("release pickup CAS");
         assert_eq!(owner_thread.join().unwrap().processed, 1);
         assert!(matches!(
-            response.blocking_recv().unwrap().unwrap(),
+            response.await.unwrap().unwrap(),
             SimulationResponse::ItemPickupCredit(None)
         ));
 
@@ -9872,7 +9882,7 @@ mod tests {
         assert!(outbound.try_recv().is_err());
     }
 
-    fn assert_player_state_cannot_pick_up(
+    async fn assert_player_state_cannot_pick_up(
         player_name: &str,
         game_mode: GameMode,
         survival: SurvivalState,
@@ -9918,15 +9928,15 @@ mod tests {
 
         assert_eq!(owner.process_tick(&registry, 3).processed, 3);
         assert!(matches!(
-            item_response.blocking_recv().unwrap().unwrap(),
+            item_response.await.unwrap().unwrap(),
             SimulationResponse::ItemPickupCredit(None)
         ));
         assert!(matches!(
-            experience_response.blocking_recv().unwrap().unwrap(),
+            experience_response.await.unwrap().unwrap(),
             SimulationResponse::ExperiencePickupCredit(None)
         ));
         assert!(matches!(
-            arrow_response.blocking_recv().unwrap().unwrap(),
+            arrow_response.await.unwrap().unwrap(),
             SimulationResponse::ArrowPickupCredit(None)
         ));
 
@@ -9949,17 +9959,18 @@ mod tests {
         assert!(registry.server_entity_snapshot(arrow).is_some());
     }
 
-    #[test]
-    fn spectator_cannot_receive_item_arrow_or_experience_pickup_credit() {
+    #[tokio::test]
+    async fn spectator_cannot_receive_item_arrow_or_experience_pickup_credit() {
         assert_player_state_cannot_pick_up(
             "SpectatorPickup",
             GameMode::Spectator,
             SurvivalState::FULL,
-        );
+        )
+        .await;
     }
 
-    #[test]
-    fn dead_player_cannot_receive_item_arrow_or_experience_pickup_credit() {
+    #[tokio::test]
+    async fn dead_player_cannot_receive_item_arrow_or_experience_pickup_credit() {
         assert_player_state_cannot_pick_up(
             "DeadPickup",
             GameMode::Survival,
@@ -9967,7 +9978,8 @@ mod tests {
                 health: 0.0,
                 ..SurvivalState::FULL
             },
-        );
+        )
+        .await;
     }
 
     #[test]
@@ -10019,8 +10031,8 @@ mod tests {
         ));
     }
 
-    #[test]
-    fn concurrent_experience_credit_has_one_exact_winner() {
+    #[tokio::test]
+    async fn concurrent_experience_credit_has_one_exact_winner() {
         let registry = SessionRegistry::new();
         let alice = register_test_session(&registry, "XpCreditBob");
         let bob = register_test_session(&registry, "XpCreditCarol");
@@ -10044,14 +10056,15 @@ mod tests {
             .unwrap();
 
         assert_eq!(owner.process_tick(&registry, 2).processed, 2);
-        let outcomes = [alice_response, bob_response].map(|response| {
+        let mut outcomes = Vec::with_capacity(2);
+        for response in [alice_response, bob_response] {
             let SimulationResponse::ExperiencePickupCredit(outcome) =
-                response.blocking_recv().unwrap().unwrap()
+                response.await.unwrap().unwrap()
             else {
                 panic!("experience credit response kind changed");
             };
-            outcome
-        });
+            outcomes.push(outcome);
+        }
 
         assert_eq!(
             outcomes.iter().filter(|outcome| outcome.is_some()).count(),
@@ -10068,8 +10081,8 @@ mod tests {
         );
     }
 
-    #[test]
-    fn stale_session_experience_credit_cannot_remove_orb_or_change_xp() {
+    #[tokio::test]
+    async fn stale_session_experience_credit_cannot_remove_orb_or_change_xp() {
         let registry = SessionRegistry::new();
         let session = register_test_session(&registry, "XpCreditStale");
         let player_state = register_test_player_state(&registry, session, PlayerInventory::empty());
@@ -10086,7 +10099,7 @@ mod tests {
 
         assert_eq!(owner.process_tick(&registry, 1).processed, 0);
         assert!(matches!(
-            response.blocking_recv().unwrap(),
+            response.await.unwrap(),
             Err(SimulationRequestError::StaleSession)
         ));
         assert_eq!(player_state.lock().unwrap().xp.total, 0);
@@ -10147,8 +10160,8 @@ mod tests {
         ));
     }
 
-    #[test]
-    fn full_inventory_rejects_arrow_pickup_without_removal() {
+    #[tokio::test]
+    async fn full_inventory_rejects_arrow_pickup_without_removal() {
         let registry = SessionRegistry::new();
         let arrow = seed_grounded_arrow(&registry);
         let session = register_test_session(&registry, "ArrowCreditFull");
@@ -10169,8 +10182,7 @@ mod tests {
             .unwrap();
 
         assert_eq!(owner.process_tick(&registry, 1).processed, 1);
-        let SimulationResponse::ArrowPickupCredit(outcome) =
-            response.blocking_recv().unwrap().unwrap()
+        let SimulationResponse::ArrowPickupCredit(outcome) = response.await.unwrap().unwrap()
         else {
             panic!("arrow credit response kind changed");
         };
@@ -10183,8 +10195,8 @@ mod tests {
         assert!(registry.server_entity_snapshot(arrow).is_some());
     }
 
-    #[test]
-    fn concurrent_arrow_credit_has_one_exact_winner() {
+    #[tokio::test]
+    async fn concurrent_arrow_credit_has_one_exact_winner() {
         let registry = SessionRegistry::new();
         let arrow = seed_grounded_arrow(&registry);
         let alice = register_test_session(&registry, "ArrowCreditBob");
@@ -10212,14 +10224,14 @@ mod tests {
             .unwrap();
 
         assert_eq!(owner.process_tick(&registry, 2).processed, 2);
-        let outcomes = [alice_response, bob_response].map(|response| {
-            let SimulationResponse::ArrowPickupCredit(outcome) =
-                response.blocking_recv().unwrap().unwrap()
+        let mut outcomes = Vec::with_capacity(2);
+        for response in [alice_response, bob_response] {
+            let SimulationResponse::ArrowPickupCredit(outcome) = response.await.unwrap().unwrap()
             else {
                 panic!("arrow credit response kind changed");
             };
-            outcome
-        });
+            outcomes.push(outcome);
+        }
 
         assert_eq!(
             outcomes.iter().filter(|outcome| outcome.is_some()).count(),
@@ -10236,8 +10248,8 @@ mod tests {
         assert!(registry.server_entity_snapshot(arrow).is_none());
     }
 
-    #[test]
-    fn stale_session_arrow_credit_cannot_remove_or_credit() {
+    #[tokio::test]
+    async fn stale_session_arrow_credit_cannot_remove_or_credit() {
         let registry = SessionRegistry::new();
         let arrow = seed_grounded_arrow(&registry);
         let session = register_test_session(&registry, "ArrowCreditStale");
@@ -10256,7 +10268,7 @@ mod tests {
 
         assert_eq!(owner.process_tick(&registry, 1).processed, 0);
         assert!(matches!(
-            response.blocking_recv().unwrap(),
+            response.await.unwrap(),
             Err(SimulationRequestError::StaleSession)
         ));
         assert!(
@@ -10306,8 +10318,8 @@ mod tests {
         assert_eq!(handle.snapshot().rejected_stale_session, 1);
     }
 
-    #[test]
-    fn queued_duplicate_lethal_attack_does_not_duplicate_rewards() {
+    #[tokio::test]
+    async fn queued_duplicate_lethal_attack_does_not_duplicate_rewards() {
         let registry = SessionRegistry::new();
         let target = seed_attack_target(&registry);
         let rewards = EntityKillRewards {
@@ -10333,7 +10345,7 @@ mod tests {
             .unwrap();
 
         assert_eq!(owner.process_tick(&registry, 2).processed, 2);
-        let killed = match lethal_response.blocking_recv().unwrap().unwrap() {
+        let killed = match lethal_response.await.unwrap().unwrap() {
             SimulationResponse::EntityAttack(Some(outcome)) => match *outcome {
                 EntityAttackOutcome::Killed {
                     damage,
@@ -10346,7 +10358,7 @@ mod tests {
             other => panic!("expected lethal entity attack response, got {other:?}"),
         };
         assert!(matches!(
-            duplicate_response.blocking_recv().unwrap().unwrap(),
+            duplicate_response.await.unwrap().unwrap(),
             SimulationResponse::EntityAttack(None)
         ));
 
@@ -10425,8 +10437,8 @@ mod tests {
         );
     }
 
-    #[test]
-    fn single_lane_region_routes_preserve_sequence_and_spawn_outcome() {
+    #[tokio::test]
+    async fn single_lane_region_routes_preserve_sequence_and_spawn_outcome() {
         let positions = [Vec3::new(-0.5, 64.0, 0.5), Vec3::new(128.5, 64.0, 0.5)];
         let routed = SessionRegistry::new();
         let (handle, mut owner) = simulation_channel_with_capacity(2);
@@ -10453,14 +10465,15 @@ mod tests {
                 .all(|route| route.lease.epoch == mc_entity::RegionEpoch::INITIAL)
         );
 
-        let routed_dispatch_counts =
-            responses.map(
-                |response| match response.blocking_recv().unwrap().unwrap() {
-                    SimulationResponse::EntitySpawn(dispatches) => dispatches.len(),
-                    other => panic!("expected regional entity spawn response, got {other:?}"),
-                },
-            );
-        assert_eq!(routed_dispatch_counts, [0, 0]);
+        let mut routed_dispatch_counts = Vec::with_capacity(responses.len());
+        for response in responses {
+            let count = match response.await.unwrap().unwrap() {
+                SimulationResponse::EntitySpawn(dispatches) => dispatches.len(),
+                other => panic!("expected regional entity spawn response, got {other:?}"),
+            };
+            routed_dispatch_counts.push(count);
+        }
+        assert_eq!(routed_dispatch_counts, vec![0, 0]);
 
         let snapshots = routed.persisted_entity_records();
         assert_eq!(snapshots.len(), 2);
@@ -10554,8 +10567,8 @@ mod tests {
         assert_eq!(command_single_owner_region(&cross_region_edit), None);
     }
 
-    #[test]
-    fn active_region_phase_rejects_routed_command_without_mutation() {
+    #[tokio::test]
+    async fn active_region_phase_rejects_routed_command_without_mutation() {
         let registry = SessionRegistry::new();
         let position = Vec3::new(0.5, 64.0, 0.5);
         let (handle, mut owner) = simulation_channel_with_capacity(1);
@@ -10573,7 +10586,7 @@ mod tests {
 
         assert_eq!(owner.process_tick(&registry, 1).processed, 1);
         assert!(matches!(
-            response.blocking_recv().expect("owner response"),
+            response.await.expect("owner response"),
             Err(SimulationRequestError::InvalidCommand)
         ));
         assert!(registry.nearby_hostile_entities(position, 2.25).is_empty());
@@ -10643,8 +10656,8 @@ mod tests {
         assert!(registry.nearby_item_entities(position, 2.25).is_empty());
     }
 
-    #[test]
-    fn queued_chunk_herd_spawn_deduplicates_chunk() {
+    #[tokio::test]
+    async fn queued_chunk_herd_spawn_deduplicates_chunk() {
         let chunk = (1, 1);
         let position = Vec3::new(24.5, 64.0, 24.5);
         let spawns = vec![super::super::HerdSpawn {
@@ -10669,11 +10682,11 @@ mod tests {
             .unwrap();
 
         assert_eq!(owner.process_tick(&queued, 2).processed, 2);
-        let first_dispatches = match first.blocking_recv().unwrap().unwrap() {
+        let first_dispatches = match first.await.unwrap().unwrap() {
             SimulationResponse::EntitySpawn(dispatches) => dispatches,
             other => panic!("expected herd spawn response, got {other:?}"),
         };
-        let duplicate_dispatches = match duplicate.blocking_recv().unwrap().unwrap() {
+        let duplicate_dispatches = match duplicate.await.unwrap().unwrap() {
             SimulationResponse::EntitySpawn(dispatches) => dispatches,
             other => panic!("expected herd dedupe response, got {other:?}"),
         };
@@ -10945,8 +10958,8 @@ mod tests {
         assert_eq!(entity_types().len(), 2);
     }
 
-    #[test]
-    fn queued_time_set_cannot_overtake_herd_admission() {
+    #[tokio::test]
+    async fn queued_time_set_cannot_overtake_herd_admission() {
         let chunk = (5, 5);
         let registry = Arc::new(SessionRegistry::new());
         let observer = register_test_session(&registry, "OrderedNightObserver");
@@ -10990,7 +11003,7 @@ mod tests {
 
         assert_eq!(owner_thread.join().expect("simulation owner"), (1, 1));
         assert!(matches!(
-            time_response.blocking_recv().expect("time set response"),
+            time_response.await.expect("time set response"),
             Ok(SimulationResponse::WorldTimeSet)
         ));
         let records = registry.persisted_entity_records();
@@ -10999,8 +11012,8 @@ mod tests {
         assert_eq!(registry.world_time(), super::super::NIGHT_START_TICK);
     }
 
-    #[test]
-    fn stale_session_time_set_is_rejected_without_changing_time() {
+    #[tokio::test]
+    async fn stale_session_time_set_is_rejected_without_changing_time() {
         let registry = SessionRegistry::new();
         let session = register_test_session(&registry, "StaleTimeSetter");
         let (handle, mut owner) = simulation_channel_with_capacity(1);
@@ -11015,7 +11028,7 @@ mod tests {
         owner.process_tick(&registry, 1);
 
         assert!(matches!(
-            response.blocking_recv().expect("time set response"),
+            response.await.expect("time set response"),
             Err(SimulationRequestError::StaleSession)
         ));
         assert_eq!(registry.world_time(), 0);
@@ -11411,8 +11424,8 @@ mod tests {
         assert_eq!(persisted_item_drop_count(&registry), 1);
     }
 
-    #[test]
-    fn survival_block_breaks_in_distinct_regions_overlap() {
+    #[tokio::test]
+    async fn survival_block_breaks_in_distinct_regions_overlap() {
         let blocks = Arc::new(BlockRegistry::from_report(&test_block_reports()).unwrap());
         let mut storage = WorldStorage::in_memory(blocks);
         let biome = Identifier::parse("minecraft:plains").unwrap();
@@ -11509,7 +11522,7 @@ mod tests {
         assert_eq!(worker.join().unwrap().processed, 2);
         for response in responses {
             let SimulationResponse::SurvivalBreak(Ok(Some(committed))) =
-                response.blocking_recv().unwrap().unwrap()
+                response.await.unwrap().unwrap()
             else {
                 panic!("regional survival break response mismatch");
             };
@@ -11517,7 +11530,7 @@ mod tests {
         }
         for (position, player_state) in positions.into_iter().zip(player_states) {
             assert_eq!(
-                world.blocking_lock().get_cached_block(position),
+                world.lock().await.get_cached_block(position),
                 Some(BlockStateId(0))
             );
             assert_eq!(
@@ -11634,8 +11647,8 @@ mod tests {
         );
     }
 
-    #[test]
-    fn survival_tool_edit_rejects_stale_extra_guard_without_tool_damage() {
+    #[tokio::test]
+    async fn survival_tool_edit_rejects_stale_extra_guard_without_tool_damage() {
         let (storage, pos, token) = test_block_storage();
         let above = BlockPos {
             y: pos.y + 1,
@@ -11660,7 +11673,8 @@ mod tests {
         plan.falling_block_entity_type_id = None;
         plan.drops.clear();
         world
-            .blocking_lock()
+            .lock()
+            .await
             .set_block_at(above, BlockStateId(2))
             .expect("replace block above after planning");
         let (handle, mut owner) = simulation_channel_with_capacity(1);
@@ -11676,11 +11690,11 @@ mod tests {
 
         owner.process_tick_with_world(&registry, Some(&world), None, 1);
         assert!(matches!(
-            response.blocking_recv().unwrap().unwrap(),
+            response.await.unwrap().unwrap(),
             SimulationResponse::SurvivalBreak(Ok(None))
         ));
         assert_eq!(
-            world.blocking_lock().get_cached_block(pos),
+            world.lock().await.get_cached_block(pos),
             Some(BlockStateId(1))
         );
         assert_eq!(
@@ -11882,8 +11896,8 @@ mod tests {
         );
     }
 
-    #[test]
-    fn survival_placements_in_distinct_regions_overlap() {
+    #[tokio::test]
+    async fn survival_placements_in_distinct_regions_overlap() {
         let blocks = Arc::new(BlockRegistry::from_report(&test_block_reports()).unwrap());
         let mut storage = WorldStorage::in_memory(blocks);
         let biome = Identifier::parse("minecraft:plains").unwrap();
@@ -11989,7 +12003,7 @@ mod tests {
         assert_eq!(worker.join().unwrap().processed, 2);
         for response in responses {
             let SimulationResponse::SurvivalPlacement(Ok(Some(committed))) =
-                response.blocking_recv().unwrap().unwrap()
+                response.await.unwrap().unwrap()
             else {
                 panic!("regional survival placement response mismatch");
             };
@@ -11997,7 +12011,7 @@ mod tests {
         }
         for (target, player_state) in targets.into_iter().zip(player_states) {
             assert_eq!(
-                world.blocking_lock().get_cached_block(target),
+                world.lock().await.get_cached_block(target),
                 Some(BlockStateId(1))
             );
             assert_eq!(
@@ -12520,8 +12534,8 @@ mod tests {
         );
     }
 
-    #[test]
-    fn food_use_transaction_rejects_stale_stack_and_survival_state() {
+    #[tokio::test]
+    async fn food_use_transaction_rejects_stale_stack_and_survival_state() {
         for stale_survival in [false, true] {
             let registry = SessionRegistry::new();
             let session = register_test_session(&registry, "StaleFoodPlayer");
@@ -12559,7 +12573,7 @@ mod tests {
 
             assert_eq!(owner.process_tick(&registry, 1).processed, 1);
             assert!(matches!(
-                response.blocking_recv().unwrap().unwrap(),
+                response.await.unwrap().unwrap(),
                 SimulationResponse::FoodUse(Ok(None))
             ));
             let state = player_state.lock().unwrap();
@@ -12606,8 +12620,8 @@ mod tests {
         );
     }
 
-    #[test]
-    fn food_use_transaction_rejects_stale_session_before_mutation() {
+    #[tokio::test]
+    async fn food_use_transaction_rejects_stale_session_before_mutation() {
         let registry = SessionRegistry::new();
         let session = register_test_session(&registry, "StaleFoodSession");
         let mut inventory = PlayerInventory::empty();
@@ -12637,7 +12651,7 @@ mod tests {
 
         assert_eq!(owner.process_tick(&registry, 1).processed, 0);
         assert!(matches!(
-            response.blocking_recv().unwrap(),
+            response.await.unwrap(),
             Err(SimulationRequestError::StaleSession)
         ));
         let state = player_state.lock().unwrap();
@@ -12715,8 +12729,8 @@ mod tests {
         assert_eq!(arrow_entity_count(&registry), 1);
     }
 
-    #[test]
-    fn bow_release_transaction_rejects_stale_bow_or_arrow_without_projectile() {
+    #[tokio::test]
+    async fn bow_release_transaction_rejects_stale_bow_or_arrow_without_projectile() {
         for stale_bow in [false, true] {
             let registry = SessionRegistry::new();
             let (session, _outbound) = register_test_session_with_outbound(&registry, "StaleBow");
@@ -12747,15 +12761,15 @@ mod tests {
 
             assert_eq!(owner.process_tick(&registry, 1).processed, 1);
             assert!(matches!(
-                response.blocking_recv().unwrap().unwrap(),
+                response.await.unwrap().unwrap(),
                 SimulationResponse::BowRelease(Ok(None))
             ));
             assert_eq!(arrow_entity_count(&registry), 0);
         }
     }
 
-    #[test]
-    fn duplicate_bow_release_commits_exactly_one_projectile() {
+    #[tokio::test]
+    async fn duplicate_bow_release_commits_exactly_one_projectile() {
         let registry = SessionRegistry::new();
         let (session, _outbound) = register_test_session_with_outbound(&registry, "DoubleBow");
         let bow = ItemStack::new(42, 1);
@@ -12782,16 +12796,15 @@ mod tests {
         }
 
         assert_eq!(owner.process_tick(&registry, 2).processed, 2);
-        let committed = responses
-            .into_iter()
-            .map(|response| {
-                matches!(
-                    response.blocking_recv().unwrap().unwrap(),
-                    SimulationResponse::BowRelease(Ok(Some(_)))
-                )
-            })
-            .filter(|committed| *committed)
-            .count();
+        let mut committed = 0;
+        for response in responses {
+            if matches!(
+                response.await.unwrap().unwrap(),
+                SimulationResponse::BowRelease(Ok(Some(_)))
+            ) {
+                committed += 1;
+            }
+        }
 
         assert_eq!(committed, 1);
         assert_eq!(arrow_entity_count(&registry), 1);
@@ -12835,8 +12848,8 @@ mod tests {
         assert_eq!(arrow_entity_count(&registry), 1);
     }
 
-    #[test]
-    fn bow_release_transaction_rejects_stale_session_before_mutation() {
+    #[tokio::test]
+    async fn bow_release_transaction_rejects_stale_session_before_mutation() {
         let registry = SessionRegistry::new();
         let (session, _outbound) = register_test_session_with_outbound(&registry, "GoneBow");
         let bow = ItemStack::new(42, 1);
@@ -12858,7 +12871,7 @@ mod tests {
 
         assert_eq!(owner.process_tick(&registry, 1).processed, 0);
         assert!(matches!(
-            response.blocking_recv().unwrap(),
+            response.await.unwrap(),
             Err(SimulationRequestError::StaleSession)
         ));
         assert_eq!(arrow_entity_count(&registry), 0);
@@ -12900,8 +12913,8 @@ mod tests {
             .collect()
     }
 
-    #[test]
-    fn lethal_player_survival_transition_commits_state_and_drops_once() {
+    #[tokio::test]
+    async fn lethal_player_survival_transition_commits_state_and_drops_once() {
         let registry = SessionRegistry::new();
         let (session, mut outbound) =
             register_test_session_with_outbound(&registry, "AtomicPlayerDeath");
@@ -12965,19 +12978,17 @@ mod tests {
             .collect::<Vec<_>>();
 
         assert_eq!(owner.process_tick(&registry, 2).processed, 2);
-        let committed = responses
-            .into_iter()
-            .filter_map(
-                |response| match response.blocking_recv().unwrap().unwrap() {
-                    SimulationResponse::PlayerSurvival(Ok(Some(outcome))) => match *outcome {
-                        PlayerSurvivalCommitOutcome::Committed(committed) => Some(committed),
-                        PlayerSurvivalCommitOutcome::Rejected(_) => None,
-                    },
-                    SimulationResponse::PlayerSurvival(Ok(None)) => None,
-                    other => panic!("expected player survival response, got {other:?}"),
+        let mut committed = Vec::new();
+        for response in responses {
+            match response.await.unwrap().unwrap() {
+                SimulationResponse::PlayerSurvival(Ok(Some(outcome))) => match *outcome {
+                    PlayerSurvivalCommitOutcome::Committed(outcome) => committed.push(outcome),
+                    PlayerSurvivalCommitOutcome::Rejected(_) => {}
                 },
-            )
-            .collect::<Vec<_>>();
+                SimulationResponse::PlayerSurvival(Ok(None)) => {}
+                other => panic!("expected player survival response, got {other:?}"),
+            }
+        }
         assert_eq!(
             committed.len(),
             1,
@@ -13087,8 +13098,8 @@ mod tests {
         );
     }
 
-    #[test]
-    fn selected_item_drop_all_commits_empty_slot_and_complete_stack() {
+    #[tokio::test]
+    async fn selected_item_drop_all_commits_empty_slot_and_complete_stack() {
         let registry = SessionRegistry::new();
         let (session, _outbound) =
             register_test_session_with_outbound(&registry, "AtomicSelectedDropAll");
@@ -13109,7 +13120,7 @@ mod tests {
 
         assert_eq!(owner.process_tick(&registry, 1).processed, 1);
         assert!(matches!(
-            response.blocking_recv().unwrap().unwrap(),
+            response.await.unwrap().unwrap(),
             SimulationResponse::SelectedItemDrop(Ok(Some(_)))
         ));
         assert!(
@@ -13128,8 +13139,8 @@ mod tests {
         );
     }
 
-    #[test]
-    fn selected_item_drop_rejects_stale_slot_or_stack_without_entity() {
+    #[tokio::test]
+    async fn selected_item_drop_rejects_stale_slot_or_stack_without_entity() {
         for stale_selection in [false, true] {
             let registry = SessionRegistry::new();
             let (session, _outbound) =
@@ -13159,15 +13170,15 @@ mod tests {
 
             assert_eq!(owner.process_tick(&registry, 1).processed, 1);
             assert!(matches!(
-                response.blocking_recv().unwrap().unwrap(),
+                response.await.unwrap().unwrap(),
                 SimulationResponse::SelectedItemDrop(Ok(None))
             ));
             assert!(persisted_item_drop_stacks(&registry).is_empty());
         }
     }
 
-    #[test]
-    fn duplicate_selected_item_drop_commits_exactly_one_entity() {
+    #[tokio::test]
+    async fn duplicate_selected_item_drop_commits_exactly_one_entity() {
         let registry = SessionRegistry::new();
         let (session, _outbound) =
             register_test_session_with_outbound(&registry, "DuplicateSelectedDrop");
@@ -13193,16 +13204,15 @@ mod tests {
             .collect::<Vec<_>>();
 
         assert_eq!(owner.process_tick(&registry, 2).processed, 2);
-        let committed = responses
-            .into_iter()
-            .map(|response| {
-                matches!(
-                    response.blocking_recv().unwrap().unwrap(),
-                    SimulationResponse::SelectedItemDrop(Ok(Some(_)))
-                )
-            })
-            .filter(|committed| *committed)
-            .count();
+        let mut committed = 0;
+        for response in responses {
+            if matches!(
+                response.await.unwrap().unwrap(),
+                SimulationResponse::SelectedItemDrop(Ok(Some(_)))
+            ) {
+                committed += 1;
+            }
+        }
 
         assert_eq!(committed, 1);
         assert_eq!(persisted_item_drop_stacks(&registry).len(), 1);
@@ -13244,8 +13254,8 @@ mod tests {
         );
     }
 
-    #[test]
-    fn selected_item_drop_rejects_stale_session_before_mutation() {
+    #[tokio::test]
+    async fn selected_item_drop_rejects_stale_session_before_mutation() {
         let registry = SessionRegistry::new();
         let (session, _outbound) =
             register_test_session_with_outbound(&registry, "StaleSelectedDropSession");
@@ -13269,7 +13279,7 @@ mod tests {
 
         assert_eq!(owner.process_tick(&registry, 1).processed, 0);
         assert!(matches!(
-            response.blocking_recv().unwrap(),
+            response.await.unwrap(),
             Err(SimulationRequestError::StaleSession)
         ));
         assert!(persisted_item_drop_stacks(&registry).is_empty());
@@ -13279,8 +13289,8 @@ mod tests {
         );
     }
 
-    #[test]
-    fn survival_placement_transaction_debits_the_offhand_slot() {
+    #[tokio::test]
+    async fn survival_placement_transaction_debits_the_offhand_slot() {
         let (storage, support, support_token) = test_block_storage();
         let target = BlockPos {
             x: support.x + 1,
@@ -13314,11 +13324,11 @@ mod tests {
             1
         );
         assert!(matches!(
-            response.blocking_recv().unwrap().unwrap(),
+            response.await.unwrap().unwrap(),
             SimulationResponse::SurvivalPlacement(Ok(Some(_)))
         ));
         assert_eq!(
-            world.blocking_lock().get_cached_block(target),
+            world.lock().await.get_cached_block(target),
             Some(BlockStateId(1))
         );
         assert_eq!(
@@ -13327,8 +13337,8 @@ mod tests {
         );
     }
 
-    #[test]
-    fn survival_placement_transaction_rejects_stale_support_without_inventory_debit() {
+    #[tokio::test]
+    async fn survival_placement_transaction_rejects_stale_support_without_inventory_debit() {
         let (mut storage, support, support_token) = test_block_storage();
         let target = BlockPos {
             x: support.x + 1,
@@ -13369,11 +13379,11 @@ mod tests {
             1
         );
         assert!(matches!(
-            response.blocking_recv().unwrap().unwrap(),
+            response.await.unwrap().unwrap(),
             SimulationResponse::SurvivalPlacement(Ok(None))
         ));
         assert_eq!(
-            world.blocking_lock().get_cached_block(target),
+            world.lock().await.get_cached_block(target),
             Some(BlockStateId(0))
         );
         assert_eq!(
@@ -13382,8 +13392,8 @@ mod tests {
         );
     }
 
-    #[test]
-    fn creative_placement_transaction_rejects_stale_support_without_mutation() {
+    #[tokio::test]
+    async fn creative_placement_transaction_rejects_stale_support_without_mutation() {
         let (mut storage, support, support_token) = test_block_storage();
         let target = BlockPos {
             x: support.x + 1,
@@ -13421,11 +13431,11 @@ mod tests {
             1
         );
         assert!(matches!(
-            response.blocking_recv().unwrap().unwrap(),
+            response.await.unwrap().unwrap(),
             SimulationResponse::SurvivalPlacement(Ok(None))
         ));
         assert_eq!(
-            world.blocking_lock().get_cached_block(target),
+            world.lock().await.get_cached_block(target),
             Some(BlockStateId(0))
         );
         assert_eq!(
@@ -13434,8 +13444,8 @@ mod tests {
         );
     }
 
-    #[test]
-    fn placement_transaction_rejects_game_mode_change_before_commit() {
+    #[tokio::test]
+    async fn placement_transaction_rejects_game_mode_change_before_commit() {
         let (storage, support, support_token) = test_block_storage();
         let target = BlockPos {
             x: support.x + 1,
@@ -13471,11 +13481,11 @@ mod tests {
             1
         );
         assert!(matches!(
-            response.blocking_recv().unwrap().unwrap(),
+            response.await.unwrap().unwrap(),
             SimulationResponse::SurvivalPlacement(Ok(None))
         ));
         assert_eq!(
-            world.blocking_lock().get_cached_block(target),
+            world.lock().await.get_cached_block(target),
             Some(BlockStateId(0))
         );
         assert_eq!(
@@ -13484,8 +13494,8 @@ mod tests {
         );
     }
 
-    #[test]
-    fn placement_transaction_rejects_non_building_game_modes() {
+    #[tokio::test]
+    async fn placement_transaction_rejects_non_building_game_modes() {
         for game_mode in [GameMode::Adventure, GameMode::Spectator] {
             let (storage, support, support_token) = test_block_storage();
             let target = BlockPos {
@@ -13516,11 +13526,11 @@ mod tests {
 
             owner.process_tick_with_world(&registry, Some(&world), None, 1);
             assert!(matches!(
-                response.blocking_recv().unwrap().unwrap(),
+                response.await.unwrap().unwrap(),
                 SimulationResponse::SurvivalPlacement(Ok(None))
             ));
             assert_eq!(
-                world.blocking_lock().get_cached_block(target),
+                world.lock().await.get_cached_block(target),
                 Some(BlockStateId(0))
             );
             assert_eq!(
@@ -13530,8 +13540,8 @@ mod tests {
         }
     }
 
-    #[test]
-    fn survival_placement_transaction_rejects_held_stack_mismatch_without_mutation() {
+    #[tokio::test]
+    async fn survival_placement_transaction_rejects_held_stack_mismatch_without_mutation() {
         let (storage, support, support_token) = test_block_storage();
         let target = BlockPos {
             x: support.x + 1,
@@ -13564,11 +13574,11 @@ mod tests {
 
         owner.process_tick_with_world(&registry, Some(&world), None, 1);
         assert!(matches!(
-            response.blocking_recv().unwrap().unwrap(),
+            response.await.unwrap().unwrap(),
             SimulationResponse::SurvivalPlacement(Ok(None))
         ));
         assert_eq!(
-            world.blocking_lock().get_cached_block(target),
+            world.lock().await.get_cached_block(target),
             Some(BlockStateId(0))
         );
         assert_eq!(
@@ -13644,8 +13654,8 @@ mod tests {
         assert!(ticks.iter().any(|tick| tick.pos == water));
     }
 
-    #[test]
-    fn survival_placement_transaction_rejects_stale_session_without_mutation() {
+    #[tokio::test]
+    async fn survival_placement_transaction_rejects_stale_session_without_mutation() {
         let (storage, support, support_token) = test_block_storage();
         let target = BlockPos {
             x: support.x + 1,
@@ -13684,11 +13694,11 @@ mod tests {
             0
         );
         assert!(matches!(
-            response.blocking_recv().unwrap(),
+            response.await.unwrap(),
             Err(SimulationRequestError::StaleSession)
         ));
         assert_eq!(
-            world.blocking_lock().get_cached_block(target),
+            world.lock().await.get_cached_block(target),
             Some(BlockStateId(0))
         );
         assert_eq!(
@@ -13697,8 +13707,8 @@ mod tests {
         );
     }
 
-    #[test]
-    fn concurrent_survival_placement_transactions_have_one_exact_winner() {
+    #[tokio::test]
+    async fn concurrent_survival_placement_transactions_have_one_exact_winner() {
         let (storage, support, support_token) = test_block_storage();
         let target = BlockPos {
             x: support.x + 1,
@@ -13740,11 +13750,11 @@ mod tests {
 
         owner.process_tick_with_world(&registry, Some(&world), None, 2);
         assert!(matches!(
-            first.blocking_recv().unwrap().unwrap(),
+            first.await.unwrap().unwrap(),
             SimulationResponse::SurvivalPlacement(Ok(Some(_)))
         ));
         assert!(matches!(
-            second.blocking_recv().unwrap().unwrap(),
+            second.await.unwrap().unwrap(),
             SimulationResponse::SurvivalPlacement(Ok(None))
         ));
         assert_eq!(
@@ -13840,8 +13850,8 @@ mod tests {
         assert!(ticks.iter().any(|tick| tick.pos == target));
     }
 
-    #[test]
-    fn bucket_uses_in_distinct_regions_overlap() {
+    #[tokio::test]
+    async fn bucket_uses_in_distinct_regions_overlap() {
         let blocks = Arc::new(BlockRegistry::from_report(&test_block_reports()).unwrap());
         let mut storage = WorldStorage::in_memory(blocks);
         let biome = Identifier::parse("minecraft:plains").unwrap();
@@ -13932,13 +13942,13 @@ mod tests {
         assert_eq!(worker.join().unwrap().processed, 2);
         for response in responses {
             let SimulationResponse::BucketUse(Ok(Some(committed))) =
-                response.blocking_recv().unwrap().unwrap()
+                response.await.unwrap().unwrap()
             else {
                 panic!("regional bucket response mismatch");
             };
             assert!(committed.block.precomputed_light_updates.is_some());
         }
-        let mut storage = world.blocking_lock();
+        let mut storage = world.lock().await;
         for (target, player_state) in targets.into_iter().zip(player_states) {
             assert_eq!(storage.get_cached_block(target), Some(BlockStateId(2)));
             assert_eq!(
@@ -14122,8 +14132,8 @@ mod tests {
         );
     }
 
-    #[test]
-    fn survival_break_transaction_rejects_stale_block_without_tool_or_drop_mutation() {
+    #[tokio::test]
+    async fn survival_break_transaction_rejects_stale_block_without_tool_or_drop_mutation() {
         let (mut storage, pos, token) = test_block_storage();
         storage
             .set_block_at(pos, BlockStateId(0))
@@ -14154,11 +14164,11 @@ mod tests {
             1
         );
         assert!(matches!(
-            response.blocking_recv().unwrap().unwrap(),
+            response.await.unwrap().unwrap(),
             SimulationResponse::SurvivalBreak(Ok(None))
         ));
         assert_eq!(
-            world.blocking_lock().get_cached_block(pos),
+            world.lock().await.get_cached_block(pos),
             Some(BlockStateId(0))
         );
         assert_eq!(
@@ -14313,8 +14323,8 @@ mod tests {
         drop(response);
     }
 
-    #[test]
-    fn survival_break_transaction_rejects_stale_session_without_mutation() {
+    #[tokio::test]
+    async fn survival_break_transaction_rejects_stale_session_without_mutation() {
         let (storage, pos, token) = test_block_storage();
         let world = Arc::new(tokio::sync::Mutex::new(storage));
         let registry = SessionRegistry::new();
@@ -14343,11 +14353,11 @@ mod tests {
             0
         );
         assert!(matches!(
-            response.blocking_recv().unwrap(),
+            response.await.unwrap(),
             Err(SimulationRequestError::StaleSession)
         ));
         assert_eq!(
-            world.blocking_lock().get_cached_block(pos),
+            world.lock().await.get_cached_block(pos),
             Some(BlockStateId(1))
         );
         assert_eq!(
@@ -14357,8 +14367,8 @@ mod tests {
         assert_eq!(persisted_item_drop_count(&registry), 0);
     }
 
-    #[test]
-    fn concurrent_survival_break_transactions_have_one_exact_winner() {
+    #[tokio::test]
+    async fn concurrent_survival_break_transactions_have_one_exact_winner() {
         let (storage, pos, token) = test_block_storage();
         let world = Arc::new(tokio::sync::Mutex::new(storage));
         let registry = SessionRegistry::new();
@@ -14401,11 +14411,11 @@ mod tests {
             2
         );
         assert!(matches!(
-            first.blocking_recv().unwrap().unwrap(),
+            first.await.unwrap().unwrap(),
             SimulationResponse::SurvivalBreak(Ok(Some(_)))
         ));
         assert!(matches!(
-            second.blocking_recv().unwrap().unwrap(),
+            second.await.unwrap().unwrap(),
             SimulationResponse::SurvivalBreak(Ok(None))
         ));
         assert_eq!(
@@ -14419,8 +14429,8 @@ mod tests {
         assert_eq!(persisted_item_drop_count(&registry), 1);
     }
 
-    #[test]
-    fn survival_break_transaction_rejects_held_stack_mismatch_without_mutation() {
+    #[tokio::test]
+    async fn survival_break_transaction_rejects_held_stack_mismatch_without_mutation() {
         let (storage, pos, token) = test_block_storage();
         let world = Arc::new(tokio::sync::Mutex::new(storage));
         let registry = SessionRegistry::new();
@@ -14448,11 +14458,11 @@ mod tests {
             1
         );
         assert!(matches!(
-            response.blocking_recv().unwrap().unwrap(),
+            response.await.unwrap().unwrap(),
             SimulationResponse::SurvivalBreak(Ok(None))
         ));
         assert_eq!(
-            world.blocking_lock().get_cached_block(pos),
+            world.lock().await.get_cached_block(pos),
             Some(BlockStateId(1))
         );
         assert_eq!(
@@ -14501,8 +14511,8 @@ mod tests {
         assert_eq!(snapshot.depth, 0);
     }
 
-    #[test]
-    fn survival_break_owner_dispatches_peer_block_before_drop_spawn() {
+    #[tokio::test]
+    async fn survival_break_owner_dispatches_peer_block_before_drop_spawn() {
         let (storage, pos, token) = test_block_storage();
         let world = Arc::new(tokio::sync::Mutex::new(storage));
         let registry = SessionRegistry::new();
@@ -14545,7 +14555,7 @@ mod tests {
             1
         );
         assert!(matches!(
-            response.blocking_recv().unwrap().unwrap(),
+            response.await.unwrap().unwrap(),
             SimulationResponse::SurvivalBreak(Ok(Some(_)))
         ));
         let first = observer_rx.try_recv();
@@ -14914,8 +14924,8 @@ mod tests {
         );
     }
 
-    #[test]
-    fn queued_conditional_block_edits_commit_only_first_matching_token() {
+    #[tokio::test]
+    async fn queued_conditional_block_edits_commit_only_first_matching_token() {
         let (storage, pos, token) = test_block_storage();
         let world = Arc::new(tokio::sync::Mutex::new(storage));
         let registry = SessionRegistry::new();
@@ -14943,22 +14953,22 @@ mod tests {
             2
         );
         assert!(matches!(
-            first.blocking_recv().unwrap().unwrap(),
+            first.await.unwrap().unwrap(),
             SimulationResponse::BlockEdits(Ok(outcome)) if outcome.is_some()
         ));
         assert!(matches!(
-            stale.blocking_recv().unwrap().unwrap(),
+            stale.await.unwrap().unwrap(),
             SimulationResponse::BlockEdits(Ok(outcome)) if outcome.is_none()
         ));
         assert_eq!(
-            world.blocking_lock().get_cached_block(pos),
+            world.lock().await.get_cached_block(pos),
             Some(BlockStateId(0))
         );
-        assert_ne!(world.blocking_lock().block_mutation_token(pos), Some(token));
+        assert_ne!(world.lock().await.block_mutation_token(pos), Some(token));
     }
 
-    #[test]
-    fn queued_conditional_block_edit_rejects_busy_world_without_mutation() {
+    #[tokio::test]
+    async fn queued_conditional_block_edit_rejects_busy_world_without_mutation() {
         let (storage, pos, token) = test_block_storage();
         let world = Arc::new(tokio::sync::Mutex::new(storage));
         let registry = SessionRegistry::new();
@@ -14987,7 +14997,7 @@ mod tests {
             1
         );
         assert!(matches!(
-            response.blocking_recv().unwrap().unwrap(),
+            response.await.unwrap().unwrap(),
             SimulationResponse::BlockEdits(Err(SimulationRequestError::WorldBusy))
         ));
         assert_eq!(guard.get_cached_block(pos), Some(BlockStateId(1)));
@@ -15089,8 +15099,8 @@ mod tests {
         assert_eq!(snapshot.rejected_world_busy, 0);
     }
 
-    #[test]
-    fn queued_unconditional_block_edits_apply_in_owner_sequence_order() {
+    #[tokio::test]
+    async fn queued_unconditional_block_edits_apply_in_owner_sequence_order() {
         let (storage, pos, _) = test_block_storage();
         let world = Arc::new(tokio::sync::Mutex::new(storage));
         let sessions = SessionRegistry::new();
@@ -15125,15 +15135,15 @@ mod tests {
             2
         );
         assert!(matches!(
-            remove.blocking_recv().unwrap().unwrap(),
+            remove.await.unwrap().unwrap(),
             SimulationResponse::BlockEdits(Ok(outcome)) if outcome.is_some()
         ));
         assert!(matches!(
-            restore.blocking_recv().unwrap().unwrap(),
+            restore.await.unwrap().unwrap(),
             SimulationResponse::BlockEdits(Ok(outcome)) if outcome.is_some()
         ));
         assert_eq!(
-            world.blocking_lock().get_cached_block(pos),
+            world.lock().await.get_cached_block(pos),
             Some(BlockStateId(1))
         );
         assert_eq!(handle.snapshot().block_edits_processed, 2);
@@ -15436,8 +15446,8 @@ mod tests {
         assert_eq!(authoritative, vec![first_update]);
     }
 
-    #[test]
-    fn chest_commits_in_distinct_regions_overlap() {
+    #[tokio::test]
+    async fn chest_commits_in_distinct_regions_overlap() {
         let blocks = Arc::new(BlockRegistry::from_report(&test_block_reports()).unwrap());
         let mut storage = WorldStorage::in_memory(blocks);
         let biome = Identifier::parse("minecraft:plains").unwrap();
@@ -15539,21 +15549,21 @@ mod tests {
         assert_eq!(worker.join().unwrap().processed, 2);
         for response in responses {
             assert!(matches!(
-                response.blocking_recv().unwrap().unwrap(),
+                response.await.unwrap().unwrap(),
                 SimulationResponse::ChestCommit(Ok(outcome))
                     if matches!(*outcome, SharedContainerCommit::Committed { state_id: 2, .. })
             ));
         }
         for position in positions {
             assert_eq!(
-                world.blocking_lock().chest_block_entity(position).unwrap(),
+                world.lock().await.chest_block_entity(position).unwrap(),
                 Some(updated.clone())
             );
         }
     }
 
-    #[test]
-    fn queued_chest_commit_moves_container_player_cursor_and_drop_once() {
+    #[tokio::test]
+    async fn queued_chest_commit_moves_container_player_cursor_and_drop_once() {
         let mut initial = mc_world::ChestBlockEntity::default();
         initial.slots[0] = mc_world::FurnaceSlot {
             item_id: 42,
@@ -15635,16 +15645,16 @@ mod tests {
             2
         );
         assert!(matches!(
-            observer_rx.blocking_recv(),
+            observer_rx.recv().await,
             Some(OutboundCommand::ChestSlots { state_id: 4, .. })
         ));
         assert!(matches!(
-            observer_rx.blocking_recv(),
+            observer_rx.recv().await,
             Some(OutboundCommand::SpawnEntity(entity))
                 if entity.item_stack == Some(EntityItemStack::new(99, 1))
         ));
         assert!(matches!(
-            first.blocking_recv().unwrap().unwrap(),
+            first.await.unwrap().unwrap(),
             SimulationResponse::ChestCommit(Ok(outcome))
                 if matches!(
                     *outcome,
@@ -15658,7 +15668,7 @@ mod tests {
                 )
         ));
         let (authoritative, rejected_inventory, rejected_carried_item) =
-            match stale.blocking_recv().unwrap().unwrap() {
+            match stale.await.unwrap().unwrap() {
                 SimulationResponse::ChestCommit(Ok(outcome)) => match *outcome {
                     SharedContainerCommit::Rejected {
                         state_id,
@@ -15678,7 +15688,7 @@ mod tests {
         assert_eq!(rejected_inventory.slots, updated_inventory.slots);
         assert_eq!(rejected_carried_item, updated_carried_item);
         assert_eq!(
-            world.blocking_lock().chest_block_entity(pos).unwrap(),
+            world.lock().await.chest_block_entity(pos).unwrap(),
             Some(first_update)
         );
         let persisted = player_state.lock().unwrap();
@@ -15978,8 +15988,8 @@ mod tests {
         assert_eq!(persisted.cook_progress, current.cook_progress);
     }
 
-    #[test]
-    fn queued_container_commit_rejects_busy_world_without_mutation() {
+    #[tokio::test]
+    async fn queued_container_commit_rejects_busy_world_without_mutation() {
         let initial = mc_world::FurnaceBlockEntity::default();
         let mut updated = initial.clone();
         updated.slots[0] = mc_world::FurnaceSlot {
@@ -16014,7 +16024,7 @@ mod tests {
             1
         );
         assert!(matches!(
-            response.blocking_recv().unwrap().unwrap(),
+            response.await.unwrap().unwrap(),
             SimulationResponse::FurnaceCommit(Err(SimulationRequestError::WorldBusy))
         ));
         assert_eq!(guard.furnace_block_entity(pos).unwrap(), Some(initial));
@@ -16098,8 +16108,8 @@ mod tests {
         assert_eq!(queued, Some(bytes));
     }
 
-    #[test]
-    fn queued_opaque_block_entity_rejects_stale_token_without_write() {
+    #[tokio::test]
+    async fn queued_opaque_block_entity_rejects_stale_token_without_write() {
         let (mut storage, pos, stale_token) = test_block_storage();
         storage.set_block_at(pos, BlockStateId(0)).unwrap();
         storage.set_block_at(pos, BlockStateId(1)).unwrap();
@@ -16122,12 +16132,13 @@ mod tests {
             1
         );
         assert!(matches!(
-            response.blocking_recv().unwrap().unwrap(),
+            response.await.unwrap().unwrap(),
             SimulationResponse::OpaqueBlockEntity(Ok(false))
         ));
         assert!(
             !world
-                .blocking_lock()
+                .lock()
+                .await
                 .cached_chunk(ChunkPos { x: 0, z: 0 })
                 .unwrap()
                 .block_entities
@@ -16785,8 +16796,8 @@ mod tests {
         );
     }
 
-    #[test]
-    fn queued_campfire_commits_accept_only_first_matching_snapshot() {
+    #[tokio::test]
+    async fn queued_campfire_commits_accept_only_first_matching_snapshot() {
         let expected = super::super::CampfireCookingState::default();
         let mut first_update = expected.clone();
         assert!(first_update.insert(
@@ -16858,11 +16869,11 @@ mod tests {
             2
         );
         assert!(matches!(
-            first.blocking_recv().unwrap().unwrap(),
+            first.await.unwrap().unwrap(),
             SimulationResponse::CampfireUse(Ok(Some(_)))
         ));
         assert!(matches!(
-            stale.blocking_recv().unwrap().unwrap(),
+            stale.await.unwrap().unwrap(),
             SimulationResponse::CampfireUse(Ok(None))
         ));
         assert_eq!(sessions.campfire_cooking_state(pos), first_update);
@@ -16876,7 +16887,8 @@ mod tests {
         );
         assert_eq!(
             world
-                .blocking_lock()
+                .lock()
+                .await
                 .cached_chunk(ChunkPos { x: 0, z: 0 })
                 .unwrap()
                 .block_entities
@@ -16886,8 +16898,8 @@ mod tests {
         );
     }
 
-    #[test]
-    fn owner_budget_carries_remaining_commands_to_next_tick() {
+    #[tokio::test]
+    async fn owner_budget_carries_remaining_commands_to_next_tick() {
         let registry = SessionRegistry::new();
         let position = Vec3::new(0.5, 64.0, 0.5);
         for value in 1..=3 {
@@ -16913,17 +16925,18 @@ mod tests {
 
         assert_eq!(owner.process_tick(&registry, 2).processed, 2);
         assert_eq!(handle.snapshot().depth, 1);
-        assert!(matches!(
-            responses[2].try_recv(),
-            Err(oneshot::error::TryRecvError::Empty)
-        ));
+        assert!(
+            tokio::time::timeout(Duration::from_millis(1), &mut responses[2])
+                .await
+                .is_err()
+        );
         assert_eq!(owner.process_tick(&registry, 2).processed, 1);
         assert_eq!(handle.snapshot().depth, 0);
         assert_eq!(handle.snapshot().processed, 3);
     }
 
-    #[test]
-    fn cancelled_and_shutdown_commands_do_not_mutate_entities() {
+    #[tokio::test]
+    async fn cancelled_and_shutdown_commands_do_not_mutate_entities() {
         let cancelled_registry = SessionRegistry::new();
         let (_, cancelled_xp) = seed_claim_entities(&cancelled_registry);
         let (cancelled_handle, mut cancelled_owner) = simulation_channel_with_capacity(1);
@@ -16958,7 +16971,7 @@ mod tests {
             .unwrap();
         shutdown_owner.shutdown();
         assert_eq!(
-            shutdown_response.blocking_recv().unwrap().unwrap_err(),
+            shutdown_response.await.unwrap().unwrap_err(),
             SimulationRequestError::ShuttingDown
         );
         assert_eq!(

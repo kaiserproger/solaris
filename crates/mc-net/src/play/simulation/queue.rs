@@ -1,3 +1,4 @@
+use super::request_wait::SimulationResponseReceiver;
 use super::{
     JavaLegacyRandom, PlayerPose, RegionOwnership, SessionId, SimulationAuthority,
     SimulationCommand, SimulationHandle, SimulationOutcome, SimulationOwner,
@@ -16,12 +17,15 @@ use std::sync::Condvar;
 use std::sync::Mutex;
 #[cfg(test)]
 use std::sync::atomic::AtomicBool;
-use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
-use tokio::sync::{mpsc, oneshot};
+use std::sync::atomic::{AtomicU8, AtomicU64, AtomicUsize, Ordering};
+use tokio::sync::{Notify, mpsc, oneshot};
 
 pub(crate) const SIMULATION_COMMAND_QUEUE_CAPACITY: usize = 1024;
 pub(crate) const SIMULATION_COMMAND_BATCH_LIMIT: usize = 256;
 pub(super) const SIMULATION_BACKGROUND_COMMAND_BATCH_LIMIT: usize = 2;
+pub(super) const SIMULATION_OWNER_HEALTHY: u8 = 0;
+pub(super) const SIMULATION_OWNER_SHUTTING_DOWN: u8 = 1;
+pub(super) const SIMULATION_OWNER_STOPPED: u8 = 2;
 
 #[derive(Debug)]
 pub(super) struct SimulationCommandEnvelope {
@@ -64,6 +68,8 @@ pub(crate) struct SimulationQueueSnapshot {
     pub(crate) block_entity_commits_processed: u64,
     pub(crate) rejected_full: u64,
     pub(crate) rejected_closed: u64,
+    pub(crate) queue_admission_timeouts: u64,
+    pub(crate) response_timeouts: u64,
     pub(crate) rejected_shutdown: u64,
     pub(crate) rejected_world_busy: u64,
     pub(crate) rejected_world_unavailable: u64,
@@ -105,6 +111,10 @@ pub(super) struct SimulationQueueMetrics {
     pub(super) block_entity_commits_processed: AtomicU64,
     pub(super) rejected_full: AtomicU64,
     pub(super) rejected_closed: AtomicU64,
+    pub(super) queue_admission_timeouts: AtomicU64,
+    pub(super) response_timeouts: AtomicU64,
+    pub(super) owner_state: AtomicU8,
+    pub(super) owner_state_notify: Arc<Notify>,
     pub(super) rejected_shutdown: AtomicU64,
     pub(super) rejected_world_busy: AtomicU64,
     pub(super) rejected_world_unavailable: AtomicU64,
@@ -187,6 +197,10 @@ impl SimulationQueueMetrics {
             block_entity_commits_processed: AtomicU64::new(0),
             rejected_full: AtomicU64::new(0),
             rejected_closed: AtomicU64::new(0),
+            queue_admission_timeouts: AtomicU64::new(0),
+            response_timeouts: AtomicU64::new(0),
+            owner_state: AtomicU8::new(SIMULATION_OWNER_HEALTHY),
+            owner_state_notify: Arc::new(Notify::new()),
             rejected_shutdown: AtomicU64::new(0),
             rejected_world_busy: AtomicU64::new(0),
             rejected_world_unavailable: AtomicU64::new(0),
@@ -219,6 +233,8 @@ impl SimulationQueueMetrics {
                 .load(Ordering::Relaxed),
             rejected_full: self.rejected_full.load(Ordering::Relaxed),
             rejected_closed: self.rejected_closed.load(Ordering::Relaxed),
+            queue_admission_timeouts: self.queue_admission_timeouts.load(Ordering::Relaxed),
+            response_timeouts: self.response_timeouts.load(Ordering::Relaxed),
             rejected_shutdown: self.rejected_shutdown.load(Ordering::Relaxed),
             rejected_world_busy: self.rejected_world_busy.load(Ordering::Relaxed),
             rejected_world_unavailable: self.rejected_world_unavailable.load(Ordering::Relaxed),
@@ -333,18 +349,55 @@ impl SimulationHandle {
         }
     }
 
+    pub(super) fn owner_state_error(&self) -> Option<SimulationRequestError> {
+        match self.metrics.owner_state.load(Ordering::Acquire) {
+            SIMULATION_OWNER_HEALTHY => None,
+            SIMULATION_OWNER_SHUTTING_DOWN => Some(SimulationRequestError::ShuttingDown),
+            SIMULATION_OWNER_STOPPED => Some(SimulationRequestError::OwnerStopped),
+            _ => Some(SimulationRequestError::OwnerStopped),
+        }
+    }
+
+    async fn reserve_with_deadline(
+        &self,
+    ) -> Result<mpsc::Permit<'_, SimulationCommandEnvelope>, SimulationRequestError> {
+        if let Some(error) = self.owner_state_error() {
+            return Err(error);
+        }
+        match tokio::time::timeout(
+            super::SIMULATION_QUEUE_ADMISSION_TIMEOUT,
+            self.sender.reserve(),
+        )
+        .await
+        {
+            Ok(Ok(permit)) => Ok(permit),
+            Ok(Err(_)) => {
+                self.metrics.rejected_closed.fetch_add(1, Ordering::Relaxed);
+                Err(self
+                    .owner_state_error()
+                    .unwrap_or(SimulationRequestError::Closed))
+            }
+            Err(_) => {
+                self.metrics
+                    .queue_admission_timeouts
+                    .fetch_add(1, Ordering::Relaxed);
+                Err(SimulationRequestError::QueueAdmissionTimeout)
+            }
+        }
+    }
+
     #[cfg(test)]
     pub(in super::super) fn enqueue(
         &self,
         command: SimulationCommand,
-    ) -> Result<oneshot::Receiver<SimulationOutcome>, SimulationRequestError> {
+    ) -> Result<SimulationResponseReceiver, SimulationRequestError> {
         self.enqueue_with_fence(self.session_fence, command)
     }
 
     pub(super) fn enqueue_player_command(
         &self,
         command: SimulationCommand,
-    ) -> Result<oneshot::Receiver<SimulationOutcome>, SimulationRequestError> {
+    ) -> Result<SimulationResponseReceiver, SimulationRequestError> {
         let session_id = self
             .session_fence
             .ok_or(SimulationRequestError::InvalidCommand)?;
@@ -354,16 +407,13 @@ impl SimulationHandle {
     pub(super) async fn enqueue_player_command_wait(
         &self,
         command: SimulationCommand,
-    ) -> Result<oneshot::Receiver<SimulationOutcome>, SimulationRequestError> {
+    ) -> Result<SimulationResponseReceiver, SimulationRequestError> {
         let session_id = self
             .session_fence
             .ok_or(SimulationRequestError::InvalidCommand)?;
         let sequence = self.metrics.next_sequence.fetch_add(1, Ordering::Relaxed);
         let (response, receiver) = oneshot::channel();
-        let permit = self.sender.reserve().await.map_err(|_| {
-            self.metrics.rejected_closed.fetch_add(1, Ordering::Relaxed);
-            SimulationRequestError::Closed
-        })?;
+        let permit = self.reserve_with_deadline().await?;
         self.metrics.enqueued.fetch_add(1, Ordering::Relaxed);
         let depth = self.metrics.depth.fetch_add(1, Ordering::Relaxed) + 1;
         self.metrics.record_depth(depth);
@@ -373,26 +423,28 @@ impl SimulationHandle {
             session_fence: Some(session_id),
             response: Some(response),
         });
-        Ok(receiver)
+        Ok(SimulationResponseReceiver::new(
+            receiver,
+            Arc::clone(&self.metrics),
+        ))
     }
 
     pub(super) async fn enqueue_script_player_teleport_wait(
         &self,
         pose: PlayerPose,
         completion: ScriptPlayerTeleportCompletion,
-    ) -> Result<oneshot::Receiver<SimulationOutcome>, SimulationRequestError> {
+    ) -> Result<SimulationResponseReceiver, SimulationRequestError> {
         let Some(session_id) = self.session_fence else {
             completion.complete(Err(ScriptPlayerTeleportFailure::RuntimeUnavailable));
             return Err(SimulationRequestError::InvalidCommand);
         };
         let sequence = self.metrics.next_sequence.fetch_add(1, Ordering::Relaxed);
         let (response, receiver) = oneshot::channel();
-        let permit = match self.sender.reserve().await {
+        let permit = match self.reserve_with_deadline().await {
             Ok(permit) => permit,
-            Err(_) => {
-                self.metrics.rejected_closed.fetch_add(1, Ordering::Relaxed);
+            Err(error) => {
                 completion.complete(Err(ScriptPlayerTeleportFailure::RuntimeUnavailable));
-                return Err(SimulationRequestError::Closed);
+                return Err(error);
             }
         };
         self.metrics.enqueued.fetch_add(1, Ordering::Relaxed);
@@ -409,7 +461,10 @@ impl SimulationHandle {
             session_fence: Some(session_id),
             response: Some(response),
         });
-        Ok(receiver)
+        Ok(SimulationResponseReceiver::new(
+            receiver,
+            Arc::clone(&self.metrics),
+        ))
     }
 
     pub(super) fn session_id(&self) -> Result<SessionId, SimulationRequestError> {
@@ -421,7 +476,7 @@ impl SimulationHandle {
         &self,
         session_fence: Option<SessionId>,
         command: SimulationCommand,
-    ) -> Result<oneshot::Receiver<SimulationOutcome>, SimulationRequestError> {
+    ) -> Result<SimulationResponseReceiver, SimulationRequestError> {
         let sequence = self.metrics.next_sequence.fetch_add(1, Ordering::Relaxed);
         let (response, receiver) = oneshot::channel();
         let envelope = SimulationCommandEnvelope {
@@ -431,7 +486,10 @@ impl SimulationHandle {
             response: Some(response),
         };
         self.try_send(envelope)?;
-        Ok(receiver)
+        Ok(SimulationResponseReceiver::new(
+            receiver,
+            Arc::clone(&self.metrics),
+        ))
     }
 
     fn enqueue_detached(&self, command: SimulationCommand) -> Result<(), SimulationRequestError> {
@@ -449,10 +507,7 @@ impl SimulationHandle {
         command: SimulationCommand,
     ) -> Result<(), SimulationRequestError> {
         let sequence = self.metrics.next_sequence.fetch_add(1, Ordering::Relaxed);
-        let permit = self.sender.reserve().await.map_err(|_| {
-            self.metrics.rejected_closed.fetch_add(1, Ordering::Relaxed);
-            SimulationRequestError::Closed
-        })?;
+        let permit = self.reserve_with_deadline().await?;
         self.metrics.enqueued.fetch_add(1, Ordering::Relaxed);
         let depth = self.metrics.depth.fetch_add(1, Ordering::Relaxed) + 1;
         self.metrics.record_depth(depth);
@@ -480,7 +535,9 @@ impl SimulationHandle {
             }
             Err(mpsc::error::TrySendError::Closed(_)) => {
                 self.metrics.rejected_closed.fetch_add(1, Ordering::Relaxed);
-                Err(SimulationRequestError::Closed)
+                Err(self
+                    .owner_state_error()
+                    .unwrap_or(SimulationRequestError::Closed))
             }
         }
     }
@@ -701,6 +758,10 @@ impl SimulationOwner {
     }
 
     pub(crate) fn shutdown(&mut self) {
+        self.metrics
+            .owner_state
+            .store(SIMULATION_OWNER_SHUTTING_DOWN, Ordering::Release);
+        self.metrics.owner_state_notify.notify_waiters();
         self.reject_pending(SimulationRequestError::ShuttingDown);
     }
 
@@ -751,6 +812,10 @@ impl SimulationOwner {
 
 impl Drop for SimulationOwner {
     fn drop(&mut self) {
+        self.metrics
+            .owner_state
+            .store(SIMULATION_OWNER_STOPPED, Ordering::Release);
+        self.metrics.owner_state_notify.notify_waiters();
         self.reject_pending(SimulationRequestError::OwnerStopped);
     }
 }

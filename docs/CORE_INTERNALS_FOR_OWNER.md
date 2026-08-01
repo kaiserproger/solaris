@@ -369,10 +369,11 @@ flood завершается typed rate-limit error. Refill использует
 | Функция/тип | Назначение |
 | --- | --- |
 | channel constructor | создает bounded queue, sequence source и metrics |
-| enqueue functions | reserve capacity, stamp sequence/session fence, fail before mutation |
+| enqueue functions | reserve capacity не дольше 250 ms, stamp sequence/session fence, fail before mutation |
+| response receiver | ждет owner reply не дольше 5 s и одновременно наблюдает owner health |
 | owner receive/drain | push wake, bounded drain, stable sequence order |
 | herd coalescing | объединяет только явно совместимые detached herd commands |
-| shutdown | закрывает admission и отвечает queued requesters typed error |
+| shutdown | сначала публикует `ShuttingDown`/`OwnerStopped`, затем закрывает admission и отвечает queued requesters |
 
 ### 9.2 `simulation.rs`
 
@@ -380,8 +381,8 @@ flood завершается typed rate-limit error. Refill использует
 
 1. получает или проверяет session fence;
 2. формирует ровно один `SimulationCommand`;
-3. enqueue без произвольного response timeout;
-4. ждет exact oneshot reply;
+3. получает queue permit в пределах 250 ms либо возвращает typed admission error;
+4. ждет exact owner reply в пределах 5 s, одновременно наблюдая shutdown/owner stop;
 5. проверяет вариант `SimulationResponse`.
 
 `SimulationOwner` владеет command processing. `process_*`/`commit_*` branches
