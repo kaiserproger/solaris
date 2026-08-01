@@ -12,9 +12,12 @@ impl SessionRegistry {
         token: String,
     ) -> Result<Option<VillagerBindingClaim>, RegionOwnerLaneError> {
         let owner = self.entities.handle.clone();
-        tokio::task::spawn_blocking(move || owner.claim_nearest_villager(center, radius, token))
-            .await
-            .map_err(|_| RegionOwnerLaneError::Closed)?
+        let result = tokio::task::spawn_blocking(move || {
+            owner.claim_nearest_villager(center, radius, token)
+        })
+        .await
+        .map_err(|_| RegionOwnerLaneError::Closed)?;
+        self.entities.try_resolve(result)
     }
 
     pub(crate) async fn apply_script_villager_binding_goal(
@@ -23,10 +26,11 @@ impl SessionRegistry {
         goal: mc_entity::GoalState,
     ) -> Result<bool, RegionOwnerLaneError> {
         let owner = self.entities.handle.clone();
-        let applied =
+        let result =
             tokio::task::spawn_blocking(move || owner.apply_villager_binding_goal(token, goal))
                 .await
-                .map_err(|_| RegionOwnerLaneError::Closed)??;
+                .map_err(|_| RegionOwnerLaneError::Closed)?;
+        let applied = self.entities.try_resolve(result)?;
         if let Some(entity) = applied {
             self.track_villager_override(entity);
             Ok(true)

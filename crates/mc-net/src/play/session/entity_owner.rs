@@ -4,9 +4,156 @@ pub(super) struct SessionEntityOwners {
     _runtime: RegionalOwnerRuntime,
     pub(super) handle: RegionalOwnerHandle,
     observation: Arc<SessionPressureObservation>,
+    failure: Arc<EntityOwnerFailureState>,
     journal_failures: Arc<EntityJournalFailureTracker>,
     #[cfg(test)]
     owner_requests: Arc<AtomicU64>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct EntityOwnerFatal {
+    pub(crate) error: mc_entity::RegionOwnerLaneError,
+}
+
+#[derive(Debug)]
+struct EntityOwnerFatalPanic(EntityOwnerFatal);
+
+impl std::fmt::Display for EntityOwnerFatalPanic {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            formatter,
+            "regional entity owner failed: {:?}",
+            self.0.error
+        )
+    }
+}
+
+impl std::error::Error for EntityOwnerFatalPanic {}
+
+pub(crate) fn entity_owner_fatal_from_panic(
+    payload: &(dyn std::any::Any + Send),
+) -> Option<mc_entity::RegionOwnerLaneError> {
+    payload
+        .downcast_ref::<EntityOwnerFatalPanic>()
+        .map(|panic| panic.0.error)
+}
+
+#[derive(Debug)]
+struct EntityOwnerFailureState {
+    sender: tokio::sync::watch::Sender<Option<EntityOwnerFatal>>,
+}
+
+impl Default for EntityOwnerFailureState {
+    fn default() -> Self {
+        Self {
+            sender: tokio::sync::watch::channel(None).0,
+        }
+    }
+}
+
+impl EntityOwnerFailureState {
+    fn current(&self) -> Option<EntityOwnerFatal> {
+        *self.sender.borrow()
+    }
+
+    fn report(&self, error: mc_entity::RegionOwnerLaneError) -> EntityOwnerFatal {
+        let fatal = EntityOwnerFatal { error };
+        self.sender.send_if_modified(|current| {
+            if current.is_some() {
+                false
+            } else {
+                *current = Some(fatal);
+                true
+            }
+        });
+        self.current().unwrap_or(fatal)
+    }
+
+    fn fail(&self, error: mc_entity::RegionOwnerLaneError) -> ! {
+        let fatal = self.report(error);
+        std::panic::panic_any(EntityOwnerFatalPanic(fatal));
+    }
+
+    fn subscribe(&self) -> tokio::sync::watch::Receiver<Option<EntityOwnerFatal>> {
+        self.sender.subscribe()
+    }
+}
+
+fn is_runtime_owner_fatal(error: mc_entity::RegionOwnerLaneError) -> bool {
+    matches!(
+        error,
+        mc_entity::RegionOwnerLaneError::Closed
+            | mc_entity::RegionOwnerLaneError::WorkerPanicked
+            | mc_entity::RegionOwnerLaneError::OutcomeUnknown
+    )
+}
+
+fn canonical_owner_error(
+    handle: &RegionalOwnerHandle,
+    error: mc_entity::RegionOwnerLaneError,
+) -> mc_entity::RegionOwnerLaneError {
+    if error == mc_entity::RegionOwnerLaneError::Closed {
+        handle.fatal_error().unwrap_or(error)
+    } else {
+        error
+    }
+}
+
+fn owner_call<T>(
+    failure: &EntityOwnerFailureState,
+    handle: &RegionalOwnerHandle,
+    call: impl FnOnce(&RegionalOwnerHandle) -> Result<T, mc_entity::RegionOwnerLaneError>,
+) -> T {
+    if let Some(fatal) = failure.current() {
+        failure.fail(fatal.error);
+    }
+    match call(handle) {
+        Ok(value) => value,
+        Err(error) => failure.fail(canonical_owner_error(handle, error)),
+    }
+}
+
+fn resolve_owner_result<T>(
+    failure: &EntityOwnerFailureState,
+    handle: &RegionalOwnerHandle,
+    result: Result<T, mc_entity::RegionOwnerLaneError>,
+) -> T {
+    if let Some(fatal) = failure.current() {
+        failure.fail(fatal.error);
+    }
+    match result {
+        Ok(value) => value,
+        Err(error) => failure.fail(canonical_owner_error(handle, error)),
+    }
+}
+
+fn try_owner_result<T>(
+    failure: &EntityOwnerFailureState,
+    handle: &RegionalOwnerHandle,
+    result: Result<T, mc_entity::RegionOwnerLaneError>,
+) -> Result<T, mc_entity::RegionOwnerLaneError> {
+    if let Some(fatal) = failure.current() {
+        return Err(fatal.error);
+    }
+    result.map_err(|error| {
+        let error = canonical_owner_error(handle, error);
+        if is_runtime_owner_fatal(error) {
+            failure.report(error);
+        }
+        error
+    })
+}
+
+fn try_owner_call<T>(
+    failure: &EntityOwnerFailureState,
+    handle: &RegionalOwnerHandle,
+    call: impl FnOnce(&RegionalOwnerHandle) -> Result<T, mc_entity::RegionOwnerLaneError>,
+) -> Result<T, mc_entity::RegionOwnerLaneError> {
+    if let Some(fatal) = failure.current() {
+        return Err(fatal.error);
+    }
+    let result = call(handle);
+    try_owner_result(failure, handle, result)
 }
 
 #[derive(Default)]
@@ -106,11 +253,11 @@ impl std::fmt::Debug for SessionEntityOwners {
 }
 
 impl SessionEntityOwners {
-    pub(super) fn new(
+    pub(super) fn try_new(
         observation: Arc<SessionPressureObservation>,
         lane_count: usize,
         journal: Option<Box<dyn mc_entity::RegionalDecisionJournal>>,
-    ) -> Self {
+    ) -> Result<Self, mc_entity::RegionalOwnerCutoverError> {
         let lane_count = lane_count.max(1);
         let store = mc_entity::RegionalEntityStore::with_next_id(SERVER_ENTITY_ID_START - 1);
         let journal_failures = Arc::new(EntityJournalFailureTracker::default());
@@ -125,30 +272,27 @@ impl SessionEntityOwners {
                 RegionalOwnerRuntime::from_store_with_journal(store, lane_count, journal)
             }
             None => RegionalOwnerRuntime::from_store(store, lane_count),
-        }
-        .unwrap_or_else(|error| {
-            panic!(
-                "failed to start {lane_count} persistent regional entity owners: {:?}",
-                error.error
-            )
-        });
+        }?;
         let handle = runtime.handle();
+        let failure = Arc::new(EntityOwnerFailureState::default());
         #[cfg(test)]
         let owner_requests = Arc::new(AtomicU64::new(0));
-        Self {
+        Ok(Self {
             _runtime: runtime,
             handle,
             observation,
+            failure,
             journal_failures,
             #[cfg(test)]
             owner_requests,
-        }
+        })
     }
 
     pub(super) fn access(&self) -> EntityOwnerAccess {
         EntityOwnerAccess {
             handle: self.handle.clone(),
             observation: Arc::clone(&self.observation),
+            failure: Arc::clone(&self.failure),
             snapshots: RefCell::new(HashMap::new()),
             selected_snapshots: RefCell::new(None),
             #[cfg(test)]
@@ -156,16 +300,49 @@ impl SessionEntityOwners {
         }
     }
 
+    fn resolve<T>(&self, result: Result<T, mc_entity::RegionOwnerLaneError>) -> T {
+        resolve_owner_result(&self.failure, &self.handle, result)
+    }
+
+    pub(super) fn try_resolve<T>(
+        &self,
+        result: Result<T, mc_entity::RegionOwnerLaneError>,
+    ) -> Result<T, mc_entity::RegionOwnerLaneError> {
+        try_owner_result(&self.failure, &self.handle, result)
+    }
+
+    fn call<T>(
+        &self,
+        call: impl FnOnce(&RegionalOwnerHandle) -> Result<T, mc_entity::RegionOwnerLaneError>,
+    ) -> T {
+        owner_call(&self.failure, &self.handle, call)
+    }
+
+    pub(super) fn subscribe_failure(
+        &self,
+    ) -> tokio::sync::watch::Receiver<Option<EntityOwnerFatal>> {
+        self.failure.subscribe()
+    }
+
+    #[cfg(test)]
+    pub(super) fn report_failure(
+        &self,
+        error: mc_entity::RegionOwnerLaneError,
+    ) -> EntityOwnerFatal {
+        self.failure
+            .report(canonical_owner_error(&self.handle, error))
+    }
+
     pub(super) fn status(&self) -> RegionalOwnerStatus {
-        owner_result(self.handle.status())
+        self.call(RegionalOwnerHandle::status)
     }
 
     pub(super) fn reconfigure_lanes(&self, lane_count: usize) -> usize {
-        owner_result(self.handle.reconfigure_lanes(lane_count.max(1)))
+        self.call(|handle| handle.reconfigure_lanes(lane_count.max(1)))
     }
 
     pub(super) fn advance_lifecycle_epoch(&self, lifecycle_epoch: u64) {
-        owner_result(self.handle.advance_lifecycle_epoch(lifecycle_epoch));
+        self.call(|handle| handle.advance_lifecycle_epoch(lifecycle_epoch));
     }
 
     pub(super) fn restore_checkpoint_boundary(
@@ -173,10 +350,7 @@ impl SessionEntityOwners {
         lifecycle_epoch: u64,
         sequence_watermark: u64,
     ) {
-        owner_result(
-            self.handle
-                .restore_checkpoint_boundary(lifecycle_epoch, sequence_watermark),
-        );
+        self.call(|handle| handle.restore_checkpoint_boundary(lifecycle_epoch, sequence_watermark));
     }
 
     #[cfg(test)]
@@ -227,17 +401,31 @@ impl SessionEntityOwners {
 pub(super) struct EntityOwnerAccess {
     handle: RegionalOwnerHandle,
     observation: Arc<SessionPressureObservation>,
+    failure: Arc<EntityOwnerFailureState>,
     snapshots: RefCell<HashMap<EntityId, Option<EntitySnapshot>>>,
     selected_snapshots: RefCell<Option<VersionedEntitySnapshots>>,
     #[cfg(test)]
     owner_requests: Arc<AtomicU64>,
 }
 
-pub(super) fn owner_result<T>(result: Result<T, mc_entity::RegionOwnerLaneError>) -> T {
-    result.unwrap_or_else(|error| panic!("regional entity owner failed: {error:?}"))
+pub(super) fn owner_result<T>(
+    owners: &SessionEntityOwners,
+    result: Result<T, mc_entity::RegionOwnerLaneError>,
+) -> T {
+    owners.resolve(result)
 }
 
 impl EntityOwnerAccess {
+    fn resolve<T>(&self, result: Result<T, mc_entity::RegionOwnerLaneError>) -> T {
+        resolve_owner_result(&self.failure, &self.handle, result)
+    }
+
+    fn try_call<T>(
+        &self,
+        call: impl FnOnce(&RegionalOwnerHandle) -> Result<T, mc_entity::RegionOwnerLaneError>,
+    ) -> Result<T, mc_entity::RegionOwnerLaneError> {
+        try_owner_call(&self.failure, &self.handle, call)
+    }
     #[cfg(test)]
     pub(super) fn record_owner_request(&self) {
         self.owner_requests.fetch_add(1, Ordering::Relaxed);
@@ -254,7 +442,7 @@ impl EntityOwnerAccess {
         }
         #[cfg(test)]
         self.record_owner_request();
-        let selected = owner_result(self.handle.snapshots_for_ids_versioned(&missing));
+        let selected = self.resolve(self.handle.snapshots_for_ids_versioned(&missing));
         let mut snapshots = self.snapshots.borrow_mut();
         for id in missing {
             snapshots.insert(id, None);
@@ -273,13 +461,13 @@ impl EntityOwnerAccess {
     pub(super) fn snapshots_vec(&self) -> Vec<EntitySnapshot> {
         #[cfg(test)]
         self.record_owner_request();
-        owner_result(self.handle.snapshots())
+        self.resolve(self.handle.snapshots())
     }
 
     #[cfg(test)]
     pub(super) fn len(&self) -> usize {
         self.record_owner_request();
-        owner_result(self.handle.status()).entity_count
+        self.resolve(self.handle.status()).entity_count
     }
 
     pub(super) fn contains(&self, id: EntityId) -> bool {
@@ -292,7 +480,7 @@ impl EntityOwnerAccess {
         }
         #[cfg(test)]
         self.record_owner_request();
-        let snapshot = owner_result(self.handle.snapshot(id));
+        let snapshot = self.resolve(self.handle.snapshot(id));
         self.snapshots.borrow_mut().insert(id, snapshot.clone());
         snapshot
     }
@@ -344,7 +532,7 @@ impl EntityOwnerAccess {
     pub(super) fn spawn(&mut self, entity: SpawnEntity) -> EntityId {
         #[cfg(test)]
         self.record_owner_request();
-        let id = owner_result(self.handle.spawn(entity));
+        let id = self.resolve(self.handle.spawn(entity));
         self.observation.record_entity_inserts(1);
         id
     }
@@ -352,7 +540,7 @@ impl EntityOwnerAccess {
     pub(super) fn spawn_deferred_journal(&mut self, entity: SpawnEntity) -> EntityId {
         #[cfg(test)]
         self.record_owner_request();
-        let id = owner_result(self.handle.spawn_deferred_journal(entity));
+        let id = self.resolve(self.handle.spawn_deferred_journal(entity));
         self.observation.record_entity_inserts(1);
         id
     }
@@ -361,7 +549,8 @@ impl EntityOwnerAccess {
         &mut self,
         entities: impl IntoIterator<Item = SpawnEntity>,
     ) -> Vec<EntityId> {
-        owner_result(self.try_spawn_batch(entities))
+        let result = self.try_spawn_batch(entities);
+        self.resolve(result)
     }
 
     pub(super) fn try_spawn_batch(
@@ -370,7 +559,7 @@ impl EntityOwnerAccess {
     ) -> Result<Vec<EntityId>, mc_entity::RegionOwnerLaneError> {
         #[cfg(test)]
         self.record_owner_request();
-        let ids = self.handle.spawn_batch(entities)?;
+        let ids = self.try_call(|handle| handle.spawn_batch(entities))?;
         self.observation.record_entity_inserts(ids.len());
         Ok(ids)
     }
@@ -379,7 +568,8 @@ impl EntityOwnerAccess {
         &mut self,
         entities: impl IntoIterator<Item = SpawnEntity>,
     ) -> Vec<EntitySnapshot> {
-        owner_result(self.try_spawn_unique_batch(entities))
+        let result = self.try_spawn_unique_batch(entities);
+        self.resolve(result)
     }
 
     pub(super) fn try_spawn_unique_batch(
@@ -388,7 +578,7 @@ impl EntityOwnerAccess {
     ) -> Result<Vec<EntitySnapshot>, mc_entity::RegionOwnerLaneError> {
         #[cfg(test)]
         self.record_owner_request();
-        let snapshots = self.handle.spawn_unique_batch(entities)?;
+        let snapshots = self.try_call(|handle| handle.spawn_unique_batch(entities))?;
         self.observation.record_entity_inserts(snapshots.len());
         Ok(snapshots)
     }
@@ -399,7 +589,7 @@ impl EntityOwnerAccess {
     ) -> bool {
         let snapshots = snapshots.into_iter().collect::<Vec<_>>();
         let expected = snapshots.len();
-        let inserted = owner_result(self.handle.insert_snapshots_batch(snapshots));
+        let inserted = self.resolve(self.handle.insert_snapshots_batch(snapshots));
         self.observation.record_entity_inserts(inserted);
         inserted == expected
     }
@@ -414,7 +604,7 @@ impl EntityOwnerAccess {
         };
         #[cfg(test)]
         self.record_owner_request();
-        let applied = owner_result(
+        let applied = self.resolve(
             self.handle
                 .set_animal_states_if_current([(expected, animal)]),
         );
@@ -433,7 +623,7 @@ impl EntityOwnerAccess {
             .collect::<Vec<_>>();
         #[cfg(test)]
         self.record_owner_request();
-        let applied = owner_result(self.handle.set_animal_states_if_current(states));
+        let applied = self.resolve(self.handle.set_animal_states_if_current(states));
         for id in ids {
             self.invalidate(id);
         }
@@ -451,7 +641,7 @@ impl EntityOwnerAccess {
             .collect::<Vec<_>>();
         #[cfg(test)]
         self.record_owner_request();
-        let applied = owner_result(
+        let applied = self.resolve(
             self.handle
                 .set_animal_states_if_current_deferred_journal(states),
         );
@@ -463,7 +653,7 @@ impl EntityOwnerAccess {
 
     #[cfg(test)]
     pub(super) fn set_goal(&mut self, id: EntityId, goal: GoalState) -> bool {
-        let applied = owner_result(self.handle.set_goal(id, goal));
+        let applied = self.resolve(self.handle.set_goal(id, goal));
         self.invalidate(id);
         applied
     }
@@ -476,7 +666,7 @@ impl EntityOwnerAccess {
         let ids = goals.iter().map(|(id, _)| *id).collect::<Vec<_>>();
         #[cfg(test)]
         self.record_owner_request();
-        let applied = owner_result(self.handle.set_goals_deferred_journal(goals));
+        let applied = self.resolve(self.handle.set_goals_deferred_journal(goals));
         for id in ids {
             self.invalidate(id);
         }
@@ -490,7 +680,7 @@ impl EntityOwnerAccess {
         stack: Option<EntityItemStack>,
     ) -> bool {
         let id = expected.id;
-        let applied = owner_result(self.handle.set_item_stack_if_current(expected, stack));
+        let applied = self.resolve(self.handle.set_item_stack_if_current(expected, stack));
         self.invalidate(id);
         applied
     }
@@ -501,7 +691,7 @@ impl EntityOwnerAccess {
         claim: u64,
         stack: Option<EntityItemStack>,
     ) -> Option<mc_entity::ItemPickupClaimResolution> {
-        let resolved = owner_result(
+        let resolved = self.resolve(
             self.handle
                 .resolve_item_pickup_claim_deferred_journal(entity, claim, stack),
         );
@@ -534,7 +724,7 @@ impl EntityOwnerAccess {
             .collect::<Vec<_>>();
         #[cfg(test)]
         self.record_owner_request();
-        let applied = owner_result(self.handle.apply_kinematics_if_current(states));
+        let applied = self.resolve(self.handle.apply_kinematics_if_current(states));
         for id in ids {
             self.invalidate(id);
         }
@@ -547,7 +737,7 @@ impl EntityOwnerAccess {
         request: EntityDamageRequest,
     ) -> Option<mc_entity::EntityDamage> {
         let id = expected.id;
-        let damage = owner_result(self.handle.damage_if_current(expected, request));
+        let damage = self.resolve(self.handle.damage_if_current(expected, request));
         self.invalidate(id);
         damage
     }
@@ -558,14 +748,14 @@ impl EntityOwnerAccess {
         request: mc_entity::EntityEffectRequest,
     ) -> mc_entity::EntityEffectResult {
         let id = expected.id;
-        let result = owner_result(self.handle.apply_effect_if_current(expected, request));
+        let result = self.resolve(self.handle.apply_effect_if_current(expected, request));
         self.invalidate(id);
         result
     }
 
     pub(super) fn remove_if_current(&mut self, expected: EntitySnapshot) -> Option<EntitySnapshot> {
         let id = expected.id;
-        let removed = owner_result(self.handle.remove_if_current(expected));
+        let removed = self.resolve(self.handle.remove_if_current(expected));
         if removed.is_some() {
             self.observation.record_entity_remove();
             self.snapshots.borrow_mut().insert(id, None);
@@ -583,7 +773,7 @@ impl EntityOwnerAccess {
         let id = expected.id;
         #[cfg(test)]
         self.record_owner_request();
-        let applied = owner_result(self.handle.replace_snapshot_if_current(expected, next));
+        let applied = self.resolve(self.handle.replace_snapshot_if_current(expected, next));
         self.invalidate(id);
         applied
     }
@@ -596,7 +786,7 @@ impl EntityOwnerAccess {
         let id = expected.id;
         #[cfg(test)]
         self.record_owner_request();
-        let applied = owner_result(self.handle.convert_snapshot_if_current(expected, next));
+        let applied = self.resolve(self.handle.convert_snapshot_if_current(expected, next));
         self.invalidate(id);
         applied
     }
@@ -609,7 +799,7 @@ impl EntityOwnerAccess {
         let id = expected.id;
         #[cfg(test)]
         self.record_owner_request();
-        let applied = owner_result(
+        let applied = self.resolve(
             self.handle
                 .replace_snapshot_if_current_deferred_journal(expected, next),
         );
@@ -628,7 +818,7 @@ impl EntityOwnerAccess {
             .collect::<Vec<_>>();
         #[cfg(test)]
         self.record_owner_request();
-        let applied = owner_result(self.handle.replace_snapshots_if_current(snapshots));
+        let applied = self.resolve(self.handle.replace_snapshots_if_current(snapshots));
         for id in ids {
             self.invalidate(id);
         }
@@ -645,7 +835,7 @@ impl EntityOwnerAccess {
         let consumed_id = consumed_expected.id;
         #[cfg(test)]
         self.record_owner_request();
-        let applied = owner_result(self.handle.merge_item_snapshots_if_current(
+        let applied = self.resolve(self.handle.merge_item_snapshots_if_current(
             survivor_expected,
             survivor_next,
             consumed_expected,
@@ -669,7 +859,7 @@ impl EntityOwnerAccess {
         let item_removed = commit.item.1.is_none();
         #[cfg(test)]
         self.record_owner_request();
-        let applied = owner_result(
+        let applied = self.resolve(
             self.handle
                 .commit_villager_inventory_pickup_if_current(commit),
         );
@@ -690,7 +880,7 @@ impl EntityOwnerAccess {
         let recipient_id = commit.recipient.id;
         #[cfg(test)]
         self.record_owner_request();
-        let thrown = owner_result(self.handle.commit_villager_food_share_if_current(commit));
+        let thrown = self.resolve(self.handle.commit_villager_food_share_if_current(commit));
         self.invalidate(donor_id);
         self.invalidate(recipient_id);
         if let Some(thrown) = &thrown {
@@ -711,7 +901,7 @@ impl EntityOwnerAccess {
             .collect::<Vec<_>>();
         #[cfg(test)]
         self.record_owner_request();
-        let applied = owner_result(self.handle.commit_villager_courtship_if_current(commit));
+        let applied = self.resolve(self.handle.commit_villager_courtship_if_current(commit));
         for id in parent_ids {
             self.invalidate(id);
         }
@@ -729,7 +919,7 @@ impl EntityOwnerAccess {
             .collect::<Vec<_>>();
         #[cfg(test)]
         self.record_owner_request();
-        let applied = owner_result(self.handle.commit_villager_no_bed_if_current(commit));
+        let applied = self.resolve(self.handle.commit_villager_no_bed_if_current(commit));
         for id in parent_ids {
             self.invalidate(id);
         }
@@ -747,7 +937,7 @@ impl EntityOwnerAccess {
             .collect::<Vec<_>>();
         #[cfg(test)]
         self.record_owner_request();
-        let child = owner_result(self.handle.commit_villager_birth_if_current(commit));
+        let child = self.resolve(self.handle.commit_villager_birth_if_current(commit));
         for id in parent_ids {
             self.invalidate(id);
         }
@@ -783,7 +973,7 @@ impl EntityOwnerAccess {
         }
         #[cfg(test)]
         self.record_owner_request();
-        let committed = owner_result(
+        let committed = self.resolve(
             self.handle
                 .apply_kinematics_if_current_deferred_journal_committed(conditional),
         );
@@ -829,7 +1019,7 @@ impl EntityOwnerAccess {
         #[cfg(test)]
         self.record_owner_request();
         let selected = self.selected_snapshots.borrow_mut().take();
-        owner_result(match selected {
+        self.resolve(match selected {
             Some(selected) => self
                 .handle
                 .prepare_goal_tick_with_pathing_for_versioned_snapshots(tick, active_ids, selected),
@@ -846,7 +1036,7 @@ impl EntityOwnerAccess {
     ) -> Option<(mc_entity::GoalTickStats, Vec<EntityKinematics>)> {
         #[cfg(test)]
         self.record_owner_request();
-        let result = owner_result(
+        let result = self.resolve(
             self.handle
                 .apply_prepared_goal_tick_and_kinematics_for_ids_deferred_journal(resolved, ids),
         );
@@ -873,7 +1063,7 @@ impl EntityOwnerAccess {
     ) -> Vec<mc_entity::EntitySimulationProjection> {
         #[cfg(test)]
         self.record_owner_request();
-        owner_result(self.handle.simulation_projections_for_ids(ids))
+        self.resolve(self.handle.simulation_projections_for_ids(ids))
     }
 
     pub(super) fn visit_simulation_entities_for_ids(
@@ -899,7 +1089,8 @@ impl EntityOwnerAccess {
     ) {
         #[cfg(test)]
         self.record_owner_request();
-        for snapshot in owner_result(self.handle.snapshots_for_ids(ids))
+        for snapshot in self
+            .resolve(self.handle.snapshots_for_ids(ids))
             .into_iter()
             .filter(|snapshot| {
                 snapshot.lifecycle == EntityLifecycle::Alive
@@ -934,5 +1125,59 @@ fn entity_snapshot_view(snapshot: &EntitySnapshot) -> mc_entity::EntityView<'_> 
         vehicle: snapshot.vehicle,
         animal: snapshot.animal,
         retained: snapshot.retained.clone(),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn try_owner_result_reports_runtime_fatal_and_returns_typed_errors() {
+        let owners =
+            SessionEntityOwners::try_new(Arc::new(SessionPressureObservation::default()), 1, None)
+                .expect("test entity owners");
+        let mut failure = owners.subscribe_failure();
+
+        assert_eq!(
+            owners.try_resolve::<()>(Err(mc_entity::RegionOwnerLaneError::OutcomeUnknown)),
+            Err(mc_entity::RegionOwnerLaneError::OutcomeUnknown)
+        );
+        assert_eq!(
+            failure
+                .borrow_and_update()
+                .as_ref()
+                .map(|fatal| fatal.error),
+            Some(mc_entity::RegionOwnerLaneError::OutcomeUnknown)
+        );
+        assert_eq!(
+            owners.try_resolve(Ok(7_u8)),
+            Err(mc_entity::RegionOwnerLaneError::OutcomeUnknown),
+            "the first fatal state blocks later owner calls before dispatch"
+        );
+    }
+
+    #[test]
+    fn first_owner_fatal_is_published_before_typed_unwind_and_blocks_future_calls() {
+        let owners =
+            SessionEntityOwners::try_new(Arc::new(SessionPressureObservation::default()), 1, None)
+                .expect("test entity owners");
+        let mut failure = owners.subscribe_failure();
+        let first = owners.report_failure(mc_entity::RegionOwnerLaneError::WorkerPanicked);
+        let repeated = owners.report_failure(mc_entity::RegionOwnerLaneError::OutcomeUnknown);
+
+        assert_eq!(
+            repeated, first,
+            "the first fatal state remains authoritative"
+        );
+        assert_eq!(*failure.borrow_and_update(), Some(first));
+
+        let panic = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| owners.status()))
+            .expect_err("future owner calls must unwind after publishing fatal state");
+        let typed = panic
+            .downcast_ref::<EntityOwnerFatalPanic>()
+            .expect("owner failure uses the typed panic payload");
+        assert_eq!(typed.0, first);
+        assert_eq!(*failure.borrow(), Some(first));
     }
 }

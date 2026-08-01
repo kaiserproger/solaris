@@ -174,6 +174,33 @@ fn is_loopback_peer(peer: SocketAddr) -> bool {
     }
 }
 
+#[derive(Debug)]
+struct EntityOwnerServeError {
+    error: mc_entity::RegionOwnerLaneError,
+}
+
+impl std::fmt::Display for EntityOwnerServeError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            formatter,
+            "regional entity owner entered fatal state: {:?}",
+            self.error
+        )
+    }
+}
+
+impl std::error::Error for EntityOwnerServeError {}
+
+fn entity_owner_serve_error(error: mc_entity::RegionOwnerLaneError) -> std::io::Error {
+    std::io::Error::other(EntityOwnerServeError { error })
+}
+
+fn is_entity_owner_serve_error(error: &std::io::Error) -> bool {
+    error
+        .get_ref()
+        .is_some_and(|inner| inner.is::<EntityOwnerServeError>())
+}
+
 #[derive(Clone, Default)]
 pub struct ShutdownHandle {
     requested: Arc<AtomicBool>,
@@ -1190,8 +1217,9 @@ impl BoundServer {
     /// Accept connections forever, spawning a per-connection task each
     /// time. Shutdown drains runtime owners and returns without performing
     /// the final save; the caller must save through [`SaveHandle`] only after
-    /// this future succeeds. An error inside a connection task is logged but
-    /// does not stop the listener.
+    /// this future succeeds. Ordinary per-connection protocol errors are logged
+    /// inside their task, while a task panic or an authoritative owner failure
+    /// stops admission and enters the coordinated drain path.
     pub async fn serve(self) -> std::io::Result<()> {
         let prewarmed_entity_pathing_states = play::prewarm_entity_pathing_tables();
         info!(
@@ -1212,6 +1240,7 @@ impl BoundServer {
             .and_then(RuntimeControlHandle::take_signal_receiver);
         let runtime_tick_metrics = self.runtime_tick_metrics;
         let sessions = self.sessions;
+        let mut entity_owner_failure = sessions.subscribe_entity_owner_failure();
         let simulation = self.simulation;
         let mut simulation_owner = self.simulation_owner;
         let extension = self.extension;
@@ -2528,6 +2557,8 @@ impl BoundServer {
         });
         let mut entity_ticker_result = None;
         let mut command_drain_error = None;
+        let mut connection_task_error = None;
+        let mut entity_owner_error = None;
         let mut accept_error = None;
         loop {
             tokio::select! {
@@ -2579,7 +2610,39 @@ impl BoundServer {
                 }
                 result = connections.join_next(), if !connections.is_empty() => {
                     if let Some(Err(err)) = result {
-                        warn!(error = %err, "connection task join failed");
+                        connection_task_error = Some(connection_task_join_error(err));
+                        if let Some(runtime_control) = runtime_control.as_ref() {
+                            request_runtime_control_drain(
+                                runtime_control,
+                                &chunk_pipeline_resources,
+                                &sessions,
+                                &shutdown,
+                            );
+                        }
+                        shutdown.request();
+                        break;
+                    }
+                }
+                changed = entity_owner_failure.changed() => {
+                    let fatal_error = match changed {
+                        Ok(()) => entity_owner_failure
+                            .borrow_and_update()
+                            .as_ref()
+                            .map(|fatal| fatal.error),
+                        Err(_) => Some(mc_entity::RegionOwnerLaneError::Closed),
+                    };
+                    if let Some(error) = fatal_error {
+                        entity_owner_error = Some(entity_owner_serve_error(error));
+                        if let Some(runtime_control) = runtime_control.as_ref() {
+                            request_runtime_control_drain(
+                                runtime_control,
+                                &chunk_pipeline_resources,
+                                &sessions,
+                                &shutdown,
+                            );
+                        }
+                        shutdown.request();
+                        break;
                     }
                 }
                 result = command_tasks.join_next(), if !command_tasks.is_empty() => {
@@ -2693,6 +2756,12 @@ impl BoundServer {
             }
         }
         if let Some(error) = accept_error {
+            return Err(error);
+        }
+        if let Some(error) = entity_owner_error {
+            return Err(error);
+        }
+        if let Some(error) = connection_task_error {
             return Err(error);
         }
         if let Some(error) = command_drain_error {
@@ -3105,6 +3174,21 @@ pub(crate) fn resolve_script_entity_type(config: &ServerConfig, entity_type: &st
         .ok()
 }
 
+fn runtime_task_join_error(task: &'static str, error: tokio::task::JoinError) -> std::io::Error {
+    if error.is_panic() {
+        let payload = error.into_panic();
+        if let Some(owner_error) = play::entity_owner_fatal_from_panic(payload.as_ref()) {
+            return entity_owner_serve_error(owner_error);
+        }
+        return std::io::Error::other(format!("{task} task panicked"));
+    }
+    std::io::Error::other(format!("{task} task join failed: {error}"))
+}
+
+fn connection_task_join_error(error: tokio::task::JoinError) -> std::io::Error {
+    runtime_task_join_error("connection", error)
+}
+
 fn log_command_task_exit(
     result: Result<&'static str, tokio::task::JoinError>,
     shutdown_requested: bool,
@@ -3118,9 +3202,7 @@ fn log_command_task_exit(
             warn!(task, "command task stopped unexpectedly");
             Ok(())
         }
-        Err(error) => Err(std::io::Error::other(format!(
-            "command task join failed: {error}"
-        ))),
+        Err(error) => Err(runtime_task_join_error("command", error)),
     }
 }
 
@@ -3215,9 +3297,7 @@ fn handle_entity_ticker_exit(
         }
         Err(error) => {
             warn!(%error, "entity ticker task failed; requesting server shutdown");
-            Err(std::io::Error::other(format!(
-                "entity ticker task failed: {error}"
-            )))
+            Err(runtime_task_join_error("entity ticker", error))
         }
     };
     shutdown.request();
@@ -3234,9 +3314,7 @@ async fn drain_entity_ticker_with_timeout(
 ) -> std::io::Result<()> {
     match tokio::time::timeout(timeout, &mut entity_ticker).await {
         Ok(Ok(())) => Ok(()),
-        Ok(Err(error)) => Err(std::io::Error::other(format!(
-            "entity ticker task join failed: {error}"
-        ))),
+        Ok(Err(error)) => Err(runtime_task_join_error("entity ticker", error)),
         Err(_) => {
             warn!("entity ticker drain timed out; cancelling task");
             entity_ticker.abort();
@@ -3278,7 +3356,9 @@ async fn drain_connections_with_timeout(
     let mut join_error = None;
     while !connections.is_empty() {
         let Some(remaining) = timeout.checked_sub(started.elapsed()) else {
-            cancel_connection_tasks(connections).await;
+            if let Some(error) = cancel_connection_tasks(connections).await {
+                return Err(error);
+            }
             return Err(std::io::Error::new(
                 ErrorKind::TimedOut,
                 "connection drain timed out",
@@ -3288,13 +3368,16 @@ async fn drain_connections_with_timeout(
             Ok(Some(Ok(()))) => {}
             Ok(Some(Err(error))) => {
                 warn!(%error, "connection task join failed");
-                join_error.get_or_insert_with(|| {
-                    std::io::Error::other(format!("connection task join failed: {error}"))
-                });
+                let error = connection_task_join_error(error);
+                if is_entity_owner_serve_error(&error) || join_error.is_none() {
+                    join_error = Some(error);
+                }
             }
             Ok(None) => break,
             Err(_) => {
-                cancel_connection_tasks(connections).await;
+                if let Some(error) = cancel_connection_tasks(connections).await {
+                    return Err(error);
+                }
                 return Err(std::io::Error::new(
                     ErrorKind::TimedOut,
                     "connection drain timed out",
@@ -3308,19 +3391,29 @@ async fn drain_connections_with_timeout(
     }
 }
 
-async fn cancel_connection_tasks(connections: &mut tokio::task::JoinSet<()>) {
+async fn cancel_connection_tasks(
+    connections: &mut tokio::task::JoinSet<()>,
+) -> Option<std::io::Error> {
     warn!(
         remaining = connections.len(),
         "connection drain timed out; cancelling tasks"
     );
     connections.abort_all();
+    let mut failure = None;
     while let Some(result) = connections.join_next().await {
         match result {
             Ok(()) => {}
             Err(error) if error.is_cancelled() => {}
-            Err(error) => warn!(%error, "connection task failed while being cancelled"),
+            Err(error) => {
+                warn!(%error, "connection task failed while being cancelled");
+                let error = connection_task_join_error(error);
+                if is_entity_owner_serve_error(&error) || failure.is_none() {
+                    failure = Some(error);
+                }
+            }
         }
     }
+    failure
 }
 
 async fn drain_chunk_pipeline(resources: &ChunkPipelineResources) {
@@ -4788,17 +4881,33 @@ async fn bind_internal(
         let (journal, pending) = play::persistence::FileRegionalDecisionJournal::open(root)
             .map_err(|error| std::io::Error::new(ErrorKind::InvalidData, error))?;
         (
-            Arc::new(play::SessionRegistry::new_with_entity_owner_journal(
-                chunk_pipeline_resources.cpu_limit(),
-                Box::new(journal),
-            )),
+            Arc::new(
+                play::SessionRegistry::try_new_with_entity_owner_journal(
+                    chunk_pipeline_resources.cpu_limit(),
+                    Box::new(journal),
+                )
+                .map_err(|error| {
+                    std::io::Error::other(format!(
+                        "failed to start regional entity owner runtime: {:?}",
+                        error.error
+                    ))
+                })?,
+            ),
             pending,
         )
     } else {
         (
-            Arc::new(play::SessionRegistry::new_with_entity_owner_lanes(
-                chunk_pipeline_resources.cpu_limit(),
-            )),
+            Arc::new(
+                play::SessionRegistry::try_new_with_entity_owner_lanes(
+                    chunk_pipeline_resources.cpu_limit(),
+                )
+                .map_err(|error| {
+                    std::io::Error::other(format!(
+                        "failed to start regional entity owner runtime: {:?}",
+                        error.error
+                    ))
+                })?,
+            ),
             Vec::new(),
         )
     };
@@ -5577,7 +5686,11 @@ async fn finish_serve_with_final_save<S>(
 where
     S: Future<Output = SaveAllReport>,
 {
-    let serve_error = serve_result.err();
+    let serve_error = match serve_result {
+        Ok(()) => None,
+        Err(error) if is_entity_owner_serve_error(&error) => return Err(error),
+        Err(error) => Some(error),
+    };
     let report = save.await;
     log_save_report("server run final save", &report);
     if let Some(error) = serve_error {
@@ -7953,7 +8066,76 @@ end
     }
 
     #[tokio::test]
-    async fn command_task_join_failure_is_a_drain_error() {
+    async fn entity_owner_failure_is_push_published_and_typed_connection_panic_is_fatal() {
+        let sessions = Arc::new(play::SessionRegistry::new());
+        let mut failure = sessions.subscribe_entity_owner_failure();
+        let reported = sessions
+            .report_entity_owner_failure_for_test(mc_entity::RegionOwnerLaneError::WorkerPanicked);
+
+        failure
+            .changed()
+            .await
+            .expect("owner fatal watch remains open");
+        assert_eq!(
+            failure.borrow_and_update().as_ref().copied(),
+            Some(reported)
+        );
+
+        let task_sessions = Arc::clone(&sessions);
+        let join = tokio::spawn(async move {
+            let _ = task_sessions.entity_owner_status_for_test();
+        })
+        .await
+        .expect_err("owner fatal blocks the connection task through typed unwind");
+        let error = connection_task_join_error(join);
+
+        assert!(is_entity_owner_serve_error(&error));
+        assert!(error.to_string().contains("WorkerPanicked"));
+    }
+
+    #[tokio::test]
+    async fn unrelated_connection_task_panic_is_terminal_without_claiming_owner_uncertainty() {
+        let join = tokio::spawn(async {
+            panic!("injected connection task panic");
+        })
+        .await
+        .expect_err("connection task panic produces a join error");
+
+        let error = connection_task_join_error(join);
+
+        assert_eq!(error.kind(), ErrorKind::Other);
+        assert!(!is_entity_owner_serve_error(&error));
+        assert_eq!(error.to_string(), "connection task panicked");
+    }
+
+    #[tokio::test]
+    async fn entity_owner_serve_error_skips_clean_final_save() {
+        let save_called = Arc::new(AtomicBool::new(false));
+        let save_called_by_future = Arc::clone(&save_called);
+        let save = async move {
+            save_called_by_future.store(true, Ordering::SeqCst);
+            SaveAllReport {
+                players_saved: 0,
+                entities_saved: 0,
+                chunks_flushed: 0,
+                world_metadata_saved: false,
+                timings: SaveAllTimings::default(),
+                errors: Vec::new(),
+            }
+        };
+        let primary = entity_owner_serve_error(mc_entity::RegionOwnerLaneError::OutcomeUnknown);
+
+        let error = finish_serve_with_final_save(Err(primary), save)
+            .await
+            .expect_err("uncertain owner state must remain terminal");
+
+        assert!(!save_called.load(Ordering::SeqCst));
+        assert!(is_entity_owner_serve_error(&error));
+        assert!(error.to_string().contains("OutcomeUnknown"));
+    }
+
+    #[tokio::test]
+    async fn unrelated_command_task_panic_is_a_terminal_drain_error() {
         let result = tokio::spawn(async {
             panic!("injected command task failure");
             #[allow(unreachable_code)]
@@ -7964,7 +8146,39 @@ end
         let error = log_command_task_exit(result, true).expect_err("join failure propagates");
 
         assert_eq!(error.kind(), ErrorKind::Other);
-        assert!(error.to_string().contains("command task join failed"));
+        assert!(!is_entity_owner_serve_error(&error));
+        assert_eq!(error.to_string(), "command task panicked");
+    }
+
+    #[tokio::test]
+    async fn typed_owner_panic_from_command_or_entity_task_remains_owner_fatal() {
+        let sessions = Arc::new(play::SessionRegistry::new());
+        sessions
+            .report_entity_owner_failure_for_test(mc_entity::RegionOwnerLaneError::OutcomeUnknown);
+
+        let command_sessions = Arc::clone(&sessions);
+        let command_result = tokio::spawn(async move {
+            let _ = command_sessions.entity_owner_status_for_test();
+            #[allow(unreachable_code)]
+            "script command"
+        })
+        .await;
+        let command_error =
+            log_command_task_exit(command_result, false).expect_err("typed panic propagates");
+        assert!(is_entity_owner_serve_error(&command_error));
+        assert!(command_error.to_string().contains("OutcomeUnknown"));
+
+        let entity_sessions = Arc::clone(&sessions);
+        let entity_result = tokio::spawn(async move {
+            let _ = entity_sessions.entity_owner_status_for_test();
+        })
+        .await;
+        let shutdown = ShutdownHandle::default();
+        let entity_error = handle_entity_ticker_exit(&shutdown, entity_result)
+            .expect_err("typed panic propagates");
+        assert!(is_entity_owner_serve_error(&entity_error));
+        assert!(entity_error.to_string().contains("OutcomeUnknown"));
+        assert!(shutdown.is_requested());
     }
 
     #[tokio::test]
@@ -8090,6 +8304,25 @@ end
 
         assert_eq!(error.kind(), ErrorKind::TimedOut);
         assert!(held_rx.await.is_err(), "ticker task must be dropped");
+    }
+
+    #[tokio::test]
+    async fn late_owner_panic_during_connection_drain_remains_owner_fatal() {
+        let sessions = Arc::new(play::SessionRegistry::new());
+        sessions
+            .report_entity_owner_failure_for_test(mc_entity::RegionOwnerLaneError::WorkerPanicked);
+        let mut connections = tokio::task::JoinSet::new();
+        connections.spawn(async move {
+            let _ = sessions.entity_owner_status_for_test();
+        });
+
+        let error = drain_connections_with_timeout(&mut connections, Duration::from_secs(1))
+            .await
+            .expect_err("late owner panic must fail the drain");
+
+        assert!(connections.is_empty());
+        assert!(is_entity_owner_serve_error(&error));
+        assert!(error.to_string().contains("WorkerPanicked"));
     }
 
     #[tokio::test]

@@ -27,10 +27,10 @@ and is not startup context.
   simulation request deadlines with owner-health wake-up, and `SOL-007` bounded
   Mojang session verification, `SOL-008` strict/offloaded compression framing,
   and `SOL-030` canonical login-name validation and collision policy are complete;
-  `SOL-002` close-safe async extension boundaries and `SOL-012` bounded committed
-  script-event delivery with explicit required/best-effort policy are complete;
-  `SOL-031` player-state authority ownership is next in the current
-  runtime-ownership series.
+  `SOL-002` close-safe async extension boundaries, `SOL-012` bounded committed
+  script-event delivery with explicit required/best-effort policy, and `SOL-031`
+  crash-only regional-owner supervision are complete; `SOL-041` poisoned-lock
+  classification is next in the current runtime-ownership series.
 - The first owner-run public-alpha session remains the routing authority for the
   next stabilization release; its exact plan is `docs/PUBLIC_ALPHA_PLAN.md`.
 - The future full Luau addon platform is frozen in

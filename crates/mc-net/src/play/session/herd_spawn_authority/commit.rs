@@ -32,10 +32,13 @@ impl SessionRegistry {
                 if failure.is_some_and(|error| !error.outcome_unknown()) {
                     Err(())
                 } else {
-                    owner_result(Err(mc_entity::RegionOwnerLaneError::Journal))
+                    owner_result(
+                        &self.entities,
+                        Err(mc_entity::RegionOwnerLaneError::Journal),
+                    )
                 }
             }
-            Err(error) => owner_result(Err(error)),
+            Err(error) => owner_result(&self.entities, Err(error)),
         }
     }
 }

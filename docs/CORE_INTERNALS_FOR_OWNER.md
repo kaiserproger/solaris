@@ -490,6 +490,16 @@ ECS components и индексы, необходимые для быстрых �
 physics iteration. Snapshot сознательно дороже component query: это boundary для
 сети, persistence и cross-lane coordination, а не формат внутреннего цикла.
 
+Regional coordinator и lane workers используют crash-only supervision. Worker
+unwind ловится внутри thread boundary и публикует `WorkerPanicked` до channel
+closure; после этого все новые owner calls fail closed. Потеря reply после
+фактической передачи region store возвращает `recovered = None`, поэтому caller
+не может создать вторую authority; coordinator помечает topology
+`OutcomeUnknown`. `mc-net` публикует first-fatal state через watch, прекращает
+network/script/entity admission, выполняет bounded drain и возвращает typed
+`serve` error. Clean final save запрещен для `WorkerPanicked`/`OutcomeUnknown`,
+поскольку authoritative state может быть неопределённым.
+
 ### 11.2 Production и staged нельзя смешивать
 
 В `mc-entity` сейчас есть два уровня:

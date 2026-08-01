@@ -32,6 +32,7 @@ mod entity_combat;
 mod entity_goal_defaults;
 mod entity_lifecycle;
 mod entity_owner;
+pub(crate) use entity_owner::entity_owner_fatal_from_panic;
 mod entity_physics_class;
 mod entity_simulation;
 mod entity_spawn_facts;
@@ -810,6 +811,7 @@ impl DerefMut for SessionEntityGuards<'_> {
     }
 }
 
+#[cfg(test)]
 impl Default for SessionRegistry {
     fn default() -> Self {
         let lane_count = std::thread::available_parallelism().map_or(1, usize::from);
@@ -818,20 +820,24 @@ impl Default for SessionRegistry {
 }
 
 impl SessionRegistry {
+    #[cfg(test)]
     fn with_entity_owner_lanes(lane_count: usize) -> Self {
-        Self::with_entity_owner_lanes_and_journal(lane_count, None)
+        Self::try_with_entity_owner_lanes_and_journal(lane_count, None)
+            .expect("test regional entity owner runtime must start")
     }
 
-    fn with_entity_owner_lanes_and_journal(
+    fn try_with_entity_owner_lanes_and_journal(
         lane_count: usize,
         journal: Option<Box<dyn mc_entity::RegionalDecisionJournal>>,
-    ) -> Self {
+    ) -> Result<Self, mc_entity::RegionalOwnerCutoverError> {
         let (simulation_tick_sender, _) = tokio::sync::watch::channel(0);
         let (player_attack_sender, _) = tokio::sync::broadcast::channel(64);
         let (active_session_sender, _) = tokio::sync::watch::channel(0);
         let pressure_observation = Arc::new(SessionPressureObservation::default());
         let simulation_inputs = Arc::new(SimulationInputPublication::default());
-        Self {
+        let entities =
+            SessionEntityOwners::try_new(Arc::clone(&pressure_observation), lane_count, journal)?;
+        Ok(Self {
             inner: Mutex::new(SessionRegistryInner {
                 simulation_inputs: Arc::clone(&simulation_inputs),
                 ..SessionRegistryInner::default()
@@ -856,11 +862,7 @@ impl SessionRegistry {
             ),
             hostile_arrow_entity_type_id: AtomicI32::new(-1),
             prepared_cache: Mutex::new(PreparedChunkCache::default()),
-            entities: SessionEntityOwners::new(
-                Arc::clone(&pressure_observation),
-                lane_count,
-                journal,
-            ),
+            entities,
             world_chunk_journal: Mutex::new(None),
             world_chunk_journal_failure: tokio::sync::watch::channel(false).0,
             script_commit_event_metrics: Arc::new(ScriptCommitEventMetrics::default()),
@@ -974,7 +976,7 @@ impl SessionRegistry {
             hostile_attack_candidates: AtomicU64::new(0),
             #[cfg(test)]
             hostile_entity_scan_visits: AtomicU64::new(0),
-        }
+        })
     }
 
     #[allow(dead_code)]
@@ -1127,32 +1129,70 @@ impl SessionRegistry {
         self.world_chunk_journal_failure.clone()
     }
 
+    pub(crate) fn subscribe_entity_owner_failure(
+        &self,
+    ) -> tokio::sync::watch::Receiver<Option<entity_owner::EntityOwnerFatal>> {
+        self.entities.subscribe_failure()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn report_entity_owner_failure_for_test(
+        &self,
+        error: mc_entity::RegionOwnerLaneError,
+    ) -> entity_owner::EntityOwnerFatal {
+        self.entities.report_failure(error)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn entity_owner_status_for_test(&self) -> RegionalOwnerStatus {
+        self.entities.status()
+    }
+
     #[must_use]
     #[cfg(test)]
     pub(crate) fn new() -> Self {
         Self::default()
     }
 
-    #[must_use]
-    pub(crate) fn new_with_entity_owner_lanes(lane_count: usize) -> Self {
-        Self::with_entity_owner_lanes(lane_count)
+    pub(crate) fn try_new_with_entity_owner_lanes(
+        lane_count: usize,
+    ) -> Result<Self, mc_entity::RegionalOwnerCutoverError> {
+        Self::try_with_entity_owner_lanes_and_journal(lane_count, None)
+    }
+
+    pub(crate) fn try_new_with_entity_owner_journal(
+        lane_count: usize,
+        journal: Box<dyn mc_entity::RegionalDecisionJournal>,
+    ) -> Result<Self, mc_entity::RegionalOwnerCutoverError> {
+        Self::try_with_entity_owner_lanes_and_journal(lane_count, Some(journal))
     }
 
     #[must_use]
+    #[cfg(test)]
+    pub(crate) fn new_with_entity_owner_lanes(lane_count: usize) -> Self {
+        Self::try_new_with_entity_owner_lanes(lane_count)
+            .expect("test regional entity owner runtime must start")
+    }
+
+    #[must_use]
+    #[cfg(test)]
     pub(crate) fn new_with_entity_owner_journal(
         lane_count: usize,
         journal: Box<dyn mc_entity::RegionalDecisionJournal>,
     ) -> Self {
-        Self::with_entity_owner_lanes_and_journal(lane_count, Some(journal))
+        Self::try_new_with_entity_owner_journal(lane_count, journal)
+            .expect("test regional entity owner runtime with journal must start")
     }
 
     pub(crate) fn clear_recovered_entity_commits(
         &self,
         phases: &[mc_entity::RegionPhase],
     ) -> Result<(), mc_entity::RegionOwnerLaneError> {
-        self.entities
+        let result = self
+            .entities
             .handle
-            .clear_recovered_commits(phases.iter().copied())
+            .clear_recovered_commits(phases.iter().copied());
+        self.entities.try_resolve(result)
     }
 
     pub(crate) fn reconfigure_entity_owner_lanes(&self, lane_count: usize) -> usize {
@@ -1325,7 +1365,7 @@ impl SessionRegistry {
             .collect::<HashSet<_>>();
         #[cfg(test)]
         self.entities.record_owner_request_for_test();
-        let current = owner_result(self.entities.handle.snapshots_for_ids(&ids));
+        let current = owner_result(&self.entities, self.entities.handle.snapshots_for_ids(&ids));
         filter_current_expected_entity_snapshots(expected, current)
     }
 

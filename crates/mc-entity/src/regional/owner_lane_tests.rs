@@ -1106,3 +1106,31 @@ fn owner_lane_start_validation_returns_the_physical_store() {
     assert_eq!(error.regions.len(), 1);
     assert!(error.regions[0].1.contains(entity));
 }
+
+#[test]
+fn owner_lane_panic_after_store_handoff_is_typed_and_never_returns_a_recovered_store() {
+    let lane = super::RegionalOwnerLane::spawn(0, std::iter::empty()).expect("empty owner lane");
+    lane.panic_after_next_install_for_test();
+    let lease = super::RegionLease {
+        key: RegionKey::new(0, 0),
+        epoch: RegionEpoch::INITIAL,
+        lane: 0,
+    };
+    let mut store = EntityStore::new();
+    let entity = store.spawn(cow(Vec3::new(0.5, 64.0, 0.5)));
+
+    let failure = lane
+        .install_region(lease, store)
+        .expect_err("injected post-handoff panic must fail installation");
+
+    assert_eq!(failure.error, super::RegionOwnerLaneError::WorkerPanicked);
+    assert!(
+        failure.recovered.is_none(),
+        "a store accepted by a panicked owner must not be exposed for a second owner"
+    );
+    assert!(matches!(
+        lane.shutdown(),
+        Err(super::RegionOwnerLaneError::WorkerPanicked)
+    ));
+    let _ = entity;
+}

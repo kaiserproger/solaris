@@ -1389,7 +1389,7 @@ impl SessionRegistry {
             .advance_lifecycle_epoch(metadata.lifecycle_tick);
         #[cfg(test)]
         self.pause_before_entity_save_owner_barrier_for_test();
-        let saved = owner_result(self.entities.handle.save_barrier());
+        let saved = owner_result(&self.entities, self.entities.handle.save_barrier());
         let (mut checkpoint, phases) = project_owner_save(saved, &metadata);
         checkpoint.settlement_claims = self
             .lock_inner("snapshot settlement spawn claims")

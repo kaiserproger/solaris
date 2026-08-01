@@ -992,12 +992,14 @@ impl SessionRegistry {
         entity_id: EntityId,
         stack: EntityItemStack,
     ) -> bool {
-        let Some(snapshot) =
-            super::entity_owner::owner_result(self.entities.handle.snapshot(entity_id))
-        else {
+        let Some(snapshot) = super::entity_owner::owner_result(
+            &self.entities,
+            self.entities.handle.snapshot(entity_id),
+        ) else {
             return false;
         };
         super::entity_owner::owner_result(
+            &self.entities,
             self.entities
                 .handle
                 .set_item_stack_if_current(snapshot, Some(stack)),
@@ -1010,15 +1012,19 @@ impl SessionRegistry {
         entity_id: EntityId,
         position: Vec3,
     ) -> bool {
-        let Some(snapshot) =
-            super::entity_owner::owner_result(self.entities.handle.snapshot(entity_id))
-        else {
+        let Some(snapshot) = super::entity_owner::owner_result(
+            &self.entities,
+            self.entities.handle.snapshot(entity_id),
+        ) else {
             return false;
         };
         if snapshot.retained.item_pickup_claim.is_none() {
             return false;
         }
-        super::entity_owner::owner_result(self.entities.handle.set_position(entity_id, position))
+        super::entity_owner::owner_result(
+            &self.entities,
+            self.entities.handle.set_position(entity_id, position),
+        )
     }
 
     #[cfg(test)]

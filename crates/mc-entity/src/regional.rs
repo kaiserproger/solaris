@@ -1,5 +1,5 @@
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
-use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU64, AtomicUsize, Ordering};
 use std::sync::mpsc::{Receiver, SyncSender, channel, sync_channel};
 use std::sync::{Arc, Mutex, RwLock};
 use std::thread::JoinHandle;
@@ -971,6 +971,10 @@ impl RegionalOwnerCommitState {
         }
     }
 
+    fn mark_outcome_unknown(&self) {
+        self.outcome_unknown.store(true, Ordering::Release);
+    }
+
     fn reserve_sequences(&self, count: usize) -> Result<(u64, u64), RegionOwnerLaneError> {
         self.ensure_committed_state()?;
         let count = u64::try_from(count).map_err(|_| RegionOwnerLaneError::InvalidMutation)?;
@@ -1106,6 +1110,7 @@ impl RegionalOwnerCommitState {
 #[derive(Clone)]
 pub struct RegionalOwnerHandle {
     sender: SyncSender<RegionalOwnerCommand>,
+    worker_health: Arc<RegionalOwnerWorkerHealth>,
     authority: RegionalAuthorityId,
     selected_read_routes: Arc<RwLock<HashMap<EntityId, CachedEntityReadRoute>>>,
     mutation_gate: Arc<RwLock<()>>,
@@ -1210,6 +1215,48 @@ struct RegionalVersionFence {
 struct SelectedEntitySnapshots {
     fence: RegionalVersionFence,
     snapshots: Vec<EntitySnapshot>,
+}
+
+const OWNER_WORKER_RUNNING: u8 = 0;
+const OWNER_WORKER_STOPPED: u8 = 1;
+const OWNER_WORKER_PANICKED: u8 = 2;
+
+#[derive(Debug)]
+struct RegionalOwnerWorkerHealth {
+    state: AtomicU8,
+}
+
+impl RegionalOwnerWorkerHealth {
+    fn new() -> Self {
+        Self {
+            state: AtomicU8::new(OWNER_WORKER_RUNNING),
+        }
+    }
+
+    fn mark_stopped(&self) {
+        self.state.store(OWNER_WORKER_STOPPED, Ordering::Release);
+    }
+
+    fn mark_panicked(&self) {
+        self.state.store(OWNER_WORKER_PANICKED, Ordering::Release);
+    }
+
+    fn error(&self) -> Option<RegionOwnerLaneError> {
+        match self.state.load(Ordering::Acquire) {
+            OWNER_WORKER_RUNNING => None,
+            OWNER_WORKER_PANICKED => Some(RegionOwnerLaneError::WorkerPanicked),
+            _ => Some(RegionOwnerLaneError::Closed),
+        }
+    }
+
+    fn error_after_disconnect(&self) -> RegionOwnerLaneError {
+        loop {
+            if let Some(error) = self.error() {
+                return error;
+            }
+            std::thread::yield_now();
+        }
+    }
 }
 
 pub struct RegionalOwnerRuntime {
@@ -1431,6 +1478,8 @@ enum RegionalOwnerCommand {
         entered: std::sync::mpsc::Sender<()>,
         release: Receiver<()>,
     },
+    #[cfg(test)]
+    PanicForTest,
     Shutdown {
         reply: std::sync::mpsc::Sender<Result<RegionalEntityStore, RegionalOwnerShutdownError>>,
     },
@@ -1631,28 +1680,46 @@ fn topology_access_for_command(
 }
 
 impl RegionalOwnerHandle {
+    #[must_use]
+    pub fn fatal_error(&self) -> Option<RegionOwnerLaneError> {
+        self.worker_health
+            .error()
+            .and_then(|error| (error == RegionOwnerLaneError::WorkerPanicked).then_some(error))
+    }
+
+    fn unavailable_error(&self) -> RegionOwnerLaneError {
+        self.worker_health.error_after_disconnect()
+    }
+
+    fn ensure_operational(&self) -> Result<(), RegionOwnerLaneError> {
+        if let Some(error) = self.worker_health.error() {
+            return Err(error);
+        }
+        self.commit_state.ensure_committed_state()
+    }
+
     pub fn snapshot(
         &self,
         entity: EntityId,
     ) -> Result<Option<EntitySnapshot>, RegionOwnerLaneError> {
-        self.commit_state.ensure_committed_state()?;
+        self.ensure_operational()?;
         if let Some(mut selected) = self.read_cached_selected_entities(&HashSet::from([entity])) {
             return Ok(selected.snapshots.pop());
         }
         let (reply, result) = channel();
         self.sender
             .send(RegionalOwnerCommand::Snapshot { entity, reply })
-            .map_err(|_| RegionOwnerLaneError::Closed)?;
-        result.recv().map_err(|_| RegionOwnerLaneError::Closed)?
+            .map_err(|_| self.unavailable_error())?;
+        result.recv().map_err(|_| self.unavailable_error())?
     }
 
     pub fn snapshots(&self) -> Result<Vec<EntitySnapshot>, RegionOwnerLaneError> {
-        self.commit_state.ensure_committed_state()?;
+        self.ensure_operational()?;
         let (reply, result) = channel();
         self.sender
             .send(RegionalOwnerCommand::Snapshots { reply })
-            .map_err(|_| RegionOwnerLaneError::Closed)?;
-        result.recv().map_err(|_| RegionOwnerLaneError::Closed)?
+            .map_err(|_| self.unavailable_error())?;
+        result.recv().map_err(|_| self.unavailable_error())?
     }
 
     pub fn claim_nearest_villager(
@@ -1671,8 +1738,8 @@ impl RegionalOwnerHandle {
                 token,
                 reply,
             })
-            .map_err(|_| RegionOwnerLaneError::Closed)?;
-        result.recv().map_err(|_| RegionOwnerLaneError::Closed)?
+            .map_err(|_| self.unavailable_error())?;
+        result.recv().map_err(|_| self.unavailable_error())?
     }
 
     pub fn apply_villager_binding_goal(
@@ -1683,8 +1750,8 @@ impl RegionalOwnerHandle {
         let (reply, result) = channel();
         self.sender
             .send(RegionalOwnerCommand::ApplyVillagerBindingGoal { token, goal, reply })
-            .map_err(|_| RegionOwnerLaneError::Closed)?;
-        result.recv().map_err(|_| RegionOwnerLaneError::Closed)?
+            .map_err(|_| self.unavailable_error())?;
+        result.recv().map_err(|_| self.unavailable_error())?
     }
 
     pub fn simulation_projections_for_ids(
@@ -1700,8 +1767,8 @@ impl RegionalOwnerHandle {
                 entities: entities.clone(),
                 reply,
             })
-            .map_err(|_| RegionOwnerLaneError::Closed)?;
-        result.recv().map_err(|_| RegionOwnerLaneError::Closed)?
+            .map_err(|_| self.unavailable_error())?;
+        result.recv().map_err(|_| self.unavailable_error())?
     }
 
     pub fn snapshots_for_ids(
@@ -1717,10 +1784,10 @@ impl RegionalOwnerHandle {
                 entities: entities.clone(),
                 reply,
             })
-            .map_err(|_| RegionOwnerLaneError::Closed)?;
+            .map_err(|_| self.unavailable_error())?;
         result
             .recv()
-            .map_err(|_| RegionOwnerLaneError::Closed)?
+            .map_err(|_| self.unavailable_error())?
             .map(VersionedEntitySnapshots::into_snapshots)
     }
 
@@ -1737,8 +1804,8 @@ impl RegionalOwnerHandle {
                 entities: entities.clone(),
                 reply,
             })
-            .map_err(|_| RegionOwnerLaneError::Closed)?;
-        result.recv().map_err(|_| RegionOwnerLaneError::Closed)?
+            .map_err(|_| self.unavailable_error())?;
+        result.recv().map_err(|_| self.unavailable_error())?
     }
 
     fn read_cached_selected_entities_versioned(
@@ -1934,7 +2001,14 @@ impl RegionalOwnerHandle {
     ) -> Result<(), RegionOwnerLaneError> {
         self.sender
             .send(RegionalOwnerCommand::HoldForTest { entered, release })
-            .map_err(|_| RegionOwnerLaneError::Closed)
+            .map_err(|_| self.unavailable_error())
+    }
+
+    #[cfg(test)]
+    fn panic_coordinator_for_test(&self) -> Result<(), RegionOwnerLaneError> {
+        self.sender
+            .send(RegionalOwnerCommand::PanicForTest)
+            .map_err(|_| self.unavailable_error())
     }
 
     #[cfg(test)]
@@ -1950,31 +2024,31 @@ impl RegionalOwnerHandle {
                 entered,
                 release,
             })
-            .map_err(|_| RegionOwnerLaneError::Closed)
+            .map_err(|_| self.unavailable_error())
     }
 
     pub fn contains_uuid(&self, uuid: Uuid) -> Result<bool, RegionOwnerLaneError> {
         let (reply, result) = channel();
         self.sender
             .send(RegionalOwnerCommand::ContainsUuid { uuid, reply })
-            .map_err(|_| RegionOwnerLaneError::Closed)?;
-        result.recv().map_err(|_| RegionOwnerLaneError::Closed)?
+            .map_err(|_| self.unavailable_error())?;
+        result.recv().map_err(|_| self.unavailable_error())?
     }
 
     pub fn status(&self) -> Result<RegionalOwnerStatus, RegionOwnerLaneError> {
         let (reply, result) = channel();
         self.sender
             .send(RegionalOwnerCommand::Status { reply })
-            .map_err(|_| RegionOwnerLaneError::Closed)?;
-        result.recv().map_err(|_| RegionOwnerLaneError::Closed)?
+            .map_err(|_| self.unavailable_error())?;
+        result.recv().map_err(|_| self.unavailable_error())?
     }
 
     pub fn reconfigure_lanes(&self, lane_count: usize) -> Result<usize, RegionOwnerLaneError> {
         let (reply, result) = channel();
         self.sender
             .send(RegionalOwnerCommand::ReconfigureLanes { lane_count, reply })
-            .map_err(|_| RegionOwnerLaneError::Closed)?;
-        result.recv().map_err(|_| RegionOwnerLaneError::Closed)?
+            .map_err(|_| self.unavailable_error())?;
+        result.recv().map_err(|_| self.unavailable_error())?
     }
 
     pub fn clear_recovered_commits(
@@ -1989,8 +2063,8 @@ impl RegionalOwnerHandle {
         let (reply, result) = channel();
         self.sender
             .send(RegionalOwnerCommand::SaveBarrier { reply })
-            .map_err(|_| RegionOwnerLaneError::Closed)?;
-        result.recv().map_err(|_| RegionOwnerLaneError::Closed)?
+            .map_err(|_| self.unavailable_error())?;
+        result.recv().map_err(|_| self.unavailable_error())?
     }
 
     pub fn advance_lifecycle_epoch(
@@ -2003,8 +2077,8 @@ impl RegionalOwnerHandle {
                 lifecycle_epoch,
                 reply,
             })
-            .map_err(|_| RegionOwnerLaneError::Closed)?;
-        result.recv().map_err(|_| RegionOwnerLaneError::Closed)?
+            .map_err(|_| self.unavailable_error())?;
+        result.recv().map_err(|_| self.unavailable_error())?
     }
 
     pub fn restore_checkpoint_boundary(
@@ -2019,8 +2093,8 @@ impl RegionalOwnerHandle {
                 sequence_watermark,
                 reply,
             })
-            .map_err(|_| RegionOwnerLaneError::Closed)?;
-        result.recv().map_err(|_| RegionOwnerLaneError::Closed)?
+            .map_err(|_| self.unavailable_error())?;
+        result.recv().map_err(|_| self.unavailable_error())?
     }
 
     pub fn spawn(&self, entity: SpawnEntity) -> Result<EntityId, RegionOwnerLaneError> {
@@ -2031,8 +2105,8 @@ impl RegionalOwnerHandle {
                 defer_journal: false,
                 reply,
             })
-            .map_err(|_| RegionOwnerLaneError::Closed)?;
-        result.recv().map_err(|_| RegionOwnerLaneError::Closed)?
+            .map_err(|_| self.unavailable_error())?;
+        result.recv().map_err(|_| self.unavailable_error())?
     }
 
     pub fn spawn_deferred_journal(
@@ -2046,8 +2120,8 @@ impl RegionalOwnerHandle {
                 defer_journal: true,
                 reply,
             })
-            .map_err(|_| RegionOwnerLaneError::Closed)?;
-        result.recv().map_err(|_| RegionOwnerLaneError::Closed)?
+            .map_err(|_| self.unavailable_error())?;
+        result.recv().map_err(|_| self.unavailable_error())?
     }
 
     pub fn spawn_batch(
@@ -2060,8 +2134,8 @@ impl RegionalOwnerHandle {
                 entities: entities.into_iter().collect(),
                 reply,
             })
-            .map_err(|_| RegionOwnerLaneError::Closed)?;
-        result.recv().map_err(|_| RegionOwnerLaneError::Closed)?
+            .map_err(|_| self.unavailable_error())?;
+        result.recv().map_err(|_| self.unavailable_error())?
     }
 
     pub fn spawn_unique_batch(
@@ -2074,8 +2148,8 @@ impl RegionalOwnerHandle {
                 entities: entities.into_iter().collect(),
                 reply,
             })
-            .map_err(|_| RegionOwnerLaneError::Closed)?;
-        result.recv().map_err(|_| RegionOwnerLaneError::Closed)?
+            .map_err(|_| self.unavailable_error())?;
+        result.recv().map_err(|_| self.unavailable_error())?
     }
 
     pub fn insert_snapshots_batch(
@@ -2088,16 +2162,16 @@ impl RegionalOwnerHandle {
                 snapshots: snapshots.into_iter().collect(),
                 reply,
             })
-            .map_err(|_| RegionOwnerLaneError::Closed)?;
-        result.recv().map_err(|_| RegionOwnerLaneError::Closed)?
+            .map_err(|_| self.unavailable_error())?;
+        result.recv().map_err(|_| self.unavailable_error())?
     }
 
     pub fn remove(&self, entity: EntityId) -> Result<Option<EntitySnapshot>, RegionOwnerLaneError> {
         let (reply, result) = channel();
         self.sender
             .send(RegionalOwnerCommand::Remove { entity, reply })
-            .map_err(|_| RegionOwnerLaneError::Closed)?;
-        result.recv().map_err(|_| RegionOwnerLaneError::Closed)?
+            .map_err(|_| self.unavailable_error())?;
+        result.recv().map_err(|_| self.unavailable_error())?
     }
 
     pub fn remove_if_current(
@@ -2110,8 +2184,8 @@ impl RegionalOwnerHandle {
                 expected: Box::new(expected),
                 reply,
             })
-            .map_err(|_| RegionOwnerLaneError::Closed)?;
-        result.recv().map_err(|_| RegionOwnerLaneError::Closed)?
+            .map_err(|_| self.unavailable_error())?;
+        result.recv().map_err(|_| self.unavailable_error())?
     }
 
     pub fn replace_snapshot_if_current(
@@ -2154,8 +2228,8 @@ impl RegionalOwnerHandle {
                 allow_type_change,
                 reply,
             })
-            .map_err(|_| RegionOwnerLaneError::Closed)?;
-        result.recv().map_err(|_| RegionOwnerLaneError::Closed)?
+            .map_err(|_| self.unavailable_error())?;
+        result.recv().map_err(|_| self.unavailable_error())?
     }
 
     pub fn replace_snapshots_if_current(
@@ -2169,8 +2243,8 @@ impl RegionalOwnerHandle {
         let (reply, result) = channel();
         self.sender
             .send(RegionalOwnerCommand::ReplaceSnapshotsIfCurrent { snapshots, reply })
-            .map_err(|_| RegionOwnerLaneError::Closed)?;
-        result.recv().map_err(|_| RegionOwnerLaneError::Closed)?
+            .map_err(|_| self.unavailable_error())?;
+        result.recv().map_err(|_| self.unavailable_error())?
     }
 
     pub fn merge_item_snapshots_if_current(
@@ -2187,8 +2261,8 @@ impl RegionalOwnerHandle {
                 consumed_expected: Box::new(consumed_expected),
                 reply,
             })
-            .map_err(|_| RegionOwnerLaneError::Closed)?;
-        result.recv().map_err(|_| RegionOwnerLaneError::Closed)?
+            .map_err(|_| self.unavailable_error())?;
+        result.recv().map_err(|_| self.unavailable_error())?
     }
 
     pub fn commit_villager_birth_if_current(
@@ -2201,8 +2275,8 @@ impl RegionalOwnerHandle {
                 commit: Box::new(commit),
                 reply,
             })
-            .map_err(|_| RegionOwnerLaneError::Closed)?;
-        result.recv().map_err(|_| RegionOwnerLaneError::Closed)?
+            .map_err(|_| self.unavailable_error())?;
+        result.recv().map_err(|_| self.unavailable_error())?
     }
 
     pub fn commit_villager_inventory_pickup_if_current(
@@ -2217,8 +2291,8 @@ impl RegionalOwnerHandle {
                     reply,
                 },
             )
-            .map_err(|_| RegionOwnerLaneError::Closed)?;
-        result.recv().map_err(|_| RegionOwnerLaneError::Closed)?
+            .map_err(|_| self.unavailable_error())?;
+        result.recv().map_err(|_| self.unavailable_error())?
     }
 
     pub fn commit_villager_food_share_if_current(
@@ -2231,8 +2305,8 @@ impl RegionalOwnerHandle {
                 commit: Box::new(commit),
                 reply,
             })
-            .map_err(|_| RegionOwnerLaneError::Closed)?;
-        result.recv().map_err(|_| RegionOwnerLaneError::Closed)?
+            .map_err(|_| self.unavailable_error())?;
+        result.recv().map_err(|_| self.unavailable_error())?
     }
 
     pub fn commit_villager_courtship_if_current(
@@ -2245,8 +2319,8 @@ impl RegionalOwnerHandle {
                 commit: Box::new(commit),
                 reply,
             })
-            .map_err(|_| RegionOwnerLaneError::Closed)?;
-        result.recv().map_err(|_| RegionOwnerLaneError::Closed)?
+            .map_err(|_| self.unavailable_error())?;
+        result.recv().map_err(|_| self.unavailable_error())?
     }
 
     pub fn commit_villager_no_bed_if_current(
@@ -2259,8 +2333,8 @@ impl RegionalOwnerHandle {
                 commit: Box::new(commit),
                 reply,
             })
-            .map_err(|_| RegionOwnerLaneError::Closed)?;
-        result.recv().map_err(|_| RegionOwnerLaneError::Closed)?
+            .map_err(|_| self.unavailable_error())?;
+        result.recv().map_err(|_| self.unavailable_error())?
     }
 
     pub fn set_animal_states_if_current(
@@ -2311,8 +2385,8 @@ impl RegionalOwnerHandle {
                 defer_journal: !journal_commit,
                 reply,
             })
-            .map_err(|_| RegionOwnerLaneError::Closed)?;
-        result.recv().map_err(|_| RegionOwnerLaneError::Closed)?
+            .map_err(|_| self.unavailable_error())?;
+        result.recv().map_err(|_| self.unavailable_error())?
     }
 
     pub fn set_goal(
@@ -2327,8 +2401,8 @@ impl RegionalOwnerHandle {
                 goal,
                 reply,
             })
-            .map_err(|_| RegionOwnerLaneError::Closed)?;
-        result.recv().map_err(|_| RegionOwnerLaneError::Closed)?
+            .map_err(|_| self.unavailable_error())?;
+        result.recv().map_err(|_| self.unavailable_error())?
     }
 
     pub fn set_goals(
@@ -2385,8 +2459,8 @@ impl RegionalOwnerHandle {
                 defer_journal: false,
                 reply,
             })
-            .map_err(|_| RegionOwnerLaneError::Closed)?;
-        result.recv().map_err(|_| RegionOwnerLaneError::Closed)?
+            .map_err(|_| self.unavailable_error())?;
+        result.recv().map_err(|_| self.unavailable_error())?
     }
 
     pub fn set_goals_deferred_journal(
@@ -2404,8 +2478,8 @@ impl RegionalOwnerHandle {
                 defer_journal: true,
                 reply,
             })
-            .map_err(|_| RegionOwnerLaneError::Closed)?;
-        result.recv().map_err(|_| RegionOwnerLaneError::Closed)?
+            .map_err(|_| self.unavailable_error())?;
+        result.recv().map_err(|_| self.unavailable_error())?
     }
 
     pub fn set_item_stack(
@@ -2420,8 +2494,8 @@ impl RegionalOwnerHandle {
                 item_stack,
                 reply,
             })
-            .map_err(|_| RegionOwnerLaneError::Closed)?;
-        result.recv().map_err(|_| RegionOwnerLaneError::Closed)?
+            .map_err(|_| self.unavailable_error())?;
+        result.recv().map_err(|_| self.unavailable_error())?
     }
 
     pub fn set_item_stack_if_current(
@@ -2450,8 +2524,8 @@ impl RegionalOwnerHandle {
                 item_stack,
                 reply,
             })
-            .map_err(|_| RegionOwnerLaneError::Closed)?;
-        result.recv().map_err(|_| RegionOwnerLaneError::Closed)?
+            .map_err(|_| self.unavailable_error())?;
+        result.recv().map_err(|_| self.unavailable_error())?
     }
 
     pub fn resolve_item_pickup_claim(
@@ -2488,8 +2562,8 @@ impl RegionalOwnerHandle {
                 defer_journal: !journal_commit,
                 reply,
             })
-            .map_err(|_| RegionOwnerLaneError::Closed)?;
-        result.recv().map_err(|_| RegionOwnerLaneError::Closed)?
+            .map_err(|_| self.unavailable_error())?;
+        result.recv().map_err(|_| self.unavailable_error())?
     }
 
     fn try_commit_cached_snapshot_mutation(
@@ -2690,7 +2764,7 @@ impl RegionalOwnerHandle {
                 sequence_watermark: sequence,
                 mutations,
             })?;
-            match committed.recv().map_err(|_| RegionOwnerLaneError::Closed)? {
+            match committed.recv().map_err(|_| self.unavailable_error())? {
                 Ok(completion) if completion.phase == phase => {}
                 Ok(_) => return Err(RegionOwnerLaneError::StalePhase),
                 Err(RegionOwnerLaneError::InvalidMutation) => return Ok(Vec::new()),
@@ -2699,9 +2773,7 @@ impl RegionalOwnerHandle {
 
             let post_state = owner
                 .request_existing_snapshots_for_ids(requested)
-                .and_then(|snapshots| {
-                    snapshots.recv().map_err(|_| RegionOwnerLaneError::Closed)?
-                });
+                .and_then(|snapshots| snapshots.recv().map_err(|_| self.unavailable_error())?);
             let upserts = match post_state {
                 Ok(upserts)
                     if upserts.len() == expected_post.len()
@@ -2759,7 +2831,7 @@ impl RegionalOwnerHandle {
                 }
             }
             let finalized = owner.finalize(phase)?;
-            match finalized.recv().map_err(|_| RegionOwnerLaneError::Closed)? {
+            match finalized.recv().map_err(|_| self.unavailable_error())? {
                 Ok(finalized) if finalized == phase => Ok(upserts),
                 Ok(_) => Err(RegionOwnerLaneError::StalePhase),
                 Err(error) => Err(error),
@@ -2779,8 +2851,8 @@ impl RegionalOwnerHandle {
                 position,
                 reply,
             })
-            .map_err(|_| RegionOwnerLaneError::Closed)?;
-        result.recv().map_err(|_| RegionOwnerLaneError::Closed)?
+            .map_err(|_| self.unavailable_error())?;
+        result.recv().map_err(|_| self.unavailable_error())?
     }
 
     pub fn set_velocities(
@@ -2793,8 +2865,8 @@ impl RegionalOwnerHandle {
                 velocities: velocities.into_iter().collect(),
                 reply,
             })
-            .map_err(|_| RegionOwnerLaneError::Closed)?;
-        result.recv().map_err(|_| RegionOwnerLaneError::Closed)?
+            .map_err(|_| self.unavailable_error())?;
+        result.recv().map_err(|_| self.unavailable_error())?
     }
 
     pub fn apply_kinematics_if_current(
@@ -2878,8 +2950,8 @@ impl RegionalOwnerHandle {
                 defer_journal: !journal_commit,
                 reply,
             })
-            .map_err(|_| RegionOwnerLaneError::Closed)?;
-        result.recv().map_err(|_| RegionOwnerLaneError::Closed)?
+            .map_err(|_| self.unavailable_error())?;
+        result.recv().map_err(|_| self.unavailable_error())?
     }
 
     pub fn apply_kinematics_if_current_deferred_journal_committed(
@@ -2925,8 +2997,8 @@ impl RegionalOwnerHandle {
                 request,
                 reply,
             })
-            .map_err(|_| RegionOwnerLaneError::Closed)?;
-        result.recv().map_err(|_| RegionOwnerLaneError::Closed)?
+            .map_err(|_| self.unavailable_error())?;
+        result.recv().map_err(|_| self.unavailable_error())?
     }
 
     pub fn damage_batch_if_current(
@@ -3017,7 +3089,7 @@ impl RegionalOwnerHandle {
             }
             workers
                 .into_iter()
-                .map(|worker| worker.join().map_err(|_| RegionOwnerLaneError::Closed)?)
+                .map(|worker| worker.join().map_err(|_| self.unavailable_error())?)
                 .collect::<Result<Vec<_>, _>>()
         })?;
 
@@ -3045,8 +3117,8 @@ impl RegionalOwnerHandle {
                 request: Box::new(request),
                 reply,
             })
-            .map_err(|_| RegionOwnerLaneError::Closed)?;
-        result.recv().map_err(|_| RegionOwnerLaneError::Closed)?
+            .map_err(|_| self.unavailable_error())?;
+        result.recv().map_err(|_| self.unavailable_error())?
     }
 
     pub fn damage(
@@ -3061,8 +3133,8 @@ impl RegionalOwnerHandle {
                 request,
                 reply,
             })
-            .map_err(|_| RegionOwnerLaneError::Closed)?;
-        result.recv().map_err(|_| RegionOwnerLaneError::Closed)?
+            .map_err(|_| self.unavailable_error())?;
+        result.recv().map_err(|_| self.unavailable_error())?
     }
 
     pub fn prepare_goal_tick_with_pathing_for_ids(
@@ -3096,8 +3168,8 @@ impl RegionalOwnerHandle {
                 selected,
                 reply,
             })
-            .map_err(|_| RegionOwnerLaneError::Closed)?;
-        result.recv().map_err(|_| RegionOwnerLaneError::Closed)?
+            .map_err(|_| self.unavailable_error())?;
+        result.recv().map_err(|_| self.unavailable_error())?
     }
 
     pub fn apply_prepared_goal_tick(
@@ -3110,8 +3182,8 @@ impl RegionalOwnerHandle {
                 resolved: Box::new(resolved),
                 reply,
             })
-            .map_err(|_| RegionOwnerLaneError::Closed)?;
-        result.recv().map_err(|_| RegionOwnerLaneError::Closed)?
+            .map_err(|_| self.unavailable_error())?;
+        result.recv().map_err(|_| self.unavailable_error())?
     }
 
     pub fn apply_prepared_goal_tick_and_kinematics_for_ids(
@@ -3127,8 +3199,8 @@ impl RegionalOwnerHandle {
                 defer_journal: false,
                 reply,
             })
-            .map_err(|_| RegionOwnerLaneError::Closed)?;
-        result.recv().map_err(|_| RegionOwnerLaneError::Closed)?
+            .map_err(|_| self.unavailable_error())?;
+        result.recv().map_err(|_| self.unavailable_error())?
     }
 
     pub fn apply_prepared_goal_tick_and_kinematics_for_ids_deferred_journal(
@@ -3144,8 +3216,8 @@ impl RegionalOwnerHandle {
                 defer_journal: true,
                 reply,
             })
-            .map_err(|_| RegionOwnerLaneError::Closed)?;
-        result.recv().map_err(|_| RegionOwnerLaneError::Closed)?
+            .map_err(|_| self.unavailable_error())?;
+        result.recv().map_err(|_| self.unavailable_error())?
     }
 }
 
@@ -3195,21 +3267,30 @@ impl RegionalOwnerRuntime {
         let runtime_goal_apply_topology_probe = Arc::clone(&goal_apply_topology_probe);
         let (sender, receiver) = sync_channel(64);
         let (start, started) = channel();
+        let worker_health = Arc::new(RegionalOwnerWorkerHealth::new());
+        let runtime_worker_health = Arc::clone(&worker_health);
         let worker = match std::thread::Builder::new()
             .name("solaris-region-coordinator".to_owned())
             .spawn(move || {
-                run_regional_owner_runtime(
-                    started,
-                    receiver,
-                    runtime_selected_read_routes,
-                    runtime_mutation_gate,
-                    #[cfg(test)]
-                    runtime_actor_snapshot_probe,
-                    #[cfg(test)]
-                    runtime_goal_prepare_probe,
-                    #[cfg(test)]
-                    runtime_goal_apply_topology_probe,
-                );
+                let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    run_regional_owner_runtime(
+                        &started,
+                        &receiver,
+                        runtime_selected_read_routes,
+                        runtime_mutation_gate,
+                        #[cfg(test)]
+                        runtime_actor_snapshot_probe,
+                        #[cfg(test)]
+                        runtime_goal_prepare_probe,
+                        #[cfg(test)]
+                        runtime_goal_apply_topology_probe,
+                    );
+                }));
+                if outcome.is_err() {
+                    runtime_worker_health.mark_panicked();
+                } else {
+                    runtime_worker_health.mark_stopped();
+                }
             }) {
             Ok(worker) => worker,
             Err(_) => {
@@ -3229,6 +3310,7 @@ impl RegionalOwnerRuntime {
         Ok(Self {
             handle: RegionalOwnerHandle {
                 sender,
+                worker_health,
                 authority,
                 selected_read_routes,
                 mutation_gate,
@@ -3271,13 +3353,19 @@ impl RegionalOwnerRuntime {
             .send(RegionalOwnerCommand::Shutdown { reply })
             .is_err()
         {
-            return match worker.join() {
-                Ok(()) => Err(RegionalOwnerRuntimeShutdownError::Closed),
-                Err(_) => Err(RegionalOwnerRuntimeShutdownError::WorkerPanicked),
+            let joined = worker.join();
+            return if joined.is_err()
+                || self.handle.fatal_error() == Some(RegionOwnerLaneError::WorkerPanicked)
+            {
+                Err(RegionalOwnerRuntimeShutdownError::WorkerPanicked)
+            } else {
+                Err(RegionalOwnerRuntimeShutdownError::Closed)
             };
         }
         let result = result.recv();
-        if worker.join().is_err() {
+        if worker.join().is_err()
+            || self.handle.fatal_error() == Some(RegionOwnerLaneError::WorkerPanicked)
+        {
             return Err(RegionalOwnerRuntimeShutdownError::WorkerPanicked);
         }
         result
@@ -3295,8 +3383,8 @@ impl Drop for RegionalOwnerRuntime {
 }
 
 fn run_regional_owner_runtime(
-    started: Receiver<RegionalOwnerCoordinator>,
-    receiver: Receiver<RegionalOwnerCommand>,
+    started: &Receiver<RegionalOwnerCoordinator>,
+    receiver: &Receiver<RegionalOwnerCommand>,
     selected_read_routes: Arc<RwLock<HashMap<EntityId, CachedEntityReadRoute>>>,
     mutation_gate: Arc<RwLock<()>>,
     #[cfg(test)] actor_snapshot_probe: Arc<std::sync::Mutex<Option<SelectedReadProbe>>>,
@@ -3838,6 +3926,10 @@ fn run_regional_owner_runtime(
                 let _ = entered.send(());
                 let _ = release.recv();
             }
+            #[cfg(test)]
+            RegionalOwnerCommand::PanicForTest => {
+                panic!("injected regional owner coordinator panic");
+            }
             RegionalOwnerCommand::Shutdown { reply } => {
                 let _ = reply.send(coordinator.shutdown());
                 return;
@@ -4279,11 +4371,15 @@ impl RegionalOwnerCoordinator {
         let reassigned = match self.ownership.reassign(expected, target_lane) {
             Ok(reassigned) => reassigned,
             Err(_) => {
-                self.lanes
+                let rollback = self
+                    .lanes
                     .get(&expected.lane)
                     .expect("source lane was validated before detach")
-                    .install_region(expected, store)
-                    .map_err(|(rollback, _)| rollback)?;
+                    .install_region(expected, store);
+                if let Err(failure) = rollback {
+                    self.commit_state.mark_outcome_unknown();
+                    return Err(failure.error);
+                }
                 return Err(RegionOwnerLaneError::Busy);
             }
         };
@@ -4292,16 +4388,25 @@ impl RegionalOwnerCoordinator {
             .get(&target_lane)
             .ok_or(RegionOwnerLaneError::WrongLane)?
             .install_region(reassigned, store);
-        if let Err((error, store)) = installed {
+        if let Err(failure) = installed {
+            let error = failure.error;
+            let Some(store) = failure.recovered else {
+                self.commit_state.mark_outcome_unknown();
+                return Err(error);
+            };
             let restored = self
                 .ownership
                 .reassign(reassigned, expected.lane)
                 .map_err(|_| RegionOwnerLaneError::InvalidMutation)?;
-            self.lanes
+            if let Err(rollback) = self
+                .lanes
                 .get(&expected.lane)
                 .ok_or(RegionOwnerLaneError::WrongLane)?
                 .install_region(restored, *store)
-                .map_err(|(rollback, _)| rollback)?;
+            {
+                self.commit_state.mark_outcome_unknown();
+                return Err(rollback.error);
+            }
             return Err(error);
         }
         Ok(reassigned)
@@ -6299,11 +6404,15 @@ impl RegionalOwnerCoordinator {
             .get(&lane)
             .ok_or(RegionOwnerLaneError::WrongLane)?
             .install_region(lease, EntityStore::new());
-        if let Err((error, _)) = installed {
-            self.ownership
-                .unassign(lease)
-                .map_err(|_| RegionOwnerLaneError::Busy)?;
-            return Err(error);
+        if let Err(failure) = installed {
+            if failure.recovered.is_some() {
+                self.ownership
+                    .unassign(lease)
+                    .map_err(|_| RegionOwnerLaneError::Busy)?;
+            } else {
+                self.commit_state.mark_outcome_unknown();
+            }
+            return Err(failure.error);
         }
         Ok(lease)
     }
@@ -15132,6 +15241,29 @@ mod tests {
             panic!("unknown outcome must surface through controlled owner shutdown");
         };
         assert_eq!(shutdown.error, super::RegionOwnerLaneError::OutcomeUnknown);
+    }
+
+    #[test]
+    fn coordinator_worker_panic_is_typed_and_future_requests_fail_closed() {
+        let runtime = super::RegionalOwnerRuntime::from_store(RegionalEntityStore::new(), 1)
+            .expect("owner runtime");
+        let handle = runtime.handle();
+        handle
+            .panic_coordinator_for_test()
+            .expect("panic command enters bounded owner queue");
+
+        assert_eq!(
+            handle.status(),
+            Err(super::RegionOwnerLaneError::WorkerPanicked)
+        );
+        assert_eq!(
+            handle.fatal_error(),
+            Some(super::RegionOwnerLaneError::WorkerPanicked)
+        );
+        assert!(matches!(
+            runtime.shutdown(),
+            Err(super::RegionalOwnerRuntimeShutdownError::WorkerPanicked)
+        ));
     }
 
     #[test]

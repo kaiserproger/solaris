@@ -1,5 +1,7 @@
 use std::collections::{BTreeMap, HashMap, HashSet};
-use std::sync::atomic::{AtomicU64, Ordering};
+#[cfg(test)]
+use std::sync::atomic::AtomicBool;
+use std::sync::atomic::{AtomicU8, AtomicU64, Ordering};
 use std::sync::mpsc::{Receiver, SyncSender, TrySendError, channel, sync_channel};
 use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
@@ -123,11 +125,60 @@ pub enum RegionOwnerLaneError {
     OutcomeUnknown,
 }
 
+const LANE_WORKER_RUNNING: u8 = 0;
+const LANE_WORKER_STOPPED: u8 = 1;
+const LANE_WORKER_PANICKED: u8 = 2;
+
+#[derive(Debug)]
+struct RegionOwnerLaneHealth {
+    state: AtomicU8,
+}
+
+impl RegionOwnerLaneHealth {
+    fn new() -> Self {
+        Self {
+            state: AtomicU8::new(LANE_WORKER_RUNNING),
+        }
+    }
+
+    fn mark_stopped(&self) {
+        self.state.store(LANE_WORKER_STOPPED, Ordering::Release);
+    }
+
+    fn mark_panicked(&self) {
+        self.state.store(LANE_WORKER_PANICKED, Ordering::Release);
+    }
+
+    fn error(&self) -> Option<RegionOwnerLaneError> {
+        match self.state.load(Ordering::Acquire) {
+            LANE_WORKER_RUNNING => None,
+            LANE_WORKER_PANICKED => Some(RegionOwnerLaneError::WorkerPanicked),
+            _ => Some(RegionOwnerLaneError::Closed),
+        }
+    }
+
+    fn error_after_disconnect(&self) -> RegionOwnerLaneError {
+        loop {
+            if let Some(error) = self.error() {
+                return error;
+            }
+            std::thread::yield_now();
+        }
+    }
+}
+
 #[derive(Debug)]
 pub struct RegionOwnerLaneStartError {
     pub error: RegionOwnerLaneError,
     pub regions: Vec<(RegionLease, EntityStore)>,
 }
+
+#[derive(Debug)]
+pub(super) struct RegionOwnerInstallError {
+    pub(super) error: RegionOwnerLaneError,
+    pub(super) recovered: Option<Box<EntityStore>>,
+}
+
 enum RegionOwnerLaneMessage {
     InstallRegion {
         lease: RegionLease,
@@ -295,9 +346,12 @@ struct CommittedRegionOwnerBatch {
 
 pub struct RegionalOwnerLane {
     sender: SyncSender<RegionOwnerLaneMessage>,
+    health: Arc<RegionOwnerLaneHealth>,
     admission: Arc<Mutex<()>>,
     state_version: Arc<AtomicU64>,
     worker: Option<JoinHandle<()>>,
+    #[cfg(test)]
+    panic_after_install: Arc<AtomicBool>,
     #[cfg(test)]
     prepare_requests: std::sync::Arc<AtomicU64>,
     #[cfg(test)]
@@ -311,11 +365,16 @@ pub struct RegionalOwnerLane {
 #[derive(Clone)]
 pub(super) struct RegionalOwnerLaneReader {
     sender: SyncSender<RegionOwnerLaneMessage>,
+    health: Arc<RegionOwnerLaneHealth>,
     admission: Arc<Mutex<()>>,
     state_version: Arc<AtomicU64>,
 }
 
 impl RegionalOwnerLaneReader {
+    fn unavailable_error(&self) -> RegionOwnerLaneError {
+        self.health.error_after_disconnect()
+    }
+
     pub(super) fn admission(&self) -> &Mutex<()> {
         &self.admission
     }
@@ -332,7 +391,7 @@ impl RegionalOwnerLaneReader {
     ) -> Result<(), RegionOwnerLaneError> {
         self.sender
             .send(RegionOwnerLaneMessage::HoldForTest { entered, release })
-            .map_err(|_| RegionOwnerLaneError::Closed)
+            .map_err(|_| self.unavailable_error())
     }
 
     pub(super) fn prepare_and_commit(
@@ -343,7 +402,7 @@ impl RegionalOwnerLaneReader {
         let (reply, committed) = channel();
         self.sender
             .send(RegionOwnerLaneMessage::PrepareAndCommit { batch, reply })
-            .map_err(|_| RegionOwnerLaneError::Closed)?;
+            .map_err(|_| self.unavailable_error())?;
         Ok(committed)
     }
 
@@ -355,7 +414,7 @@ impl RegionalOwnerLaneReader {
         let (reply, snapshots) = channel();
         self.sender
             .send(RegionOwnerLaneMessage::ExistingSnapshotsForIds { entities, reply })
-            .map_err(|_| RegionOwnerLaneError::Closed)?;
+            .map_err(|_| self.unavailable_error())?;
         Ok(snapshots)
     }
 
@@ -369,7 +428,7 @@ impl RegionalOwnerLaneReader {
         let (reply, projections) = channel();
         self.sender
             .send(RegionOwnerLaneMessage::SimulationProjectionsForIds { entities, reply })
-            .map_err(|_| RegionOwnerLaneError::Closed)?;
+            .map_err(|_| self.unavailable_error())?;
         Ok(projections)
     }
 
@@ -383,7 +442,7 @@ impl RegionalOwnerLaneReader {
         let (reply, checkpoints) = channel();
         self.sender
             .send(RegionOwnerLaneMessage::GoalCheckpointsForIds { entities, reply })
-            .map_err(|_| RegionOwnerLaneError::Closed)?;
+            .map_err(|_| self.unavailable_error())?;
         Ok(checkpoints)
     }
 
@@ -395,7 +454,7 @@ impl RegionalOwnerLaneReader {
         let (reply, states) = channel();
         self.sender
             .send(RegionOwnerLaneMessage::AliveKinematicsForIds { entities, reply })
-            .map_err(|_| RegionOwnerLaneError::Closed)?;
+            .map_err(|_| self.unavailable_error())?;
         Ok(states)
     }
 
@@ -417,7 +476,7 @@ impl RegionalOwnerLaneReader {
                 excluded,
                 reply,
             })
-            .map_err(|_| RegionOwnerLaneError::Closed)?;
+            .map_err(|_| self.unavailable_error())?;
         Ok(snapshot)
     }
 
@@ -428,7 +487,7 @@ impl RegionalOwnerLaneReader {
         let (reply, finalized) = channel();
         self.sender
             .send(RegionOwnerLaneMessage::Finalize { phase, reply })
-            .map_err(|_| RegionOwnerLaneError::Closed)?;
+            .map_err(|_| self.unavailable_error())?;
         Ok(finalized)
     }
 
@@ -439,7 +498,7 @@ impl RegionalOwnerLaneReader {
         let (reply, rolled_back) = channel();
         self.sender
             .send(RegionOwnerLaneMessage::Rollback { phase, reply })
-            .map_err(|_| RegionOwnerLaneError::Closed)?;
+            .map_err(|_| self.unavailable_error())?;
         Ok(rolled_back)
     }
 
@@ -448,10 +507,7 @@ impl RegionalOwnerLaneReader {
         phase: RegionPhase,
     ) -> Result<(), RegionOwnerLaneError> {
         let rolled_back = self.rollback(phase)?;
-        match rolled_back
-            .recv()
-            .map_err(|_| RegionOwnerLaneError::Closed)?
-        {
+        match rolled_back.recv().map_err(|_| self.unavailable_error())? {
             Ok(rolled_back) if rolled_back == phase => Ok(()),
             Ok(_) => Err(RegionOwnerLaneError::StalePhase),
             Err(error) => Err(error),
@@ -470,7 +526,7 @@ impl RegionalOwnerLaneReader {
         {
             Ok(()) => {}
             Err(TrySendError::Full(_)) => return Err(RegionOwnerLaneError::Busy),
-            Err(TrySendError::Disconnected(_)) => return Err(RegionOwnerLaneError::Closed),
+            Err(TrySendError::Disconnected(_)) => return Err(self.unavailable_error()),
         }
         Ok(snapshots)
     }
@@ -478,6 +534,10 @@ impl RegionalOwnerLaneReader {
 
 impl RegionalOwnerLane {
     const QUEUE_CAPACITY: usize = 64;
+
+    fn unavailable_error(&self) -> RegionOwnerLaneError {
+        self.health.error_after_disconnect()
+    }
 
     pub fn spawn(
         lane: usize,
@@ -511,9 +571,15 @@ impl RegionalOwnerLane {
             owned.insert(lease.key, (lease, store));
         }
         let (sender, receiver) = sync_channel(Self::QUEUE_CAPACITY);
+        let health = Arc::new(RegionOwnerLaneHealth::new());
+        let worker_health = Arc::clone(&health);
         let admission = Arc::new(Mutex::new(()));
         let state_version = Arc::new(AtomicU64::new(0));
         let worker_state_version = Arc::clone(&state_version);
+        #[cfg(test)]
+        let panic_after_install = Arc::new(AtomicBool::new(false));
+        #[cfg(test)]
+        let worker_panic_after_install = Arc::clone(&panic_after_install);
         #[cfg(test)]
         let prepare_requests = std::sync::Arc::new(AtomicU64::new(0));
         #[cfg(test)]
@@ -532,14 +598,23 @@ impl RegionalOwnerLane {
                     .unwrap_or_else(|poisoned| poisoned.into_inner())
                     .take()
                     .expect("owner lane startup handoff remains available");
-                run_region_owner_lane(
-                    lane,
-                    owned,
-                    last_phase.0,
-                    last_sequence,
-                    receiver,
-                    worker_state_version,
-                );
+                let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    run_region_owner_lane(
+                        lane,
+                        owned,
+                        last_phase.0,
+                        last_sequence,
+                        &receiver,
+                        worker_state_version,
+                        #[cfg(test)]
+                        worker_panic_after_install,
+                    );
+                }));
+                if outcome.is_err() {
+                    worker_health.mark_panicked();
+                } else {
+                    worker_health.mark_stopped();
+                }
             }) {
             Ok(worker) => worker,
             Err(_) => {
@@ -556,9 +631,12 @@ impl RegionalOwnerLane {
         };
         Ok(Self {
             sender,
+            health,
             admission,
             state_version,
             worker: Some(worker),
+            #[cfg(test)]
+            panic_after_install,
             #[cfg(test)]
             prepare_requests,
             #[cfg(test)]
@@ -579,7 +657,7 @@ impl RegionalOwnerLane {
         let (reply, prepared) = channel();
         self.sender
             .send(RegionOwnerLaneMessage::Prepare { batch, reply })
-            .map_err(|_| RegionOwnerLaneError::Closed)?;
+            .map_err(|_| self.unavailable_error())?;
         Ok(prepared)
     }
 
@@ -597,8 +675,13 @@ impl RegionalOwnerLane {
         let (reply, committed) = channel();
         self.sender
             .send(RegionOwnerLaneMessage::PrepareAndCommit { batch, reply })
-            .map_err(|_| RegionOwnerLaneError::Closed)?;
+            .map_err(|_| self.unavailable_error())?;
         Ok(committed)
+    }
+
+    #[cfg(test)]
+    pub(super) fn panic_after_next_install_for_test(&self) {
+        self.panic_after_install.store(true, Ordering::Release);
     }
 
     #[cfg(test)]
@@ -635,6 +718,7 @@ impl RegionalOwnerLane {
     pub(super) fn reader(&self) -> RegionalOwnerLaneReader {
         RegionalOwnerLaneReader {
             sender: self.sender.clone(),
+            health: Arc::clone(&self.health),
             admission: Arc::clone(&self.admission),
             state_version: Arc::clone(&self.state_version),
         }
@@ -644,7 +728,7 @@ impl RegionalOwnerLane {
         &self,
         lease: RegionLease,
         store: EntityStore,
-    ) -> Result<(), (RegionOwnerLaneError, Box<EntityStore>)> {
+    ) -> Result<(), RegionOwnerInstallError> {
         let (reply, installed) = channel();
         self.sender
             .send(RegionOwnerLaneMessage::InstallRegion {
@@ -653,16 +737,23 @@ impl RegionalOwnerLane {
                 reply,
             })
             .map_err(|error| match error.0 {
-                RegionOwnerLaneMessage::InstallRegion { store, .. } => {
-                    (RegionOwnerLaneError::Closed, store)
-                }
+                RegionOwnerLaneMessage::InstallRegion { store, .. } => RegionOwnerInstallError {
+                    error: self.unavailable_error(),
+                    recovered: Some(store),
+                },
                 _ => unreachable!("send returned the install message"),
             })?;
         match installed.recv() {
             Ok(Ok(installed)) if installed == lease => Ok(()),
             Ok(Ok(_)) => unreachable!("owner lane echoes the requested lease"),
-            Ok(Err(error)) => Err(error),
-            Err(_) => panic!("owner lane closed after accepting a region store"),
+            Ok(Err((error, store))) => Err(RegionOwnerInstallError {
+                error,
+                recovered: Some(store),
+            }),
+            Err(_) => Err(RegionOwnerInstallError {
+                error: self.unavailable_error(),
+                recovered: None,
+            }),
         }
     }
 
@@ -673,8 +764,8 @@ impl RegionalOwnerLane {
         let (reply, detached) = channel();
         self.sender
             .send(RegionOwnerLaneMessage::DetachRegion { lease, reply })
-            .map_err(|_| RegionOwnerLaneError::Closed)?;
-        detached.recv().map_err(|_| RegionOwnerLaneError::Closed)?
+            .map_err(|_| self.unavailable_error())?;
+        detached.recv().map_err(|_| self.unavailable_error())?
     }
 
     pub fn commit(
@@ -685,7 +776,7 @@ impl RegionalOwnerLane {
         let (reply, committed) = channel();
         self.sender
             .send(RegionOwnerLaneMessage::Commit { phase, reply })
-            .map_err(|_| RegionOwnerLaneError::Closed)?;
+            .map_err(|_| self.unavailable_error())?;
         Ok(committed)
     }
 
@@ -696,7 +787,7 @@ impl RegionalOwnerLane {
         let (reply, aborted) = channel();
         self.sender
             .send(RegionOwnerLaneMessage::Abort { phase, reply })
-            .map_err(|_| RegionOwnerLaneError::Closed)?;
+            .map_err(|_| self.unavailable_error())?;
         Ok(aborted)
     }
 
@@ -707,7 +798,7 @@ impl RegionalOwnerLane {
         let (reply, finalized) = channel();
         self.sender
             .send(RegionOwnerLaneMessage::Finalize { phase, reply })
-            .map_err(|_| RegionOwnerLaneError::Closed)?;
+            .map_err(|_| self.unavailable_error())?;
         Ok(finalized)
     }
 
@@ -718,7 +809,7 @@ impl RegionalOwnerLane {
         let (reply, rolled_back) = channel();
         self.sender
             .send(RegionOwnerLaneMessage::Rollback { phase, reply })
-            .map_err(|_| RegionOwnerLaneError::Closed)?;
+            .map_err(|_| self.unavailable_error())?;
         Ok(rolled_back)
     }
 
@@ -734,8 +825,8 @@ impl RegionalOwnerLane {
                 entity,
                 reply,
             })
-            .map_err(|_| RegionOwnerLaneError::Closed)?;
-        snapshot.recv().map_err(|_| RegionOwnerLaneError::Closed)?
+            .map_err(|_| self.unavailable_error())?;
+        snapshot.recv().map_err(|_| self.unavailable_error())?
     }
 
     pub(super) fn request_snapshots(
@@ -746,7 +837,7 @@ impl RegionalOwnerLane {
         let (reply, snapshots) = channel();
         self.sender
             .send(RegionOwnerLaneMessage::Snapshots { reply })
-            .map_err(|_| RegionOwnerLaneError::Closed)?;
+            .map_err(|_| self.unavailable_error())?;
         Ok(snapshots)
     }
 
@@ -760,7 +851,7 @@ impl RegionalOwnerLane {
         let (reply, snapshots) = channel();
         self.sender
             .send(RegionOwnerLaneMessage::SnapshotsForIds { entities, reply })
-            .map_err(|_| RegionOwnerLaneError::Closed)?;
+            .map_err(|_| self.unavailable_error())?;
         Ok(snapshots)
     }
 
@@ -802,7 +893,7 @@ impl RegionalOwnerLane {
         let (reply, snapshots) = channel();
         self.sender
             .send(RegionOwnerLaneMessage::ExistingSnapshotsForIds { entities, reply })
-            .map_err(|_| RegionOwnerLaneError::Closed)?;
+            .map_err(|_| self.unavailable_error())?;
         Ok(snapshots)
     }
 
@@ -823,7 +914,7 @@ impl RegionalOwnerLane {
                 excluded,
                 reply,
             })
-            .map_err(|_| RegionOwnerLaneError::Closed)?;
+            .map_err(|_| self.unavailable_error())?;
         Ok(snapshot)
     }
 
@@ -840,7 +931,7 @@ impl RegionalOwnerLane {
                 leases,
                 reply,
             })
-            .map_err(|_| RegionOwnerLaneError::Closed)?;
+            .map_err(|_| self.unavailable_error())?;
         Ok(snapshots)
     }
 
@@ -859,7 +950,7 @@ impl RegionalOwnerLane {
                 active_ids,
                 reply,
             })
-            .map_err(|_| RegionOwnerLaneError::Closed)?;
+            .map_err(|_| self.unavailable_error())?;
         Ok(prepared)
     }
 
@@ -883,7 +974,7 @@ impl RegionalOwnerLane {
 
     fn stop(&mut self) -> Result<BTreeMap<RegionKey, EntityStore>, RegionOwnerLaneError> {
         let Some(worker) = self.worker.take() else {
-            return Err(RegionOwnerLaneError::Closed);
+            return Err(self.unavailable_error());
         };
         let (reply, stores) = channel();
         if self
@@ -891,15 +982,21 @@ impl RegionalOwnerLane {
             .send(RegionOwnerLaneMessage::Shutdown { reply })
             .is_err()
         {
-            let _ = worker.join();
-            return Err(RegionOwnerLaneError::Closed);
+            let joined = worker.join();
+            return if joined.is_err()
+                || self.health.error() == Some(RegionOwnerLaneError::WorkerPanicked)
+            {
+                Err(RegionOwnerLaneError::WorkerPanicked)
+            } else {
+                Err(self.unavailable_error())
+            };
         }
         let stores = stores.recv();
         let joined = worker.join();
-        if joined.is_err() {
+        if joined.is_err() || self.health.error() == Some(RegionOwnerLaneError::WorkerPanicked) {
             return Err(RegionOwnerLaneError::WorkerPanicked);
         }
-        stores.map_err(|_| RegionOwnerLaneError::Closed)?
+        stores.map_err(|_| self.unavailable_error())?
     }
 }
 
@@ -916,8 +1013,9 @@ fn run_region_owner_lane(
     mut regions: BTreeMap<RegionKey, (RegionLease, EntityStore)>,
     mut last_phase: u64,
     mut last_sequence: u64,
-    receiver: Receiver<RegionOwnerLaneMessage>,
+    receiver: &Receiver<RegionOwnerLaneMessage>,
     state_version: Arc<AtomicU64>,
+    #[cfg(test)] panic_after_install: Arc<AtomicBool>,
 ) {
     let mut pending = None;
     let mut committed = None;
@@ -945,6 +1043,10 @@ fn run_region_owner_lane(
                 };
                 if result.is_ok() {
                     state_version.fetch_add(1, Ordering::Release);
+                    #[cfg(test)]
+                    if panic_after_install.swap(false, Ordering::AcqRel) {
+                        panic!("injected owner lane panic after region store installation");
+                    }
                 }
                 let _ = reply.send(result);
             }
