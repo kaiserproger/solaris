@@ -2600,20 +2600,73 @@ pub enum ScriptCommand {
 ///
 /// The constructor is crate-private so scripts and external adapters cannot
 /// fabricate an origin. Adapters may inspect the id to route a completion event.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Clone)]
 pub struct ScriptCommandProvenance {
     plugin_id: Arc<str>,
     nonce: u64,
+    _cancellation: Option<Arc<HostAdmissionCancellation>>,
 }
 
+impl std::fmt::Debug for ScriptCommandProvenance {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("ScriptCommandProvenance")
+            .field("plugin_id", &self.plugin_id)
+            .field("nonce", &self.nonce)
+            .finish()
+    }
+}
+
+impl PartialEq for ScriptCommandProvenance {
+    fn eq(&self, other: &Self) -> bool {
+        self.plugin_id == other.plugin_id && self.nonce == other.nonce
+    }
+}
+
+impl Eq for ScriptCommandProvenance {}
+
 impl ScriptCommandProvenance {
-    #[cfg(any(test, feature = "lua-runtime"))]
+    #[cfg(test)]
     fn for_host_plugin(plugin_id: Arc<str>, nonce: u64) -> Self {
-        Self { plugin_id, nonce }
+        Self {
+            plugin_id,
+            nonce,
+            _cancellation: None,
+        }
+    }
+
+    #[cfg(any(test, feature = "lua-runtime"))]
+    fn for_issued_host_plugin(
+        plugin_id: Arc<str>,
+        nonce: u64,
+        ledger: &Arc<HostAdmissionLedger>,
+    ) -> Self {
+        Self {
+            plugin_id,
+            nonce,
+            _cancellation: Some(Arc::new(HostAdmissionCancellation {
+                ledger: Arc::downgrade(ledger),
+                nonce,
+            })),
+        }
     }
 
     pub fn plugin_id(&self) -> &str {
         &self.plugin_id
+    }
+}
+
+#[derive(Debug)]
+struct HostAdmissionCancellation {
+    ledger: Weak<HostAdmissionLedger>,
+    nonce: u64,
+}
+
+impl Drop for HostAdmissionCancellation {
+    fn drop(&mut self) {
+        if let Some(ledger) = self.ledger.upgrade() {
+            ledger.cancel(self.nonce);
+        }
     }
 }
 
@@ -2633,7 +2686,7 @@ struct HostAdmissionLedger {
 impl HostAdmissionLedger {
     #[cfg(any(test, feature = "lua-runtime"))]
     fn issue(
-        &self,
+        self: &Arc<Self>,
         plugin_id: Arc<str>,
         batch: CommandBatch,
     ) -> Result<Vec<ScriptCommand>, CommandBatch> {
@@ -2672,11 +2725,34 @@ impl HostAdmissionLedger {
                 },
             );
             attached.push(ScriptCommand::HostAttached {
-                provenance: ScriptCommandProvenance::for_host_plugin(Arc::clone(&plugin_id), nonce),
+                provenance: ScriptCommandProvenance::for_issued_host_plugin(
+                    Arc::clone(&plugin_id),
+                    nonce,
+                    self,
+                ),
                 request,
             });
         }
         Ok(attached)
+    }
+
+    fn cancel(&self, nonce: u64) {
+        match self.pending.lock() {
+            Ok(mut pending) => {
+                pending.remove(&nonce);
+            }
+            Err(mut poisoned) => {
+                poisoned.get_mut().clear();
+            }
+        }
+    }
+
+    #[cfg(test)]
+    fn pending_len(&self) -> usize {
+        self.pending
+            .lock()
+            .expect("host admission ledger lock poisoned")
+            .len()
     }
 
     fn accept(
@@ -7226,10 +7302,12 @@ mod tests {
             )
             .unwrap();
         endpoint.try_submit_plugin_batch(&admission, batch).unwrap();
+        assert_eq!(endpoint.host_admissions.pending_len(), 1);
 
         let command = boundary.recv_command().await.unwrap();
         let replay = command.clone();
         let admitted = boundary.accept_host_command(command).unwrap();
+        assert_eq!(endpoint.host_admissions.pending_len(), 0);
         assert_eq!(admitted.plugin_id(), "shop");
         let result = admitted
             .plugin_storage_get_result(Some("9"), Some(1))
@@ -7239,6 +7317,79 @@ mod tests {
             boundary.accept_host_command(replay),
             Err(ScriptCommandAcceptanceError::UnknownOrConsumed)
         ));
+        assert_eq!(endpoint.host_admissions.pending_len(), 0);
+    }
+
+    #[tokio::test]
+    async fn dropping_last_host_attached_clone_cancels_admission_and_recovers_capacity() {
+        let (boundary, endpoint) = script_boundary_pair(nonzero(1), nonzero(1));
+        let manifest = ScriptPluginManifest::new("shop", "Shop", "0.1.0", SCRIPT_API_VERSION)
+            .declare_plugin_storage()
+            .validate()
+            .unwrap();
+        let admission = HostCommandAdmission::from_manifest(&manifest);
+        let make_batch = |request_id: &str| {
+            let mut batch = CommandBatch::new(nonzero(1));
+            batch
+                .try_push_authorized(
+                    ScriptCommand::PluginStorageGet {
+                        request: ScriptPluginStorageGetRequest::try_new(request_id, "balance")
+                            .unwrap(),
+                    },
+                    &manifest.to_command_capabilities(),
+                )
+                .unwrap();
+            batch
+        };
+
+        endpoint
+            .try_submit_plugin_batch(&admission, make_batch("first"))
+            .unwrap();
+        let command = boundary.recv_command().await.unwrap();
+        let replay = command.clone();
+        assert_eq!(endpoint.host_admissions.pending_len(), 1);
+
+        drop(command);
+        assert_eq!(endpoint.host_admissions.pending_len(), 1);
+        drop(replay);
+        assert_eq!(endpoint.host_admissions.pending_len(), 0);
+
+        endpoint
+            .try_submit_plugin_batch(&admission, make_batch("replacement"))
+            .unwrap();
+        let admitted = boundary
+            .accept_host_command(boundary.recv_command().await.unwrap())
+            .unwrap();
+        assert_eq!(admitted.plugin_id(), "shop");
+        assert_eq!(endpoint.host_admissions.pending_len(), 0);
+    }
+
+    #[test]
+    fn dropping_command_receiver_cancels_every_queued_admission() {
+        let (boundary, endpoint) = script_boundary_pair(nonzero(1), nonzero(2));
+        let manifest = ScriptPluginManifest::new("shop", "Shop", "0.1.0", SCRIPT_API_VERSION)
+            .declare_plugin_storage()
+            .validate()
+            .unwrap();
+        let admission = HostCommandAdmission::from_manifest(&manifest);
+        let mut batch = CommandBatch::new(nonzero(2));
+        for request_id in ["first", "second"] {
+            batch
+                .try_push_authorized(
+                    ScriptCommand::PluginStorageGet {
+                        request: ScriptPluginStorageGetRequest::try_new(request_id, "balance")
+                            .unwrap(),
+                    },
+                    &manifest.to_command_capabilities(),
+                )
+                .unwrap();
+        }
+        endpoint.try_submit_plugin_batch(&admission, batch).unwrap();
+        assert_eq!(endpoint.host_admissions.pending_len(), 2);
+
+        drop(boundary);
+
+        assert_eq!(endpoint.host_admissions.pending_len(), 0);
     }
 
     #[tokio::test]
@@ -7409,7 +7560,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn unconsumed_host_tickets_are_bounded_and_recover_after_exact_acceptance() {
+    async fn unconsumed_host_tickets_are_bounded_and_recover_after_drop_or_acceptance() {
         let (boundary, endpoint) = script_boundary_pair(nonzero(1), nonzero(256));
         let manifest = ScriptPluginManifest::new("bounded", "Bounded", "0.1.0", SCRIPT_API_VERSION)
             .validate()
@@ -7430,6 +7581,7 @@ mod tests {
                 unconsumed.push(boundary.recv_command().await.unwrap());
             }
         }
+        assert_eq!(endpoint.host_admissions.pending_len(), 256);
 
         let mut overflow = CommandBatch::new(nonzero(1));
         overflow
@@ -7445,17 +7597,31 @@ mod tests {
             })
         ));
 
-        boundary
-            .accept_host_command(unconsumed.pop().unwrap())
-            .unwrap();
-        let mut recovered = CommandBatch::new(nonzero(1));
-        recovered
+        drop(unconsumed.pop().unwrap());
+        assert_eq!(endpoint.host_admissions.pending_len(), 255);
+        let mut recovered_after_drop = CommandBatch::new(nonzero(1));
+        recovered_after_drop
             .try_push(ScriptCommand::BroadcastChatMessage {
-                message: "recovered".to_owned(),
+                message: "recovered-after-drop".to_owned(),
             })
             .unwrap();
         endpoint
-            .try_submit_plugin_batch(&admission, recovered)
+            .try_submit_plugin_batch(&admission, recovered_after_drop)
+            .unwrap();
+        assert_eq!(endpoint.host_admissions.pending_len(), 256);
+
+        boundary
+            .accept_host_command(unconsumed.pop().unwrap())
+            .unwrap();
+        assert_eq!(endpoint.host_admissions.pending_len(), 255);
+        let mut recovered_after_accept = CommandBatch::new(nonzero(1));
+        recovered_after_accept
+            .try_push(ScriptCommand::BroadcastChatMessage {
+                message: "recovered-after-accept".to_owned(),
+            })
+            .unwrap();
+        endpoint
+            .try_submit_plugin_batch(&admission, recovered_after_accept)
             .unwrap();
     }
 

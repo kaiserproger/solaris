@@ -133,6 +133,13 @@ reply requester-у. Для более сложных новых kernels испо
 state revision и publication facts фиксируются вместе, а baseline продвигается
 только после ACK доставки.
 
+Plugin host command admission также имеет exact lifecycle. Выданный nonce живет
+в ledger, пока хотя бы одна копия private host provenance существует. Последняя
+копия queued command удаляет nonce через RAII cancellation; server acceptance
+сначала consumes nonce, поэтому последующий guard drop становится no-op. Это не
+дает shutdown/cancellation оставлять capacity tombstones и сохраняет one-shot
+replay fence без polling или периодической очистки weak records.
+
 ### 3.6 ECS + SoA, но не "ECS для всего"
 
 Moving entities идут через `bevy_ecs`/SoA-friendly storage. Chunks, connections,
