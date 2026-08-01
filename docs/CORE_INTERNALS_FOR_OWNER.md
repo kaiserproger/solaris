@@ -278,6 +278,11 @@ Codec functions только преобразуют bytes <-> typed packet. Он
 Он не ждет "несколько ticks, чтобы состояние успело". Packet handler строит
 plan, вызывает domain/owner API, применяет только typed result и пишет packet.
 
+До liveness и handler dispatch каждый frame проходит per-session ingress limiter:
+total packet/byte buckets, weighted work и отдельные chat/command/suggestion/custom
+budgets. Первые нарушения drop'аются, не обновляя keepalive activity; повторный
+flood завершается typed rate-limit error. Refill использует monotonic time.
+
 ### 7.2 Модули packet-authored gameplay
 
 | Модуль | Что решают его функции |

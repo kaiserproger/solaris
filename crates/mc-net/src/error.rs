@@ -62,6 +62,12 @@ pub enum ConnectionError {
     #[error("pre-Play byte budget exceeded: {bytes} bytes, maximum {max}")]
     PrePlayByteBudgetExceeded { bytes: usize, max: usize },
 
+    #[error("Play ingress rate limit exceeded for {class} after {violations} violations")]
+    PlayRateLimitExceeded {
+        class: &'static str,
+        violations: u32,
+    },
+
     #[error("outbound socket write remained blocked for {timeout:?}")]
     WriteTimeout { timeout: Duration },
 

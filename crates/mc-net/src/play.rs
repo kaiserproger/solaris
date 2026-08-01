@@ -125,6 +125,7 @@ mod containers;
 mod explosions;
 mod falling_blocks;
 mod fluids;
+mod ingress_rate;
 mod inhabited_time;
 #[cfg(test)]
 mod inhabited_time_tests;
@@ -12385,6 +12386,7 @@ where
     world_time_ticker.tick().await;
 
     let mut keepalive = KeepAliveTracker::new();
+    let mut ingress_limiter = ingress_rate::PlayIngressLimiter::new(Instant::now());
     let mut script_zone_observer = script_zones.clone().map(|zones| ScriptZoneObserver {
         zones,
         player_id: ScriptPlayerId::new(session_id),
@@ -13081,6 +13083,33 @@ where
             }
             result = read_frame(reader, buf, compression) => {
                 let frame = result?;
+                match ingress_limiter.admit(frame.id, frame.body.len(), Instant::now())? {
+                    ingress_rate::IngressDecision::Allow => {}
+                    ingress_rate::IngressDecision::Drop {
+                        class,
+                        violations,
+                        class_violations,
+                    } => {
+                        if violations == 1 {
+                            debug!(
+                                packet_id = frame.id,
+                                class,
+                                violations,
+                                class_violations,
+                                "Play ingress packet dropped by rate budget"
+                            );
+                        } else {
+                            warn!(
+                                packet_id = frame.id,
+                                class,
+                                violations,
+                                class_violations,
+                                "repeated Play ingress rate violation"
+                            );
+                        }
+                        continue;
+                    }
+                }
                 if liveness::validate_serverbound_play_frame(frame.id, &frame.body)? {
                     keepalive.record_inbound_activity();
                 }
