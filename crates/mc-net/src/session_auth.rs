@@ -16,6 +16,11 @@ const RSA_KEY_BITS: usize = 1024;
 const MOJANG_HAS_JOINED_URL: &str = "https://sessionserver.mojang.com/session/minecraft/hasJoined";
 const DEFAULT_CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
 const DEFAULT_REQUEST_TIMEOUT: Duration = Duration::from_secs(10);
+const MAX_HAS_JOINED_BODY_BYTES: usize = 64 * 1024;
+const MAX_PROFILE_PROPERTIES: usize = 16;
+const MAX_PROPERTY_NAME_BYTES: usize = 64;
+const MAX_PROPERTY_VALUE_BYTES: usize = 16 * 1024;
+const MAX_PROPERTY_SIGNATURE_BYTES: usize = 16 * 1024;
 
 /// RSA identity used by the Minecraft login encryption handshake.
 pub struct RsaIdentity {
@@ -119,6 +124,7 @@ pub struct VerifySession {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct VerifiedSession {
     pub uuid: uuid::Uuid,
+    pub name: String,
     pub properties: Vec<GameProfileProperty>,
 }
 
@@ -179,6 +185,7 @@ impl MojangSessionVerifier {
 impl SessionVerifier for MojangSessionVerifier {
     fn verify(&self, request: VerifySession) -> SessionVerifierFuture<'_> {
         Box::pin(async move {
+            let expected_username = request.username.clone();
             let mut query = vec![
                 ("username", request.username),
                 ("serverId", request.server_id_hash),
@@ -195,44 +202,94 @@ impl SessionVerifier for MojangSessionVerifier {
                 .await
                 .map_err(|_| VerifySessionError::Unavailable)?;
             let status = response.status();
-            let body = response
-                .bytes()
-                .await
-                .map_err(|_| VerifySessionError::Unavailable)?;
-
-            if status.is_client_error() {
-                return Err(VerifySessionError::Unverified);
-            }
-
-            let response: HasJoinedResponse =
-                serde_json::from_slice(&body).map_err(|_| VerifySessionError::Unverified)?;
             if status.is_server_error() {
                 return Err(VerifySessionError::Unavailable);
             }
-            if !status.is_success() {
+            if status.is_client_error() || status == reqwest::StatusCode::NO_CONTENT {
                 return Err(VerifySessionError::Unverified);
             }
+            if !status.is_success() {
+                return Err(VerifySessionError::Unavailable);
+            }
 
+            let body = read_bounded_response_body(response).await?;
+            let response: HasJoinedResponse =
+                serde_json::from_slice(&body).map_err(|_| VerifySessionError::Unavailable)?;
             let uuid = response
                 .id
-                .ok_or(VerifySessionError::Unverified)
+                .ok_or(VerifySessionError::Unavailable)
                 .and_then(|id| {
-                    uuid::Uuid::parse_str(&id).map_err(|_| VerifySessionError::Unverified)
+                    uuid::Uuid::parse_str(&id).map_err(|_| VerifySessionError::Unavailable)
                 })?;
-            let properties = response
-                .properties
-                .unwrap_or_default()
-                .into_iter()
-                .map(HasJoinedProperty::into_game_profile_property)
-                .collect();
-            Ok(VerifiedSession { uuid, properties })
+            let name = response.name.ok_or(VerifySessionError::Unavailable)?;
+            if !name.eq_ignore_ascii_case(&expected_username) {
+                return Err(VerifySessionError::Unverified);
+            }
+            let properties = validate_properties(response.properties.unwrap_or_default())?;
+            Ok(VerifiedSession {
+                uuid,
+                name,
+                properties,
+            })
         })
     }
+}
+
+async fn read_bounded_response_body(
+    mut response: reqwest::Response,
+) -> Result<Vec<u8>, VerifySessionError> {
+    if response
+        .content_length()
+        .is_some_and(|len| len > MAX_HAS_JOINED_BODY_BYTES as u64)
+    {
+        return Err(VerifySessionError::Unavailable);
+    }
+    let mut body = Vec::new();
+    while let Some(chunk) = response
+        .chunk()
+        .await
+        .map_err(|_| VerifySessionError::Unavailable)?
+    {
+        let next_len = body
+            .len()
+            .checked_add(chunk.len())
+            .ok_or(VerifySessionError::Unavailable)?;
+        if next_len > MAX_HAS_JOINED_BODY_BYTES {
+            return Err(VerifySessionError::Unavailable);
+        }
+        body.extend_from_slice(&chunk);
+    }
+    Ok(body)
+}
+
+fn validate_properties(
+    properties: Vec<HasJoinedProperty>,
+) -> Result<Vec<GameProfileProperty>, VerifySessionError> {
+    if properties.len() > MAX_PROFILE_PROPERTIES {
+        return Err(VerifySessionError::Unavailable);
+    }
+    properties
+        .into_iter()
+        .map(|property| {
+            if property.name.is_empty()
+                || property.name.len() > MAX_PROPERTY_NAME_BYTES
+                || property.value.len() > MAX_PROPERTY_VALUE_BYTES
+                || property
+                    .signature
+                    .as_ref()
+                    .is_some_and(|signature| signature.len() > MAX_PROPERTY_SIGNATURE_BYTES)
+            {
+                return Err(VerifySessionError::Unavailable);
+            }
+            Ok(property.into_game_profile_property())
+        })
+        .collect()
 }
 
 #[derive(Debug, serde::Deserialize)]
 struct HasJoinedResponse {
     id: Option<String>,
+    name: Option<String>,
     #[serde(default)]
     properties: Option<Vec<HasJoinedProperty>>,
 }
@@ -271,8 +328,9 @@ mod tests {
     use uuid::Uuid;
 
     use super::{
-        MojangSessionVerifier, RsaIdentity, RsaIdentityError, SessionVerifier, VerifySession,
-        VerifySessionError, java_signed_hex, minecraft_server_hash,
+        MAX_HAS_JOINED_BODY_BYTES, MAX_PROFILE_PROPERTIES, MAX_PROPERTY_SIGNATURE_BYTES,
+        MAX_PROPERTY_VALUE_BYTES, MojangSessionVerifier, RsaIdentity, RsaIdentityError,
+        SessionVerifier, VerifySession, VerifySessionError, java_signed_hex, minecraft_server_hash,
     };
 
     async fn local_response(status: &str, body: &str) -> (String, oneshot::Receiver<String>) {
@@ -312,6 +370,40 @@ mod tests {
             format!("http://{address}/session/minecraft/hasJoined"),
             request_rx,
         )
+    }
+
+    async fn local_response_without_length(status: &str, body: Vec<u8>) -> String {
+        let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0))
+            .await
+            .expect("bind local HTTP listener");
+        let address = listener.local_addr().expect("local HTTP address");
+        let status = status.to_owned();
+
+        tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.expect("accept HTTP request");
+            let mut request = Vec::new();
+            loop {
+                let mut chunk = [0; 1024];
+                let read = stream.read(&mut chunk).await.expect("read HTTP request");
+                assert!(read > 0, "client closed before completing HTTP headers");
+                request.extend_from_slice(&chunk[..read]);
+                if request.windows(4).any(|window| window == b"\r\n\r\n") {
+                    break;
+                }
+            }
+            let header = format!(
+                "HTTP/1.1 {status}\r\nContent-Type: application/json\r\nConnection: close\r\n\r\n"
+            );
+            if stream.write_all(header.as_bytes()).await.is_ok() {
+                for chunk in body.chunks(4096) {
+                    if stream.write_all(chunk).await.is_err() {
+                        break;
+                    }
+                }
+            }
+        });
+
+        format!("http://{address}/session/minecraft/hasJoined")
     }
 
     fn verifier(base_url: &str) -> MojangSessionVerifier {
@@ -428,7 +520,7 @@ mod tests {
     async fn verifier_returns_uuid_and_signed_or_unsigned_properties() {
         let (base_url, received_request) = local_response(
             "200 OK",
-            r#"{"id":"12345678123456789abcdef012345678","name":"IgnoredName","properties":[{"name":"textures","value":"texture-value","signature":"texture-signature"},{"name":"rank","value":"builder"}]}"#,
+            r#"{"id":"12345678123456789abcdef012345678","name":"a b+?","properties":[{"name":"textures","value":"texture-value","signature":"texture-signature"},{"name":"rank","value":"builder"}]}"#,
         )
         .await;
         let verifier = verifier(&base_url);
@@ -440,6 +532,7 @@ mod tests {
             verified.uuid,
             Uuid::parse_str("12345678-1234-5678-9abc-def012345678").unwrap()
         );
+        assert_eq!(verified.name, "a b+?");
         assert_eq!(
             verified.properties,
             vec![
@@ -476,7 +569,7 @@ mod tests {
     async fn verifier_accepts_dashed_uuid_and_null_properties() {
         let (base_url, _) = local_response(
             "200 OK",
-            r#"{"id":"12345678-1234-5678-9abc-def012345678","properties":null}"#,
+            r#"{"id":"12345678-1234-5678-9abc-def012345678","name":"Player","properties":null}"#,
         )
         .await;
 
@@ -493,11 +586,11 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn verifier_maps_null_and_client_errors_to_unverified() {
+    async fn verifier_maps_no_profile_and_client_errors_to_unverified() {
         for (status, body) in [
-            ("200 OK", "null"),
-            ("200 OK", "{}"),
+            ("204 No Content", ""),
             ("403 Forbidden", r#"{"error":"Forbidden"}"#),
+            ("404 Not Found", "not-json"),
         ] {
             let (base_url, _) = local_response(status, body).await;
             assert_eq!(
@@ -508,8 +601,36 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn verifier_maps_malformed_success_to_unverified() {
-        let (base_url, _) = local_response("200 OK", "not-json").await;
+    async fn verifier_maps_malformed_success_to_unavailable() {
+        for body in ["null", "{}", "not-json"] {
+            let (base_url, _) = local_response("200 OK", body).await;
+            assert_eq!(
+                verifier(&base_url).verify(request()).await,
+                Err(VerifySessionError::Unavailable)
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn verifier_maps_server_error_html_to_unavailable_before_json_parse() {
+        let (base_url, _) = local_response(
+            "503 Service Unavailable",
+            "<html><body>upstream outage</body></html>",
+        )
+        .await;
+        assert_eq!(
+            verifier(&base_url).verify(request()).await,
+            Err(VerifySessionError::Unavailable)
+        );
+    }
+
+    #[tokio::test]
+    async fn verifier_rejects_mismatched_profile_name() {
+        let (base_url, _) = local_response(
+            "200 OK",
+            r#"{"id":"12345678123456789abcdef012345678","name":"OtherPlayer","properties":[]}"#,
+        )
+        .await;
         assert_eq!(
             verifier(&base_url).verify(request()).await,
             Err(VerifySessionError::Unverified)
@@ -517,15 +638,74 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn verifier_maps_parsed_server_error_to_unavailable() {
-        let (base_url, _) = local_response(
-            "503 Service Unavailable",
-            r#"{"error":"ServiceUnavailable","errorMessage":"try later"}"#,
-        )
-        .await;
+    async fn verifier_accepts_exact_body_limit_and_rejects_content_length_over_limit() {
+        let mut exact =
+            r#"{"id":"12345678123456789abcdef012345678","name":"A B+?","properties":[]}"#
+                .to_owned();
+        exact.extend(std::iter::repeat_n(
+            ' ',
+            MAX_HAS_JOINED_BODY_BYTES - exact.len(),
+        ));
+        let (base_url, _) = local_response("200 OK", &exact).await;
+        assert!(verifier(&base_url).verify(request()).await.is_ok());
+
+        let oversized = "x".repeat(MAX_HAS_JOINED_BODY_BYTES + 1);
+        let (base_url, _) = local_response("200 OK", &oversized).await;
         assert_eq!(
             verifier(&base_url).verify(request()).await,
             Err(VerifySessionError::Unavailable)
         );
+    }
+
+    #[tokio::test]
+    async fn verifier_rejects_streamed_body_over_limit_without_content_length() {
+        let base_url =
+            local_response_without_length("200 OK", vec![b'x'; MAX_HAS_JOINED_BODY_BYTES + 1])
+                .await;
+        assert_eq!(
+            verifier(&base_url).verify(request()).await,
+            Err(VerifySessionError::Unavailable)
+        );
+    }
+
+    #[tokio::test]
+    async fn verifier_rejects_excessive_or_oversized_properties() {
+        let excessive = (0..=MAX_PROFILE_PROPERTIES)
+            .map(|index| serde_json::json!({"name": format!("p{index}"), "value": "v"}))
+            .collect::<Vec<_>>();
+        let bodies = [
+            serde_json::json!({
+                "id": "12345678123456789abcdef012345678",
+                "name": "A B+?",
+                "properties": excessive,
+            })
+            .to_string(),
+            serde_json::json!({
+                "id": "12345678123456789abcdef012345678",
+                "name": "A B+?",
+                "properties": [{"name": "textures", "value": "x".repeat(MAX_PROPERTY_VALUE_BYTES + 1)}],
+            })
+            .to_string(),
+            serde_json::json!({
+                "id": "12345678123456789abcdef012345678",
+                "name": "A B+?",
+                "properties": [{"name": "textures", "value": "v", "signature": "x".repeat(MAX_PROPERTY_SIGNATURE_BYTES + 1)}],
+            })
+            .to_string(),
+            serde_json::json!({
+                "id": "12345678123456789abcdef012345678",
+                "name": "A B+?",
+                "properties": [{"name": "", "value": "v"}],
+            })
+            .to_string(),
+        ];
+
+        for body in bodies {
+            let (base_url, _) = local_response("200 OK", &body).await;
+            assert_eq!(
+                verifier(&base_url).verify(request()).await,
+                Err(VerifySessionError::Unavailable)
+            );
+        }
     }
 }

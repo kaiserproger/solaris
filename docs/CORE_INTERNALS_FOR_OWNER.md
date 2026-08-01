@@ -257,6 +257,11 @@ unauthenticated capacity.
 Codec functions только преобразуют bytes <-> typed packet. Они не имеют права
 мутировать session/world state.
 
+`session_auth` классифицирует HTTP status до body read, читает успешный
+`hasJoined` response потоково максимум до 64 KiB и ограничивает profile
+properties. Возвращённое Mojang имя обязано совпасть с requested name без учёта
+ASCII-регистра; его канонический регистр становится именем LoginSuccess/session.
+
 `AuthSection::prevent_proxy_connections` напрямую включает передачу IP клиента
 в Mojang `hasJoined`; default остается `false`. Это operator policy, а не
 эвристика login path.

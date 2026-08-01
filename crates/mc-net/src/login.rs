@@ -200,8 +200,8 @@ where
         budget,
     )
     .await?;
-    let name = login_start.name;
-    let (uuid, properties) = if access.online_mode {
+    let requested_name = login_start.name;
+    let (name, uuid, properties) = if access.online_mode {
         let authentication = online_authentication.ok_or(ConnectionError::OnlineAuthentication(
             "server authentication context is unavailable",
         ))?;
@@ -243,7 +243,7 @@ where
         let verified = authentication
             .verifier
             .verify(VerifySession {
-                username: name.clone(),
+                username: requested_name.clone(),
                 server_id_hash: minecraft_server_hash(
                     b"",
                     &shared_secret,
@@ -252,11 +252,15 @@ where
                 client_ip: authentication.prevent_proxy_connections.then_some(peer_ip),
             })
             .await;
-        let VerifiedSession { uuid, properties } = match verified {
+        let VerifiedSession {
+            uuid,
+            name,
+            properties,
+        } = match verified {
             Ok(profile) => profile,
             Err(VerifySessionError::Unverified) => {
                 write_login_disconnect(writer, "Failed to verify username!").await?;
-                info!(player = %name, "online login rejected: unverified session");
+                info!(player = %requested_name, "online login rejected: unverified session");
                 return Ok(None);
             }
             Err(VerifySessionError::Unavailable) => {
@@ -265,17 +269,17 @@ where
                     "Authentication servers are down. Please try again later, sorry!",
                 )
                 .await?;
-                info!(player = %name, "online login rejected: session service unavailable");
+                info!(player = %requested_name, "online login rejected: session service unavailable");
                 return Ok(None);
             }
         };
-        info!(player = %name, %uuid, "online login verified");
-        (uuid, properties)
+        info!(player = %name, requested = %requested_name, %uuid, "online login verified");
+        (name, uuid, properties)
     } else {
         // Offline mode ignores the client UUID and derives the vanilla UUID.
-        let uuid = offline_uuid(&name);
-        info!(player = %name, %uuid, "offline login");
-        (uuid, Vec::new())
+        let uuid = offline_uuid(&requested_name);
+        info!(player = %requested_name, %uuid, "offline login");
+        (requested_name, uuid, Vec::new())
     };
     if let Some(rejection) = access_rejection(access, &name, uuid) {
         write_login_disconnect(writer, rejection.message()).await?;
@@ -434,6 +438,7 @@ mod tests {
             requests: Mutex::new(Vec::new()),
             result: VerifiedSession {
                 uuid: verified_uuid,
+                name: "OnlinePlayer".to_owned(),
                 properties: properties.clone(),
             },
         });
@@ -481,7 +486,7 @@ mod tests {
             write_packet(
                 &mut client_writer,
                 &LoginStart {
-                    name: "OnlinePlayer".to_owned(),
+                    name: "onlineplayer".to_owned(),
                     player_uuid: Uuid::nil(),
                 },
                 Compression::Disabled,
@@ -554,7 +559,7 @@ mod tests {
         assert_eq!(success.properties, properties);
         let requests = verifier.requests.lock().unwrap();
         assert_eq!(requests.len(), 1);
-        assert_eq!(requests[0].username, "OnlinePlayer");
+        assert_eq!(requests[0].username, "onlineplayer");
         assert_eq!(requests[0].server_id_hash, expected_hash);
         assert_eq!(requests[0].client_ip, Some("203.0.113.9".parse().unwrap()));
     }

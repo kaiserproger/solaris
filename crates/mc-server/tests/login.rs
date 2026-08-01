@@ -487,6 +487,7 @@ async fn online_mode_completes_encrypted_login_with_fake_session_verifier() {
         request: Mutex::new(None),
         response: mc_net::VerifiedSession {
             uuid: verified_uuid,
+            name: "OnlinePlayer".to_owned(),
             properties: properties.clone(),
         },
     });
@@ -498,7 +499,7 @@ async fn online_mode_completes_encrypted_login_with_fake_session_verifier() {
     )
     .with_session_verifier(verifier.clone());
     let addr = start_server_with_login_access(login_access).await;
-    let (mut stream, mut rbuf) = send_login_start(addr, "OnlinePlayer").await;
+    let (mut stream, mut rbuf) = send_login_start(addr, "onlineplayer").await;
 
     let mut frame = read_one_frame(&mut stream, &mut rbuf, Compression::Disabled).await;
     assert_eq!(frame.id, EncryptionRequest::ID);
@@ -577,7 +578,7 @@ async fn online_mode_completes_encrypted_login_with_fake_session_verifier() {
         .unwrap()
         .clone()
         .expect("login success proves that the verifier was called");
-    assert_eq!(verification.username, "OnlinePlayer");
+    assert_eq!(verification.username, "onlineplayer");
     assert_eq!(
         verification.server_id_hash,
         mc_net::minecraft_server_hash(b"", &SHARED_SECRET, &request.public_key)
