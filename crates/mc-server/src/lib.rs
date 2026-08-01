@@ -221,6 +221,10 @@ pub struct PluginSection {
     pub directory: Option<PathBuf>,
     #[serde(default)]
     pub bundled: Vec<BundledPlugin>,
+    #[serde(default)]
+    pub strict: bool,
+    #[serde(default)]
+    pub expected: Vec<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -761,6 +765,8 @@ mod tests {
             [plugins]
             directory = "plugins"
             bundled = ["basic-economy", "online-roster"]
+            strict = true
+            expected = ["basic-economy", "online-roster"]
         "#;
         let cfg: ServerConfig = toml::from_str(toml_src).expect("parse");
 
@@ -768,6 +774,11 @@ mod tests {
         assert_eq!(
             cfg.plugins.bundled,
             [BundledPlugin::BasicEconomy, BundledPlugin::OnlineRoster]
+        );
+        assert!(cfg.plugins.strict);
+        assert_eq!(
+            cfg.plugins.expected,
+            ["basic-economy".to_owned(), "online-roster".to_owned()]
         );
     }
 

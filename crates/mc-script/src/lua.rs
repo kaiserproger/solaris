@@ -99,21 +99,35 @@ impl BundledLuauPlugin {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct LuaHostConfig {
     plugins_dir: PathBuf,
+    strict_discovery: bool,
 }
 
 impl LuaHostConfig {
     pub fn new(plugins_dir: impl Into<PathBuf>) -> Self {
         Self {
             plugins_dir: plugins_dir.into(),
+            strict_discovery: false,
         }
     }
 
     pub fn plugins_dir(&self) -> &Path {
         &self.plugins_dir
     }
+
+    #[must_use]
+    pub const fn strict_discovery(mut self, strict: bool) -> Self {
+        self.strict_discovery = strict;
+        self
+    }
+
+    #[must_use]
+    pub const fn is_strict_discovery(&self) -> bool {
+        self.strict_discovery
+    }
 }
 
-/// Startup error for the Luau host itself. Individual broken plugins are skipped.
+/// Startup error for the Luau host itself. Permissive discovery skips ordinary broken plugins;
+/// strict discovery and strict startup fail closed.
 #[derive(Debug)]
 #[non_exhaustive]
 pub enum LuaHostError {
@@ -135,6 +149,10 @@ pub enum LuaHostError {
     },
     InvalidStartupPlugin {
         path: PathBuf,
+        message: String,
+    },
+    StrictStartupPlugin {
+        id: String,
         message: String,
     },
 }
@@ -163,6 +181,9 @@ impl fmt::Display for LuaHostError {
                 "startup-declarative plugin {} is invalid: {message}",
                 path.display()
             ),
+            Self::StrictStartupPlugin { id, message } => {
+                write!(formatter, "strict plugin {id:?} failed startup: {message}")
+            }
         }
     }
 }
@@ -696,6 +717,7 @@ pub struct PreparedLuaPlugins {
     worldgen_ore_profile: Option<LuaWorldgenOreProfile>,
     worldgen_settlement_plan: Option<LuaSettlementPlan>,
     client_bundles: Vec<LuaClientBundle>,
+    strict_startup: bool,
 }
 
 impl PreparedLuaPlugins {
@@ -720,6 +742,12 @@ impl PreparedLuaPlugins {
     #[must_use]
     pub fn client_bundles(&self) -> &[LuaClientBundle] {
         &self.client_bundles
+    }
+
+    #[must_use]
+    pub const fn strict_startup(mut self, strict: bool) -> Self {
+        self.strict_startup = strict;
+        self
     }
 
     pub fn discovered_plugins(&self) -> impl ExactSizeIterator<Item = LuaPluginDiscovery<'_>> + '_ {
@@ -791,8 +819,9 @@ impl PreparedLuaPlugins {
     }
 
     pub fn merge(mut self, other: Self) -> Result<Self, LuaHostError> {
+        let strict_startup = self.strict_startup || other.strict_startup;
         self.sources.extend(other.sources);
-        prepare_plugin_sources(self.sources)
+        Ok(prepare_plugin_sources(self.sources)?.strict_startup(strict_startup))
     }
 }
 
@@ -816,7 +845,11 @@ pub fn prepare_lua_plugins(config: LuaHostConfig) -> Result<PreparedLuaPlugins, 
         path: config.plugins_dir().to_path_buf(),
         message: error.to_string(),
     })?;
-    prepare_plugin_sources(discover_plugins(config.plugins_dir())?)
+    let strict = config.is_strict_discovery();
+    Ok(
+        prepare_plugin_sources(discover_plugins(config.plugins_dir(), strict)?)?
+            .strict_startup(strict),
+    )
 }
 
 pub fn prepare_bundled_luau_plugins(
@@ -904,6 +937,7 @@ fn prepare_plugin_sources(sources: Vec<PluginSource>) -> Result<PreparedLuaPlugi
         worldgen_ore_profile: selected_ore,
         worldgen_settlement_plan: selected_settlement,
         client_bundles,
+        strict_startup: false,
     })
 }
 
@@ -915,14 +949,19 @@ pub fn start_prepared_lua_host(
         NonZeroUsize::new(COMMAND_QUEUE_CAPACITY).expect("command queue capacity is non-zero"),
     );
     let (startup_tx, startup_rx) = std::sync::mpsc::sync_channel(1);
+    let strict_startup = prepared.strict_startup;
     let thread = thread::Builder::new()
         .name("solaris-luau-host".to_owned())
-        .spawn(move || run_lua_host(endpoint, prepared.sources, startup_tx))
+        .spawn(move || run_lua_host(endpoint, prepared.sources, strict_startup, startup_tx))
         .map_err(|error| LuaHostError::ThreadSpawn {
             message: error.to_string(),
         })?;
     let loaded_plugins = match startup_rx.recv() {
-        Ok(loaded_plugins) => loaded_plugins,
+        Ok(Ok(loaded_plugins)) => loaded_plugins,
+        Ok(Err(error)) => {
+            let _ = thread.join();
+            return Err(error);
+        }
         Err(_) => {
             let _ = thread.join();
             return Err(LuaHostError::StartupChannelClosed);
@@ -1148,27 +1187,56 @@ enum DiskDependencyRelation {
     LoadBefore,
 }
 
-fn discover_plugins(plugins_dir: &Path) -> Result<Vec<PluginSource>, LuaHostError> {
+fn discover_plugins(
+    plugins_dir: &Path,
+    strict_discovery: bool,
+) -> Result<Vec<PluginSource>, LuaHostError> {
     let entries = fs::read_dir(plugins_dir).map_err(|error| LuaHostError::Io {
         path: plugins_dir.to_path_buf(),
         message: error.to_string(),
     })?;
     let mut directories = Vec::new();
     for entry in entries {
-        match entry {
-            Ok(entry) if entry.file_type().is_ok_and(|kind| kind.is_dir()) => {
-                if directories.len() >= MAX_PLUGIN_DIRECTORIES {
-                    return Err(LuaHostError::Io {
-                        path: plugins_dir.to_path_buf(),
-                        message: format!("plugin directory count exceeds {MAX_PLUGIN_DIRECTORIES}"),
-                    });
-                }
-                directories.push(entry.path());
-            }
-            Ok(_) => {}
-            Err(error) => {
+        let entry = match entry {
+            Ok(entry) => entry,
+            Err(error) if !strict_discovery => {
                 warn!(%error, directory = %plugins_dir.display(), "plugin directory entry ignored");
+                continue;
             }
+            Err(error) => {
+                return Err(LuaHostError::Io {
+                    path: plugins_dir.to_path_buf(),
+                    message: format!("reading plugin directory entry: {error}"),
+                });
+            }
+        };
+        let entry_path = entry.path();
+        let file_type = match entry.file_type() {
+            Ok(file_type) => file_type,
+            Err(error) if !strict_discovery => {
+                warn!(%error, path = %entry_path.display(), "plugin entry type unavailable; entry ignored");
+                continue;
+            }
+            Err(error) => {
+                return Err(LuaHostError::Io {
+                    path: entry_path,
+                    message: format!("reading plugin entry type: {error}"),
+                });
+            }
+        };
+        if file_type.is_dir() {
+            if directories.len() >= MAX_PLUGIN_DIRECTORIES {
+                return Err(LuaHostError::Io {
+                    path: plugins_dir.to_path_buf(),
+                    message: format!("plugin directory count exceeds {MAX_PLUGIN_DIRECTORIES}"),
+                });
+            }
+            directories.push(entry_path);
+        } else if strict_discovery {
+            return Err(LuaHostError::InvalidStartupPlugin {
+                path: entry_path,
+                message: "strict discovery permits only plugin directories".to_owned(),
+            });
         }
     }
     directories.sort();
@@ -1177,7 +1245,7 @@ fn discover_plugins(plugins_dir: &Path) -> Result<Vec<PluginSource>, LuaHostErro
     for directory in directories {
         match read_plugin_source(&directory) {
             Ok(source) => sources.push(source),
-            Err(error) if error.startup_contract_declared => {
+            Err(error) if strict_discovery || error.startup_contract_declared => {
                 return Err(LuaHostError::InvalidStartupPlugin {
                     path: directory,
                     message: error.message,
@@ -1905,15 +1973,17 @@ fn parse_api_version(value: &str) -> Result<ScriptApiVersion, String> {
 fn run_lua_host(
     mut endpoint: ScriptHostEndpoint,
     sources: Vec<PluginSource>,
-    startup: std::sync::mpsc::SyncSender<usize>,
+    strict_startup: bool,
+    startup: std::sync::mpsc::SyncSender<Result<usize, LuaHostError>>,
 ) {
-    run_lua_host_inner(&mut endpoint, sources, startup, None);
+    run_lua_host_inner(&mut endpoint, sources, strict_startup, startup, None);
 }
 
 fn run_lua_host_inner(
     endpoint: &mut ScriptHostEndpoint,
     sources: Vec<PluginSource>,
-    startup: std::sync::mpsc::SyncSender<usize>,
+    strict_startup: bool,
+    startup: std::sync::mpsc::SyncSender<Result<usize, LuaHostError>>,
     progress: Option<std::sync::mpsc::SyncSender<&'static str>>,
 ) {
     let mut plugins = Vec::new();
@@ -1921,10 +1991,24 @@ fn run_lua_host_inner(
     for source in sources {
         let plugin_id = source.manifest.plugin_id().to_owned();
         if loaded_plugin_ids.contains(&plugin_id) {
+            if strict_startup {
+                let _ = startup.send(Err(LuaHostError::StrictStartupPlugin {
+                    id: plugin_id,
+                    message: "plugin id was already loaded".to_owned(),
+                }));
+                return;
+            }
             warn!(plugin = %plugin_id, "Lua plugin skipped because its id is already loaded");
             continue;
         }
         if let Err(error) = endpoint.register_player_commands(&source.manifest) {
+            if strict_startup {
+                let _ = startup.send(Err(LuaHostError::StrictStartupPlugin {
+                    id: plugin_id,
+                    message: format!("registering player commands: {error:?}"),
+                }));
+                return;
+            }
             match error {
                 PlayerCommandRegistrationError::RootConflict {
                     root,
@@ -1943,7 +2027,7 @@ fn run_lua_host_inner(
                 ),
                 PlayerCommandRegistrationError::AuthorityPoisoned => {
                     warn!("Lua host disabled because player-command authority was poisoned");
-                    let _ = startup.send(0);
+                    let _ = startup.send(Ok(0));
                     return;
                 }
             }
@@ -1957,11 +2041,18 @@ fn run_lua_host_inner(
             }
             Err(error) => {
                 endpoint.unregister_player_commands(&plugin_id);
+                if strict_startup {
+                    let _ = startup.send(Err(LuaHostError::StrictStartupPlugin {
+                        id: plugin_id,
+                        message: error.to_string(),
+                    }));
+                    return;
+                }
                 warn!(plugin = %plugin_id, %error, "Lua plugin skipped during load");
             }
         }
     }
-    let _ = startup.send(plugins.len());
+    let _ = startup.send(Ok(plugins.len()));
 
     while let Some(event) = endpoint.recv_event_blocking() {
         for plugin in &mut plugins {
@@ -4490,9 +4581,15 @@ mod tests {
         let (progress_tx, progress_rx) = std::sync::mpsc::sync_channel(2);
         let host = thread::spawn(move || {
             let mut endpoint = endpoint;
-            run_lua_host_inner(&mut endpoint, vec![source], startup_tx, Some(progress_tx));
+            run_lua_host_inner(
+                &mut endpoint,
+                vec![source],
+                false,
+                startup_tx,
+                Some(progress_tx),
+            );
         });
-        assert_eq!(startup_rx.recv().unwrap(), 1);
+        assert_eq!(startup_rx.recv().unwrap().unwrap(), 1);
 
         boundary
             .try_enqueue_event(ScriptEvent::server_tick(1))
@@ -4553,9 +4650,15 @@ mod tests {
         let (progress_tx, progress_rx) = std::sync::mpsc::sync_channel(2);
         let host = thread::spawn(move || {
             let mut endpoint = endpoint;
-            run_lua_host_inner(&mut endpoint, vec![source], startup_tx, Some(progress_tx));
+            run_lua_host_inner(
+                &mut endpoint,
+                vec![source],
+                false,
+                startup_tx,
+                Some(progress_tx),
+            );
         });
-        assert_eq!(startup_rx.recv().unwrap(), 1);
+        assert_eq!(startup_rx.recv().unwrap().unwrap(), 1);
 
         let player_id = ScriptPlayerId::new(7);
         let context = player_context("Alex");
@@ -5004,8 +5107,9 @@ mod tests {
         let (boundary, endpoint) =
             script_boundary_pair(NonZeroUsize::new(4).unwrap(), NonZeroUsize::new(4).unwrap());
         let (startup_tx, startup_rx) = std::sync::mpsc::sync_channel(1);
-        let host = thread::spawn(move || run_lua_host(endpoint, vec![bad, good], startup_tx));
-        assert_eq!(startup_rx.recv().unwrap(), 2);
+        let host =
+            thread::spawn(move || run_lua_host(endpoint, vec![bad, good], false, startup_tx));
+        assert_eq!(startup_rx.recv().unwrap().unwrap(), 2);
 
         boundary
             .try_enqueue_event(ScriptEvent::server_tick(1))
@@ -5060,11 +5164,12 @@ mod tests {
             run_lua_host(
                 endpoint,
                 vec![source("first/main.lua"), source("second/main.lua")],
+                false,
                 startup_tx,
             )
         });
 
-        assert_eq!(startup_rx.recv().unwrap(), 1);
+        assert_eq!(startup_rx.recv().unwrap().unwrap(), 1);
 
         drop(boundary);
         host.join().unwrap();
@@ -5114,11 +5219,12 @@ mod tests {
                     source("first", "first/main.lua"),
                     source("second", "second/main.lua"),
                 ],
+                false,
                 startup_tx,
             )
         });
 
-        assert_eq!(startup_rx.recv().unwrap(), 1);
+        assert_eq!(startup_rx.recv().unwrap().unwrap(), 1);
         assert_eq!(boundary.player_command_roots(), vec!["hello".to_owned()]);
 
         drop(boundary);
@@ -5149,10 +5255,11 @@ mod tests {
             run_lua_host(
                 endpoint,
                 vec![source("greetings", "hello"), source("farewells", "bye")],
+                false,
                 startup_tx,
             )
         });
-        assert_eq!(startup_rx.recv().unwrap(), 2);
+        assert_eq!(startup_rx.recv().unwrap().unwrap(), 2);
 
         assert_eq!(
             boundary.try_enqueue_player_command_with_context(
@@ -5216,8 +5323,9 @@ mod tests {
         let (boundary, endpoint) =
             script_boundary_pair(NonZeroUsize::new(4).unwrap(), NonZeroUsize::new(4).unwrap());
         let (startup_tx, startup_rx) = std::sync::mpsc::sync_channel(1);
-        let host = thread::spawn(move || run_lua_host(endpoint, vec![bad, good], startup_tx));
-        assert_eq!(startup_rx.recv().unwrap(), 2);
+        let host =
+            thread::spawn(move || run_lua_host(endpoint, vec![bad, good], false, startup_tx));
+        assert_eq!(startup_rx.recv().unwrap().unwrap(), 2);
 
         assert_eq!(
             boundary.try_enqueue_player_command_with_context(
@@ -5549,9 +5657,14 @@ mod tests {
             script_boundary_pair(NonZeroUsize::new(2).unwrap(), NonZeroUsize::new(2).unwrap());
         let (startup_tx, startup_rx) = std::sync::mpsc::sync_channel(1);
         let host = thread::spawn(move || {
-            run_lua_host(endpoint, vec![source("owner"), source("other")], startup_tx)
+            run_lua_host(
+                endpoint,
+                vec![source("owner"), source("other")],
+                false,
+                startup_tx,
+            )
         });
-        assert_eq!(startup_rx.recv().unwrap(), 2);
+        assert_eq!(startup_rx.recv().unwrap().unwrap(), 2);
         let request = ScriptPluginStorageGetRequest::try_new("read", "balance:player-7").unwrap();
 
         boundary
@@ -5720,6 +5833,64 @@ mod tests {
                 .contains("main.lua exceeds")
         );
         fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn strict_discovery_rejects_broken_plugin_and_stray_entries() {
+        let root = std::env::temp_dir().join(format!(
+            "solaris-mc-script-strict-discovery-{}-{}",
+            std::process::id(),
+            TEST_TEMP_ID.fetch_add(1, Ordering::Relaxed)
+        ));
+        let broken = root.join("broken");
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir(&root).unwrap();
+        fs::create_dir(&broken).unwrap();
+        fs::write(broken.join("plugin.toml"), "not valid toml = [").unwrap();
+        fs::write(broken.join("main.lua"), "return nil").unwrap();
+
+        let permissive = prepare_lua_plugins(LuaHostConfig::new(&root)).unwrap();
+        assert_eq!(permissive.discovered_plugins().len(), 0);
+        assert!(matches!(
+            prepare_lua_plugins(LuaHostConfig::new(&root).strict_discovery(true)),
+            Err(LuaHostError::InvalidStartupPlugin { path, .. }) if path == broken
+        ));
+
+        fs::remove_dir_all(&broken).unwrap();
+        let stray = root.join("README.txt");
+        fs::write(&stray, "not a plugin package").unwrap();
+        assert!(matches!(
+            prepare_lua_plugins(LuaHostConfig::new(&root).strict_discovery(true)),
+            Err(LuaHostError::InvalidStartupPlugin { path, .. }) if path == stray
+        ));
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn strict_startup_rejects_lua_compile_failure_instead_of_loading_a_subset() {
+        let source = || PluginSource {
+            manifest: manifest(&["server.tick"]),
+            config: toml::Table::new(),
+            source: "function on_server_tick(".to_owned(),
+            source_path: PathBuf::from("broken/main.lua"),
+            worldgen_ore_profile: None,
+            worldgen_settlement_plan: None,
+            client_bundles: Vec::new(),
+        };
+
+        let permissive = prepare_plugin_sources(vec![source()]).unwrap();
+        let (boundary, host) = start_prepared_lua_host(permissive).unwrap();
+        assert_eq!(host.loaded_plugins(), 0);
+        drop(boundary);
+        host.join().unwrap();
+
+        let strict = prepare_plugin_sources(vec![source()])
+            .unwrap()
+            .strict_startup(true);
+        assert!(matches!(
+            start_prepared_lua_host(strict),
+            Err(LuaHostError::StrictStartupPlugin { id, .. }) if id == "test-plugin"
+        ));
     }
 
     #[test]

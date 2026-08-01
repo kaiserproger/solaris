@@ -35,9 +35,12 @@ Every source is parsed and type-checked as `--!strict` Luau before it may claim
 commands or receive events, even when the file omits the directive. The shipped
 sources include `--!strict` explicitly. Solaris supplies a type-check-only
 `solaris` host prelude, rejects diagnostics, then executes the accepted source in
-one sandboxed Luau VM with bounded memory and interrupt fuel. A normal invalid
-plugin is skipped; a plugin declaring startup worldgen or client content fails
-server startup instead of silently changing the world/client contract.
+one sandboxed Luau VM with bounded memory and interrupt fuel. In permissive development mode, an ordinary invalid plugin is skipped; a plugin
+declaring startup worldgen or client content still fails server startup instead
+of silently changing the world/client contract. Production should use strict
+deployment mode: every filesystem entry must be a valid plugin directory, every
+plugin must finish host startup, and the final merged external/bundled id set must
+match the configured expected set exactly.
 
 External and server-embedded plugins can be selected together:
 
@@ -45,7 +48,17 @@ External and server-embedded plugins can be selected together:
 [plugins]
 directory = "plugins" # optional external root
 bundled = ["basic-economy", "online-roster"]
+strict = true
+expected = ["basic-economy", "online-roster", "my-external-plugin"]
 ```
+
+`expected` is valid only when `strict = true`. Duplicate expected ids, missing
+plugins, unexpected plugins, malformed packages, stray non-directory entries,
+player-command registration conflicts, and Luau compile/startup failures reject
+`--check` and normal server startup. The expected set is evaluated after external
+and bundled packages are merged, so one operator contract covers the complete
+production deployment. Keep `strict = false` only for local iteration where
+skipping an ordinary broken package is intentional.
 
 The available bundled ids are `basic-economy`, `colony-villager-scaffold`,
 `geological-mines`, `land-claims`, `online-roster`, and

@@ -106,6 +106,10 @@ allow_local_dev_operators = true
 
 [plugins]
 directory = "plugins"
+# Keep permissive for local iteration. Production should set strict = true and
+# list the exact external and bundled ids in expected.
+strict = false
+expected = []
 
 [data]
 world_dir = "world"

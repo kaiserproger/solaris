@@ -1,6 +1,6 @@
 //! `mc-server` binary entry point.
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::net::IpAddr;
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
@@ -95,19 +95,23 @@ fn bundled_luau_plugin(plugin: mc_server::BundledPlugin) -> mc_script::BundledLu
 fn prepare_configured_luau_plugins(
     config: &ServerConfig,
 ) -> Result<Option<mc_script::PreparedLuaPlugins>> {
+    if !config.plugins.strict && !config.plugins.expected.is_empty() {
+        bail!("plugins.expected requires plugins.strict = true");
+    }
     let mut prepared = config
         .plugins
         .directory
         .as_deref()
         .map(|directory| {
-            mc_script::prepare_lua_plugins(mc_script::LuaHostConfig::new(directory)).with_context(
-                || {
-                    format!(
-                        "preparing external Luau plugins from {}",
-                        directory.display()
-                    )
-                },
+            mc_script::prepare_lua_plugins(
+                mc_script::LuaHostConfig::new(directory).strict_discovery(config.plugins.strict),
             )
+            .with_context(|| {
+                format!(
+                    "preparing external Luau plugins from {}",
+                    directory.display()
+                )
+            })
         })
         .transpose()?;
 
@@ -129,7 +133,43 @@ fn prepare_configured_luau_plugins(
         });
     }
 
+    prepared = prepared.map(|prepared| prepared.strict_startup(config.plugins.strict));
+    validate_expected_plugin_set(config, prepared.as_ref())?;
     Ok(prepared)
+}
+
+fn validate_expected_plugin_set(
+    config: &ServerConfig,
+    prepared: Option<&mc_script::PreparedLuaPlugins>,
+) -> Result<()> {
+    if !config.plugins.strict {
+        return Ok(());
+    }
+
+    let mut expected = BTreeSet::new();
+    for id in &config.plugins.expected {
+        if id.is_empty() {
+            bail!("plugins.expected contains an empty plugin id");
+        }
+        if !expected.insert(id.as_str()) {
+            bail!("plugins.expected contains duplicate plugin id `{id}`");
+        }
+    }
+    let actual = prepared
+        .into_iter()
+        .flat_map(mc_script::PreparedLuaPlugins::discovered_plugins)
+        .map(|plugin| plugin.id())
+        .collect::<BTreeSet<_>>();
+    let missing = expected.difference(&actual).copied().collect::<Vec<_>>();
+    let unexpected = actual.difference(&expected).copied().collect::<Vec<_>>();
+    if missing.is_empty() && unexpected.is_empty() {
+        return Ok(());
+    }
+    bail!(
+        "strict plugin set mismatch: missing [{}], unexpected [{}]",
+        missing.join(", "),
+        unexpected.join(", ")
+    )
 }
 
 fn check_config(path: &Path) -> Result<()> {
@@ -1950,6 +1990,70 @@ mod tests {
         assert_eq!(host.loaded_plugins(), 3);
         drop(boundary);
         host.join().unwrap();
+    }
+
+    #[test]
+    fn strict_plugin_set_matches_merged_external_and_bundled_deployment() {
+        let plugins = tempfile::tempdir().unwrap();
+        let external = plugins.path().join("external");
+        std::fs::create_dir(&external).unwrap();
+        std::fs::write(
+            external.join("plugin.toml"),
+            "id='external'\nname='External'\nversion='0.1.0'\napi='0.6.0'\n",
+        )
+        .unwrap();
+        std::fs::write(external.join("main.lua"), "return nil").unwrap();
+        let mut config: ServerConfig = toml::from_str(
+            r#"
+                [server]
+                name = "Strict"
+                motd = "Strict plugins"
+
+                [network]
+                bind_address = "127.0.0.1"
+                port = 25565
+            "#,
+        )
+        .unwrap();
+        config.plugins.directory = Some(plugins.path().to_path_buf());
+        config.plugins.bundled = vec![mc_server::BundledPlugin::OnlineRoster];
+        config.plugins.strict = true;
+        config.plugins.expected = vec!["online-roster".to_owned(), "external".to_owned()];
+
+        let prepared = prepare_configured_luau_plugins(&config)
+            .unwrap()
+            .expect("strict merged plugin set prepares");
+        assert_eq!(
+            prepared
+                .discovered_plugins()
+                .map(|plugin| plugin.id())
+                .collect::<BTreeSet<_>>(),
+            BTreeSet::from(["external", "online-roster"])
+        );
+        let (boundary, host) = mc_script::start_prepared_lua_host(prepared).unwrap();
+        assert_eq!(host.loaded_plugins(), 2);
+        drop(boundary);
+        host.join().unwrap();
+
+        config.plugins.expected.push("missing".to_owned());
+        let error = prepare_configured_luau_plugins(&config).unwrap_err();
+        assert!(error.to_string().contains("missing [missing]"), "{error:#}");
+
+        config.plugins.expected = vec!["external".to_owned()];
+        let error = prepare_configured_luau_plugins(&config).unwrap_err();
+        assert!(
+            error.to_string().contains("unexpected [online-roster]"),
+            "{error:#}"
+        );
+
+        config.plugins.expected = vec!["external".to_owned(), "external".to_owned()];
+        let error = prepare_configured_luau_plugins(&config).unwrap_err();
+        assert!(error.to_string().contains("duplicate plugin id `external`"));
+
+        config.plugins.strict = false;
+        config.plugins.expected = vec!["external".to_owned()];
+        let error = prepare_configured_luau_plugins(&config).unwrap_err();
+        assert!(error.to_string().contains("requires plugins.strict = true"));
     }
 
     #[test]

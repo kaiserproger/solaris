@@ -929,6 +929,13 @@ filesystem/process/debug libraries не выдаются. `plugin.toml` чита
 allocation и queue admission. Ошибка handler или poisoned invocation authority
 отключает один plugin и освобождает его command roots, не останавливая сервер.
 
+Deployment имеет два явных режима. Permissive mode предназначен для local
+iteration и может пропустить обычный broken package. Strict production mode
+запрещает stray filesystem entries и любой discovery/startup skip, а
+`plugins.expected` должен точно совпасть с merged external+bundled ID set.
+Проверка выполняется одинаково в `--check` и serve; host startup возвращает typed
+ошибку, если expected plugin не прошёл command-root registration или Lua compile.
+
 Owner-committed player-death/entity-kill events проходят отдельный bounded outbox
 на 256 envelopes. Каждый envelope явно `Required` или `BestEffort`: required
 переполнение/closure публикует fatal health signal, запрашивает shutdown и делает
