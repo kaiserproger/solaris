@@ -202,11 +202,61 @@ impl From<TryRecvError> for QueueRecvError {
     }
 }
 
+#[derive(Debug)]
+struct SharedQueueSender<T> {
+    sender: Mutex<Option<SyncSender<T>>>,
+    ready: Arc<Notify>,
+}
+
+impl<T> SharedQueueSender<T> {
+    fn new(sender: SyncSender<T>, ready: Arc<Notify>) -> Self {
+        Self {
+            sender: Mutex::new(Some(sender)),
+            ready,
+        }
+    }
+
+    fn try_send(&self, item: T) -> Result<(), QueueError<T>> {
+        let sender = self
+            .sender
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let Some(sender) = sender.as_ref() else {
+            return Err(QueueError::Closed(item));
+        };
+        sender
+            .try_send(item)
+            .map(|()| self.ready.notify_one())
+            .map_err(QueueError::from)
+    }
+
+    fn close(&self) {
+        let sender = self
+            .sender
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .take();
+        drop(sender);
+        self.ready.notify_waiters();
+    }
+}
+
+impl<T> Drop for SharedQueueSender<T> {
+    fn drop(&mut self) {
+        let sender = self
+            .sender
+            .get_mut()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .take();
+        drop(sender);
+        self.ready.notify_waiters();
+    }
+}
+
 /// Server-owned side of the extension boundary.
 #[derive(Debug, Clone)]
 pub struct ExtensionBoundary {
-    event_tx: SyncSender<InboundEvent>,
-    event_ready: Arc<Notify>,
+    event_tx: Arc<SharedQueueSender<InboundEvent>>,
     command_rx: Arc<Mutex<Receiver<OutboundCommand>>>,
     command_ready: Arc<Notify>,
 }
@@ -214,10 +264,12 @@ pub struct ExtensionBoundary {
 impl ExtensionBoundary {
     /// Try to enqueue one inbound event without blocking server tasks.
     pub fn try_enqueue_event(&self, event: InboundEvent) -> Result<(), QueueError<InboundEvent>> {
-        self.event_tx
-            .try_send(event)
-            .map(|()| self.event_ready.notify_one())
-            .map_err(QueueError::from)
+        self.event_tx.try_send(event)
+    }
+
+    /// Close event production for every boundary clone.
+    pub fn close_event_queue(&self) {
+        self.event_tx.close();
     }
 
     /// Try to receive one outbound command emitted by the extension side.
@@ -233,6 +285,8 @@ impl ExtensionBoundary {
     pub async fn recv_command(&self) -> Result<OutboundCommand, QueueRecvError> {
         loop {
             let command_ready = self.command_ready.notified();
+            tokio::pin!(command_ready);
+            command_ready.as_mut().enable();
             match self.try_recv_command() {
                 Err(QueueRecvError::Empty) => command_ready.await,
                 result => return result,
@@ -241,19 +295,12 @@ impl ExtensionBoundary {
     }
 }
 
-impl Drop for ExtensionBoundary {
-    fn drop(&mut self) {
-        self.event_ready.notify_one();
-    }
-}
-
 /// Extension-host side of the boundary.
 #[derive(Debug)]
 pub struct ExtensionEndpoint {
     event_rx: Arc<Mutex<Receiver<InboundEvent>>>,
     event_ready: Arc<Notify>,
-    command_tx: SyncSender<OutboundCommand>,
-    command_ready: Arc<Notify>,
+    command_tx: Arc<SharedQueueSender<OutboundCommand>>,
 }
 
 impl ExtensionEndpoint {
@@ -270,6 +317,8 @@ impl ExtensionEndpoint {
     pub async fn recv_event(&self) -> Result<InboundEvent, QueueRecvError> {
         loop {
             let event_ready = self.event_ready.notified();
+            tokio::pin!(event_ready);
+            event_ready.as_mut().enable();
             match self.try_recv_event() {
                 Err(QueueRecvError::Empty) => event_ready.await,
                 result => return result,
@@ -282,16 +331,12 @@ impl ExtensionEndpoint {
         &self,
         command: OutboundCommand,
     ) -> Result<(), QueueError<OutboundCommand>> {
-        self.command_tx
-            .try_send(command)
-            .map(|()| self.command_ready.notify_one())
-            .map_err(QueueError::from)
+        self.command_tx.try_send(command)
     }
-}
 
-impl Drop for ExtensionEndpoint {
-    fn drop(&mut self) {
-        self.command_ready.notify_one();
+    /// Close command production for this extension endpoint.
+    pub fn close_command_queue(&self) {
+        self.command_tx.close();
     }
 }
 
@@ -304,19 +349,22 @@ pub fn boundary_pair(
     let (command_tx, command_rx) = sync_channel(command_capacity.get());
     let event_ready = Arc::new(Notify::new());
     let command_ready = Arc::new(Notify::new());
+    let event_tx = Arc::new(SharedQueueSender::new(event_tx, Arc::clone(&event_ready)));
+    let command_tx = Arc::new(SharedQueueSender::new(
+        command_tx,
+        Arc::clone(&command_ready),
+    ));
 
     (
         ExtensionBoundary {
             event_tx,
-            event_ready: Arc::clone(&event_ready),
             command_rx: Arc::new(Mutex::new(command_rx)),
-            command_ready: Arc::clone(&command_ready),
+            command_ready,
         },
         ExtensionEndpoint {
             event_rx: Arc::new(Mutex::new(event_rx)),
             event_ready,
             command_tx,
-            command_ready,
         },
     )
 }
@@ -333,6 +381,13 @@ mod tests {
         InboundEvent::PlayerJoined {
             player_id: PlayerId::new(7),
             username: name.to_owned(),
+        }
+    }
+
+    fn disconnect(reason: &str) -> OutboundCommand {
+        OutboundCommand::DisconnectPlayer {
+            player_id: PlayerId::new(9),
+            reason: reason.to_owned(),
         }
     }
 
@@ -479,6 +534,112 @@ mod tests {
             .expect("closed event channel must wake receiver")
             .unwrap();
         assert_eq!(received, Err(QueueRecvError::Closed));
+    }
+
+    #[tokio::test]
+    async fn explicit_event_close_wakes_two_waiters() {
+        let (boundary, endpoint) = boundary_pair(nonzero(1), nonzero(1));
+        let endpoint = Arc::new(endpoint);
+        let barrier = Arc::new(tokio::sync::Barrier::new(3));
+        let first = {
+            let endpoint = Arc::clone(&endpoint);
+            let barrier = Arc::clone(&barrier);
+            tokio::spawn(async move {
+                barrier.wait().await;
+                endpoint.recv_event().await
+            })
+        };
+        let second = {
+            let endpoint = Arc::clone(&endpoint);
+            let barrier = Arc::clone(&barrier);
+            tokio::spawn(async move {
+                barrier.wait().await;
+                endpoint.recv_event().await
+            })
+        };
+        barrier.wait().await;
+        boundary.close_event_queue();
+
+        assert_eq!(first.await.unwrap(), Err(QueueRecvError::Closed));
+        assert_eq!(second.await.unwrap(), Err(QueueRecvError::Closed));
+    }
+
+    #[tokio::test]
+    async fn explicit_command_close_wakes_two_waiters() {
+        let (boundary, endpoint) = boundary_pair(nonzero(1), nonzero(1));
+        let barrier = Arc::new(tokio::sync::Barrier::new(3));
+        let first = {
+            let boundary = boundary.clone();
+            let barrier = Arc::clone(&barrier);
+            tokio::spawn(async move {
+                barrier.wait().await;
+                boundary.recv_command().await
+            })
+        };
+        let second = {
+            let boundary = boundary.clone();
+            let barrier = Arc::clone(&barrier);
+            tokio::spawn(async move {
+                barrier.wait().await;
+                boundary.recv_command().await
+            })
+        };
+        barrier.wait().await;
+        endpoint.close_command_queue();
+
+        assert_eq!(first.await.unwrap(), Err(QueueRecvError::Closed));
+        assert_eq!(second.await.unwrap(), Err(QueueRecvError::Closed));
+    }
+
+    #[tokio::test]
+    async fn close_drains_filled_queues_before_reporting_closed() {
+        let (boundary, endpoint) = boundary_pair(nonzero(1), nonzero(1));
+        let event = joined("queued");
+        boundary.try_enqueue_event(event.clone()).unwrap();
+        boundary.close_event_queue();
+        assert_eq!(endpoint.recv_event().await, Ok(event));
+        assert_eq!(endpoint.recv_event().await, Err(QueueRecvError::Closed));
+
+        let command = disconnect("queued");
+        endpoint.try_submit_command(command.clone()).unwrap();
+        endpoint.close_command_queue();
+        assert_eq!(boundary.recv_command().await, Ok(command));
+        assert_eq!(boundary.recv_command().await, Err(QueueRecvError::Closed));
+    }
+
+    #[tokio::test]
+    async fn repeated_close_is_idempotent_and_rejects_new_items() {
+        let (boundary, endpoint) = boundary_pair(nonzero(1), nonzero(1));
+        boundary.close_event_queue();
+        boundary.close_event_queue();
+        let event = joined("late");
+        assert_eq!(
+            boundary.try_enqueue_event(event.clone()),
+            Err(QueueError::Closed(event))
+        );
+        assert_eq!(endpoint.recv_event().await, Err(QueueRecvError::Closed));
+
+        endpoint.close_command_queue();
+        endpoint.close_command_queue();
+        let command = disconnect("late");
+        assert_eq!(
+            endpoint.try_submit_command(command.clone()),
+            Err(QueueError::Closed(command))
+        );
+        assert_eq!(boundary.recv_command().await, Err(QueueRecvError::Closed));
+    }
+
+    #[tokio::test]
+    async fn event_queue_closes_only_after_last_boundary_clone_drops() {
+        let (boundary, endpoint) = boundary_pair(nonzero(1), nonzero(1));
+        let clone = boundary.clone();
+        drop(boundary);
+
+        let event = joined("survives-clone-drop");
+        clone.try_enqueue_event(event.clone()).unwrap();
+        assert_eq!(endpoint.recv_event().await, Ok(event));
+        drop(clone);
+        assert_eq!(endpoint.recv_event().await, Err(QueueRecvError::Closed));
     }
 
     #[test]

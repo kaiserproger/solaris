@@ -914,9 +914,12 @@ DTO, atomic currency/item transaction, colonies и villager-binding requests.
 Этот crate не запускает плагины и не хранит прежнюю Solaris manifest/version
 схему. Он задает только immutable inbound events, bounded outbound commands,
 allow-list/размерный fence для custom payload и push-уведомления для обеих
-ограниченных очередей. Он намеренно не ссылается на server internals. Vanilla
-client работает без этого bridge; custom client использует только явно
-разрешенные payload channels.
+ограниченных очередей. Producer sender хранится в shared `Option`: close/final
+Drop сначала уничтожает sender и только затем вызывает `notify_waiters`.
+Async receive заранее enables `Notified` до `try_recv`, поэтому close нельзя
+потерять между проверкой Empty и сном; queued prefix остается drainable.
+Он намеренно не ссылается на server internals. Vanilla client работает без
+этого bridge; custom client использует только явно разрешенные payload channels.
 
 Minecraft client MCP находится рядом, но не является частью server authority.
 Fabric mod переводит MCP commands в реальные client actions и публикует
