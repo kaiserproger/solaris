@@ -14,6 +14,7 @@ pub const MIN_VIEW_DISTANCE: i32 = 2;
 /// Vanilla's maximum supported server view distance.
 pub const MAX_VIEW_DISTANCE: i32 = 32;
 
+mod admission;
 mod autoscale_soak;
 mod blocking;
 mod chunk_pipeline;

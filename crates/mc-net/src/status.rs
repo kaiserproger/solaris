@@ -7,7 +7,9 @@ use mc_protocol::{PROTOCOL_VERSION, State, TARGET_RELEASE};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
 use crate::RuntimeControlHandle;
-use crate::connection::{PRE_PLAY_READ_TIMEOUT, read_packet_with_timeout, write_packet};
+use crate::connection::{
+    PRE_PLAY_READ_TIMEOUT, PrePlayBudget, read_packet_with_timeout_budgeted, write_packet,
+};
 use crate::error::ConnectionError;
 use crate::play::SessionRegistry;
 use crate::server::ServerConfig;
@@ -70,6 +72,7 @@ pub(crate) async fn handle<R, W>(
     reader: &mut R,
     writer: &mut W,
     buf: &mut BytesMut,
+    budget: &mut PrePlayBudget,
     config: &ServerConfig,
     sessions: &SessionRegistry,
     runtime_control: Option<&RuntimeControlHandle>,
@@ -82,12 +85,13 @@ where
     // It's tempting to skip the StatusRequest read and just wait for the
     // ping, but mcstatus-style clients always send the empty status
     // request first.
-    let _ = read_packet_with_timeout::<StatusRequest, _>(
+    let _ = read_packet_with_timeout_budgeted::<StatusRequest, _>(
         reader,
         buf,
         Compression::Disabled,
         State::Status,
         PRE_PLAY_READ_TIMEOUT,
+        budget,
     )
     .await?;
 
@@ -100,12 +104,13 @@ where
     };
     write_packet(writer, &response, Compression::Disabled).await?;
 
-    let ping = read_packet_with_timeout::<PingRequest, _>(
+    let ping = read_packet_with_timeout_budgeted::<PingRequest, _>(
         reader,
         buf,
         Compression::Disabled,
         State::Status,
         PRE_PLAY_READ_TIMEOUT,
+        budget,
     )
     .await?;
     write_packet(

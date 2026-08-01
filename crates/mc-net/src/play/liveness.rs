@@ -1,4 +1,5 @@
 use bytes::{Buf, Bytes};
+use mc_extension::DEFAULT_MAX_CUSTOM_PAYLOAD_BYTES;
 use mc_protocol::packets::Packet;
 use mc_protocol::packets::play::{
     ConfirmTeleportation, ServerboundAttack, ServerboundChangeGameMode, ServerboundChat,
@@ -36,6 +37,10 @@ pub(super) fn validate_serverbound_play_frame(
     id: i32,
     body: &Bytes,
 ) -> Result<bool, ConnectionError> {
+    if id == ServerboundCustomPayload::ID && body.len() > DEFAULT_MAX_CUSTOM_PAYLOAD_BYTES {
+        return Ok(false);
+    }
+
     macro_rules! recognized {
         ($packet:ty) => {
             if id == <$packet>::ID {
@@ -92,6 +97,12 @@ mod tests {
     #[test]
     fn unknown_packet_does_not_count_as_valid_activity() {
         assert!(!validate_serverbound_play_frame(0x7fff, &Bytes::new()).unwrap());
+    }
+
+    #[test]
+    fn oversized_custom_payload_is_ignored_without_refreshing_activity() {
+        let body = Bytes::from(vec![0_u8; DEFAULT_MAX_CUSTOM_PAYLOAD_BYTES + 1]);
+        assert!(!validate_serverbound_play_frame(ServerboundCustomPayload::ID, &body).unwrap());
     }
 
     #[test]

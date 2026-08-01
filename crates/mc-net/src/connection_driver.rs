@@ -1,5 +1,6 @@
 //! Per-connection protocol state orchestration.
 
+use std::future::Future;
 use std::net::SocketAddr;
 use std::sync::Arc;
 
@@ -10,9 +11,12 @@ use mc_protocol::packets::handshake::{Handshake, NextState};
 use mc_world::ChunkGeometry;
 use tracing::debug;
 
+use crate::admission::PreAuthPermit;
 use crate::chunk_pipeline::ChunkPipelineResources;
 use crate::connection::{
-    ConnectionReader, ConnectionWriter, PRE_PLAY_READ_TIMEOUT, read_packet_with_timeout,
+    ConnectionReader, ConnectionWriter, MAX_PRE_PLAY_BYTES, MAX_PRE_PLAY_PACKETS,
+    PRE_PLAY_READ_TIMEOUT, PRE_PLAY_TOTAL_TIMEOUT, PrePlayBudget,
+    read_packet_with_timeout_budgeted,
 };
 use crate::error::ConnectionError;
 use crate::script::PluginZoneAdapter;
@@ -35,10 +39,26 @@ pub(crate) struct ConnectionServices {
     pub(crate) script_zones: Option<PluginZoneAdapter>,
 }
 
+async fn before_pre_play_deadline<T, F>(
+    deadline: tokio::time::Instant,
+    future: F,
+) -> Result<T, ConnectionError>
+where
+    F: Future<Output = Result<T, ConnectionError>>,
+{
+    match tokio::time::timeout_at(deadline, future).await {
+        Ok(result) => result,
+        Err(_) => Err(ConnectionError::PrePlayDeadlineExceeded {
+            timeout: PRE_PLAY_TOTAL_TIMEOUT,
+        }),
+    }
+}
+
 pub(crate) async fn handle_connection(
     socket: tokio::net::TcpStream,
     peer: SocketAddr,
     services: ConnectionServices,
+    pre_auth_permit: PreAuthPermit,
 ) -> Result<(), ConnectionError> {
     // Disable Nagle for low-latency interactive packets, matching vanilla.
     socket.set_nodelay(true)?;
@@ -48,13 +68,19 @@ pub(crate) async fn handle_connection(
     let mut writer = ConnectionWriter::new(writer);
     let mut buf = BytesMut::with_capacity(4096);
     let mut compression = Compression::Disabled;
+    let deadline = tokio::time::Instant::now() + PRE_PLAY_TOTAL_TIMEOUT;
+    let mut budget = PrePlayBudget::new(MAX_PRE_PLAY_PACKETS, MAX_PRE_PLAY_BYTES);
 
-    let handshake = read_packet_with_timeout::<Handshake, _>(
-        &mut reader,
-        &mut buf,
-        Compression::Disabled,
-        State::Handshake,
-        PRE_PLAY_READ_TIMEOUT,
+    let handshake = before_pre_play_deadline(
+        deadline,
+        read_packet_with_timeout_budgeted::<Handshake, _>(
+            &mut reader,
+            &mut buf,
+            Compression::Disabled,
+            State::Handshake,
+            PRE_PLAY_READ_TIMEOUT,
+            &mut budget,
+        ),
     )
     .await?;
     debug!(
@@ -67,27 +93,35 @@ pub(crate) async fn handle_connection(
 
     match handshake.next_state {
         NextState::Status => {
-            status::handle(
-                &mut reader,
-                &mut writer,
-                &mut buf,
-                services.config.as_ref(),
-                &services.sessions,
-                services.runtime_control.as_ref(),
+            before_pre_play_deadline(
+                deadline,
+                status::handle(
+                    &mut reader,
+                    &mut writer,
+                    &mut buf,
+                    &mut budget,
+                    services.config.as_ref(),
+                    &services.sessions,
+                    services.runtime_control.as_ref(),
+                ),
             )
             .await
         }
         NextState::Login | NextState::Transfer => {
-            let outcome = login::handle(
-                &mut reader,
-                &mut writer,
-                &mut buf,
-                services.config.chunk_pipeline.compression_threshold,
-                &mut compression,
-                services.config.chunk_pipeline.compression_level,
-                services.config.command_permissions.login_access(),
-                services.online_authentication.as_deref(),
-                peer.ip(),
+            let outcome = before_pre_play_deadline(
+                deadline,
+                login::handle(
+                    &mut reader,
+                    &mut writer,
+                    &mut buf,
+                    &mut budget,
+                    services.config.chunk_pipeline.compression_threshold,
+                    &mut compression,
+                    services.config.chunk_pipeline.compression_level,
+                    services.config.command_permissions.login_access(),
+                    services.online_authentication.as_deref(),
+                    peer.ip(),
+                ),
             )
             .await?;
             let Some(login::LoginOutcome {
@@ -101,28 +135,33 @@ pub(crate) async fn handle_connection(
                 .config
                 .command_permissions
                 .permissions_for(&profile, peer);
-            let configuration_outcome = configuration::handle(
-                &mut reader,
-                &mut writer,
-                &mut buf,
-                compression,
-                &profile,
-                configuration::ConfigurationContext {
-                    data: services.config.data.as_ref(),
-                    tags: services.config.tags.as_ref(),
-                    chunk_geometry: services.chunk_geometry,
-                    custom_payload_policy: services
-                        .extension
-                        .as_ref()
-                        .map(ExtensionEventSink::custom_payload_policy),
-                    loader_manifest: services
-                        .config
-                        .loader_manifest
-                        .as_deref()
-                        .filter(|manifest| !manifest.is_empty()),
-                },
+            let configuration_outcome = before_pre_play_deadline(
+                deadline,
+                configuration::handle(
+                    &mut reader,
+                    &mut writer,
+                    &mut buf,
+                    &mut budget,
+                    compression,
+                    &profile,
+                    configuration::ConfigurationContext {
+                        data: services.config.data.as_ref(),
+                        tags: services.config.tags.as_ref(),
+                        chunk_geometry: services.chunk_geometry,
+                        custom_payload_policy: services
+                            .extension
+                            .as_ref()
+                            .map(ExtensionEventSink::custom_payload_policy),
+                        loader_manifest: services
+                            .config
+                            .loader_manifest
+                            .as_deref()
+                            .filter(|manifest| !manifest.is_empty()),
+                    },
+                ),
             )
             .await?;
+            drop(pre_auth_permit);
             Box::pin(play::handle(
                 &mut reader,
                 &mut writer,
@@ -148,3 +187,7 @@ pub(crate) async fn handle_connection(
         }
     }
 }
+
+#[cfg(test)]
+#[path = "connection_driver_tests.rs"]
+mod tests;

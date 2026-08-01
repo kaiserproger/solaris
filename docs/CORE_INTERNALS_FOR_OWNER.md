@@ -237,6 +237,12 @@ Login/Transfer. После Login он последовательно прово�
 Переход фазы явный: packet ID никогда не интерпретируется без текущего protocol
 state.
 
+Handshake -> Login -> Configuration имеет один абсолютный 45-second deadline,
+10-second progress timeout на read и общий 96-packet/512-KiB budget. Отдельный
+pre-auth admission guard ограничивает global и per-IP handshakes; guard
+освобождается сразу после Configuration, поэтому Play session не удерживает
+unauthenticated capacity.
+
 ### 6.2 `connection`, `encryption`, `login`, `configuration`, `status`
 
 | Модуль | Function-level роль |

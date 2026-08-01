@@ -53,6 +53,15 @@ pub enum ConnectionError {
     #[error("timed out after {timeout:?} waiting for a packet in state {state:?}")]
     ReadTimeout { state: State, timeout: Duration },
 
+    #[error("pre-Play protocol deadline exceeded after {timeout:?}")]
+    PrePlayDeadlineExceeded { timeout: Duration },
+
+    #[error("pre-Play packet budget exceeded: {packets} packets, maximum {max}")]
+    PrePlayPacketBudgetExceeded { packets: usize, max: usize },
+
+    #[error("pre-Play byte budget exceeded: {bytes} bytes, maximum {max}")]
+    PrePlayByteBudgetExceeded { bytes: usize, max: usize },
+
     #[error("outbound socket write remained blocked for {timeout:?}")]
     WriteTimeout { timeout: Duration },
 

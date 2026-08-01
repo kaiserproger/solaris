@@ -47,4 +47,5 @@ zip = { workspace = true }
 [dev-dependencies]
 mc-entity = { path = "../mc-entity" }
 mc-script = { path = "../mc-script", features = ["lua-runtime"] }
+tokio = { workspace = true, features = ["test-util"] }
 tempfile = "3"

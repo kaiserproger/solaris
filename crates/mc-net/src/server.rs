@@ -37,6 +37,7 @@ use tokio::net::TcpListener;
 use tokio::sync::{Mutex, Notify, Semaphore, broadcast};
 use tracing::{debug, info, warn};
 
+use crate::admission::PreAuthAdmission;
 use crate::chunk_pipeline::ChunkPipelineResources;
 use crate::connection_driver::{ConnectionServices, handle_connection};
 use crate::control_plane::{
@@ -71,6 +72,9 @@ static PHYSICS_MATERIAL_CACHE: OnceLock<std::sync::Mutex<PhysicsMaterialCache>> 
 const CONNECTION_DRAIN_TIMEOUT: Duration = Duration::from_secs(5);
 const MIN_CONNECTION_TASKS: usize = 32;
 const MAX_CONNECTION_TASKS: usize = 512;
+const MIN_PRE_AUTH_CONNECTIONS: usize = 16;
+const MAX_PRE_AUTH_CONNECTIONS: usize = 128;
+const MAX_PRE_AUTH_CONNECTIONS_PER_IP: usize = 4;
 const ENTITY_TICKER_DRAIN_TIMEOUT: Duration = Duration::from_secs(5);
 const DIRTY_ONLY_FLUSH_MAX_CHUNKS: usize = 64;
 const DIRTY_ONLY_FLUSH_STALE_REGION_RETRIES: usize = 3;
@@ -82,6 +86,14 @@ fn connection_task_limit(max_players: u32) -> usize {
         .saturating_mul(2)
         .saturating_add(16)
         .clamp(MIN_CONNECTION_TASKS, MAX_CONNECTION_TASKS)
+}
+
+fn pre_auth_connection_limit(max_players: u32) -> usize {
+    usize::try_from(max_players)
+        .unwrap_or(usize::MAX)
+        .saturating_add(8)
+        .clamp(MIN_PRE_AUTH_CONNECTIONS, MAX_PRE_AUTH_CONNECTIONS)
+        .min(connection_task_limit(max_players))
 }
 
 #[derive(Debug, Clone, Default)]
@@ -1151,7 +1163,15 @@ impl BoundServer {
         let shutdown = config.shutdown.clone();
         let connection_task_limit = connection_task_limit(config.max_players);
         let connection_permits = Arc::new(Semaphore::new(connection_task_limit));
-        info!(connection_task_limit, "bounded concurrent connection tasks");
+        let pre_auth_connection_limit = pre_auth_connection_limit(config.max_players);
+        let pre_auth_admission =
+            PreAuthAdmission::new(pre_auth_connection_limit, MAX_PRE_AUTH_CONNECTIONS_PER_IP);
+        info!(
+            connection_task_limit,
+            pre_auth_connection_limit,
+            pre_auth_per_ip_limit = MAX_PRE_AUTH_CONNECTIONS_PER_IP,
+            "bounded concurrent connection tasks"
+        );
         if let Some(scripts) = scripts.as_ref() {
             scripts.enqueue_event(ScriptEvent::server_started());
         }
@@ -2454,6 +2474,10 @@ impl BoundServer {
                             break;
                         }
                     };
+                    let Some(pre_auth_permit) = pre_auth_admission.try_acquire(peer.ip()) else {
+                        debug!(%peer, "pre-auth admission rejected connection");
+                        continue;
+                    };
                     debug!(%peer, "accepted connection");
                     let connection_permit = Arc::clone(&connection_permits)
                         .try_acquire_owned()
@@ -2461,7 +2485,14 @@ impl BoundServer {
                     let services = connection_services.clone();
                     connections.spawn(async move {
                         let _connection_permit = connection_permit;
-                        if let Err(err) = Box::pin(handle_connection(socket, peer, services)).await {
+                        if let Err(err) = Box::pin(handle_connection(
+                            socket,
+                            peer,
+                            services,
+                            pre_auth_permit,
+                        ))
+                        .await
+                        {
                             match err {
                                 err if is_client_disconnect(&err) => {
                                     debug!(%peer, "client disconnected");
@@ -5510,6 +5541,21 @@ mod tests {
         assert_eq!(connection_task_limit(128), 272);
         assert_eq!(connection_task_limit(512), MAX_CONNECTION_TASKS);
         assert_eq!(connection_task_limit(u32::MAX), MAX_CONNECTION_TASKS);
+    }
+
+    #[test]
+    fn pre_auth_connection_limit_is_smaller_and_bounded() {
+        assert_eq!(pre_auth_connection_limit(0), MIN_PRE_AUTH_CONNECTIONS);
+        assert_eq!(pre_auth_connection_limit(8), MIN_PRE_AUTH_CONNECTIONS);
+        assert_eq!(pre_auth_connection_limit(20), 28);
+        assert_eq!(pre_auth_connection_limit(128), MAX_PRE_AUTH_CONNECTIONS);
+        assert_eq!(
+            pre_auth_connection_limit(u32::MAX),
+            MAX_PRE_AUTH_CONNECTIONS
+        );
+        for max_players in [0, 1, 8, 20, 128, 512, u32::MAX] {
+            assert!(pre_auth_connection_limit(max_players) <= connection_task_limit(max_players));
+        }
     }
 
     #[test]

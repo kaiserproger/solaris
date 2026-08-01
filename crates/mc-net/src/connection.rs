@@ -19,6 +19,9 @@ use crate::encryption::MinecraftCipher;
 use crate::error::ConnectionError;
 
 pub(crate) const PRE_PLAY_READ_TIMEOUT: Duration = Duration::from_secs(10);
+pub(crate) const PRE_PLAY_TOTAL_TIMEOUT: Duration = Duration::from_secs(45);
+pub(crate) const MAX_PRE_PLAY_PACKETS: usize = 96;
+pub(crate) const MAX_PRE_PLAY_BYTES: usize = 512 * 1024;
 /// Maximum bytes retained while waiting for one incomplete serverbound frame.
 ///
 /// The protocol encoder supports larger clientbound chunk frames, but every
@@ -31,6 +34,46 @@ pub(crate) const MAX_INBOUND_BUFFER_BYTES: usize = 1024 * 1024;
 pub(crate) const OUTBOUND_WRITE_STALL_TIMEOUT: Duration = Duration::from_secs(5);
 #[cfg(test)]
 pub(crate) const OUTBOUND_WRITE_STALL_TIMEOUT: Duration = Duration::from_millis(10);
+
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct PrePlayBudget {
+    packets: usize,
+    bytes: usize,
+    max_packets: usize,
+    max_bytes: usize,
+}
+
+impl PrePlayBudget {
+    #[must_use]
+    pub(crate) fn new(max_packets: usize, max_bytes: usize) -> Self {
+        Self {
+            packets: 0,
+            bytes: 0,
+            max_packets,
+            max_bytes,
+        }
+    }
+
+    fn record(&mut self, frame: &RawFrame) -> Result<(), ConnectionError> {
+        self.packets = self.packets.saturating_add(1);
+        if self.packets > self.max_packets {
+            return Err(ConnectionError::PrePlayPacketBudgetExceeded {
+                packets: self.packets,
+                max: self.max_packets,
+            });
+        }
+        self.bytes = self
+            .bytes
+            .saturating_add(frame.body.len().saturating_add(5));
+        if self.bytes > self.max_bytes {
+            return Err(ConnectionError::PrePlayByteBudgetExceeded {
+                bytes: self.bytes,
+                max: self.max_bytes,
+            });
+        }
+        Ok(())
+    }
+}
 
 pub(crate) struct ConnectionReader<R> {
     inner: R,
@@ -255,6 +298,23 @@ where
     }
 }
 
+pub(crate) async fn read_frame_with_timeout_budgeted<R>(
+    reader: &mut R,
+    buf: &mut BytesMut,
+    compression: Compression,
+    state: State,
+    timeout: Duration,
+    budget: &mut PrePlayBudget,
+) -> Result<RawFrame, ConnectionError>
+where
+    R: AsyncReadExt + Unpin,
+{
+    let frame = read_frame_with_timeout(reader, buf, compression, state, timeout).await?;
+    budget.record(&frame)?;
+    Ok(frame)
+}
+
+#[cfg(test)]
 pub(crate) async fn read_packet_with_timeout<P, R>(
     reader: &mut R,
     buf: &mut BytesMut,
@@ -267,6 +327,39 @@ where
     R: AsyncReadExt + Unpin,
 {
     let mut frame = read_frame_with_timeout(reader, buf, compression, state, timeout).await?;
+    if frame.id != P::ID {
+        return Err(ConnectionError::UnexpectedPacketId {
+            state,
+            expected: P::ID,
+            got: frame.id,
+        });
+    }
+    let packet = P::decode(&mut frame.body)?;
+    let trailing = frame.body.remaining();
+    if trailing != 0 {
+        return Err(ConnectionError::TrailingBytes {
+            state,
+            id: frame.id,
+            trailing,
+        });
+    }
+    Ok(packet)
+}
+
+pub(crate) async fn read_packet_with_timeout_budgeted<P, R>(
+    reader: &mut R,
+    buf: &mut BytesMut,
+    compression: Compression,
+    state: State,
+    timeout: Duration,
+    budget: &mut PrePlayBudget,
+) -> Result<P, ConnectionError>
+where
+    P: Packet,
+    R: AsyncReadExt + Unpin,
+{
+    let mut frame =
+        read_frame_with_timeout_budgeted(reader, buf, compression, state, timeout, budget).await?;
     if frame.id != P::ID {
         return Err(ConnectionError::UnexpectedPacketId {
             state,
@@ -411,6 +504,42 @@ mod tests {
         ));
         assert_eq!(buf.len(), MAX_INBOUND_BUFFER_BYTES);
         writer.await.unwrap();
+    }
+
+    #[test]
+    fn pre_play_packet_budget_accepts_exact_limit_and_rejects_next_frame() {
+        let mut budget = PrePlayBudget::new(2, usize::MAX);
+        let frame = RawFrame {
+            id: 0,
+            body: bytes::Bytes::new(),
+        };
+
+        budget.record(&frame).unwrap();
+        budget.record(&frame).unwrap();
+        assert!(matches!(
+            budget.record(&frame),
+            Err(ConnectionError::PrePlayPacketBudgetExceeded { packets: 3, max: 2 })
+        ));
+    }
+
+    #[test]
+    fn pre_play_byte_budget_accepts_exact_limit_and_rejects_next_frame() {
+        let frame = RawFrame {
+            id: 0,
+            body: bytes::Bytes::from_static(&[1, 2, 3]),
+        };
+        let frame_cost = frame.body.len() + 5;
+        let mut budget = PrePlayBudget::new(usize::MAX, frame_cost);
+
+        budget.record(&frame).unwrap();
+        assert!(matches!(
+            budget.record(&RawFrame {
+                id: 1,
+                body: bytes::Bytes::new(),
+            }),
+            Err(ConnectionError::PrePlayByteBudgetExceeded { bytes, max })
+                if bytes == frame_cost + 5 && max == frame_cost
+        ));
     }
 
     #[tokio::test]

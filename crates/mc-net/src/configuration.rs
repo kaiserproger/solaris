@@ -50,7 +50,11 @@ use mc_world::{ChunkGeometry, OVERWORLD_GEOMETRY};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tracing::{debug, info, warn};
 
-use crate::connection::{PRE_PLAY_READ_TIMEOUT, read_frame_with_timeout, write_packet};
+#[cfg(test)]
+use crate::connection::read_frame_with_timeout;
+use crate::connection::{
+    PRE_PLAY_READ_TIMEOUT, PrePlayBudget, read_frame_with_timeout_budgeted, write_packet,
+};
 use crate::error::ConnectionError;
 use crate::loader::{
     LOADER_ARTIFACT_CHUNK_BYTES, LoaderArtifactRequest, LoaderClientAck, LoaderManifest,
@@ -61,7 +65,7 @@ use crate::login::LoggedInProfile;
 
 const MAX_IGNORED_CONFIGURATION_PACKETS: usize = 32;
 const MAX_LOADER_DISCONNECT_BUNDLES: usize = 8;
-const LOADER_HANDSHAKE_READ_TIMEOUT: Duration = Duration::from_secs(120);
+const LOADER_HANDSHAKE_READ_TIMEOUT: Duration = PRE_PLAY_READ_TIMEOUT;
 
 fn decode_configuration_exact<P: Packet>(id: i32, mut body: Bytes) -> Result<P, ConnectionError> {
     let packet = P::decode(&mut body)?;
@@ -193,6 +197,7 @@ pub(crate) async fn handle<R, W>(
     reader: &mut R,
     writer: &mut W,
     buf: &mut BytesMut,
+    budget: &mut PrePlayBudget,
     compression: Compression,
     profile: &LoggedInProfile,
     context: ConfigurationContext<'_>,
@@ -234,12 +239,13 @@ where
     // Step 2: read frames until we see the client's KnownPacks response.
     let mut ignored_packets = 0usize;
     let client_packs = loop {
-        let frame = read_frame_with_timeout(
+        let frame = read_frame_with_timeout_budgeted(
             reader,
             buf,
             compression,
             State::Configuration,
             PRE_PLAY_READ_TIMEOUT,
+            budget,
         )
         .await?;
         if frame.id == ServerboundKnownPacks::ID {
@@ -426,6 +432,7 @@ where
             reader,
             writer,
             buf,
+            budget,
             compression,
             context.custom_payload_policy,
             &mut custom_payloads,
@@ -448,12 +455,13 @@ where
     // anything else.
     let mut ignored_packets = 0usize;
     loop {
-        let frame = read_frame_with_timeout(
+        let frame = read_frame_with_timeout_budgeted(
             reader,
             buf,
             compression,
             State::Configuration,
             PRE_PLAY_READ_TIMEOUT,
+            budget,
         )
         .await?;
         if frame.id == AcknowledgeFinishConfiguration::ID {
@@ -606,6 +614,7 @@ async fn complete_loader_handshake<R, W>(
     reader: &mut R,
     writer: &mut W,
     buf: &mut BytesMut,
+    budget: &mut PrePlayBudget,
     compression: Compression,
     custom_payload_policy: Option<&CustomPayloadPolicy>,
     custom_payloads: &mut Vec<ConfigurationCustomPayload>,
@@ -620,12 +629,13 @@ where
 {
     let mut ignored_packets = 0usize;
     while !*loader_acknowledged {
-        let frame = read_frame_with_timeout(
+        let frame = read_frame_with_timeout_budgeted(
             reader,
             buf,
             compression,
             State::Configuration,
             LOADER_HANDSHAKE_READ_TIMEOUT,
+            budget,
         )
         .await?;
         if frame.id == ServerboundClientInformation::ID {

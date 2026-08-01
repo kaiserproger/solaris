@@ -20,8 +20,8 @@ use tracing::info;
 use uuid::Uuid;
 
 use crate::connection::{
-    ConnectionReader, ConnectionWriter, PRE_PLAY_READ_TIMEOUT, read_packet_with_timeout,
-    write_packet,
+    ConnectionReader, ConnectionWriter, PRE_PLAY_READ_TIMEOUT, PrePlayBudget,
+    read_packet_with_timeout_budgeted, write_packet,
 };
 use crate::error::ConnectionError;
 use crate::session_auth::{
@@ -179,6 +179,7 @@ pub(crate) async fn handle<R, W>(
     reader: &mut ConnectionReader<R>,
     writer: &mut ConnectionWriter<W>,
     buf: &mut BytesMut,
+    budget: &mut PrePlayBudget,
     compression_threshold: i32,
     compression: &mut Compression,
     compression_level: Option<u32>,
@@ -190,12 +191,13 @@ where
     R: AsyncRead + Unpin,
     W: AsyncWrite + Unpin,
 {
-    let login_start = read_packet_with_timeout::<LoginStart, _>(
+    let login_start = read_packet_with_timeout_budgeted::<LoginStart, _>(
         reader,
         buf,
         Compression::Disabled,
         State::Login,
         PRE_PLAY_READ_TIMEOUT,
+        budget,
     )
     .await?;
     let name = login_start.name;
@@ -215,15 +217,18 @@ where
             Compression::Disabled,
         )
         .await?;
-        let response =
-            read_packet_with_timeout::<mc_protocol::packets::login::EncryptionResponse, _>(
-                reader,
-                buf,
-                Compression::Disabled,
-                State::Login,
-                PRE_PLAY_READ_TIMEOUT,
-            )
-            .await?;
+        let response = read_packet_with_timeout_budgeted::<
+            mc_protocol::packets::login::EncryptionResponse,
+            _,
+        >(
+            reader,
+            buf,
+            Compression::Disabled,
+            State::Login,
+            PRE_PLAY_READ_TIMEOUT,
+            budget,
+        )
+        .await?;
         let shared_secret = authentication
             .identity
             .decrypt_response(
@@ -299,12 +304,13 @@ where
     };
     write_packet(writer, &success, *compression).await?;
 
-    let _ack = read_packet_with_timeout::<LoginAcknowledged, _>(
+    let _ack = read_packet_with_timeout_budgeted::<LoginAcknowledged, _>(
         reader,
         buf,
         *compression,
         State::Login,
         PRE_PLAY_READ_TIMEOUT,
+        budget,
     )
     .await?;
 
@@ -352,6 +358,7 @@ mod tests {
     use std::sync::Mutex;
 
     use super::*;
+    use crate::connection::read_packet_with_timeout;
     use mc_protocol::packets::login::{
         EncryptionRequest, EncryptionResponse, GameProfileProperty, LoginAcknowledged, LoginStart,
         LoginSuccess, SetCompression,
@@ -448,12 +455,17 @@ mod tests {
         let mut server_buf = BytesMut::new();
         let mut client_buf = BytesMut::new();
         let mut server_compression = Compression::Disabled;
+        let mut budget = PrePlayBudget::new(
+            crate::connection::MAX_PRE_PLAY_PACKETS,
+            crate::connection::MAX_PRE_PLAY_BYTES,
+        );
 
         let server = async {
             handle(
                 &mut server_reader,
                 &mut server_writer,
                 &mut server_buf,
+                &mut budget,
                 LOGIN_COMPRESSION_THRESHOLD,
                 &mut server_compression,
                 None,
