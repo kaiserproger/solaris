@@ -1607,7 +1607,7 @@ mod tests {
         );
         assert!(matches!(result, PlayerAttackResult::Damaged(_)));
         let event = deaths
-            .try_recv()
+            .try_recv_required()
             .expect("PvP owner commit must not depend on target outbound");
         assert!(matches!(
             event.kind(),
@@ -1619,7 +1619,7 @@ mod tests {
             } if player_id.value() == target && context.username() == "PvpDeathTarget"
         ));
         assert!(matches!(
-            deaths.try_recv(),
+            deaths.try_recv_required(),
             Err(mpsc::error::TryRecvError::Empty)
         ));
     }
@@ -1658,7 +1658,7 @@ mod tests {
         drop(inner);
 
         assert!(matches!(
-            deaths.try_recv().unwrap().kind(),
+            deaths.try_recv_required().unwrap().kind(),
             ScriptEventKind::PlayerDied {
                 player_id,
                 context,
@@ -1667,7 +1667,7 @@ mod tests {
             } if player_id.value() == target && context.username() == "ArrowDeath"
         ));
         assert!(matches!(
-            deaths.try_recv(),
+            deaths.try_recv_required(),
             Err(mpsc::error::TryRecvError::Empty)
         ));
     }

@@ -904,6 +904,17 @@ filesystem/process/debug libraries не выдаются. `plugin.toml` чита
 allocation и queue admission. Ошибка handler или poisoned invocation authority
 отключает один plugin и освобождает его command roots, не останавливая сервер.
 
+Owner-committed player-death/entity-kill events проходят отдельный bounded outbox
+на 256 envelopes. Каждый envelope явно `Required` или `BestEffort`: required
+переполнение/closure публикует fatal health signal, запрашивает shutdown и делает
+`serve` ошибочным; best-effort drop только увеличивает отдельный counter. Forward
+required event в bounded script sink имеет пятисекундный failure deadline: stall не
+считается успехом, worker завершает drain с typed error, а оставшийся required
+backlog помечается fatal при drop receiver. Metrics показывают depth/max-depth,
+enqueue/dequeue, fatal overflow/closure/abandonment, sink drops и общий abandoned
+backlog. Shutdown закрывает producers, дренирует bounded prefix и join'ит worker до
+завершения runtime.
+
 Контракт 0.6 уже содержит persistent-storage requests, zones, inventory-menu
 DTO, atomic currency/item transaction, colonies и villager-binding requests.
 Открытый разрыв находится в `mc-net`: production router и domain owner adapters

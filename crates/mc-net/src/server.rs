@@ -76,6 +76,7 @@ const MIN_PRE_AUTH_CONNECTIONS: usize = 16;
 const MAX_PRE_AUTH_CONNECTIONS: usize = 128;
 const MAX_PRE_AUTH_CONNECTIONS_PER_IP: usize = 4;
 const ENTITY_TICKER_DRAIN_TIMEOUT: Duration = Duration::from_secs(5);
+const SCRIPT_COMMIT_FORWARD_TIMEOUT: Duration = Duration::from_secs(5);
 const DIRTY_ONLY_FLUSH_MAX_CHUNKS: usize = 64;
 const DIRTY_ONLY_FLUSH_STALE_REGION_RETRIES: usize = 3;
 const SLOW_SIMULATION_ATTRIBUTION_LIMIT: usize = 8;
@@ -803,9 +804,13 @@ impl ScriptEventSink {
         Self { boundary }
     }
 
+    pub(crate) fn try_enqueue_event(&self, event: ScriptEvent) -> Result<(), ScriptQueueError> {
+        self.boundary.try_enqueue_event(event)
+    }
+
     pub(crate) fn enqueue_event(&self, event: ScriptEvent) {
         let event_name = event.event_name();
-        match self.boundary.try_enqueue_event(event) {
+        match self.try_enqueue_event(event) {
             Ok(()) => {}
             Err(ScriptQueueError::Full) if event_name == "server.tick" => {
                 debug!(event = event_name, "script event queue full; tick dropped");
@@ -932,14 +937,67 @@ impl ScriptEventSink {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ScriptCommitForwardError {
+    Queue(ScriptQueueError),
+    RequiredTimeout { timeout: Duration },
+}
+
 async fn forward_committed_script_events(
-    mut events: tokio::sync::mpsc::UnboundedReceiver<ScriptEvent>,
+    mut events: play::ScriptCommitEventReceiver,
     scripts: ScriptEventSink,
-) -> Result<(), ScriptQueueError> {
-    while let Some(event) = events.recv().await {
-        scripts.enqueue_required_event(event).await?;
+) -> Result<(), ScriptCommitForwardError> {
+    while let Some(envelope) = events.recv().await {
+        match envelope.delivery {
+            play::ScriptCommitDelivery::Required => {
+                match tokio::time::timeout(
+                    SCRIPT_COMMIT_FORWARD_TIMEOUT,
+                    scripts.enqueue_required_event(envelope.event),
+                )
+                .await
+                {
+                    Ok(Ok(())) => {}
+                    Ok(Err(error)) => {
+                        events.report_required_failure();
+                        return Err(ScriptCommitForwardError::Queue(error));
+                    }
+                    Err(_) => {
+                        events.report_required_failure();
+                        return Err(ScriptCommitForwardError::RequiredTimeout {
+                            timeout: SCRIPT_COMMIT_FORWARD_TIMEOUT,
+                        });
+                    }
+                }
+            }
+            play::ScriptCommitDelivery::BestEffort => {
+                if scripts.try_enqueue_event(envelope.event).is_err() {
+                    events.record_best_effort_sink_drop();
+                }
+            }
+        }
     }
     Ok(())
+}
+
+async fn watch_script_commit_event_failure(
+    mut failure: tokio::sync::watch::Receiver<bool>,
+    shutdown: ShutdownHandle,
+) {
+    loop {
+        if *failure.borrow_and_update() {
+            warn!("required committed script event delivery failed; requesting shutdown");
+            shutdown.request();
+            return;
+        }
+        tokio::select! {
+            changed = failure.changed() => {
+                if changed.is_err() {
+                    return;
+                }
+            }
+            () = shutdown.notified() => return,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -1175,10 +1233,23 @@ impl BoundServer {
         if let Some(scripts) = scripts.as_ref() {
             scripts.enqueue_event(ScriptEvent::server_started());
         }
-        let mut script_commit_event_worker = scripts.clone().map(|scripts| {
-            let events = sessions.install_script_commit_event_outbox();
-            tokio::spawn(forward_committed_script_events(events, scripts))
-        });
+        let (mut script_commit_event_worker, mut script_commit_event_failure_watcher) =
+            if let Some(scripts) = scripts.clone() {
+                let events = sessions.install_script_commit_event_outbox();
+                let failure = sessions.subscribe_script_commit_event_failure();
+                let failure_shutdown = shutdown.clone();
+                (
+                    Some(tokio::spawn(forward_committed_script_events(
+                        events, scripts,
+                    ))),
+                    Some(tokio::spawn(watch_script_commit_event_failure(
+                        failure,
+                        failure_shutdown,
+                    ))),
+                )
+            } else {
+                (None, None)
+            };
         let mut connections = tokio::task::JoinSet::new();
         let (entity_world_root, entity_scheduled_ticks) = if let Some(world) = config.world.as_ref()
         {
@@ -2572,7 +2643,7 @@ impl BoundServer {
             }
         };
         sessions.close_script_commit_event_outbox();
-        let script_commit_event_drain_result = match script_commit_event_worker.take() {
+        let mut script_commit_event_drain_result = match script_commit_event_worker.take() {
             Some(worker) => match worker.await {
                 Ok(Ok(())) => Ok(()),
                 Ok(Err(error)) => Err(std::io::Error::other(format!(
@@ -2584,6 +2655,24 @@ impl BoundServer {
             },
             None => Ok(()),
         };
+        if let Some(watcher) = script_commit_event_failure_watcher.take() {
+            watcher.abort();
+            let _ = watcher.await;
+        }
+        let script_commit_events = sessions.script_commit_event_outbox_snapshot();
+        if script_commit_events.required_overflow != 0
+            || script_commit_events.required_closed != 0
+            || script_commit_events.required_abandoned_on_receiver_drop != 0
+        {
+            script_commit_event_drain_result = Err(std::io::Error::other(format!(
+                "required committed script event delivery failed: overflow={}, closed={}, abandoned={}, max_depth={}, capacity={}",
+                script_commit_events.required_overflow,
+                script_commit_events.required_closed,
+                script_commit_events.required_abandoned_on_receiver_drop,
+                script_commit_events.max_depth,
+                script_commit_events.capacity,
+            )));
+        }
         let server_stopping_event_result = if let Some(scripts) = scripts.as_ref() {
             let result = scripts
                 .enqueue_required_event(ScriptEvent::server_stopping("server stopping"))
@@ -5637,9 +5726,11 @@ mod tests {
             .try_enqueue_event(ScriptEvent::server_started())
             .unwrap();
         let sink = ScriptEventSink::new(boundary);
-        let (sender, receiver) = tokio::sync::mpsc::unbounded_channel();
-        sender
-            .send(
+        let sessions = play::SessionRegistry::new();
+        let receiver = sessions.install_script_commit_event_outbox();
+        sessions
+            .try_enqueue_script_commit_event_for_test(
+                play::ScriptCommitDelivery::Required,
                 ScriptEvent::try_player_died_with_context(
                     ScriptPlayerId::new(7),
                     ScriptPlayerContext::new(
@@ -5656,7 +5747,7 @@ mod tests {
                 .unwrap(),
             )
             .unwrap();
-        drop(sender);
+        sessions.close_script_commit_event_outbox();
         let worker = tokio::spawn(forward_committed_script_events(receiver, sink));
 
         assert!(matches!(
@@ -5669,6 +5760,112 @@ mod tests {
                 if *player_id == ScriptPlayerId::new(7)
         ));
         worker.await.unwrap().unwrap();
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn stalled_required_script_sink_times_out_and_fails_remaining_backlog() {
+        let one = NonZeroUsize::new(1).unwrap();
+        let (boundary, _endpoint) = script_boundary_pair(one, one);
+        boundary
+            .try_enqueue_event(ScriptEvent::server_started())
+            .unwrap();
+        let sink = ScriptEventSink::new(boundary);
+        let sessions = play::SessionRegistry::new();
+        let receiver = sessions.install_script_commit_event_outbox();
+        for tick in 1..=2 {
+            sessions
+                .try_enqueue_script_commit_event_for_test(
+                    play::ScriptCommitDelivery::Required,
+                    ScriptEvent::server_tick(tick),
+                )
+                .unwrap();
+        }
+        sessions.close_script_commit_event_outbox();
+        let mut failure = sessions.subscribe_script_commit_event_failure();
+        let worker = tokio::spawn(forward_committed_script_events(receiver, sink));
+        tokio::task::yield_now().await;
+
+        tokio::time::advance(SCRIPT_COMMIT_FORWARD_TIMEOUT + Duration::from_millis(1)).await;
+
+        assert!(matches!(
+            worker.await.unwrap(),
+            Err(ScriptCommitForwardError::RequiredTimeout { timeout })
+                if timeout == SCRIPT_COMMIT_FORWARD_TIMEOUT
+        ));
+        assert!(*failure.borrow_and_update());
+        let snapshot = sessions.script_commit_event_outbox_snapshot();
+        assert_eq!(snapshot.depth, 0);
+        assert_eq!(snapshot.dequeued, 1);
+        assert_eq!(snapshot.abandoned_on_receiver_drop, 1);
+        assert_eq!(snapshot.required_abandoned_on_receiver_drop, 1);
+    }
+
+    #[tokio::test]
+    async fn required_committed_script_event_overflow_requests_shutdown() {
+        let sessions = play::SessionRegistry::new();
+        let _receiver = sessions.install_script_commit_event_outbox();
+        let capacity = sessions.script_commit_event_outbox_snapshot().capacity;
+        let shutdown = ShutdownHandle::default();
+        let watcher = tokio::spawn(watch_script_commit_event_failure(
+            sessions.subscribe_script_commit_event_failure(),
+            shutdown.clone(),
+        ));
+
+        for tick in 0..capacity {
+            sessions
+                .try_enqueue_script_commit_event_for_test(
+                    play::ScriptCommitDelivery::Required,
+                    ScriptEvent::server_tick(tick as u64),
+                )
+                .unwrap();
+        }
+        assert!(
+            sessions
+                .try_enqueue_script_commit_event_for_test(
+                    play::ScriptCommitDelivery::Required,
+                    ScriptEvent::server_stopping("required overflow"),
+                )
+                .is_err()
+        );
+
+        tokio::time::timeout(Duration::from_secs(1), shutdown.wait_requested())
+            .await
+            .expect("required outbox failure did not request shutdown");
+        let snapshot = sessions.script_commit_event_outbox_snapshot();
+        assert_eq!(snapshot.depth, capacity);
+        assert_eq!(snapshot.max_depth, capacity);
+        assert_eq!(snapshot.required_overflow, 1);
+        watcher.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn best_effort_committed_script_event_drop_is_counted_without_failure() {
+        let one = NonZeroUsize::new(1).unwrap();
+        let (boundary, _endpoint) = script_boundary_pair(one, one);
+        boundary
+            .try_enqueue_event(ScriptEvent::server_started())
+            .unwrap();
+        let sink = ScriptEventSink::new(boundary);
+        let sessions = play::SessionRegistry::new();
+        let receiver = sessions.install_script_commit_event_outbox();
+        sessions
+            .try_enqueue_script_commit_event_for_test(
+                play::ScriptCommitDelivery::BestEffort,
+                ScriptEvent::server_tick(1),
+            )
+            .unwrap();
+        sessions.close_script_commit_event_outbox();
+
+        forward_committed_script_events(receiver, sink)
+            .await
+            .unwrap();
+
+        let snapshot = sessions.script_commit_event_outbox_snapshot();
+        assert_eq!(snapshot.depth, 0);
+        assert_eq!(snapshot.best_effort_sink_dropped, 1);
+        assert_eq!(snapshot.required_overflow, 0);
+        assert_eq!(snapshot.required_closed, 0);
+        assert!(!*sessions.subscribe_script_commit_event_failure().borrow());
     }
 
     #[tokio::test]

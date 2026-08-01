@@ -105,7 +105,7 @@ async fn committed_campfire_death_survives_client_write_failure() {
     );
     assert!(survival_state.is_dead());
     let event = deaths
-        .try_recv()
+        .try_recv_required()
         .expect("owner commit must publish death before client transport");
     assert!(matches!(
         event.kind(),
@@ -116,7 +116,7 @@ async fn committed_campfire_death_survives_client_write_failure() {
         } if context.username() == "CampfireFail"
     ));
     assert!(matches!(
-        deaths.try_recv(),
+        deaths.try_recv_required(),
         Err(mpsc::error::TryRecvError::Empty)
     ));
 }

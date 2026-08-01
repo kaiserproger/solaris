@@ -127,7 +127,7 @@ fn player_death_inventory_xp_policy_is_atomic_and_idempotent() {
                 } else {
                     ScriptGameMode::Adventure
                 };
-                let event = deaths.try_recv().unwrap_or_else(|error| {
+                let event = deaths.try_recv_required().unwrap_or_else(|error| {
                     panic!("missing {expected_mode:?} death event for {game_mode:?}: {error:?}")
                 });
                 match event.kind() {
@@ -140,13 +140,13 @@ fn player_death_inventory_xp_policy_is_atomic_and_idempotent() {
             }
             GameMode::Creative | GameMode::Spectator => {
                 assert!(matches!(
-                    deaths.try_recv(),
+                    deaths.try_recv_required(),
                     Err(mpsc::error::TryRecvError::Empty)
                 ));
             }
         }
         assert!(matches!(
-            deaths.try_recv(),
+            deaths.try_recv_required(),
             Err(mpsc::error::TryRecvError::Empty)
         ));
 
@@ -185,7 +185,7 @@ fn player_death_inventory_xp_policy_is_atomic_and_idempotent() {
         snapshots_after_duplicate.sort_unstable_by_key(|snapshot| snapshot.id);
         assert_eq!(snapshots_after_duplicate, snapshots_before_duplicate);
         assert!(matches!(
-            deaths.try_recv(),
+            deaths.try_recv_required(),
             Err(mpsc::error::TryRecvError::Empty)
         ));
     }

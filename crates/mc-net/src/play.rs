@@ -228,9 +228,9 @@ use falling_blocks::{
     is_falling_block_state, plan_falling_block_landings, plan_falling_block_starts,
 };
 pub(crate) use inhabited_time::InhabitedTimeAccumulator;
-pub(crate) use session::SessionRegistry;
 #[cfg(test)]
 pub(in crate::play) use session::{ENTITY_PICKUP_RADIUS, ITEM_PICKUP_DELAY_TICKS};
+pub(crate) use session::{ScriptCommitDelivery, ScriptCommitEventReceiver, SessionRegistry};
 
 pub(crate) fn prewarm_entity_pathing_tables() -> std::num::NonZeroUsize {
     std::num::NonZeroUsize::new(session::prewarm_canonical_pathing_state_facts())

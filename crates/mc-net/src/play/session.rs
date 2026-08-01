@@ -84,6 +84,14 @@ mod script_loader_interaction_endpoint;
 mod script_loader_interaction_endpoint_tests;
 pub(super) use script_loader_interaction_endpoint::route_client_loader_interaction;
 mod script_commit_events;
+use script_commit_events::{
+    SCRIPT_COMMIT_EVENT_OUTBOX_CAPACITY, ScriptCommitEventMetrics, ScriptCommitEventOutbox,
+};
+pub(crate) use script_commit_events::{
+    ScriptCommitDelivery, ScriptCommitEventOutboxSnapshot, ScriptCommitEventReceiver,
+};
+#[cfg(test)]
+use script_commit_events::{ScriptCommitEnqueueError, ScriptCommitEnqueueOutcome};
 mod script_entity_interaction;
 #[cfg(test)]
 mod script_entity_interaction_tests;
@@ -438,7 +446,7 @@ struct SessionRegistryInner {
     entity_dispatches: EntityDispatchCounters,
     arrow_kill_rewards: ArrowKillRewards,
     player_combat: PlayerCombatResources,
-    script_commit_events: Option<tokio::sync::mpsc::UnboundedSender<ScriptEvent>>,
+    script_commit_events: Option<ScriptCommitEventOutbox>,
 }
 
 impl SessionRegistryInner {
@@ -537,6 +545,8 @@ pub(crate) struct SessionRegistry {
     entities: SessionEntityOwners,
     world_chunk_journal: Mutex<Option<super::world_journal::WorldChunkJournal>>,
     world_chunk_journal_failure: tokio::sync::watch::Sender<bool>,
+    script_commit_event_metrics: Arc<ScriptCommitEventMetrics>,
+    script_commit_event_failure: tokio::sync::watch::Sender<bool>,
     containers: ContainerRegistryShards,
     campfire_cooking: Arc<Mutex<HashMap<mc_world::BlockPos, CampfireCookingState>>>,
     pressure_observation: Arc<SessionPressureObservation>,
@@ -853,6 +863,8 @@ impl SessionRegistry {
             ),
             world_chunk_journal: Mutex::new(None),
             world_chunk_journal_failure: tokio::sync::watch::channel(false).0,
+            script_commit_event_metrics: Arc::new(ScriptCommitEventMetrics::default()),
+            script_commit_event_failure: tokio::sync::watch::channel(false).0,
             containers: ContainerRegistryShards::default(),
             campfire_cooking: Arc::new(Mutex::new(HashMap::new())),
             pressure_observation,
@@ -1661,21 +1673,56 @@ impl SessionRegistry {
         self.simulation_tick_sender.subscribe()
     }
 
-    pub(crate) fn install_script_commit_event_outbox(
-        &self,
-    ) -> tokio::sync::mpsc::UnboundedReceiver<ScriptEvent> {
-        let (sender, receiver) = tokio::sync::mpsc::unbounded_channel();
+    pub(crate) fn install_script_commit_event_outbox(&self) -> ScriptCommitEventReceiver {
+        let (sender, receiver) = tokio::sync::mpsc::channel(SCRIPT_COMMIT_EVENT_OUTBOX_CAPACITY);
+        let outbox = ScriptCommitEventOutbox::new(
+            sender,
+            Arc::clone(&self.script_commit_event_metrics),
+            self.script_commit_event_failure.clone(),
+        );
         let mut inner = self.lock_inner("install script commit event outbox");
         assert!(
-            inner.script_commit_events.replace(sender).is_none(),
+            inner.script_commit_events.replace(outbox).is_none(),
             "script commit event outbox may only be installed once"
         );
-        receiver
+        ScriptCommitEventReceiver::new(
+            receiver,
+            Arc::clone(&self.script_commit_event_metrics),
+            self.script_commit_event_failure.clone(),
+        )
     }
 
     pub(crate) fn close_script_commit_event_outbox(&self) {
         self.lock_inner("close script commit event outbox")
             .script_commit_events = None;
+    }
+
+    pub(crate) fn subscribe_script_commit_event_failure(
+        &self,
+    ) -> tokio::sync::watch::Receiver<bool> {
+        self.script_commit_event_failure.subscribe()
+    }
+
+    pub(crate) fn script_commit_event_outbox_snapshot(&self) -> ScriptCommitEventOutboxSnapshot {
+        self.script_commit_event_metrics.snapshot()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn try_enqueue_script_commit_event_for_test(
+        &self,
+        delivery: ScriptCommitDelivery,
+        event: ScriptEvent,
+    ) -> Result<ScriptCommitEnqueueOutcome, ScriptCommitEnqueueError> {
+        let inner = self.lock_inner("enqueue test script commit event");
+        let Some(outbox) = inner.script_commit_events.as_ref() else {
+            return match delivery {
+                ScriptCommitDelivery::Required => Err(ScriptCommitEnqueueError::RequiredClosed),
+                ScriptCommitDelivery::BestEffort => {
+                    Ok(ScriptCommitEnqueueOutcome::BestEffortDropped)
+                }
+            };
+        };
+        outbox.try_enqueue(delivery, event)
     }
 
     pub(crate) fn subscribe_player_attacks(

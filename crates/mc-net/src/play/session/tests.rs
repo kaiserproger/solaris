@@ -88,7 +88,7 @@ fn lethal_survival_commit_pushes_immutable_player_death_before_session_cleanup()
 
     registry.unregister(session);
     let event = deaths
-        .try_recv()
+        .try_recv_required()
         .expect("authoritative death must survive session cleanup");
     assert!(matches!(
         event.kind(),
@@ -103,7 +103,7 @@ fn lethal_survival_commit_pushes_immutable_player_death_before_session_cleanup()
             && dimension == "minecraft:overworld"
     ));
     assert!(matches!(
-        deaths.try_recv(),
+        deaths.try_recv_required(),
         Err(mpsc::error::TryRecvError::Empty)
     ));
 }
@@ -7929,7 +7929,7 @@ fn direct_player_melee_kill_pushes_one_authoritative_script_event() {
             if matches!(*outcome, EntityAttackOutcome::Damaged { .. })
     ));
     assert!(matches!(
-        events.try_recv(),
+        events.try_recv_required(),
         Err(mpsc::error::TryRecvError::Empty)
     ));
 
@@ -7953,7 +7953,7 @@ fn direct_player_melee_kill_pushes_one_authoritative_script_event() {
         PlayerAttackResult::ValidationRejected
     ));
     assert!(matches!(
-        events.try_recv(),
+        events.try_recv_required(),
         Err(mpsc::error::TryRecvError::Empty)
     ));
 
@@ -7973,7 +7973,7 @@ fn direct_player_melee_kill_pushes_one_authoritative_script_event() {
         PlayerAttackResult::ValidationRejected
     ));
     assert!(matches!(
-        events.try_recv(),
+        events.try_recv_required(),
         Err(mpsc::error::TryRecvError::Empty)
     ));
 
@@ -7992,7 +7992,9 @@ fn direct_player_melee_kill_pushes_one_authoritative_script_event() {
         PlayerAttackResult::Damaged(outcome)
             if matches!(*outcome, EntityAttackOutcome::Killed { .. })
     ));
-    let event = events.try_recv().expect("lethal melee commit event");
+    let event = events
+        .try_recv_required()
+        .expect("lethal melee commit event");
     assert!(matches!(
         event.kind(),
         ScriptEventKind::PlayerEntityKilled {
@@ -8027,7 +8029,7 @@ fn direct_player_melee_kill_pushes_one_authoritative_script_event() {
         PlayerAttackResult::AcceptedNoDamage
     ));
     assert!(matches!(
-        events.try_recv(),
+        events.try_recv_required(),
         Err(mpsc::error::TryRecvError::Empty)
     ));
 
