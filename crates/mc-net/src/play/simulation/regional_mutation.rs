@@ -37,7 +37,7 @@ impl RegionalBlockEditProbe {
         self.entered.send(region).expect("regional worker entry");
         self.release
             .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .expect("test lock poisoned")
             .recv()
             .expect("regional worker release");
     }

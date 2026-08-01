@@ -2,7 +2,6 @@ use std::time::Instant;
 
 use mc_entity::{EntityId, EntityLifecycle};
 use mc_protocol::packets::play::{GameMode, ItemStack};
-use tracing::warn;
 
 use crate::play::containers::inputs_satisfy_offer;
 use crate::play::inventory::can_stack;
@@ -58,13 +57,8 @@ impl SessionRegistry {
             .map(|session| (session.pose, session.uuid))?;
         let player_state = inner.player_persistence.get(&actor_session)?.clone();
         let wait_started = Instant::now();
-        let guard = player_state.lock().unwrap_or_else(|poisoned| {
-            warn!(
-                session_id = actor_session,
-                "player persistence mutex was poisoned during merchant trade; recovering state"
-            );
-            poisoned.into_inner()
-        });
+        let guard =
+            crate::lock_policy::lock_authoritative_mutex(&player_state, "play.player_persistence");
         let mut player_state = crate::lock_metrics::timed_guard(
             crate::lock_metrics::LockMetricKind::PlayerPersistence,
             "commit villager merchant trade",

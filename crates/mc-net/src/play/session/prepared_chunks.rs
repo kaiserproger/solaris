@@ -1,18 +1,13 @@
 use super::*;
+use crate::lock_policy::lock_benign_mutex;
 use std::collections::hash_map::Entry;
 
 impl SessionRegistry {
     pub(super) fn lock_prepared_cache(
         &self,
-        operation: &'static str,
+        _operation: &'static str,
     ) -> MutexGuard<'_, PreparedChunkCache> {
-        self.prepared_cache.lock().unwrap_or_else(|poisoned| {
-            warn!(
-                operation,
-                "prepared chunk cache mutex was poisoned; recovering state"
-            );
-            poisoned.into_inner()
-        })
+        lock_benign_mutex(&self.prepared_cache, "play.prepared_chunk_cache")
     }
 
     pub(super) fn publish_prepared_cache(&self, cache: &PreparedChunkCache) {

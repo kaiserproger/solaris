@@ -8,6 +8,7 @@ use mc_script::{
 use rsa::rand_core::{OsRng, RngCore};
 
 use super::events::{TargetedEventDelivery, deliver_required_targeted_event};
+use crate::lock_policy::lock_authoritative_mutex;
 use crate::play::SessionRegistry;
 use crate::server::ScriptEventSink;
 
@@ -38,6 +39,10 @@ pub(crate) struct PluginVillagerAdapter {
 }
 
 impl PluginVillagerAdapter {
+    fn lock_bindings(&self) -> std::sync::MutexGuard<'_, BTreeMap<String, VillagerBindingOwner>> {
+        lock_authoritative_mutex(&self.bindings, "script.villager_bindings")
+    }
+
     pub(crate) fn new(scripts: ScriptEventSink) -> Self {
         Self {
             scripts,
@@ -71,16 +76,13 @@ impl PluginVillagerAdapter {
                 let binding =
                     ScriptVillagerBinding::try_new(claim.token(), claim.expires_at_tick())
                         .map_err(VillagerAdapterError::InvalidResult)?;
-                self.bindings
-                    .lock()
-                    .unwrap_or_else(|poisoned| poisoned.into_inner())
-                    .insert(
-                        binding.token().to_owned(),
-                        VillagerBindingOwner {
-                            plugin_id: admitted.plugin_id().to_owned(),
-                            expires_at_tick: binding.expires_at_tick(),
-                        },
-                    );
+                self.lock_bindings().insert(
+                    binding.token().to_owned(),
+                    VillagerBindingOwner {
+                        plugin_id: admitted.plugin_id().to_owned(),
+                        expires_at_tick: binding.expires_at_tick(),
+                    },
+                );
                 (Some(binding), None)
             }
             Ok(None)
@@ -115,9 +117,7 @@ impl PluginVillagerAdapter {
         let current_tick = sessions.simulation_tick();
         self.purge_expired_bindings(current_tick);
         let owns_binding = self
-            .bindings
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .lock_bindings()
             .get(request.binding_token())
             .is_some_and(|binding| binding.plugin_id == admitted.plugin_id());
 
@@ -175,17 +175,12 @@ impl PluginVillagerAdapter {
     }
 
     fn purge_expired_bindings(&self, current_tick: u64) {
-        self.bindings
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
+        self.lock_bindings()
             .retain(|_, binding| current_tick < binding.expires_at_tick);
     }
 
     fn remove_binding(&self, token: &str) {
-        self.bindings
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .remove(token);
+        self.lock_bindings().remove(token);
     }
 
     #[cfg(test)]

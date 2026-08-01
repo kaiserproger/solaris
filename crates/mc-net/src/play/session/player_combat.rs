@@ -15,6 +15,7 @@ use super::{
     CommittedPlayerAttackCosts, EntityAttackOutcome, PlayerAttackResult, ServerEntityPlayerAttack,
     SessionEntityGuards, SessionId, SessionRegistry, session_recipients, visible_observers_locked,
 };
+use crate::lock_policy::lock_authoritative_mutex;
 use crate::play::combat::{
     ActiveShield, PlayerDamageKind, PlayerDamageRequest, PlayerHurtResolution,
     damage_active_shield_slot, melee_knockback, shield_block_knockback, shield_blocks_damage_since,
@@ -30,7 +31,6 @@ use mc_entity::{EntityId, Vec3};
 use mc_protocol::packets::play::ItemStack;
 use std::sync::Arc;
 use std::time::Instant;
-use tracing::warn;
 
 pub(in crate::play) struct PlayerEntityAttack<'a> {
     pub(in crate::play) attacker_session: SessionId,
@@ -183,13 +183,7 @@ impl SessionRegistry {
         }
 
         let wait_started = Instant::now();
-        let target_state = target_state.lock().unwrap_or_else(|poisoned| {
-            warn!(
-                session_id = target_session,
-                "player persistence mutex was poisoned during PvP target validation; recovering state"
-            );
-            poisoned.into_inner()
-        });
+        let target_state = lock_authoritative_mutex(&target_state, "play.player_persistence");
         let target_state = crate::lock_metrics::timed_guard(
             crate::lock_metrics::LockMetricKind::PlayerPersistence,
             "validate PvP target state",
@@ -460,9 +454,7 @@ impl SessionRegistry {
             (target_session, &target, attacker_session, &attacker)
         };
         let first_wait = Instant::now();
-        let first_guard = first
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let first_guard = lock_authoritative_mutex(first, "play.player_persistence");
         let first_guard = crate::lock_metrics::timed_guard(
             crate::lock_metrics::LockMetricKind::PlayerPersistence,
             "commit player attack first participant",
@@ -470,9 +462,7 @@ impl SessionRegistry {
             first_guard,
         );
         let second_wait = Instant::now();
-        let second_guard = second
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let second_guard = lock_authoritative_mutex(second, "play.player_persistence");
         let second_guard = crate::lock_metrics::timed_guard(
             crate::lock_metrics::LockMetricKind::PlayerPersistence,
             "commit player attack second participant",
@@ -568,18 +558,12 @@ impl SessionRegistry {
 }
 
 fn authoritative_attacker_mode(
-    attacker_session: SessionId,
+    _attacker_session: SessionId,
     attacker_state: &std::sync::Mutex<crate::play::persistence::PlayerPersistedState>,
     operation: &'static str,
 ) -> Option<GameMode> {
     let wait_started = Instant::now();
-    let state = attacker_state.lock().unwrap_or_else(|poisoned| {
-        warn!(
-            session_id = attacker_session,
-            "player persistence mutex was poisoned during attacker validation; recovering state"
-        );
-        poisoned.into_inner()
-    });
+    let state = lock_authoritative_mutex(attacker_state, "play.player_persistence");
     let state = crate::lock_metrics::timed_guard(
         crate::lock_metrics::LockMetricKind::PlayerPersistence,
         operation,
@@ -590,19 +574,13 @@ fn authoritative_attacker_mode(
 }
 
 fn authoritative_attacker_reach(
-    attacker_session: SessionId,
+    _attacker_session: SessionId,
     attacker_state: &std::sync::Mutex<crate::play::persistence::PlayerPersistedState>,
     resources: &super::PlayerCombatResources,
     operation: &'static str,
 ) -> Option<AuthoritativeAttackerContext> {
     let wait_started = Instant::now();
-    let state = attacker_state.lock().unwrap_or_else(|poisoned| {
-        warn!(
-            session_id = attacker_session,
-            "player persistence mutex was poisoned during attacker validation; recovering state"
-        );
-        poisoned.into_inner()
-    });
+    let state = lock_authoritative_mutex(attacker_state, "play.player_persistence");
     let state = crate::lock_metrics::timed_guard(
         crate::lock_metrics::LockMetricKind::PlayerPersistence,
         operation,
@@ -707,9 +685,7 @@ pub(super) fn prepare_projectile_player_damage_locked(
         return ProjectilePlayerDamagePreview::Rejected(None);
     };
     let wait_started = Instant::now();
-    let target_state = target_state
-        .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let target_state = lock_authoritative_mutex(&target_state, "play.player_persistence");
     let target_state = crate::lock_metrics::timed_guard(
         crate::lock_metrics::LockMetricKind::PlayerPersistence,
         "prepare projectile player damage",
@@ -849,9 +825,7 @@ pub(super) fn commit_projectile_player_damage_locked(
         return false;
     };
     let wait_started = Instant::now();
-    let target_state = target_state
-        .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let target_state = lock_authoritative_mutex(&target_state, "play.player_persistence");
     let mut target_state = crate::lock_metrics::timed_guard(
         crate::lock_metrics::LockMetricKind::PlayerPersistence,
         "commit projectile player damage",
@@ -1399,7 +1373,7 @@ mod tests {
                 .clone();
             attacker_state
                 .lock()
-                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .expect("test lock poisoned")
                 .inventory
                 .slots[PlayerInventory::HOTBAR_BASE] = ItemStack::new(3, 1);
         }
@@ -1430,9 +1404,7 @@ mod tests {
                 .lock_inner("switch stale axe selected slot")
                 .player_persistence[&attacker]
                 .clone();
-            let mut attacker_state = attacker_state
-                .lock()
-                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            let mut attacker_state = attacker_state.lock().expect("test lock poisoned");
             attacker_state.inventory.slots[PlayerInventory::HOTBAR_BASE] = ItemStack::new(2, 1);
             attacker_state.inventory.slots[PlayerInventory::HOTBAR_BASE + 1] = ItemStack::new(3, 1);
             attacker_state.selected_hotbar_slot = 1;
@@ -1464,7 +1436,7 @@ mod tests {
         assert!(!inner.shield_disabled_until.contains_key(&target));
         let target_state = inner.player_persistence[&target]
             .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
+            .expect("test lock poisoned");
         assert_eq!(
             target_state.inventory.slots,
             target_plan.expected_inventory.slots
@@ -1715,7 +1687,7 @@ mod tests {
 
         let health = target_state
             .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .expect("test lock poisoned")
             .survival
             .health;
         assert_eq!(health, 18.0);

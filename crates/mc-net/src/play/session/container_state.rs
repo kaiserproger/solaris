@@ -3,12 +3,11 @@ use std::ops::{Deref, DerefMut};
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::Instant;
 
-use mc_protocol::packets::play::ItemStack;
-use tokio::sync::mpsc;
-use tracing::warn;
-
+use crate::lock_policy::lock_authoritative_mutex;
 use crate::play::ContainerPlayerPlan;
 use crate::play::inventory::PlayerInventory;
+use mc_protocol::packets::play::ItemStack;
+use tokio::sync::mpsc;
 
 use super::outbound::{
     OutboundCommand, OutboundPressureMetrics, SessionPressureObservation, SessionRecipient,
@@ -135,7 +134,7 @@ impl ContainerCommitProbe {
             .expect("container commit probe entry");
         self.release
             .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .expect("test lock poisoned")
             .recv()
             .expect("container commit probe release");
     }
@@ -170,12 +169,8 @@ impl SessionRegistry {
         operation: &'static str,
     ) -> ContainerRegistryGuard<'_> {
         let wait_started = Instant::now();
-        let guard = self.containers.shards[shard]
-            .lock()
-            .unwrap_or_else(|poisoned| {
-                warn!("container registry mutex was poisoned; recovering state");
-                poisoned.into_inner()
-            });
+        let guard =
+            lock_authoritative_mutex(&self.containers.shards[shard], "play.container_registry");
         let furnace_viewer_sets_before = guard.furnace_viewers.len();
         let chest_viewer_sets_before = guard.chest_viewers.len();
         ContainerRegistryGuard {
@@ -204,13 +199,7 @@ impl SessionRegistry {
             inner.player_persistence.get(&id).cloned()
         }?;
         let wait_started = Instant::now();
-        let guard = state.lock().unwrap_or_else(|poisoned| {
-            warn!(
-                session_id = id,
-                "player persistence mutex was poisoned while reading container state; recovering state"
-            );
-            poisoned.into_inner()
-        });
+        let guard = lock_authoritative_mutex(&state, "play.player_persistence");
         let state = crate::lock_metrics::timed_guard(
             crate::lock_metrics::LockMetricKind::PlayerPersistence,
             "read player container state",
@@ -232,13 +221,7 @@ impl SessionRegistry {
             inner.player_persistence.get(&id).cloned()
         }?;
         let wait_started = Instant::now();
-        let guard = state.lock().unwrap_or_else(|poisoned| {
-            warn!(
-                session_id = id,
-                "player persistence mutex was poisoned while reading merchant state; recovering state"
-            );
-            poisoned.into_inner()
-        });
+        let guard = lock_authoritative_mutex(&state, "play.player_persistence");
         let state = crate::lock_metrics::timed_guard(
             crate::lock_metrics::LockMetricKind::PlayerPersistence,
             "read player merchant container state",
@@ -261,8 +244,7 @@ impl SessionRegistry {
         *self
             .server_container_dispatch_probe
             .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner()) =
-            Some(ServerContainerDispatchProbe { reached, resume });
+            .expect("test lock poisoned") = Some(ServerContainerDispatchProbe { reached, resume });
     }
 
     #[cfg(test)]
@@ -270,7 +252,7 @@ impl SessionRegistry {
         let probe = self
             .server_container_dispatch_probe
             .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .expect("test lock poisoned")
             .take();
         if let Some(probe) = probe {
             probe
@@ -293,8 +275,7 @@ impl SessionRegistry {
         *self
             .server_furnace_commit_probe
             .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner()) =
-            Some(ServerFurnaceCommitProbe { reached, resume });
+            .expect("test lock poisoned") = Some(ServerFurnaceCommitProbe { reached, resume });
     }
 
     #[cfg(test)]
@@ -302,7 +283,7 @@ impl SessionRegistry {
         let probe = self
             .server_furnace_commit_probe
             .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .expect("test lock poisoned")
             .take();
         if let Some(probe) = probe {
             probe
@@ -325,7 +306,7 @@ impl SessionRegistry {
         *self
             .container_commit_probe
             .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(ContainerCommitProbe {
+            .expect("test lock poisoned") = Some(ContainerCommitProbe {
             entered,
             release: Arc::new(Mutex::new(release)),
         });

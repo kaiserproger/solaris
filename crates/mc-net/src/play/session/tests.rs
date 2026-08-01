@@ -1059,7 +1059,7 @@ fn entity_save_owner_barrier_does_not_hold_session_registry() {
     *registry
         .entity_save_owner_probe
         .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(EntityApplyReleaseProbe {
+        .expect("test lock poisoned") = Some(EntityApplyReleaseProbe {
         reached: reached_tx,
         resume: resume_rx,
     });
@@ -1108,7 +1108,7 @@ fn breeding_plan_does_not_hold_session_or_entity_locks() {
     *registry
         .breeding_plan_probe
         .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(BreedingPlanProbe {
+        .expect("test lock poisoned") = Some(BreedingPlanProbe {
         reached: reached_tx,
         resume: resume_rx,
     });
@@ -1194,7 +1194,7 @@ fn breeding_rejects_the_whole_plan_when_a_parent_changes_after_snapshot() {
     *registry
         .breeding_plan_probe
         .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(BreedingPlanProbe {
+        .expect("test lock poisoned") = Some(BreedingPlanProbe {
         reached: reached_tx,
         resume: resume_rx,
     });
@@ -1342,7 +1342,7 @@ fn breeding_commit_releases_both_locks_before_session_publication() {
     *registry
         .breeding_commit_probe
         .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(BreedingCommitProbe {
+        .expect("test lock poisoned") = Some(BreedingCommitProbe {
         reached: reached_tx,
         resume: resume_rx,
     });
@@ -1386,7 +1386,7 @@ fn sheep_grazing_plan_does_not_hold_session_and_entity_locks_together() {
     *registry
         .sheep_grazing_plan_probe
         .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(SheepGrazingPlanProbe {
+        .expect("test lock poisoned") = Some(SheepGrazingPlanProbe {
         reached: reached_tx,
         resume: resume_rx,
     });
@@ -1427,7 +1427,7 @@ fn sheep_grazing_start_releases_both_locks_before_session_publication() {
     *registry
         .sheep_grazing_commit_probe
         .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(SheepGrazingCommitProbe {
+        .expect("test lock poisoned") = Some(SheepGrazingCommitProbe {
         reached: reached_tx,
         resume: resume_rx,
     });
@@ -1474,7 +1474,7 @@ fn sheep_grazing_owner_validation_does_not_hold_session_registry() {
     *registry
         .sheep_grazing_owner_read_probe
         .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(EntityApplyReleaseProbe {
+        .expect("test lock poisoned") = Some(EntityApplyReleaseProbe {
         reached: reached_tx,
         resume: resume_rx,
     });
@@ -1545,7 +1545,7 @@ fn sheep_grazing_finish_releases_both_locks_before_session_publication() {
     *registry
         .sheep_grazing_commit_probe
         .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(SheepGrazingCommitProbe {
+        .expect("test lock poisoned") = Some(SheepGrazingCommitProbe {
         reached: reached_tx,
         resume: resume_rx,
     });
@@ -1714,7 +1714,7 @@ fn sheep_grazing_plan_rejects_the_whole_stale_timer_batch() {
     *registry
         .sheep_grazing_plan_probe
         .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(SheepGrazingPlanProbe {
+        .expect("test lock poisoned") = Some(SheepGrazingPlanProbe {
         reached: reached_tx,
         resume: resume_rx,
     });
@@ -1833,7 +1833,7 @@ fn hostile_candidate_scan_does_not_hold_session_registry() {
     *registry
         .hostile_scan_probe
         .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(HostileScanProbe {
+        .expect("test lock poisoned") = Some(HostileScanProbe {
         reached: reached_tx,
         resume: resume_rx,
     });
@@ -2461,7 +2461,7 @@ fn hostile_commit_releases_both_locks_before_arrow_publication() {
     *registry
         .hostile_commit_probe
         .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(HostileCommitProbe {
+        .expect("test lock poisoned") = Some(HostileCommitProbe {
         reached: reached_tx,
         resume: resume_rx,
     });
@@ -3924,7 +3924,7 @@ fn concurrent_live_session_change_cannot_leave_stale_hostile_cleanup() {
     *registry
         .hostile_reconcile_probe
         .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(HostileScanProbe {
+        .expect("test lock poisoned") = Some(HostileScanProbe {
         reached: reached_tx,
         resume: resume_rx,
     });
@@ -5180,17 +5180,23 @@ fn chicken_pathing_uses_its_own_aabb_next_to_a_wall() {
 }
 
 #[test]
-fn registry_recovers_after_inner_mutex_poison() {
+fn registry_poison_fails_stop_before_new_session_mutation() {
     let registry = SessionRegistry::new();
     let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
         let _guard = registry.inner.lock().unwrap();
         panic!("poison registry");
     }));
 
-    let id = register_test_session(&registry, "PoisonAlice");
+    let panic = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        let _ = register_test_session(&registry, "PoisonAlice");
+    }))
+    .expect_err("poisoned session registry must fail-stop");
 
-    assert_eq!(registry.active_session_count(), 1);
-    assert_eq!(id, 1);
+    assert_eq!(
+        crate::lock_policy::authoritative_lock_poison_from_panic(panic.as_ref()),
+        Some("play.session_registry")
+    );
+    assert!(registry.inner.is_poisoned());
 }
 
 #[test]
@@ -6280,7 +6286,7 @@ fn mark_loaded_does_not_wait_for_move_fanout() {
     *registry
         .move_fanout_probe
         .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(MoveFanoutProbe {
+        .expect("test lock poisoned") = Some(MoveFanoutProbe {
         reached: reached_tx,
         resume: resume_rx,
     });
@@ -6343,7 +6349,7 @@ fn entity_physics_owner_apply_does_not_hold_session_registry() {
     *registry
         .physics_owner_apply_probe
         .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(EntityApplyReleaseProbe {
+        .expect("test lock poisoned") = Some(EntityApplyReleaseProbe {
         reached: reached_tx,
         resume: resume_rx,
     });
@@ -6397,7 +6403,7 @@ fn entity_physics_prepare_does_not_wait_for_session_registry() {
     *registry
         .physics_owner_apply_probe
         .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(EntityApplyReleaseProbe {
+        .expect("test lock poisoned") = Some(EntityApplyReleaseProbe {
         reached: reached_tx,
         resume: resume_rx,
     });
@@ -6448,7 +6454,7 @@ fn delayed_physics_routing_cannot_overwrite_a_newer_physics_commit() {
     *registry
         .physics_routing_probe
         .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(EntityApplyReleaseProbe {
+        .expect("test lock poisoned") = Some(EntityApplyReleaseProbe {
         reached: reached_tx,
         resume: resume_rx,
     });
@@ -6562,7 +6568,7 @@ fn delayed_entity_physics_apply_cannot_overwrite_newer_commit() {
     *registry
         .physics_owner_apply_probe
         .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(EntityApplyReleaseProbe {
+        .expect("test lock poisoned") = Some(EntityApplyReleaseProbe {
         reached: reached_tx,
         resume: resume_rx,
     });
@@ -6639,7 +6645,7 @@ fn entity_and_session_state_are_released_before_movement_plan() {
     *registry
         .entity_apply_release_probe
         .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(EntityApplyReleaseProbe {
+        .expect("test lock poisoned") = Some(EntityApplyReleaseProbe {
         reached: reached_tx,
         resume: resume_rx,
     });
@@ -6697,7 +6703,7 @@ fn movement_recipient_snapshot_does_not_wait_for_session_registry() {
     *registry
         .entity_apply_release_probe
         .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(EntityApplyReleaseProbe {
+        .expect("test lock poisoned") = Some(EntityApplyReleaseProbe {
         reached: plan_reached_tx,
         resume: plan_resume_rx,
     });
@@ -6706,7 +6712,7 @@ fn movement_recipient_snapshot_does_not_wait_for_session_registry() {
     *registry
         .move_fanout_probe
         .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(MoveFanoutProbe {
+        .expect("test lock poisoned") = Some(MoveFanoutProbe {
         reached: fanout_reached_tx,
         resume: fanout_resume_rx,
     });
@@ -6776,7 +6782,7 @@ fn movement_publication_finishes_while_session_registry_is_held() {
     *registry
         .move_fanout_probe
         .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(MoveFanoutProbe {
+        .expect("test lock poisoned") = Some(MoveFanoutProbe {
         reached: fanout_reached_tx,
         resume: fanout_resume_rx,
     });
@@ -6844,7 +6850,7 @@ fn unregister_fences_movement_after_recipient_validation() {
     *registry
         .movement_dispatch_probe
         .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(MoveFanoutProbe {
+        .expect("test lock poisoned") = Some(MoveFanoutProbe {
         reached: validated_tx,
         resume: resume_rx,
     });
@@ -6901,7 +6907,7 @@ fn concurrent_spawn_cannot_follow_an_earlier_movement_reservation() {
     *registry
         .movement_visibility_load_probe
         .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(MoveFanoutProbe {
+        .expect("test lock poisoned") = Some(MoveFanoutProbe {
         reached: reached_tx,
         resume: resume_rx,
     });
@@ -6947,7 +6953,7 @@ fn concurrent_spawn_cannot_follow_an_earlier_movement_reservation() {
 }
 
 #[test]
-fn save_all_recovers_after_player_persistence_mutex_poison() {
+fn save_all_player_persistence_poison_fails_stop_without_snapshotting() {
     let registry = SessionRegistry::new();
     let session_id = register_test_session(&registry, "PoisonPersist");
     let state = Arc::new(Mutex::new(PlayerPersistedState::new_default(
@@ -6959,10 +6965,16 @@ fn save_all_recovers_after_player_persistence_mutex_poison() {
         panic!("poison player persistence");
     }));
 
-    let snapshots = registry.persisted_player_states();
+    let panic = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        let _ = registry.persisted_player_states();
+    }))
+    .expect_err("poisoned player persistence must fail-stop save-all");
 
-    assert_eq!(snapshots.len(), 1);
-    assert_eq!(snapshots[0].0, profile("PoisonPersist").uuid);
+    assert_eq!(
+        crate::lock_policy::authoritative_lock_poison_from_panic(panic.as_ref()),
+        Some("play.player_persistence")
+    );
+    assert!(state.is_poisoned());
 }
 
 #[test]
@@ -7907,9 +7919,7 @@ fn direct_player_melee_kill_pushes_one_authoritative_script_event() {
     let pose = PlayerPose::new(0.5, 64.0, 0.5);
     let authority = SimulationAuthority::for_test();
     let next_costs = || {
-        let state = persisted
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let state = persisted.lock().expect("test lock poisoned");
         attack_costs(&state, Vec3::new(pose.x, pose.y, pose.z))
     };
 
@@ -7936,7 +7946,7 @@ fn direct_player_melee_kill_pushes_one_authoritative_script_event() {
     let stale_costs = next_costs();
     persisted
         .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .expect("test lock poisoned")
         .survival
         .add_exhaustion(0.25);
     assert!(matches!(
@@ -9295,7 +9305,7 @@ fn moving_arrow_damages_player_target_but_not_owner() {
     assert_eq!(
         target_state
             .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .expect("test lock poisoned")
             .survival
             .health,
         SurvivalState::MAX_HEALTH - ARROW_ENTITY_HIT_DAMAGE
@@ -9389,9 +9399,7 @@ fn shielded_player_hit_commits_shield_and_arrow_state_together() {
     );
 
     assert!(registry.server_entity_snapshot(arrow_id).is_some());
-    let state = target_state
-        .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let state = target_state.lock().expect("test lock poisoned");
     assert_eq!(state.survival.health, SurvivalState::MAX_HEALTH);
     assert_eq!(
         state.inventory.slots[shield_slot],
@@ -9519,7 +9527,7 @@ fn stale_player_plan_rejects_arrow_and_prior_entity_targets_atomically() {
         .expect("arrow preparation reaches transaction boundary");
     target_state
         .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .expect("test lock poisoned")
         .survival
         .apply_damage(1.0);
     resume_tx.send(()).expect("release arrow transaction");
@@ -9535,7 +9543,7 @@ fn stale_player_plan_rejects_arrow_and_prior_entity_targets_atomically() {
     assert_eq!(
         target_state
             .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .expect("test lock poisoned")
             .survival
             .health,
         SurvivalState::MAX_HEALTH - 1.0
@@ -9736,9 +9744,7 @@ fn rejected_player_damage_preserves_projectile_for_invulnerable_targets() {
             )),
             "{name}"
         );
-        let state = target_state
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let state = target_state.lock().expect("test lock poisoned");
         assert_eq!(state.game_mode, mode, "{name}");
         assert_eq!(state.survival.is_dead(), dead, "{name}");
     }
@@ -9800,7 +9806,7 @@ fn closed_player_publication_queue_does_not_create_false_projectile_rejection() 
     assert_eq!(
         target_state
             .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .expect("test lock poisoned")
             .survival
             .health,
         SurvivalState::MAX_HEALTH - ARROW_ENTITY_HIT_DAMAGE
@@ -11215,7 +11221,7 @@ fn older_physics_movement_keeps_its_order_across_unlocked_fanout() {
     *registry
         .move_fanout_probe
         .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(MoveFanoutProbe {
+        .expect("test lock poisoned") = Some(MoveFanoutProbe {
         reached: reached_tx,
         resume: resume_rx,
     });
@@ -12052,7 +12058,7 @@ fn player_body_push_releases_both_locks_before_session_publication() {
     *registry
         .player_push_commit_probe
         .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(PlayerPushCommitProbe {
+        .expect("test lock poisoned") = Some(PlayerPushCommitProbe {
         reached: reached_tx,
         resume: resume_rx,
     });
@@ -12152,7 +12158,7 @@ fn player_body_push_rejects_removed_same_id_replacement_before_publication() {
     *registry
         .player_push_commit_probe
         .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(PlayerPushCommitProbe {
+        .expect("test lock poisoned") = Some(PlayerPushCommitProbe {
         reached: reached_tx,
         resume: resume_rx,
     });
@@ -12728,7 +12734,7 @@ fn physics_pickup_snapshot_does_not_hold_session_registry() {
     *registry
         .pickup_snapshot_probe
         .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(PickupSnapshotProbe {
+        .expect("test lock poisoned") = Some(PickupSnapshotProbe {
         reached: reached_tx,
         resume: resume_rx,
     });
@@ -13657,7 +13663,7 @@ fn xp_orb_spawn_pickup_snapshot_releases_session_registry() {
     *registry
         .pickup_snapshot_probe
         .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(PickupSnapshotProbe {
+        .expect("test lock poisoned") = Some(PickupSnapshotProbe {
         reached: reached_tx,
         resume: resume_rx,
     });
@@ -13715,7 +13721,7 @@ fn pickup_candidate_snapshot_does_not_hold_session_registry() {
     *registry
         .pickup_snapshot_probe
         .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(PickupSnapshotProbe {
+        .expect("test lock poisoned") = Some(PickupSnapshotProbe {
         reached: reached_tx,
         resume: resume_rx,
     });
@@ -13758,7 +13764,7 @@ fn pickup_candidate_publication_rechecks_player_position() {
     *registry
         .pickup_snapshot_probe
         .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(PickupSnapshotProbe {
+        .expect("test lock poisoned") = Some(PickupSnapshotProbe {
         reached: reached_tx,
         resume: resume_rx,
     });

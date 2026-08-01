@@ -29,10 +29,7 @@ impl SessionRegistry {
         reached: tokio::sync::oneshot::Sender<()>,
         resume: tokio::sync::oneshot::Receiver<()>,
     ) {
-        *self
-            .campfire_d1_probe
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner()) =
+        *self.campfire_d1_probe.lock().expect("test lock poisoned") =
             Some(CampfireRecoveryProbe { reached, resume });
     }
 
@@ -45,8 +42,7 @@ impl SessionRegistry {
         *self
             .campfire_entity_probe
             .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner()) =
-            Some(CampfireRecoveryProbe { reached, resume });
+            .expect("test lock poisoned") = Some(CampfireRecoveryProbe { reached, resume });
     }
 
     #[cfg(test)]
@@ -54,7 +50,7 @@ impl SessionRegistry {
         let probe = self
             .campfire_d1_probe
             .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .expect("test lock poisoned")
             .take();
         if let Some(probe) = probe {
             let _ = probe.reached.send(());
@@ -67,7 +63,7 @@ impl SessionRegistry {
         let probe = self
             .campfire_entity_probe
             .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .expect("test lock poisoned")
             .take();
         if let Some(probe) = probe {
             let _ = probe.reached.send(());
@@ -96,13 +92,8 @@ impl SessionRegistry {
             return Ok(None);
         };
         let wait_started = Instant::now();
-        let guard = player_state.lock().unwrap_or_else(|poisoned| {
-            warn!(
-                session_id = actor_session,
-                "player persistence mutex was poisoned during campfire use; recovering state"
-            );
-            poisoned.into_inner()
-        });
+        let guard =
+            crate::lock_policy::lock_authoritative_mutex(&player_state, "play.player_persistence");
         let mut player_state = crate::lock_metrics::timed_guard(
             crate::lock_metrics::LockMetricKind::PlayerPersistence,
             "commit campfire use",
@@ -325,9 +316,9 @@ impl SessionRegistry {
     }
 
     fn lock_campfire_cooking(&self) -> MutexGuard<'_, HashMap<BlockPos, CampfireCookingState>> {
-        self.campfire_cooking.lock().unwrap_or_else(|poisoned| {
-            warn!("campfire cooking state was poisoned; recovering state");
-            poisoned.into_inner()
-        })
+        crate::lock_policy::lock_authoritative_mutex(
+            &self.campfire_cooking,
+            "play.campfire_cooking",
+        )
     }
 }

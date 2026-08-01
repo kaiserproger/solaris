@@ -29,8 +29,9 @@ and is not startup context.
   and `SOL-030` canonical login-name validation and collision policy are complete;
   `SOL-002` close-safe async extension boundaries, `SOL-012` bounded committed
   script-event delivery with explicit required/best-effort policy, and `SOL-031`
-  crash-only regional-owner supervision are complete; `SOL-041` poisoned-lock
-  classification is next in the current runtime-ownership series.
+  crash-only regional-owner supervision and `SOL-041` named poisoned-lock policy
+  are complete; `SOL-037` RAII admission tombstone cleanup is next in the current
+  runtime-ownership series.
 - The first owner-run public-alpha session remains the routing authority for the
   next stabilization release; its exact plan is `docs/PUBLIC_ALPHA_PLAN.md`.
 - The future full Luau addon platform is frozen in

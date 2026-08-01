@@ -3,6 +3,8 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, RwLock};
 use std::time::Instant;
 
+use crate::lock_policy::{read_benign_rwlock, write_benign_rwlock};
+
 pub(crate) const DEFAULT_RUNTIME_TICK_METRICS_CAPACITY: usize = 1_200;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -162,17 +164,11 @@ pub(crate) struct RuntimeTickMetricsHandle {
 
 impl RuntimeTickMetricsHandle {
     pub(crate) fn publish(&self, snapshot: RuntimeTickPercentiles) {
-        *self
-            .latest
-            .write()
-            .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(snapshot);
+        *write_benign_rwlock(&self.latest, "runtime.tick_metrics_latest") = Some(snapshot);
     }
 
     pub(crate) fn snapshot(&self) -> Option<RuntimeTickPercentiles> {
-        *self
-            .latest
-            .read()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
+        *read_benign_rwlock(&self.latest, "runtime.tick_metrics_latest")
     }
 }
 
@@ -371,6 +367,38 @@ mod tests {
             handle
                 .snapshot()
                 .expect("published second window")
+                .tick
+                .p50_us,
+            30
+        );
+    }
+
+    #[test]
+    fn poisoned_latest_snapshot_resets_and_accepts_new_publication() {
+        let handle = RuntimeTickMetricsHandle::default();
+        let mut window = RuntimeTickMetricsWindow::with_capacity(1);
+        window.record(sample(10));
+        let stale = window.snapshot().expect("stale snapshot");
+        let poisoned = Arc::clone(&handle.latest);
+        let _ = std::thread::spawn(move || {
+            let mut guard = poisoned.write().unwrap();
+            *guard = Some(stale);
+            panic!("inject runtime metrics poison");
+        })
+        .join();
+        let before = crate::runtime_lock_poison_metrics_snapshot().benign_reset;
+
+        assert!(handle.snapshot().is_none());
+        assert!(!handle.latest.is_poisoned());
+        assert!(crate::runtime_lock_poison_metrics_snapshot().benign_reset > before);
+
+        let mut replacement = RuntimeTickMetricsWindow::with_capacity(1);
+        replacement.record(sample(30));
+        handle.publish(replacement.snapshot().expect("replacement snapshot"));
+        assert_eq!(
+            handle
+                .snapshot()
+                .expect("replacement published")
                 .tick
                 .p50_us,
             30

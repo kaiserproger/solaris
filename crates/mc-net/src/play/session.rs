@@ -6,6 +6,7 @@ use super::simulation::{
     EntitySimulationTickPolicy, EntitySimulationWorldContext, SimulationAuthority,
 };
 use super::*;
+use crate::lock_policy::lock_authoritative_mutex;
 #[cfg(test)]
 use mc_entity::RegionKey;
 use mc_entity::{
@@ -1097,17 +1098,18 @@ impl SessionRegistry {
         &self,
         journal: super::world_journal::WorldChunkJournal,
     ) {
-        *self
-            .world_chunk_journal
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(journal);
+        *lock_authoritative_mutex(
+            &self.world_chunk_journal,
+            "persistence.world_chunk_journal_handle",
+        ) = Some(journal);
     }
 
     pub(crate) fn world_chunk_journal(&self) -> Option<super::world_journal::WorldChunkJournal> {
-        self.world_chunk_journal
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .clone()
+        lock_authoritative_mutex(
+            &self.world_chunk_journal,
+            "persistence.world_chunk_journal_handle",
+        )
+        .clone()
     }
 
     pub(crate) fn world_chunk_journal_watermark(&self) -> Option<u64> {
@@ -1235,13 +1237,7 @@ impl SessionRegistry {
                 crate::lock_metrics::LockMetricKind::SessionRegistry,
                 operation,
                 Instant::now(),
-                self.inner.lock().unwrap_or_else(|poisoned| {
-                    warn!(
-                        operation,
-                        "session registry mutex was poisoned; recovering state"
-                    );
-                    poisoned.into_inner()
-                }),
+                lock_authoritative_mutex(&self.inner, "play.session_registry"),
             ),
             observation: &self.pressure_observation,
             dirty: false,
@@ -1384,7 +1380,7 @@ impl SessionRegistry {
         let probe = self
             .move_fanout_probe
             .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .expect("test lock poisoned")
             .take();
         if let Some(probe) = probe {
             probe.reached.send(()).expect("move fanout probe receiver");
@@ -1397,7 +1393,7 @@ impl SessionRegistry {
         let probe = self
             .movement_dispatch_probe
             .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .expect("test lock poisoned")
             .take();
         if let Some(probe) = probe {
             let _ = probe.reached.send(());
@@ -1410,7 +1406,7 @@ impl SessionRegistry {
         let probe = self
             .movement_visibility_load_probe
             .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .expect("test lock poisoned")
             .take();
         if let Some(probe) = probe {
             probe
@@ -1429,7 +1425,7 @@ impl SessionRegistry {
         let probe = self
             .entity_apply_release_probe
             .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .expect("test lock poisoned")
             .take();
         if let Some(probe) = probe {
             probe.reached.send(()).expect("entity apply probe receiver");
@@ -1442,7 +1438,7 @@ impl SessionRegistry {
         let probe = self
             .physics_owner_apply_probe
             .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .expect("test lock poisoned")
             .take();
         if let Some(probe) = probe {
             probe
@@ -1461,7 +1457,7 @@ impl SessionRegistry {
         let probe = self
             .physics_routing_probe
             .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .expect("test lock poisoned")
             .take();
         if let Some(probe) = probe {
             probe
@@ -1481,8 +1477,7 @@ impl SessionRegistry {
         *self
             .arrow_transaction_probe
             .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner()) =
-            Some(ArrowTransactionProbe { reached, resume });
+            .expect("test lock poisoned") = Some(ArrowTransactionProbe { reached, resume });
     }
 
     #[cfg(test)]
@@ -1490,7 +1485,7 @@ impl SessionRegistry {
         let probe = self
             .arrow_transaction_probe
             .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .expect("test lock poisoned")
             .take();
         if let Some(probe) = probe {
             probe
@@ -1509,7 +1504,7 @@ impl SessionRegistry {
         let probe = self
             .breeding_plan_probe
             .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .expect("test lock poisoned")
             .take();
         if let Some(probe) = probe {
             probe.reached.send(()).expect("breeding probe receiver");
@@ -1522,7 +1517,7 @@ impl SessionRegistry {
         let probe = self
             .breeding_commit_probe
             .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .expect("test lock poisoned")
             .take();
         if let Some(probe) = probe {
             probe
@@ -1538,7 +1533,7 @@ impl SessionRegistry {
         let probe = self
             .sheep_grazing_plan_probe
             .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .expect("test lock poisoned")
             .take();
         if let Some(probe) = probe {
             probe
@@ -1554,7 +1549,7 @@ impl SessionRegistry {
         let probe = self
             .sheep_grazing_commit_probe
             .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .expect("test lock poisoned")
             .take();
         if let Some(probe) = probe {
             probe
@@ -1573,7 +1568,7 @@ impl SessionRegistry {
         let probe = self
             .sheep_grazing_owner_read_probe
             .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .expect("test lock poisoned")
             .take();
         if let Some(probe) = probe {
             probe
@@ -1592,7 +1587,7 @@ impl SessionRegistry {
         let probe = self
             .entity_save_owner_probe
             .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .expect("test lock poisoned")
             .take();
         if let Some(probe) = probe {
             probe
@@ -1611,7 +1606,7 @@ impl SessionRegistry {
         let probe = self
             .player_push_commit_probe
             .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .expect("test lock poisoned")
             .take();
         if let Some(probe) = probe {
             probe
@@ -1630,7 +1625,7 @@ impl SessionRegistry {
         let probe = self
             .pickup_snapshot_probe
             .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .expect("test lock poisoned")
             .take();
         if let Some(probe) = probe {
             probe
@@ -1650,8 +1645,7 @@ impl SessionRegistry {
         *self
             .server_relight_compute_probe
             .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner()) =
-            Some(ServerRelightComputeProbe { reached, resume });
+            .expect("test lock poisoned") = Some(ServerRelightComputeProbe { reached, resume });
     }
 
     #[cfg(test)]
@@ -1659,7 +1653,7 @@ impl SessionRegistry {
         let probe = self
             .server_relight_compute_probe
             .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .expect("test lock poisoned")
             .take();
         if let Some(probe) = probe {
             probe
@@ -1682,8 +1676,7 @@ impl SessionRegistry {
         *self
             .entity_goal_compute_probe
             .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner()) =
-            Some(EntityGoalComputeProbe { reached, resume });
+            .expect("test lock poisoned") = Some(EntityGoalComputeProbe { reached, resume });
     }
 
     #[cfg(test)]
@@ -1691,7 +1684,7 @@ impl SessionRegistry {
         let probe = self
             .entity_goal_compute_probe
             .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .expect("test lock poisoned")
             .take();
         if let Some(probe) = probe {
             probe

@@ -4,6 +4,8 @@ use std::sync::{Arc, Mutex, Weak};
 
 use tokio::sync::{Notify, oneshot};
 
+use crate::lock_policy::lock_authoritative_mutex;
+
 #[derive(Debug)]
 pub(crate) enum DirtyFlushWriteError {
     World(mc_world::storage::WorldError),
@@ -74,19 +76,21 @@ struct DirtyFlushShared {
     completed: Notify,
 }
 
+impl DirtyFlushShared {
+    fn lock_state(&self) -> std::sync::MutexGuard<'_, DirtyFlushState> {
+        lock_authoritative_mutex(&self.state, "persistence.dirty_flush_state")
+    }
+}
+
 struct DirtyFlushWorkerExit {
     shared: Arc<DirtyFlushShared>,
 }
 
 impl Drop for DirtyFlushWorkerExit {
     fn drop(&mut self) {
-        let mut state = self
-            .shared
-            .state
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
-        state.stopped = true;
-        drop(state);
+        if let Ok(mut state) = self.shared.state.lock() {
+            state.stopped = true;
+        }
         self.shared.completed.notify_waiters();
     }
 }
@@ -115,10 +119,7 @@ impl DirtyFlushNotifier {
     pub(crate) fn request_dirty_flush_ticket(&self) -> Option<DirtyFlushTicket> {
         let shared = self.shared.upgrade()?;
         let generation = {
-            let mut state = shared
-                .state
-                .lock()
-                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            let mut state = shared.lock_state();
             if state.stopped {
                 return None;
             }
@@ -138,10 +139,7 @@ impl DirtyFlushNotifier {
         let Some(shared) = self.shared.upgrade() else {
             return;
         };
-        let mut state = shared
-            .state
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let mut state = shared.lock_state();
         if state.stopped {
             tracing::warn!("dirty flush worker stopped before producer notification");
             return;
@@ -169,10 +167,7 @@ impl DirtyFlushTicket {
             tokio::pin!(completed);
             completed.as_mut().enable();
             {
-                let state = shared
-                    .state
-                    .lock()
-                    .unwrap_or_else(|poisoned| poisoned.into_inner());
+                let state = shared.lock_state();
                 if state.dirty_completed_generation >= self.generation {
                     return true;
                 }
@@ -237,15 +232,6 @@ pub(crate) enum DirtyFlushDrainOutcome {
     Failed(DirtyFlushDrainError),
 }
 
-impl DirtyFlushDrainOutcome {
-    pub(crate) fn into_result(self) -> Result<(), DirtyFlushDrainError> {
-        match self {
-            Self::Complete => Ok(()),
-            Self::Failed(error) => Err(error),
-        }
-    }
-}
-
 impl DirtyFlushCoordinator {
     #[cfg(test)]
     pub(crate) fn spawn<Flush, FlushFuture>(mut flush: Flush) -> Self
@@ -294,10 +280,7 @@ impl DirtyFlushCoordinator {
                 worker_shared.wake.notified().await;
                 loop {
                     let action = {
-                        let mut state = worker_shared
-                            .state
-                            .lock()
-                            .unwrap_or_else(|poisoned| poisoned.into_inner());
+                        let mut state = worker_shared.lock_state();
                         if state.full_checkpoint {
                             state.full_checkpoint = false;
                             // A full checkpoint includes dirty chunks, so it
@@ -321,10 +304,7 @@ impl DirtyFlushCoordinator {
                             let completion = dirty_flush().await;
                             complete_dirty_generation(&worker_shared, generation);
                             if completion == DirtyFlushCompletion::MoreDirty {
-                                let mut state = worker_shared
-                                    .state
-                                    .lock()
-                                    .unwrap_or_else(|poisoned| poisoned.into_inner());
+                                let mut state = worker_shared.lock_state();
                                 state.dirty_flush = true;
                                 drop(state);
                                 worker_shared.wake.notify_one();
@@ -359,11 +339,7 @@ impl DirtyFlushCoordinator {
     pub(crate) async fn drain(self) -> DirtyFlushDrainOutcome {
         let (completed, received) = oneshot::channel();
         {
-            let mut state = self
-                .shared
-                .state
-                .lock()
-                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            let mut state = self.shared.lock_state();
             state.drain = Some(completed);
         }
         self.shared.wake.notify_one();
@@ -408,10 +384,7 @@ enum DirtyFlushAction {
 }
 
 fn complete_dirty_generation(shared: &DirtyFlushShared, generation: u64) {
-    let mut state = shared
-        .state
-        .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let mut state = shared.lock_state();
     state.dirty_completed_generation = state.dirty_completed_generation.max(generation);
     drop(state);
     shared.completed.notify_waiters();

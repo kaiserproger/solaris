@@ -3,6 +3,8 @@ use std::sync::Mutex;
 
 use mc_entity::{EntityId, Rotation, Vec3};
 
+use crate::lock_policy::lock_benign_mutex;
+
 const TRACKER_SHARD_COUNT: usize = 64;
 
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -37,9 +39,7 @@ impl EntityMovementTrackers {
         &self,
         shard_index: usize,
     ) -> std::sync::MutexGuard<'_, HashMap<EntityId, LastSentEntityState>> {
-        self.shards[shard_index]
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
+        lock_benign_mutex(&self.shards[shard_index], "play.entity_movement_tracker")
     }
 
     pub(super) fn get(&self, entity_id: EntityId) -> Option<LastSentEntityState> {
@@ -129,11 +129,9 @@ impl EntityMovementTrackers {
 
     #[cfg(test)]
     pub(super) fn is_empty(&self) -> bool {
-        self.shards.iter().all(|shard| {
-            shard
-                .lock()
-                .unwrap_or_else(|poisoned| poisoned.into_inner())
-                .is_empty()
-        })
+        self.shards
+            .iter()
+            .enumerate()
+            .all(|(index, _)| self.lock_shard(index).is_empty())
     }
 }

@@ -84,13 +84,10 @@ impl SessionRegistry {
         let tool_slot = PlayerInventory::HOTBAR_BASE + usize::from(plan.held.hotbar_slot);
         let (expected_inventory, updated_inventory, changed_slots) = {
             let wait_started = Instant::now();
-            let guard = player_state.lock().unwrap_or_else(|poisoned| {
-                warn!(
-                    session_id = actor_session,
-                    "player persistence mutex was poisoned while snapshotting survival break; recovering state"
-                );
-                poisoned.into_inner()
-            });
+            let guard = crate::lock_policy::lock_authoritative_mutex(
+                &player_state,
+                "play.player_persistence",
+            );
             let player = crate::lock_metrics::timed_guard(
                 crate::lock_metrics::LockMetricKind::PlayerPersistence,
                 "snapshot survival break inventory",
@@ -151,13 +148,10 @@ impl SessionRegistry {
                 false
             } else {
                 let wait_started = Instant::now();
-                let guard = player_state.lock().unwrap_or_else(|poisoned| {
-                    warn!(
-                        session_id = actor_session,
-                        "player persistence mutex was poisoned during survival break; recovering state"
-                    );
-                    poisoned.into_inner()
-                });
+                let guard = crate::lock_policy::lock_authoritative_mutex(
+                    &player_state,
+                    "play.player_persistence",
+                );
                 let mut player = crate::lock_metrics::timed_guard(
                     crate::lock_metrics::LockMetricKind::PlayerPersistence,
                     "publish survival break inventory",
@@ -206,13 +200,8 @@ impl SessionRegistry {
             return Ok(None);
         };
         let wait_started = Instant::now();
-        let guard = player_state.lock().unwrap_or_else(|poisoned| {
-            warn!(
-                session_id = actor_session,
-                "player persistence mutex was poisoned during survival placement; recovering state"
-            );
-            poisoned.into_inner()
-        });
+        let guard =
+            crate::lock_policy::lock_authoritative_mutex(&player_state, "play.player_persistence");
         let mut player_state = crate::lock_metrics::timed_guard(
             crate::lock_metrics::LockMetricKind::PlayerPersistence,
             "commit survival placement",
@@ -329,13 +318,8 @@ impl SessionRegistry {
             return Ok(None);
         };
         let wait_started = Instant::now();
-        let guard = player_state.lock().unwrap_or_else(|poisoned| {
-            warn!(
-                session_id = actor_session,
-                "player persistence mutex was poisoned during bucket use; recovering state"
-            );
-            poisoned.into_inner()
-        });
+        let guard =
+            crate::lock_policy::lock_authoritative_mutex(&player_state, "play.player_persistence");
         let mut player_state = crate::lock_metrics::timed_guard(
             crate::lock_metrics::LockMetricKind::PlayerPersistence,
             "commit bucket use",

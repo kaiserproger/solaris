@@ -4,6 +4,8 @@ use super::{
     SimulationCommand, SimulationHandle, SimulationOutcome, SimulationOwner,
     SimulationRequestError, command_is_background, command_orders_earlier_herds,
 };
+#[cfg(feature = "load-bench")]
+use crate::lock_policy::lock_benign_mutex;
 use crate::play::SettlementInhabitantSpawn;
 use crate::play::session::ScriptPlayerTeleportCompletion;
 use mc_script::ScriptPlayerTeleportFailure;
@@ -166,7 +168,7 @@ impl HerdEnqueueProbe {
                 .expect("herd enqueue winner probe receiver");
             self.release_winner
                 .lock()
-                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .expect("test lock poisoned")
                 .recv()
                 .expect("herd enqueue winner probe release");
         }
@@ -265,10 +267,8 @@ impl SimulationQueueMetrics {
         count: usize,
         elapsed_us: u64,
     ) {
-        let mut stats = self
-            .command_kind_stats
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let mut stats =
+            lock_benign_mutex(&self.command_kind_stats, "simulation.command_kind_stats");
         let entry = stats.entry(kind).or_default();
         entry.count = entry
             .count
@@ -279,18 +279,12 @@ impl SimulationQueueMetrics {
 
     #[cfg(feature = "load-bench")]
     fn reset_command_kind_stats(&self) {
-        self.command_kind_stats
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .clear();
+        lock_benign_mutex(&self.command_kind_stats, "simulation.command_kind_stats").clear();
     }
 
     #[cfg(feature = "load-bench")]
     fn command_kind_snapshot(&self) -> Vec<SimulationCommandKindSnapshot> {
-        let stats = self
-            .command_kind_stats
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let stats = lock_benign_mutex(&self.command_kind_stats, "simulation.command_kind_stats");
         let mut snapshot = stats
             .iter()
             .map(|(&kind, stat)| SimulationCommandKindSnapshot {
@@ -332,7 +326,7 @@ impl SimulationHandle {
             .metrics
             .herd_enqueue_probe
             .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(Arc::new(HerdEnqueueProbe {
+            .expect("test lock poisoned") = Some(Arc::new(HerdEnqueueProbe {
             winner_claimed,
             release_winner: Mutex::new(release_winner),
             waiter_blocked,
@@ -553,7 +547,7 @@ impl SimulationHandle {
                 .metrics
                 .requested_herd_chunks
                 .lock()
-                .unwrap_or_else(|poisoned| poisoned.into_inner());
+                .expect("test lock poisoned");
             if let Some(claim) = requested.get(&chunk) {
                 (Arc::clone(claim), false)
             } else {
@@ -568,20 +562,14 @@ impl SimulationHandle {
                 self.metrics
                     .herd_enqueue_probe
                     .lock()
-                    .unwrap_or_else(|poisoned| poisoned.into_inner())
+                    .expect("test lock poisoned")
                     .clone()
             } {
                 probe.notify_waiter();
             }
-            let mut outcome = claim
-                .outcome
-                .lock()
-                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            let mut outcome = claim.outcome.lock().expect("test lock poisoned");
             while outcome.is_none() {
-                outcome = claim
-                    .completed
-                    .wait(outcome)
-                    .unwrap_or_else(|poisoned| poisoned.into_inner());
+                outcome = claim.completed.wait(outcome).expect("test lock poisoned");
             }
             return outcome.expect("completed herd enqueue claim has an outcome");
         }
@@ -591,7 +579,7 @@ impl SimulationHandle {
             self.metrics
                 .herd_enqueue_probe
                 .lock()
-                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .expect("test lock poisoned")
                 .clone()
         } {
             probe.pause_winner();
@@ -602,7 +590,7 @@ impl SimulationHandle {
                 .metrics
                 .requested_herd_chunks
                 .lock()
-                .unwrap_or_else(|poisoned| poisoned.into_inner());
+                .expect("test lock poisoned");
             if requested
                 .get(&chunk)
                 .is_some_and(|current| Arc::ptr_eq(current, &claim))
@@ -610,10 +598,7 @@ impl SimulationHandle {
                 requested.remove(&chunk);
             }
         }
-        *claim
-            .outcome
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(result);
+        *claim.outcome.lock().expect("test lock poisoned") = Some(result);
         claim.completed.notify_all();
         result
     }
@@ -663,7 +648,7 @@ impl SimulationOwner {
             .metrics
             .requested_herd_chunks
             .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
+            .expect("test lock poisoned");
         for chunk in chunks {
             requested.remove(chunk);
         }
@@ -771,7 +756,7 @@ impl SimulationOwner {
         self.metrics
             .requested_herd_chunks
             .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .expect("test lock poisoned")
             .clear();
         if let Some(envelope) = self.prefetched.take() {
             self.metrics.depth.fetch_sub(1, Ordering::Relaxed);

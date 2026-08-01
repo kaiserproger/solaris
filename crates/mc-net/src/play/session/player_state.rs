@@ -4,6 +4,7 @@ use super::{
     PlayerInventoryCommitError, SessionEntityGuards, SessionId, SessionRegistry,
     spawn_item_drop_locked, spawn_xp_orb_locked,
 };
+use crate::lock_policy::lock_authoritative_mutex;
 use crate::play::combat::ActiveShield;
 use crate::play::persistence::PlayerPersistedState;
 use crate::play::recoverable_death_xp;
@@ -17,8 +18,6 @@ use mc_protocol::packets::play::{GameMode, ItemStack};
 use std::sync::atomic::Ordering;
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
-use tracing::warn;
-
 impl SessionRegistry {
     pub(in crate::play) fn register_player_persistence(
         &self,
@@ -27,9 +26,7 @@ impl SessionRegistry {
     ) {
         let mut inner = self.lock_inner("register player persistence");
         let (game_mode, dead) = {
-            let state = state
-                .lock()
-                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            let state = lock_authoritative_mutex(&state, "play.player_persistence");
             (state.game_mode, state.survival.is_dead())
         };
         inner.player_persistence.insert(id, state);
@@ -93,13 +90,7 @@ impl SessionRegistry {
             crate::lock_metrics::LockMetricKind::PlayerPersistence,
             "recover disconnected player persistence snapshot",
             Instant::now(),
-            state.lock().unwrap_or_else(|poisoned| {
-                warn!(
-                    player = %uuid,
-                    "player persistence mutex was poisoned during reconnect; recovering state"
-                );
-                poisoned.into_inner()
-            }),
+            lock_authoritative_mutex(&state, "play.player_persistence"),
         );
         Some((*state).clone())
     }
@@ -118,13 +109,7 @@ impl SessionRegistry {
             return Err(PlayerInventoryCommitError::MissingPlayer);
         };
         let wait_started = Instant::now();
-        let guard = player_state.lock().unwrap_or_else(|poisoned| {
-            warn!(
-                session_id = actor_session,
-                "player persistence mutex was poisoned during inventory commit; recovering state"
-            );
-            poisoned.into_inner()
-        });
+        let guard = lock_authoritative_mutex(&player_state, "play.player_persistence");
         let mut player_state = crate::lock_metrics::timed_guard(
             crate::lock_metrics::LockMetricKind::PlayerPersistence,
             "commit player inventory state",
@@ -214,12 +199,7 @@ impl SessionRegistry {
                     crate::lock_metrics::LockMetricKind::PlayerPersistence,
                     "save-all player persistence snapshot",
                     Instant::now(),
-                    state.lock().unwrap_or_else(|poisoned| {
-                        warn!(
-                            "player persistence mutex was poisoned during save-all; recovering state"
-                        );
-                        poisoned.into_inner()
-                    }),
+                    lock_authoritative_mutex(&state, "play.player_persistence"),
                 );
                 (uuid, (*state).clone(), disconnected_generation)
             })
@@ -275,13 +255,7 @@ impl SessionRegistry {
         }
         let player_state = inner.player_persistence.get(&actor_session)?.clone();
         let wait_started = Instant::now();
-        let guard = player_state.lock().unwrap_or_else(|poisoned| {
-            warn!(
-                session_id = actor_session,
-                "player persistence mutex was poisoned during survival transition; recovering state"
-            );
-            poisoned.into_inner()
-        });
+        let guard = lock_authoritative_mutex(&player_state, "play.player_persistence");
         let mut player_state = crate::lock_metrics::timed_guard(
             crate::lock_metrics::LockMetricKind::PlayerPersistence,
             "commit player survival",
@@ -502,5 +476,36 @@ pub(super) fn apply_player_survival_plan_locked(
         xp,
         died,
         dispatches,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn poisoned_player_persistence_fails_stop_with_typed_lock_name() {
+        let registry = SessionRegistry::new();
+        let state = Arc::new(Mutex::new(PlayerPersistedState::new_default(
+            crate::play::PlayerPose::new(0.5, 64.0, 0.5),
+        )));
+        let poisoned = Arc::clone(&state);
+        let _ = std::thread::spawn(move || {
+            let mut guard = poisoned.lock().unwrap();
+            guard.selected_hotbar_slot = 4;
+            panic!("inject player persistence poison");
+        })
+        .join();
+
+        let panic = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            registry.register_player_persistence(1, Arc::clone(&state));
+        }))
+        .expect_err("poisoned player persistence must fail-stop");
+
+        assert_eq!(
+            crate::lock_policy::authoritative_lock_poison_from_panic(panic.as_ref()),
+            Some("play.player_persistence")
+        );
+        assert!(state.is_poisoned());
     }
 }

@@ -165,7 +165,7 @@ async fn pause_block_drop_after(stage: BlockDropAwaitStage) {
         waiter
             .release
             .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .expect("test lock poisoned")
             .recv()
             .expect("block-drop probe release");
     })

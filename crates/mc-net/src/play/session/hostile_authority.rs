@@ -398,7 +398,7 @@ impl SessionRegistry {
         let probe = self
             .hostile_reconcile_probe
             .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .expect("test lock poisoned")
             .take();
         if let Some(probe) = probe {
             probe.reached.send(()).expect("hostile reconcile receiver");
@@ -411,7 +411,7 @@ impl SessionRegistry {
         let probe = self
             .hostile_scan_probe
             .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .expect("test lock poisoned")
             .take();
         if let Some(probe) = probe {
             probe.reached.send(()).expect("hostile scan receiver");
@@ -424,7 +424,7 @@ impl SessionRegistry {
         let probe = self
             .hostile_commit_probe
             .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .expect("test lock poisoned")
             .take();
         if let Some(probe) = probe {
             probe.reached.send(()).expect("hostile commit receiver");
@@ -437,7 +437,7 @@ impl SessionRegistry {
         let probe = self
             .hostile_publication_probe
             .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .expect("test lock poisoned")
             .take();
         if let Some(probe) = probe {
             probe
@@ -453,7 +453,7 @@ impl SessionRegistry {
         let probe = self
             .hostile_target_snapshot_probe
             .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .expect("test lock poisoned")
             .take();
         if let Some(probe) = probe {
             probe.reached.send(()).expect("hostile target receiver");

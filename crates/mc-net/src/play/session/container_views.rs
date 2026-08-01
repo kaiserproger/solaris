@@ -2,7 +2,6 @@ use std::sync::Arc;
 use std::time::Instant;
 
 use mc_protocol::packets::play::ItemStack;
-use tracing::warn;
 
 use crate::play::inventory::PlayerInventory;
 use crate::play::simulation::SimulationAuthority;
@@ -175,13 +174,10 @@ impl SessionRegistry {
         let (state_id, inventory, carried_item, recipients) = {
             let mut containers = self.lock_containers(position, "commit chest slots");
             let wait_started = Instant::now();
-            let guard = player_state.lock().unwrap_or_else(|poisoned| {
-                warn!(
-                    session_id = actor_session,
-                    "player persistence mutex was poisoned during chest commit; recovering state"
-                );
-                poisoned.into_inner()
-            });
+            let guard = crate::lock_policy::lock_authoritative_mutex(
+                &player_state,
+                "play.player_persistence",
+            );
             let mut player_state = crate::lock_metrics::timed_guard(
                 crate::lock_metrics::LockMetricKind::PlayerPersistence,
                 "commit chest player state",
@@ -342,13 +338,10 @@ impl SessionRegistry {
         let (state_id, inventory, carried_item, recipients) = {
             let mut containers = self.lock_containers(position, "commit furnace slots");
             let wait_started = Instant::now();
-            let guard = player_state.lock().unwrap_or_else(|poisoned| {
-                warn!(
-                    session_id = actor_session,
-                    "player persistence mutex was poisoned during furnace commit; recovering state"
-                );
-                poisoned.into_inner()
-            });
+            let guard = crate::lock_policy::lock_authoritative_mutex(
+                &player_state,
+                "play.player_persistence",
+            );
             let mut player_state = crate::lock_metrics::timed_guard(
                 crate::lock_metrics::LockMetricKind::PlayerPersistence,
                 "commit furnace player state",
@@ -508,7 +501,7 @@ impl SessionRegistry {
         let commit_probe = self
             .container_commit_probe
             .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .expect("test lock poisoned")
             .clone();
         let inner = self.lock_inner("prepare regional chest commit");
         if !inner.sessions.contains_key(&actor_session) {

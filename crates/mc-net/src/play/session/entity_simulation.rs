@@ -1152,7 +1152,7 @@ impl SessionRegistry {
         let resolved_direct_paths = pathing_probe
             .resolved_direct_paths
             .into_inner()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
+            .expect("entity pathing result lock poisoned");
         #[cfg(feature = "load-bench")]
         let resolve_us = u64::try_from(resolve_started.elapsed().as_micros()).unwrap_or(u64::MAX);
         #[cfg(feature = "load-bench")]

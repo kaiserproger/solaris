@@ -27,7 +27,6 @@ use std::collections::HashSet;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
-use tracing::warn;
 
 pub(in crate::play) const ENTITY_PICKUP_RADIUS: f64 = 2.25;
 pub(in crate::play) const ITEM_PICKUP_DELAY_TICKS: u64 = 4;
@@ -692,13 +691,10 @@ impl SessionRegistry {
             expected_selected_hotbar_slot,
         ) = {
             let wait_started = Instant::now();
-            let guard = player_state.lock().unwrap_or_else(|poisoned| {
-                warn!(
-                    session_id = collector_session,
-                    "player persistence mutex was poisoned during item pickup planning; recovering state"
-                );
-                poisoned.into_inner()
-            });
+            let guard = crate::lock_policy::lock_authoritative_mutex(
+                &player_state,
+                "play.player_persistence",
+            );
             let player = crate::lock_metrics::timed_guard(
                 crate::lock_metrics::LockMetricKind::PlayerPersistence,
                 "snapshot item pickup player",
@@ -798,13 +794,10 @@ impl SessionRegistry {
         let player_started = Instant::now();
         let player_committed = {
             let wait_started = Instant::now();
-            let guard = plan.player_state.lock().unwrap_or_else(|poisoned| {
-                warn!(
-                    session_id = collector_session,
-                    "player persistence mutex was poisoned during item pickup commit; recovering state"
-                );
-                poisoned.into_inner()
-            });
+            let guard = crate::lock_policy::lock_authoritative_mutex(
+                &plan.player_state,
+                "play.player_persistence",
+            );
             let mut player = crate::lock_metrics::timed_guard(
                 crate::lock_metrics::LockMetricKind::PlayerPersistence,
                 "credit item pickup",
@@ -902,8 +895,7 @@ impl SessionRegistry {
         *self
             .item_pickup_plan_probe
             .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner()) =
-            Some(super::ItemPickupPlanProbe { reached, resume });
+            .expect("test lock poisoned") = Some(super::ItemPickupPlanProbe { reached, resume });
     }
 
     #[cfg(test)]
@@ -911,7 +903,7 @@ impl SessionRegistry {
         let probe = self
             .item_pickup_plan_probe
             .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .expect("test lock poisoned")
             .take();
         if let Some(probe) = probe {
             probe
@@ -931,7 +923,7 @@ impl SessionRegistry {
         *self
             .item_pickup_owner_probe
             .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner()) =
+            .expect("test lock poisoned") =
             Some(super::EntityApplyReleaseProbe { reached, resume });
     }
 
@@ -940,7 +932,7 @@ impl SessionRegistry {
         let probe = self
             .item_pickup_owner_probe
             .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .expect("test lock poisoned")
             .take();
         if let Some(probe) = probe {
             probe
@@ -963,7 +955,7 @@ impl SessionRegistry {
         *self
             .item_pickup_claimed_probe
             .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner()) =
+            .expect("test lock poisoned") =
             Some(super::EntityApplyReleaseProbe { reached, resume });
     }
 
@@ -972,7 +964,7 @@ impl SessionRegistry {
         let probe = self
             .item_pickup_claimed_probe
             .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .expect("test lock poisoned")
             .take();
         if let Some(probe) = probe {
             probe
@@ -1069,13 +1061,10 @@ impl SessionRegistry {
             }
             let player_state = inner.player_persistence.get(&collector_session).cloned()?;
             let wait_started = Instant::now();
-            let guard = player_state.lock().unwrap_or_else(|poisoned| {
-                warn!(
-                    session_id = collector_session,
-                    "player persistence mutex was poisoned during arrow pickup; recovering state"
-                );
-                poisoned.into_inner()
-            });
+            let guard = crate::lock_policy::lock_authoritative_mutex(
+                &player_state,
+                "play.player_persistence",
+            );
             let mut player_state = crate::lock_metrics::timed_guard(
                 crate::lock_metrics::LockMetricKind::PlayerPersistence,
                 "credit arrow pickup",
@@ -1146,13 +1135,10 @@ impl SessionRegistry {
             }
             let player_state = inner.player_persistence.get(&collector_session).cloned()?;
             let wait_started = Instant::now();
-            let guard = player_state.lock().unwrap_or_else(|poisoned| {
-                warn!(
-                    session_id = collector_session,
-                    "player persistence mutex was poisoned during XP pickup; recovering state"
-                );
-                poisoned.into_inner()
-            });
+            let guard = crate::lock_policy::lock_authoritative_mutex(
+                &player_state,
+                "play.player_persistence",
+            );
             let mut player_state = crate::lock_metrics::timed_guard(
                 crate::lock_metrics::LockMetricKind::PlayerPersistence,
                 "credit experience pickup",

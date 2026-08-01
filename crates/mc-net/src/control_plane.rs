@@ -9,6 +9,7 @@ use std::sync::{Arc, Mutex};
 
 use tokio::sync::Notify;
 
+use crate::lock_policy::lock_authoritative_mutex;
 use crate::memory_pressure::{
     MemoryPressureHandle, MemoryPressureObservation, MemoryPressureSampler,
     spawn_memory_pressure_sampler,
@@ -55,6 +56,12 @@ struct RuntimeControlSignalChannel {
     changed: Notify,
 }
 
+impl RuntimeControlSignalChannel {
+    fn lock_state(&self) -> std::sync::MutexGuard<'_, RuntimeControlSignalState> {
+        lock_authoritative_mutex(&self.state, "runtime.control_signal_state")
+    }
+}
+
 /// A bounded, non-blocking producer for runtime-control state changes.
 #[derive(Debug, Clone)]
 pub(crate) struct RuntimeControlSignalProducer {
@@ -64,11 +71,7 @@ pub(crate) struct RuntimeControlSignalProducer {
 impl RuntimeControlSignalProducer {
     /// Returns false only after the sole consumer has been dropped.
     pub(crate) fn push_slow_client_shed(&self) -> bool {
-        let mut state = self
-            .channel
-            .state
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let mut state = self.channel.lock_state();
         if !state.receiver_open {
             return false;
         }
@@ -125,11 +128,7 @@ impl RuntimeControlSignalReceiver {
     }
 
     fn take_pending(&self) -> Option<RuntimeControlSignal> {
-        let mut state = self
-            .channel
-            .state
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let mut state = self.channel.lock_state();
         if state.slow_client_shed {
             state.slow_client_shed = false;
             return Some(RuntimeControlSignal::SlowClientShed);
@@ -167,11 +166,7 @@ impl RuntimeControlSignalReceiver {
 
 impl Drop for RuntimeControlSignalReceiver {
     fn drop(&mut self) {
-        let mut state = self
-            .channel
-            .state
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let mut state = self.channel.lock_state();
         state.receiver_open = false;
         self.channel.changed.notify_waiters();
     }
@@ -186,20 +181,12 @@ pub(crate) struct RuntimeControlChunkPressureSource {
 impl RuntimeControlChunkPressureSource {
     pub(crate) fn set_saturated(&mut self, saturated: bool) -> bool {
         if saturated == self.saturated {
-            let state = self
-                .channel
-                .state
-                .lock()
-                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            let state = self.channel.lock_state();
             return state.receiver_open;
         }
 
         self.saturated = saturated;
-        let mut state = self
-            .channel
-            .state
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let mut state = self.channel.lock_state();
         let had_pending_change = state.chunk_pressure_changed;
         if saturated {
             state.saturated_chunk_sources = state
@@ -245,20 +232,12 @@ pub(crate) struct RuntimeControlFirstChunkSlaSource {
 impl RuntimeControlFirstChunkSlaSource {
     pub(crate) fn set_active(&mut self, active: bool) -> bool {
         if active == self.active {
-            let state = self
-                .channel
-                .state
-                .lock()
-                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            let state = self.channel.lock_state();
             return state.receiver_open;
         }
 
         self.active = active;
-        let mut state = self
-            .channel
-            .state
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let mut state = self.channel.lock_state();
         let had_pending_change = state.first_chunk_sla_changed;
         if active {
             state.active_first_chunk_sla_sources = state
@@ -1195,10 +1174,7 @@ impl RuntimeControlHandle {
     }
 
     pub(crate) fn take_signal_receiver(&self) -> Option<RuntimeControlSignalReceiver> {
-        self.signal_receiver
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .take()
+        lock_authoritative_mutex(&self.signal_receiver, "runtime.control_signal_receiver").take()
     }
 
     #[must_use]
@@ -1325,10 +1301,7 @@ impl RuntimeControlHandle {
             &RuntimeControlSnapshot,
         ) -> Result<(), RuntimeControlApplyError>,
     ) -> Result<RuntimeControlOutcome, RuntimeControlApplyError> {
-        let mut controller = self
-            .controller
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let mut controller = lock_authoritative_mutex(&self.controller, "runtime.control_plane");
         if let Some(reason) = controller.application_stop_reason.clone() {
             return Err(RuntimeControlApplyError::controlled_stop(reason));
         }
@@ -1373,10 +1346,7 @@ impl RuntimeControlHandle {
     }
 
     fn with_controller<T>(&self, f: impl FnOnce(&mut RuntimeControlPlane) -> T) -> T {
-        let mut controller = self
-            .controller
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let mut controller = lock_authoritative_mutex(&self.controller, "runtime.control_plane");
         f(&mut controller)
     }
 }
@@ -1618,7 +1588,7 @@ mod tests {
                         assert_eq!(proposed.limits.view_distance, 7);
                         events
                             .lock()
-                            .unwrap_or_else(|poisoned| poisoned.into_inner())
+                            .expect("test lock poisoned")
                             .push("first application started");
                         first_started_tx.send(()).expect("first start is observed");
                         release_first_rx
@@ -1626,7 +1596,7 @@ mod tests {
                             .expect("first application is released");
                         events
                             .lock()
-                            .unwrap_or_else(|poisoned| poisoned.into_inner())
+                            .expect("test lock poisoned")
                             .push("first application finished");
                         Ok(())
                     },
@@ -1651,7 +1621,7 @@ mod tests {
                         assert_eq!(proposed.limits.view_distance, 8);
                         events
                             .lock()
-                            .unwrap_or_else(|poisoned| poisoned.into_inner())
+                            .expect("test lock poisoned")
                             .push("second application");
                         Ok(())
                     },
@@ -1675,9 +1645,7 @@ mod tests {
             .expect("second observation applies");
 
         assert_eq!(
-            *events
-                .lock()
-                .unwrap_or_else(|poisoned| poisoned.into_inner()),
+            *events.lock().expect("test lock poisoned"),
             [
                 "first application started",
                 "first application finished",

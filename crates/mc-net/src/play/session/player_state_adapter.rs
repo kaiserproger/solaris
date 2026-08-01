@@ -1,7 +1,6 @@
 use std::time::Instant;
 
 use mc_protocol::packets::play::{EntityDataValue, GameMode};
-use tracing::warn;
 
 use crate::play::persistence::SpawnState;
 use crate::play::simulation::{PlayerStateEvent, SimulationAuthority, SimulationRequestError};
@@ -26,13 +25,8 @@ impl SessionRegistry {
             return Err(SimulationRequestError::InvalidCommand);
         };
         let wait_started = Instant::now();
-        let guard = player_state.lock().unwrap_or_else(|poisoned| {
-            warn!(
-                session_id = id,
-                "player persistence mutex was poisoned during state event; recovering state"
-            );
-            poisoned.into_inner()
-        });
+        let guard =
+            crate::lock_policy::lock_authoritative_mutex(&player_state, "play.player_persistence");
         let mut player_state = crate::lock_metrics::timed_guard(
             crate::lock_metrics::LockMetricKind::PlayerPersistence,
             "commit player state event persistence",

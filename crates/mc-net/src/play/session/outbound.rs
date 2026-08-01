@@ -13,6 +13,7 @@ use mc_world::light::ChunkLight;
 use tokio::sync::mpsc;
 use tracing::{debug, warn};
 
+use crate::lock_policy::lock_authoritative_mutex;
 use crate::play::PlayerPose;
 use crate::play::block_wire::BlockDelta;
 use crate::play::combat::{MeleeKnockback, PlayerDamageRequest};
@@ -419,10 +420,7 @@ enum OrderedCancelAction {
 fn lock_ordered_dispatch_state(
     state: &OrderedDispatchState,
 ) -> MutexGuard<'_, OrderedDispatchQueue> {
-    state.queue.lock().unwrap_or_else(|poisoned| {
-        warn!("ordered outbound queue was poisoned; recovering state");
-        poisoned.into_inner()
-    })
+    lock_authoritative_mutex(&state.queue, "play.ordered_outbound_queue")
 }
 
 #[derive(Debug, Clone)]
@@ -500,12 +498,7 @@ impl OutboundPressureMetrics {
     pub(super) fn lock_reliable_retry_queues(
         &self,
     ) -> MutexGuard<'_, HashMap<SessionId, ReliableRetryQueue>> {
-        self.reliable_retry_queues
-            .lock()
-            .unwrap_or_else(|poisoned| {
-                warn!("reliable retry queue map was poisoned; recovering state");
-                poisoned.into_inner()
-            })
+        lock_authoritative_mutex(&self.reliable_retry_queues, "play.reliable_retry_queues")
     }
 
     fn record_reliable_retry_in_flight(&self, current: u64) {

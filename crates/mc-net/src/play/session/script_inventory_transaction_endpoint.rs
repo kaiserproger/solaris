@@ -4,8 +4,8 @@ use std::time::Instant;
 use mc_data::item_components::ItemFactsTable;
 use mc_data::items::ItemRegistry;
 use mc_script::ScriptInventoryStorageTransaction;
-use tracing::warn;
 
+use crate::lock_policy::{lock_authoritative_mutex, resolve_authoritative_lock};
 use crate::play::script_inventory_transaction::{
     ScriptStoragePrepareOutcome, ScriptStorageTransactionPrepare, plan_script_inventory_transaction,
 };
@@ -68,13 +68,10 @@ impl ScriptInventoryTransactionGate {
     fn begin_compound(&self, player_id: u64) -> Option<ScriptInventoryTransactionGuard<'_>> {
         let mut state = self.lock("begin compound inventory transaction", Some(player_id));
         while state.active && state.pending_owner_transactions != 0 {
-            state = self.changed.wait(state).unwrap_or_else(|poisoned| {
-                warn!(
-                    player_id,
-                    "script transaction gate was poisoned while waiting; recovering state"
-                );
-                poisoned.into_inner()
-            });
+            state = resolve_authoritative_lock(
+                self.changed.wait(state),
+                "script.inventory_transaction_gate",
+            );
         }
         state
             .active
@@ -89,16 +86,10 @@ impl ScriptInventoryTransactionGate {
 
     fn lock(
         &self,
-        operation: &'static str,
-        player_id: Option<u64>,
+        _operation: &'static str,
+        _player_id: Option<u64>,
     ) -> MutexGuard<'_, ScriptInventoryTransactionGateState> {
-        self.state.lock().unwrap_or_else(|poisoned| {
-            warn!(
-                ?player_id,
-                operation, "script transaction gate was poisoned; recovering state"
-            );
-            poisoned.into_inner()
-        })
+        lock_authoritative_mutex(&self.state, "script.inventory_transaction_gate")
     }
 }
 
@@ -179,13 +170,7 @@ impl SessionRegistry {
         };
 
         let wait_started = Instant::now();
-        let guard = player_state.lock().unwrap_or_else(|poisoned| {
-            warn!(
-                player_id = transaction.player_id().value(),
-                "player persistence mutex was poisoned during script inventory transaction; recovering state"
-            );
-            poisoned.into_inner()
-        });
+        let guard = lock_authoritative_mutex(&player_state, "play.player_persistence");
         let mut player_state = crate::lock_metrics::timed_guard(
             crate::lock_metrics::LockMetricKind::PlayerPersistence,
             "commit script inventory transaction",
@@ -225,7 +210,7 @@ impl SessionRegistry {
         let probe = self
             .script_transaction_capture_probe
             .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .expect("test lock poisoned")
             .take();
         if let Some(probe) = probe {
             probe.reached.send(()).expect("capture probe receiver");

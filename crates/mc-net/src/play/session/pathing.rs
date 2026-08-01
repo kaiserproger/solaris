@@ -1,4 +1,5 @@
 use super::*;
+use crate::lock_policy::lock_authoritative_mutex;
 
 #[cfg(test)]
 #[path = "pathing_tests.rs"]
@@ -305,10 +306,11 @@ impl PathingProbe for LoadedChunkPathingProbe<'_> {
 
     fn direct_path_resolved(&self, entity_id: EntityId) {
         if self.terrain_pathing_entities.contains(&entity_id) {
-            self.resolved_direct_paths
-                .lock()
-                .unwrap_or_else(|poisoned| poisoned.into_inner())
-                .insert(entity_id);
+            lock_authoritative_mutex(
+                &self.resolved_direct_paths,
+                "play.pathing_resolved_direct_paths",
+            )
+            .insert(entity_id);
         }
     }
 }

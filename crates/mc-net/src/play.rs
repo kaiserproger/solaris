@@ -3820,14 +3820,10 @@ fn commit_session_owner_script_player_inventory(
     let items = Arc::clone(&state.items);
     let item_facts = Arc::clone(&state.item_facts);
     let player_persistence = Arc::clone(&state.player_persistence);
-    let mut persisted = player_persistence
-        .lock()
-        .unwrap_or_else(|poisoned| {
-            warn!(
-                "player persistence mutex was poisoned during session-owner script inventory commit; recovering state"
-            );
-            poisoned.into_inner()
-        });
+    let mut persisted = crate::lock_policy::lock_authoritative_mutex(
+        &player_persistence,
+        "play.player_persistence",
+    );
     apply_script_player_inventory_transaction(
         transaction,
         &mut state.inventory,
@@ -3844,10 +3840,10 @@ fn commit_session_owner_loader_item_grant(
     let items = Arc::clone(&state.items);
     let item_facts = Arc::clone(&state.item_facts);
     let player_persistence = Arc::clone(&state.player_persistence);
-    let mut persisted = player_persistence.lock().unwrap_or_else(|poisoned| {
-        warn!("player persistence mutex was poisoned during Loader item grant; recovering state");
-        poisoned.into_inner()
-    });
+    let mut persisted = crate::lock_policy::lock_authoritative_mutex(
+        &player_persistence,
+        "play.player_persistence",
+    );
     apply_loader_item_grant(
         stack,
         &mut state.inventory,
@@ -11866,10 +11862,10 @@ async fn settle_disconnected_cursor(
         return true;
     }
     let pose = {
-        let state = player_save_state.lock().unwrap_or_else(|poisoned| {
-            warn!("player persistence mutex was poisoned while settling cursor");
-            poisoned.into_inner()
-        });
+        let state = crate::lock_policy::lock_authoritative_mutex(
+            player_save_state,
+            "play.player_persistence",
+        );
         state.pose
     };
     match settle_player_inventory_returns(interaction, InventoryReturnPlan::cursor(pose)).await {
@@ -11886,10 +11882,10 @@ async fn settle_disconnected_inventory(
     player_save_state: &Arc<Mutex<PlayerPersistedState>>,
 ) -> bool {
     let (pose, owner_has_crafting_table_input, owner_enchanting_table_input, owner_merchant_input) = {
-        let state = player_save_state.lock().unwrap_or_else(|poisoned| {
-            warn!("player persistence mutex was poisoned while settling disconnect inventory");
-            poisoned.into_inner()
-        });
+        let state = crate::lock_policy::lock_authoritative_mutex(
+            player_save_state,
+            "play.player_persistence",
+        );
         (
             state.pose,
             state.crafting_table_input.is_some(),

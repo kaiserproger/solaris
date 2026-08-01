@@ -146,6 +146,14 @@ Unknown packet layout, unsupported registry version, non-finite numeric state,
 stale snapshot, duplicate UUID, malformed NBT и unknown persistence schema не
 угадываются. Они возвращают typed error до частичной мутации.
 
+Poisoned lock тоже не означает «можно взять `into_inner()` и продолжить».
+Authoritative session/player/owner/journal/admission/transaction/delivery state
+использует named fail-stop payload: task supervisor переводит его в uncertain
+runtime error, запускает drain/shutdown и запрещает clean final save. Только
+явно derivable cache/telemetry разрешено сбросить в `Default`, снять poison flag
+и увеличить benign-reset metric. Эти две политики живут в общих lock-policy
+модулях; production call sites не содержат собственных recovery closures.
+
 ### 3.8 Autoscale по измерениям
 
 Процесс один раз определяет доступную CPU capacity. Operator не раздает

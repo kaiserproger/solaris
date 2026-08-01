@@ -1,4 +1,5 @@
 use super::*;
+use crate::lock_policy::lock_authoritative_mutex;
 
 pub(super) struct SessionEntityOwners {
     _runtime: RegionalOwnerRuntime,
@@ -172,11 +173,10 @@ impl TrackedEntityDecisionJournal {
         decisions: &[mc_entity::RegionalCommitDecision],
         error: mc_entity::RegionalDecisionJournalError,
     ) {
-        let mut failures = self
-            .failures
-            .by_uuid
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let mut failures = lock_authoritative_mutex(
+            &self.failures.by_uuid,
+            "persistence.entity_journal_failures",
+        );
         for snapshot in decisions
             .iter()
             .flat_map(mc_entity::RegionalCommitDecision::upserts)
@@ -377,11 +377,10 @@ impl SessionEntityOwners {
         &self,
         uuids: impl IntoIterator<Item = uuid::Uuid>,
     ) -> Option<mc_entity::RegionalDecisionJournalError> {
-        let mut failures = self
-            .journal_failures
-            .by_uuid
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let mut failures = lock_authoritative_mutex(
+            &self.journal_failures.by_uuid,
+            "persistence.entity_journal_failures",
+        );
         let mut outcome = None;
         for uuid in uuids {
             if let Some(error) = failures.remove(&uuid) {

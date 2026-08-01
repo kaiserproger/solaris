@@ -6,6 +6,7 @@ use mc_data::block_light::BlockLightTable;
 use mc_protocol::packets::play::ItemStack;
 use tracing::warn;
 
+use crate::lock_policy::lock_authoritative_mutex;
 use crate::play::bucket_interactions::plan_bucket_replacement;
 use crate::play::campfire::CampfireCookingState;
 use crate::play::containers::{ChestView, chest_slot_stacks};
@@ -109,10 +110,7 @@ impl ChestTransaction {
             &player.updated_carried_item,
         );
         let container_wait_started = Instant::now();
-        let container_guard = self.containers.lock().unwrap_or_else(|poisoned| {
-            warn!("container registry mutex was poisoned during regional chest commit; recovering state");
-            poisoned.into_inner()
-        });
+        let container_guard = lock_authoritative_mutex(&self.containers, "play.container_registry");
         let mut containers = crate::lock_metrics::timed_guard(
             crate::lock_metrics::LockMetricKind::ContainerRegistry,
             "commit regional chest slots",
@@ -124,13 +122,7 @@ impl ChestTransaction {
             probe.enter(primary_position);
         }
         let player_wait_started = Instant::now();
-        let player_guard = self.player_state.lock().unwrap_or_else(|poisoned| {
-            warn!(
-                session_id = self.actor_session,
-                "player persistence mutex was poisoned during regional chest commit; recovering state"
-            );
-            poisoned.into_inner()
-        });
+        let player_guard = lock_authoritative_mutex(&self.player_state, "play.player_persistence");
         let mut player_state = crate::lock_metrics::timed_guard(
             crate::lock_metrics::LockMetricKind::PlayerPersistence,
             "commit regional chest player state",
@@ -218,10 +210,7 @@ impl FurnaceTransaction {
             player,
         } = request;
         let container_wait_started = Instant::now();
-        let container_guard = self.containers.lock().unwrap_or_else(|poisoned| {
-            warn!("container registry mutex was poisoned during regional furnace commit; recovering state");
-            poisoned.into_inner()
-        });
+        let container_guard = lock_authoritative_mutex(&self.containers, "play.container_registry");
         let mut containers = crate::lock_metrics::timed_guard(
             crate::lock_metrics::LockMetricKind::ContainerRegistry,
             "commit regional furnace slots",
@@ -229,13 +218,7 @@ impl FurnaceTransaction {
             container_guard,
         );
         let player_wait_started = Instant::now();
-        let player_guard = self.player_state.lock().unwrap_or_else(|poisoned| {
-            warn!(
-                session_id = self.actor_session,
-                "player persistence mutex was poisoned during regional furnace commit; recovering state"
-            );
-            poisoned.into_inner()
-        });
+        let player_guard = lock_authoritative_mutex(&self.player_state, "play.player_persistence");
         let mut player_state = crate::lock_metrics::timed_guard(
             crate::lock_metrics::LockMetricKind::PlayerPersistence,
             "commit regional furnace player state",
@@ -311,12 +294,7 @@ impl BucketUseTransaction {
         plan: &BucketUsePlan,
     ) -> Result<Option<CommittedBucketUse>, SimulationRequestError> {
         let wait_started = Instant::now();
-        let guard = self.player_state.lock().unwrap_or_else(|poisoned| {
-            warn!(
-                "player persistence mutex was poisoned during regional bucket use; recovering state"
-            );
-            poisoned.into_inner()
-        });
+        let guard = lock_authoritative_mutex(&self.player_state, "play.player_persistence");
         let mut player_state = crate::lock_metrics::timed_guard(
             crate::lock_metrics::LockMetricKind::PlayerPersistence,
             "commit regional bucket use",
@@ -371,12 +349,7 @@ impl CampfireUseTransaction {
         plan: &CampfireUsePlan,
     ) -> Result<Option<CommittedCampfireUse>, SimulationRequestError> {
         let wait_started = Instant::now();
-        let guard = self.player_state.lock().unwrap_or_else(|poisoned| {
-            warn!(
-                "player persistence mutex was poisoned during regional campfire use; recovering state"
-            );
-            poisoned.into_inner()
-        });
+        let guard = lock_authoritative_mutex(&self.player_state, "play.player_persistence");
         let mut player_state = crate::lock_metrics::timed_guard(
             crate::lock_metrics::LockMetricKind::PlayerPersistence,
             "commit regional campfire use",
@@ -387,10 +360,8 @@ impl CampfireUseTransaction {
             return Ok(None);
         }
 
-        let mut campfires = self.campfire_cooking.lock().unwrap_or_else(|poisoned| {
-            warn!("campfire cooking mutex was poisoned; recovering state");
-            poisoned.into_inner()
-        });
+        let mut campfires =
+            lock_authoritative_mutex(&self.campfire_cooking, "play.campfire_cooking");
         let authoritative = campfires.get(&plan.position).cloned().unwrap_or_default();
         if authoritative != plan.expected_cooking {
             return Ok(None);
@@ -439,10 +410,7 @@ impl SurvivalBreakTransaction {
         plan: &SurvivalBreakPlan,
     ) -> Result<Option<CommittedSurvivalBreak>, SimulationRequestError> {
         let wait_started = Instant::now();
-        let guard = self.player_state.lock().unwrap_or_else(|poisoned| {
-            warn!("player persistence mutex was poisoned during regional break; recovering state");
-            poisoned.into_inner()
-        });
+        let guard = lock_authoritative_mutex(&self.player_state, "play.player_persistence");
         let mut player_state = crate::lock_metrics::timed_guard(
             crate::lock_metrics::LockMetricKind::PlayerPersistence,
             "commit regional survival break",
@@ -510,12 +478,7 @@ impl SurvivalPlacementTransaction {
         plan: &SurvivalPlacementPlan,
     ) -> Result<Option<CommittedSurvivalPlacement>, SimulationRequestError> {
         let wait_started = Instant::now();
-        let guard = self.player_state.lock().unwrap_or_else(|poisoned| {
-            warn!(
-                "player persistence mutex was poisoned during regional placement; recovering state"
-            );
-            poisoned.into_inner()
-        });
+        let guard = lock_authoritative_mutex(&self.player_state, "play.player_persistence");
         let mut player_state = crate::lock_metrics::timed_guard(
             crate::lock_metrics::LockMetricKind::PlayerPersistence,
             "commit regional survival placement",

@@ -183,7 +183,7 @@ async fn compound_transaction_waits_for_earlier_session_owner_inventory_commit()
     *registry
         .script_transaction_capture_probe
         .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(EntityApplyReleaseProbe {
+        .expect("test lock poisoned") = Some(EntityApplyReleaseProbe {
         reached: captured,
         resume: resume_receiver,
     });

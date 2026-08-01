@@ -9,6 +9,8 @@ use mc_world::anvil::{chunk_from_nbt_with_items, chunk_to_payload_with_items_at_
 use mc_world::{BlockRegistry, Chunk, ChunkPos, ChunkSnapshot};
 use thiserror::Error;
 
+use crate::lock_policy::lock_authoritative_mutex;
+
 const SOLARIS_DIRECTORY: &str = "solaris";
 const JOURNAL_FILE: &str = "world-chunk-journal.bin";
 const JOURNAL_LOCK_FILE: &str = "world-chunk-journal.lock";
@@ -212,6 +214,12 @@ struct JournalShared {
     append_advanced: tokio::sync::Notify,
 }
 
+impl JournalShared {
+    fn lock_state(&self) -> std::sync::MutexGuard<'_, JournalState> {
+        lock_authoritative_mutex(&self.state, "persistence.world_chunk_journal")
+    }
+}
+
 struct JournalState {
     path: PathBuf,
     checkpoint_base: u64,
@@ -340,11 +348,7 @@ impl WorldChunkJournal {
         }
         let images = self.encode_images(current_tick, snapshots)?;
 
-        let mut state = self
-            .shared
-            .state
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let mut state = self.shared.lock_state();
         if state.poisoned {
             return Err(WorldChunkJournalError::PoisonedOutcomeUnknown);
         }
@@ -382,11 +386,7 @@ impl WorldChunkJournal {
         &self,
         count: usize,
     ) -> Result<Vec<u64>, WorldChunkJournalError> {
-        let mut state = self
-            .shared
-            .state
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let mut state = self.shared.lock_state();
         if state.poisoned {
             return Err(WorldChunkJournalError::PoisonedOutcomeUnknown);
         }
@@ -426,11 +426,7 @@ impl WorldChunkJournal {
             });
         }
 
-        let mut state = self
-            .shared
-            .state
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let mut state = self.shared.lock_state();
         if state.poisoned {
             return Err(WorldChunkJournalError::PoisonedOutcomeUnknown);
         }
@@ -471,11 +467,7 @@ impl WorldChunkJournal {
         loop {
             let advanced = self.shared.append_advanced.notified();
             {
-                let state = self
-                    .shared
-                    .state
-                    .lock()
-                    .unwrap_or_else(|poisoned| poisoned.into_inner());
+                let state = self.shared.lock_state();
                 if state.poisoned {
                     return Err(WorldChunkJournalError::PoisonedOutcomeUnknown);
                 }
@@ -518,9 +510,7 @@ impl WorldChunkJournal {
     #[must_use]
     pub(crate) fn watermark(&self) -> Option<u64> {
         self.shared
-            .state
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .lock_state()
             .pending
             .last()
             .map(WorldChunkDecision::id)
@@ -528,20 +518,11 @@ impl WorldChunkJournal {
 
     #[cfg(test)]
     pub(crate) fn pending_decisions_for_test(&self) -> Vec<WorldChunkDecision> {
-        self.shared
-            .state
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .pending
-            .clone()
+        self.shared.lock_state().pending.clone()
     }
 
     pub(crate) fn checkpoint_through(&self, watermark: u64) -> Result<(), WorldChunkJournalError> {
-        let mut state = self
-            .shared
-            .state
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let mut state = self.shared.lock_state();
         if state.poisoned {
             return Err(WorldChunkJournalError::PoisonedOutcomeUnknown);
         }

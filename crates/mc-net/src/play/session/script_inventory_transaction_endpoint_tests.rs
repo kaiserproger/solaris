@@ -63,7 +63,7 @@ fn unregister_after_transaction_capture_rejects_before_storage_commit() {
     *registry
         .script_transaction_capture_probe
         .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(EntityApplyReleaseProbe {
+        .expect("test lock poisoned") = Some(EntityApplyReleaseProbe {
         reached,
         resume: resume_receiver,
     });

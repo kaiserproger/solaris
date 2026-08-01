@@ -7,6 +7,10 @@ use std::thread::JoinHandle;
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
+use crate::lock_policy::{
+    lock_authoritative_mutex, read_authoritative_rwlock, read_benign_rwlock,
+    write_authoritative_rwlock, write_benign_rwlock,
+};
 use crate::{
     AnimalBreedingState, EntityDamage, EntityDamageRequest, EntityEffectRequest,
     EntityEffectResult, EntityGoalCheckpoint, EntityId, EntityItemStack, EntityKinematics,
@@ -867,9 +871,7 @@ impl RegionalPreparedGoalTick {
                         .into_iter()
                         .map(|(key, prepared)| (key, prepared.resolve(probe, budget)))
                         .collect::<Vec<_>>();
-                    resolved
-                        .lock()
-                        .unwrap_or_else(|poisoned| poisoned.into_inner())
+                    lock_authoritative_mutex(resolved, "regional.goal_parallel_results")
                         .extend(worker_results);
                 });
             }
@@ -878,14 +880,12 @@ impl RegionalPreparedGoalTick {
                 .chain(local)
                 .map(|(key, prepared)| (key, prepared.resolve(probe, budget)))
                 .collect::<Vec<_>>();
-            resolved
-                .lock()
-                .unwrap_or_else(|poisoned| poisoned.into_inner())
+            lock_authoritative_mutex(&resolved, "regional.goal_parallel_results")
                 .extend(local_results);
         });
         let resolved = resolved
             .into_inner()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .expect("regional goal parallel result lock poisoned")
             .into_iter()
             .collect::<BTreeMap<_, _>>();
 
@@ -1029,24 +1029,20 @@ impl RegionalOwnerCommitState {
 
     fn clear_recovered_commits(&self, phases: &[RegionPhase]) -> Result<(), RegionOwnerLaneError> {
         let identities = {
-            let journal_commits = self
-                .journal_commits
-                .lock()
-                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            let journal_commits = lock_authoritative_mutex(
+                &self.journal_commits,
+                "regional.journal_commit_identities",
+            );
             phases
                 .iter()
                 .filter_map(|phase| journal_commits.get(phase).copied())
                 .collect::<Vec<_>>()
         };
-        self.journal
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
+        lock_authoritative_mutex(&self.journal, "regional.decision_journal")
             .clear_commit_identities(&identities)
             .map_err(|_| RegionOwnerLaneError::Journal)?;
-        let mut journal_commits = self
-            .journal_commits
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let mut journal_commits =
+            lock_authoritative_mutex(&self.journal_commits, "regional.journal_commit_identities");
         for identity in identities {
             if journal_commits.get(&identity.0) == Some(&identity) {
                 journal_commits.remove(&identity.0);
@@ -1060,7 +1056,7 @@ impl RegionalOwnerCommitState {
         if let Some(hook) = self
             .save_barrier_phase_snapshot_hook
             .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .expect("save-barrier test hook lock poisoned")
             .take()
         {
             hook.entered
@@ -1070,9 +1066,7 @@ impl RegionalOwnerCommitState {
                 .recv()
                 .expect("save barrier phase snapshot release dropped");
         }
-        self.journal_commits
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
+        lock_authoritative_mutex(&self.journal_commits, "regional.journal_commit_identities")
             .iter()
             .filter_map(|(&phase, identity)| (identity.1 <= sequence_watermark).then_some(phase))
             .collect()
@@ -1082,13 +1076,9 @@ impl RegionalOwnerCommitState {
         &self,
         decision: &RegionalCommitDecision,
     ) -> Result<(), RegionalDecisionJournalError> {
-        self.journal
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
+        lock_authoritative_mutex(&self.journal, "regional.decision_journal")
             .record_commit(decision)?;
-        self.journal_commits
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
+        lock_authoritative_mutex(&self.journal_commits, "regional.journal_commit_identities")
             .insert(decision.phase(), decision.identity());
         Ok(())
     }
@@ -1102,7 +1092,7 @@ impl RegionalOwnerCommitState {
         *self
             .save_barrier_phase_snapshot_hook
             .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner()) =
+            .expect("save-barrier test hook lock poisoned") =
             Some(SaveBarrierPhaseSnapshotHook { entered, release });
     }
 }
@@ -1827,10 +1817,8 @@ impl RegionalOwnerHandle {
         self.commit_state.ensure_committed_state().ok()?;
         let _admission =
             DirectSelectedReadPermit::try_acquire(Arc::clone(&self.direct_selected_reads))?;
-        let routes = self
-            .selected_read_routes
-            .read()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let routes =
+            read_benign_rwlock(&self.selected_read_routes, "regional.selected_read_routes");
         let mut ordered = entities.iter().copied().collect::<Vec<_>>();
         ordered.sort_unstable();
         let mut expected = HashMap::with_capacity(ordered.len());
@@ -1860,7 +1848,7 @@ impl RegionalOwnerHandle {
         if let Some(probe) = self
             .selected_read_probe
             .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .expect("selected-read test probe lock poisoned")
             .take()
         {
             probe.entered.send(()).ok()?;
@@ -1915,7 +1903,7 @@ impl RegionalOwnerHandle {
         *self
             .selected_read_probe
             .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner()) =
+            .expect("regional owner test probe lock poisoned") =
             Some(SelectedReadProbe { entered, release });
     }
 
@@ -1924,7 +1912,7 @@ impl RegionalOwnerHandle {
         *self
             .referenced_goal_fallback_probe
             .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(entered);
+            .expect("regional owner test probe lock poisoned") = Some(entered);
     }
 
     #[cfg(test)]
@@ -1932,7 +1920,7 @@ impl RegionalOwnerHandle {
         if let Some(probe) = self
             .referenced_goal_fallback_probe
             .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .expect("regional owner test probe lock poisoned")
             .take()
         {
             let _ = probe.send(());
@@ -1944,7 +1932,7 @@ impl RegionalOwnerHandle {
         *self
             .direct_mutation_admission_probe
             .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(entered);
+            .expect("regional owner test probe lock poisoned") = Some(entered);
     }
 
     #[cfg(test)]
@@ -1952,7 +1940,7 @@ impl RegionalOwnerHandle {
         let Some(probe) = self
             .direct_mutation_admission_probe
             .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .expect("regional owner test probe lock poisoned")
             .take()
         else {
             return;
@@ -1973,7 +1961,7 @@ impl RegionalOwnerHandle {
         *self
             .actor_snapshot_probe
             .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner()) =
+            .expect("regional owner test probe lock poisoned") =
             Some(SelectedReadProbe { entered, release });
     }
 
@@ -1982,7 +1970,7 @@ impl RegionalOwnerHandle {
         *self
             .goal_prepare_probe
             .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(entered);
+            .expect("regional owner test probe lock poisoned") = Some(entered);
     }
 
     #[cfg(test)]
@@ -1990,7 +1978,7 @@ impl RegionalOwnerHandle {
         *self
             .goal_apply_topology_probe
             .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(entered);
+            .expect("regional owner test probe lock poisoned") = Some(entered);
     }
 
     #[cfg(test)]
@@ -2620,14 +2608,10 @@ impl RegionalOwnerHandle {
         {
             return None;
         }
-        let _mutation_gate = self
-            .mutation_gate
-            .read()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
-        let routes = self
-            .selected_read_routes
-            .read()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let _mutation_gate =
+            read_authoritative_rwlock(&self.mutation_gate, "regional.mutation_gate");
+        let routes =
+            read_benign_rwlock(&self.selected_read_routes, "regional.selected_read_routes");
         let mut owners = BTreeMap::new();
         for snapshot in selected.snapshots() {
             let route = routes.get(&snapshot.id)?;
@@ -2649,10 +2633,7 @@ impl RegionalOwnerHandle {
         let _lane_admissions = owners
             .values()
             .map(|owner| {
-                owner
-                    .admission()
-                    .lock()
-                    .unwrap_or_else(|poisoned| poisoned.into_inner())
+                lock_authoritative_mutex(owner.admission(), "regional.owner_lane_admission")
             })
             .collect::<Vec<_>>();
         if owners.iter().any(|(lane, owner)| {
@@ -2680,15 +2661,10 @@ impl RegionalOwnerHandle {
         if expected_mutations.is_empty() {
             return Some(Ok(Vec::new()));
         }
-        let _mutation_gate = (!mutation_gate_held).then(|| {
-            self.mutation_gate
-                .read()
-                .unwrap_or_else(|poisoned| poisoned.into_inner())
-        });
-        let cached = self
-            .selected_read_routes
-            .read()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let _mutation_gate = (!mutation_gate_held)
+            .then(|| read_authoritative_rwlock(&self.mutation_gate, "regional.mutation_gate"));
+        let cached =
+            read_benign_rwlock(&self.selected_read_routes, "regional.selected_read_routes");
         let mut routes = BTreeMap::new();
         let mut mutation_leases = Vec::with_capacity(expected_mutations.len());
         let mut selected_lane = None;
@@ -2732,10 +2708,7 @@ impl RegionalOwnerHandle {
             #[cfg(test)]
             self.notify_direct_mutation_admission_probe(&owner);
             let _lane_admission = (!lane_admission_held).then(|| {
-                owner
-                    .admission()
-                    .lock()
-                    .unwrap_or_else(|poisoned| poisoned.into_inner())
+                lock_authoritative_mutex(owner.admission(), "regional.owner_lane_admission")
             });
             let (first_sequence, sequence) = self
                 .commit_state
@@ -2799,12 +2772,11 @@ impl RegionalOwnerHandle {
                 }
             };
             let journal_enabled = journal_commit
-                && self
-                    .commit_state
-                    .journal
-                    .lock()
-                    .unwrap_or_else(|poisoned| poisoned.into_inner())
-                    .enabled();
+                && lock_authoritative_mutex(
+                    &self.commit_state.journal,
+                    "regional.decision_journal",
+                )
+                .enabled();
             if journal_enabled {
                 let decision = RegionalCommitDecision {
                     phase,
@@ -2816,11 +2788,11 @@ impl RegionalOwnerHandle {
                 let journal_result = self.commit_state.record_commit(&decision);
                 if let Err(error) = journal_result {
                     if error.outcome_unknown() {
-                        self.commit_state
-                            .journal_commits
-                            .lock()
-                            .unwrap_or_else(|poisoned| poisoned.into_inner())
-                            .insert(phase, decision.identity());
+                        lock_authoritative_mutex(
+                            &self.commit_state.journal_commits,
+                            "regional.journal_commit_identities",
+                        )
+                        .insert(phase, decision.identity());
                         self.commit_state
                             .outcome_unknown
                             .store(true, Ordering::Release);
@@ -3019,10 +2991,8 @@ impl RegionalOwnerHandle {
             return Err(RegionOwnerLaneError::InvalidMutation);
         }
 
-        let cached = self
-            .selected_read_routes
-            .read()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let cached =
+            read_benign_rwlock(&self.selected_read_routes, "regional.selected_read_routes");
         let mut groups = BTreeMap::<usize, Vec<(EntitySnapshot, EntityDamageRequest)>>::new();
         let mut routes_complete = true;
         for (expected, request) in requests {
@@ -3399,17 +3369,9 @@ fn run_regional_owner_runtime(
     while let Ok(command) = receiver.recv() {
         let topology_access = topology_access_for_command(&coordinator, &command);
         let _shared_topology = matches!(topology_access, RegionalOwnerTopologyAccess::Shared(_))
-            .then(|| {
-                mutation_gate
-                    .read()
-                    .unwrap_or_else(|poisoned| poisoned.into_inner())
-            });
+            .then(|| read_authoritative_rwlock(&mutation_gate, "regional.mutation_gate"));
         let _exclusive_topology = matches!(topology_access, RegionalOwnerTopologyAccess::Exclusive)
-            .then(|| {
-                mutation_gate
-                    .write()
-                    .unwrap_or_else(|poisoned| poisoned.into_inner())
-            });
+            .then(|| write_authoritative_rwlock(&mutation_gate, "regional.mutation_gate"));
         #[cfg(test)]
         if matches!(
             command,
@@ -3417,7 +3379,7 @@ fn run_regional_owner_runtime(
                 | RegionalOwnerCommand::ApplyPreparedGoalTickAndKinematics { .. }
         ) && let Some(probe) = goal_apply_topology_probe
             .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .expect("goal-apply topology test probe lock poisoned")
             .take()
         {
             let _ = probe.send(());
@@ -3427,10 +3389,7 @@ fn run_regional_owner_runtime(
                 readers
                     .iter()
                     .map(|owner| {
-                        owner
-                            .admission()
-                            .lock()
-                            .unwrap_or_else(|poisoned| poisoned.into_inner())
+                        lock_authoritative_mutex(owner.admission(), "regional.owner_lane_admission")
                     })
                     .collect::<Vec<_>>(),
             ),
@@ -3454,7 +3413,7 @@ fn run_regional_owner_runtime(
                 #[cfg(test)]
                 if let Some(probe) = actor_snapshot_probe
                     .lock()
-                    .unwrap_or_else(|poisoned| poisoned.into_inner())
+                    .expect("actor-snapshot test probe lock poisoned")
                     .take()
                 {
                     let _ = probe.entered.send(());
@@ -3532,9 +3491,7 @@ fn run_regional_owner_runtime(
             RegionalOwnerCommand::ReconfigureLanes { lane_count, reply } => {
                 let result = coordinator.reconfigure_lanes(lane_count);
                 if result.is_ok() {
-                    selected_read_routes
-                        .write()
-                        .unwrap_or_else(|poisoned| poisoned.into_inner())
+                    write_benign_rwlock(&selected_read_routes, "regional.selected_read_routes")
                         .clear();
                 }
                 let _ = reply.send(result);
@@ -3647,9 +3604,7 @@ fn run_regional_owner_runtime(
                     allow_type_change,
                 );
                 if matches!(&result, Ok(true)) {
-                    selected_read_routes
-                        .write()
-                        .unwrap_or_else(|poisoned| poisoned.into_inner())
+                    write_benign_rwlock(&selected_read_routes, "regional.selected_read_routes")
                         .clear();
                 }
                 let _ = reply.send(result);
@@ -3657,9 +3612,7 @@ fn run_regional_owner_runtime(
             RegionalOwnerCommand::ReplaceSnapshotsIfCurrent { snapshots, reply } => {
                 let result = coordinator.replace_snapshots_if_current(snapshots);
                 if matches!(&result, Ok(true)) {
-                    selected_read_routes
-                        .write()
-                        .unwrap_or_else(|poisoned| poisoned.into_inner())
+                    write_benign_rwlock(&selected_read_routes, "regional.selected_read_routes")
                         .clear();
                 }
                 let _ = reply.send(result);
@@ -3676,9 +3629,7 @@ fn run_regional_owner_runtime(
                     *consumed_expected,
                 );
                 if matches!(&result, Ok(true)) {
-                    selected_read_routes
-                        .write()
-                        .unwrap_or_else(|poisoned| poisoned.into_inner())
+                    write_benign_rwlock(&selected_read_routes, "regional.selected_read_routes")
                         .clear();
                 }
                 let _ = reply.send(result);
@@ -3686,9 +3637,7 @@ fn run_regional_owner_runtime(
             RegionalOwnerCommand::CommitVillagerBirthIfCurrent { commit, reply } => {
                 let result = coordinator.commit_villager_birth_if_current(*commit);
                 if matches!(&result, Ok(Some(_))) {
-                    selected_read_routes
-                        .write()
-                        .unwrap_or_else(|poisoned| poisoned.into_inner())
+                    write_benign_rwlock(&selected_read_routes, "regional.selected_read_routes")
                         .clear();
                 }
                 let _ = reply.send(result);
@@ -3696,9 +3645,7 @@ fn run_regional_owner_runtime(
             RegionalOwnerCommand::CommitVillagerInventoryPickupIfCurrent { commit, reply } => {
                 let result = coordinator.commit_villager_inventory_pickup_if_current(*commit);
                 if matches!(&result, Ok(true)) {
-                    selected_read_routes
-                        .write()
-                        .unwrap_or_else(|poisoned| poisoned.into_inner())
+                    write_benign_rwlock(&selected_read_routes, "regional.selected_read_routes")
                         .clear();
                 }
                 let _ = reply.send(result);
@@ -3706,9 +3653,7 @@ fn run_regional_owner_runtime(
             RegionalOwnerCommand::CommitVillagerFoodShareIfCurrent { commit, reply } => {
                 let result = coordinator.commit_villager_food_share_if_current(*commit);
                 if matches!(&result, Ok(Some(_))) {
-                    selected_read_routes
-                        .write()
-                        .unwrap_or_else(|poisoned| poisoned.into_inner())
+                    write_benign_rwlock(&selected_read_routes, "regional.selected_read_routes")
                         .clear();
                 }
                 let _ = reply.send(result);
@@ -3716,9 +3661,7 @@ fn run_regional_owner_runtime(
             RegionalOwnerCommand::CommitVillagerCourtshipIfCurrent { commit, reply } => {
                 let result = coordinator.commit_villager_courtship_if_current(*commit);
                 if matches!(&result, Ok(true)) {
-                    selected_read_routes
-                        .write()
-                        .unwrap_or_else(|poisoned| poisoned.into_inner())
+                    write_benign_rwlock(&selected_read_routes, "regional.selected_read_routes")
                         .clear();
                 }
                 let _ = reply.send(result);
@@ -3726,9 +3669,7 @@ fn run_regional_owner_runtime(
             RegionalOwnerCommand::CommitVillagerNoBedIfCurrent { commit, reply } => {
                 let result = coordinator.commit_villager_no_bed_if_current(*commit);
                 if matches!(&result, Ok(true)) {
-                    selected_read_routes
-                        .write()
-                        .unwrap_or_else(|poisoned| poisoned.into_inner())
+                    write_benign_rwlock(&selected_read_routes, "regional.selected_read_routes")
                         .clear();
                 }
                 let _ = reply.send(result);
@@ -3831,9 +3772,7 @@ fn run_regional_owner_runtime(
                     .is_ok_and(|committed| committed.len() == expected_count)
                     && crosses_region
                 {
-                    selected_read_routes
-                        .write()
-                        .unwrap_or_else(|poisoned| poisoned.into_inner())
+                    write_benign_rwlock(&selected_read_routes, "regional.selected_read_routes")
                         .clear();
                 }
                 let _ = reply.send(result);
@@ -3868,7 +3807,7 @@ fn run_regional_owner_runtime(
                 #[cfg(test)]
                 if let Some(probe) = goal_prepare_probe
                     .lock()
-                    .unwrap_or_else(|poisoned| poisoned.into_inner())
+                    .expect("goal-prepare test probe lock poisoned")
                     .take()
                 {
                     let _ = probe.send(());
@@ -4052,9 +3991,7 @@ fn publish_selected_read_routes(
         ));
     }
 
-    let mut routes = routes
-        .write()
-        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let mut routes = write_benign_rwlock(routes, "regional.selected_read_routes");
     for entity in requested {
         routes.remove(entity);
     }
@@ -4065,9 +4002,7 @@ fn invalidate_selected_read_routes(
     routes: &RwLock<HashMap<EntityId, CachedEntityReadRoute>>,
     entities: impl IntoIterator<Item = EntityId>,
 ) {
-    let mut routes = routes
-        .write()
-        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let mut routes = write_benign_rwlock(routes, "regional.selected_read_routes");
     for entity in entities {
         routes.remove(&entity);
     }
@@ -7600,11 +7535,7 @@ impl RegionalOwnerCoordinator {
         journal_commit: bool,
     ) -> Result<MutationExecution, RegionOwnerLaneError> {
         let journal_enabled = journal_commit
-            && self
-                .commit_state
-                .journal
-                .lock()
-                .unwrap_or_else(|poisoned| poisoned.into_inner())
+            && lock_authoritative_mutex(&self.commit_state.journal, "regional.decision_journal")
                 .enabled();
         let journal_entities = journal_enabled.then(|| journal_entities_by_lane(&mutations));
         let participants = mutations.keys().copied().collect::<BTreeSet<_>>();
@@ -7714,11 +7645,11 @@ impl RegionalOwnerCoordinator {
                         sequence_watermark,
                         self.commit_state.lifecycle_epoch(),
                     );
-                    self.commit_state
-                        .journal_commits
-                        .lock()
-                        .unwrap_or_else(|poisoned| poisoned.into_inner())
-                        .insert(phase, identity);
+                    lock_authoritative_mutex(
+                        &self.commit_state.journal_commits,
+                        "regional.journal_commit_identities",
+                    )
+                    .insert(phase, identity);
                     self.commit_state
                         .outcome_unknown
                         .store(true, Ordering::Release);
@@ -9420,26 +9351,25 @@ impl RegionalEntityAuthority {
                             for (key, store, states) in bucket {
                                 before_region(key);
                                 let accepted = apply_local_kinematics(store, states);
-                                applied
-                                    .lock()
-                                    .unwrap_or_else(|poisoned| poisoned.into_inner())
-                                    .extend(accepted);
+                                lock_authoritative_mutex(
+                                    applied,
+                                    "regional.kinematics_parallel_results",
+                                )
+                                .extend(accepted);
                             }
                         });
                     }
                     for (key, store, states) in local {
                         before_region(key);
                         let accepted = apply_local_kinematics(store, states);
-                        applied
-                            .lock()
-                            .unwrap_or_else(|poisoned| poisoned.into_inner())
+                        lock_authoritative_mutex(&applied, "regional.kinematics_parallel_results")
                             .extend(accepted);
                     }
                 });
             }
             let mut applied = applied
                 .into_inner()
-                .unwrap_or_else(|poisoned| poisoned.into_inner());
+                .expect("regional kinematics parallel result lock poisoned");
             applied.extend(apply_kinematics_in_phase(
                 regions,
                 phase,
@@ -9673,9 +9603,7 @@ impl RegionalEntityAuthority {
                         );
                     }
                     add_goal_tick_stats(
-                        &mut total
-                            .lock()
-                            .unwrap_or_else(|poisoned| poisoned.into_inner()),
+                        &mut lock_authoritative_mutex(total, "regional.goal_apply_parallel_stats"),
                         worker_total,
                     );
                 });
@@ -9689,15 +9617,13 @@ impl RegionalEntityAuthority {
                 );
             }
             add_goal_tick_stats(
-                &mut total
-                    .lock()
-                    .unwrap_or_else(|poisoned| poisoned.into_inner()),
+                &mut lock_authoritative_mutex(&total, "regional.goal_apply_parallel_stats"),
                 local_total,
             );
         });
         total
             .into_inner()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .expect("regional goal parallel stats lock poisoned")
     }
 
     pub fn visit_simulation_entities(&self, visitor: impl FnMut(EntityView<'_>)) {
@@ -11290,7 +11216,7 @@ mod tests {
                 entered_tx.send(key).expect("goal apply probe receiver");
                 release_rx
                     .lock()
-                    .unwrap_or_else(|poisoned| poisoned.into_inner())
+                    .expect("regional test lock poisoned")
                     .recv()
                     .expect("goal apply probe release");
             })
@@ -11329,7 +11255,7 @@ mod tests {
                 entered_tx.send(key).expect("kinematics probe receiver");
                 release_rx
                     .lock()
-                    .unwrap_or_else(|poisoned| poisoned.into_inner())
+                    .expect("regional test lock poisoned")
                     .recv()
                     .expect("kinematics probe release");
             })
@@ -14305,7 +14231,7 @@ mod tests {
             let routes = handle
                 .selected_read_routes
                 .read()
-                .unwrap_or_else(|poisoned| poisoned.into_inner());
+                .expect("regional test lock poisoned");
             assert_eq!(routes[&target].lease.lane, routes[&follower].lease.lane);
             assert_ne!(routes[&target].lease.lane, routes[&unrelated].lease.lane);
         }
@@ -14411,7 +14337,7 @@ mod tests {
             *handle
                 .selected_read_probe
                 .lock()
-                .unwrap_or_else(|poisoned| poisoned.into_inner()) = None;
+                .expect("regional test lock poisoned") = None;
             let result = mutation.join().expect("join missing direct read");
             panic!("follow-target selected read was not dispatched: {error}; result: {result:?}");
         }
@@ -15382,7 +15308,7 @@ mod tests {
             let routes = handle
                 .selected_read_routes
                 .read()
-                .unwrap_or_else(|poisoned| poisoned.into_inner());
+                .expect("regional test lock poisoned");
             assert_ne!(routes[&west].lease.lane, routes[&east].lease.lane);
         }
 
@@ -15468,7 +15394,7 @@ mod tests {
             let mut routes = handle
                 .selected_read_routes
                 .write()
-                .unwrap_or_else(|poisoned| poisoned.into_inner());
+                .expect("regional test lock poisoned");
             assert_ne!(routes[&west].lease.lane, routes[&east].lease.lane);
             routes.remove(&west);
         }
@@ -15553,7 +15479,7 @@ mod tests {
             let routes = handle
                 .selected_read_routes
                 .read()
-                .unwrap_or_else(|poisoned| poisoned.into_inner());
+                .expect("regional test lock poisoned");
             assert_ne!(routes[&west].lease.lane, routes[&east].lease.lane);
             (routes[&west].owner.clone(), routes[&east].owner.clone())
         };
@@ -15699,7 +15625,7 @@ mod tests {
             let routes = handle
                 .selected_read_routes
                 .read()
-                .unwrap_or_else(|poisoned| poisoned.into_inner());
+                .expect("regional test lock poisoned");
             assert_ne!(routes[&west].lease.lane, routes[&east].lease.lane);
             routes[&west].owner.clone()
         };
@@ -15711,7 +15637,7 @@ mod tests {
         let west_admission = west_owner
             .admission()
             .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
+            .expect("regional test lock poisoned");
         let (apply_entered, apply_entered_rx) = mpsc::channel();
         handle.notify_goal_apply_topology_for_test(apply_entered);
         let (apply_complete, apply_complete_rx) = mpsc::channel();
@@ -17361,7 +17287,7 @@ mod tests {
                     handle
                         .selected_read_routes
                         .write()
-                        .unwrap_or_else(|poisoned| poisoned.into_inner())
+                        .expect("benchmark route cache lock poisoned")
                         .clear();
                 }
                 let started = Instant::now();
@@ -17421,7 +17347,7 @@ mod tests {
                     handle
                         .selected_read_routes
                         .write()
-                        .unwrap_or_else(|poisoned| poisoned.into_inner())
+                        .expect("benchmark route cache lock poisoned")
                         .clear();
                 }
                 let barrier = Arc::new(std::sync::Barrier::new(3));

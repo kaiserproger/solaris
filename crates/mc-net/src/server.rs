@@ -201,6 +201,34 @@ fn is_entity_owner_serve_error(error: &std::io::Error) -> bool {
         .is_some_and(|inner| inner.is::<EntityOwnerServeError>())
 }
 
+#[derive(Debug)]
+struct PoisonedRuntimeServeError {
+    lock: &'static str,
+}
+
+impl std::fmt::Display for PoisonedRuntimeServeError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            formatter,
+            "authoritative runtime lock poisoned: {}",
+            self.lock
+        )
+    }
+}
+
+impl std::error::Error for PoisonedRuntimeServeError {}
+
+fn poisoned_runtime_serve_error(lock: &'static str) -> std::io::Error {
+    std::io::Error::other(PoisonedRuntimeServeError { lock })
+}
+
+fn is_uncertain_runtime_serve_error(error: &std::io::Error) -> bool {
+    is_entity_owner_serve_error(error)
+        || error
+            .get_ref()
+            .is_some_and(|inner| inner.is::<PoisonedRuntimeServeError>())
+}
+
 #[derive(Clone, Default)]
 pub struct ShutdownHandle {
     requested: Arc<AtomicBool>,
@@ -3180,6 +3208,14 @@ fn runtime_task_join_error(task: &'static str, error: tokio::task::JoinError) ->
         if let Some(owner_error) = play::entity_owner_fatal_from_panic(payload.as_ref()) {
             return entity_owner_serve_error(owner_error);
         }
+        if let Some(lock) = mc_entity::authoritative_lock_poison_from_panic(payload.as_ref()) {
+            return poisoned_runtime_serve_error(lock);
+        }
+        if let Some(lock) =
+            crate::lock_policy::authoritative_lock_poison_from_panic(payload.as_ref())
+        {
+            return poisoned_runtime_serve_error(lock);
+        }
         return std::io::Error::other(format!("{task} task panicked"));
     }
     std::io::Error::other(format!("{task} task join failed: {error}"))
@@ -3337,11 +3373,15 @@ async fn drain_periodic_save_worker(
     let Some(worker) = worker else {
         return Ok(());
     };
-    worker
-        .drain()
-        .await
-        .into_result()
-        .map_err(|error| std::io::Error::other(format!("periodic save worker: {error}")))
+    match worker.drain().await {
+        crate::dirty_flush::DirtyFlushDrainOutcome::Complete => Ok(()),
+        crate::dirty_flush::DirtyFlushDrainOutcome::Failed(
+            crate::dirty_flush::DirtyFlushDrainError::WorkerJoin(error),
+        ) => Err(runtime_task_join_error("periodic save", error)),
+        crate::dirty_flush::DirtyFlushDrainOutcome::Failed(error) => Err(std::io::Error::other(
+            format!("periodic save worker: {error}"),
+        )),
+    }
 }
 
 async fn drain_connections(connections: &mut tokio::task::JoinSet<()>) -> std::io::Result<()> {
@@ -3369,7 +3409,7 @@ async fn drain_connections_with_timeout(
             Ok(Some(Err(error))) => {
                 warn!(%error, "connection task join failed");
                 let error = connection_task_join_error(error);
-                if is_entity_owner_serve_error(&error) || join_error.is_none() {
+                if is_uncertain_runtime_serve_error(&error) || join_error.is_none() {
                     join_error = Some(error);
                 }
             }
@@ -3407,7 +3447,7 @@ async fn cancel_connection_tasks(
             Err(error) => {
                 warn!(%error, "connection task failed while being cancelled");
                 let error = connection_task_join_error(error);
-                if is_entity_owner_serve_error(&error) || failure.is_none() {
+                if is_uncertain_runtime_serve_error(&error) || failure.is_none() {
                     failure = Some(error);
                 }
             }
@@ -4734,11 +4774,8 @@ fn cached_material_ids(config: &ServerConfig) -> Arc<BlockMaterialIds> {
         Arc::as_ptr(&config.block_facts) as usize,
     );
     let cache_lock = PHYSICS_MATERIAL_CACHE.get_or_init(|| std::sync::Mutex::new(HashMap::new()));
-    let mut cache = cache_lock.lock().unwrap_or_else(|poisoned| {
-        warn!("physics material cache mutex was poisoned; recovering state");
-        cache_lock.clear_poison();
-        poisoned.into_inner()
-    });
+    let mut cache =
+        crate::lock_policy::lock_benign_mutex(cache_lock, "server.physics_material_cache");
     if let Some((blocks, facts, materials)) = cache.get(&key)
         && blocks
             .upgrade()
@@ -5688,7 +5725,7 @@ where
 {
     let serve_error = match serve_result {
         Ok(()) => None,
-        Err(error) if is_entity_owner_serve_error(&error) => return Err(error),
+        Err(error) if is_uncertain_runtime_serve_error(&error) => return Err(error),
         Err(error) => Some(error),
     };
     let report = save.await;
@@ -8135,6 +8172,52 @@ end
     }
 
     #[tokio::test]
+    async fn authoritative_runtime_poison_is_terminal_and_skips_clean_final_save() {
+        let lock = Arc::new(std::sync::Mutex::new(()));
+        let poisoned = Arc::clone(&lock);
+        let _ = std::thread::spawn(move || {
+            let _guard = poisoned.lock().unwrap();
+            panic!("inject authoritative runtime poison");
+        })
+        .join();
+        let before = crate::runtime_lock_poison_metrics_snapshot().authoritative_poison;
+        let task_lock = Arc::clone(&lock);
+        let join = tokio::spawn(async move {
+            drop(crate::lock_policy::lock_authoritative_mutex(
+                &task_lock,
+                "test.runtime_authority",
+            ));
+        })
+        .await
+        .expect_err("poisoned runtime authority must unwind its task");
+        let primary = runtime_task_join_error("connection", join);
+
+        assert!(is_uncertain_runtime_serve_error(&primary));
+        assert!(primary.to_string().contains("test.runtime_authority"));
+        assert!(crate::runtime_lock_poison_metrics_snapshot().authoritative_poison > before);
+
+        let save_called = Arc::new(AtomicBool::new(false));
+        let save_called_by_future = Arc::clone(&save_called);
+        let save = async move {
+            save_called_by_future.store(true, Ordering::SeqCst);
+            SaveAllReport {
+                players_saved: 0,
+                entities_saved: 0,
+                chunks_flushed: 0,
+                world_metadata_saved: false,
+                timings: SaveAllTimings::default(),
+                errors: Vec::new(),
+            }
+        };
+        let error = finish_serve_with_final_save(Err(primary), save)
+            .await
+            .expect_err("poisoned runtime state must remain terminal");
+
+        assert!(!save_called.load(Ordering::SeqCst));
+        assert!(is_uncertain_runtime_serve_error(&error));
+    }
+
+    #[tokio::test]
     async fn unrelated_command_task_panic_is_a_terminal_drain_error() {
         let result = tokio::spawn(async {
             panic!("injected command task failure");
@@ -8200,7 +8283,8 @@ end
             .expect_err("periodic worker failure propagates");
 
         assert_eq!(error.kind(), ErrorKind::Other);
-        assert!(error.to_string().contains("periodic save worker"));
+        assert!(!is_uncertain_runtime_serve_error(&error));
+        assert_eq!(error.to_string(), "periodic save task panicked");
     }
 
     #[tokio::test]

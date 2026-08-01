@@ -4,6 +4,8 @@ use std::sync::{Arc, Mutex};
 
 use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 
+use crate::lock_policy::lock_authoritative_mutex;
+
 #[derive(Clone)]
 pub(crate) struct PreAuthAdmission {
     permits: Arc<Semaphore>,
@@ -29,10 +31,7 @@ impl PreAuthAdmission {
 
     pub(crate) fn try_acquire(&self, ip: IpAddr) -> Option<PreAuthPermit> {
         let permit = Arc::clone(&self.permits).try_acquire_owned().ok()?;
-        let mut by_ip = self
-            .by_ip
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let mut by_ip = lock_authoritative_mutex(&self.by_ip, "network.pre_auth_by_ip");
         let current = by_ip.get(&ip).copied().unwrap_or(0);
         if current >= self.per_ip_limit {
             return None;
@@ -55,10 +54,7 @@ pub(crate) struct PreAuthPermit {
 
 impl Drop for PreAuthPermit {
     fn drop(&mut self) {
-        let mut by_ip = self
-            .by_ip
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let mut by_ip = lock_authoritative_mutex(&self.by_ip, "network.pre_auth_by_ip");
         match by_ip.get_mut(&self.ip) {
             Some(count) if *count > 1 => *count -= 1,
             Some(_) => {

@@ -57,10 +57,7 @@ fn player_death_inventory_xp_policy_is_atomic_and_idempotent() {
         let persisted = Arc::new(Mutex::new(persisted));
         registry.register_player_persistence(session, Arc::clone(&persisted));
 
-        let before = persisted
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .clone();
+        let before = persisted.lock().expect("test lock poisoned").clone();
         let mut dead = before.survival;
         dead.apply_damage(SurvivalState::MAX_HEALTH);
         let plan = PlayerSurvivalPlan {
@@ -86,10 +83,7 @@ fn player_death_inventory_xp_policy_is_atomic_and_idempotent() {
             panic!("fresh death policy commit must apply")
         };
         assert!(first.died, "{game_mode:?} keep={keep_inventory}");
-        let after = persisted
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .clone();
+        let after = persisted.lock().expect("test lock poisoned").clone();
         let records = registry.persisted_entity_records();
 
         if expect_drops {
@@ -207,10 +201,7 @@ fn stale_keep_inventory_death_plan_rejects_without_side_effects() {
     };
     let persisted = Arc::new(Mutex::new(state));
     registry.register_player_persistence(session, Arc::clone(&persisted));
-    let before = persisted
-        .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner())
-        .clone();
+    let before = persisted.lock().expect("test lock poisoned").clone();
     let mut dead = before.survival;
     dead.apply_damage(SurvivalState::MAX_HEALTH);
 
@@ -237,10 +228,7 @@ fn stale_keep_inventory_death_plan_rejects_without_side_effects() {
         .expect("registered stale death plan");
 
     assert!(matches!(outcome, PlayerSurvivalCommitOutcome::Rejected(_)));
-    let after = persisted
-        .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner())
-        .clone();
+    let after = persisted.lock().expect("test lock poisoned").clone();
     assert_eq!(after.survival, before.survival);
     assert_eq!(after.inventory.slots, before.inventory.slots);
     assert_eq!(after.carried_item, before.carried_item);

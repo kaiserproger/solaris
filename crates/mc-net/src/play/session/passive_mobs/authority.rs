@@ -23,7 +23,6 @@ use std::collections::{HashMap, HashSet};
 #[cfg(test)]
 use std::sync::atomic::Ordering;
 use std::time::Instant;
-use tracing::warn;
 
 impl SessionRegistry {
     #[cfg(test)]
@@ -51,13 +50,8 @@ impl SessionRegistry {
         let player_pose = inner.sessions.get(&actor_session)?.pose;
         let player_state = inner.player_persistence.get(&actor_session)?.clone();
         let wait_started = Instant::now();
-        let guard = player_state.lock().unwrap_or_else(|poisoned| {
-            warn!(
-                session_id = actor_session,
-                "player persistence mutex was poisoned during animal feed; recovering state"
-            );
-            poisoned.into_inner()
-        });
+        let guard =
+            crate::lock_policy::lock_authoritative_mutex(&player_state, "play.player_persistence");
         let mut player_state = crate::lock_metrics::timed_guard(
             crate::lock_metrics::LockMetricKind::PlayerPersistence,
             "commit animal feed",
@@ -133,13 +127,8 @@ impl SessionRegistry {
         let player_pose = inner.sessions.get(&actor_session)?.pose;
         let player_state = inner.player_persistence.get(&actor_session)?.clone();
         let wait_started = Instant::now();
-        let guard = player_state.lock().unwrap_or_else(|poisoned| {
-            warn!(
-                session_id = actor_session,
-                "player persistence mutex was poisoned during sheep shear; recovering state"
-            );
-            poisoned.into_inner()
-        });
+        let guard =
+            crate::lock_policy::lock_authoritative_mutex(&player_state, "play.player_persistence");
         let mut player_state = crate::lock_metrics::timed_guard(
             crate::lock_metrics::LockMetricKind::PlayerPersistence,
             "commit sheep shear",

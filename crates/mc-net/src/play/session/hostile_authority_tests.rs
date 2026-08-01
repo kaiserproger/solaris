@@ -60,7 +60,7 @@ fn install_hostile_target_snapshot_probe(
     *registry
         .hostile_target_snapshot_probe
         .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(HostileCommitProbe {
+        .expect("test lock poisoned") = Some(HostileCommitProbe {
         reached: reached_tx,
         resume: resume_rx,
     });
@@ -388,7 +388,7 @@ fn attacker_death_between_melee_plan_and_commit_cancels_damage_and_swing() {
     *registry
         .hostile_commit_probe
         .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(HostileCommitProbe {
+        .expect("test lock poisoned") = Some(HostileCommitProbe {
         reached: reached_tx,
         resume: resume_rx,
     });
@@ -443,7 +443,7 @@ fn hostile_melee_publication_finishes_while_session_registry_is_held_elsewhere()
     *registry
         .hostile_publication_probe
         .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(HostileCommitProbe {
+        .expect("test lock poisoned") = Some(HostileCommitProbe {
         reached: reached_tx,
         resume: resume_rx,
     });

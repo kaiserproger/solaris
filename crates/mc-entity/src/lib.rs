@@ -19,6 +19,7 @@ pub mod effects_26_1_2;
 mod entity_scale_26_1_2;
 pub mod equipment_26_1_2;
 pub mod living_26_1_2;
+mod lock_policy;
 pub mod mob_control_26_1_2;
 pub mod natural_spawn_26_1_2;
 pub mod navigation_26_1_2;
@@ -42,6 +43,9 @@ mod entity_scale_26_1_2_tests;
 mod natural_spawn_26_1_2_tests;
 
 pub use entity_scale_26_1_2::{EntityScale26_1_2, EntityScaleError};
+pub use lock_policy::{
+    LockPoisonMetricsSnapshot, authoritative_lock_poison_from_panic, lock_poison_metrics_snapshot,
+};
 pub use regional::VillagerBindingClaim;
 pub use regional::{
     ItemPickupClaimResolution, REGION_SIZE_CHUNKS, RegionEntityStoreError, RegionEpoch, RegionKey,

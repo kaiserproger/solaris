@@ -67,10 +67,7 @@ fn owner_accepts_only_reachable_live_entity_interactions() {
         GameMode::Survival,
     ));
     assert_eq!(
-        persisted
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .game_mode,
+        persisted.lock().expect("test lock poisoned").game_mode,
         GameMode::Survival
     );
 
@@ -116,10 +113,7 @@ fn owner_accepts_only_reachable_live_entity_interactions() {
             .is_none()
     );
 
-    persisted
-        .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner())
-        .game_mode = GameMode::Spectator;
+    persisted.lock().expect("test lock poisoned").game_mode = GameMode::Spectator;
     assert!(
         registry
             .accept_script_entity_interaction(player, reachable)
@@ -127,10 +121,7 @@ fn owner_accepts_only_reachable_live_entity_interactions() {
     );
 
     for game_mode in [GameMode::Creative, GameMode::Adventure] {
-        persisted
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .game_mode = game_mode;
+        persisted.lock().expect("test lock poisoned").game_mode = game_mode;
         assert_eq!(
             registry
                 .accept_script_entity_interaction(player, reachable)
@@ -140,9 +131,7 @@ fn owner_accepts_only_reachable_live_entity_interactions() {
         );
     }
 
-    let mut state = persisted
-        .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let mut state = persisted.lock().expect("test lock poisoned");
     state.game_mode = GameMode::Survival;
     state.survival.health = 0.0;
     drop(state);

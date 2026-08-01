@@ -11,6 +11,7 @@ use super::{
     order_vehicle_group_for_removal, snapshot_vehicle_reference,
 };
 
+use crate::lock_policy::lock_authoritative_mutex;
 use crate::{
     AnimalBreedingState, EntityDamageRequest, EntityEffectRequest, EntityEffectResult,
     EntityGoalCheckpoint, EntityId, EntityItemStack, EntityKinematics, EntitySimulationProjection,
@@ -593,11 +594,10 @@ impl RegionalOwnerLane {
         let worker = match std::thread::Builder::new()
             .name(format!("solaris-region-owner-{lane}"))
             .spawn(move || {
-                let owned = worker_handoff
-                    .lock()
-                    .unwrap_or_else(|poisoned| poisoned.into_inner())
-                    .take()
-                    .expect("owner lane startup handoff remains available");
+                let owned =
+                    lock_authoritative_mutex(&worker_handoff, "regional.owner_lane_start_handoff")
+                        .take()
+                        .expect("owner lane startup handoff remains available");
                 let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                     run_region_owner_lane(
                         lane,
@@ -618,9 +618,7 @@ impl RegionalOwnerLane {
             }) {
             Ok(worker) => worker,
             Err(_) => {
-                let owned = handoff
-                    .lock()
-                    .unwrap_or_else(|poisoned| poisoned.into_inner())
+                let owned = lock_authoritative_mutex(&handoff, "regional.owner_lane_start_handoff")
                     .take()
                     .expect("failed spawn keeps owner stores in handoff");
                 return Err(RegionOwnerLaneStartError {
@@ -878,10 +876,7 @@ impl RegionalOwnerLane {
         #[cfg(test)]
         self.goal_checkpoint_batch_requests
             .fetch_add(1, Ordering::Relaxed);
-        let _admission = self
-            .admission
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let _admission = lock_authoritative_mutex(&self.admission, "regional.owner_lane_admission");
         self.reader().request_goal_checkpoints_for_ids(entities)
     }
 
@@ -961,10 +956,7 @@ impl RegionalOwnerLane {
         active_ids: HashSet<EntityId>,
     ) -> Result<Receiver<Result<PreparedGoalTick, RegionOwnerLaneError>>, RegionOwnerLaneError>
     {
-        let _admission = self
-            .admission
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let _admission = lock_authoritative_mutex(&self.admission, "regional.owner_lane_admission");
         self.request_goal_tick(lease, tick, active_ids)
     }
 

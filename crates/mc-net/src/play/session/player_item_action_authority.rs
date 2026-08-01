@@ -3,7 +3,6 @@ use std::time::Instant;
 use mc_data::block_light::BlockLightTable;
 use mc_entity::{EntityItemStack, Vec3};
 use mc_protocol::packets::play::{GameMode, ItemStack};
-use tracing::warn;
 
 use crate::play::BlockEdit;
 use crate::play::block_edit_commit::apply_block_edit_batch_to_storage_conditionally;
@@ -34,13 +33,8 @@ impl SessionRegistry {
         let Some(player_state) = inner.player_persistence.get(&actor_session).cloned() else {
             return Ok(None);
         };
-        let mut player_state = player_state.lock().unwrap_or_else(|poisoned| {
-            warn!(
-                session_id = actor_session,
-                "TNT player state poisoned; recovering"
-            );
-            poisoned.into_inner()
-        });
+        let mut player_state =
+            crate::lock_policy::lock_authoritative_mutex(&player_state, "play.player_persistence");
         if player_state.game_mode != plan.game_mode
             || !matches!(plan.game_mode, GameMode::Creative | GameMode::Survival)
         {
@@ -122,13 +116,8 @@ impl SessionRegistry {
         }
         let player_state = inner.player_persistence.get(&actor_session)?.clone();
         let wait_started = Instant::now();
-        let guard = player_state.lock().unwrap_or_else(|poisoned| {
-            warn!(
-                session_id = actor_session,
-                "player persistence mutex was poisoned during food use; recovering state"
-            );
-            poisoned.into_inner()
-        });
+        let guard =
+            crate::lock_policy::lock_authoritative_mutex(&player_state, "play.player_persistence");
         let mut player_state = crate::lock_metrics::timed_guard(
             crate::lock_metrics::LockMetricKind::PlayerPersistence,
             "commit food use",
@@ -179,13 +168,8 @@ impl SessionRegistry {
         }
         let player_state = inner.player_persistence.get(&actor_session)?.clone();
         let wait_started = Instant::now();
-        let guard = player_state.lock().unwrap_or_else(|poisoned| {
-            warn!(
-                session_id = actor_session,
-                "player persistence mutex was poisoned during bow release; recovering state"
-            );
-            poisoned.into_inner()
-        });
+        let guard =
+            crate::lock_policy::lock_authoritative_mutex(&player_state, "play.player_persistence");
         let mut player_state = crate::lock_metrics::timed_guard(
             crate::lock_metrics::LockMetricKind::PlayerPersistence,
             "commit bow release",
@@ -249,13 +233,8 @@ impl SessionRegistry {
         }
         let player_state = inner.player_persistence.get(&actor_session)?.clone();
         let wait_started = Instant::now();
-        let guard = player_state.lock().unwrap_or_else(|poisoned| {
-            warn!(
-                session_id = actor_session,
-                "player persistence mutex was poisoned during selected item drop; recovering state"
-            );
-            poisoned.into_inner()
-        });
+        let guard =
+            crate::lock_policy::lock_authoritative_mutex(&player_state, "play.player_persistence");
         let mut player_state = crate::lock_metrics::timed_guard(
             crate::lock_metrics::LockMetricKind::PlayerPersistence,
             "commit selected item drop",

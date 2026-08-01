@@ -1,4 +1,5 @@
 use super::*;
+use crate::lock_policy::lock_authoritative_mutex;
 use crate::play::beds::next_morning_time;
 use std::sync::atomic::{AtomicU64, Ordering};
 
@@ -400,9 +401,8 @@ impl SessionRegistry {
                     state.wake.as_mut().expect("validated staged wake").claimed = false;
                     return None;
                 };
-                let mut player_state = player_state
-                    .lock()
-                    .unwrap_or_else(|poisoned| poisoned.into_inner());
+                let mut player_state =
+                    lock_authoritative_mutex(&player_state, "play.player_persistence");
                 state.wake = None;
                 if player_state.game_mode == GameMode::Spectator {
                     player_state.game_mode = previous;
@@ -439,10 +439,7 @@ impl SessionRegistry {
                     .player_persistence
                     .get(&token.session_id)
                     .is_some_and(|player_state| {
-                        player_state
-                            .lock()
-                            .unwrap_or_else(|poisoned| poisoned.into_inner())
-                            .game_mode
+                        lock_authoritative_mutex(player_state, "play.player_persistence").game_mode
                             == GameMode::Spectator
                     });
             if spectator_commit_is_current {

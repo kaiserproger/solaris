@@ -54,8 +54,7 @@ impl SessionRegistry {
         *self
             .chunk_herd_claim_probe
             .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner()) =
-            Some(ChunkHerdClaimProbe { reached, resume });
+            .expect("test lock poisoned") = Some(ChunkHerdClaimProbe { reached, resume });
     }
 
     #[cfg(test)]
@@ -63,7 +62,7 @@ impl SessionRegistry {
         let probe = self
             .chunk_herd_claim_probe
             .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .expect("test lock poisoned")
             .take();
         if let Some(probe) = probe {
             probe

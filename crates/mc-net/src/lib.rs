@@ -27,6 +27,7 @@ pub mod encryption;
 mod error;
 mod loader;
 mod lock_metrics;
+mod lock_policy;
 mod login;
 mod memory_pressure;
 mod play;
@@ -63,6 +64,7 @@ pub use loader::{
 #[cfg(feature = "load-bench")]
 pub use lock_metrics::reset_lock_pressure_metrics;
 pub use lock_metrics::{LockMetricSnapshot, LockMetricsSnapshot, lock_pressure_snapshot};
+pub use lock_policy::{RuntimeLockPoisonMetricsSnapshot, runtime_lock_poison_metrics_snapshot};
 pub use login::{LoginAccessConfig, offline_uuid};
 pub use play::{
     DEFAULT_VIEW_DISTANCE, EntityEffectHandle, EntityEffectRequestError, ITEM_DESPAWN_AGE_TICKS,

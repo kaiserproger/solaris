@@ -13,6 +13,7 @@ use super::{
     spawn_item_drop_locked, spawn_xp_orb_locked, visibility_dispatches,
     visible_entity_observers_locked,
 };
+use crate::lock_policy::lock_authoritative_mutex;
 use crate::play::simulation::{PlayerSurvivalPlan, SimulationAuthority};
 use crate::play::{GameMode, PlayerPose};
 use mc_entity::{
@@ -204,9 +205,7 @@ impl SessionRegistry {
             attacker.zip(attacker_persistence.as_ref())
         {
             let wait_started = Instant::now();
-            let state = state
-                .lock()
-                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            let state = lock_authoritative_mutex(state, "play.player_persistence");
             let state = crate::lock_metrics::timed_guard(
                 crate::lock_metrics::LockMetricKind::PlayerPersistence,
                 "commit server-entity attack costs",

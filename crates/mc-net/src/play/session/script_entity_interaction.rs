@@ -5,6 +5,7 @@ use mc_protocol::packets::play::GameMode;
 
 use super::interaction_geometry::{entity_geometry, within_entity_reach};
 use super::{SessionId, SessionRegistry, server_entity_snapshot_from};
+use crate::lock_policy::lock_authoritative_mutex;
 use crate::play::PlayerPose;
 
 #[derive(Debug, Clone)]
@@ -26,9 +27,7 @@ impl SessionRegistry {
         let player_pose = inner.sessions.get(&actor_session)?.pose;
         let player_state = inner.player_persistence.get(&actor_session)?.clone();
         let wait_started = Instant::now();
-        let player_state = player_state
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let player_state = lock_authoritative_mutex(&player_state, "play.player_persistence");
         let player_state = crate::lock_metrics::timed_guard(
             crate::lock_metrics::LockMetricKind::PlayerPersistence,
             "accept script entity interaction",
