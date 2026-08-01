@@ -10079,12 +10079,12 @@ fn replace_view_updates_view_distance_and_tickets() {
 }
 
 #[test]
-fn try_register_rejects_duplicate_profile_until_unregister() {
+fn try_register_rejects_case_insensitive_duplicate_name_until_unregister() {
     let registry = SessionRegistry::new();
     let first_id = register_test_session(&registry, "DupAlice");
     let (tx, _rx) = mpsc::channel(8);
 
-    let dup_alice = profile("DupAlice");
+    let dup_alice = profile("dupalice");
     let duplicate = registry.try_register(registration(&dup_alice, tx, 8));
 
     assert!(matches!(
@@ -10095,7 +10095,7 @@ fn try_register_rejects_duplicate_profile_until_unregister() {
     let _ = registry.unregister(first_id);
 
     let (tx, _rx) = mpsc::channel(8);
-    let dup_alice = profile("DupAlice");
+    let dup_alice = profile("dupalice");
     assert!(
         registry
             .try_register(registration(&dup_alice, tx, 8))

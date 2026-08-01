@@ -25,9 +25,10 @@ and is not startup context.
   `SOL-004` exact Configuration bodies, `SOL-003` absolute pre-Play deadlines and
   admission permits, `SOL-028` weighted Play ingress budgets, `SOL-029`
   simulation request deadlines with owner-health wake-up, and `SOL-007` bounded
-  Mojang session verification and `SOL-008` strict/offloaded compression framing
-  are complete; `SOL-030` canonical login-name validation and collision policy is
-  next.
+  Mojang session verification, `SOL-008` strict/offloaded compression framing,
+  and `SOL-030` canonical login-name validation and collision policy are complete;
+  `SOL-002` close-safe async extension boundaries starts the next five-checkpoint
+  runtime-ownership series.
 - The first owner-run public-alpha session remains the routing authority for the
   next stabilization release; its exact plan is `docs/PUBLIC_ALPHA_PLAN.md`.
 - The future full Luau addon platform is frozen in

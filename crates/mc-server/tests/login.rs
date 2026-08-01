@@ -425,6 +425,19 @@ async fn login_uses_configured_compression_threshold() {
 }
 
 #[tokio::test]
+async fn login_rejects_invalid_username_syntax_before_compression() {
+    let addr = start_server().await;
+    for name in ["", "ab", "abc\n", "abc def", "abc-def", "éclair", "玩家123"] {
+        let (mut stream, mut rbuf) = send_login_start(addr, name).await;
+        let mut frame = read_one_frame(&mut stream, &mut rbuf, Compression::Disabled).await;
+        assert_eq!(frame.id, LoginDisconnect::ID, "name {name:?}");
+        let disconnect = LoginDisconnect::decode(&mut frame.body).unwrap();
+        assert!(disconnect.reason_json.contains("Invalid username"));
+        assert_eq!(frame.body.remaining(), 0);
+    }
+}
+
+#[tokio::test]
 async fn login_whitelist_rejects_before_compression() {
     let permissions = mc_net::CommandPermissionConfig::new(Vec::<String>::new(), false)
         .with_login_access(mc_net::LoginAccessConfig::normalized(

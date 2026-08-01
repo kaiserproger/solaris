@@ -146,6 +146,24 @@ pub(crate) enum LoginRejection {
     Whitelist,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum LoginNameError {
+    Length { bytes: usize },
+    InvalidCharacter { index: usize, byte: u8 },
+}
+
+pub(crate) fn validate_login_name(name: &str) -> Result<(), LoginNameError> {
+    if !(3..=16).contains(&name.len()) {
+        return Err(LoginNameError::Length { bytes: name.len() });
+    }
+    for (index, byte) in name.bytes().enumerate() {
+        if !byte.is_ascii_alphanumeric() && byte != b'_' {
+            return Err(LoginNameError::InvalidCharacter { index, byte });
+        }
+    }
+    Ok(())
+}
+
 impl LoginRejection {
     fn message(self) -> &'static str {
         match self {
@@ -201,6 +219,15 @@ where
     )
     .await?;
     let requested_name = login_start.name;
+    if let Err(reason) = validate_login_name(&requested_name) {
+        write_login_disconnect(writer, "Invalid username").await?;
+        info!(
+            ?reason,
+            name_bytes = requested_name.len(),
+            "login rejected: invalid username syntax"
+        );
+        return Ok(None);
+    }
     let (name, uuid, properties) = if access.online_mode {
         let authentication = online_authentication.ok_or(ConnectionError::OnlineAuthentication(
             "server authentication context is unavailable",
@@ -273,6 +300,24 @@ where
                 return Ok(None);
             }
         };
+        if let Err(reason) = validate_login_name(&name) {
+            write_login_disconnect(writer, "Failed to verify username!").await?;
+            info!(
+                ?reason,
+                returned_name_bytes = name.len(),
+                "online login rejected: verifier returned an invalid username"
+            );
+            return Ok(None);
+        }
+        if !name.eq_ignore_ascii_case(&requested_name) {
+            write_login_disconnect(writer, "Failed to verify username!").await?;
+            info!(
+                requested_name_bytes = requested_name.len(),
+                returned_name_bytes = name.len(),
+                "online login rejected: verifier returned a different username"
+            );
+            return Ok(None);
+        }
         info!(player = %name, requested = %requested_name, %uuid, "online login verified");
         (name, uuid, properties)
     } else {
@@ -423,6 +468,31 @@ mod tests {
     fn offline_uuid_is_deterministic() {
         assert_eq!(offline_uuid("repeat"), offline_uuid("repeat"));
         assert_ne!(offline_uuid("a"), offline_uuid("b"));
+    }
+
+    #[test]
+    fn login_name_accepts_exact_boundaries_and_ascii_alphabet() {
+        for name in ["abc", "A_1", "abcdefghijklmnop", "Player_123"] {
+            assert_eq!(validate_login_name(name), Ok(()), "name {name:?}");
+        }
+    }
+
+    #[test]
+    fn login_name_rejects_length_controls_spaces_punctuation_and_unicode() {
+        for name in [
+            "",
+            "ab",
+            "abcdefghijklmnopq",
+            "abc\n",
+            "abc\r",
+            "abc def",
+            "abc-def",
+            "abc.dev",
+            "éclair",
+            "玩家123",
+        ] {
+            assert!(validate_login_name(name).is_err(), "name {name:?}");
+        }
     }
 
     #[tokio::test]

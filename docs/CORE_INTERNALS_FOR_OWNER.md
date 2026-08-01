@@ -262,6 +262,11 @@ Codec functions только преобразуют bytes <-> typed packet. Он
 properties. Возвращённое Mojang имя обязано совпасть с requested name без учёта
 ASCII-регистра; его канонический регистр становится именем LoginSuccess/session.
 
+До auth/offline UUID/login policy имя обязано быть 3–16 ASCII bytes из
+`[A-Za-z0-9_]`. Invalid input получает LoginDisconnect, а structured diagnostic
+не содержит raw name. Session registration дополнительно запрещает active names,
+совпадающие без учёта ASCII-регистра, даже если UUID различаются.
+
 `AuthSection::prevent_proxy_connections` напрямую включает передачу IP клиента
 в Mojang `hasJoined`; default остается `false`. Это operator policy, а не
 эвристика login path.
