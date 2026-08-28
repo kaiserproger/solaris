@@ -24,7 +24,8 @@ lua-runtime = [
 ]
 
 [dependencies]
-luaur = { version = "0.1.8", optional = true }
+# crates.io luaur 0.1.8 hardcodes signed i8 at translated C char boundaries; this exact-release fork carries only the AArch64 c_char portability fix.
+luaur = { git = "https://github.com/kaiserproger/luaur.git", rev = "ea648bd95d4948b47dd66e5df62074b5b7ef2ec7", optional = true }
 mlua = { workspace = true, optional = true }
 serde = { workspace = true, optional = true }
 sha2 = { workspace = true, optional = true }
