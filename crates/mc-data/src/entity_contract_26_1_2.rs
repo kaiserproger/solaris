@@ -453,6 +453,11 @@ pub struct EntityTypeContract {
 }
 
 impl EntityTypeContract {
+    #[must_use]
+    pub const fn mob_category(self) -> MobCategory {
+        self.category
+    }
+
     /// Classifies a normal instance created from this registered entity type.
     #[must_use]
     pub const fn registered_instance_contract(self) -> EntityInstanceContract {

@@ -2,12 +2,11 @@ use std::collections::{BTreeMap, HashMap, VecDeque, hash_map::Entry};
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard};
 
+use mc_data::ItemStack;
 use mc_entity::{EntityId, EntityItemStack, Rotation, Vec3};
 use mc_nbt::Tag;
 use mc_protocol::codec::Identifier;
-use mc_protocol::packets::play::{
-    ClientboundExplode, EntityDataValue, ItemStack, LevelEvent, LightData,
-};
+use mc_protocol::packets::play::{ClientboundExplode, EntityDataValue, LevelEvent, LightData};
 use mc_world::ChunkPos;
 use mc_world::light::ChunkLight;
 use tokio::sync::mpsc;
@@ -21,7 +20,7 @@ use crate::play::inventory::PlayerInventory;
 use crate::play::persistence::XpState;
 use crate::play::session::{
     LoaderItemGrantCommand, ScriptMenuCloseRequest, ScriptMenuOpenRequest,
-    ScriptPlayerInventoryCommand, ScriptPlayerTeleportCommand,
+    ScriptPlayerInventoryCommand, ScriptPlayerTeleportCommand, WeatherProjection,
 };
 use crate::play::wire_entities::ServerEntityWireMove;
 
@@ -56,6 +55,7 @@ pub(in crate::play) struct ServerEntitySnapshot {
     pub(in crate::play) villager_baby: bool,
     pub(in crate::play) main_hand_item: Option<EntityItemStack>,
     pub(in crate::play) crossbow_charging: bool,
+    pub(in crate::play) blaze_charged: bool,
     pub(in crate::play) guardian_attack_target_entity_id: i32,
 }
 
@@ -91,6 +91,12 @@ pub(in crate::play) enum OutboundCommand {
     LevelEvent(LevelEvent),
     DamagePlayer {
         damage: PlayerDamageRequest,
+    },
+    ApplyPlayerEffect {
+        entity_id: i32,
+        effect_id: i32,
+        amplifier: i32,
+        duration_ticks: i32,
     },
     PlayerDamageCommitted {
         publication: Box<PlayerDamagePublication>,
@@ -140,6 +146,7 @@ pub(in crate::play) enum OutboundCommand {
         world_time: u64,
         rate: f32,
     },
+    Weather(WeatherProjection),
     WakeFromBed {
         bed: mc_world::BlockPos,
     },
@@ -225,6 +232,7 @@ impl OutboundCommand {
             | Self::EntityEvent { .. }
             | Self::LevelEvent(_)
             | Self::DamagePlayer { .. }
+            | Self::ApplyPlayerEffect { .. }
             | Self::PlayerDamageCommitted { .. }
             | Self::TakeItemEntity { .. }
             | Self::PickupCandidates(_)
@@ -237,6 +245,7 @@ impl OutboundCommand {
             | Self::CustomPayload { .. }
             | Self::SystemChat { .. }
             | Self::WorldTime { .. }
+            | Self::Weather(_)
             | Self::WakeFromBed { .. }
             | Self::DisconnectPlayer { .. }
             | Self::OpenScriptMenu(_)

@@ -7,6 +7,7 @@ use crate::play::is_hostile_entity;
 
 use super::entity_goal_defaults::apply_default_mob_goal;
 use super::entity_lifecycle::track_entity_chunk_locked;
+use super::herd_spawn_authority::install_committed_herd_spawns_locked;
 use super::interaction_geometry::entity_aabb;
 use super::outbound::dispatch_visibility_commands;
 use super::visibility::{
@@ -70,9 +71,6 @@ impl SessionRegistry {
     ) -> LoadBenchSeedStats {
         let mob_behaviors = self.mob_behavior_table();
         let spawn_tick = self.entity_lifecycle_tick.load(Ordering::Acquire);
-        let mut region_counts = HashMap::<RegionKey, usize>::new();
-        let mut hostile_entities = 0usize;
-
         for entity in &mut entities {
             apply_entity_facts(entity);
             apply_default_mob_goal(entity, &mob_behaviors);
@@ -81,6 +79,67 @@ impl SessionRegistry {
                 period_ticks: 1,
             };
             entity.retained.spawn_tick = spawn_tick;
+        }
+        self.commit_load_bench_entities(entities)
+    }
+
+    pub(crate) fn seed_load_bench_spawn_entities(
+        &self,
+        entities: Vec<SpawnEntity>,
+    ) -> LoadBenchSeedStats {
+        self.commit_load_bench_entities(entities)
+    }
+
+    pub(crate) fn seed_load_bench_natural_entities(
+        &self,
+        mut entities: Vec<SpawnEntity>,
+    ) -> LoadBenchSeedStats {
+        let mob_behaviors = self.mob_behavior_table();
+        let spawn_tick = self.entity_lifecycle_tick.load(Ordering::Acquire);
+        let mut region_counts = HashMap::<RegionKey, usize>::new();
+        let mut hostile_entities = 0usize;
+        for entity in &mut entities {
+            apply_entity_facts(entity);
+            apply_default_mob_goal(entity, &mob_behaviors);
+            entity.retained.spawn_tick = spawn_tick;
+            hostile_entities += usize::from(is_hostile_entity(&entity.type_name));
+            if let Some(region) = RegionKey::from_position(entity.position) {
+                *region_counts.entry(region).or_default() += 1;
+            }
+        }
+        let committed = self
+            .commit_unique_herd_candidates(entities)
+            .unwrap_or_else(|()| panic!("load benchmark natural owner batch failed"));
+        let entity_count = committed.len();
+        self.pressure_observation
+            .record_entity_inserts(entity_count);
+        let dispatches = {
+            let mut inner = self.lock_inner("publish load benchmark natural entities");
+            install_committed_herd_spawns_locked(&mut inner, committed, spawn_tick)
+        };
+        let spawn_dispatches = dispatches
+            .iter()
+            .map(|dispatch| match &dispatch.command {
+                super::outbound::OutboundCommand::SpawnEntity(_) => 1,
+                super::outbound::OutboundCommand::SpawnEntities(entities) => entities.len(),
+                _ => 0,
+            })
+            .sum();
+        dispatch_visibility_commands(dispatches);
+        LoadBenchSeedStats {
+            entities: entity_count,
+            hostile_entities,
+            regions: region_counts.len(),
+            max_entities_per_region: region_counts.values().copied().max().unwrap_or(0),
+            spawn_dispatches,
+            owner_lanes: self.entities.status().lane_count,
+        }
+    }
+
+    fn commit_load_bench_entities(&self, entities: Vec<SpawnEntity>) -> LoadBenchSeedStats {
+        let mut region_counts = HashMap::<RegionKey, usize>::new();
+        let mut hostile_entities = 0usize;
+        for entity in &entities {
             hostile_entities += usize::from(is_hostile_entity(&entity.type_name));
             if let Some(region) = RegionKey::from_position(entity.position) {
                 *region_counts.entry(region).or_default() += 1;

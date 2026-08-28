@@ -631,6 +631,11 @@ impl ScheduledTickView {
 
 impl WorldReadSnapshot {
     #[must_use]
+    pub fn contains_chunk(&self, position: ChunkPos) -> bool {
+        self.chunks.contains_key(&position)
+    }
+
+    #[must_use]
     pub fn chunk(&self, position: ChunkPos) -> Option<ChunkSnapshot> {
         self.chunks.get(&position).map(Arc::clone)
     }

@@ -183,7 +183,7 @@ impl SolarisServer {
         let cfg = mc_net::ServerConfig {
             bind_address: "127.0.0.1:0".parse()?,
             motd: "W07 entity differential harness".into(),
-            max_players: 4,
+            max_players: 8,
             view_distance: 2,
             data,
             blocks,
@@ -419,6 +419,13 @@ impl EntityProtocolHarness {
             .with_context(|| format!("item {name} is unavailable"))
     }
 
+    async fn write_command(&mut self, command: String) -> Result<()> {
+        self.client
+            .write_packet(&ServerboundChatCommand { command })
+            .await?;
+        Ok(())
+    }
+
     pub(crate) async fn give_hotbar_zero(&mut self, item: &str) -> Result<()> {
         let item_id = self.item_id(item)?;
         self.client
@@ -437,9 +444,7 @@ impl EntityProtocolHarness {
                 "commands.item.entity.set.success.single".into(),
             ),
         };
-        self.client
-            .write_packet(&ServerboundChatCommand { command })
-            .await?;
+        self.write_command(command).await?;
 
         let deadline = tokio::time::Instant::now() + self.failure_timeout;
         let mut saw_item = false;
@@ -510,14 +515,11 @@ impl EntityProtocolHarness {
                 FeedbackExpectation::TranslationKey("commands.summon.success".into())
             }
         };
-        self.client
-            .write_packet(&ServerboundChatCommand {
-                command: format!(
-                    "summon {entity_name} {} {} {}{command_suffix}",
-                    position[0], position[1], position[2]
-                ),
-            })
-            .await?;
+        self.write_command(format!(
+            "summon {entity_name} {} {} {}{command_suffix}",
+            position[0], position[1], position[2]
+        ))
+        .await?;
 
         let deadline = tokio::time::Instant::now() + self.failure_timeout;
         let mut runtime_entity_id = None;
@@ -617,11 +619,11 @@ impl EntityProtocolHarness {
                 "commands.teleport.success.location.single".into(),
             ),
         };
-        self.client
-            .write_packet(&ServerboundChatCommand {
-                command: format!("tp {} {} {}", position[0], position[1], position[2]),
-            })
-            .await?;
+        self.write_command(format!(
+            "tp {} {} {}",
+            position[0], position[1], position[2]
+        ))
+        .await?;
         let deadline = tokio::time::Instant::now() + self.failure_timeout;
         let mut saw_sync = false;
         let mut saw_feedback = false;
@@ -768,11 +770,7 @@ impl EntityProtocolHarness {
         expected_feedback: FeedbackExpectation,
         reason: &str,
     ) -> Result<Vec<RawFrame>> {
-        self.client
-            .write_packet(&ServerboundChatCommand {
-                command: command.to_owned(),
-            })
-            .await?;
+        self.write_command(command.to_owned()).await?;
         let deadline = tokio::time::Instant::now() + self.failure_timeout;
         let mut frames = Vec::new();
         loop {

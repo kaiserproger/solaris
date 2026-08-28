@@ -97,9 +97,22 @@ public final class AgentHttpBridge implements AutoCloseable {
             JsonObject payload = command.execute(request);
             write(exchange, 200, BridgeCodec.encodeResponse(BridgeResponse.success(request.id(), payload)));
         } catch (Exception error) {
+            error.printStackTrace(System.err);
             write(exchange, 500, BridgeCodec.encodeResponse(BridgeResponse.failure(
-                request.id(), new BridgeError("command-failed", error.getMessage()))));
+                request.id(), new BridgeError("command-failed", diagnosticMessage(error)))));
+        } catch (Error error) {
+            error.printStackTrace(System.err);
+            write(exchange, 500, BridgeCodec.encodeResponse(BridgeResponse.failure(
+                request.id(), new BridgeError("command-error", diagnosticMessage(error)))));
         }
+    }
+
+    private static String diagnosticMessage(Throwable error) {
+        String message = error.getMessage();
+        if (message == null || message.isBlank()) {
+            return error.getClass().getName();
+        }
+        return error.getClass().getName() + ": " + message;
     }
 
     private static void write(HttpExchange exchange, int status, String body) throws IOException {

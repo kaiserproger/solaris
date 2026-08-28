@@ -82,14 +82,14 @@ impl Packet for EncryptionResponse {
             self.encrypted_verify_token.as_slice(),
         ] {
             if ciphertext.len() > MAX_ENCRYPTED_RESPONSE_BYTES {
-                return Err(CodecError::StringTooLong {
+                return Err(CodecError::ArrayTooLong {
                     len: ciphertext.len(),
                     max: MAX_ENCRYPTED_RESPONSE_BYTES,
                 });
             }
         }
-        buf.write_byte_array(&self.encrypted_shared_secret);
-        buf.write_byte_array(&self.encrypted_verify_token);
+        buf.write_byte_array(&self.encrypted_shared_secret)?;
+        buf.write_byte_array(&self.encrypted_verify_token)?;
         Ok(())
     }
 
@@ -142,8 +142,8 @@ impl Packet for EncryptionRequest {
     fn encode<B: BufMut>(&self, buf: &mut B) -> Result<(), CodecError> {
         // Vanilla's writer uses writeUtf(String), whose default limit is 32,767.
         buf.write_string(&self.server_id, 32_767)?;
-        buf.write_byte_array(&self.public_key);
-        buf.write_byte_array(&self.verify_token);
+        buf.write_byte_array(&self.public_key)?;
+        buf.write_byte_array(&self.verify_token)?;
         buf.write_bool(self.should_authenticate);
         Ok(())
     }
@@ -362,8 +362,8 @@ mod tests {
     fn encryption_request_rejects_server_id_over_twenty_utf16_units() {
         let mut body = Vec::new();
         body.write_string("123456789012345678901", 32_767).unwrap();
-        body.write_byte_array(&[]);
-        body.write_byte_array(&[]);
+        body.write_byte_array(&[]).unwrap();
+        body.write_byte_array(&[]).unwrap();
         body.write_bool(true);
 
         let error = EncryptionRequest::decode(&mut body.as_slice()).unwrap_err();
@@ -401,12 +401,12 @@ mod tests {
         let mut body = Vec::new();
         body.write_varint(129);
         body.extend_from_slice(&[0xAA; 129]);
-        body.write_byte_array(&[]);
+        body.write_byte_array(&[]).unwrap();
         let mut cursor = body.as_slice();
 
         let error = EncryptionResponse::decode(&mut cursor).unwrap_err();
 
-        assert_eq!(error, CodecError::StringTooLong { len: 129, max: 128 });
+        assert_eq!(error, CodecError::ArrayTooLong { len: 129, max: 128 });
         assert_eq!(cursor.len(), 130);
         assert_eq!(&cursor[..129], &[0xAA; 129]);
     }
@@ -430,14 +430,14 @@ mod tests {
     #[test]
     fn encryption_response_rejects_129_byte_verify_token_before_copy() {
         let mut body = Vec::new();
-        body.write_byte_array(&[0xAA; 128]);
+        body.write_byte_array(&[0xAA; 128]).unwrap();
         body.write_varint(129);
         body.extend_from_slice(&[0xBB; 129]);
         let mut cursor = body.as_slice();
 
         let error = EncryptionResponse::decode(&mut cursor).unwrap_err();
 
-        assert_eq!(error, CodecError::StringTooLong { len: 129, max: 128 });
+        assert_eq!(error, CodecError::ArrayTooLong { len: 129, max: 128 });
         assert_eq!(cursor, &[0xBB; 129]);
     }
 
@@ -451,7 +451,7 @@ mod tests {
 
         assert_eq!(
             error,
-            CodecError::StringTooLong {
+            CodecError::ArrayTooLong {
                 len: i32::MAX as usize,
                 max: 128,
             }
@@ -497,7 +497,7 @@ mod tests {
 
             let error = packet.encode(&mut body).unwrap_err();
 
-            assert_eq!(error, CodecError::StringTooLong { len: 129, max: 128 });
+            assert_eq!(error, CodecError::ArrayTooLong { len: 129, max: 128 });
             assert_eq!(body, vec![0xCC]);
         }
     }

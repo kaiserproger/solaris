@@ -12,7 +12,6 @@ import net.minecraft.commands.arguments.EntityAnchorArgument;
 import net.minecraft.core.BlockPos;
 import net.minecraft.core.Direction;
 import net.minecraft.core.registries.BuiltInRegistries;
-import net.minecraft.network.protocol.game.ServerboundClientCommandPacket;
 import net.minecraft.network.protocol.game.ServerboundPlaceRecipePacket;
 import net.minecraft.network.protocol.game.ServerboundSetCarriedItemPacket;
 import net.minecraft.network.protocol.game.ServerboundSignUpdatePacket;
@@ -2066,9 +2065,7 @@ public final class MinecraftScenarioClient implements ScenarioClient {
                 throw new IllegalStateException("client player is not dead");
             }
             long healthVersion = ClientStateEvents.healthVersion();
-            minecraft.getConnection().send(new ServerboundClientCommandPacket(
-                ServerboundClientCommandPacket.Action.PERFORM_RESPAWN
-            ));
+            minecraft.player.respawn();
             return healthVersion;
         });
 

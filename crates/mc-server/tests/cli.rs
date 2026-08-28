@@ -322,7 +322,7 @@ fn check_rejects_zero_save_interval() {
         .assert()
         .failure()
         .stderr(contains(
-            "simulation.save_interval_ticks must be greater than 0",
+            "simulation.save_interval_ticks=0 must be between 1 and 1728000",
         ));
 }
 
@@ -1537,6 +1537,106 @@ fn check_malformed_config_exits_nonzero_with_clear_error() {
         .assert()
         .failure()
         .stderr(contains("parsing config file"));
+}
+
+#[test]
+fn check_file_backed_access_control_is_loaded_and_missing_or_malformed_files_fail_closed() {
+    let temp = tempfile::tempdir().expect("tempdir");
+    let config_path = temp.path().join("server.toml");
+    std::fs::write(
+        &config_path,
+        r#"
+            [server]
+            name = "AccessFiles"
+            motd = "Hello"
+
+            [network]
+            bind_address = "127.0.0.1"
+            port = 30000
+
+            [admin]
+            operators_file = "ops.json"
+
+            [auth]
+            whitelist_enabled = true
+            whitelist_file = "whitelist.json"
+            banned_players_file = "banned-players.json"
+
+            [data]
+            world_dir = "world"
+        "#,
+    )
+    .expect("write config");
+    std::fs::write(
+        temp.path().join("ops.json"),
+        br#"[{"name":"FileOp","level":4}]"#,
+    )
+    .expect("write ops");
+    std::fs::write(
+        temp.path().join("whitelist.json"),
+        br#"[{"name":"Allowed"}]"#,
+    )
+    .expect("write whitelist");
+    std::fs::write(temp.path().join("banned-players.json"), b"[]").expect("write bans");
+
+    Command::cargo_bin("mc-server")
+        .expect("locate mc-server binary")
+        .arg("--check")
+        .arg("--config")
+        .arg(&config_path)
+        .assert()
+        .success()
+        .stdout(contains("fileop"))
+        .stdout(contains("allowed"));
+
+    std::fs::remove_file(temp.path().join("whitelist.json")).expect("remove whitelist");
+    Command::cargo_bin("mc-server")
+        .expect("locate mc-server binary")
+        .arg("--check")
+        .arg("--config")
+        .arg(&config_path)
+        .assert()
+        .failure()
+        .stderr(contains("auth.whitelist_file"))
+        .stderr(contains("whitelist.json"));
+
+    std::fs::write(temp.path().join("whitelist.json"), b"{}").expect("write malformed whitelist");
+    Command::cargo_bin("mc-server")
+        .expect("locate mc-server binary")
+        .arg("--check")
+        .arg("--config")
+        .arg(&config_path)
+        .assert()
+        .failure()
+        .stderr(contains("parsing auth.whitelist_file JSON"));
+
+    std::fs::write(
+        temp.path().join("whitelist.json"),
+        br#"[{"uuid":"secret-raw-uuid"}]"#,
+    )
+    .expect("write invalid identity");
+    Command::cargo_bin("mc-server")
+        .expect("locate mc-server binary")
+        .arg("--check")
+        .arg("--config")
+        .arg(&config_path)
+        .assert()
+        .failure()
+        .stderr(contains("auth.whitelist_file"))
+        .stderr(contains("whitelist.json"))
+        .stderr(contains("invalid uuid"))
+        .stderr(contains("secret-raw-uuid").not());
+
+    Command::cargo_bin("mc-server")
+        .expect("locate mc-server binary")
+        .arg("--config")
+        .arg(&config_path)
+        .assert()
+        .failure()
+        .stderr(contains("auth.whitelist_file"))
+        .stderr(contains("whitelist.json"))
+        .stderr(contains("invalid uuid"))
+        .stderr(contains("secret-raw-uuid").not());
 }
 
 #[test]

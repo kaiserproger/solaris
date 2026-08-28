@@ -7,10 +7,11 @@ Checkpoint base: `9319fa75430a03a037c65df49b9842e0f2dc30d1`
 ## Ownership cutover
 
 The production natural-spawn scheduler and planner previously lived under
-`mc-net::play::session::herd_spawn_authority`. The cutover moves the
-caller-neutral herd template, deterministic identity, caps, rotating scheduler,
-metrics, distance, terrain, darkness, collision, and candidate rules into
-`mc_entity::natural_spawn_26_1_2`.
+`mc-net::play::session::herd_spawn_authority` and retained a second chunk-template
+planner in `mc-net::play::chunk_stream`. The cutover now moves the caller-neutral
+herd template, deterministic identity, caps, rotating scheduler, metrics,
+distance, terrain, darkness, collision, biome/surface lookup, land/water spawn
+placement, sheep colour, and candidate rules into `mc_entity::natural_spawn_26_1_2`.
 
 `mc-net` still owns only the live adapters that must see runtime authority:
 
@@ -48,18 +49,13 @@ release benchmark gates remain at their existing feature/release boundaries.
 
 ## Validation
 
-- `cargo test -p mc-entity natural_spawn_26_1_2`: 3 passed.
-- `cargo test -p mc-net periodic_`: 12 passed.
-- `cargo test -p mc-entity`: 573 passed, 6 ignored; production ECS integration:
-  8 passed.
-- `cargo test -p mc-net`: 1,849 passed, 5 ignored; doc tests: 3 passed.
+- `cargo test -p mc-entity natural_spawn_26_1_2`: 4 passed.
+- `cargo test -p mc-net herd_surface`: 4 passed.
+- `cargo test -p mc-net passive_sheep_plan`: 1 passed.
 - `cargo run -p xtask -- code-health`: `0 fail`, `KEEP`.
-- `cargo test --workspace`: passed.
 - `cargo clippy --workspace --all-targets -- -D warnings`: passed.
-- `cargo fmt --all -- --check`: passed.
-- `git diff --check`: passed.
-- Independent read-only review against the checkpoint base: `pass`, no
-  findings.
+- `cargo test --workspace --quiet`: passed; `mc-entity` 581 passed/6 ignored and `mc-net` 1,932 passed/5 ignored in the current workspace checkpoint.
+- `cargo fmt`: passed.
 
 The PrismLauncher graphical/client gate was not run. This checkpoint changes
 crate ownership without claiming new gameplay, graphical, performance, or

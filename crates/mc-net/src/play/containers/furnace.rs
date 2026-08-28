@@ -1,15 +1,14 @@
 use std::collections::BTreeMap;
 
+use mc_data::ItemStack;
 use mc_data::item_components::ItemFactsTable;
 use mc_data::items::ItemRegistry;
 use mc_data::recipes::{Recipe, RecipeKind};
 use mc_data::tags::TagsData;
 use mc_protocol::codec::Identifier;
-use mc_protocol::packets::play::ItemStack;
 use mc_world::{BlockPos, FurnaceBlockEntity, FurnaceSlot};
 
 use crate::play::inventory::{PlayerInventory, can_stack, item_max_stack};
-use crate::play::recipes::ingredient_accepts_item;
 
 pub(in crate::play) const FURNACE_MENU_SLOT_COUNT: usize = 39;
 pub(in crate::play) const FURNACE_MENU_TYPE_ID: i32 = 14;
@@ -89,6 +88,14 @@ pub(in crate::play) fn furnace_menu_title_for_block_id(id: &str) -> Option<&'sta
     }
 }
 
+fn cooking_kind(kind: FurnaceKind) -> mc_data::recipes::CookingKind {
+    match kind {
+        FurnaceKind::Furnace => mc_data::recipes::CookingKind::Furnace,
+        FurnaceKind::Smoker => mc_data::recipes::CookingKind::Smoker,
+        FurnaceKind::BlastFurnace => mc_data::recipes::CookingKind::BlastFurnace,
+    }
+}
+
 pub(in crate::play) fn find_cooking_recipe_for_item(
     recipes: &[Recipe],
     items: &ItemRegistry,
@@ -96,15 +103,13 @@ pub(in crate::play) fn find_cooking_recipe_for_item(
     kind: FurnaceKind,
     item_id: u32,
 ) -> Option<Recipe> {
-    recipes.iter().find_map(|recipe| {
-        let cooking = match (&recipe.kind, kind) {
-            (RecipeKind::Smelting(cooking), FurnaceKind::Furnace) => cooking,
-            (RecipeKind::Smoking(cooking), FurnaceKind::Smoker) => cooking,
-            (RecipeKind::Blasting(cooking), FurnaceKind::BlastFurnace) => cooking,
-            _ => return None,
-        };
-        ingredient_accepts_item(items, tags, item_id, &cooking.ingredient).then(|| recipe.clone())
-    })
+    mc_data::recipes::find_cooking_recipe_for_item(
+        recipes,
+        items,
+        tags,
+        cooking_kind(kind),
+        item_id,
+    )
 }
 
 pub(in crate::play) fn furnace_fuel_ticks(
@@ -112,11 +117,7 @@ pub(in crate::play) fn furnace_fuel_ticks(
     kind: FurnaceKind,
     item_id: u32,
 ) -> Option<i16> {
-    let ticks = tags.fuel_values().burn_duration(item_id)?;
-    Some(match kind {
-        FurnaceKind::Furnace => ticks,
-        FurnaceKind::Smoker | FurnaceKind::BlastFurnace => ticks / 2,
-    })
+    mc_data::recipes::furnace_fuel_ticks(tags, cooking_kind(kind), item_id)
 }
 
 pub(in crate::play) fn furnace_slot_to_stack(slot: &FurnaceSlot) -> ItemStack {
@@ -169,42 +170,7 @@ pub(in crate::play) fn furnace_experience_award(
     recipes_used: &BTreeMap<String, i32>,
     seed: u64,
 ) -> i32 {
-    let mut total = 0_u64;
-    for (recipe_id, count) in recipes_used {
-        let Ok(count) = u64::try_from(*count) else {
-            continue;
-        };
-        let Some(recipe) = recipes
-            .iter()
-            .find(|recipe| recipe.id.as_str() == recipe_id)
-        else {
-            continue;
-        };
-        let experience_milli = match &recipe.kind {
-            RecipeKind::Smelting(recipe)
-            | RecipeKind::Blasting(recipe)
-            | RecipeKind::Smoking(recipe) => recipe.experience_milli,
-            RecipeKind::Shaped(_)
-            | RecipeKind::Shapeless(_)
-            | RecipeKind::CampfireCooking(_)
-            | RecipeKind::Stonecutting(_) => continue,
-        };
-        let scaled = count.saturating_mul(u64::from(experience_milli));
-        let mut recipe_award = scaled / 1_000;
-        let remainder = scaled % 1_000;
-        if remainder > 0 {
-            let mut recipe_seed = seed ^ 0xCBF2_9CE4_8422_2325;
-            for byte in recipe_id.bytes() {
-                recipe_seed ^= u64::from(byte);
-                recipe_seed = recipe_seed.wrapping_mul(0x0000_0100_0000_01B3);
-            }
-            if splitmix64(recipe_seed) % 1_000 < remainder {
-                recipe_award = recipe_award.saturating_add(1);
-            }
-        }
-        total = total.saturating_add(recipe_award);
-    }
-    total.min(i32::MAX as u64) as i32
+    mc_data::recipes::furnace_experience_award(recipes, recipes_used, seed)
 }
 
 pub(in crate::play) fn plan_click(input: FurnaceClickInput<'_>) -> Option<FurnaceClickPlan> {

@@ -56,6 +56,7 @@ use crate::{
 };
 use crate::{login, play};
 
+mod entity_ticker;
 mod natural_spawn_ticker;
 
 static CONSOLE_LINES: OnceLock<broadcast::Sender<String>> = OnceLock::new();
@@ -608,6 +609,38 @@ impl LoadBenchHandle {
     }
 
     #[must_use]
+    pub fn seed_spawn_entities(
+        &self,
+        entities: Vec<mc_entity::SpawnEntity>,
+    ) -> LoadBenchSeedReport {
+        let seeded = self.sessions.seed_load_bench_spawn_entities(entities);
+        LoadBenchSeedReport {
+            entities: seeded.entities,
+            hostile_entities: seeded.hostile_entities,
+            regions: seeded.regions,
+            max_entities_per_region: seeded.max_entities_per_region,
+            spawn_dispatches: seeded.spawn_dispatches,
+            owner_lanes: seeded.owner_lanes,
+        }
+    }
+
+    #[must_use]
+    pub fn seed_natural_entities(
+        &self,
+        entities: Vec<mc_entity::SpawnEntity>,
+    ) -> LoadBenchSeedReport {
+        let seeded = self.sessions.seed_load_bench_natural_entities(entities);
+        LoadBenchSeedReport {
+            entities: seeded.entities,
+            hostile_entities: seeded.hostile_entities,
+            regions: seeded.regions,
+            max_entities_per_region: seeded.max_entities_per_region,
+            spawn_dispatches: seeded.spawn_dispatches,
+            owner_lanes: seeded.owner_lanes,
+        }
+    }
+
+    #[must_use]
     pub fn readiness(&self) -> LoadBenchReadinessReport {
         let readiness = self.sessions.load_bench_readiness();
         LoadBenchReadinessReport {
@@ -998,6 +1031,11 @@ enum ScriptCommitForwardError {
     RequiredTimeout { timeout: Duration },
 }
 
+struct ScriptCommitWorkers {
+    worker: Option<tokio::task::JoinHandle<Result<(), ScriptCommitForwardError>>>,
+    failure_watcher: Option<tokio::task::JoinHandle<()>>,
+}
+
 async fn forward_committed_script_events(
     mut events: play::ScriptCommitEventReceiver,
     scripts: ScriptEventSink,
@@ -1053,6 +1091,175 @@ async fn watch_script_commit_event_failure(
             () = shutdown.notified() => return,
         }
     }
+}
+
+fn spawn_script_commit_workers(
+    scripts: Option<ScriptEventSink>,
+    sessions: &play::SessionRegistry,
+    shutdown: &ShutdownHandle,
+) -> ScriptCommitWorkers {
+    let Some(scripts) = scripts else {
+        return ScriptCommitWorkers {
+            worker: None,
+            failure_watcher: None,
+        };
+    };
+    let events = sessions.install_script_commit_event_outbox();
+    let failure = sessions.subscribe_script_commit_event_failure();
+    let failure_shutdown = shutdown.clone();
+    ScriptCommitWorkers {
+        worker: Some(tokio::spawn(forward_committed_script_events(
+            events, scripts,
+        ))),
+        failure_watcher: Some(tokio::spawn(watch_script_commit_event_failure(
+            failure,
+            failure_shutdown,
+        ))),
+    }
+}
+
+async fn drain_script_commit_runtime(
+    sessions: &play::SessionRegistry,
+    scripts: Option<&ScriptEventSink>,
+    workers: ScriptCommitWorkers,
+) -> (std::io::Result<()>, std::io::Result<()>) {
+    sessions.close_script_commit_event_outbox();
+    let mut script_commit_event_drain_result = match workers.worker {
+        Some(worker) => match worker.await {
+            Ok(Ok(())) => Ok(()),
+            Ok(Err(error)) => Err(std::io::Error::other(format!(
+                "committed script event drain failed: {error:?}"
+            ))),
+            Err(error) => Err(std::io::Error::other(format!(
+                "committed script event worker failed: {error}"
+            ))),
+        },
+        None => Ok(()),
+    };
+    if let Some(watcher) = workers.failure_watcher {
+        watcher.abort();
+        let _ = watcher.await;
+    }
+    let script_commit_events = sessions.script_commit_event_outbox_snapshot();
+    if script_commit_events.required_overflow != 0
+        || script_commit_events.required_closed != 0
+        || script_commit_events.required_abandoned_on_receiver_drop != 0
+    {
+        script_commit_event_drain_result = Err(std::io::Error::other(format!(
+            "required committed script event delivery failed: overflow={}, closed={}, abandoned={}, max_depth={}, capacity={}",
+            script_commit_events.required_overflow,
+            script_commit_events.required_closed,
+            script_commit_events.required_abandoned_on_receiver_drop,
+            script_commit_events.max_depth,
+            script_commit_events.capacity,
+        )));
+    }
+    let server_stopping_event_result = if let Some(scripts) = scripts {
+        let result = scripts
+            .enqueue_required_event(ScriptEvent::server_stopping("server stopping"))
+            .await
+            .map_err(|error| {
+                std::io::Error::other(format!("server stopping script event failed: {error:?}"))
+            });
+        scripts.close_event_admission();
+        result
+    } else {
+        Ok(())
+    };
+    (
+        script_commit_event_drain_result,
+        server_stopping_event_result,
+    )
+}
+
+async fn entity_world_context(
+    config: &ServerConfig,
+) -> (
+    Option<std::path::PathBuf>,
+    Option<mc_world::ScheduledTickView>,
+) {
+    let Some(world) = config.world.as_ref() else {
+        return (None, None);
+    };
+    let storage = crate::lock_metrics::timed_guard(
+        crate::lock_metrics::LockMetricKind::WorldStorage,
+        "entity world root",
+        Instant::now(),
+        world.lock().await,
+    );
+    (
+        storage.world_root().map(std::path::Path::to_path_buf),
+        Some(storage.scheduled_tick_view()),
+    )
+}
+
+fn spawn_periodic_save_coordinator(
+    enabled: bool,
+    entity_config: &Arc<ServerConfig>,
+    entity_sessions: &Arc<play::SessionRegistry>,
+    simulation: &play::SimulationHandle,
+    shutdown: &ShutdownHandle,
+) -> (
+    Option<crate::dirty_flush::DirtyFlushNotifier>,
+    Option<crate::dirty_flush::DirtyFlushCoordinator>,
+) {
+    if !enabled {
+        return (None, None);
+    }
+    let periodic_config = Arc::clone(entity_config);
+    let periodic_sessions = Arc::clone(entity_sessions);
+    let periodic_simulation = simulation.clone();
+    let periodic_shutdown = shutdown.clone();
+    let dirty_config = Arc::clone(entity_config);
+    let dirty_sessions = Arc::clone(entity_sessions);
+    let worker = crate::dirty_flush::DirtyFlushCoordinator::spawn_actions(
+        move || {
+            let config = Arc::clone(&dirty_config);
+            let sessions = Arc::clone(&dirty_sessions);
+            async move {
+                log_dirty_only_flush(
+                    "dirty high-water flush",
+                    flush_dirty_chunks_only(&config, sessions.simulation_tick()).await,
+                )
+            }
+        },
+        move || {
+            let config = Arc::clone(&periodic_config);
+            let sessions = Arc::clone(&periodic_sessions);
+            let simulation = periodic_simulation.clone();
+            let shutdown = periodic_shutdown.clone();
+            async move {
+                let Some(report) =
+                    save_periodic_checkpoint(&config, &sessions, &simulation, &shutdown).await
+                else {
+                    return;
+                };
+                log_save_report("periodic checkpoint", &report);
+            }
+        },
+    );
+    (Some(worker.notifier()), Some(worker))
+}
+
+async fn install_dirty_high_water_notifier(
+    config: &ServerConfig,
+    dirty_flush: Option<&crate::dirty_flush::DirtyFlushNotifier>,
+) {
+    let (Some(world), Some(dirty_flush)) = (config.world.as_ref(), dirty_flush) else {
+        return;
+    };
+    let dirty_flush = dirty_flush.clone();
+    let dirty_tail_progress = config.shutdown.clone();
+    let storage = crate::lock_metrics::timed_guard(
+        crate::lock_metrics::LockMetricKind::WorldStorage,
+        "dirty flush notification install",
+        Instant::now(),
+        world.lock().await,
+    );
+    storage.set_dirty_high_water_notifier(Arc::new(move || {
+        dirty_tail_progress.mark_dirty_tail_progress();
+        dirty_flush.request_dirty_flush();
+    }));
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -1174,6 +1381,84 @@ fn handle_accept_failure(
     error
 }
 
+fn spawn_admitted_connection(
+    connections: &mut tokio::task::JoinSet<()>,
+    socket: tokio::net::TcpStream,
+    peer: SocketAddr,
+    services: &ConnectionServices,
+    connection_permits: &Arc<Semaphore>,
+    pre_auth_admission: &PreAuthAdmission,
+) {
+    let Some(pre_auth_permit) = pre_auth_admission.try_acquire(peer.ip()) else {
+        debug!(%peer, "pre-auth admission rejected connection");
+        return;
+    };
+    debug!(%peer, "accepted connection");
+    let connection_permit = Arc::clone(connection_permits)
+        .try_acquire_owned()
+        .expect("accept branch is enabled only while a connection permit exists");
+    let services = services.clone();
+    connections.spawn(async move {
+        let _connection_permit = connection_permit;
+        if let Err(err) = Box::pin(handle_connection(socket, peer, services, pre_auth_permit)).await
+        {
+            match err {
+                err if is_client_disconnect(&err) => {
+                    debug!(%peer, "client disconnected");
+                }
+                other => {
+                    warn!(%peer, error = %other, "connection terminated");
+                }
+            }
+        } else {
+            debug!(%peer, "connection finished");
+        }
+    });
+}
+
+fn configured_entity_type_id(config: &ServerConfig, name: &str) -> Option<i32> {
+    Identifier::parse(name)
+        .ok()
+        .and_then(|id| config.entity_types.id_of(&id))
+        .and_then(|id| i32::try_from(id).ok())
+}
+
+fn villager_population_ids(
+    config: &ServerConfig,
+) -> Option<(
+    mc_entity::villager_population_26_1_2::VillagerFoodItemIds,
+    i32,
+    i32,
+)> {
+    let item_id = |name: &str| {
+        Identifier::parse(name)
+            .ok()
+            .and_then(|id| config.items.id_of(&id))
+    };
+    match (
+        item_id("minecraft:bread"),
+        item_id("minecraft:potato"),
+        item_id("minecraft:carrot"),
+        item_id("minecraft:beetroot"),
+        configured_entity_type_id(config, "minecraft:villager"),
+        configured_entity_type_id(config, "minecraft:item"),
+    ) {
+        (Some(bread), Some(potato), Some(carrot), Some(beetroot), Some(villager), Some(item)) => {
+            Some((
+                mc_entity::villager_population_26_1_2::VillagerFoodItemIds {
+                    bread,
+                    potato,
+                    carrot,
+                    beetroot,
+                },
+                villager,
+                item,
+            ))
+        }
+        _ => None,
+    }
+}
+
 impl BoundServer {
     /// The socket address the listener is bound to.
     pub fn local_addr(&self) -> std::io::Result<SocketAddr> {
@@ -1270,7 +1555,7 @@ impl BoundServer {
         let sessions = self.sessions;
         let mut entity_owner_failure = sessions.subscribe_entity_owner_failure();
         let simulation = self.simulation;
-        let mut simulation_owner = self.simulation_owner;
+        let simulation_owner = self.simulation_owner;
         let extension = self.extension;
         let scripts = self.scripts;
         let script_storage = self.script_storage;
@@ -1290,109 +1575,32 @@ impl BoundServer {
         if let Some(scripts) = scripts.as_ref() {
             scripts.enqueue_event(ScriptEvent::server_started());
         }
-        let (mut script_commit_event_worker, mut script_commit_event_failure_watcher) =
-            if let Some(scripts) = scripts.clone() {
-                let events = sessions.install_script_commit_event_outbox();
-                let failure = sessions.subscribe_script_commit_event_failure();
-                let failure_shutdown = shutdown.clone();
-                (
-                    Some(tokio::spawn(forward_committed_script_events(
-                        events, scripts,
-                    ))),
-                    Some(tokio::spawn(watch_script_commit_event_failure(
-                        failure,
-                        failure_shutdown,
-                    ))),
-                )
-            } else {
-                (None, None)
-            };
+        let script_commit_workers =
+            spawn_script_commit_workers(scripts.clone(), &sessions, &shutdown);
         let mut connections = tokio::task::JoinSet::new();
-        let (entity_world_root, entity_scheduled_ticks) = if let Some(world) = config.world.as_ref()
-        {
-            let storage = crate::lock_metrics::timed_guard(
-                crate::lock_metrics::LockMetricKind::WorldStorage,
-                "entity world root",
-                Instant::now(),
-                world.lock().await,
-            );
-            (
-                storage.world_root().map(std::path::Path::to_path_buf),
-                Some(storage.scheduled_tick_view()),
-            )
-        } else {
-            (None, None)
-        };
+        let (entity_world_root, entity_scheduled_ticks) = entity_world_context(&config).await;
         let entity_world_read = connection_world.read.clone();
         let entity_world_mutation = connection_world.mutation.clone();
         let entity_pathing_materials = entity_world_read
             .as_ref()
             .map(|_| cached_material_ids(&config));
         let entity_sessions = Arc::clone(&sessions);
-        let mut entity_world_journal_failure =
-            entity_sessions.subscribe_world_chunk_journal_failure();
+        let entity_world_journal_failure = entity_sessions.subscribe_world_chunk_journal_failure();
         let entity_config = Arc::clone(&config);
         let entity_runtime_control = runtime_control.clone();
-        let mut entity_runtime_control_signals = runtime_control_signals.take();
+        let entity_runtime_control_signals = runtime_control_signals.take();
         let entity_tick_metrics = runtime_tick_metrics.clone();
         let entity_chunk_pipeline_resources = chunk_pipeline_resources.clone();
         let entity_scripts = scripts.clone();
         let entity_script_zones = script_zones.clone();
-        let (periodic_save_requests, periodic_save_worker) = if entity_world_root.is_some() {
-            let periodic_config = Arc::clone(&entity_config);
-            let periodic_sessions = Arc::clone(&entity_sessions);
-            let periodic_simulation = simulation.clone();
-            let periodic_shutdown = shutdown.clone();
-            let dirty_config = Arc::clone(&entity_config);
-            let dirty_sessions = Arc::clone(&entity_sessions);
-            let worker = crate::dirty_flush::DirtyFlushCoordinator::spawn_actions(
-                move || {
-                    let config = Arc::clone(&dirty_config);
-                    let sessions = Arc::clone(&dirty_sessions);
-                    async move {
-                        log_dirty_only_flush(
-                            "dirty high-water flush",
-                            flush_dirty_chunks_only(&config, sessions.simulation_tick()).await,
-                        )
-                    }
-                },
-                move || {
-                    let config = Arc::clone(&periodic_config);
-                    let sessions = Arc::clone(&periodic_sessions);
-                    let simulation = periodic_simulation.clone();
-                    let shutdown = periodic_shutdown.clone();
-                    async move {
-                        let Some(report) =
-                            save_periodic_checkpoint(&config, &sessions, &simulation, &shutdown)
-                                .await
-                        else {
-                            return;
-                        };
-                        log_save_report("periodic checkpoint", &report);
-                    }
-                },
-            );
-            (Some(worker.notifier()), Some(worker))
-        } else {
-            (None, None)
-        };
-        if let (Some(world), Some(dirty_flush)) = (
-            entity_config.world.as_ref(),
-            periodic_save_requests.as_ref(),
-        ) {
-            let dirty_flush = dirty_flush.clone();
-            let dirty_tail_progress = entity_config.shutdown.clone();
-            let storage = crate::lock_metrics::timed_guard(
-                crate::lock_metrics::LockMetricKind::WorldStorage,
-                "dirty flush notification install",
-                Instant::now(),
-                world.lock().await,
-            );
-            storage.set_dirty_high_water_notifier(Arc::new(move || {
-                dirty_tail_progress.mark_dirty_tail_progress();
-                dirty_flush.request_dirty_flush();
-            }));
-        }
+        let (periodic_save_requests, periodic_save_worker) = spawn_periodic_save_coordinator(
+            entity_world_root.is_some(),
+            &entity_config,
+            &entity_sessions,
+            &simulation,
+            &shutdown,
+        );
+        install_dirty_high_water_notifier(&entity_config, periodic_save_requests.as_ref()).await;
         if let Some(requests) = periodic_save_requests.as_ref() {
             enqueue_startup_dirty_flush(&config, requests).await;
         }
@@ -1410,1178 +1618,42 @@ impl BoundServer {
             scripts: scripts.clone(),
             script_zones: script_zones.clone(),
         };
-        let (entity_shutdown, mut entity_shutdown_requested) = tokio::sync::oneshot::channel();
-        let mut entity_ticker = tokio::spawn(async move {
-            let _pathing_tables_ready = prewarmed_entity_pathing_states;
-            let mut ticker = tokio::time::interval(play::ENTITY_TICK_PERIOD);
-            ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
-            let metrics_policy = RuntimeMetricsPolicy::default().normalized();
-            let mut metrics_log_gate = RuntimeMetricsLogGate::default();
-            let simulation_policy = entity_config.random_tick.normalized();
-            let mut natural_spawn_ticker =
-                natural_spawn_ticker::NaturalSpawnTicker::new(simulation_policy);
-            let mut tick_metrics = RuntimeTickMetricsWindow::default();
-            let (tick_metrics_publisher, mut tick_metrics_observations, tick_metrics_worker) =
-                spawn_runtime_tick_metrics_worker(entity_tick_metrics.clone());
-            let (memory_pressure_sampler, memory_pressure_worker) =
-                if let Some(control) = entity_runtime_control.as_ref() {
-                    let (sampler, worker) = control.spawn_memory_pressure_sampler();
-                    (Some(sampler), Some(worker))
-                } else {
-                    (None, None)
-                };
-            let mut tick = 0_u64;
-            let villager_population_ids = {
-                let item_id = |name: &str| {
-                    Identifier::parse(name)
-                        .ok()
-                        .and_then(|id| entity_config.items.id_of(&id))
-                };
-                let entity_type_id = |name: &str| {
-                    Identifier::parse(name)
-                        .ok()
-                        .and_then(|id| entity_config.entity_types.id_of(&id))
-                        .and_then(|id| i32::try_from(id).ok())
-                };
-                match (
-                    item_id("minecraft:bread"),
-                    item_id("minecraft:potato"),
-                    item_id("minecraft:carrot"),
-                    item_id("minecraft:beetroot"),
-                    entity_type_id("minecraft:villager"),
-                    entity_type_id("minecraft:item"),
-                ) {
-                    (
-                        Some(bread),
-                        Some(potato),
-                        Some(carrot),
-                        Some(beetroot),
-                        Some(villager),
-                        Some(item),
-                    ) => Some((
-                        mc_entity::villager_population_26_1_2::VillagerFoodItemIds {
-                            bread,
-                            potato,
-                            carrot,
-                            beetroot,
-                        },
-                        villager,
-                        item,
-                    )),
-                    _ => None,
-                }
-            };
-            let village_defense_golem_type_id = Identifier::parse("minecraft:iron_golem")
-                .ok()
-                .and_then(|id| entity_config.entity_types.id_of(&id))
-                .and_then(|id| i32::try_from(id).ok());
-            let mut session_empty_generation = entity_sessions.session_empty_generation();
-            let mut player_save_generation = entity_sessions.player_save_generation();
-            let mut simulation_command_window = SimulationCommandTelemetryWindow::default();
-            let mut simulation_command_gate = SimulationCommandGate::default();
-            let mut pushed_simulation_lane_attribution = Vec::new();
-            let mut entity_physics_job = None;
-            let mut entity_update_budget =
-                crate::runtime_entity_budget::EntityUpdateBudgetController::default();
-            let mut movement_publication_budget =
-                crate::runtime_entity_budget::MovementPublicationBudgetController::default();
-            let mut entity_budget_last_reliable_drops = 0_u64;
-            let mut scheduled_budget_exhausted_since_publish = false;
-            let mut inhabited_time = play::InhabitedTimeAccumulator::default();
-            loop {
-                let command_arrived = tokio::select! {
-                    biased;
-                    result = entity_world_journal_failure.changed() => {
-                        result.expect("session registry owns the world journal failure sender");
-                        if *entity_world_journal_failure.borrow_and_update() {
-                            warn!("world chunk journal failed; requesting controlled shutdown");
-                            entity_config.shutdown.request();
-                        }
-                        continue;
-                    }
-                    _ = &mut entity_shutdown_requested => {
-                        if let Some(job) = entity_physics_job.take() {
-                            apply_entity_physics_job_result(
-                                job.await,
-                                &simulation_owner,
-                                &entity_config,
-                                &entity_sessions,
-                                &entity_chunk_pipeline_resources,
-                                entity_world_read.as_ref(),
-                            )
-                            .await;
-                        }
-                        persist_inhabited_time_tail(
-                            &entity_config,
-                            entity_world_mutation.as_ref(),
-                            &mut inhabited_time,
-                        )
-                        .await;
-                        simulation_owner.shutdown();
-                        tick_metrics_publisher.try_publish(
-                            tick,
-                            &tick_metrics,
-                            scheduled_budget_exhausted_since_publish,
-                        );
-                        info!("simulation drain fenced; entity ticker stopping");
-                        break;
-                    }
-                    generation = wait_for_session_empty_save_request(
-                        &entity_sessions,
-                        session_empty_generation,
-                        periodic_save_requests.as_ref(),
-                        tick,
-                    ) => {
-                        session_empty_generation = generation;
-                        continue;
-                    }
-                    generation = wait_for_player_save_request(
-                        &entity_sessions,
-                        player_save_generation,
-                        periodic_save_requests.as_ref(),
-                        tick,
-                    ) => {
-                        player_save_generation = generation;
-                        continue;
-                    }
-                    result = wait_for_entity_physics_job(&mut entity_physics_job) => {
-                        let _completed_job = entity_physics_job.take();
-                        apply_entity_physics_job_result(
-                            result,
-                            &simulation_owner,
-                            &entity_config,
-                            &entity_sessions,
-                            &entity_chunk_pipeline_resources,
-                            entity_world_read.as_ref(),
-                        )
-                        .await;
-                        simulation_owner
-                            .tick_primed_tnt(
-                                &entity_sessions,
-                                entity_config.world.as_ref(),
-                                entity_config.block_light.as_deref(),
-                                &entity_config.block_facts,
-                                &entity_config.blocks,
-                                entity_pathing_materials.as_deref(),
-                                || {
-                                    entity_script_zones.as_ref().map(|zones| {
-                                        zones.protection_snapshot().unwrap_or_else(|error| {
-                                            warn!(
-                                                ?error,
-                                                "zone protection snapshot unavailable; denying explosion block damage"
-                                            );
-                                            crate::script::ZoneProtectionSnapshot::unavailable()
-                                        })
-                                    })
-                                },
-                            )
-                            .await;
-                        continue;
-                    }
-                    observation = tick_metrics_observations.recv(), if !tick_metrics_observations.is_closed() => {
-                        let Some(observation) = observation else {
-                            continue;
-                        };
-                        if let Some(control) = entity_runtime_control.as_ref() {
-                            let outcome = apply_runtime_control_operation(
-                                control,
-                                &entity_chunk_pipeline_resources,
-                                &entity_sessions,
-                                &entity_config.shutdown,
-                                RuntimeControlOperation::ObserveWork(runtime_work_input(
-                                    &observation.percentiles,
-                                    observation.scheduled_budget_exhausted,
-                                )),
-                            );
-                            if let Some(RuntimeControlOutcome::Work(decision)) = outcome.as_ref()
-                                && decision.action == crate::AutoscaleAction::ScaleDown
-                            {
-                                info!(
-                                    tick,
-                                    source_tick = observation.percentiles.source_tick,
-                                    action = ?decision.action,
-                                    focus = ?decision.focus,
-                                    entity_pathing_candidates =
-                                        decision.budgets.entity_pathing_candidates,
-                                    random_tick_chunk_budget =
-                                        decision.budgets.random_tick_chunks,
-                                    scheduled_tick_budget = decision.budgets.scheduled_ticks,
-                                    reason = %decision.reason,
-                                    "runtime work budgets changed"
-                                );
-                            } else if let Some(RuntimeControlOutcome::Work(decision)) =
-                                outcome.as_ref()
-                                && decision.action == crate::AutoscaleAction::ScaleUp
-                            {
-                                debug!(
-                                    tick,
-                                    source_tick = observation.percentiles.source_tick,
-                                    entity_pathing_candidates =
-                                        decision.budgets.entity_pathing_candidates,
-                                    random_tick_chunk_budget =
-                                        decision.budgets.random_tick_chunks,
-                                    scheduled_tick_budget = decision.budgets.scheduled_ticks,
-                                    reason = %decision.reason,
-                                    "runtime work budgets recovering"
-                                );
-                            }
-                        }
-                        continue;
-                    }
-                    signal = recv_runtime_control_signal(&mut entity_runtime_control_signals) => {
-                        let Some(signal) = signal else {
-                            entity_runtime_control_signals = None;
-                            continue;
-                        };
-                        if let Some(control) = entity_runtime_control.as_ref() {
-                            observe_runtime_control_signal(
-                                control,
-                                &entity_chunk_pipeline_resources,
-                                &entity_sessions,
-                                &entity_config.shutdown,
-                                signal,
-                            );
-                        }
-                        continue;
-                    }
-                    // An overdue tick is immediately ready. Commands must win the
-                    // biased select so overloaded ticks cannot starve player actions.
-                    ready = simulation_owner.wait_for_command(), if simulation_command_gate.accepts_off_tick_batch() => {
-                        if !ready {
-                            if let Some(job) = entity_physics_job.take() {
-                                apply_entity_physics_job_result(
-                                    job.await,
-                                    &simulation_owner,
-                                    &entity_config,
-                                    &entity_sessions,
-                                    &entity_chunk_pipeline_resources,
-                                    entity_world_read.as_ref(),
-                                )
-                                .await;
-                            }
-                            persist_inhabited_time_tail(
-                                &entity_config,
-                                entity_world_mutation.as_ref(),
-                                &mut inhabited_time,
-                            )
-                            .await;
-                            simulation_owner.shutdown();
-                            tick_metrics_publisher.try_publish(
-                                tick,
-                                &tick_metrics,
-                                scheduled_budget_exhausted_since_publish,
-                            );
-                            info!("simulation command channel closed; entity ticker stopping");
-                            break;
-                        }
-                        true
-                    }
-                    _ = ticker.tick() => false,
-                };
-                if command_arrived {
-                    let started = Instant::now();
-                    let report = simulation_owner
-                        .process_ready_commands_with_world_views(
-                            &entity_sessions,
-                            entity_config.world.as_ref(),
-                            play::SimulationWorldAccess {
-                                read: entity_world_read.as_ref(),
-                                mutation: entity_world_mutation.as_ref(),
-                                cpu: Some(&entity_chunk_pipeline_resources),
-                                light: entity_config.block_light.as_ref(),
-                            },
-                            entity_config.block_light.as_deref(),
-                            play::SIMULATION_COMMAND_BATCH_LIMIT,
-                        )
-                        .await;
-                    simulation_command_window
-                        .record_off_tick(elapsed_us(started), report.processed);
-                    simulation_command_gate.record_off_tick_batch();
-                    pushed_simulation_lane_attribution.extend(report.lane_attribution);
-                    continue;
-                }
-                simulation_command_gate.record_tick_boundary();
-                let tick_started = Instant::now();
-                tick = entity_sessions.simulation_tick().saturating_add(1);
-                if let Some(scripts) = entity_scripts.as_ref() {
-                    scripts.enqueue_server_tick(tick);
-                }
-                let work_budgets = entity_runtime_control
-                    .as_ref()
-                    .map(|control| control.snapshot().work_budgets)
-                    .unwrap_or(RuntimeWorkBudgets {
-                        random_tick_chunks: simulation_policy.chunk_budget,
-                        scheduled_ticks: simulation_policy.fluid_tick_budget,
-                        ..RuntimeWorkBudgets::default()
-                    });
-
-                let started = Instant::now();
-                let mut simulation_commands = simulation_owner
-                    .process_commands_with_world_views(
-                        &entity_sessions,
-                        entity_config.world.as_ref(),
-                        play::SimulationWorldAccess {
-                            read: entity_world_read.as_ref(),
-                            mutation: entity_world_mutation.as_ref(),
-                            cpu: Some(&entity_chunk_pipeline_resources),
-                            light: entity_config.block_light.as_ref(),
-                        },
-                        entity_config.block_light.as_deref(),
-                        play::SIMULATION_COMMAND_BATCH_LIMIT,
-                    )
-                    .await;
-                let simulation_command_telemetry = simulation_command_window
-                    .finish_tick(elapsed_us(started), simulation_commands.processed);
-                simulation_commands.processed = simulation_command_telemetry.processed;
-                pushed_simulation_lane_attribution
-                    .append(&mut simulation_commands.lane_attribution);
-                simulation_commands.lane_attribution =
-                    std::mem::take(&mut pushed_simulation_lane_attribution);
-                let mut simulation_commands_us = simulation_command_telemetry.elapsed_us;
-                let simulation_command_scope = simulation_command_telemetry.scope.as_str();
-                let mut simulation_command_cpu_admission_wait_us = simulation_commands
-                    .lane_attribution
-                    .iter()
-                    .map(|attribution| attribution.cpu_admission_wait_us)
-                    .sum::<u64>();
-                let mut simulation_command_post_admission_us = simulation_commands
-                    .lane_attribution
-                    .iter()
-                    .flat_map(|lane| &lane.commands)
-                    .map(|attribution| attribution.post_admission_command_us)
-                    .sum::<u64>();
-                let started = Instant::now();
-                let world_time = simulation_owner.advance_world_time(&entity_sessions, 1);
-                tick = entity_sessions.simulation_tick();
-                entity_sessions.synchronize_entity_lifecycle_epoch(tick);
-                simulation_owner
-                    .tick_dying_entities(&entity_sessions, entity_sessions.simulation_tick());
-                let world_time_us = elapsed_us(started);
-                natural_spawn_ticker.tick(
-                    &entity_sessions,
-                    tick,
-                    entity_world_read.as_ref(),
-                    entity_pathing_materials.as_deref(),
-                );
-                let started = Instant::now();
-                simulation_owner
-                    .run_sheep_grazing(
-                        &entity_config,
-                        &entity_sessions,
-                        entity_world_read.as_ref(),
-                        entity_world_mutation.as_ref(),
-                        tick,
-                    )
-                    .await;
-                let sheep_grazing_us = elapsed_us(started);
-                let mut animal_breeding_us = 0;
-                let physics_was_in_flight = entity_physics_job.is_some();
-                let started = Instant::now();
-                let queries = if physics_was_in_flight {
-                    Vec::new()
-                } else {
-                    simulation_owner.collect_entity_physics_queries(
-                        &entity_sessions,
-                        &entity_chunk_pipeline_resources,
-                        tick,
-                        play::EntitySimulationTickPolicy {
-                            entity_updates_per_lane: entity_update_budget.configured_per_lane(),
-                            pathing_candidates_per_entity: work_budgets.entity_pathing_candidates,
-                            simulation_distance: simulation_policy.simulation_distance,
-                        },
-                        simulation_owner.entity_world_context(
-                            entity_world_read.as_ref(),
-                            entity_pathing_materials.as_deref(),
-                            entity_config.blocks.as_ref(),
-                            entity_config.items.as_ref(),
-                        ),
-                    )
-                };
-                let entity_goals_us = elapsed_us(started);
-                let started = Instant::now();
-                simulation_owner.tick_hostile_attacks(
-                    &entity_sessions,
-                    tick,
-                    play::air_state_id(&entity_config.blocks),
-                );
-                let hostile_attacks_us = elapsed_us(started);
-                if tick.is_multiple_of(u64::from(ANIMAL_BREEDING_TICK_INTERVAL_TICKS)) {
-                    let started = Instant::now();
-                    simulation_owner.tick_animal_breeding(
-                        &entity_sessions,
-                        ANIMAL_BREEDING_TICK_INTERVAL_TICKS,
-                    );
-                    animal_breeding_us = elapsed_us(started);
-                }
-                if let Some((food_items, villager_type_id, item_type_id)) = villager_population_ids
-                {
-                    simulation_owner.tick_villager_population(
-                        &entity_sessions,
-                        tick,
-                        food_items,
-                        villager_type_id,
-                        item_type_id,
-                        1,
-                    );
-                }
-                if let Some(iron_golem_type_id) = village_defense_golem_type_id {
-                    simulation_owner.tick_village_defense(
-                        &entity_sessions,
-                        tick,
-                        iron_golem_type_id,
-                        entity_world_read.as_ref(),
-                        entity_pathing_materials.as_deref(),
-                    );
-                }
-                let entity_query_count = queries.len();
-                let (steps, entity_physics_us, entity_dispatch_us) = if physics_was_in_flight {
-                    (Vec::new(), 0, 0)
-                } else {
-                    let started = Instant::now();
-                    let inputs = prepare_entity_physics_inputs(
-                        &entity_config,
-                        entity_world_read.as_ref(),
-                        &queries,
-                    );
-                    if inputs.len() > ENTITY_PHYSICS_INLINE_LIMIT {
-                        entity_physics_job = Some(spawn_entity_physics_job(
-                            tick,
-                            queries,
-                            entity_chunk_pipeline_resources.clone(),
-                            inputs,
-                        ));
-                        (Vec::new(), elapsed_us(started), 0)
-                    } else {
-                        let physics_snapshot =
-                            inputs.first().map(|input| Arc::clone(&input.snapshot));
-                        let steps = step_entity_physics_inputs(
-                            entity_chunk_pipeline_resources.clone(),
-                            inputs,
-                        )
-                        .await;
-                        let entity_physics_us = elapsed_us(started);
-                        let world_is_current = physics_snapshot.as_ref().is_none_or(|snapshot| {
-                            entity_world_read.as_ref().is_some_and(|world_read| {
-                                entity_physics_snapshot_is_current(world_read, snapshot)
-                            })
-                        });
-                        if !world_is_current {
-                            debug!(
-                                tick,
-                                "discarded inline entity physics after world snapshot changed"
-                            );
-                            (Vec::new(), entity_physics_us, 0)
-                        } else {
-                            let arrow_physics_facts =
-                                physics_snapshot.map_or_else(Vec::new, |snapshot| {
-                                    arrow_physics_facts_from_steps(
-                                        tick, &queries, &snapshot, &steps,
-                                    )
-                                });
-                            let started = Instant::now();
-                            let accepted_steps = simulation_owner.apply_entity_physics_if_current(
-                                &entity_sessions,
-                                &entity_chunk_pipeline_resources,
-                                tick,
-                                &queries,
-                                &steps,
-                                &arrow_physics_facts,
-                            );
-                            let entity_dispatch_us = elapsed_us(started);
-                            let landed_falling_blocks =
-                                entity_sessions.landed_falling_blocks(&accepted_steps);
-                            if !landed_falling_blocks.is_empty() {
-                                simulation_owner
-                                    .land_falling_blocks(
-                                        &entity_config,
-                                        &entity_sessions,
-                                        entity_world_read.as_ref(),
-                                        &landed_falling_blocks,
-                                    )
-                                    .await;
-                            }
-                            (steps, entity_physics_us, entity_dispatch_us)
-                        }
-                    }
-                };
-                let entity_step_count = steps.len();
-                if entity_physics_job.is_none() {
-                    simulation_owner
-                        .tick_primed_tnt(
-                            &entity_sessions,
-                            entity_config.world.as_ref(),
-                            entity_config.block_light.as_deref(),
-                            &entity_config.block_facts,
-                            &entity_config.blocks,
-                            entity_pathing_materials.as_deref(),
-                            || {
-                                entity_script_zones.as_ref().map(|zones| {
-                                    zones.protection_snapshot().unwrap_or_else(|error| {
-                                        warn!(
-                                            ?error,
-                                            "zone protection snapshot unavailable; denying explosion block damage"
-                                        );
-                                        crate::script::ZoneProtectionSnapshot::unavailable()
-                                    })
-                                })
-                            },
-                        )
-                        .await;
-                }
-
-                let started = Instant::now();
-                let campfire_tick = simulation_owner
-                    .run_campfire_cooking_ticks(
-                        &entity_config,
-                        &entity_sessions,
-                        entity_world_read.as_ref(),
-                        entity_world_mutation.as_ref(),
-                    )
-                    .await;
-                let campfire_tick_us = elapsed_us(started);
-
-                let started = Instant::now();
-                let furnace_updated = simulation_owner
-                    .run_furnace_ticks(
-                        &entity_config,
-                        &entity_sessions,
-                        entity_world_read.as_ref(),
-                        entity_world_mutation.as_ref(),
-                    )
-                    .await;
-                let furnace_tick_us = elapsed_us(started);
-
-                let loaded_chunks = entity_sessions.loaded_chunks_sorted();
-                let spawning_chunks = entity_sessions.spawning_chunks_sorted();
-                let started = Instant::now();
-                let inhabited_updates = inhabited_time.observe_tick(tick, &spawning_chunks);
-                let missing = entity_world_mutation
-                    .as_ref()
-                    .map_or(inhabited_updates.clone(), |mutation| {
-                        mutation.increment_chunk_inhabited_times(&inhabited_updates)
-                    });
-                inhabited_time.restore(missing);
-                let inhabited_time_us = elapsed_us(started);
-                // `entity_save_us` is the synchronous save work executed inside this
-                // tick. It is intentionally zero: the request below is non-blocking,
-                // its tiny enqueue cost remains visible in total/unattributed tick time,
-                // and actual checkpoint I/O is reported by `SaveAllTimings` from the
-                // dedicated save worker.
-                let entity_save_us = 0;
-                if tick.is_multiple_of(simulation_policy.save_interval_ticks)
-                    && entity_sessions.active_session_count() > 0
-                {
-                    request_full_checkpoint(
-                        periodic_save_requests.as_ref(),
-                        tick,
-                        "periodic interval",
-                    );
-                }
-
-                let started = Instant::now();
-                let ambient_protection = entity_script_zones.as_ref().map(|zones| {
-                    zones.protection_snapshot().unwrap_or_else(|error| {
-                        warn!(
-                            ?error,
-                            "zone protection snapshot unavailable; denying ambient block mutation"
-                        );
-                        crate::script::ZoneProtectionSnapshot::unavailable()
-                    })
-                });
-                let random_tick = simulation_owner
-                    .run_random_ticks_with_budget(
-                        &entity_config,
-                        &entity_sessions,
-                        play::SimulationWorldAccess {
-                            read: entity_world_read.as_ref(),
-                            mutation: entity_world_mutation.as_ref(),
-                            cpu: Some(&entity_chunk_pipeline_resources),
-                            light: entity_config.block_light.as_ref(),
-                        },
-                        ambient_protection.as_ref(),
-                        tick,
-                        work_budgets.random_tick_chunks,
-                    )
-                    .await;
-                let random_tick_us = elapsed_us(started);
-
-                let (block_tick, block_tick_us) =
-                    if entity_scheduled_ticks
-                        .as_ref()
-                        .is_some_and(|scheduled_ticks| {
-                            loaded_block_tick_due(scheduled_ticks, &loaded_chunks, tick)
-                        })
-                    {
-                        let started = Instant::now();
-                        let job = spawn_scheduled_block_tick_job(
-                            tick,
-                            work_budgets.scheduled_ticks,
-                            Arc::clone(&entity_config),
-                            Arc::clone(&entity_sessions),
-                            entity_world_read.clone(),
-                            entity_world_mutation.clone(),
-                            ambient_protection.map(Arc::new),
-                            entity_chunk_pipeline_resources.clone(),
-                        );
-                        let (result, mid_tick_commands) =
-                            await_scheduled_block_tick_job_with_commands(
-                                job,
-                                &mut simulation_owner,
-                                &entity_config,
-                                &entity_sessions,
-                                entity_world_read.as_ref(),
-                                entity_world_mutation.as_ref(),
-                                &entity_chunk_pipeline_resources,
-                            )
-                            .await;
-                        simulation_commands_us =
-                            simulation_commands_us.saturating_add(mid_tick_commands.elapsed_us);
-                        simulation_commands.processed = simulation_commands
-                            .processed
-                            .saturating_add(mid_tick_commands.report.processed);
-                        simulation_commands.remaining_depth =
-                            mid_tick_commands.report.remaining_depth;
-                        simulation_command_cpu_admission_wait_us =
-                            simulation_command_cpu_admission_wait_us.saturating_add(
-                                mid_tick_commands
-                                    .report
-                                    .lane_attribution
-                                    .iter()
-                                    .map(|attribution| attribution.cpu_admission_wait_us)
-                                    .sum::<u64>(),
-                            );
-                        simulation_command_post_admission_us = simulation_command_post_admission_us
-                            .saturating_add(
-                                mid_tick_commands
-                                    .report
-                                    .lane_attribution
-                                    .iter()
-                                    .flat_map(|lane| &lane.commands)
-                                    .map(|attribution| attribution.post_admission_command_us)
-                                    .sum::<u64>(),
-                            );
-                        simulation_commands
-                            .lane_attribution
-                            .extend(mid_tick_commands.report.lane_attribution);
-                        let block_tick_us =
-                            elapsed_us(started).saturating_sub(mid_tick_commands.elapsed_us);
-                        let report = match result {
-                            Ok(completed) => {
-                                debug!(
-                                    tick = completed.tick,
-                                    drained = completed.report.drained,
-                                    applied = completed.report.applied,
-                                    elapsed_us = completed.elapsed_us,
-                                    "scheduled block tick job completed"
-                                );
-                                completed.report
-                            }
-                            Err(error) if error.is_cancelled() => {
-                                debug!("scheduled block tick job cancelled");
-                                play::ScheduledBlockTickReport {
-                                    budget: work_budgets.scheduled_ticks.max(1),
-                                    ..play::ScheduledBlockTickReport::default()
-                                }
-                            }
-                            Err(error) => {
-                                warn!(%error, "scheduled block tick job failed");
-                                play::ScheduledBlockTickReport {
-                                    budget: work_budgets.scheduled_ticks.max(1),
-                                    ..play::ScheduledBlockTickReport::default()
-                                }
-                            }
-                        };
-                        (report, block_tick_us)
-                    } else {
-                        (
-                            play::ScheduledBlockTickReport {
-                                budget: work_budgets.scheduled_ticks.max(1),
-                                ..play::ScheduledBlockTickReport::default()
-                            },
-                            0,
-                        )
-                    };
-
-                let started = Instant::now();
-                let fluid_tick = if entity_scheduled_ticks
-                    .as_ref()
-                    .is_some_and(|scheduled_ticks| {
-                        loaded_fluid_tick_due(scheduled_ticks, &loaded_chunks, tick)
-                    }) {
-                    simulation_owner
-                        .run_scheduled_fluid_ticks_with_budget(
-                            &entity_config,
-                            &entity_sessions,
-                            entity_world_read.as_ref(),
-                            entity_world_mutation.as_ref(),
-                            tick,
-                            work_budgets.scheduled_ticks,
-                        )
-                        .await
-                } else {
-                    play::ScheduledFluidTickReport {
-                        budget: work_budgets.scheduled_ticks.max(1),
-                        ..play::ScheduledFluidTickReport::default()
-                    }
-                };
-                let fluid_tick_us = elapsed_us(started);
-
-                let tick_us = elapsed_us(tick_started)
-                    .saturating_add(simulation_command_telemetry.off_tick_elapsed_us);
-                let (_, _, selected_entity_updates, active_entity_population) =
-                    entity_sessions.entity_update_budget_observation();
-                let target_tick_us = entity_runtime_control
-                    .as_ref()
-                    .map(|control| {
-                        control
-                            .snapshot()
-                            .policy
-                            .target_tick_ms
-                            .saturating_mul(1_000)
-                    })
-                    .unwrap_or(50_000);
-                let outbound_pressure = entity_sessions.pressure_snapshot();
-                let reliable_drops_increased =
-                    outbound_pressure.reliable_command_drops > entity_budget_last_reliable_drops;
-                entity_budget_last_reliable_drops = outbound_pressure.reliable_command_drops;
-                let entity_pressure = crate::runtime_entity_budget::EntityUpdatePressure {
-                    reliable_drops_increased,
-                    reliable_retries_in_flight: outbound_pressure
-                        .reliable_command_retries_in_flight,
-                    simulation_queue_depth: simulation_commands.remaining_depth,
-                };
-                let entity_update_budget_snapshot = entity_update_budget.observe(
-                    crate::runtime_entity_budget::EntityUpdateBudgetObservation {
-                        tick_us,
-                        entity_goals_us,
-                        selected: selected_entity_updates,
-                        active_population: active_entity_population,
-                        lane_count: entity_chunk_pipeline_resources.cpu_limit().max(1),
-                        target_tick_us,
-                        pressure: entity_pressure,
-                    },
-                );
-                let movement_budget =
-                    movement_publication_budget.observe(tick_us, target_tick_us, entity_pressure);
-                entity_sessions.set_entity_movement_publication_budget(movement_budget);
-                let current_tick_sample = RuntimeTickSample {
-                    tick_us,
-                    world_time_us,
-                    sheep_grazing_us,
-                    animal_breeding_us,
-                    hostile_attacks_us,
-                    entity_goals_us,
-                    entity_physics_us,
-                    entity_dispatch_us,
-                    campfire_tick_us,
-                    inhabited_time_us,
-                    entity_save_us,
-                    random_tick_us,
-                    block_tick_us,
-                    fluid_tick_us,
-                };
-                let attributed_tick_us = runtime_attributed_tick_us(
-                    &current_tick_sample,
-                    simulation_commands_us,
-                    furnace_tick_us,
-                );
-                let unattributed_tick_us = tick_us.saturating_sub(attributed_tick_us);
-                tick_metrics.record(current_tick_sample);
-                scheduled_budget_exhausted_since_publish |=
-                    block_tick.budget_exhausted || fluid_tick.budget_exhausted;
-                if let Some(control) = entity_runtime_control.as_ref() {
-                    if let Some(sampler) = memory_pressure_sampler.as_ref() {
-                        sampler.request();
-                    }
-                    observe_runtime_control_tick(
-                        control,
-                        &entity_chunk_pipeline_resources,
-                        &entity_sessions,
-                        &entity_config.shutdown,
-                        tick_us,
-                    );
-                }
-                if tick.is_multiple_of(metrics_policy.log_interval_ticks) {
-                    if tick_metrics_publisher.try_publish(
-                        tick,
-                        &tick_metrics,
-                        scheduled_budget_exhausted_since_publish,
-                    ) {
-                        scheduled_budget_exhausted_since_publish = false;
-                    }
-                    if let Some(percentiles) = entity_tick_metrics.snapshot()
-                        && tracing::enabled!(tracing::Level::DEBUG)
-                    {
-                        debug!(
-                            tick,
-                            world_time,
-                            tick_window_source_tick = percentiles.source_tick,
-                            tick_window_submit_us = percentiles.observer_submit_us,
-                            tick_window_compute_us = percentiles.observer_compute_us,
-                            tick_window_skipped = percentiles.observer_skipped_windows,
-                            tick_window_samples = percentiles.tick.samples,
-                            tick_window_capacity = tick_metrics.capacity(),
-                            tick_p50_us = percentiles.tick.p50_us,
-                            tick_p95_us = percentiles.tick.p95_us,
-                            tick_p99_us = percentiles.tick.p99_us,
-                            tick_max_us = percentiles.tick.max_us,
-                            world_time_p50_us = percentiles.world_time.p50_us,
-                            world_time_p95_us = percentiles.world_time.p95_us,
-                            world_time_p99_us = percentiles.world_time.p99_us,
-                            world_time_max_us = percentiles.world_time.max_us,
-                            sheep_grazing_p50_us = percentiles.sheep_grazing.p50_us,
-                            sheep_grazing_p95_us = percentiles.sheep_grazing.p95_us,
-                            sheep_grazing_p99_us = percentiles.sheep_grazing.p99_us,
-                            sheep_grazing_max_us = percentiles.sheep_grazing.max_us,
-                            animal_breeding_p50_us = percentiles.animal_breeding.p50_us,
-                            animal_breeding_p95_us = percentiles.animal_breeding.p95_us,
-                            animal_breeding_p99_us = percentiles.animal_breeding.p99_us,
-                            animal_breeding_max_us = percentiles.animal_breeding.max_us,
-                            hostile_attacks_p50_us = percentiles.hostile_attacks.p50_us,
-                            hostile_attacks_p95_us = percentiles.hostile_attacks.p95_us,
-                            hostile_attacks_p99_us = percentiles.hostile_attacks.p99_us,
-                            hostile_attacks_max_us = percentiles.hostile_attacks.max_us,
-                            entity_goals_p50_us = percentiles.entity_goals.p50_us,
-                            entity_goals_p95_us = percentiles.entity_goals.p95_us,
-                            entity_goals_p99_us = percentiles.entity_goals.p99_us,
-                            entity_goals_max_us = percentiles.entity_goals.max_us,
-                            entity_physics_p50_us = percentiles.entity_physics.p50_us,
-                            entity_physics_p95_us = percentiles.entity_physics.p95_us,
-                            entity_physics_p99_us = percentiles.entity_physics.p99_us,
-                            entity_physics_max_us = percentiles.entity_physics.max_us,
-                            entity_dispatch_p50_us = percentiles.entity_dispatch.p50_us,
-                            entity_dispatch_p95_us = percentiles.entity_dispatch.p95_us,
-                            entity_dispatch_p99_us = percentiles.entity_dispatch.p99_us,
-                            entity_dispatch_max_us = percentiles.entity_dispatch.max_us,
-                            campfire_tick_p50_us = percentiles.campfire_tick.p50_us,
-                            campfire_tick_p95_us = percentiles.campfire_tick.p95_us,
-                            campfire_tick_p99_us = percentiles.campfire_tick.p99_us,
-                            campfire_tick_max_us = percentiles.campfire_tick.max_us,
-                            inhabited_time_p50_us = percentiles.inhabited_time.p50_us,
-                            inhabited_time_p95_us = percentiles.inhabited_time.p95_us,
-                            inhabited_time_p99_us = percentiles.inhabited_time.p99_us,
-                            inhabited_time_max_us = percentiles.inhabited_time.max_us,
-                            entity_save_p50_us = percentiles.entity_save.p50_us,
-                            entity_save_p95_us = percentiles.entity_save.p95_us,
-                            entity_save_p99_us = percentiles.entity_save.p99_us,
-                            entity_save_max_us = percentiles.entity_save.max_us,
-                            random_tick_p50_us = percentiles.random_tick.p50_us,
-                            random_tick_p95_us = percentiles.random_tick.p95_us,
-                            random_tick_p99_us = percentiles.random_tick.p99_us,
-                            random_tick_max_us = percentiles.random_tick.max_us,
-                            block_tick_p50_us = percentiles.block_tick.p50_us,
-                            block_tick_p95_us = percentiles.block_tick.p95_us,
-                            block_tick_p99_us = percentiles.block_tick.p99_us,
-                            block_tick_max_us = percentiles.block_tick.max_us,
-                            fluid_tick_p50_us = percentiles.fluid_tick.p50_us,
-                            fluid_tick_p95_us = percentiles.fluid_tick.p95_us,
-                            fluid_tick_p99_us = percentiles.fluid_tick.p99_us,
-                            fluid_tick_max_us = percentiles.fluid_tick.max_us,
-                            "runtime tick percentile window"
-                        );
-                    }
-                }
-                if metrics_log_gate.should_log(tick, tick_us, metrics_policy) {
-                    let pressure = entity_sessions.pressure_snapshot();
-                    let lock_pressure = crate::lock_metrics::snapshot();
-                    if is_slow_tick(tick_us, metrics_policy) {
-                        warn!(
-                            tick,
-                            world_time,
-                            tick_us,
-                            world_time_us,
-                            sheep_grazing_us,
-                            animal_breeding_us,
-                            hostile_attacks_us,
-                            entity_goals_us,
-                            entity_physics_us,
-                            entity_dispatch_us,
-                            campfire_tick_us,
-                            furnace_tick_us,
-                            furnace_updated,
-                            unattributed_tick_us,
-                            inhabited_time_us,
-                            entity_save_us,
-                            random_tick_us,
-                            block_tick_us,
-                            fluid_tick_us,
-                            simulation_commands_us,
-                            simulation_commands_processed = simulation_commands.processed,
-                            simulation_commands_remaining = simulation_commands.remaining_depth,
-                            simulation_command_scope,
-                            simulation_command_cpu_admission_wait_us,
-                            simulation_command_post_admission_us,
-                            entity_queries = entity_query_count,
-                            entity_steps = entity_step_count,
-                            entity_update_budget_per_lane =
-                                entity_update_budget_snapshot.configured_per_lane,
-                            entity_update_budget_total =
-                                entity_update_budget_snapshot.effective_total,
-                            entity_update_selected = entity_update_budget_snapshot.selected,
-                            entity_update_active_population =
-                                entity_update_budget_snapshot.active_population,
-                            entity_update_rotation_ticks =
-                                entity_update_budget_snapshot.estimated_rotation_ticks,
-                            entity_physics_in_flight = entity_physics_job.is_some(),
-                            campfire_persisted = campfire_tick.persisted,
-                            campfire_completed = campfire_tick.completed,
-                            campfire_dropped = campfire_tick.dropped,
-                            random_sampled = random_tick.sampled,
-                            random_eligible = random_tick.eligible,
-                            random_applied = random_tick.applied,
-                            block_drained = block_tick.drained,
-                            block_applied = block_tick.applied,
-                            block_budget = block_tick.budget,
-                            block_budget_exhausted = block_tick.budget_exhausted,
-                            fluid_drained = fluid_tick.drained,
-                            fluid_applied = fluid_tick.applied,
-                            fluid_budget = fluid_tick.budget,
-                            fluid_budget_exhausted = fluid_tick.budget_exhausted,
-                            sessions = pressure.sessions,
-                            ticketed_chunks = pressure.ticketed_chunks,
-                            prepared_chunks = pressure.prepared_chunks,
-                            server_entities = pressure.server_entities,
-                            entity_spawn_dispatches = pressure.entity_dispatches.spawn,
-                            entity_move_dispatches = pressure.entity_dispatches.move_relative,
-                            entity_data_dispatches = pressure.entity_dispatches.data,
-                            entity_take_dispatches = pressure.entity_dispatches.take,
-                            entity_remove_dispatches = pressure.entity_dispatches.remove,
-                            best_effort_animation_drops = pressure.best_effort_animation_drops,
-                            reliable_command_drops = pressure.reliable_command_drops,
-                            reliable_command_retries = pressure.reliable_command_retries,
-                            reliable_command_retries_in_flight =
-                                pressure.reliable_command_retries_in_flight,
-                            furnace_viewer_sets = pressure.furnace_viewer_sets,
-                            chest_viewer_sets = pressure.chest_viewer_sets,
-                            world_lock_waits = lock_pressure.world_storage.wait_count,
-                            world_lock_wait_us = lock_pressure.world_storage.wait_us,
-                            world_lock_max_wait_us = lock_pressure.world_storage.max_wait_us,
-                            world_lock_hold_us = lock_pressure.world_storage.hold_us,
-                            world_lock_max_hold_us = lock_pressure.world_storage.max_hold_us,
-                            session_lock_waits = lock_pressure.session_registry.wait_count,
-                            session_lock_wait_us = lock_pressure.session_registry.wait_us,
-                            session_lock_max_wait_us = lock_pressure.session_registry.max_wait_us,
-                            session_lock_hold_us = lock_pressure.session_registry.hold_us,
-                            session_lock_max_hold_us = lock_pressure.session_registry.max_hold_us,
-                            container_lock_wait_us = lock_pressure.container_registry.wait_us,
-                            container_lock_max_wait_us =
-                                lock_pressure.container_registry.max_wait_us,
-                            container_lock_hold_us = lock_pressure.container_registry.hold_us,
-                            container_lock_max_hold_us =
-                                lock_pressure.container_registry.max_hold_us,
-                            save_flush_lock_wait_us = lock_pressure.save_all_flush.wait_us,
-                            save_flush_lock_hold_us = lock_pressure.save_all_flush.hold_us,
-                            chunk_prepare_lock_wait_us = lock_pressure.chunk_prepare.wait_us,
-                            chunk_prepare_lock_hold_us = lock_pressure.chunk_prepare.hold_us,
-                            player_persistence_lock_wait_us =
-                                lock_pressure.player_persistence.wait_us,
-                            player_persistence_lock_hold_us =
-                                lock_pressure.player_persistence.hold_us,
-                            "runtime tick exceeded performance budget"
-                        );
-                        let attributed_lane_waits = simulation_commands
-                            .lane_attribution
-                            .iter()
-                            .take(SLOW_SIMULATION_ATTRIBUTION_LIMIT)
-                            .map(|lane| lane.cpu_admission_wait_us)
-                            .collect::<Vec<_>>();
-                        let attributed_commands = simulation_commands
-                            .lane_attribution
-                            .iter()
-                            .flat_map(|lane| &lane.commands)
-                            .take(SLOW_SIMULATION_ATTRIBUTION_LIMIT)
-                            .collect::<Vec<_>>();
-                        let attributed_command_count = simulation_commands
-                            .lane_attribution
-                            .iter()
-                            .map(|lane| lane.commands.len())
-                            .sum::<usize>();
-                        let omitted_lanes = simulation_commands
-                            .lane_attribution
-                            .len()
-                            .saturating_sub(attributed_lane_waits.len());
-                        let omitted_commands =
-                            attributed_command_count.saturating_sub(attributed_commands.len());
-                        if !attributed_lane_waits.is_empty() || !attributed_commands.is_empty() {
-                            warn!(
-                                tick,
-                                simulation_command_scope,
-                                cpu_admission_wait_us_by_lane = ?attributed_lane_waits,
-                                simulation_commands = ?attributed_commands,
-                                omitted_lanes,
-                                omitted_commands,
-                                "slow simulation command attribution"
-                            );
-                        }
-                    } else {
-                        debug!(
-                            tick,
-                            world_time,
-                            tick_us,
-                            world_time_us,
-                            sheep_grazing_us,
-                            animal_breeding_us,
-                            hostile_attacks_us,
-                            entity_goals_us,
-                            entity_physics_us,
-                            entity_dispatch_us,
-                            campfire_tick_us,
-                            furnace_tick_us,
-                            furnace_updated,
-                            unattributed_tick_us,
-                            inhabited_time_us,
-                            entity_save_us,
-                            random_tick_us,
-                            block_tick_us,
-                            fluid_tick_us,
-                            simulation_commands_us,
-                            simulation_commands_processed = simulation_commands.processed,
-                            simulation_commands_remaining = simulation_commands.remaining_depth,
-                            simulation_command_scope,
-                            simulation_command_cpu_admission_wait_us,
-                            simulation_command_post_admission_us,
-                            entity_queries = entity_query_count,
-                            entity_steps = entity_step_count,
-                            entity_update_budget_per_lane =
-                                entity_update_budget_snapshot.configured_per_lane,
-                            entity_update_budget_total =
-                                entity_update_budget_snapshot.effective_total,
-                            entity_update_selected = entity_update_budget_snapshot.selected,
-                            entity_update_active_population =
-                                entity_update_budget_snapshot.active_population,
-                            entity_update_rotation_ticks =
-                                entity_update_budget_snapshot.estimated_rotation_ticks,
-                            entity_physics_in_flight = entity_physics_job.is_some(),
-                            campfire_persisted = campfire_tick.persisted,
-                            campfire_completed = campfire_tick.completed,
-                            campfire_dropped = campfire_tick.dropped,
-                            random_sampled = random_tick.sampled,
-                            random_eligible = random_tick.eligible,
-                            random_applied = random_tick.applied,
-                            block_drained = block_tick.drained,
-                            block_applied = block_tick.applied,
-                            block_budget = block_tick.budget,
-                            block_budget_exhausted = block_tick.budget_exhausted,
-                            fluid_drained = fluid_tick.drained,
-                            fluid_applied = fluid_tick.applied,
-                            fluid_budget = fluid_tick.budget,
-                            fluid_budget_exhausted = fluid_tick.budget_exhausted,
-                            sessions = pressure.sessions,
-                            ticketed_chunks = pressure.ticketed_chunks,
-                            prepared_chunks = pressure.prepared_chunks,
-                            server_entities = pressure.server_entities,
-                            entity_spawn_dispatches = pressure.entity_dispatches.spawn,
-                            entity_move_dispatches = pressure.entity_dispatches.move_relative,
-                            entity_data_dispatches = pressure.entity_dispatches.data,
-                            entity_take_dispatches = pressure.entity_dispatches.take,
-                            entity_remove_dispatches = pressure.entity_dispatches.remove,
-                            best_effort_animation_drops = pressure.best_effort_animation_drops,
-                            reliable_command_drops = pressure.reliable_command_drops,
-                            reliable_command_retries = pressure.reliable_command_retries,
-                            reliable_command_retries_in_flight =
-                                pressure.reliable_command_retries_in_flight,
-                            furnace_viewer_sets = pressure.furnace_viewer_sets,
-                            chest_viewer_sets = pressure.chest_viewer_sets,
-                            world_lock_waits = lock_pressure.world_storage.wait_count,
-                            world_lock_wait_us = lock_pressure.world_storage.wait_us,
-                            world_lock_max_wait_us = lock_pressure.world_storage.max_wait_us,
-                            world_lock_hold_us = lock_pressure.world_storage.hold_us,
-                            world_lock_max_hold_us = lock_pressure.world_storage.max_hold_us,
-                            session_lock_waits = lock_pressure.session_registry.wait_count,
-                            session_lock_wait_us = lock_pressure.session_registry.wait_us,
-                            session_lock_max_wait_us = lock_pressure.session_registry.max_wait_us,
-                            session_lock_hold_us = lock_pressure.session_registry.hold_us,
-                            session_lock_max_hold_us = lock_pressure.session_registry.max_hold_us,
-                            container_lock_wait_us = lock_pressure.container_registry.wait_us,
-                            container_lock_max_wait_us =
-                                lock_pressure.container_registry.max_wait_us,
-                            container_lock_hold_us = lock_pressure.container_registry.hold_us,
-                            container_lock_max_hold_us =
-                                lock_pressure.container_registry.max_hold_us,
-                            save_flush_lock_wait_us = lock_pressure.save_all_flush.wait_us,
-                            save_flush_lock_hold_us = lock_pressure.save_all_flush.hold_us,
-                            chunk_prepare_lock_wait_us = lock_pressure.chunk_prepare.wait_us,
-                            chunk_prepare_lock_hold_us = lock_pressure.chunk_prepare.hold_us,
-                            player_persistence_lock_wait_us =
-                                lock_pressure.player_persistence.wait_us,
-                            player_persistence_lock_hold_us =
-                                lock_pressure.player_persistence.hold_us,
-                            "runtime tick metrics"
-                        );
-                    }
-                }
-            }
-            drop(memory_pressure_sampler);
-            if let Some(worker) = memory_pressure_worker
-                && let Err(error) = worker.await
-            {
-                warn!(%error, "memory pressure sampler worker failed");
-            }
-            drop(tick_metrics_publisher);
-            drop(tick_metrics_observations);
-            if let Err(error) = tick_metrics_worker.await {
-                warn!(%error, "runtime tick metrics worker failed");
-            }
-        });
-        let runtime_control_signal_watcher = runtime_control.as_ref().map(|control| {
-            let control = control.clone();
-            let sessions = Arc::clone(&sessions);
-            let shutdown = shutdown.clone();
-            tokio::spawn(async move {
-                forward_slow_client_sheds_to_runtime_control(sessions, control, shutdown).await;
-            })
-        });
-        let mut command_tasks = tokio::task::JoinSet::new();
-        if let Some(extension_commands) = extension.clone() {
-            let extension_sessions = Arc::clone(&sessions);
-            let extension_shutdown = shutdown.clone();
-            command_tasks.spawn(async move {
-                run_extension_commands(extension_commands, extension_sessions, extension_shutdown)
-                    .await;
-                "extension command"
-            });
-        }
-        if let Some(script_commands) = scripts.clone() {
-            let script_config = Arc::clone(&config);
-            let script_sessions = Arc::clone(&sessions);
-            let script_runtime_control = runtime_control.clone();
-            let script_simulation = simulation.clone();
-            let script_chunk_pipeline_resources = chunk_pipeline_resources.clone();
-            let script_shutdown = shutdown.clone();
-            let script_zones = script_zones
-                .clone()
-                .expect("script boundary and zone adapter are created together");
-            command_tasks.spawn(async move {
-                run_script_commands(ScriptCommandTask {
-                    scripts: script_commands,
-                    storage: script_storage,
-                    config: script_config,
-                    sessions: script_sessions,
-                    runtime_control: script_runtime_control,
-                    simulation: script_simulation,
-                    chunk_pipeline_resources: script_chunk_pipeline_resources,
-                    shutdown: script_shutdown,
-                    zones: script_zones,
-                })
-                .await;
-                "script command"
-            });
-        }
-        let console_config = Arc::clone(&config);
-        let console_sessions = Arc::clone(&sessions);
-        let console_runtime_control = runtime_control.clone();
-        let console_simulation = simulation.clone();
-        let console_chunk_pipeline_resources = chunk_pipeline_resources.clone();
-        command_tasks.spawn(async move {
-            run_console_commands(
-                console_config,
-                console_sessions,
-                console_runtime_control,
-                console_simulation,
-                console_chunk_pipeline_resources,
-            )
-            .await;
-            "console command"
+        let (entity_shutdown, entity_shutdown_requested) = tokio::sync::oneshot::channel();
+        let mut entity_ticker = tokio::spawn(entity_ticker::run_entity_ticker(
+            entity_ticker::EntityTickerContext {
+                prewarmed_entity_pathing_states,
+                entity_world_journal_failure,
+                entity_shutdown_requested,
+                simulation_owner,
+                entity_config,
+                entity_sessions,
+                entity_chunk_pipeline_resources,
+                entity_world_read,
+                entity_world_mutation,
+                entity_scheduled_ticks,
+                periodic_save_requests: periodic_save_requests.clone(),
+                entity_runtime_control,
+                entity_runtime_control_signals,
+                entity_tick_metrics,
+                entity_pathing_materials,
+                entity_scripts,
+                entity_script_zones,
+            },
+        ));
+        let RuntimeCommandTasks {
+            mut command_tasks,
+            runtime_control_signal_watcher,
+        } = spawn_runtime_command_tasks(RuntimeCommandTaskContext {
+            config: Arc::clone(&config),
+            sessions: Arc::clone(&sessions),
+            runtime_control: runtime_control.clone(),
+            simulation: simulation.clone(),
+            chunk_pipeline_resources: chunk_pipeline_resources.clone(),
+            extension: extension.clone(),
+            scripts: scripts.clone(),
+            script_storage,
+            script_zones: script_zones.clone(),
+            shutdown: shutdown.clone(),
         });
         let mut entity_ticker_result = None;
         let mut command_drain_error = None;
@@ -2604,37 +1676,14 @@ impl BoundServer {
                             break;
                         }
                     };
-                    let Some(pre_auth_permit) = pre_auth_admission.try_acquire(peer.ip()) else {
-                        debug!(%peer, "pre-auth admission rejected connection");
-                        continue;
-                    };
-                    debug!(%peer, "accepted connection");
-                    let connection_permit = Arc::clone(&connection_permits)
-                        .try_acquire_owned()
-                        .expect("accept branch is enabled only while a connection permit exists");
-                    let services = connection_services.clone();
-                    connections.spawn(async move {
-                        let _connection_permit = connection_permit;
-                        if let Err(err) = Box::pin(handle_connection(
-                            socket,
-                            peer,
-                            services,
-                            pre_auth_permit,
-                        ))
-                        .await
-                        {
-                            match err {
-                                err if is_client_disconnect(&err) => {
-                                    debug!(%peer, "client disconnected");
-                                }
-                                other => {
-                                    warn!(%peer, error = %other, "connection terminated");
-                                }
-                            }
-                        } else {
-                            debug!(%peer, "connection finished");
-                        }
-                    });
+                    spawn_admitted_connection(
+                        &mut connections,
+                        socket,
+                        peer,
+                        &connection_services,
+                        &connection_permits,
+                        &pre_auth_admission,
+                    );
                 }
                 result = connections.join_next(), if !connections.is_empty() => {
                     if let Some(Err(err)) = result {
@@ -2733,49 +1782,8 @@ impl BoundServer {
                 simulation_barrier_result.and(ticker_result)
             }
         };
-        sessions.close_script_commit_event_outbox();
-        let mut script_commit_event_drain_result = match script_commit_event_worker.take() {
-            Some(worker) => match worker.await {
-                Ok(Ok(())) => Ok(()),
-                Ok(Err(error)) => Err(std::io::Error::other(format!(
-                    "committed script event drain failed: {error:?}"
-                ))),
-                Err(error) => Err(std::io::Error::other(format!(
-                    "committed script event worker failed: {error}"
-                ))),
-            },
-            None => Ok(()),
-        };
-        if let Some(watcher) = script_commit_event_failure_watcher.take() {
-            watcher.abort();
-            let _ = watcher.await;
-        }
-        let script_commit_events = sessions.script_commit_event_outbox_snapshot();
-        if script_commit_events.required_overflow != 0
-            || script_commit_events.required_closed != 0
-            || script_commit_events.required_abandoned_on_receiver_drop != 0
-        {
-            script_commit_event_drain_result = Err(std::io::Error::other(format!(
-                "required committed script event delivery failed: overflow={}, closed={}, abandoned={}, max_depth={}, capacity={}",
-                script_commit_events.required_overflow,
-                script_commit_events.required_closed,
-                script_commit_events.required_abandoned_on_receiver_drop,
-                script_commit_events.max_depth,
-                script_commit_events.capacity,
-            )));
-        }
-        let server_stopping_event_result = if let Some(scripts) = scripts.as_ref() {
-            let result = scripts
-                .enqueue_required_event(ScriptEvent::server_stopping("server stopping"))
-                .await
-                .map_err(|error| {
-                    std::io::Error::other(format!("server stopping script event failed: {error:?}"))
-                });
-            scripts.close_event_admission();
-            result
-        } else {
-            Ok(())
-        };
+        let (script_commit_event_drain_result, server_stopping_event_result) =
+            drain_script_commit_runtime(&sessions, scripts.as_ref(), script_commit_workers).await;
         while let Some(result) = command_tasks.join_next().await {
             if let Err(error) = log_command_task_exit(result, true)
                 && command_drain_error.is_none()
@@ -3110,6 +2118,93 @@ async fn startup_dirty_flush_remaining_dirty_count(config: &ServerConfig) -> Opt
     (dirty_chunks > 0).then_some(dirty_chunks)
 }
 
+struct RuntimeCommandTaskContext {
+    config: Arc<ServerConfig>,
+    sessions: Arc<play::SessionRegistry>,
+    runtime_control: Option<RuntimeControlHandle>,
+    simulation: play::SimulationHandle,
+    chunk_pipeline_resources: ChunkPipelineResources,
+    extension: Option<ExtensionEventSink>,
+    scripts: Option<ScriptEventSink>,
+    script_storage: Option<PluginStorageHandle>,
+    script_zones: Option<PluginZoneAdapter>,
+    shutdown: ShutdownHandle,
+}
+
+struct RuntimeCommandTasks {
+    command_tasks: tokio::task::JoinSet<&'static str>,
+    runtime_control_signal_watcher: Option<tokio::task::JoinHandle<()>>,
+}
+
+fn spawn_runtime_command_tasks(context: RuntimeCommandTaskContext) -> RuntimeCommandTasks {
+    let RuntimeCommandTaskContext {
+        config,
+        sessions,
+        runtime_control,
+        simulation,
+        chunk_pipeline_resources,
+        extension,
+        scripts,
+        script_storage,
+        script_zones,
+        shutdown,
+    } = context;
+    let runtime_control_signal_watcher = runtime_control.as_ref().map(|control| {
+        let control = control.clone();
+        let sessions = Arc::clone(&sessions);
+        let shutdown = shutdown.clone();
+        tokio::spawn(async move {
+            forward_slow_client_sheds_to_runtime_control(sessions, control, shutdown).await;
+        })
+    });
+    let mut command_tasks = tokio::task::JoinSet::new();
+    if let Some(extension_commands) = extension {
+        let extension_sessions = Arc::clone(&sessions);
+        let extension_shutdown = shutdown.clone();
+        command_tasks.spawn(async move {
+            run_extension_commands(extension_commands, extension_sessions, extension_shutdown)
+                .await;
+            "extension command"
+        });
+    }
+    if let Some(script_commands) = scripts {
+        let script_config = Arc::clone(&config);
+        let script_sessions = Arc::clone(&sessions);
+        let script_simulation = simulation.clone();
+        let script_shutdown = shutdown.clone();
+        let script_zones =
+            script_zones.expect("script boundary and zone adapter are created together");
+        command_tasks.spawn(async move {
+            run_script_commands(ScriptCommandTask {
+                scripts: script_commands,
+                storage: script_storage,
+                config: script_config,
+                sessions: script_sessions,
+                simulation: script_simulation,
+                shutdown: script_shutdown,
+                zones: script_zones,
+            })
+            .await;
+            "script command"
+        });
+    }
+    command_tasks.spawn(async move {
+        run_console_commands(
+            config,
+            sessions,
+            runtime_control,
+            simulation,
+            chunk_pipeline_resources,
+        )
+        .await;
+        "console command"
+    });
+    RuntimeCommandTasks {
+        command_tasks,
+        runtime_control_signal_watcher,
+    }
+}
+
 async fn run_extension_commands(
     extension: ExtensionEventSink,
     sessions: Arc<play::SessionRegistry>,
@@ -3138,9 +2233,7 @@ struct ScriptCommandTask {
     storage: Option<PluginStorageHandle>,
     config: Arc<ServerConfig>,
     sessions: Arc<play::SessionRegistry>,
-    runtime_control: Option<RuntimeControlHandle>,
     simulation: play::SimulationHandle,
-    chunk_pipeline_resources: ChunkPipelineResources,
     shutdown: ShutdownHandle,
     zones: PluginZoneAdapter,
 }
@@ -3151,9 +2244,7 @@ async fn run_script_commands(task: ScriptCommandTask) {
         storage,
         config,
         sessions,
-        runtime_control,
         simulation,
-        chunk_pipeline_resources,
         shutdown,
         zones,
     } = task;
@@ -3169,14 +2260,7 @@ async fn run_script_commands(task: ScriptCommandTask) {
                 };
                 if router.route(
                     command,
-                    ScriptRouter::context(
-                        &config,
-                        &sessions,
-                        runtime_control.as_ref(),
-                        &simulation,
-                        &chunk_pipeline_resources,
-                        &shutdown,
-                    ),
+                    ScriptRouter::context(&config, &sessions, &simulation, &shutdown),
                 ).await == ScriptRouterExit::Stop {
                     return;
                 }
@@ -3853,6 +2937,16 @@ pub(crate) async fn execute_console_command(
             );
             false
         }
+        Ok(play::commands::AdminCommand::Weather(command)) => {
+            let weather = match command {
+                play::commands::WeatherCommand::Clear => play::WeatherKind::Clear,
+                play::commands::WeatherCommand::Rain => play::WeatherKind::Rain,
+                play::commands::WeatherCommand::Thunder => play::WeatherKind::Thunder,
+            };
+            sessions.set_weather(weather);
+            info!(?weather, "console set weather");
+            false
+        }
         Ok(play::commands::AdminCommand::PlayersSleepingPercentage(value)) => {
             if let Some(value) = value {
                 sessions.set_players_sleeping_percentage(value);
@@ -4081,7 +3175,7 @@ struct CompletedEntityPhysics {
     expected: Vec<play::EntityPhysicsQuery>,
     snapshot: Arc<EntityPhysicsSnapshot>,
     steps: Vec<play::EntityPhysicsStep>,
-    arrow_physics_facts: Vec<play::ArrowPhysicsFact>,
+    projectile_physics_facts: play::EntityProjectilePhysicsFacts,
 }
 
 fn spawn_entity_physics_job(
@@ -4096,14 +3190,14 @@ fn spawn_entity_physics_job(
     tokio::spawn(async move {
         let _prepare_task = prepare_task;
         let steps = step_entity_physics_inputs(cpu_resources, inputs).await;
-        let arrow_physics_facts =
-            arrow_physics_facts_from_steps(tick, &expected, &snapshot, &steps);
+        let projectile_physics_facts =
+            entity_projectile_physics_facts_from_steps(tick, &expected, &snapshot, &steps);
         CompletedEntityPhysics {
             tick,
             expected,
             snapshot,
             steps,
-            arrow_physics_facts,
+            projectile_physics_facts,
         }
     })
 }
@@ -4154,7 +3248,7 @@ async fn apply_entity_physics_job_result(
         completed.tick,
         &completed.expected,
         &completed.steps,
-        &completed.arrow_physics_facts,
+        &completed.projectile_physics_facts,
     );
     if accepted_steps.len() != produced_steps {
         debug!(
@@ -4379,7 +3473,7 @@ fn arrow_physics_facts_from_steps(
             } else {
                 endpoint_block.is_some()
             };
-            let in_water = arrow_bounds_overlap_water(&sampler, step.position, query.aabb);
+            let in_water = entity_bounds_overlap_water(&sampler, step.position, query.aabb);
             Some(play::ArrowPhysicsFact {
                 arrow_id: step.id,
                 block_hit,
@@ -4396,7 +3490,93 @@ fn arrow_physics_facts_from_steps(
         .collect()
 }
 
-fn arrow_bounds_overlap_water(
+fn entity_projectile_physics_facts_from_steps(
+    tick: u64,
+    expected: &[play::EntityPhysicsQuery],
+    snapshot: &Arc<EntityPhysicsSnapshot>,
+    steps: &[play::EntityPhysicsStep],
+) -> play::EntityProjectilePhysicsFacts {
+    play::EntityProjectilePhysicsFacts {
+        arrows: arrow_physics_facts_from_steps(tick, expected, snapshot, steps),
+        hurting: hurting_projectile_physics_facts_from_steps(expected, snapshot, steps),
+        throwable: throwable_projectile_physics_facts_from_steps(expected, snapshot, steps),
+    }
+}
+
+fn throwable_projectile_physics_facts_from_steps(
+    expected: &[play::EntityPhysicsQuery],
+    snapshot: &Arc<EntityPhysicsSnapshot>,
+    steps: &[play::EntityPhysicsStep],
+) -> Vec<play::HurtingProjectilePhysicsFact> {
+    let sampler = SampledPhysicsWorld::without_entity_context(Arc::clone(snapshot));
+    let mut expected = expected.iter();
+    steps
+        .iter()
+        .filter_map(|step| {
+            let query = expected.find(|query| query.id == step.id)?;
+            if !matches!(
+                query.kind,
+                play::EntityPhysicsKind::ThrowableProjectile { .. }
+            ) {
+                return None;
+            }
+            let endpoint_block =
+                collision_block_touching_arrow_endpoint(&sampler, step.position, query.aabb);
+            let block_hit = endpoint_block.map(|(block_position, block_state)| {
+                play::HurtingProjectileBlockHitFact {
+                    projectile_id: step.id,
+                    block_state: mc_world::BlockStateId(block_state),
+                    block_position,
+                    location: step.position,
+                }
+            });
+            Some(play::HurtingProjectilePhysicsFact {
+                projectile_id: step.id,
+                block_hit,
+                in_water: entity_bounds_overlap_water(&sampler, query.position, query.aabb),
+            })
+        })
+        .collect()
+}
+
+fn hurting_projectile_physics_facts_from_steps(
+    expected: &[play::EntityPhysicsQuery],
+    snapshot: &Arc<EntityPhysicsSnapshot>,
+    steps: &[play::EntityPhysicsStep],
+) -> Vec<play::HurtingProjectilePhysicsFact> {
+    let sampler = SampledPhysicsWorld::without_entity_context(Arc::clone(snapshot));
+    let mut expected = expected.iter();
+    steps
+        .iter()
+        .filter_map(|step| {
+            let query = expected.find(|query| query.id == step.id)?;
+            if !matches!(
+                query.kind,
+                play::EntityPhysicsKind::HurtingProjectile { .. }
+                    | play::EntityPhysicsKind::ShulkerBullet { .. }
+            ) {
+                return None;
+            }
+            let endpoint_block =
+                collision_block_touching_arrow_endpoint(&sampler, step.position, query.aabb);
+            let block_hit = endpoint_block.map(|(block_position, block_state)| {
+                play::HurtingProjectileBlockHitFact {
+                    projectile_id: step.id,
+                    block_state: mc_world::BlockStateId(block_state),
+                    block_position,
+                    location: step.position,
+                }
+            });
+            Some(play::HurtingProjectilePhysicsFact {
+                projectile_id: step.id,
+                block_hit,
+                in_water: entity_bounds_overlap_water(&sampler, query.position, query.aabb),
+            })
+        })
+        .collect()
+}
+
+fn entity_bounds_overlap_water(
     sampler: &SampledPhysicsWorld,
     position: mc_entity::Vec3,
     aabb: mc_physics::Aabb,
@@ -4532,25 +3712,27 @@ impl BlockSampler for SampledPhysicsWorld {
             });
         if let Some(("minecraft:powder_snow", _)) = exact_shape {
             if self.fall_distance > 2.5 {
-                emit(BlockCollisionBox::from_fixed_4096([
+                if let Some(collision_box) = BlockCollisionBox::from_fixed_4096([
                     0,
                     0,
                     0,
                     4096,
                     (0.9_f32 * 4096.0) as i16,
                     4096,
-                ]));
+                ]) {
+                    emit(collision_box);
+                }
                 return;
             }
             match self.powder_snow_collision {
                 PowderSnowCollision::FallingBlock => {
-                    emit(BlockCollisionBox::from_sixteenths(0, 0, 0, 16, 16, 16));
+                    emit(BlockCollisionBox::FULL_BLOCK);
                     return;
                 }
                 PowderSnowCollision::WalkableMob
                     if self.entity_bottom > f64::from(y) + 1.0 - 1.0e-5_f32 as f64 =>
                 {
-                    emit(BlockCollisionBox::from_sixteenths(0, 0, 0, 16, 16, 16));
+                    emit(BlockCollisionBox::FULL_BLOCK);
                     return;
                 }
                 PowderSnowCollision::None | PowderSnowCollision::WalkableMob => {}
@@ -4558,13 +3740,18 @@ impl BlockSampler for SampledPhysicsWorld {
         }
         if let Some((_, boxes)) = exact_shape {
             for collision_box in boxes.iter() {
-                emit(BlockCollisionBox::from_fixed_4096(
-                    collision_box.coordinates(),
-                ));
+                if let Some(collision_box) =
+                    BlockCollisionBox::from_fixed_4096(collision_box.coordinates())
+                {
+                    emit(collision_box);
+                }
             }
         } else if let Some(height) = self.snapshot.materials.collision_height(state) {
             let max_y = (height.as_blocks() * 16.0) as u8;
-            emit(BlockCollisionBox::from_sixteenths(0, 0, 0, 16, max_y, 16));
+            if let Some(collision_box) = BlockCollisionBox::from_sixteenths(0, 0, 0, 16, max_y, 16)
+            {
+                emit(collision_box);
+            }
         }
     }
 }
@@ -4672,11 +3859,41 @@ fn entity_physics_samples_are_complete(
     true
 }
 
+fn entity_physics_bounds_velocity(query: play::EntityPhysicsQuery) -> mc_entity::Vec3 {
+    let velocity = mc_entity::projectile_26_1_2::Vec3::new(
+        query.velocity.x,
+        query.velocity.y,
+        query.velocity.z,
+    );
+    let next = match query.kind {
+        play::EntityPhysicsKind::HurtingProjectile {
+            acceleration_power_bits,
+            ..
+        } => mc_entity::projectile_26_1_2::next_hurting_projectile_velocity(
+            velocity,
+            f64::from_bits(acceleration_power_bits),
+            false,
+        )
+        .ok(),
+        play::EntityPhysicsKind::ThrowableProjectile { gravity_bits, .. } => {
+            mc_entity::projectile_26_1_2::next_throwable_velocity(
+                velocity,
+                f64::from_bits(gravity_bits),
+                false,
+                false,
+            )
+        }
+        _ => return query.velocity,
+    };
+    next.map(|velocity| mc_entity::Vec3::new(velocity.x, velocity.y, velocity.z))
+        .unwrap_or(query.velocity)
+}
+
 fn entity_physics_sample_bounds(query: play::EntityPhysicsQuery) -> EntityPhysicsSampleBounds {
     let config = physics_config_for_query(query);
     let body = EntityBody {
         position: physics_vec(query.position),
-        velocity: physics_vec(query.velocity),
+        velocity: physics_vec(entity_physics_bounds_velocity(query)),
         aabb: query.aabb,
         on_ground: query.on_ground,
     };
@@ -4702,6 +3919,15 @@ fn entity_physics_sample_bounds(query: play::EntityPhysicsQuery) -> EntityPhysic
 }
 
 fn step_sampled_entity(input: EntityPhysicsInput) -> play::EntityPhysicsStep {
+    if matches!(input.query.kind, play::EntityPhysicsKind::ExternalFlight) {
+        return play::EntityPhysicsStep {
+            id: input.query.id,
+            position: input.query.position,
+            velocity: input.query.velocity,
+            on_ground: false,
+            horizontal_collision: false,
+        };
+    }
     if !input.complete_samples {
         return play::EntityPhysicsStep {
             id: input.query.id,
@@ -4712,10 +3938,50 @@ fn step_sampled_entity(input: EntityPhysicsInput) -> play::EntityPhysicsStep {
         };
     }
     let sampler = SampledPhysicsWorld::for_query(input.snapshot, input.query);
+    let physics_velocity = match input.query.kind {
+        play::EntityPhysicsKind::Immobile => mc_entity::Vec3::ZERO,
+        play::EntityPhysicsKind::HurtingProjectile {
+            acceleration_power_bits,
+            ..
+        } => {
+            let in_water =
+                entity_bounds_overlap_water(&sampler, input.query.position, input.query.aabb);
+            let velocity = mc_entity::projectile_26_1_2::Vec3::new(
+                input.query.velocity.x,
+                input.query.velocity.y,
+                input.query.velocity.z,
+            );
+            mc_entity::projectile_26_1_2::next_hurting_projectile_velocity(
+                velocity,
+                f64::from_bits(acceleration_power_bits),
+                in_water,
+            )
+            .map(|velocity| mc_entity::Vec3::new(velocity.x, velocity.y, velocity.z))
+            .unwrap_or(input.query.velocity)
+        }
+        play::EntityPhysicsKind::ThrowableProjectile { gravity_bits, .. } => {
+            let in_water =
+                entity_bounds_overlap_water(&sampler, input.query.position, input.query.aabb);
+            let velocity = mc_entity::projectile_26_1_2::Vec3::new(
+                input.query.velocity.x,
+                input.query.velocity.y,
+                input.query.velocity.z,
+            );
+            mc_entity::projectile_26_1_2::next_throwable_velocity(
+                velocity,
+                f64::from_bits(gravity_bits),
+                false,
+                in_water,
+            )
+            .map(|velocity| mc_entity::Vec3::new(velocity.x, velocity.y, velocity.z))
+            .unwrap_or(input.query.velocity)
+        }
+        _ => input.query.velocity,
+    };
     let result = mc_physics::step_entity(
         EntityBody {
             position: physics_vec(input.query.position),
-            velocity: physics_vec(input.query.velocity),
+            velocity: physics_vec(physics_velocity),
             aabb: input.query.aabb,
             on_ground: input.query.on_ground,
         },
@@ -4740,16 +4006,30 @@ fn step_sampled_entity(input: EntityPhysicsInput) -> play::EntityPhysicsStep {
 fn physics_config_for_query(query: play::EntityPhysicsQuery) -> PhysicsConfig {
     match query.kind {
         play::EntityPhysicsKind::Default => PhysicsConfig::default(),
+        play::EntityPhysicsKind::Immobile | play::EntityPhysicsKind::ExternalFlight => {
+            PhysicsConfig {
+                gravity: 0.0,
+                air_drag: 1.0,
+                vertical_air_drag: 1.0,
+                water_drag: 1.0,
+                water_buoyancy: 0.0,
+                step_height: 0.0,
+                ..PhysicsConfig::default()
+            }
+        }
         play::EntityPhysicsKind::Living | play::EntityPhysicsKind::PowderSnowWalkableLiving => {
             PhysicsConfig::living_entity()
         }
         play::EntityPhysicsKind::AquaticLiving => PhysicsConfig::aquatic_entity(),
         play::EntityPhysicsKind::FallingBlock => PhysicsConfig::default(),
-        play::EntityPhysicsKind::ArrowProjectile { .. } => {
+        play::EntityPhysicsKind::ArrowProjectile { .. }
+        | play::EntityPhysicsKind::ShulkerBullet { .. }
+        | play::EntityPhysicsKind::HurtingProjectile { .. }
+        | play::EntityPhysicsKind::ThrowableProjectile { .. } => {
             let mut config = PhysicsConfig::arrow_projectile();
             // Retained projectile velocity is blocks per Minecraft tick. This
             // adapter resolves only the authoritative collision endpoint; the
-            // projectile kernel owns drag and gravity after impact ordering.
+            // projectile kernels own inertia/drag/gravity ordering.
             config.tick_seconds = 1.0;
             config.gravity = 0.0;
             config.air_drag = 1.0;
@@ -4822,7 +4102,10 @@ fn material_ids(blocks: &BlockRegistry, facts: &BlockFactsTable) -> BlockMateria
     .with_water_states(fluid_material_states(blocks, facts, FluidKind::Water))
     .with_lava_states(fluid_material_states(blocks, facts, FluidKind::Lava))
     .with_passable(passable)
-    .with_collision_height(farmland, BlockCollisionHeight::from_sixteenths(15))
+    .with_collision_height(
+        farmland,
+        BlockCollisionHeight::from_sixteenths(15).expect("valid farmland collision height"),
+    )
 }
 
 fn fluid_material_states(
@@ -4995,7 +4278,7 @@ async fn bind_internal(
         }
         sessions.install_world_chunk_journal(journal);
     }
-    let (simulation, simulation_owner) =
+    let (simulation, mut simulation_owner) =
         play::simulation_channel_with_explosion_seed(config.random_tick.seed as i64);
     play::configure_session_arrow_kill_rewards(&sessions, &config);
     play::configure_session_player_combat(&sessions, &config);
@@ -5041,11 +4324,13 @@ async fn bind_internal(
                     }
                     simulation_owner.restore_world_time(&sessions, metadata.world_time);
                     sessions.set_daylight_cycle_enabled(metadata.daylight_cycle_enabled);
+                    sessions.restore_weather(metadata.weather);
                     sessions.set_players_sleeping_percentage(metadata.players_sleeping_percentage);
                     sessions.set_keep_inventory(metadata.keep_inventory);
                     info!(
                         world_time = metadata.world_time,
                         daylight_cycle_enabled = metadata.daylight_cycle_enabled,
+                        weather = ?metadata.weather,
                         players_sleeping_percentage = metadata.players_sleeping_percentage,
                         keep_inventory = metadata.keep_inventory,
                         "loaded world metadata"
@@ -5103,6 +4388,13 @@ async fn bind_internal(
     } else {
         ConnectionWorld::default()
     };
+    if let Some(world_read) = connection_world.read.as_ref() {
+        simulation_owner.configure_player_movement_authority(
+            world_read.clone(),
+            Arc::clone(&config.blocks),
+            Arc::clone(&config.block_facts),
+        );
+    }
     play::hydrate_persisted_campfire_cooking_strict(&config, &sessions)
         .await
         .map_err(|error| {
@@ -5385,6 +4677,7 @@ async fn save_all_with_context_snapshot_locked(
         world_chunk_journal_watermark,
         world_time,
         daylight_cycle_enabled,
+        weather,
         players_sleeping_percentage,
         keep_inventory,
         mut world_flush_plan,
@@ -5397,6 +4690,7 @@ async fn save_all_with_context_snapshot_locked(
             snapshot.world_chunk_journal_watermark,
             snapshot.world_time,
             snapshot.daylight_cycle_enabled,
+            snapshot.weather,
             snapshot.players_sleeping_percentage,
             snapshot.keep_inventory,
             snapshot.world_flush_plan,
@@ -5411,6 +4705,7 @@ async fn save_all_with_context_snapshot_locked(
                 sessions.world_chunk_journal_watermark(),
                 sessions.world_time(),
                 sessions.daylight_cycle_enabled(),
+                sessions.weather(),
                 sessions.players_sleeping_percentage(),
                 sessions.keep_inventory(),
                 None,
@@ -5636,6 +4931,7 @@ async fn save_all_with_context_snapshot_locked(
     let metadata = play::persistence::WorldPersistedMetadata {
         world_time,
         daylight_cycle_enabled,
+        weather,
         players_sleeping_percentage,
         keep_inventory,
         world_identity: play::persistence::world_identity(&root),
@@ -5756,8 +5052,7 @@ mod tests {
     use super::*;
     use mc_data::blocks::{BlockReport, BlockStateReport};
     use mc_script::{
-        LuaHostConfig, ScriptEventKind, ScriptGameMode, ScriptPlayerContext, ScriptPlayerId,
-        script_boundary_pair, start_lua_host,
+        ScriptEventKind, ScriptGameMode, ScriptPlayerContext, ScriptPlayerId, script_boundary_pair,
     };
     use std::collections::BTreeMap;
     use std::future::Future;
@@ -5932,13 +5227,19 @@ mod tests {
         }
         sessions.close_script_commit_event_outbox();
         let mut failure = sessions.subscribe_script_commit_event_failure();
-        let worker = tokio::spawn(forward_committed_script_events(receiver, sink));
-        tokio::task::yield_now().await;
+        let worker = forward_committed_script_events(receiver, sink);
+        tokio::pin!(worker);
+        let waker = std::task::Waker::noop();
+        let mut context = std::task::Context::from_waker(waker);
+        assert!(matches!(
+            std::future::Future::poll(worker.as_mut(), &mut context),
+            std::task::Poll::Pending
+        ));
 
         tokio::time::advance(SCRIPT_COMMIT_FORWARD_TIMEOUT + Duration::from_millis(1)).await;
 
         assert!(matches!(
-            worker.await.unwrap(),
+            worker.await,
             Err(ScriptCommitForwardError::RequiredTimeout { timeout })
                 if timeout == SCRIPT_COMMIT_FORWARD_TIMEOUT
         ));
@@ -6276,9 +5577,7 @@ mod tests {
             storage: None,
             config,
             sessions: Arc::new(play::SessionRegistry::new()),
-            runtime_control: None,
             simulation,
-            chunk_pipeline_resources: ChunkPipelineResources::with_limits(1, 1),
             shutdown,
         })
         .await;
@@ -6287,81 +5586,6 @@ mod tests {
             scripts.recv_command().await.is_none(),
             "buffered script command must be consumed before the shutdown fence"
         );
-    }
-
-    #[tokio::test]
-    async fn script_stop_drains_later_commands_from_the_same_host_batch() {
-        let plugins = tempfile::tempdir().unwrap();
-        let plugin = plugins.path().join("stop-batch");
-        std::fs::create_dir(&plugin).unwrap();
-        std::fs::write(
-            plugin.join("plugin.toml"),
-            r#"id = "stop-batch"
-name = "Stop Batch"
-version = "0.1.0"
-api = "0.6.0"
-events = ["server.started", "server.stopping"]
-console_commands = ["stop"]
-"#,
-        )
-        .unwrap();
-        std::fs::write(
-            plugin.join("main.lua"),
-            r#"function on_server_started(_event)
-    solaris.run_console("stop")
-end
-
-function on_server_stopping(_event)
-    solaris.broadcast("accepted after stop")
-end
-"#,
-        )
-        .unwrap();
-
-        let (boundary, host) = start_lua_host(LuaHostConfig::new(plugins.path())).unwrap();
-        assert_eq!(host.loaded_plugins(), 1);
-        let shutdown_boundary = boundary.clone();
-        let scripts = ScriptEventSink::new(boundary);
-        let tmp = tempfile::tempdir().unwrap();
-        std::fs::create_dir_all(tmp.path().join("region")).unwrap();
-        let config = Arc::new(save_all_test_config(
-            tmp.path(),
-            Arc::new(BlockRegistry::from_report(&[]).unwrap()),
-            Arc::new(ItemRegistry::default()),
-            canonical_entity_types(),
-        ));
-        let sessions = Arc::new(play::SessionRegistry::new());
-        let shutdown = config.shutdown.clone();
-        let (simulation, _owner) = play::simulation_channel();
-
-        scripts.enqueue_event(ScriptEvent::server_started());
-        let command_task = tokio::spawn(run_script_commands(ScriptCommandTask {
-            scripts: scripts.clone(),
-            zones: PluginZoneAdapter::new(scripts.clone()),
-            storage: None,
-            config,
-            sessions,
-            runtime_control: None,
-            simulation,
-            chunk_pipeline_resources: ChunkPipelineResources::with_limits(1, 1),
-            shutdown: shutdown.clone(),
-        }));
-
-        shutdown.wait_requested().await;
-        scripts.enqueue_event(ScriptEvent::server_stopping("server stopping"));
-        shutdown_boundary.close_event_admission();
-        tokio::task::spawn_blocking(move || host.join())
-            .await
-            .unwrap()
-            .unwrap();
-        command_task.await.unwrap();
-
-        let leftover = scripts.recv_command().await;
-        assert!(
-            leftover.is_none(),
-            "script stop must drain commands emitted by the accepted stopping event"
-        );
-        drop(scripts);
     }
 
     #[test]
@@ -6486,6 +5710,7 @@ end
                     aabb: mc_physics::Aabb::COW,
                     on_ground: false,
                     fall_distance: 0.0,
+                    goal_fence: mc_entity::EntityGoalFence::Idle,
                     kind: play::EntityPhysicsKind::Default,
                 },
                 snapshot: Arc::clone(&snapshot),
@@ -6510,6 +5735,7 @@ end
             aabb: mc_physics::Aabb::COW,
             on_ground: false,
             fall_distance: 0.0,
+            goal_fence: mc_entity::EntityGoalFence::Idle,
             kind: play::EntityPhysicsKind::Default,
         };
         let inputs = vec![EntityPhysicsInput {
@@ -6552,6 +5778,7 @@ end
                     aabb: mc_physics::Aabb::COW,
                     on_ground: false,
                     fall_distance: 0.0,
+                    goal_fence: mc_entity::EntityGoalFence::Idle,
                     kind: play::EntityPhysicsKind::Default,
                 },
                 snapshot: Arc::clone(&snapshot),
@@ -6603,6 +5830,7 @@ end
                 aabb: mc_physics::Aabb::COW,
                 on_ground: false,
                 fall_distance: 0.0,
+                goal_fence: mc_entity::EntityGoalFence::Idle,
                 kind: play::EntityPhysicsKind::Default,
             })
             .collect::<Vec<_>>();
@@ -6861,6 +6089,7 @@ end
             },
             on_ground: false,
             fall_distance: 0.0,
+            goal_fence: mc_entity::EntityGoalFence::Idle,
             kind: play::EntityPhysicsKind::ArrowProjectile {
                 revision: None,
                 embedded_block: None,
@@ -6927,6 +6156,7 @@ end
             },
             on_ground: true,
             fall_distance: 0.0,
+            goal_fence: mc_entity::EntityGoalFence::Idle,
             kind: play::EntityPhysicsKind::ArrowProjectile {
                 revision: None,
                 embedded_block: Some(mc_entity::projectile_26_1_2::BlockPosition::new(8, 64, 8)),
@@ -6996,6 +6226,7 @@ end
             },
             on_ground: false,
             fall_distance: 0.0,
+            goal_fence: mc_entity::EntityGoalFence::Idle,
             kind: play::EntityPhysicsKind::ArrowProjectile {
                 revision: None,
                 embedded_block: Some(mc_entity::projectile_26_1_2::BlockPosition::new(8, 64, 8)),
@@ -7019,6 +6250,64 @@ end
         ] {
             assert!((0.0..0.2).contains(&component));
         }
+    }
+
+    #[test]
+    fn hurting_projectile_physics_applies_inertia_before_collision_move() {
+        let reports = mc_data::blocks::solaris_required_blocks_report();
+        let air = state_id(&reports, "minecraft:air", &[]);
+        let blocks = Arc::new(BlockRegistry::from_report(&reports).unwrap());
+        let facts = BlockFactsTable::from_blocks_report(&reports);
+        let materials = material_ids(&blocks, &facts);
+        let position = mc_world::ChunkPos { x: 0, z: 0 };
+        let mut world = WorldStorage::in_memory(blocks);
+        world
+            .insert_generated_chunk(
+                position,
+                mc_world::Chunk::empty(
+                    position,
+                    mc_world::BlockStateId(air),
+                    Identifier::parse("minecraft:plains").unwrap(),
+                ),
+            )
+            .unwrap();
+        let query = play::EntityPhysicsQuery {
+            id: mc_entity::EntityId(75),
+            position: mc_entity::Vec3::new(8.5, 64.0, 8.5),
+            velocity: mc_entity::Vec3::new(0.1, 0.0, 0.0),
+            aabb: mc_physics::Aabb {
+                half_width: 0.15625,
+                height: 0.3125,
+            },
+            on_ground: false,
+            fall_distance: 0.0,
+            goal_fence: mc_entity::EntityGoalFence::Idle,
+            kind: play::EntityPhysicsKind::HurtingProjectile {
+                revision: Some(0),
+                acceleration_power_bits: 0.1_f64.to_bits(),
+            },
+        };
+        let input = sample_entity_physics_input(query, &mut world, &materials);
+        assert!(input.complete_samples);
+        let snapshot = Arc::clone(&input.snapshot);
+        let step = step_sampled_entity(input);
+        let expected = mc_entity::projectile_26_1_2::next_hurting_projectile_velocity(
+            mc_entity::projectile_26_1_2::Vec3::new(0.1, 0.0, 0.0),
+            0.1,
+            false,
+        )
+        .unwrap();
+
+        assert_eq!(step.velocity.x.to_bits(), expected.x.to_bits());
+        assert_eq!(step.velocity.y.to_bits(), expected.y.to_bits());
+        assert_eq!(step.velocity.z.to_bits(), expected.z.to_bits());
+        assert_eq!(
+            step.position.x.to_bits(),
+            (query.position.x + expected.x).to_bits()
+        );
+        let fact = hurting_projectile_physics_facts_from_steps(&[query], &snapshot, &[step])[0];
+        assert!(!fact.in_water);
+        assert!(fact.block_hit.is_none());
     }
 
     #[test]
@@ -7065,6 +6354,7 @@ end
             },
             on_ground: false,
             fall_distance: 0.0,
+            goal_fence: mc_entity::EntityGoalFence::Idle,
             kind: play::EntityPhysicsKind::ArrowProjectile {
                 revision: None,
                 embedded_block: None,
@@ -7140,6 +6430,7 @@ end
             aabb: mc_physics::Aabb::COW,
             on_ground: false,
             fall_distance: 0.0,
+            goal_fence: mc_entity::EntityGoalFence::Idle,
             kind: play::EntityPhysicsKind::Default,
         };
         let queries = [query];
@@ -7533,6 +6824,7 @@ end
             aabb: mc_physics::Aabb::COW,
             on_ground: true,
             fall_distance: 0.0,
+            goal_fence: mc_entity::EntityGoalFence::Idle,
             kind: play::EntityPhysicsKind::Default,
         };
         let step = step_sampled_entity(EntityPhysicsInput {
@@ -7581,6 +6873,7 @@ end
             aabb: mc_physics::Aabb::COW,
             on_ground: true,
             fall_distance: 0.0,
+            goal_fence: mc_entity::EntityGoalFence::Idle,
             kind: play::EntityPhysicsKind::Living,
         };
 
@@ -7588,7 +6881,9 @@ end
             step_sampled_entity(sample_entity_physics_input(query, &mut storage, &materials));
 
         assert!(step.horizontal_collision);
-        assert_eq!(step.position, query.position);
+        assert!((step.position.x - 8.55).abs() < 1.0e-9);
+        assert_eq!(step.position.y, query.position.y);
+        assert_eq!(step.position.z, query.position.z);
         assert_eq!(step.velocity, mc_entity::Vec3::ZERO);
         assert!(step.on_ground);
     }
@@ -7630,6 +6925,7 @@ end
             aabb: mc_physics::Aabb::COW,
             on_ground: true,
             fall_distance: 0.0,
+            goal_fence: mc_entity::EntityGoalFence::Idle,
             kind: play::EntityPhysicsKind::Living,
         };
 
@@ -7655,6 +6951,7 @@ end
             },
             on_ground: true,
             fall_distance: 0.0,
+            goal_fence: mc_entity::EntityGoalFence::Idle,
             kind: play::EntityPhysicsKind::Living,
         };
 
@@ -7678,6 +6975,7 @@ end
             },
             on_ground: false,
             fall_distance: 0.0,
+            goal_fence: mc_entity::EntityGoalFence::Idle,
             kind: play::EntityPhysicsKind::Living,
         };
 
@@ -7685,7 +6983,7 @@ end
             step_sampled_entity(sample_entity_physics_input(query, &mut storage, &materials));
 
         assert!(step.horizontal_collision);
-        assert_eq!(step.position.x, query.position.x);
+        assert!((step.position.x - 9.175).abs() < 1.0e-9);
     }
 
     struct FlatGenerator {
@@ -7732,6 +7030,7 @@ end
             aabb: mc_physics::Aabb::COW,
             on_ground: false,
             fall_distance: 0.0,
+            goal_fence: mc_entity::EntityGoalFence::Idle,
             kind: play::EntityPhysicsKind::Default,
         };
 
@@ -7778,6 +7077,7 @@ end
             aabb: mc_physics::Aabb::COW,
             on_ground: true,
             fall_distance: 0.0,
+            goal_fence: mc_entity::EntityGoalFence::Idle,
             kind: play::EntityPhysicsKind::Default,
         });
         let plans = entity_physics_sample_plans(&queries);
@@ -7837,6 +7137,7 @@ end
                 aabb: mc_physics::Aabb::COW,
                 on_ground: false,
                 fall_distance: 0.0,
+                goal_fence: mc_entity::EntityGoalFence::Idle,
                 kind: play::EntityPhysicsKind::Default,
             })
             .collect::<Vec<_>>();
@@ -10001,6 +9302,8 @@ end
         let sessions = play::SessionRegistry::new();
         sessions.set_world_time(99);
         sessions.set_daylight_cycle_enabled(false);
+        sessions.set_weather(play::WeatherKind::Thunder);
+        sessions.tick_weather(25);
         sessions.set_players_sleeping_percentage(50);
         let mut retained = mc_entity::EntityRetainedState::default();
         retained.item_pickup_ready_tick = Some(12);
@@ -10052,6 +9355,9 @@ end
         .unwrap();
         assert_eq!(bound.sessions.world_time(), 99);
         assert!(!bound.sessions.daylight_cycle_enabled());
+        assert_eq!(bound.sessions.weather().kind(), play::WeatherKind::Thunder);
+        assert!((bound.sessions.weather().rain_level() - 0.25).abs() < f32::EPSILON);
+        assert!((bound.sessions.weather().thunder_level() - 0.25).abs() < f32::EPSILON);
         assert_eq!(bound.sessions.players_sleeping_percentage(), 50);
         let records = bound.sessions.persisted_entity_records();
         assert_eq!(records.len(), 1);
@@ -10341,6 +9647,7 @@ end
             &play::persistence::WorldPersistedMetadata {
                 world_time: 77,
                 daylight_cycle_enabled: true,
+                weather: play::SessionRegistry::new().weather(),
                 players_sleeping_percentage: 100,
                 keep_inventory: false,
                 world_identity: "different-world".into(),

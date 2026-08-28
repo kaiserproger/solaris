@@ -7,8 +7,15 @@ use mc_entity::EntityId;
 use tracing::debug;
 
 use crate::play::PlayerPose;
-use crate::play::simulation::{CommittedPlayerPose, SimulationAuthority, SimulationRequestError};
+use crate::play::movement::{
+    PlayerMovementAuthorityError, PlayerMovementAuthorityResources, PlayerMovementRejection,
+    PlayerPoseCommitKind, valid_authoritative_pose,
+};
+use crate::play::simulation::{
+    CommittedPlayerPose, PlayerPoseCommitRequest, SimulationAuthority, SimulationRequestError,
+};
 
+use super::inventory::PlayerInventory;
 use super::outbound::VisibilityDispatch;
 use super::player_pose_authority::{
     AcceptedPlayerPose, PlayerBodyMutation, PlayerBodyPushes, PlayerContactContext,
@@ -20,6 +27,7 @@ use super::visibility::server_entity_snapshot_from;
 use super::{SessionId, SessionRegistry};
 
 impl SessionRegistry {
+    #[cfg(test)]
     pub(in crate::play) fn commit_player_pose(
         &self,
         authority: &SimulationAuthority,
@@ -27,7 +35,25 @@ impl SessionRegistry {
         pose: PlayerPose,
         exhaustion: f32,
     ) -> Result<(Vec<VisibilityDispatch>, CommittedPlayerPose), SimulationRequestError> {
-        self.commit_player_pose_batch(authority, vec![(id, pose, exhaustion)])
+        self.commit_player_pose_request(
+            authority,
+            PlayerPoseCommitRequest {
+                actor_session: id,
+                kind: PlayerPoseCommitKind::Movement,
+                pose,
+                exhaustion,
+            },
+            None,
+        )
+    }
+
+    pub(in crate::play) fn commit_player_pose_request(
+        &self,
+        authority: &SimulationAuthority,
+        request: PlayerPoseCommitRequest,
+        movement_authority: Option<&PlayerMovementAuthorityResources>,
+    ) -> Result<(Vec<VisibilityDispatch>, CommittedPlayerPose), SimulationRequestError> {
+        self.commit_player_pose_batch(authority, vec![request], movement_authority)
             .pop()
             .expect("single pose batch returns one result")
     }
@@ -35,7 +61,8 @@ impl SessionRegistry {
     pub(in crate::play) fn commit_player_pose_batch(
         &self,
         _authority: &SimulationAuthority,
-        requests: Vec<(SessionId, PlayerPose, f32)>,
+        requests: Vec<PlayerPoseCommitRequest>,
+        movement_authority: Option<&PlayerMovementAuthorityResources>,
     ) -> Vec<Result<(Vec<VisibilityDispatch>, CommittedPlayerPose), SimulationRequestError>> {
         struct AcceptedPose {
             index: usize,
@@ -54,11 +81,19 @@ impl SessionRegistry {
         let mut accepted_batch = Vec::with_capacity(requests.len());
         {
             let mut inner = self.lock_inner("accept player pose batch");
-            for (index, (id, pose, exhaustion)) in requests.into_iter().enumerate() {
-                if !inner.sessions.contains_key(&id) {
+            for (index, request) in requests.into_iter().enumerate() {
+                let PlayerPoseCommitRequest {
+                    actor_session: id,
+                    kind,
+                    pose,
+                    exhaustion,
+                } = request;
+                let Some(session) = inner.sessions.get(&id) else {
                     results[index] = Some(Err(SimulationRequestError::StaleSession));
                     continue;
-                }
+                };
+                let old_pose = session.pose;
+                let loaded_chunks = session.loaded.clone();
                 let Some(player_state) = inner.player_persistence.get(&id).cloned() else {
                     results[index] = Some(Err(SimulationRequestError::InvalidCommand));
                     continue;
@@ -74,6 +109,41 @@ impl SessionRegistry {
                     wait_started,
                     guard,
                 );
+                if !valid_authoritative_pose(pose) {
+                    results[index] = Some(Err(SimulationRequestError::PlayerMovementRejected(
+                        PlayerMovementRejection::InvalidPose,
+                    )));
+                    continue;
+                }
+                if kind == PlayerPoseCommitKind::Movement
+                    && let Some(authority) = movement_authority
+                {
+                    let feet = &player_state.inventory.slots[PlayerInventory::FEET_ARMOR_SLOT];
+                    let walks_on_powder_snow = !feet.is_empty()
+                        && inner
+                            .player_combat
+                            .items
+                            .name_of(feet.item_id)
+                            .is_some_and(|name| name.as_str() == "minecraft:leather_boots");
+                    if let Err(error) = authority.validate_movement(
+                        &loaded_chunks,
+                        old_pose,
+                        pose,
+                        player_state.game_mode,
+                        walks_on_powder_snow,
+                    ) {
+                        let error = match error {
+                            PlayerMovementAuthorityError::Rejected(reason) => {
+                                SimulationRequestError::PlayerMovementRejected(reason)
+                            }
+                            PlayerMovementAuthorityError::WorldUnavailable => {
+                                SimulationRequestError::WorldUnavailable
+                            }
+                        };
+                        results[index] = Some(Err(error));
+                        continue;
+                    }
+                }
                 player_state.pose = pose;
                 let resources_changed = player_state.survival.add_exhaustion(exhaustion);
                 let committed = CommittedPlayerPose {
@@ -448,3 +518,7 @@ fn complete_publication_batch(
 #[cfg(test)]
 #[path = "player_pose_adapter_tests.rs"]
 mod tests;
+
+#[cfg(test)]
+#[path = "player_pose_adapter_authority_tests.rs"]
+mod authority_tests;

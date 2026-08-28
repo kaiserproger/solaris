@@ -17,6 +17,7 @@ load-bench = ["mc-script/lua-runtime"]
 [dependencies]
 arc-swap = { workspace = true }
 mc-data = { path = "../mc-data" }
+mc-domain = { path = "../mc-domain" }
 mc-entity = { path = "../mc-entity" }
 mc-extension = { path = "../mc-extension" }
 mc-nbt = { path = "../mc-nbt" }

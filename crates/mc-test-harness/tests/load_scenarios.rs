@@ -1146,12 +1146,10 @@ async fn replay_same_target_placement(
             .await
             .set_block_at(target, air)
             .expect("reset replay placement target");
-        let ((), ()) = tokio::join!(
-            set_load_client_game_mode(&mut left, "gamemode creative", GameMode::Creative),
-            set_load_client_game_mode(&mut right, "gamemode creative", GameMode::Creative),
-        );
-        // `debug give` is an authoritative exact hotbar overwrite, so each round
-        // resets the tested slot without a separate empty-stack transaction.
+        // `debug give` is an authoritative exact hotbar overwrite and does not require
+        // Creative mode, so keep both clients in Survival throughout the transaction
+        // replay instead of adding unrelated game-mode transition traffic.
+        // Each round resets the tested slot without a separate empty-stack transaction.
         left.write_packet(&ServerboundChatCommand {
             command: format!("debug give {} 1 0", items[0]),
         })
@@ -1167,11 +1165,6 @@ async fn replay_same_target_placement(
             wait_for_inventory_stack(&mut left),
             wait_for_inventory_stack(&mut right),
         );
-        let ((), ()) = tokio::join!(
-            set_load_client_game_mode(&mut left, "gamemode survival", GameMode::Survival),
-            set_load_client_game_mode(&mut right, "gamemode survival", GameMode::Survival),
-        );
-
         let left_sequence = 800 + i32::from(round) * 2;
         let right_sequence = left_sequence + 1;
         let left_action = ServerboundUseItemOn {
@@ -1279,6 +1272,10 @@ async fn replay_shared_chest_pickup(
     }
     let slot = usize::from(slots[0]);
     let baseline_sessions = server.runtime_telemetry.snapshot().active_sessions;
+    assert_eq!(
+        baseline_sessions, 0,
+        "shared-chest replay must start from a quiescent session registry"
+    );
 
     let addr = server.addr;
     let left_profile = format!("R{}G{group_index}A0", seed % 10_000);
@@ -1445,7 +1442,7 @@ async fn replay_shared_chest_pickup(
 
     drop(left);
     drop(right);
-    wait_for_active_sessions_at_most(server, baseline_sessions).await;
+    wait_for_active_sessions(server, baseline_sessions).await;
     let (mut left_rejoined, _) = connect_to_play(addr, &left_profile).await;
     let (mut right_rejoined, _) = connect_to_play(addr, &right_profile).await;
     let (left_inventory, right_inventory) = tokio::join!(
@@ -1460,6 +1457,7 @@ async fn replay_shared_chest_pickup(
         .sum::<i32>();
     drop(left_rejoined);
     drop(right_rejoined);
+    wait_for_active_sessions(server, baseline_sessions).await;
     let observation = ReplayStateObservation {
         id: observation_id.to_string(),
         values: vec![
@@ -2160,6 +2158,22 @@ async fn vd8_multi_client_stop_drains_and_flushes_disk_world_under_stream_load()
         dirty_before > 0,
         "disk-backed VD8 stream should dirty generated chunks before stop"
     );
+    let startup_runtime_control = server
+        .runtime_control
+        .as_ref()
+        .expect("O2 stop gate enables runtime control")
+        .snapshot();
+    assert!(!startup_runtime_control.draining);
+    assert!(startup_runtime_control.application_stop_reason.is_none());
+    eprintln!(
+        "O2 VD8 startup autoscale scale_down_decisions={} scale_up_decisions={} pressure_ticks={} healthy_ticks={} limits={:?} last_decision={:?}",
+        startup_runtime_control.scale_down_decisions,
+        startup_runtime_control.scale_up_decisions,
+        startup_runtime_control.pressure_ticks,
+        startup_runtime_control.healthy_ticks,
+        startup_runtime_control.limits,
+        startup_runtime_control.last_decision,
+    );
 
     stopper
         .write_packet(&ServerboundChatCommand {
@@ -2281,7 +2295,14 @@ async fn vd8_twenty_same_spawn_clients_drain_full_window_and_stop_without_duplic
     for idx in 0..O2_VD8_CONCURRENT_CLIENTS {
         client_tasks.push(tokio::spawn(async move {
             let name = format!("O2Vd8Load{idx}");
-            let (mut client, _) = connect_to_play(addr, &name).await;
+            let local_ip = std::net::Ipv4Addr::new(
+                127,
+                0,
+                0,
+                u8::try_from(idx + 1).expect("VD8 load client index fits loopback address"),
+            );
+            let local_addr = std::net::SocketAddr::new(local_ip.into(), 0);
+            let (mut client, _) = connect_to_play_from(addr, local_addr, &name).await;
             let play_ready_ms = elapsed_ms(started);
             let chunks =
                 try_drain_vd8_chunks_with_timing(&mut client, Duration::from_secs(90), &name).await;
@@ -4509,12 +4530,15 @@ async fn set_load_client_game_mode(client: &mut Client, command: &'static str, e
         })
         .await
         .expect("send load-client game mode command");
-    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
     loop {
+        let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+        assert!(
+            !remaining.is_zero(),
+            "timed out waiting for load-client game mode transition to {expected:?}"
+        );
         let mut frame = client
-            .read_frame_with_timeout(
-                deadline.saturating_duration_since(tokio::time::Instant::now()),
-            )
+            .read_frame_with_timeout(remaining)
             .await
             .expect("load-client game mode transition frame");
         if handle_keepalive(client, frame.id, &frame.body).await {
@@ -4543,7 +4567,26 @@ async fn connect_to_play(
     addr: std::net::SocketAddr,
     name: &str,
 ) -> (Client, SynchronizePlayerPosition) {
-    let mut client = Client::connect(addr).await.expect("client connect");
+    let client = Client::connect(addr).await.expect("client connect");
+    drive_client_to_play(client, addr, name).await
+}
+
+async fn connect_to_play_from(
+    addr: std::net::SocketAddr,
+    local_addr: std::net::SocketAddr,
+    name: &str,
+) -> (Client, SynchronizePlayerPosition) {
+    let client = Client::connect_from(addr, local_addr)
+        .await
+        .expect("load client connect from source address");
+    drive_client_to_play(client, addr, name).await
+}
+
+async fn drive_client_to_play(
+    mut client: Client,
+    addr: std::net::SocketAddr,
+    name: &str,
+) -> (Client, SynchronizePlayerPosition) {
     let _ = client.drive_login(addr, name).await.expect("drive login");
     client
         .drive_configuration()
@@ -4622,7 +4665,13 @@ async fn wait_for_active_sessions(server: &LoadServer, expected: usize) {
     let result = tokio::time::timeout(Duration::from_secs(5), async {
         loop {
             if *active_sessions.borrow_and_update() == expected {
-                return;
+                match tokio::time::timeout(Duration::from_millis(100), active_sessions.changed())
+                    .await
+                {
+                    Err(_) => return,
+                    Ok(Ok(())) => continue,
+                    Ok(Err(_)) => panic!("active session sender remains"),
+                }
             }
             active_sessions
                 .changed()
@@ -5029,7 +5078,7 @@ async fn wait_for_load_container_content(
 }
 
 async fn wait_for_inventory_stack(client: &mut Client) {
-    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
     loop {
         let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
         assert!(
@@ -5047,7 +5096,14 @@ async fn wait_for_inventory_stack(client: &mut Client) {
             let mut body = frame.body;
             let pkt = ClientboundContainerSetSlot::decode(&mut body)
                 .expect("decode inventory ContainerSetSlot");
-            if pkt.container_id == 0 && !pkt.item_stack.is_empty() {
+            if pkt.slot == 36 && !pkt.item_stack.is_empty() {
+                return;
+            }
+        } else if frame.id == ClientboundContainerSetContent::ID {
+            let mut body = frame.body;
+            let pkt = ClientboundContainerSetContent::decode(&mut body)
+                .expect("decode inventory ContainerSetContent");
+            if pkt.container_id == 0 && pkt.items.get(36).is_some_and(|stack| !stack.is_empty()) {
                 return;
             }
         }

@@ -1,10 +1,10 @@
 use super::inventory::PlayerInventory;
 use super::session::VisibilityDispatch;
 use super::{BlockEditBatchOutcome, BlockEditPrecondition};
+use mc_data::ItemStack;
+use mc_domain::GameMode;
 use mc_entity::Vec3;
-use mc_protocol::packets::play::{
-    ClientboundExplode, EntityVec3, ExplosionBlockParticle, GameMode, ItemStack,
-};
+use mc_protocol::packets::play::{ClientboundExplode, EntityVec3, ExplosionBlockParticle};
 use mc_world::{BlockPos, BlockStateId};
 use std::collections::HashSet;
 

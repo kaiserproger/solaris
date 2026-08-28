@@ -4,9 +4,14 @@ use std::sync::atomic::Ordering;
 
 use mc_data::mob_behavior_26_1_2::{MobBehaviorTable, MobCombatPolicy};
 use mc_entity::{
-    AttributeKind, EntityCrossbowAttackPhase, EntityCrossbowAttackState, EntityGuardianBeamPhase,
-    EntityGuardianBeamState, EntityId, EntityLifecycle, EntityPrimedTntState,
-    EntitySimulationProjection, EntitySnapshot, GoalState, Rotation, SpawnEntity, Vec3,
+    AttributeKind, EntityBlazeAttackState, EntityBreezeAttackPhase, EntityBreezeAttackState,
+    EntityCrossbowAttackPhase, EntityCrossbowAttackState, EntityEvokerAttackPhase,
+    EntityEvokerAttackState, EntityEvokerFangState, EntityExplosionInteraction,
+    EntityGhastAttackState, EntityGuardianBeamPhase, EntityGuardianBeamState, EntityId,
+    EntityLifecycle, EntityPendingExplosionState, EntityPrimedTntState, EntityShulkerAttackState,
+    EntitySimulationProjection, EntitySnapshot, EntityWardenSonicBoomPhase,
+    EntityWardenSonicBoomState, EntityWitchAttackState, EntityWitchPotionKind, GoalState, Rotation,
+    SpawnEntity, Vec3,
 };
 use mc_world::BlockStateId;
 
@@ -22,14 +27,21 @@ use crate::play::{
 
 #[cfg(test)]
 use super::entity_lifecycle::nearby_entity_snapshots_locked;
-use super::entity_lifecycle::{nearby_entity_candidate_ids_locked, track_entity_chunk_locked};
+use super::entity_lifecycle::{
+    nearby_entity_candidate_ids_locked, remove_server_entity_locked, track_entity_chunk_locked,
+};
 use super::entity_owner::EntityOwnerAccess;
 use super::explosion_authority::schedule_primed_tnt_deadline_locked;
 use super::interaction_geometry::{distance_sq, entity_aabb};
 #[cfg(test)]
 use super::outbound::ServerEntitySnapshot;
 use super::outbound::{OutboundCommand, VisibilityDispatch};
-use super::projectiles::{initial_arrow_state, projectile_identity};
+use super::player_effects::PlayerEffectFacts;
+use super::projectiles::{
+    HurtingProjectileMotionProfile, initial_arrow_state, initial_hurting_projectile_state,
+    initial_hurting_projectile_state_with_motion, initial_throwable_projectile_state,
+    projectile_identity,
+};
 use super::visibility::{
     entity_event_dispatches_locked, initialize_entity_wire_state_from_snapshot_locked,
     server_entity_snapshot_from, session_recipients, spawn_entity_visibility_from_snapshot_locked,
@@ -55,6 +67,64 @@ const GUARDIAN_MIN_TARGET_DISTANCE_SQ: f64 = 9.0;
 const GUARDIAN_BEAM_START_EVENT: i8 = 21;
 const GUARDIAN_EASY_MAGIC_DAMAGE: f32 = 1.0;
 
+// Exact local 26.1.2 BlazeAttackGoal attackTime/attackStep defaults.
+const BLAZE_CHARGE_TICKS: u64 = 60;
+const BLAZE_SHOT_INTERVAL_TICKS: u64 = 6;
+const BLAZE_BURST_COOLDOWN_TICKS: u64 = 100;
+const BLAZE_CLOSE_MELEE_RANGE_SQ: f64 = 4.0;
+const BLAZE_CLOSE_MELEE_PERIOD_TICKS: u64 = 20;
+const BLAZE_PROJECTILE_Y_OFFSET: f64 = 1.4;
+const BLAZE_TARGET_Y_OFFSET: f64 = 0.9;
+
+// Exact local 26.1.2 SonicBoom behavior timings/ranges.
+const WARDEN_SONIC_RANGE_XZ: f64 = 15.0;
+const WARDEN_SONIC_RANGE_Y: f64 = 20.0;
+const WARDEN_SONIC_CHARGE_TICKS: u64 = 34;
+const WARDEN_SONIC_DURATION_TICKS: u64 = 60;
+const WARDEN_SONIC_COOLDOWN_TICKS: u64 = 40;
+const WARDEN_SONIC_EVENT: i8 = 62;
+const WARDEN_SONIC_DAMAGE: f32 = 10.0;
+
+const EVOKER_FANGS_WARMUP_TICKS: u64 = 20;
+const EVOKER_FANGS_CASTING_TICKS: u64 = 40;
+const EVOKER_FANGS_INTERVAL_TICKS: u64 = 100;
+const EVOKER_FANGS_RANGE: f64 = 12.0;
+const EVOKER_FANGS_DAMAGE: f32 = 6.0;
+const EVOKER_FANGS_EVENT: i8 = 4;
+
+const GHAST_FIREBALL_RANGE_SQ: f64 = 4096.0;
+const GHAST_FIREBALL_SHOT_CHARGE: i32 = 20;
+const GHAST_FIREBALL_RESET_CHARGE: i32 = -40;
+const GHAST_FIREBALL_SPAWN_OFFSET: f64 = 4.0;
+const GHAST_FIREBALL_Y_OFFSET: f64 = 2.5;
+const GHAST_FIREBALL_EXPLOSION_POWER: f32 = 1.0;
+
+const BREEZE_WIND_CHARGE_RANGE_SQ: f64 = 256.0;
+const BREEZE_WIND_CHARGE_INITIAL_DELAY_TICKS: u64 = 15;
+const BREEZE_WIND_CHARGE_RECOVERY_TICKS: u64 = 4;
+const BREEZE_WIND_CHARGE_COOLDOWN_TICKS: u64 = 10;
+const BREEZE_WIND_CHARGE_SPEED: f64 = 0.7;
+const BREEZE_WIND_CHARGE_EXPLOSION_POWER: f32 = 3.0;
+const BREEZE_WIND_CHARGE_FIRING_Y_OFFSET: f64 = 0.3;
+const BREEZE_WIND_CHARGE_TARGET_Y_FRACTION: f64 = 0.3;
+
+const WITHER_SKULL_RANGE: f64 = 20.0;
+const WITHER_SKULL_SHOT_PERIOD_TICKS: u64 = 40;
+const WITHER_SKULL_HEAD_Y_OFFSET: f64 = 3.0;
+const WITHER_SKULL_EXPLOSION_POWER: f32 = 1.0;
+
+const WITCH_ATTACK_INTERVAL_TICKS: u64 = 60;
+const WITCH_ATTACK_RANGE_SQ: f64 = 100.0;
+const WITCH_PROJECTILE_Y_OFFSET: f64 = 1.1;
+const WITCH_POTION_SPEED_NEAR: f64 = 0.45;
+const WITCH_POTION_SPEED_FAR: f64 = 0.75;
+
+// Local 26.1.2 ShulkerAttackGoal: first shot after 20 ticks, range < 20 blocks.
+const SHULKER_INITIAL_SHOT_DELAY_TICKS: u64 = 20;
+const SHULKER_SHOT_DELAY_STEPS: u64 = 10;
+const SHULKER_SHOT_DELAY_VARIANTS: u64 = 10;
+const SHULKER_ATTACK_RANGE_SQ: f64 = 400.0;
+
 struct HostileAttackTickEntity {
     id: EntityId,
     kind: HostileAttackKind,
@@ -62,7 +132,14 @@ struct HostileAttackTickEntity {
     rotation: Rotation,
     goal: GoalState,
     crossbow_attack: Option<EntityCrossbowAttackState>,
+    blaze_attack: Option<EntityBlazeAttackState>,
+    ghast_attack: Option<EntityGhastAttackState>,
+    breeze_attack: Option<EntityBreezeAttackState>,
+    witch_attack: Option<EntityWitchAttackState>,
     guardian_beam: Option<EntityGuardianBeamState>,
+    warden_sonic_boom: Option<EntityWardenSonicBoomState>,
+    shulker_attack: Option<EntityShulkerAttackState>,
+    evoker_attack: Option<EntityEvokerAttackState>,
 }
 
 struct HostileTargetTickSession {
@@ -70,6 +147,7 @@ struct HostileTargetTickSession {
     entity_id: i32,
     position: Vec3,
     visible_entities: Arc<HashSet<EntityId>>,
+    effect_facts: Option<PlayerEffectFacts>,
 }
 
 struct PlannedCreeperFuse {
@@ -87,6 +165,17 @@ enum HostileAttackKind {
         follow_range: f64,
         attack_damage: f32,
     },
+    SmallFireball {
+        follow_range: f64,
+        attack_damage: f32,
+    },
+    SonicBoom,
+    ShulkerBullet,
+    EvokerFangs,
+    LargeFireball,
+    WindCharge,
+    ThrownPotion,
+    WitherSkull,
     Melee {
         attack_damage: f32,
     },
@@ -100,6 +189,84 @@ struct PlannedArrowAttack {
     velocity: Vec3,
     rotation: Rotation,
     animate_shooter: bool,
+}
+
+#[derive(Debug, Clone)]
+struct PlannedSmallFireballAttack {
+    hostile_id: EntityId,
+    entity_type_id: i32,
+    position: Vec3,
+    direction: Vec3,
+    rotation: Rotation,
+}
+
+#[derive(Debug, Clone)]
+struct PlannedLargeFireballAttack {
+    hostile_id: EntityId,
+    entity_type_id: i32,
+    position: Vec3,
+    direction: Vec3,
+    rotation: Rotation,
+    air_block_state: u32,
+}
+
+#[derive(Debug, Clone)]
+struct PlannedWitherSkullAttack {
+    hostile_id: EntityId,
+    entity_type_id: i32,
+    position: Vec3,
+    direction: Vec3,
+    rotation: Rotation,
+    air_block_state: u32,
+}
+
+struct PlannedGhastTransition {
+    hostile_id: EntityId,
+    expected: Option<EntityGhastAttackState>,
+    next: Option<EntityGhastAttackState>,
+    shot: Option<PlannedLargeFireballAttack>,
+}
+
+#[derive(Debug, Clone)]
+struct PlannedWindChargeAttack {
+    hostile_id: EntityId,
+    entity_type_id: i32,
+    position: Vec3,
+    velocity: Vec3,
+    rotation: Rotation,
+    air_block_state: u32,
+}
+
+struct PlannedBreezeTransition {
+    hostile_id: EntityId,
+    expected: Option<EntityBreezeAttackState>,
+    next: Option<EntityBreezeAttackState>,
+    shot: Option<PlannedWindChargeAttack>,
+}
+
+#[derive(Debug, Clone)]
+struct PlannedThrownPotionAttack {
+    hostile_id: EntityId,
+    entity_type_id: i32,
+    position: Vec3,
+    velocity: Vec3,
+    rotation: Rotation,
+    potion: EntityWitchPotionKind,
+}
+
+struct PlannedWitchTransition {
+    hostile_id: EntityId,
+    expected: Option<EntityWitchAttackState>,
+    next: Option<EntityWitchAttackState>,
+    shot: Option<PlannedThrownPotionAttack>,
+}
+
+struct PlannedBlazeTransition {
+    hostile_id: EntityId,
+    expected: Option<EntityBlazeAttackState>,
+    next: Option<EntityBlazeAttackState>,
+    shot: Option<PlannedSmallFireballAttack>,
+    melee: Option<PlannedMeleeAttack>,
 }
 
 struct PlannedCrossbowTransition {
@@ -125,6 +292,52 @@ struct PlannedGuardianBeamAttack {
     attack_damage: f32,
 }
 
+struct PlannedWardenSonicTransition {
+    hostile_id: EntityId,
+    expected: Option<EntityWardenSonicBoomState>,
+    next: Option<EntityWardenSonicBoomState>,
+    charge_started: bool,
+    attack: Option<PlannedWardenSonicAttack>,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct PlannedWardenSonicAttack {
+    hostile_id: EntityId,
+    target_session: super::SessionId,
+}
+
+struct PlannedShulkerTransition {
+    hostile_id: EntityId,
+    expected: Option<EntityShulkerAttackState>,
+    next: Option<EntityShulkerAttackState>,
+    shot: Option<PlannedShulkerBulletAttack>,
+}
+
+#[derive(Debug, Clone)]
+struct PlannedShulkerBulletAttack {
+    hostile_id: EntityId,
+    entity_type_id: i32,
+    target_entity_id: i32,
+    position: Vec3,
+    rotation: Rotation,
+}
+
+struct PlannedEvokerTransition {
+    hostile_id: EntityId,
+    expected: Option<EntityEvokerAttackState>,
+    next: Option<EntityEvokerAttackState>,
+    fangs: Vec<PlannedEvokerFang>,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct PlannedEvokerFang {
+    owner_id: EntityId,
+    entity_type_id: i32,
+    position: Vec3,
+    rotation: Rotation,
+    warmup_delay_ticks: i32,
+}
+
 struct PlannedMeleeAttack {
     hostile_id: EntityId,
     target_session: super::SessionId,
@@ -141,6 +354,210 @@ fn deterministic_crossbow_delay_ticks(entity_id: EntityId, tick: u64) -> u64 {
     let mixed = u64::from(entity_id.0.unsigned_abs()).wrapping_mul(0x9E37_79B9_7F4A_7C15)
         ^ tick.rotate_left(17);
     PILLAGER_CROSSBOW_ATTACK_DELAY_MIN_TICKS + mixed % PILLAGER_CROSSBOW_ATTACK_DELAY_SPAN_TICKS
+}
+
+fn deterministic_shulker_delay_ticks(entity_id: EntityId, tick: u64) -> u64 {
+    let mixed = u64::from(entity_id.0.unsigned_abs()).wrapping_mul(0xD6E8_FEB8_6659_FD93)
+        ^ tick.rotate_left(11);
+    SHULKER_INITIAL_SHOT_DELAY_TICKS
+        + (mixed % SHULKER_SHOT_DELAY_VARIANTS) * SHULKER_SHOT_DELAY_STEPS
+}
+
+fn plan_evoker_fang_pattern(
+    hostile: &HostileAttackTickEntity,
+    target: &HostileTargetTickSession,
+    entity_type_id: i32,
+) -> Vec<PlannedEvokerFang> {
+    let dx = target.position.x - hostile.position.x;
+    let dz = target.position.z - hostile.position.z;
+    let angle = dz.atan2(dx);
+    let y = hostile.position.y.min(target.position.y);
+    let rotation = |angle: f64| Rotation {
+        yaw: angle.to_degrees() as f32,
+        pitch: 0.0,
+        head_yaw: angle.to_degrees() as f32,
+    };
+    let fang = |reach: f64, angle: f64, warmup_delay_ticks: i32| PlannedEvokerFang {
+        owner_id: hostile.id,
+        entity_type_id,
+        position: Vec3::new(
+            hostile.position.x + angle.cos() * reach,
+            y,
+            hostile.position.z + angle.sin() * reach,
+        ),
+        rotation: rotation(angle),
+        warmup_delay_ticks,
+    };
+    if distance_sq(hostile.position, target.position) < 9.0 {
+        let mut fangs = Vec::with_capacity(13);
+        for i in 0..5 {
+            let fang_angle = angle + f64::from(i) * std::f64::consts::PI * 0.4;
+            fangs.push(fang(1.5, fang_angle, 0));
+        }
+        for i in 0..8 {
+            let fang_angle =
+                angle + f64::from(i) * std::f64::consts::TAU / 8.0 + std::f64::consts::TAU / 5.0;
+            fangs.push(fang(2.5, fang_angle, 3));
+        }
+        fangs
+    } else {
+        (0..16)
+            .map(|i| fang(1.25 * f64::from(i + 1), angle, i))
+            .collect()
+    }
+}
+
+fn plan_evoker_transition(
+    hostile: &HostileAttackTickEntity,
+    targets: &[HostileTargetTickSession],
+    fangs_entity_type_id: Option<i32>,
+    tick: u64,
+) -> Option<PlannedEvokerTransition> {
+    let expected = hostile.evoker_attack;
+    let target_valid = |target: &HostileTargetTickSession| {
+        target.visible_entities.contains(&hostile.id)
+            && distance_sq(hostile.position, target.position)
+                <= EVOKER_FANGS_RANGE * EVOKER_FANGS_RANGE
+    };
+    match expected {
+        None => {
+            let target = targets
+                .iter()
+                .filter(|target| target_valid(target))
+                .min_by(|left, right| {
+                    distance_sq(hostile.position, left.position)
+                        .total_cmp(&distance_sq(hostile.position, right.position))
+                })?;
+            Some(PlannedEvokerTransition {
+                hostile_id: hostile.id,
+                expected,
+                next: Some(EntityEvokerAttackState::new(
+                    EntityEvokerAttackPhase::Warmup,
+                    target.id,
+                    target.entity_id,
+                    tick.saturating_add(EVOKER_FANGS_WARMUP_TICKS),
+                )),
+                fangs: Vec::new(),
+            })
+        }
+        Some(state) if state.phase == EntityEvokerAttackPhase::Warmup => {
+            let target = targets.iter().find(|target| {
+                target.id == state.target_session
+                    && target.entity_id == state.target_entity_id
+                    && target_valid(target)
+            });
+            let Some(target) = target else {
+                return Some(PlannedEvokerTransition {
+                    hostile_id: hostile.id,
+                    expected,
+                    next: None,
+                    fangs: Vec::new(),
+                });
+            };
+            if tick < state.deadline_tick {
+                return None;
+            }
+            let entity_type_id = fangs_entity_type_id?;
+            Some(PlannedEvokerTransition {
+                hostile_id: hostile.id,
+                expected,
+                next: Some(EntityEvokerAttackState::new(
+                    EntityEvokerAttackPhase::Casting,
+                    state.target_session,
+                    state.target_entity_id,
+                    tick.saturating_add(
+                        EVOKER_FANGS_CASTING_TICKS.saturating_sub(EVOKER_FANGS_WARMUP_TICKS),
+                    ),
+                )),
+                fangs: plan_evoker_fang_pattern(hostile, target, entity_type_id),
+            })
+        }
+        Some(state) if state.phase == EntityEvokerAttackPhase::Casting => {
+            if tick < state.deadline_tick {
+                return None;
+            }
+            Some(PlannedEvokerTransition {
+                hostile_id: hostile.id,
+                expected,
+                next: Some(EntityEvokerAttackState::new(
+                    EntityEvokerAttackPhase::Cooldown,
+                    state.target_session,
+                    state.target_entity_id,
+                    tick.saturating_add(
+                        EVOKER_FANGS_INTERVAL_TICKS.saturating_sub(EVOKER_FANGS_CASTING_TICKS),
+                    ),
+                )),
+                fangs: Vec::new(),
+            })
+        }
+        Some(state) => {
+            if tick < state.deadline_tick {
+                return None;
+            }
+            Some(PlannedEvokerTransition {
+                hostile_id: hostile.id,
+                expected,
+                next: None,
+                fangs: Vec::new(),
+            })
+        }
+    }
+}
+
+fn plan_shulker_transition(
+    hostile: &HostileAttackTickEntity,
+    targets: &[HostileTargetTickSession],
+    bullet_entity_type_id: Option<i32>,
+    tick: u64,
+) -> Option<PlannedShulkerTransition> {
+    let expected = hostile.shulker_attack;
+    let target = targets
+        .iter()
+        .filter(|target| target.visible_entities.contains(&hostile.id))
+        .map(|target| (distance_sq(hostile.position, target.position), target))
+        .filter(|(distance, _)| *distance < SHULKER_ATTACK_RANGE_SQ)
+        .min_by(|left, right| left.0.total_cmp(&right.0))
+        .map(|(_, target)| target);
+    let Some(target) = target else {
+        return expected.map(|_| PlannedShulkerTransition {
+            hostile_id: hostile.id,
+            expected,
+            next: None,
+            shot: None,
+        });
+    };
+    match expected {
+        None => Some(PlannedShulkerTransition {
+            hostile_id: hostile.id,
+            expected,
+            next: Some(EntityShulkerAttackState::new(
+                tick.saturating_add(SHULKER_INITIAL_SHOT_DELAY_TICKS),
+            )),
+            shot: None,
+        }),
+        Some(state) if tick < state.deadline_tick => None,
+        Some(_) => {
+            let entity_type_id = bullet_entity_type_id?;
+            Some(PlannedShulkerTransition {
+                hostile_id: hostile.id,
+                expected,
+                next: Some(EntityShulkerAttackState::new(tick.saturating_add(
+                    deterministic_shulker_delay_ticks(hostile.id, tick),
+                ))),
+                shot: Some(PlannedShulkerBulletAttack {
+                    hostile_id: hostile.id,
+                    entity_type_id,
+                    target_entity_id: target.entity_id,
+                    position: Vec3::new(
+                        hostile.position.x,
+                        hostile.position.y + 0.5,
+                        hostile.position.z,
+                    ),
+                    rotation: hostile.rotation,
+                }),
+            })
+        }
+    }
 }
 
 fn plan_hostile_arrow(
@@ -192,6 +609,450 @@ fn plan_hostile_arrow(
             head_yaw: yaw,
         },
         animate_shooter: !crossbow,
+    })
+}
+
+fn plan_hostile_small_fireball(
+    hostile: &HostileAttackTickEntity,
+    target_position: Vec3,
+    entity_type_id: i32,
+) -> Option<PlannedSmallFireballAttack> {
+    let position = Vec3::new(
+        hostile.position.x,
+        hostile.position.y + BLAZE_PROJECTILE_Y_OFFSET,
+        hostile.position.z,
+    );
+    let direction = Vec3::new(
+        target_position.x - position.x,
+        target_position.y + BLAZE_TARGET_Y_OFFSET - position.y,
+        target_position.z - position.z,
+    );
+    let length_squared =
+        direction.x * direction.x + direction.y * direction.y + direction.z * direction.z;
+    if !length_squared.is_finite() || length_squared <= f64::EPSILON {
+        return None;
+    }
+    let horizontal = direction.x.hypot(direction.z);
+    let yaw = direction.z.atan2(direction.x).to_degrees() as f32 - 90.0;
+    let pitch = (-direction.y).atan2(horizontal).to_degrees() as f32;
+    if !yaw.is_finite() || !pitch.is_finite() {
+        return None;
+    }
+    Some(PlannedSmallFireballAttack {
+        hostile_id: hostile.id,
+        entity_type_id,
+        position,
+        direction,
+        rotation: Rotation {
+            yaw,
+            pitch,
+            head_yaw: yaw,
+        },
+    })
+}
+
+fn plan_ghast_transition(
+    hostile: &HostileAttackTickEntity,
+    targets: &[HostileTargetTickSession],
+    fireball_entity_type_id: Option<i32>,
+    air: BlockStateId,
+) -> Option<PlannedGhastTransition> {
+    let expected = hostile.ghast_attack;
+    let target = targets
+        .iter()
+        .filter(|target| target.visible_entities.contains(&hostile.id))
+        .map(|target| (distance_sq(hostile.position, target.position), target))
+        .filter(|(distance, _)| *distance < GHAST_FIREBALL_RANGE_SQ)
+        .min_by(|left, right| left.0.total_cmp(&right.0))
+        .map(|(_, target)| target);
+    let Some(target) = target else {
+        return expected.map(|_| PlannedGhastTransition {
+            hostile_id: hostile.id,
+            expected,
+            next: None,
+            shot: None,
+        });
+    };
+
+    let charge_time = expected.map_or(0, |state| state.charge_time) + 1;
+    if charge_time != GHAST_FIREBALL_SHOT_CHARGE {
+        return Some(PlannedGhastTransition {
+            hostile_id: hostile.id,
+            expected,
+            next: Some(EntityGhastAttackState::new(charge_time)),
+            shot: None,
+        });
+    }
+
+    let entity_type_id = fireball_entity_type_id?;
+    let dx = target.position.x - hostile.position.x;
+    let dz = target.position.z - hostile.position.z;
+    let horizontal = dx.hypot(dz);
+    if !horizontal.is_finite() || horizontal <= 1.0e-9 {
+        return None;
+    }
+    let spawn = Vec3::new(
+        hostile.position.x + dx / horizontal * GHAST_FIREBALL_SPAWN_OFFSET,
+        hostile.position.y + GHAST_FIREBALL_Y_OFFSET,
+        hostile.position.z + dz / horizontal * GHAST_FIREBALL_SPAWN_OFFSET,
+    );
+    let target_center = Vec3::new(
+        target.position.x,
+        target.position.y + 0.9,
+        target.position.z,
+    );
+    let direction = Vec3::new(
+        target_center.x - spawn.x,
+        target_center.y - spawn.y,
+        target_center.z - spawn.z,
+    );
+    Some(PlannedGhastTransition {
+        hostile_id: hostile.id,
+        expected,
+        next: Some(EntityGhastAttackState::new(GHAST_FIREBALL_RESET_CHARGE)),
+        shot: Some(PlannedLargeFireballAttack {
+            hostile_id: hostile.id,
+            entity_type_id,
+            position: spawn,
+            direction,
+            rotation: hostile.rotation,
+            air_block_state: air.0,
+        }),
+    })
+}
+
+fn plan_witch_transition(
+    hostile: &HostileAttackTickEntity,
+    targets: &[HostileTargetTickSession],
+    potion_entity_type_id: Option<i32>,
+    tick: u64,
+) -> Option<PlannedWitchTransition> {
+    let expected = hostile.witch_attack;
+    let target_valid = |target: &HostileTargetTickSession| {
+        target.visible_entities.contains(&hostile.id)
+            && distance_sq(hostile.position, target.position) <= WITCH_ATTACK_RANGE_SQ
+    };
+    let target = match expected {
+        Some(state) => targets.iter().find(|target| {
+            target.id == state.target_session
+                && target.entity_id == state.target_entity_id
+                && target_valid(target)
+        }),
+        None => targets
+            .iter()
+            .filter(|target| target_valid(target))
+            .min_by(|left, right| {
+                distance_sq(hostile.position, left.position)
+                    .total_cmp(&distance_sq(hostile.position, right.position))
+            }),
+    };
+    let Some(target) = target else {
+        return expected.map(|_| PlannedWitchTransition {
+            hostile_id: hostile.id,
+            expected,
+            next: None,
+            shot: None,
+        });
+    };
+    if expected.is_none() {
+        return Some(PlannedWitchTransition {
+            hostile_id: hostile.id,
+            expected,
+            next: Some(EntityWitchAttackState::new(
+                target.id,
+                target.entity_id,
+                tick.saturating_add(WITCH_ATTACK_INTERVAL_TICKS),
+            )),
+            shot: None,
+        });
+    }
+    let state = expected.expect("checked witch attack state");
+    if tick < state.deadline_tick {
+        return None;
+    }
+    let entity_type_id = potion_entity_type_id?;
+    let dx = target.position.x - hostile.position.x;
+    let dz = target.position.z - hostile.position.z;
+    let horizontal = dx.hypot(dz);
+    let dy = target.position.y + 1.62 - WITCH_PROJECTILE_Y_OFFSET - hostile.position.y
+        + horizontal * 0.2;
+    let length = (dx * dx + dy * dy + dz * dz).sqrt();
+    if !length.is_finite() || length <= f64::EPSILON {
+        return None;
+    }
+    let speed = if horizontal <= 2.0 {
+        WITCH_POTION_SPEED_NEAR
+    } else {
+        WITCH_POTION_SPEED_FAR
+    };
+    let velocity = Vec3::new(
+        dx / length * speed,
+        dy / length * speed,
+        dz / length * speed,
+    );
+    let facts = target.effect_facts;
+    let potion = if horizontal >= 8.0 && !facts.is_some_and(|facts| facts.has_slowness) {
+        EntityWitchPotionKind::Slowness
+    } else if facts.is_some_and(|facts| facts.health >= 8.0 && !facts.has_poison) {
+        EntityWitchPotionKind::Poison
+    } else {
+        // Vanilla has an additional 25% Weakness branch at <=3 blocks. Keep
+        // that RNG-owned branch explicit rather than inventing a new random stream.
+        EntityWitchPotionKind::Harming
+    };
+    Some(PlannedWitchTransition {
+        hostile_id: hostile.id,
+        expected,
+        next: Some(EntityWitchAttackState::new(
+            target.id,
+            target.entity_id,
+            tick.saturating_add(WITCH_ATTACK_INTERVAL_TICKS),
+        )),
+        shot: Some(PlannedThrownPotionAttack {
+            hostile_id: hostile.id,
+            entity_type_id,
+            position: Vec3::new(
+                hostile.position.x,
+                hostile.position.y + WITCH_PROJECTILE_Y_OFFSET,
+                hostile.position.z,
+            ),
+            velocity,
+            rotation: hostile.rotation,
+            potion,
+        }),
+    })
+}
+
+fn plan_wither_skull_attack(
+    hostile: &HostileAttackTickEntity,
+    targets: &[HostileTargetTickSession],
+    wither_skull_entity_type_id: Option<i32>,
+    air: BlockStateId,
+) -> Option<PlannedWitherSkullAttack> {
+    let entity_type_id = wither_skull_entity_type_id?;
+    let max_distance_sq = WITHER_SKULL_RANGE * WITHER_SKULL_RANGE;
+    let target = targets
+        .iter()
+        .filter(|target| target.visible_entities.contains(&hostile.id))
+        .map(|target| (distance_sq(hostile.position, target.position), target))
+        .filter(|(distance, _)| *distance <= max_distance_sq)
+        .min_by(|left, right| left.0.total_cmp(&right.0))?
+        .1;
+    let position = Vec3::new(
+        hostile.position.x,
+        hostile.position.y + WITHER_SKULL_HEAD_Y_OFFSET,
+        hostile.position.z,
+    );
+    let target_center = Vec3::new(
+        target.position.x,
+        target.position.y + 0.81,
+        target.position.z,
+    );
+    let direction = Vec3::new(
+        target_center.x - position.x,
+        target_center.y - position.y,
+        target_center.z - position.z,
+    );
+    Some(PlannedWitherSkullAttack {
+        hostile_id: hostile.id,
+        entity_type_id,
+        position,
+        direction,
+        rotation: hostile.rotation,
+        air_block_state: air.0,
+    })
+}
+
+fn plan_breeze_transition(
+    hostile: &HostileAttackTickEntity,
+    targets: &[HostileTargetTickSession],
+    wind_charge_entity_type_id: Option<i32>,
+    air: BlockStateId,
+    tick: u64,
+) -> Option<PlannedBreezeTransition> {
+    let expected = hostile.breeze_attack;
+    let target_valid = |target: &HostileTargetTickSession| {
+        target.visible_entities.contains(&hostile.id)
+            && distance_sq(hostile.position, target.position) < BREEZE_WIND_CHARGE_RANGE_SQ
+    };
+    match expected {
+        None => {
+            let target = targets
+                .iter()
+                .filter(|target| target_valid(target))
+                .min_by(|left, right| {
+                    distance_sq(hostile.position, left.position)
+                        .total_cmp(&distance_sq(hostile.position, right.position))
+                })?;
+            Some(PlannedBreezeTransition {
+                hostile_id: hostile.id,
+                expected,
+                next: Some(EntityBreezeAttackState::new(
+                    EntityBreezeAttackPhase::Charging,
+                    target.id,
+                    target.entity_id,
+                    tick.saturating_add(BREEZE_WIND_CHARGE_INITIAL_DELAY_TICKS),
+                )),
+                shot: None,
+            })
+        }
+        Some(state) if state.phase == EntityBreezeAttackPhase::Charging => {
+            let target = targets.iter().find(|target| {
+                target.id == state.target_session
+                    && target.entity_id == state.target_entity_id
+                    && target_valid(target)
+            });
+            let Some(target) = target else {
+                return Some(PlannedBreezeTransition {
+                    hostile_id: hostile.id,
+                    expected,
+                    next: None,
+                    shot: None,
+                });
+            };
+            if tick < state.deadline_tick {
+                return None;
+            }
+            let entity_type_id = wind_charge_entity_type_id?;
+            let breeze_height = entity_aabb("minecraft:breeze").height;
+            let position = Vec3::new(
+                hostile.position.x,
+                hostile.position.y + breeze_height / 2.0 + BREEZE_WIND_CHARGE_FIRING_Y_OFFSET,
+                hostile.position.z,
+            );
+            let target_y = target.position.y + 1.8 * BREEZE_WIND_CHARGE_TARGET_Y_FRACTION;
+            let dx = target.position.x - position.x;
+            let dy = target_y - position.y;
+            let dz = target.position.z - position.z;
+            let length = (dx * dx + dy * dy + dz * dz).sqrt();
+            if !length.is_finite() || length <= f64::EPSILON {
+                return None;
+            }
+            let velocity = Vec3::new(
+                dx / length * BREEZE_WIND_CHARGE_SPEED,
+                dy / length * BREEZE_WIND_CHARGE_SPEED,
+                dz / length * BREEZE_WIND_CHARGE_SPEED,
+            );
+            Some(PlannedBreezeTransition {
+                hostile_id: hostile.id,
+                expected,
+                next: Some(EntityBreezeAttackState::new(
+                    EntityBreezeAttackPhase::Recovery,
+                    state.target_session,
+                    state.target_entity_id,
+                    tick.saturating_add(BREEZE_WIND_CHARGE_RECOVERY_TICKS),
+                )),
+                shot: Some(PlannedWindChargeAttack {
+                    hostile_id: hostile.id,
+                    entity_type_id,
+                    position,
+                    velocity,
+                    rotation: hostile.rotation,
+                    air_block_state: air.0,
+                }),
+            })
+        }
+        Some(state) if state.phase == EntityBreezeAttackPhase::Recovery => {
+            if tick < state.deadline_tick {
+                return None;
+            }
+            Some(PlannedBreezeTransition {
+                hostile_id: hostile.id,
+                expected,
+                next: Some(EntityBreezeAttackState::new(
+                    EntityBreezeAttackPhase::Cooldown,
+                    state.target_session,
+                    state.target_entity_id,
+                    tick.saturating_add(BREEZE_WIND_CHARGE_COOLDOWN_TICKS),
+                )),
+                shot: None,
+            })
+        }
+        Some(state) => {
+            if tick < state.deadline_tick {
+                return None;
+            }
+            Some(PlannedBreezeTransition {
+                hostile_id: hostile.id,
+                expected,
+                next: None,
+                shot: None,
+            })
+        }
+    }
+}
+
+fn plan_blaze_transition(
+    hostile: &HostileAttackTickEntity,
+    target: Option<(f64, super::SessionId, Vec3)>,
+    follow_range: f64,
+    attack_damage: f32,
+    small_fireball_entity_type_id: Option<i32>,
+    tick: u64,
+) -> Option<PlannedBlazeTransition> {
+    let expected = hostile.blaze_attack;
+    let Some((distance, target_session, target_position)) = target else {
+        return expected.is_some().then_some(PlannedBlazeTransition {
+            hostile_id: hostile.id,
+            expected,
+            next: None,
+            shot: None,
+            melee: None,
+        });
+    };
+    let current = expected.unwrap_or_else(|| EntityBlazeAttackState::new(0, tick));
+    if distance < BLAZE_CLOSE_MELEE_RANGE_SQ {
+        if tick < current.deadline_tick {
+            return None;
+        }
+        return Some(PlannedBlazeTransition {
+            hostile_id: hostile.id,
+            expected,
+            next: Some(EntityBlazeAttackState::new(
+                current.attack_step,
+                tick.saturating_add(BLAZE_CLOSE_MELEE_PERIOD_TICKS),
+            )),
+            shot: None,
+            melee: (attack_damage > 0.0).then_some(PlannedMeleeAttack {
+                hostile_id: hostile.id,
+                target_session,
+                amount: attack_damage,
+            }),
+        });
+    }
+    if distance > follow_range * follow_range || tick < current.deadline_tick {
+        return None;
+    }
+    let (next, shoot) = match current.attack_step {
+        0 => (
+            EntityBlazeAttackState::new(1, tick.saturating_add(BLAZE_CHARGE_TICKS)),
+            false,
+        ),
+        1..=3 => (
+            EntityBlazeAttackState::new(
+                current.attack_step + 1,
+                tick.saturating_add(BLAZE_SHOT_INTERVAL_TICKS),
+            ),
+            true,
+        ),
+        _ => (
+            EntityBlazeAttackState::new(0, tick.saturating_add(BLAZE_BURST_COOLDOWN_TICKS)),
+            false,
+        ),
+    };
+    let shot = if shoot {
+        small_fireball_entity_type_id.and_then(|entity_type_id| {
+            plan_hostile_small_fireball(hostile, target_position, entity_type_id)
+        })
+    } else {
+        None
+    };
+    Some(PlannedBlazeTransition {
+        hostile_id: hostile.id,
+        expected,
+        next: Some(next),
+        shot,
+        melee: None,
     })
 }
 
@@ -254,6 +1115,112 @@ fn plan_crossbow_transition(
         next,
         shot,
     })
+}
+
+fn plan_warden_sonic_transition(
+    hostile: &HostileAttackTickEntity,
+    targets: &[HostileTargetTickSession],
+    tick: u64,
+) -> Option<PlannedWardenSonicTransition> {
+    let expected = hostile.warden_sonic_boom;
+    let target_valid = |target: &HostileTargetTickSession| {
+        if !target.visible_entities.contains(&hostile.id) {
+            return false;
+        }
+        let dx = target.position.x - hostile.position.x;
+        let dz = target.position.z - hostile.position.z;
+        let dy = (target.position.y - hostile.position.y).abs();
+        dx * dx + dz * dz <= WARDEN_SONIC_RANGE_XZ * WARDEN_SONIC_RANGE_XZ
+            && dy <= WARDEN_SONIC_RANGE_Y
+    };
+    match expected {
+        None => {
+            let target = targets
+                .iter()
+                .filter(|target| target_valid(target))
+                .min_by(|left, right| {
+                    distance_sq(hostile.position, left.position)
+                        .total_cmp(&distance_sq(hostile.position, right.position))
+                })?;
+            Some(PlannedWardenSonicTransition {
+                hostile_id: hostile.id,
+                expected,
+                next: Some(EntityWardenSonicBoomState::new(
+                    EntityWardenSonicBoomPhase::Charging,
+                    target.id,
+                    target.entity_id,
+                    tick.saturating_add(WARDEN_SONIC_CHARGE_TICKS),
+                )),
+                charge_started: true,
+                attack: None,
+            })
+        }
+        Some(state) if state.phase == EntityWardenSonicBoomPhase::Charging => {
+            let target = targets.iter().find(|target| {
+                target.id == state.target_session
+                    && target.entity_id == state.target_entity_id
+                    && target_valid(target)
+            });
+            let Some(target) = target else {
+                return Some(PlannedWardenSonicTransition {
+                    hostile_id: hostile.id,
+                    expected,
+                    next: None,
+                    charge_started: false,
+                    attack: None,
+                });
+            };
+            if tick < state.deadline_tick {
+                return None;
+            }
+            Some(PlannedWardenSonicTransition {
+                hostile_id: hostile.id,
+                expected,
+                next: Some(EntityWardenSonicBoomState::new(
+                    EntityWardenSonicBoomPhase::Recovery,
+                    state.target_session,
+                    state.target_entity_id,
+                    tick.saturating_add(
+                        WARDEN_SONIC_DURATION_TICKS.saturating_sub(WARDEN_SONIC_CHARGE_TICKS),
+                    ),
+                )),
+                charge_started: false,
+                attack: Some(PlannedWardenSonicAttack {
+                    hostile_id: hostile.id,
+                    target_session: target.id,
+                }),
+            })
+        }
+        Some(state) if state.phase == EntityWardenSonicBoomPhase::Recovery => {
+            if tick < state.deadline_tick {
+                return None;
+            }
+            Some(PlannedWardenSonicTransition {
+                hostile_id: hostile.id,
+                expected,
+                next: Some(EntityWardenSonicBoomState::new(
+                    EntityWardenSonicBoomPhase::Cooldown,
+                    state.target_session,
+                    state.target_entity_id,
+                    tick.saturating_add(WARDEN_SONIC_COOLDOWN_TICKS),
+                )),
+                charge_started: false,
+                attack: None,
+            })
+        }
+        Some(state) => {
+            if tick < state.deadline_tick {
+                return None;
+            }
+            Some(PlannedWardenSonicTransition {
+                hostile_id: hostile.id,
+                expected,
+                next: None,
+                charge_started: false,
+                attack: None,
+            })
+        }
+    }
 }
 
 fn plan_guardian_beam_transition(
@@ -461,15 +1428,133 @@ impl SessionRegistry {
         }
     }
 
+    fn tick_evoker_fangs(&self) -> Vec<VisibilityDispatch> {
+        let active_ids = self.active_simulation_entities.load_full();
+        if active_ids.is_empty() {
+            return Vec::new();
+        }
+        let targets = self
+            .movement_recipients
+            .load_full()
+            .values()
+            .filter_map(|publication| {
+                let (target, _) = publication.combat_target_snapshot()?;
+                target.is_targetable().then_some(HostileTargetTickSession {
+                    id: publication.id(),
+                    entity_id: publication.entity_id(),
+                    position: Vec3::new(target.pose().x, target.pose().y, target.pose().z),
+                    visible_entities: Arc::new(HashSet::new()),
+                    effect_facts: None,
+                })
+            })
+            .collect::<Vec<_>>();
+        let mut ids = {
+            let entities = self.lock_entities("scan active evoker fangs");
+            entities.prefetch(&active_ids);
+            active_ids
+                .iter()
+                .copied()
+                .filter(|&id| {
+                    entities.snapshot(id).is_some_and(|snapshot| {
+                        snapshot.type_name == "minecraft:evoker_fangs"
+                            && snapshot.lifecycle == EntityLifecycle::Alive
+                            && snapshot.retained.evoker_fangs.is_some()
+                    })
+                })
+                .collect::<Vec<_>>()
+        };
+        if ids.is_empty() {
+            return Vec::new();
+        }
+        ids.sort_unstable();
+        let fang_ids = ids.iter().copied().collect::<HashSet<_>>();
+        let fang_aabb = entity_aabb("minecraft:evoker_fangs");
+        let horizontal_reach = fang_aabb.half_width + 0.2 + 0.3;
+        let mut inner = self.lock_session_entities("tick evoker fangs");
+        inner.entities.prefetch(&fang_ids);
+        let mut dispatches = Vec::new();
+        for id in ids {
+            let Some(expected) = inner.entities.snapshot(id) else {
+                continue;
+            };
+            if expected.type_name != "minecraft:evoker_fangs"
+                || expected.lifecycle != EntityLifecycle::Alive
+            {
+                continue;
+            }
+            let Some(mut state) = expected.retained.evoker_fangs else {
+                continue;
+            };
+            state.warmup_delay_ticks = state.warmup_delay_ticks.saturating_sub(1);
+            let active = state.warmup_delay_ticks < 0;
+            let damage_now = state.warmup_delay_ticks == -8;
+            let event_now = active && !state.sent_spike_event;
+            if event_now {
+                state.sent_spike_event = true;
+            }
+            if active {
+                state.life_ticks = state.life_ticks.saturating_sub(1);
+            }
+            if active && state.life_ticks < 0 {
+                if let Some((_, removed)) = remove_server_entity_locked(&mut inner, id) {
+                    dispatches.extend(removed);
+                }
+                continue;
+            }
+            let mut next = expected.clone();
+            next.retained.evoker_fangs = Some(state);
+            if !inner
+                .entities
+                .replace_snapshot_if_current(expected, next.clone())
+            {
+                continue;
+            }
+            if event_now {
+                dispatches.extend(entity_event_dispatches_locked(
+                    &inner,
+                    id,
+                    EVOKER_FANGS_EVENT,
+                ));
+            }
+            if !damage_now {
+                continue;
+            }
+            for target in &targets {
+                if target.entity_id == state.owner_entity_id
+                    || (target.position.x - next.position.x).abs() > horizontal_reach
+                    || (target.position.z - next.position.z).abs() > horizontal_reach
+                    || target.position.y > next.position.y + fang_aabb.height
+                    || target.position.y + 1.8 < next.position.y
+                {
+                    continue;
+                }
+                for recipient in session_recipients(&inner, [target.id]) {
+                    dispatches.push(VisibilityDispatch {
+                        recipient,
+                        command: OutboundCommand::DamagePlayer {
+                            damage: PlayerDamageRequest {
+                                kind: PlayerDamageKind::IndirectMagic,
+                                amount: EVOKER_FANGS_DAMAGE,
+                                source_origin: Some(next.position),
+                            },
+                        },
+                    });
+                }
+            }
+        }
+        dispatches
+    }
+
     pub(in crate::play) fn tick_hostile_attacks(
         &self,
         _authority: &SimulationAuthority,
         tick: u64,
         air: BlockStateId,
     ) -> (usize, Vec<VisibilityDispatch>) {
+        let fang_dispatches = self.tick_evoker_fangs();
         let loaded_entity_ids = self.active_hostile_entities.load_full();
         if loaded_entity_ids.is_empty() {
-            return (0, Vec::new());
+            return (0, fang_dispatches);
         }
         let mob_behaviors = self.mob_behavior_table();
         let mut hostiles = Vec::new();
@@ -508,6 +1593,28 @@ impl SessionRegistry {
                                 6.0
                             }) as f32,
                     },
+                    MobCombatPolicy::SmallFireball => HostileAttackKind::SmallFireball {
+                        follow_range: entity
+                            .attributes
+                            .base(&AttributeKind::FollowRange)
+                            .unwrap_or(48.0)
+                            .clamp(1.0, 2_048.0),
+                        attack_damage: entity
+                            .attributes
+                            .base(&AttributeKind::AttackDamage)
+                            .filter(|damage| damage.is_finite() && *damage > 0.0)
+                            .unwrap_or(6.0) as f32,
+                    },
+                    MobCombatPolicy::SonicBoom => HostileAttackKind::SonicBoom,
+                    MobCombatPolicy::ShulkerBullet => HostileAttackKind::ShulkerBullet,
+                    MobCombatPolicy::EvokerFangs => HostileAttackKind::EvokerFangs,
+                    MobCombatPolicy::LargeFireball => HostileAttackKind::LargeFireball,
+                    MobCombatPolicy::WindCharge => HostileAttackKind::WindCharge,
+                    MobCombatPolicy::ThrownPotion => HostileAttackKind::ThrownPotion,
+                    MobCombatPolicy::WitherSkull => HostileAttackKind::WitherSkull,
+                    // Ender Dragon owns movement/combat in dragon_authority; never
+                    // fall through to the common hostile planner or generic melee.
+                    MobCombatPolicy::DragonBoss => return,
                     MobCombatPolicy::Melee => HostileAttackKind::Melee {
                         attack_damage: entity
                             .attributes
@@ -519,7 +1626,15 @@ impl SessionRegistry {
                 let period = match kind {
                     HostileAttackKind::Creeper
                     | HostileAttackKind::Crossbow
-                    | HostileAttackKind::GuardianBeam { .. } => 1,
+                    | HostileAttackKind::GuardianBeam { .. }
+                    | HostileAttackKind::SmallFireball { .. }
+                    | HostileAttackKind::SonicBoom
+                    | HostileAttackKind::ShulkerBullet
+                    | HostileAttackKind::EvokerFangs
+                    | HostileAttackKind::LargeFireball
+                    | HostileAttackKind::WindCharge
+                    | HostileAttackKind::ThrownPotion => 1,
+                    HostileAttackKind::WitherSkull => WITHER_SKULL_SHOT_PERIOD_TICKS,
                     HostileAttackKind::Skeleton => SKELETON_SHOT_PERIOD_TICKS,
                     HostileAttackKind::Melee { .. } => HOSTILE_MELEE_PERIOD_TICKS,
                 };
@@ -534,7 +1649,14 @@ impl SessionRegistry {
                     rotation: entity.rotation,
                     goal: entity.goal.clone(),
                     crossbow_attack: entity.retained.crossbow_attack,
+                    blaze_attack: entity.retained.blaze_attack,
+                    ghast_attack: entity.retained.ghast_attack,
+                    breeze_attack: entity.retained.breeze_attack,
                     guardian_beam: entity.retained.guardian_beam,
+                    warden_sonic_boom: entity.retained.warden_sonic_boom,
+                    shulker_attack: entity.retained.shulker_attack,
+                    evoker_attack: entity.retained.evoker_attack,
+                    witch_attack: entity.retained.witch_attack,
                 });
             });
         }
@@ -542,8 +1664,11 @@ impl SessionRegistry {
         self.hostile_attack_candidates
             .fetch_add(hostiles.len() as u64, Ordering::Relaxed);
         if hostiles.is_empty() {
-            return (0, Vec::new());
+            return (0, fang_dispatches);
         }
+        let needs_witch_effect_facts = hostiles
+            .iter()
+            .any(|hostile| matches!(hostile.kind, HostileAttackKind::ThrownPotion));
 
         let targets = self
             .movement_recipients
@@ -556,16 +1681,61 @@ impl SessionRegistry {
                     entity_id: publication.entity_id(),
                     position: Vec3::new(target.pose().x, target.pose().y, target.pose().z),
                     visible_entities,
+                    effect_facts: needs_witch_effect_facts
+                        .then(|| self.player_effect_facts(publication.id()))
+                        .flatten(),
                 })
             })
             .collect::<Vec<_>>();
         let arrow_entity_type_id = self.hostile_arrow_entity_type_id.load(Ordering::Acquire);
         let arrow_entity_type_id = (arrow_entity_type_id >= 0).then_some(arrow_entity_type_id);
+        let small_fireball_entity_type_id = self
+            .hostile_small_fireball_entity_type_id
+            .load(Ordering::Acquire);
+        let small_fireball_entity_type_id =
+            (small_fireball_entity_type_id >= 0).then_some(small_fireball_entity_type_id);
+        let fireball_entity_type_id = self.hostile_fireball_entity_type_id.load(Ordering::Acquire);
+        let fireball_entity_type_id =
+            (fireball_entity_type_id >= 0).then_some(fireball_entity_type_id);
+        let breeze_wind_charge_entity_type_id = self
+            .hostile_breeze_wind_charge_entity_type_id
+            .load(Ordering::Acquire);
+        let breeze_wind_charge_entity_type_id =
+            (breeze_wind_charge_entity_type_id >= 0).then_some(breeze_wind_charge_entity_type_id);
+        let wither_skull_entity_type_id = self
+            .hostile_wither_skull_entity_type_id
+            .load(Ordering::Acquire);
+        let wither_skull_entity_type_id =
+            (wither_skull_entity_type_id >= 0).then_some(wither_skull_entity_type_id);
+        let splash_potion_entity_type_id = self
+            .hostile_splash_potion_entity_type_id
+            .load(Ordering::Acquire);
+        let splash_potion_entity_type_id =
+            (splash_potion_entity_type_id >= 0).then_some(splash_potion_entity_type_id);
+        let shulker_bullet_entity_type_id = self
+            .hostile_shulker_bullet_entity_type_id
+            .load(Ordering::Acquire);
+        let shulker_bullet_entity_type_id =
+            (shulker_bullet_entity_type_id >= 0).then_some(shulker_bullet_entity_type_id);
+        let evoker_fangs_entity_type_id = self
+            .hostile_evoker_fangs_entity_type_id
+            .load(Ordering::Acquire);
+        let evoker_fangs_entity_type_id =
+            (evoker_fangs_entity_type_id >= 0).then_some(evoker_fangs_entity_type_id);
 
         let mut creeper_fuses = Vec::new();
         let mut arrow_attacks = Vec::new();
+        let mut small_fireball_attacks = Vec::new();
+        let mut wither_skull_attacks = Vec::new();
+        let mut blaze_transitions = Vec::new();
+        let mut ghast_transitions = Vec::new();
+        let mut breeze_transitions = Vec::new();
+        let mut witch_transitions = Vec::new();
         let mut crossbow_transitions = Vec::new();
         let mut guardian_beam_transitions = Vec::new();
+        let mut warden_sonic_transitions = Vec::new();
+        let mut shulker_transitions = Vec::new();
+        let mut evoker_transitions = Vec::new();
         let mut melee_attacks = Vec::new();
         for hostile in hostiles {
             match hostile.kind {
@@ -635,6 +1805,96 @@ impl SessionRegistry {
                         tick,
                     ) {
                         guardian_beam_transitions.push(transition);
+                    }
+                }
+                HostileAttackKind::SmallFireball {
+                    follow_range,
+                    attack_damage,
+                } => {
+                    let target = targets
+                        .iter()
+                        .filter(|target| target.visible_entities.contains(&hostile.id))
+                        .map(|target| {
+                            (
+                                distance_sq(hostile.position, target.position),
+                                target.id,
+                                target.position,
+                            )
+                        })
+                        .min_by(|left, right| left.0.total_cmp(&right.0));
+                    if let Some(transition) = plan_blaze_transition(
+                        &hostile,
+                        target,
+                        follow_range,
+                        attack_damage,
+                        small_fireball_entity_type_id,
+                        tick,
+                    ) {
+                        blaze_transitions.push(transition);
+                    }
+                }
+                HostileAttackKind::SonicBoom => {
+                    if let Some(transition) = plan_warden_sonic_transition(&hostile, &targets, tick)
+                    {
+                        warden_sonic_transitions.push(transition);
+                    }
+                }
+                HostileAttackKind::ShulkerBullet => {
+                    if let Some(transition) = plan_shulker_transition(
+                        &hostile,
+                        &targets,
+                        shulker_bullet_entity_type_id,
+                        tick,
+                    ) {
+                        shulker_transitions.push(transition);
+                    }
+                }
+                HostileAttackKind::EvokerFangs => {
+                    if let Some(transition) = plan_evoker_transition(
+                        &hostile,
+                        &targets,
+                        evoker_fangs_entity_type_id,
+                        tick,
+                    ) {
+                        evoker_transitions.push(transition);
+                    }
+                }
+                HostileAttackKind::LargeFireball => {
+                    if let Some(transition) =
+                        plan_ghast_transition(&hostile, &targets, fireball_entity_type_id, air)
+                    {
+                        ghast_transitions.push(transition);
+                    }
+                }
+                HostileAttackKind::WindCharge => {
+                    if let Some(transition) = plan_breeze_transition(
+                        &hostile,
+                        &targets,
+                        breeze_wind_charge_entity_type_id,
+                        air,
+                        tick,
+                    ) {
+                        breeze_transitions.push(transition);
+                    }
+                }
+                HostileAttackKind::ThrownPotion => {
+                    if let Some(transition) = plan_witch_transition(
+                        &hostile,
+                        &targets,
+                        splash_potion_entity_type_id,
+                        tick,
+                    ) {
+                        witch_transitions.push(transition);
+                    }
+                }
+                HostileAttackKind::WitherSkull => {
+                    if let Some(attack) = plan_wither_skull_attack(
+                        &hostile,
+                        &targets,
+                        wither_skull_entity_type_id,
+                        air,
+                    ) {
+                        wither_skull_attacks.push(attack);
                     }
                 }
                 HostileAttackKind::Melee {
@@ -771,6 +2031,159 @@ impl SessionRegistry {
             };
         arrow_attacks.extend(committed_crossbow_attacks);
 
+        let (blaze_state_updates, committed_small_fireballs, committed_blaze_melee) =
+            if blaze_transitions.is_empty() {
+                (Vec::new(), Vec::new(), Vec::new())
+            } else {
+                let blaze_ids = blaze_transitions
+                    .iter()
+                    .map(|transition| transition.hostile_id)
+                    .collect::<HashSet<_>>();
+                let mut entities = self.lock_entities("commit hostile blaze attack states");
+                entities.prefetch(&blaze_ids);
+                let mut updates = Vec::new();
+                let mut shots = Vec::new();
+                let mut melee = Vec::new();
+                for transition in blaze_transitions {
+                    let Some(expected) = entities.snapshot(transition.hostile_id) else {
+                        continue;
+                    };
+                    if expected.lifecycle != EntityLifecycle::Alive
+                        || expected.type_name != "minecraft:blaze"
+                        || expected.retained.blaze_attack != transition.expected
+                    {
+                        continue;
+                    }
+                    let previous_charged = transition
+                        .expected
+                        .is_some_and(EntityBlazeAttackState::is_charged);
+                    let next_charged = transition
+                        .next
+                        .is_some_and(EntityBlazeAttackState::is_charged);
+                    let mut next = expected.clone();
+                    next.retained.blaze_attack = transition.next;
+                    if !entities.replace_snapshot_if_current(expected, next.clone()) {
+                        continue;
+                    }
+                    if previous_charged != next_charged {
+                        updates.push(next);
+                    }
+                    if let Some(shot) = transition.shot {
+                        shots.push(shot);
+                    }
+                    if let Some(attack) = transition.melee {
+                        melee.push(attack);
+                    }
+                }
+                (updates, shots, melee)
+            };
+        small_fireball_attacks.extend(committed_small_fireballs);
+        melee_attacks.extend(committed_blaze_melee);
+
+        let committed_large_fireballs = if ghast_transitions.is_empty() {
+            Vec::new()
+        } else {
+            let ghast_ids = ghast_transitions
+                .iter()
+                .map(|transition| transition.hostile_id)
+                .collect::<HashSet<_>>();
+            let mut entities = self.lock_entities("commit hostile ghast attack states");
+            entities.prefetch(&ghast_ids);
+            let mut shots = Vec::new();
+            for transition in ghast_transitions {
+                let Some(expected) = entities.snapshot(transition.hostile_id) else {
+                    continue;
+                };
+                if expected.lifecycle != EntityLifecycle::Alive
+                    || expected.type_name != "minecraft:ghast"
+                    || expected.retained.ghast_attack != transition.expected
+                {
+                    continue;
+                }
+                let mut next = expected.clone();
+                next.retained.ghast_attack = transition.next;
+                if !entities.replace_snapshot_if_current(expected, next) {
+                    continue;
+                }
+                if let Some(shot) = transition.shot {
+                    shots.push(shot);
+                }
+            }
+            shots
+        };
+
+        let committed_wind_charges = if breeze_transitions.is_empty() {
+            Vec::new()
+        } else {
+            let breeze_ids = breeze_transitions
+                .iter()
+                .map(|transition| transition.hostile_id)
+                .collect::<HashSet<_>>();
+            let mut entities = self.lock_entities("commit hostile breeze attack states");
+            entities.prefetch(&breeze_ids);
+            let mut shots = Vec::new();
+            for transition in breeze_transitions {
+                let Some(expected) = entities.snapshot(transition.hostile_id) else {
+                    continue;
+                };
+                if expected.lifecycle != EntityLifecycle::Alive
+                    || expected.type_name != "minecraft:breeze"
+                    || expected.retained.breeze_attack != transition.expected
+                {
+                    continue;
+                }
+                let mut next = expected.clone();
+                next.retained.breeze_attack = transition.next;
+                if transition.next.is_some_and(|state| {
+                    matches!(
+                        state.phase,
+                        EntityBreezeAttackPhase::Charging | EntityBreezeAttackPhase::Recovery
+                    )
+                }) {
+                    next.goal = GoalState::Idle;
+                }
+                if !entities.replace_snapshot_if_current(expected, next) {
+                    continue;
+                }
+                if let Some(shot) = transition.shot {
+                    shots.push(shot);
+                }
+            }
+            shots
+        };
+
+        let committed_witch_potions = if witch_transitions.is_empty() {
+            Vec::new()
+        } else {
+            let witch_ids = witch_transitions
+                .iter()
+                .map(|transition| transition.hostile_id)
+                .collect::<HashSet<_>>();
+            let mut entities = self.lock_entities("commit hostile witch attack states");
+            entities.prefetch(&witch_ids);
+            let mut shots = Vec::new();
+            for transition in witch_transitions {
+                let Some(expected) = entities.snapshot(transition.hostile_id) else {
+                    continue;
+                };
+                if expected.lifecycle != EntityLifecycle::Alive
+                    || expected.type_name != "minecraft:witch"
+                    || expected.retained.witch_attack != transition.expected
+                {
+                    continue;
+                }
+                let mut next = expected.clone();
+                next.retained.witch_attack = transition.next;
+                if !entities.replace_snapshot_if_current(expected, next) {
+                    continue;
+                }
+                if let Some(shot) = transition.shot {
+                    shots.push(shot);
+                }
+            }
+            shots
+        };
+
         let (guardian_state_updates, guardian_beam_started, committed_guardian_attacks) =
             if guardian_beam_transitions.is_empty() {
                 (Vec::new(), HashSet::new(), Vec::new())
@@ -824,20 +2237,158 @@ impl SessionRegistry {
                 (updates, started, attacks)
             };
 
+        let (warden_charge_started, committed_warden_attacks) = if warden_sonic_transitions
+            .is_empty()
+        {
+            (HashSet::new(), Vec::new())
+        } else {
+            let warden_ids = warden_sonic_transitions
+                .iter()
+                .map(|transition| transition.hostile_id)
+                .collect::<HashSet<_>>();
+            let mut entities = self.lock_entities("commit hostile warden sonic states");
+            entities.prefetch(&warden_ids);
+            let mut started = HashSet::new();
+            let mut attacks = Vec::new();
+            for transition in warden_sonic_transitions {
+                let Some(expected) = entities.snapshot(transition.hostile_id) else {
+                    continue;
+                };
+                if expected.lifecycle != EntityLifecycle::Alive
+                    || expected.type_name != "minecraft:warden"
+                    || expected.retained.warden_sonic_boom != transition.expected
+                {
+                    continue;
+                }
+                let mut next = expected.clone();
+                next.retained.warden_sonic_boom = transition.next;
+                if transition.next.is_some_and(|state| {
+                    matches!(
+                        state.phase,
+                        EntityWardenSonicBoomPhase::Charging | EntityWardenSonicBoomPhase::Recovery
+                    )
+                }) {
+                    next.goal = GoalState::Idle;
+                }
+                if !entities.replace_snapshot_if_current(expected, next) {
+                    continue;
+                }
+                if transition.charge_started {
+                    started.insert(transition.hostile_id);
+                }
+                if let Some(attack) = transition.attack {
+                    attacks.push(attack);
+                }
+            }
+            (started, attacks)
+        };
+
+        let committed_shulker_shots = if shulker_transitions.is_empty() {
+            Vec::new()
+        } else {
+            let shulker_ids = shulker_transitions
+                .iter()
+                .map(|transition| transition.hostile_id)
+                .collect::<HashSet<_>>();
+            let mut entities = self.lock_entities("commit hostile shulker attack states");
+            entities.prefetch(&shulker_ids);
+            let mut shots = Vec::new();
+            for transition in shulker_transitions {
+                let Some(expected) = entities.snapshot(transition.hostile_id) else {
+                    continue;
+                };
+                if expected.lifecycle != EntityLifecycle::Alive
+                    || expected.type_name != "minecraft:shulker"
+                    || expected.retained.shulker_attack != transition.expected
+                {
+                    continue;
+                }
+                let mut next = expected.clone();
+                next.retained.shulker_attack = transition.next;
+                if !entities.replace_snapshot_if_current(expected, next) {
+                    continue;
+                }
+                if let Some(shot) = transition.shot {
+                    shots.push(shot);
+                }
+            }
+            shots
+        };
+
+        let committed_evoker_fangs = if evoker_transitions.is_empty() {
+            Vec::new()
+        } else {
+            let evoker_ids = evoker_transitions
+                .iter()
+                .map(|transition| transition.hostile_id)
+                .collect::<HashSet<_>>();
+            let mut entities = self.lock_entities("commit hostile evoker attack states");
+            entities.prefetch(&evoker_ids);
+            let mut fangs = Vec::new();
+            for transition in evoker_transitions {
+                let Some(expected) = entities.snapshot(transition.hostile_id) else {
+                    continue;
+                };
+                if expected.lifecycle != EntityLifecycle::Alive
+                    || expected.type_name != "minecraft:evoker"
+                    || expected.retained.evoker_attack != transition.expected
+                {
+                    continue;
+                }
+                let mut next = expected.clone();
+                next.retained.evoker_attack = transition.next;
+                if transition.next.is_some_and(|state| {
+                    matches!(
+                        state.phase,
+                        EntityEvokerAttackPhase::Warmup | EntityEvokerAttackPhase::Casting
+                    )
+                }) {
+                    next.goal = GoalState::Idle;
+                }
+                if !entities.replace_snapshot_if_current(expected, next) {
+                    continue;
+                }
+                fangs.extend(transition.fangs);
+            }
+            fangs
+        };
+
         let crossbow_state_updates = if crossbow_state_updates.is_empty() {
             Vec::new()
         } else {
             self.current_expected_entity_snapshots(crossbow_state_updates)
+        };
+        let blaze_state_updates = if blaze_state_updates.is_empty() {
+            Vec::new()
+        } else {
+            self.current_expected_entity_snapshots(blaze_state_updates)
         };
         let guardian_state_updates = if guardian_state_updates.is_empty() {
             Vec::new()
         } else {
             self.current_expected_entity_snapshots(guardian_state_updates)
         };
-        let mut dispatches = Vec::new();
+        let mut dispatches = fang_dispatches;
         if !crossbow_state_updates.is_empty() {
             let mut inner = self.lock_inner("publish hostile crossbow state");
             for entity in crossbow_state_updates {
+                let published = server_entity_snapshot_from(entity);
+                let entity_id = published.id;
+                inner
+                    .published_entity_snapshots
+                    .insert(entity_id, published.clone());
+                let recipients =
+                    session_recipients(&inner, visible_entity_observers_locked(&inner, entity_id));
+                let updates = visibility_dispatches(recipients, || {
+                    OutboundCommand::UpdateEntityData(published.clone())
+                });
+                record_entity_dispatches_locked(&mut inner, &updates);
+                dispatches.extend(updates);
+            }
+        }
+        if !blaze_state_updates.is_empty() {
+            let mut inner = self.lock_inner("publish hostile blaze state");
+            for entity in blaze_state_updates {
                 let published = server_entity_snapshot_from(entity);
                 let entity_id = published.id;
                 inner
@@ -878,10 +2429,26 @@ impl SessionRegistry {
                 }
             }
         }
+        if !warden_charge_started.is_empty() {
+            let mut inner = self.lock_inner("publish hostile warden sonic charge");
+            for entity_id in warden_charge_started {
+                let events = entity_event_dispatches_locked(&inner, entity_id, WARDEN_SONIC_EVENT);
+                record_entity_dispatches_locked(&mut inner, &events);
+                dispatches.extend(events);
+            }
+        }
 
         if arrow_attacks.is_empty()
+            && small_fireball_attacks.is_empty()
+            && wither_skull_attacks.is_empty()
             && melee_attacks.is_empty()
             && committed_guardian_attacks.is_empty()
+            && committed_warden_attacks.is_empty()
+            && committed_shulker_shots.is_empty()
+            && committed_evoker_fangs.is_empty()
+            && committed_large_fireballs.is_empty()
+            && committed_wind_charges.is_empty()
+            && committed_witch_potions.is_empty()
         {
             return (creeper_ignitions, dispatches);
         }
@@ -940,6 +2507,288 @@ impl SessionRegistry {
             );
             spawned
         };
+        let spawned_small_fireballs = if small_fireball_attacks.is_empty() {
+            Vec::new()
+        } else {
+            let mut entities = self.lock_entities("spawn hostile small fireballs ECS");
+            let mut fireballs = Vec::with_capacity(small_fireball_attacks.len());
+            for attack in small_fireball_attacks {
+                let state = initial_hurting_projectile_state(
+                    Some(projectile_identity(attack.hostile_id)),
+                    "minecraft:small_fireball",
+                    attack.position,
+                    attack.direction,
+                    attack.rotation,
+                )
+                .expect("finite hostile small fireball must produce a valid kernel state");
+                let mut fireball = SpawnEntity::new(
+                    attack.entity_type_id,
+                    "minecraft:small_fireball",
+                    attack.position,
+                );
+                fireball.retained.spawn_tick = tick;
+                fireball.velocity = Vec3::new(
+                    state.projectile.velocity.x,
+                    state.projectile.velocity.y,
+                    state.projectile.velocity.z,
+                );
+                fireball.rotation = attack.rotation;
+                fireball.on_ground = false;
+                apply_entity_facts(&mut fireball);
+                fireball.retained.hurting_projectile_state = Some(state);
+                fireballs.push(fireball);
+            }
+            let ids = entities.spawn_batch(fireballs);
+            let id_set = ids.iter().copied().collect::<HashSet<_>>();
+            entities.prefetch(&id_set);
+            ids.into_iter()
+                .filter_map(|id| entities.snapshot(id))
+                .collect::<Vec<_>>()
+        };
+        let spawned_large_fireballs = if committed_large_fireballs.is_empty() {
+            Vec::new()
+        } else {
+            let mut entities = self.lock_entities("spawn hostile large fireballs ECS");
+            let mut fireballs = Vec::with_capacity(committed_large_fireballs.len());
+            for attack in committed_large_fireballs {
+                let state = initial_hurting_projectile_state(
+                    Some(projectile_identity(attack.hostile_id)),
+                    "minecraft:fireball",
+                    attack.position,
+                    attack.direction,
+                    attack.rotation,
+                )
+                .expect("finite hostile large fireball must produce a valid kernel state");
+                let mut fireball =
+                    SpawnEntity::new(attack.entity_type_id, "minecraft:fireball", attack.position);
+                fireball.retained.spawn_tick = tick;
+                fireball.velocity = Vec3::new(
+                    state.projectile.velocity.x,
+                    state.projectile.velocity.y,
+                    state.projectile.velocity.z,
+                );
+                fireball.rotation = attack.rotation;
+                fireball.on_ground = false;
+                apply_entity_facts(&mut fireball);
+                fireball.retained.hurting_projectile_state = Some(state);
+                fireball.retained.pending_explosion = EntityPendingExplosionState::new(
+                    u64::MAX,
+                    GHAST_FIREBALL_EXPLOSION_POWER,
+                    EntityExplosionInteraction::Mob,
+                    true,
+                    attack.air_block_state,
+                );
+                fireballs.push(fireball);
+            }
+            let ids = entities.spawn_batch(fireballs);
+            let id_set = ids.iter().copied().collect::<HashSet<_>>();
+            entities.prefetch(&id_set);
+            ids.into_iter()
+                .filter_map(|id| entities.snapshot(id))
+                .collect::<Vec<_>>()
+        };
+        let spawned_wither_skulls = if wither_skull_attacks.is_empty() {
+            Vec::new()
+        } else {
+            let mut entities = self.lock_entities("spawn hostile wither skulls ECS");
+            let mut skulls = Vec::with_capacity(wither_skull_attacks.len());
+            for attack in wither_skull_attacks {
+                let state = initial_hurting_projectile_state(
+                    Some(projectile_identity(attack.hostile_id)),
+                    "minecraft:wither_skull",
+                    attack.position,
+                    attack.direction,
+                    attack.rotation,
+                )
+                .expect("finite hostile wither skull must produce a valid kernel state");
+                let mut skull = SpawnEntity::new(
+                    attack.entity_type_id,
+                    "minecraft:wither_skull",
+                    attack.position,
+                );
+                skull.retained.spawn_tick = tick;
+                skull.velocity = Vec3::new(
+                    state.projectile.velocity.x,
+                    state.projectile.velocity.y,
+                    state.projectile.velocity.z,
+                );
+                skull.rotation = attack.rotation;
+                skull.on_ground = false;
+                apply_entity_facts(&mut skull);
+                skull.retained.hurting_projectile_state = Some(state);
+                skull.retained.pending_explosion = EntityPendingExplosionState::new(
+                    u64::MAX,
+                    WITHER_SKULL_EXPLOSION_POWER,
+                    EntityExplosionInteraction::Mob,
+                    true,
+                    attack.air_block_state,
+                );
+                skulls.push(skull);
+            }
+            let ids = entities.spawn_batch(skulls);
+            let id_set = ids.iter().copied().collect::<HashSet<_>>();
+            entities.prefetch(&id_set);
+            ids.into_iter()
+                .filter_map(|id| entities.snapshot(id))
+                .collect::<Vec<_>>()
+        };
+        let spawned_wind_charges = if committed_wind_charges.is_empty() {
+            Vec::new()
+        } else {
+            let mut entities = self.lock_entities("spawn hostile breeze wind charges ECS");
+            let mut projectiles = Vec::with_capacity(committed_wind_charges.len());
+            for attack in committed_wind_charges {
+                let state = initial_hurting_projectile_state_with_motion(
+                    Some(projectile_identity(attack.hostile_id)),
+                    "minecraft:breeze_wind_charge",
+                    attack.position,
+                    Vec3::ZERO,
+                    attack.rotation,
+                    HurtingProjectileMotionProfile {
+                        acceleration_power: 0.0,
+                        air_inertia: 1.0,
+                        water_inertia: 1.0,
+                    },
+                )
+                .expect("finite breeze wind charge must produce a valid kernel state")
+                .retarget_velocity(mc_entity::projectile_26_1_2::Vec3::new(
+                    attack.velocity.x,
+                    attack.velocity.y,
+                    attack.velocity.z,
+                ))
+                .expect("finite breeze wind charge velocity must retarget kernel state");
+                let mut projectile = SpawnEntity::new(
+                    attack.entity_type_id,
+                    "minecraft:breeze_wind_charge",
+                    attack.position,
+                );
+                projectile.retained.spawn_tick = tick;
+                projectile.velocity = attack.velocity;
+                projectile.rotation = Rotation {
+                    yaw: state.projectile.rotation.yaw,
+                    pitch: state.projectile.rotation.pitch,
+                    head_yaw: state.projectile.rotation.yaw,
+                };
+                projectile.on_ground = false;
+                apply_entity_facts(&mut projectile);
+                projectile.retained.hurting_projectile_state = Some(state);
+                projectile.retained.pending_explosion = EntityPendingExplosionState::new(
+                    u64::MAX,
+                    BREEZE_WIND_CHARGE_EXPLOSION_POWER,
+                    EntityExplosionInteraction::Trigger,
+                    false,
+                    attack.air_block_state,
+                );
+                projectiles.push(projectile);
+            }
+            let ids = entities.spawn_batch(projectiles);
+            let id_set = ids.iter().copied().collect::<HashSet<_>>();
+            entities.prefetch(&id_set);
+            ids.into_iter()
+                .filter_map(|id| entities.snapshot(id))
+                .collect::<Vec<_>>()
+        };
+        let spawned_witch_potions = if committed_witch_potions.is_empty() {
+            Vec::new()
+        } else {
+            let mut entities = self.lock_entities("spawn hostile witch potions ECS");
+            let mut potions = Vec::with_capacity(committed_witch_potions.len());
+            for attack in committed_witch_potions {
+                let state = initial_throwable_projectile_state(
+                    Some(projectile_identity(attack.hostile_id)),
+                    "minecraft:splash_potion",
+                    attack.position,
+                    attack.velocity,
+                    attack.rotation,
+                )
+                .expect("finite witch splash potion must produce a valid throwable state");
+                let mut potion = SpawnEntity::new(
+                    attack.entity_type_id,
+                    "minecraft:splash_potion",
+                    attack.position,
+                );
+                potion.retained.spawn_tick = tick;
+                potion.velocity = attack.velocity;
+                potion.rotation = attack.rotation;
+                potion.on_ground = false;
+                apply_entity_facts(&mut potion);
+                potion.retained.throwable_projectile_state = Some(state);
+                potion.retained.witch_potion = Some(attack.potion);
+                potions.push(potion);
+            }
+            let ids = entities.spawn_batch(potions);
+            let id_set = ids.iter().copied().collect::<HashSet<_>>();
+            entities.prefetch(&id_set);
+            ids.into_iter()
+                .filter_map(|id| entities.snapshot(id))
+                .collect::<Vec<_>>()
+        };
+        let spawned_shulker_bullets = if committed_shulker_shots.is_empty() {
+            Vec::new()
+        } else {
+            let mut entities = self.lock_entities("spawn hostile shulker bullets ECS");
+            let mut bullets = Vec::with_capacity(committed_shulker_shots.len());
+            for attack in committed_shulker_shots {
+                let state = initial_hurting_projectile_state_with_motion(
+                    Some(projectile_identity(attack.hostile_id)),
+                    "minecraft:shulker_bullet",
+                    attack.position,
+                    Vec3::ZERO,
+                    attack.rotation,
+                    HurtingProjectileMotionProfile {
+                        acceleration_power: 0.0,
+                        air_inertia: 1.0,
+                        water_inertia: 1.0,
+                    },
+                )
+                .expect("finite hostile shulker bullet must produce a valid kernel state");
+                let mut bullet = SpawnEntity::new(
+                    attack.entity_type_id,
+                    "minecraft:shulker_bullet",
+                    attack.position,
+                );
+                bullet.retained.spawn_tick = tick;
+                bullet.rotation = attack.rotation;
+                bullet.on_ground = false;
+                apply_entity_facts(&mut bullet);
+                bullet.retained.hurting_projectile_state = Some(state);
+                bullet.retained.shulker_bullet = Some(mc_entity::EntityShulkerBulletState::new(
+                    attack.target_entity_id,
+                ));
+                bullets.push(bullet);
+            }
+            let ids = entities.spawn_batch(bullets);
+            let id_set = ids.iter().copied().collect::<HashSet<_>>();
+            entities.prefetch(&id_set);
+            ids.into_iter()
+                .filter_map(|id| entities.snapshot(id))
+                .collect::<Vec<_>>()
+        };
+        let spawned_evoker_fangs = if committed_evoker_fangs.is_empty() {
+            Vec::new()
+        } else {
+            let mut entities = self.lock_entities("spawn hostile evoker fangs ECS");
+            let mut fangs = Vec::with_capacity(committed_evoker_fangs.len());
+            for fang in committed_evoker_fangs {
+                let mut entity =
+                    SpawnEntity::new(fang.entity_type_id, "minecraft:evoker_fangs", fang.position);
+                entity.retained.spawn_tick = tick;
+                entity.rotation = fang.rotation;
+                entity.on_ground = true;
+                apply_entity_facts(&mut entity);
+                entity.retained.evoker_fangs = Some(EntityEvokerFangState::new(
+                    fang.owner_id.0,
+                    fang.warmup_delay_ticks,
+                ));
+                fangs.push(entity);
+            }
+            let ids = entities.spawn_batch(fangs);
+            let id_set = ids.iter().copied().collect::<HashSet<_>>();
+            entities.prefetch(&id_set);
+            ids.into_iter()
+                .filter_map(|id| entities.snapshot(id))
+                .collect::<Vec<_>>()
+        };
         #[cfg(test)]
         self.pause_between_hostile_entity_and_session_commit_for_test();
 
@@ -962,6 +2811,41 @@ impl SessionRegistry {
                 }
             })
             .collect::<Vec<_>>();
+        let spawned_small_fireballs = if spawned_small_fireballs.is_empty() {
+            Vec::new()
+        } else {
+            self.current_expected_entity_snapshots(spawned_small_fireballs)
+        };
+        let spawned_large_fireballs = if spawned_large_fireballs.is_empty() {
+            Vec::new()
+        } else {
+            self.current_expected_entity_snapshots(spawned_large_fireballs)
+        };
+        let spawned_wither_skulls = if spawned_wither_skulls.is_empty() {
+            Vec::new()
+        } else {
+            self.current_expected_entity_snapshots(spawned_wither_skulls)
+        };
+        let spawned_wind_charges = if spawned_wind_charges.is_empty() {
+            Vec::new()
+        } else {
+            self.current_expected_entity_snapshots(spawned_wind_charges)
+        };
+        let spawned_witch_potions = if spawned_witch_potions.is_empty() {
+            Vec::new()
+        } else {
+            self.current_expected_entity_snapshots(spawned_witch_potions)
+        };
+        let spawned_shulker_bullets = if spawned_shulker_bullets.is_empty() {
+            Vec::new()
+        } else {
+            self.current_expected_entity_snapshots(spawned_shulker_bullets)
+        };
+        let spawned_evoker_fangs = if spawned_evoker_fangs.is_empty() {
+            Vec::new()
+        } else {
+            self.current_expected_entity_snapshots(spawned_evoker_fangs)
+        };
         if !spawned_arrows.is_empty() {
             let mut inner = self.lock_inner("publish hostile arrows");
             for arrow in spawned_arrows {
@@ -989,6 +2873,139 @@ impl SessionRegistry {
                         }
                     }));
                 }
+                attacks += 1;
+            }
+        }
+        if !spawned_small_fireballs.is_empty() {
+            let mut inner = self.lock_inner("publish hostile small fireballs");
+            for fireball in spawned_small_fireballs {
+                let snapshot = server_entity_snapshot_from(fireball);
+                let fireball_id = snapshot.id;
+                let fireball_position = snapshot.position;
+                let fireball_type_id = snapshot.type_id;
+                inner
+                    .entity_type_aabbs
+                    .entry(fireball_type_id)
+                    .or_insert_with(|| entity_aabb(&snapshot.type_name));
+                track_entity_chunk_locked(&mut inner, fireball_id, fireball_position);
+                initialize_entity_wire_state_from_snapshot_locked(&mut inner, &snapshot);
+                dispatches.extend(spawn_entity_visibility_from_snapshot_locked(
+                    &mut inner, snapshot,
+                ));
+                attacks += 1;
+            }
+        }
+        if !spawned_large_fireballs.is_empty() {
+            let mut inner = self.lock_inner("publish hostile large fireballs");
+            for fireball in spawned_large_fireballs {
+                let snapshot = server_entity_snapshot_from(fireball);
+                let fireball_id = snapshot.id;
+                let fireball_position = snapshot.position;
+                let fireball_type_id = snapshot.type_id;
+                inner
+                    .entity_type_aabbs
+                    .entry(fireball_type_id)
+                    .or_insert_with(|| entity_aabb(&snapshot.type_name));
+                track_entity_chunk_locked(&mut inner, fireball_id, fireball_position);
+                initialize_entity_wire_state_from_snapshot_locked(&mut inner, &snapshot);
+                dispatches.extend(spawn_entity_visibility_from_snapshot_locked(
+                    &mut inner, snapshot,
+                ));
+                attacks += 1;
+            }
+        }
+        if !spawned_wither_skulls.is_empty() {
+            let mut inner = self.lock_inner("publish hostile wither skulls");
+            for skull in spawned_wither_skulls {
+                let snapshot = server_entity_snapshot_from(skull);
+                let skull_id = snapshot.id;
+                let skull_position = snapshot.position;
+                let skull_type_id = snapshot.type_id;
+                inner
+                    .entity_type_aabbs
+                    .entry(skull_type_id)
+                    .or_insert_with(|| entity_aabb(&snapshot.type_name));
+                track_entity_chunk_locked(&mut inner, skull_id, skull_position);
+                initialize_entity_wire_state_from_snapshot_locked(&mut inner, &snapshot);
+                dispatches.extend(spawn_entity_visibility_from_snapshot_locked(
+                    &mut inner, snapshot,
+                ));
+                attacks += 1;
+            }
+        }
+        if !spawned_wind_charges.is_empty() {
+            let mut inner = self.lock_inner("publish hostile breeze wind charges");
+            for projectile in spawned_wind_charges {
+                let snapshot = server_entity_snapshot_from(projectile);
+                let projectile_id = snapshot.id;
+                let projectile_position = snapshot.position;
+                let projectile_type_id = snapshot.type_id;
+                inner
+                    .entity_type_aabbs
+                    .entry(projectile_type_id)
+                    .or_insert_with(|| entity_aabb(&snapshot.type_name));
+                track_entity_chunk_locked(&mut inner, projectile_id, projectile_position);
+                initialize_entity_wire_state_from_snapshot_locked(&mut inner, &snapshot);
+                dispatches.extend(spawn_entity_visibility_from_snapshot_locked(
+                    &mut inner, snapshot,
+                ));
+                attacks += 1;
+            }
+        }
+        if !spawned_witch_potions.is_empty() {
+            let mut inner = self.lock_inner("publish hostile witch potions");
+            for potion in spawned_witch_potions {
+                let snapshot = server_entity_snapshot_from(potion);
+                let potion_id = snapshot.id;
+                let potion_position = snapshot.position;
+                let potion_type_id = snapshot.type_id;
+                inner
+                    .entity_type_aabbs
+                    .entry(potion_type_id)
+                    .or_insert_with(|| entity_aabb(&snapshot.type_name));
+                track_entity_chunk_locked(&mut inner, potion_id, potion_position);
+                initialize_entity_wire_state_from_snapshot_locked(&mut inner, &snapshot);
+                dispatches.extend(spawn_entity_visibility_from_snapshot_locked(
+                    &mut inner, snapshot,
+                ));
+                attacks += 1;
+            }
+        }
+        if !spawned_shulker_bullets.is_empty() {
+            let mut inner = self.lock_inner("publish hostile shulker bullets");
+            for bullet in spawned_shulker_bullets {
+                let snapshot = server_entity_snapshot_from(bullet);
+                let bullet_id = snapshot.id;
+                let bullet_position = snapshot.position;
+                let bullet_type_id = snapshot.type_id;
+                inner
+                    .entity_type_aabbs
+                    .entry(bullet_type_id)
+                    .or_insert_with(|| entity_aabb(&snapshot.type_name));
+                track_entity_chunk_locked(&mut inner, bullet_id, bullet_position);
+                initialize_entity_wire_state_from_snapshot_locked(&mut inner, &snapshot);
+                dispatches.extend(spawn_entity_visibility_from_snapshot_locked(
+                    &mut inner, snapshot,
+                ));
+                attacks += 1;
+            }
+        }
+        if !spawned_evoker_fangs.is_empty() {
+            let mut inner = self.lock_inner("publish hostile evoker fangs");
+            for fang in spawned_evoker_fangs {
+                let snapshot = server_entity_snapshot_from(fang);
+                let fang_id = snapshot.id;
+                let fang_position = snapshot.position;
+                let fang_type_id = snapshot.type_id;
+                inner
+                    .entity_type_aabbs
+                    .entry(fang_type_id)
+                    .or_insert_with(|| entity_aabb(&snapshot.type_name));
+                track_entity_chunk_locked(&mut inner, fang_id, fang_position);
+                initialize_entity_wire_state_from_snapshot_locked(&mut inner, &snapshot);
+                dispatches.extend(spawn_entity_visibility_from_snapshot_locked(
+                    &mut inner, snapshot,
+                ));
                 attacks += 1;
             }
         }
@@ -1094,6 +3111,90 @@ impl SessionRegistry {
                             kind: PlayerDamageKind::MobAttack,
                             amount: attack.attack_damage,
                             source_origin: Some(guardian.position),
+                        },
+                    },
+                });
+                attacks += 1;
+            }
+        }
+
+        if !committed_warden_attacks.is_empty() {
+            let warden_ids = committed_warden_attacks
+                .iter()
+                .map(|attack| attack.hostile_id)
+                .collect::<HashSet<_>>();
+            let current_wardens = {
+                let entities = self.lock_entities("validate hostile warden sonic attackers");
+                entities.prefetch(&warden_ids);
+                warden_ids
+                    .iter()
+                    .filter_map(|&entity_id| {
+                        entities
+                            .snapshot(entity_id)
+                            .map(|entity| (entity_id, entity))
+                    })
+                    .collect::<HashMap<_, _>>()
+            };
+            let recipients = self.movement_recipients.load_full();
+            let mut reserved_attacks = Vec::with_capacity(committed_warden_attacks.len());
+            for attack in committed_warden_attacks {
+                let Some(warden) = current_wardens.get(&attack.hostile_id) else {
+                    continue;
+                };
+                if warden.lifecycle != EntityLifecycle::Alive
+                    || warden.type_name != "minecraft:warden"
+                    || !warden.retained.warden_sonic_boom.is_some_and(|state| {
+                        state.phase == EntityWardenSonicBoomPhase::Recovery
+                            && state.target_session == attack.target_session
+                    })
+                {
+                    continue;
+                }
+                let Some(target_publication) = recipients.get(&attack.target_session) else {
+                    continue;
+                };
+                let Some((_, target_recipient)) =
+                    target_publication.reserve_combat_recipient_if(|target, visible_entities| {
+                        if !target.is_targetable() || !visible_entities.contains(&attack.hostile_id)
+                        {
+                            return false;
+                        }
+                        let target_pose = target.pose();
+                        let dx = target_pose.x - warden.position.x;
+                        let dz = target_pose.z - warden.position.z;
+                        let dy = (target_pose.y - warden.position.y).abs();
+                        dx * dx + dz * dz <= WARDEN_SONIC_RANGE_XZ * WARDEN_SONIC_RANGE_XZ
+                            && dy <= WARDEN_SONIC_RANGE_Y
+                    })
+                else {
+                    continue;
+                };
+                reserved_attacks.push((attack, warden.clone(), target_recipient));
+            }
+            let current_attacker_ids = self
+                .current_expected_entity_snapshots(
+                    reserved_attacks.iter().map(|(_, warden, _)| warden.clone()),
+                )
+                .into_iter()
+                .filter(|warden| {
+                    warden
+                        .retained
+                        .warden_sonic_boom
+                        .is_some_and(|state| state.phase == EntityWardenSonicBoomPhase::Recovery)
+                })
+                .map(|warden| warden.id)
+                .collect::<HashSet<_>>();
+            for (attack, warden, recipient) in reserved_attacks {
+                if !current_attacker_ids.contains(&attack.hostile_id) {
+                    continue;
+                }
+                dispatches.push(VisibilityDispatch {
+                    recipient,
+                    command: OutboundCommand::DamagePlayer {
+                        damage: PlayerDamageRequest {
+                            kind: PlayerDamageKind::SonicBoom,
+                            amount: WARDEN_SONIC_DAMAGE,
+                            source_origin: Some(warden.position),
                         },
                     },
                 });
@@ -1269,8 +3370,11 @@ struct HostileTargetCandidate {
     position: Vec3,
     follow_range: f64,
     uses_ranged_attack: bool,
+    uses_small_fireball: bool,
     is_creeper: bool,
     fuse_active: bool,
+    guardian_beam_active: bool,
+    exclusive_flight: bool,
     wander_speed: f64,
     wander_period_ticks: u32,
     pursuit_speed: f64,
@@ -1294,10 +3398,22 @@ fn hostile_target_candidate_from_projection(
             MobCombatPolicy::Arrow
                 | MobCombatPolicy::Crossbow
                 | MobCombatPolicy::GuardianBeam
+                | MobCombatPolicy::SmallFireball
+                | MobCombatPolicy::SonicBoom
+                | MobCombatPolicy::ShulkerBullet
+                | MobCombatPolicy::EvokerFangs
+                | MobCombatPolicy::LargeFireball
+                | MobCombatPolicy::WindCharge
+                | MobCombatPolicy::ThrownPotion
+                | MobCombatPolicy::WitherSkull
+                | MobCombatPolicy::DragonBoss
                 | MobCombatPolicy::UnsupportedSpecial
         ),
+        uses_small_fireball: profile.combat == MobCombatPolicy::SmallFireball,
         is_creeper: profile.combat == MobCombatPolicy::CreeperFuse,
         fuse_active: entity.primed_tnt,
+        guardian_beam_active: entity.guardian_beam_active,
+        exclusive_flight: profile.combat == MobCombatPolicy::DragonBoss,
         wander_speed: profile.wander_speed,
         wander_period_ticks: profile.wander_period_ticks,
         pursuit_speed: profile.pursuit_speed,
@@ -1326,31 +3442,44 @@ fn apply_hostile_target_candidates(
                             .total_cmp(&distance_sq(*right, hostile.position))
                     })
             };
-            let goal = match target {
-                None if hostile.is_creeper && hostile.fuse_active => GoalState::Idle,
-                None => hostile_wander_goal_for(hostile.wander_speed, hostile.wander_period_ticks),
-                Some(target)
-                    if hostile.is_creeper
-                        && (hostile.fuse_active
-                            || distance_sq(target, hostile.position)
-                                < CREEPER_TRIGGER_RANGE * CREEPER_TRIGGER_RANGE) =>
-                {
-                    GoalState::Idle
+            let goal = if hostile.guardian_beam_active || hostile.exclusive_flight {
+                GoalState::Idle
+            } else {
+                match target {
+                    None if hostile.is_creeper && hostile.fuse_active => GoalState::Idle,
+                    None => {
+                        hostile_wander_goal_for(hostile.wander_speed, hostile.wander_period_ticks)
+                    }
+                    Some(target)
+                        if hostile.is_creeper
+                            && (hostile.fuse_active
+                                || distance_sq(target, hostile.position)
+                                    < CREEPER_TRIGGER_RANGE * CREEPER_TRIGGER_RANGE) =>
+                    {
+                        GoalState::Idle
+                    }
+                    Some(target)
+                        if hostile.uses_small_fireball
+                            && distance_sq(target, hostile.position)
+                                >= BLAZE_CLOSE_MELEE_RANGE_SQ =>
+                    {
+                        GoalState::Idle
+                    }
+                    Some(target)
+                        if !hostile.uses_ranged_attack
+                            && (target.y - hostile.position.y).abs()
+                                <= HOSTILE_MELEE_VERTICAL_REACH
+                            && (target.x - hostile.position.x).powi(2)
+                                + (target.z - hostile.position.z).powi(2)
+                                <= HOSTILE_MELEE_RANGE * HOSTILE_MELEE_RANGE =>
+                    {
+                        GoalState::FollowPosition { target, speed: 0.0 }
+                    }
+                    Some(target) => GoalState::FollowPosition {
+                        target,
+                        speed: hostile.pursuit_speed,
+                    },
                 }
-                Some(target)
-                    if !hostile.uses_ranged_attack
-                        && (target.y - hostile.position.y).abs()
-                            <= HOSTILE_MELEE_VERTICAL_REACH
-                        && (target.x - hostile.position.x).powi(2)
-                            + (target.z - hostile.position.z).powi(2)
-                            <= HOSTILE_MELEE_RANGE * HOSTILE_MELEE_RANGE =>
-                {
-                    GoalState::FollowPosition { target, speed: 0.0 }
-                }
-                Some(target) => GoalState::FollowPosition {
-                    target,
-                    speed: hostile.pursuit_speed,
-                },
             };
             changed_hostile_goal(hostile.id, &hostile.current, goal)
         })
@@ -1399,10 +3528,22 @@ pub(super) fn update_hostile_targets(
                 MobCombatPolicy::Arrow
                     | MobCombatPolicy::Crossbow
                     | MobCombatPolicy::GuardianBeam
+                    | MobCombatPolicy::SmallFireball
+                    | MobCombatPolicy::SonicBoom
+                    | MobCombatPolicy::ShulkerBullet
+                    | MobCombatPolicy::EvokerFangs
+                    | MobCombatPolicy::LargeFireball
+                    | MobCombatPolicy::WindCharge
+                    | MobCombatPolicy::ThrownPotion
+                    | MobCombatPolicy::WitherSkull
+                    | MobCombatPolicy::DragonBoss
                     | MobCombatPolicy::UnsupportedSpecial
             ),
+            uses_small_fireball: profile.combat == MobCombatPolicy::SmallFireball,
             is_creeper: profile.combat == MobCombatPolicy::CreeperFuse,
             fuse_active: entity.retained.primed_tnt.is_some(),
+            guardian_beam_active: entity.retained.guardian_beam.is_some(),
+            exclusive_flight: profile.combat == MobCombatPolicy::DragonBoss,
             wander_speed: profile.wander_speed,
             wander_period_ticks: profile.wander_period_ticks,
             pursuit_speed: profile.pursuit_speed,

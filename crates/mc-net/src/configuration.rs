@@ -837,33 +837,31 @@ async fn send_loader_artifact<W>(
 where
     W: AsyncWriteExt + Unpin,
 {
-    let (bundle, path) =
+    let (bundle, artifact_bytes) =
         manifest
             .requested_artifact(request)
             .map_err(|error| ConnectionError::LoaderHandshake {
                 reason: error.to_string(),
             })?;
-    let metadata = tokio::fs::metadata(path).await?;
-    if !metadata.is_file() || metadata.len() != bundle.size_bytes {
+    if artifact_bytes.len() as u64 != bundle.size_bytes {
         return Err(ConnectionError::LoaderHandshake {
             reason: format!(
-                "server artifact {} no longer matches declared size {}",
-                path.display(),
-                bundle.size_bytes
+                "server artifact cache {} no longer matches declared size {}",
+                bundle.cache_key, bundle.size_bytes
             ),
         });
     }
-    let mut file = tokio::fs::File::open(path).await?;
     let mut offset = 0_u64;
     while offset < bundle.size_bytes {
         let remaining = bundle.size_bytes - offset;
         let chunk_len = usize::try_from(remaining.min(LOADER_ARTIFACT_CHUNK_BYTES as u64))
             .expect("loader chunk length fits usize");
-        let mut chunk = vec![0_u8; chunk_len];
-        file.read_exact(&mut chunk).await?;
+        let start = usize::try_from(offset).expect("verified Loader artifact offset fits usize");
+        let end = start + chunk_len;
+        let chunk = &artifact_bytes[start..end];
         let last = offset + chunk_len as u64 == bundle.size_bytes;
         let payload =
-            encode_artifact_chunk(&bundle.cache_key, offset, last, &chunk).map_err(|error| {
+            encode_artifact_chunk(&bundle.cache_key, offset, last, chunk).map_err(|error| {
                 ConnectionError::LoaderHandshake {
                     reason: error.to_string(),
                 }
@@ -880,15 +878,6 @@ where
         )
         .await?;
         offset += chunk_len as u64;
-    }
-    let mut trailing = [0_u8; 1];
-    if file.read(&mut trailing).await? != 0 {
-        return Err(ConnectionError::LoaderHandshake {
-            reason: format!(
-                "server artifact {} grew while it was transferred",
-                path.display()
-            ),
-        });
     }
     debug!(
         cache_key = %bundle.cache_key,
@@ -1099,6 +1088,7 @@ mod tests {
                 permissions: vec![LoaderPermission::OpenScreens],
                 cache_key: format!("example:screen/1/{}", "a".repeat(64)),
                 source_path: None,
+                artifact_bytes: None,
                 block_id: None,
                 block_name: None,
             }],
@@ -1195,6 +1185,7 @@ mod tests {
     fn configuration_loader_request_resolves_exact_manifest_artifact() {
         let mut manifest = loader_manifest();
         manifest.bundles[0].source_path = Some("/plugin/client/screen.zip".into());
+        manifest.bundles[0].artifact_bytes = Some(std::sync::Arc::from(&b"x"[..]));
         let request = LoaderArtifactRequest {
             protocol: LOADER_PROTOCOL_VERSION,
             cache_key: manifest.bundles[0].cache_key.clone(),

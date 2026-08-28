@@ -299,7 +299,7 @@ fn older_victim_publication_preserves_newer_attacker_costs() {
         &mut survival,
         &mut xp,
         PlayerDamagePublication {
-            expected_health: SurvivalState::MAX_HEALTH,
+            expected_health: mc_entity::player_survival_26_1_2::MAX_HEALTH,
             health: 16.0,
             inventory: vec![PlayerInventorySlotDelta {
                 slot: 5,
@@ -338,7 +338,7 @@ fn stale_damage_publication_does_not_apply_health_side_effects() {
         &mut survival,
         &mut xp,
         PlayerDamagePublication {
-            expected_health: SurvivalState::MAX_HEALTH,
+            expected_health: mc_entity::player_survival_26_1_2::MAX_HEALTH,
             health: 0.0,
             inventory: Vec::new(),
             carried_item: None,

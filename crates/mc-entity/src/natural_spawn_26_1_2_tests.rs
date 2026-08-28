@@ -5,7 +5,9 @@ use crate::Vec3;
 use crate::natural_spawn_26_1_2::{
     HerdSpawn, MAX_HOSTILE_SPAWNS_PER_CHUNK, MAX_PASSIVE_SPAWNS_PER_CHUNK, NaturalSpawnCategory,
     NaturalSpawnCategoryReport, NaturalSpawnReport, NaturalSpawnScheduler,
-    build_herd_spawn_candidates, spawn_far_enough_from_players,
+    build_herd_spawn_candidates, choose_biome_spawn, herd_entry_count, hostile_chunk_spawns,
+    passive_chunk_spawns, safe_land_spawn_offset, sheep_color_for_rolls,
+    spawn_far_enough_from_players,
 };
 
 #[test]
@@ -65,6 +67,50 @@ fn scheduler_reports_cumulative_metrics_only_at_the_bounded_log_interval() {
             },
         })
     );
+}
+
+#[test]
+fn deterministic_spawn_randomness_lives_in_entity_domain() {
+    use mc_data::biomes::{BiomeSpawnEntry, SheepColorClimate};
+
+    assert!(passive_chunk_spawns((0, 0)));
+    assert!(hostile_chunk_spawns((0, 0)));
+    assert!((0..128).any(|x| !passive_chunk_spawns((x, 7))));
+    assert!((0..128).any(|x| !hostile_chunk_spawns((x, 7))));
+
+    assert_eq!(
+        sheep_color_for_rolls(SheepColorClimate::Temperate, 0, 0),
+        crate::SheepColor::Black
+    );
+    assert_eq!(
+        sheep_color_for_rolls(SheepColorClimate::Warm, 99, 499),
+        crate::SheepColor::Pink
+    );
+    assert_eq!(safe_land_spawn_offset(0), 0.48);
+    assert_eq!(safe_land_spawn_offset(3), 0.51);
+
+    let cow = mc_data::Identifier::parse("minecraft:cow").unwrap();
+    let sheep = mc_data::Identifier::parse("minecraft:sheep").unwrap();
+    let entries = vec![
+        BiomeSpawnEntry {
+            entity_type: cow,
+            min_count: 2,
+            max_count: 4,
+            weight: 0,
+        },
+        BiomeSpawnEntry {
+            entity_type: sheep.clone(),
+            min_count: 3,
+            max_count: 5,
+            weight: 10,
+        },
+    ];
+    assert_eq!(
+        choose_biome_spawn(&entries, (11, -3), 2).map(|entry| &entry.entity_type),
+        Some(&sheep)
+    );
+    let count = herd_entry_count(&entries[1], (11, -3), 2);
+    assert!((3..=5).contains(&count));
 }
 
 #[test]

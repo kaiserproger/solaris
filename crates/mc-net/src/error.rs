@@ -74,6 +74,9 @@ pub enum ConnectionError {
     #[error("outbound socket write remained blocked for {timeout:?}")]
     WriteTimeout { timeout: Duration },
 
+    #[error("invalid connection encryption state: {reason}")]
+    EncryptionState { reason: &'static str },
+
     #[error("ignored more than {max} non-target packet(s) in state {state:?}")]
     IgnoredPacketBudgetExceeded { state: State, max: usize },
 

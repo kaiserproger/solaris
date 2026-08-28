@@ -148,12 +148,19 @@ The same review keeps these blockers canonical for replacement claims:
   `minecraft:overworld`, and wrote after-move plus after-rejoin screenshots.
   This is narrow evidence for one join/rejoin/movement path; it is not broad
   movement, water/swim, slow-client, two-client, or performance evidence.
-- Beds set respawn points. A bounded draft sleep path skips a lone player from
-  Solaris-defined night to the next morning through the existing `SetTime` path,
-  but client-visible clock-map/time-sync behavior and sleep skip save/restart
-  persistence are not proven. Multiplayer sleep quorum, weather, and
-  client-visible bed animation parity are not claimed. Weather is currently
-  disabled: Solaris does not start rain/thunder or send weather transitions.
+- Beds set respawn points and the focused TCP suite covers single-player sleep,
+  multiplayer quorum, occupancy/rejection, wake publication, and morning time
+  updates. The typed 26.1.2 world-clock map and a complete rendered 24,000-tick
+  cycle/restart gate are recorded in
+  [`evidence/world-clock-26.1.2.md`](evidence/world-clock-26.1.2.md); broader
+  subjective bed-animation parity remains a separate client gate. Weather is no
+  longer disabled: Solaris owns persisted `clear`/`rain`/`thunder` state, ramps
+  rain/thunder levels at the vanilla 26.1.2 rate, publishes the exact threshold
+  state/full-level `GameEvent` sequence, and exposes operator `/weather` commands.
+  The side-by-side Mojang oracle and restart evidence are recorded in
+  [`evidence/weather-26.1.2-authority-persistence-oracle.md`](evidence/weather-26.1.2-authority-persistence-oracle.md).
+  Autonomous random weather cycling and `/weather ... <duration>` remain explicitly
+  unclaimed until the separate vanilla scheduler state is modelled.
 - Signs support regular plain-text editing through Solaris harness coverage. A
   focused packet-path harness now flushes and reopens a disk-backed world after
   regular sign text edit and checks the persisted sign NBT plus client

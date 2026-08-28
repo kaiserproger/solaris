@@ -1,14 +1,21 @@
+use mc_data::item_stack::ItemStack;
 use mc_entity::Vec3;
 use mc_entity::living_26_1_2::{DamageFlags, DamageSource, DamageSourceKind};
-use mc_protocol::packets::play::ItemStack;
 
-const PLAYER_HURT_RESISTANCE_TICKS: u64 = 10;
+pub(in crate::play) use mc_entity::player_combat_26_1_2::{
+    HurtResistance as PlayerHurtResistance, HurtResolution as PlayerHurtResolution,
+};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(in crate::play) enum PlayerDamageKind {
     MobAttack,
     PlayerAttack,
     Projectile,
+    Fireball,
+    LargeFireball,
+    ShulkerBullet,
+    WindCharge,
+    SonicBoom,
     IndirectMagic,
     Fall,
     Campfire,
@@ -35,7 +42,17 @@ impl PlayerDamageKind {
     pub(in crate::play) const fn source(self) -> DamageSource {
         match self {
             Self::MobAttack | Self::PlayerAttack => DamageSource::vanilla(DamageSourceKind::Melee),
-            Self::Projectile => DamageSource::vanilla(DamageSourceKind::Projectile),
+            Self::Projectile | Self::ShulkerBullet | Self::WindCharge => {
+                DamageSource::vanilla(DamageSourceKind::Projectile)
+            }
+            Self::Fireball | Self::LargeFireball => DamageSource::with_flags(
+                DamageSourceKind::Projectile,
+                DamageFlags::IS_PROJECTILE.union(DamageFlags::IS_FIRE),
+            ),
+            Self::SonicBoom => DamageSource::with_flags(
+                DamageSourceKind::Generic,
+                DamageFlags::BYPASSES_ARMOR.union(DamageFlags::BYPASSES_ENCHANTMENTS),
+            ),
             Self::IndirectMagic => DamageSource::vanilla(DamageSourceKind::IndirectMagic),
             Self::Fall => DamageSource::vanilla(DamageSourceKind::Fall),
             Self::Campfire | Self::Fire => DamageSource::vanilla(DamageSourceKind::Fire),
@@ -85,61 +102,14 @@ impl PlayerDamageKind {
     pub(in crate::play) const fn can_be_blocked_by_shield(self) -> bool {
         matches!(
             self,
-            Self::MobAttack | Self::PlayerAttack | Self::Projectile
+            Self::MobAttack
+                | Self::PlayerAttack
+                | Self::Projectile
+                | Self::Fireball
+                | Self::LargeFireball
+                | Self::ShulkerBullet
+                | Self::WindCharge
         )
-    }
-}
-
-#[derive(Debug, Clone, Copy, PartialEq)]
-pub(in crate::play) enum PlayerHurtResolution {
-    Rejected,
-    Apply { amount: f32, fresh_hurt: bool },
-}
-
-#[derive(Debug, Clone, Copy, Default, PartialEq)]
-pub(in crate::play) struct PlayerHurtResistance {
-    last_full_hurt_tick: Option<u64>,
-    last_hurt: f32,
-}
-
-impl PlayerHurtResistance {
-    pub(in crate::play) fn preview(
-        self,
-        current_tick: u64,
-        amount: f32,
-    ) -> (PlayerHurtResolution, Self) {
-        let mut next = self;
-        let resolution = next.resolve(current_tick, amount);
-        (resolution, next)
-    }
-
-    pub(in crate::play) fn resolve(
-        &mut self,
-        current_tick: u64,
-        amount: f32,
-    ) -> PlayerHurtResolution {
-        if !amount.is_finite() || amount <= 0.0 {
-            return PlayerHurtResolution::Rejected;
-        }
-        if let Some(last_tick) = self.last_full_hurt_tick
-            && current_tick.saturating_sub(last_tick) < PLAYER_HURT_RESISTANCE_TICKS
-        {
-            if amount <= self.last_hurt {
-                return PlayerHurtResolution::Rejected;
-            }
-            let difference = amount - self.last_hurt;
-            self.last_hurt = amount;
-            return PlayerHurtResolution::Apply {
-                amount: difference,
-                fresh_hurt: false,
-            };
-        }
-        self.last_full_hurt_tick = Some(current_tick);
-        self.last_hurt = amount;
-        PlayerHurtResolution::Apply {
-            amount,
-            fresh_hurt: true,
-        }
     }
 }
 
@@ -163,13 +133,12 @@ pub(in crate::play) fn melee_knockback(
     target_on_ground: bool,
     source: Vec3,
 ) -> Option<MeleeKnockback> {
-    knockback_with_strength(
-        target_x,
-        target_z,
-        target_on_ground,
-        source,
-        0.400_000_005_960_464_5,
-    )
+    mc_entity::player_combat_26_1_2::melee_knockback(target_x, target_z, target_on_ground, source)
+        .map(|knockback| MeleeKnockback {
+            x: knockback.x,
+            y: knockback.y,
+            z: knockback.z,
+        })
 }
 
 pub(in crate::play) fn shield_block_knockback(
@@ -178,27 +147,16 @@ pub(in crate::play) fn shield_block_knockback(
     target_on_ground: bool,
     source: Vec3,
 ) -> Option<MeleeKnockback> {
-    knockback_with_strength(target_x, target_z, target_on_ground, source, 0.5)
-}
-
-fn knockback_with_strength(
-    target_x: f64,
-    target_z: f64,
-    target_on_ground: bool,
-    source: Vec3,
-    strength: f64,
-) -> Option<MeleeKnockback> {
-    let direction_x = source.x - target_x;
-    let direction_z = source.z - target_z;
-    let length_squared = direction_x * direction_x + direction_z * direction_z;
-    if length_squared < 9.999_999_747_378_752e-6 {
-        return None;
-    }
-    let scale = strength / length_squared.sqrt();
-    Some(MeleeKnockback {
-        x: -direction_x * scale,
-        y: if target_on_ground { 0.4 } else { 0.0 },
-        z: -direction_z * scale,
+    mc_entity::player_combat_26_1_2::shield_block_knockback(
+        target_x,
+        target_z,
+        target_on_ground,
+        source,
+    )
+    .map(|knockback| MeleeKnockback {
+        x: knockback.x,
+        y: knockback.y,
+        z: knockback.z,
     })
 }
 

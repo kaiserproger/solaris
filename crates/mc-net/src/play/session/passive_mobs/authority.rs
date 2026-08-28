@@ -17,8 +17,9 @@ use crate::play::inventory::PlayerInventory;
 use crate::play::simulation::{
     AnimalFeedPlan, CommittedAnimalFeed, CommittedSheepShear, SheepShearPlan, SimulationAuthority,
 };
+use mc_data::ItemStack;
+use mc_domain::GameMode;
 use mc_entity::{EntityId, EntityItemStack, EntityLifecycle, GoalState, SpawnEntity, Vec3};
-use mc_protocol::packets::play::{GameMode, ItemStack};
 use std::collections::{HashMap, HashSet};
 #[cfg(test)]
 use std::sync::atomic::Ordering;

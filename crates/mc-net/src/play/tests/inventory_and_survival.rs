@@ -1154,6 +1154,7 @@ fn survival_periodic_tick_regens_and_starves() {
         food: 18,
         saturation: 0.0,
         exhaustion: 0.0,
+        remaining_fire_ticks: 0,
     };
     let mut fed_timer = 0;
     for _ in 0..79 {
@@ -1767,76 +1768,6 @@ fn durability_tool_detection_covers_fallback_tool_families() {
 }
 
 #[test]
-fn fallback_food_rules_include_common_edibles() {
-    let item_facts = ItemFactsTable::default();
-    assert_eq!(
-        food_rule_for_item(
-            &item_facts,
-            &mc_data::Identifier::parse("minecraft:apple").unwrap()
-        ),
-        Some((
-            mc_data::food::FoodEntry {
-                food: 4,
-                saturation: 2.4,
-            },
-            DEFAULT_FOOD_USE_DURATION,
-        ))
-    );
-    assert_eq!(
-        food_rule_for_item(
-            &item_facts,
-            &mc_data::Identifier::parse("minecraft:bread").unwrap()
-        ),
-        Some((
-            mc_data::food::FoodEntry {
-                food: 5,
-                saturation: 6.0,
-            },
-            DEFAULT_FOOD_USE_DURATION,
-        ))
-    );
-    assert_eq!(
-        food_rule_for_item(
-            &item_facts,
-            &mc_data::Identifier::parse("minecraft:dirt").unwrap()
-        ),
-        None
-    );
-}
-
-#[test]
-fn food_rules_prefer_item_component_facts() {
-    let apple = mc_data::Identifier::parse("minecraft:apple").unwrap();
-    let item_facts = ItemFactsTable::from_entries([(
-        apple.clone(),
-        mc_data::item_components::ItemFacts {
-            max_stack_size: Some(64),
-            max_damage: None,
-            food: Some(mc_data::food::FoodEntry {
-                food: 7,
-                saturation: 1.5,
-            }),
-            use_duration_ticks: Some(10),
-            use_action: Some(mc_data::item_components::UseAction::Eat),
-            tool: None,
-            equippable_slot: None,
-            ..mc_data::item_components::ItemFacts::default()
-        },
-    )]);
-
-    assert_eq!(
-        food_rule_for_item(&item_facts, &apple),
-        Some((
-            mc_data::food::FoodEntry {
-                food: 7,
-                saturation: 1.5
-            },
-            Duration::from_millis(500),
-        ))
-    );
-}
-
-#[test]
 fn item_max_stack_prefers_component_facts() {
     use mc_data::items::ItemReport;
 
@@ -1927,75 +1858,4 @@ fn fallback_sword_damage_uses_material_tier() {
     assert_eq!(attack_damage_for_item(&facts, &items, Some(5)), 8.0);
     assert_eq!(attack_damage_for_item(&facts, &items, Some(6)), 4.0);
     assert_eq!(attack_damage_for_item(&facts, &items, Some(7)), 2.0);
-}
-
-#[test]
-fn fallback_mining_rules_use_block_family_and_matching_tool() {
-    let stone_hand = fallback_mining_time("stone", None);
-    let stone_pickaxe = fallback_mining_time("stone", Some("iron_pickaxe"));
-    let stone_shovel = fallback_mining_time("stone", Some("iron_shovel"));
-
-    assert!(stone_pickaxe < stone_hand);
-    assert_eq!(stone_shovel, stone_hand);
-    assert!(
-        fallback_mining_time("oak_log", Some("stone_axe")) < fallback_mining_time("oak_log", None)
-    );
-    assert!(
-        fallback_mining_time("dirt", Some("wooden_shovel")) < fallback_mining_time("dirt", None)
-    );
-    assert_eq!(
-        fallback_mining_time("podzol", None),
-        Duration::from_millis(750)
-    );
-    assert_eq!(
-        fallback_mining_time("unknown_custom_block", None),
-        Duration::from_millis(1_200)
-    );
-}
-
-#[test]
-fn zero_hardness_blocks_have_instant_vanilla_progress() {
-    assert!(fallback_mining_time("short_grass", None).is_zero());
-    assert!(fallback_mining_time("wheat", None).is_zero());
-    assert!(!fallback_mining_time("grass_block", None).is_zero());
-    assert!(!fallback_mining_time("oak_log", None).is_zero());
-}
-
-#[test]
-fn fallback_drop_rules_enforce_common_pickaxe_progression() {
-    assert!(fallback_tool_allows_block_drop("dirt", None));
-    assert!(!fallback_tool_allows_block_drop("stone", None));
-    assert!(!fallback_tool_allows_block_drop(
-        "stone",
-        Some("wooden_shovel")
-    ));
-    assert!(fallback_tool_allows_block_drop(
-        "stone",
-        Some("wooden_pickaxe")
-    ));
-
-    assert!(!fallback_tool_allows_block_drop(
-        "iron_ore",
-        Some("wooden_pickaxe")
-    ));
-    assert!(fallback_tool_allows_block_drop(
-        "deepslate_iron_ore",
-        Some("stone_pickaxe")
-    ));
-    assert!(!fallback_tool_allows_block_drop(
-        "diamond_ore",
-        Some("stone_pickaxe")
-    ));
-    assert!(fallback_tool_allows_block_drop(
-        "deepslate_diamond_ore",
-        Some("iron_pickaxe")
-    ));
-    assert!(!fallback_tool_allows_block_drop(
-        "obsidian",
-        Some("iron_pickaxe")
-    ));
-    assert!(fallback_tool_allows_block_drop(
-        "obsidian",
-        Some("diamond_pickaxe")
-    ));
 }

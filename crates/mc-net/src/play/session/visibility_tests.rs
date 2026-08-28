@@ -266,6 +266,7 @@ fn physics_motion_publication_preserves_non_kinematic_state() {
         villager_baby: false,
         main_hand_item: None,
         crossbow_charging: false,
+        blaze_charged: false,
         guardian_attack_target_entity_id: 0,
     };
     let motion = EntityMotionState {
@@ -279,11 +280,16 @@ fn physics_motion_publication_preserves_non_kinematic_state() {
         velocity: Vec3::new(0.1, 0.2, 0.3),
         on_ground: false,
         fall_distance: 0.0,
+        goal_fence: mc_entity::EntityGoalFence::Idle,
         is_item: false,
         is_experience: false,
         is_arrow: false,
         arrow_revision: None,
         arrow_embedded_block: None,
+        is_hurting_projectile: false,
+        hurting_projectile_revision: None,
+        is_throwable_projectile: false,
+        throwable_projectile_revision: None,
         sends_velocity: true,
     };
 

@@ -43,7 +43,7 @@ fn lethal_survival_commit_pushes_immutable_player_death_before_session_cleanup()
     }
 
     let mut dead = expected_survival;
-    dead.apply_damage(SurvivalState::MAX_HEALTH);
+    dead.apply_damage(mc_entity::player_survival_26_1_2::MAX_HEALTH);
     let committed = registry.commit_player_survival(
         &SimulationAuthority::for_test(),
         session,
@@ -114,7 +114,9 @@ fn respawn_commit_clears_player_hurt_resistance() {
     let session = register_test_session(&registry, "RespawnResistance");
     assert!(registry.mark_loaded(session, (0, 0)).is_empty());
     let mut persisted = PlayerPersistedState::new_default(PlayerPose::new(0.5, 64.0, 0.5));
-    persisted.survival.apply_damage(SurvivalState::MAX_HEALTH);
+    persisted
+        .survival
+        .apply_damage(mc_entity::player_survival_26_1_2::MAX_HEALTH);
     let expected_survival = persisted.survival;
     let expected_inventory = persisted.inventory.clone();
     let expected_carried_item = persisted.carried_item.clone();
@@ -7868,7 +7870,8 @@ fn player_attack_uses_authoritative_held_spear_range() {
 fn direct_player_melee_kill_pushes_one_authoritative_script_event() {
     fn attack_costs(state: &PlayerPersistedState, position: Vec3) -> PlayerSurvivalPlan {
         let mut updated_survival = state.survival;
-        updated_survival.add_exhaustion(SurvivalState::ENTITY_ATTACK_EXHAUSTION);
+        updated_survival
+            .add_exhaustion(mc_entity::player_survival_26_1_2::ENTITY_ATTACK_EXHAUSTION);
         PlayerSurvivalPlan {
             expected_survival: state.survival,
             updated_survival,
@@ -8931,6 +8934,7 @@ fn stale_arrow_physics_does_not_commit_or_publish_projectile_work() {
         aabb: entity_aabb("minecraft:arrow"),
         on_ground: false,
         fall_distance: 0.0,
+        goal_fence: mc_entity::EntityGoalFence::Idle,
         kind: EntityPhysicsKind::ArrowProjectile {
             revision: Some(99),
             embedded_block: None,
@@ -9308,7 +9312,7 @@ fn moving_arrow_damages_player_target_but_not_owner() {
             .expect("test lock poisoned")
             .survival
             .health,
-        SurvivalState::MAX_HEALTH - ARROW_ENTITY_HIT_DAMAGE
+        mc_entity::player_survival_26_1_2::MAX_HEALTH - ARROW_ENTITY_HIT_DAMAGE
     );
 }
 
@@ -9400,7 +9404,10 @@ fn shielded_player_hit_commits_shield_and_arrow_state_together() {
 
     assert!(registry.server_entity_snapshot(arrow_id).is_some());
     let state = target_state.lock().expect("test lock poisoned");
-    assert_eq!(state.survival.health, SurvivalState::MAX_HEALTH);
+    assert_eq!(
+        state.survival.health,
+        mc_entity::player_survival_26_1_2::MAX_HEALTH
+    );
     assert_eq!(
         state.inventory.slots[shield_slot],
         ItemStack::new(1, 1).with_damage(5)
@@ -9413,7 +9420,7 @@ fn shielded_player_hit_commits_shield_and_arrow_state_together() {
         matches!(
             &command,
             OutboundCommand::PlayerDamageCommitted { publication, .. }
-                if publication.shield_blocked && publication.health == SurvivalState::MAX_HEALTH
+                if publication.shield_blocked && publication.health == mc_entity::player_survival_26_1_2::MAX_HEALTH
         ),
         "unexpected shield publication: {command:?}"
     );
@@ -9546,7 +9553,7 @@ fn stale_player_plan_rejects_arrow_and_prior_entity_targets_atomically() {
             .expect("test lock poisoned")
             .survival
             .health,
-        SurvivalState::MAX_HEALTH - 1.0
+        mc_entity::player_survival_26_1_2::MAX_HEALTH - 1.0
     );
     assert!(matches!(
         owner_rx.try_recv(),
@@ -9705,7 +9712,9 @@ fn rejected_player_damage_preserves_projectile_for_invulnerable_targets() {
         let mut persisted = PlayerPersistedState::new_default(PlayerPose::new(0.5, 64.0, 1.5));
         persisted.game_mode = mode;
         if dead {
-            persisted.survival.apply_damage(SurvivalState::MAX_HEALTH);
+            persisted
+                .survival
+                .apply_damage(mc_entity::player_survival_26_1_2::MAX_HEALTH);
         }
         let target_state = Arc::new(Mutex::new(persisted));
         registry.register_player_persistence(target, Arc::clone(&target_state));
@@ -9809,7 +9818,7 @@ fn closed_player_publication_queue_does_not_create_false_projectile_rejection() 
             .expect("test lock poisoned")
             .survival
             .health,
-        SurvivalState::MAX_HEALTH - ARROW_ENTITY_HIT_DAMAGE
+        mc_entity::player_survival_26_1_2::MAX_HEALTH - ARROW_ENTITY_HIT_DAMAGE
     );
 }
 
@@ -10558,7 +10567,7 @@ fn vehicle_crossing_publishes_authoritative_passenger_motion() {
                 horizontal_collision: false,
             },
         ],
-        &[],
+        &EntityProjectilePhysicsFacts::default(),
     );
 
     assert_eq!(accepted.len(), 2);
@@ -11695,6 +11704,7 @@ fn stale_entity_physics_result_does_not_overwrite_newer_kinematics() {
         aabb: mc_physics::Aabb::COW,
         on_ground: initial.on_ground,
         fall_distance: 0.0,
+        goal_fence: mc_entity::EntityGoalFence::from_goal(&initial.goal),
         kind: EntityPhysicsKind::Living,
     };
     let newer_position = Vec3::new(1.5, 64.0, 0.5);
@@ -11745,6 +11755,72 @@ fn stale_entity_physics_result_does_not_overwrite_newer_kinematics() {
         .expect("spawned entity keeps tracker state");
     assert_eq!(tracker.tracking_update_count, 59);
     assert_eq!(tracker.teleport_delay, 399);
+}
+
+#[test]
+fn stale_entity_physics_result_does_not_cross_goal_change() {
+    let registry = SessionRegistry::new();
+    let (tx, _rx) = mpsc::channel(8);
+    let (alice, _) = registry.register(
+        &profile("StaleGoalPhysicsAlice"),
+        (0, 0),
+        2,
+        HashSet::from([(0, 0)]),
+        tx,
+        PlayerPose::new(0.5, 64.0, 0.5),
+    );
+    assert!(registry.mark_loaded(alice, (0, 0)).is_empty());
+    registry.spawn_command_entity(
+        &SimulationAuthority::for_test(),
+        63,
+        "minecraft:guardian".to_string(),
+        Vec3::new(0.5, 64.0, 6.5),
+    );
+    let initial = registry
+        .lock_entities("read stale goal physics entity")
+        .snapshots()
+        .next()
+        .expect("spawned guardian");
+    assert_ne!(initial.goal, GoalState::Idle);
+    let expected = EntityPhysicsQuery {
+        id: initial.id,
+        position: initial.position,
+        velocity: initial.velocity,
+        aabb: mc_physics::Aabb::COW,
+        on_ground: initial.on_ground,
+        fall_distance: initial.retained.fall_distance,
+        goal_fence: mc_entity::EntityGoalFence::from_goal(&initial.goal),
+        kind: EntityPhysicsKind::AquaticLiving,
+    };
+    assert!(
+        registry
+            .lock_entities("change goal before stale physics apply")
+            .set_goal(initial.id, GoalState::Idle)
+    );
+
+    registry.apply_entity_physics_if_current_and_dispatch(
+        2,
+        &[expected],
+        &[EntityPhysicsStep {
+            id: initial.id,
+            position: Vec3::new(
+                initial.position.x,
+                initial.position.y,
+                initial.position.z - 0.5,
+            ),
+            velocity: Vec3::new(0.0, 0.0, -0.5),
+            on_ground: false,
+            horizontal_collision: false,
+        }],
+    );
+
+    let current = registry
+        .lock_entities("verify stale goal physics rejection")
+        .snapshot(initial.id)
+        .expect("guardian remains authoritative");
+    assert_eq!(current.position, initial.position);
+    assert_eq!(current.velocity, initial.velocity);
+    assert_eq!(current.goal, GoalState::Idle);
 }
 
 #[test]
@@ -12323,6 +12399,194 @@ fn bounded_natural_mobs_publish_changed_movement_every_tick() {
         rx.try_recv(),
         Ok(OutboundCommand::MoveEntityRelative(movement)) if movement.id == entity_id
     ));
+}
+
+#[test]
+fn natural_mob_hard_despawn_respects_exact_distance_and_persistent_category() {
+    let registry = SessionRegistry::new();
+    let (tx, _rx) = mpsc::channel(8);
+    let (player, _) = registry.register(
+        &profile("NaturalDespawnObserver"),
+        (0, 0),
+        2,
+        HashSet::from([(0, 0)]),
+        tx,
+        PlayerPose::new(0.5, 64.0, 0.5),
+    );
+    assert!(registry.mark_loaded(player, (0, 0)).is_empty());
+    for (type_id, type_name, position) in [
+        (150, "minecraft:zombie", Vec3::new(128.5, 64.0, 0.5)),
+        (150, "minecraft:zombie", Vec3::new(128.500_1, 64.0, 0.5)),
+        (26, "minecraft:chicken", Vec3::new(200.5, 64.0, 0.5)),
+    ] {
+        let _ = registry.spawn_command_entity(
+            &SimulationAuthority::for_test(),
+            type_id,
+            type_name.to_owned(),
+            position,
+        );
+    }
+    let (boundary_zombie, distant_zombie, distant_chicken) = {
+        let entities = registry.lock_entities("read hard despawn fixtures");
+        let find = |name: &str, x: f64| {
+            entities
+                .snapshots()
+                .find(|entity| entity.type_name == name && (entity.position.x - x).abs() < 1.0e-9)
+                .map(|entity| entity.id)
+                .expect("hard despawn fixture")
+        };
+        (
+            find("minecraft:zombie", 128.5),
+            find("minecraft:zombie", 128.500_1),
+            find("minecraft:chicken", 200.5),
+        )
+    };
+    {
+        let mut inner = registry.lock_inner("mark hard despawn natural fixtures");
+        inner.natural_hostile_mobs.insert(boundary_zombie);
+        inner.natural_hostile_mobs.insert(distant_zombie);
+        inner.natural_ground_mobs.insert(distant_chicken);
+    }
+
+    assert_eq!(registry.tick_natural_mob_despawn(20).removed(), 1);
+    assert!(registry.server_entity_snapshot(boundary_zombie).is_some());
+    assert!(registry.server_entity_snapshot(distant_zombie).is_none());
+    assert!(registry.server_entity_snapshot(distant_chicken).is_some());
+    let inner = registry.lock_inner("verify hard despawn indexes");
+    assert!(inner.natural_hostile_mobs.contains(&boundary_zombie));
+    assert!(!inner.natural_hostile_mobs.contains(&distant_zombie));
+    assert!(inner.natural_ground_mobs.contains(&distant_chicken));
+}
+
+#[test]
+fn water_ambient_hard_despawn_uses_sixty_four_block_distance() {
+    let registry = SessionRegistry::new();
+    let (tx, _rx) = mpsc::channel(8);
+    let (player, _) = registry.register(
+        &profile("WaterDespawnObserver"),
+        (0, 0),
+        2,
+        HashSet::from([(0, 0)]),
+        tx,
+        PlayerPose::new(0.5, 64.0, 0.5),
+    );
+    assert!(registry.mark_loaded(player, (0, 0)).is_empty());
+    let _ = registry.spawn_command_entity(
+        &SimulationAuthority::for_test(),
+        110,
+        "minecraft:salmon".to_owned(),
+        Vec3::new(64.500_1, 64.0, 0.5),
+    );
+    let salmon = registry
+        .lock_entities("read water ambient despawn fixture")
+        .snapshots()
+        .find(|entity| entity.type_name == "minecraft:salmon")
+        .map(|entity| entity.id)
+        .expect("salmon fixture");
+    registry
+        .lock_inner("mark water ambient natural fixture")
+        .natural_aquatic_mobs
+        .insert(salmon);
+
+    assert_eq!(registry.tick_natural_mob_despawn(20).removed(), 1);
+    assert!(registry.server_entity_snapshot(salmon).is_none());
+}
+
+#[test]
+fn natural_mob_soft_despawn_requires_six_hundred_idle_ticks_and_exact_roll() {
+    let registry = SessionRegistry::new();
+    let (tx, _rx) = mpsc::channel(8);
+    let (player, _) = registry.register(
+        &profile("SoftDespawnObserver"),
+        (0, 0),
+        2,
+        HashSet::from([(0, 0)]),
+        tx,
+        PlayerPose::new(0.5, 64.0, 0.5),
+    );
+    assert!(registry.mark_loaded(player, (0, 0)).is_empty());
+    let _ = registry.spawn_command_entity(
+        &SimulationAuthority::for_test(),
+        150,
+        "minecraft:zombie".to_owned(),
+        Vec3::new(40.5, 64.0, 0.5),
+    );
+    let zombie = registry
+        .lock_entities("read soft despawn fixture")
+        .snapshots()
+        .find(|entity| entity.type_name == "minecraft:zombie")
+        .expect("soft despawn zombie");
+    {
+        let mut inner = registry.lock_inner("mark soft despawn natural fixture");
+        inner.natural_hostile_mobs.insert(zombie.id);
+        inner.natural_mob_no_action_since_tick.insert(zombie.id, 0);
+    }
+
+    assert_eq!(registry.tick_natural_mob_despawn(600).removed(), 0);
+    assert!(registry.server_entity_snapshot(zombie.id).is_some());
+    let roll_tick = (601..100_000)
+        .find(|tick| super::entity_lifecycle::natural_mob_soft_despawn_roll(zombie.uuid, *tick))
+        .expect("bounded deterministic range contains a one-in-800 soft despawn roll");
+    assert_eq!(registry.tick_natural_mob_despawn(roll_tick).removed(), 1);
+    assert!(registry.server_entity_snapshot(zombie.id).is_none());
+}
+
+#[test]
+fn natural_mob_soft_despawn_idle_clock_resets_near_player_and_after_damage() {
+    let registry = SessionRegistry::new();
+    let (tx, _rx) = mpsc::channel(8);
+    let (player, _) = registry.register(
+        &profile("SoftResetObserver"),
+        (0, 0),
+        2,
+        HashSet::from([(0, 0)]),
+        tx,
+        PlayerPose::new(0.5, 64.0, 0.5),
+    );
+    assert!(registry.mark_loaded(player, (0, 0)).is_empty());
+    for position in [Vec3::new(31.5, 64.0, 0.5), Vec3::new(40.5, 64.0, 0.5)] {
+        let _ = registry.spawn_command_entity(
+            &SimulationAuthority::for_test(),
+            150,
+            "minecraft:zombie".to_owned(),
+            position,
+        );
+    }
+    let (near, damaged) = {
+        let entities = registry.lock_entities("read soft reset fixtures");
+        let mut zombies = entities
+            .snapshots()
+            .filter(|entity| entity.type_name == "minecraft:zombie")
+            .collect::<Vec<_>>();
+        zombies.sort_by(|left, right| left.position.x.total_cmp(&right.position.x));
+        (zombies[0].clone(), zombies[1].clone())
+    };
+    {
+        let mut entities = registry.lock_entities("record soft reset damage fixture");
+        let expected = entities
+            .snapshot(damaged.id)
+            .expect("damaged zombie remains current");
+        let mut next = expected.clone();
+        next.retained.last_damage_tick = Some(650);
+        assert!(entities.replace_snapshot_if_current(expected, next));
+    }
+    {
+        let mut inner = registry.lock_inner("mark soft reset natural fixtures");
+        inner.natural_hostile_mobs.extend([near.id, damaged.id]);
+        inner.natural_mob_no_action_since_tick.insert(near.id, 0);
+        inner.natural_mob_no_action_since_tick.insert(damaged.id, 0);
+    }
+
+    assert_eq!(registry.tick_natural_mob_despawn(700).removed(), 0);
+    let inner = registry.lock_inner("verify soft despawn idle resets");
+    assert_eq!(
+        inner.natural_mob_no_action_since_tick.get(&near.id),
+        Some(&700)
+    );
+    assert_eq!(
+        inner.natural_mob_no_action_since_tick.get(&damaged.id),
+        Some(&650)
+    );
 }
 
 #[test]

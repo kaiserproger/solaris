@@ -264,8 +264,8 @@ where
                 challenge,
             )
             .map_err(|_| ConnectionError::OnlineAuthentication("invalid encryption response"))?;
-        reader.enable_encryption(&shared_secret, buf);
-        writer.enable_encryption(&shared_secret);
+        reader.enable_encryption(&shared_secret, buf)?;
+        writer.enable_encryption(&shared_secret)?;
 
         let verified = authentication
             .verifier
@@ -590,8 +590,10 @@ mod tests {
             )
             .await
             .unwrap();
-            client_reader.enable_encryption(&SHARED_SECRET, &mut client_buf);
-            client_writer.enable_encryption(&SHARED_SECRET);
+            client_reader
+                .enable_encryption(&SHARED_SECRET, &mut client_buf)
+                .unwrap();
+            client_writer.enable_encryption(&SHARED_SECRET).unwrap();
 
             let set_compression = read_packet_with_timeout::<SetCompression, _>(
                 &mut client_reader,

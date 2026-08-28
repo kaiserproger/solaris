@@ -17,9 +17,49 @@ use mc_protocol::packets::play::{
 
 use crate::error::ConnectionError;
 
-fn decode_exact<P: Packet>(id: i32, body: &Bytes) -> Result<(), ConnectionError> {
+macro_rules! for_each_serverbound_play_packet {
+    ($visit:ident) => {
+        $visit!(ServerboundKeepAlive);
+        $visit!(ConfirmTeleportation);
+        $visit!(ServerboundMovePlayerPos);
+        $visit!(ServerboundMovePlayerPosRot);
+        $visit!(ServerboundMovePlayerRot);
+        $visit!(ServerboundMovePlayerStatusOnly);
+        $visit!(ServerboundPlayerAction);
+        $visit!(ServerboundPlayerCommand);
+        $visit!(ServerboundPlayerInput);
+        $visit!(ServerboundUseItemOn);
+        $visit!(ServerboundUseItem);
+        $visit!(ServerboundSignUpdate);
+        $visit!(ServerboundAttack);
+        $visit!(ServerboundInteract);
+        $visit!(ServerboundSwing);
+        $visit!(ServerboundPlaceRecipe);
+        $visit!(ServerboundSelectTrade);
+        $visit!(ServerboundContainerButtonClick);
+        $visit!(ServerboundContainerClick);
+        $visit!(ServerboundContainerClose);
+        $visit!(ServerboundRecipeBookChangeSettings);
+        $visit!(ServerboundRecipeBookSeenRecipe);
+        $visit!(ServerboundSetCarriedItem);
+        $visit!(ServerboundClientCommand);
+        $visit!(ServerboundClientInformation);
+        $visit!(ServerboundCustomPayload);
+        $visit!(ServerboundResourcePack);
+        $visit!(ServerboundChatAck);
+        $visit!(ServerboundChunkBatchReceived);
+        $visit!(ServerboundClientTickEnd);
+        $visit!(ServerboundPlayerLoaded);
+        $visit!(ServerboundCommandSuggestion);
+        $visit!(ServerboundChat);
+        $visit!(ServerboundChatCommand);
+        $visit!(ServerboundChangeGameMode);
+    };
+}
+
+pub(super) fn decode_exact<P: Packet>(id: i32, body: &Bytes) -> Result<P, ConnectionError> {
     let mut body = body.clone();
-    P::decode(&mut body)?;
+    let packet = P::decode(&mut body)?;
     let trailing = body.remaining();
     if trailing != 0 {
         return Err(ConnectionError::TrailingBytes {
@@ -28,7 +68,7 @@ fn decode_exact<P: Packet>(id: i32, body: &Bytes) -> Result<(), ConnectionError>
             trailing,
         });
     }
-    Ok(())
+    Ok(packet)
 }
 
 /// Validate one recognized serverbound Play packet before it may count as
@@ -50,41 +90,7 @@ pub(super) fn validate_serverbound_play_frame(
         };
     }
 
-    recognized!(ServerboundKeepAlive);
-    recognized!(ConfirmTeleportation);
-    recognized!(ServerboundMovePlayerPos);
-    recognized!(ServerboundMovePlayerPosRot);
-    recognized!(ServerboundMovePlayerRot);
-    recognized!(ServerboundMovePlayerStatusOnly);
-    recognized!(ServerboundPlayerAction);
-    recognized!(ServerboundPlayerCommand);
-    recognized!(ServerboundPlayerInput);
-    recognized!(ServerboundUseItemOn);
-    recognized!(ServerboundUseItem);
-    recognized!(ServerboundSignUpdate);
-    recognized!(ServerboundAttack);
-    recognized!(ServerboundInteract);
-    recognized!(ServerboundSwing);
-    recognized!(ServerboundPlaceRecipe);
-    recognized!(ServerboundSelectTrade);
-    recognized!(ServerboundContainerButtonClick);
-    recognized!(ServerboundContainerClick);
-    recognized!(ServerboundContainerClose);
-    recognized!(ServerboundRecipeBookChangeSettings);
-    recognized!(ServerboundRecipeBookSeenRecipe);
-    recognized!(ServerboundSetCarriedItem);
-    recognized!(ServerboundClientCommand);
-    recognized!(ServerboundClientInformation);
-    recognized!(ServerboundCustomPayload);
-    recognized!(ServerboundResourcePack);
-    recognized!(ServerboundChatAck);
-    recognized!(ServerboundChunkBatchReceived);
-    recognized!(ServerboundClientTickEnd);
-    recognized!(ServerboundPlayerLoaded);
-    recognized!(ServerboundCommandSuggestion);
-    recognized!(ServerboundChat);
-    recognized!(ServerboundChatCommand);
-    recognized!(ServerboundChangeGameMode);
+    for_each_serverbound_play_packet!(recognized);
     Ok(false)
 }
 
@@ -93,6 +99,82 @@ mod tests {
     use bytes::{BufMut as _, BytesMut};
 
     use super::*;
+
+    #[test]
+    fn recognized_packet_inventory_has_unique_ids() {
+        let mut ids = Vec::new();
+        macro_rules! collect_id {
+            ($packet:ty) => {
+                ids.push(<$packet>::ID);
+            };
+        }
+        for_each_serverbound_play_packet!(collect_id);
+        assert_eq!(ids.len(), 35);
+        ids.sort_unstable();
+        ids.dedup();
+        assert_eq!(ids.len(), 35, "serverbound Play packet IDs must be unique");
+    }
+
+    #[test]
+    fn every_recognized_packet_has_a_dispatch_classification() {
+        fn family_routes(packet: &str, id: i32) -> bool {
+            match packet {
+                "ServerboundMovePlayerPos"
+                | "ServerboundMovePlayerPosRot"
+                | "ServerboundMovePlayerRot"
+                | "ServerboundMovePlayerStatusOnly" => {
+                    super::super::is_serverbound_movement_packet(id)
+                }
+                "ServerboundPlayerAction"
+                | "ServerboundPlayerCommand"
+                | "ServerboundPlayerInput" => super::super::is_serverbound_player_state_packet(id),
+                "ServerboundUseItemOn"
+                | "ServerboundUseItem"
+                | "ServerboundSignUpdate"
+                | "ServerboundAttack"
+                | "ServerboundInteract"
+                | "ServerboundSwing" => super::super::is_serverbound_use_interaction_packet(id),
+                "ServerboundPlaceRecipe"
+                | "ServerboundSelectTrade"
+                | "ServerboundContainerButtonClick"
+                | "ServerboundContainerClick"
+                | "ServerboundContainerClose" => super::super::is_serverbound_container_packet(id),
+                "ServerboundSetCarriedItem"
+                | "ServerboundClientCommand"
+                | "ServerboundChangeGameMode" => {
+                    super::super::is_serverbound_player_control_packet(id)
+                }
+                "ServerboundRecipeBookChangeSettings"
+                | "ServerboundRecipeBookSeenRecipe"
+                | "ServerboundClientInformation"
+                | "ServerboundCustomPayload"
+                | "ServerboundResourcePack"
+                | "ServerboundChatAck"
+                | "ServerboundChunkBatchReceived"
+                | "ServerboundClientTickEnd"
+                | "ServerboundPlayerLoaded" => {
+                    super::super::is_serverbound_client_metadata_packet(id)
+                }
+                "ServerboundCommandSuggestion" | "ServerboundChat" | "ServerboundChatCommand" => {
+                    super::super::is_serverbound_chat_command_packet(id)
+                }
+                _ => false,
+            }
+        }
+
+        macro_rules! assert_dispatch_branch {
+            ($packet:ty) => {
+                let packet = stringify!($packet);
+                let id = <$packet>::ID;
+                let direct = id == ServerboundKeepAlive::ID || id == ConfirmTeleportation::ID;
+                assert!(
+                    direct || family_routes(packet, id),
+                    "recognized packet {packet} is missing from direct or family Play dispatch classification"
+                );
+            };
+        }
+        for_each_serverbound_play_packet!(assert_dispatch_branch);
+    }
 
     #[test]
     fn unknown_packet_does_not_count_as_valid_activity() {
@@ -108,10 +190,14 @@ mod tests {
     #[test]
     fn valid_non_keepalive_packet_counts_after_exact_decode() {
         let mut body = BytesMut::new();
-        ConfirmTeleportation { teleport_id: 0 }
+        ConfirmTeleportation { teleport_id: 7 }
             .encode(&mut body)
             .unwrap();
-        assert!(validate_serverbound_play_frame(ConfirmTeleportation::ID, &body.freeze()).unwrap());
+        let body = body.freeze();
+        assert!(validate_serverbound_play_frame(ConfirmTeleportation::ID, &body).unwrap());
+        let decoded =
+            decode_exact::<ConfirmTeleportation>(ConfirmTeleportation::ID, &body).unwrap();
+        assert_eq!(decoded.teleport_id, 7);
     }
 
     #[test]

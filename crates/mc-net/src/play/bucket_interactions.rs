@@ -1,8 +1,8 @@
 use std::sync::Arc;
 
-use mc_data::block_facts::FluidKind;
+use mc_data::{ItemStack, block_facts::FluidKind};
+use mc_domain::{Direction, GameMode, InteractionHand};
 use mc_protocol::codec::Identifier;
-use mc_protocol::packets::play::{Direction, GameMode, InteractionHand, ItemStack};
 use tokio::io::AsyncWriteExt;
 use tracing::debug;
 
@@ -311,4 +311,152 @@ pub(in crate::play) fn plan_bucket_replacement(
     }
     changed.append(&mut merged);
     Some((inventory, changed))
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::Arc;
+    use std::task::{Context, Poll};
+
+    use bytes::BytesMut;
+    use mc_protocol::Packet;
+    use mc_protocol::packets::play::{BlockChangedAck, BlockUpdate, ClientboundContainerSetSlot};
+
+    use super::*;
+    use crate::play::simulation::simulation_channel;
+    use crate::play::tests::{
+        interaction_state_for_items_and_blocks, register_survival_test_player,
+    };
+    use crate::play::{SurvivalState, XpState};
+
+    #[tokio::test]
+    async fn committed_bucket_response_orders_block_ack_before_inventory_update() {
+        let items = Arc::new(mc_data::items::solaris_required_items());
+        let blocks =
+            Arc::new(
+                mc_world::BlockRegistry::from_report(
+                    &mc_data::blocks::solaris_required_blocks_report(),
+                )
+                .unwrap(),
+            );
+        let mut state =
+            interaction_state_for_items_and_blocks(Arc::clone(&items), Arc::clone(&blocks));
+        let water_bucket = items
+            .id_of(&Identifier::parse("minecraft:water_bucket").unwrap())
+            .unwrap();
+        let empty_bucket = items
+            .id_of(&Identifier::parse("minecraft:bucket").unwrap())
+            .unwrap();
+        let stone = blocks
+            .block(&Identifier::parse("minecraft:stone").unwrap())
+            .unwrap()
+            .default;
+        let water = blocks
+            .block(&Identifier::parse("minecraft:water").unwrap())
+            .unwrap()
+            .default;
+        let air = blocks
+            .block(&Identifier::parse("minecraft:air").unwrap())
+            .unwrap()
+            .default;
+        let pos = mc_world::BlockPos { x: 1, y: 64, z: 1 };
+        let token = {
+            let mut storage = state.world.lock().await;
+            let chunk_pos = mc_world::ChunkPos { x: 0, z: 0 };
+            storage
+                .insert_generated_chunk(
+                    chunk_pos,
+                    mc_world::Chunk::empty(
+                        chunk_pos,
+                        air,
+                        Identifier::parse("minecraft:plains").unwrap(),
+                    ),
+                )
+                .unwrap();
+            storage.set_block_at(pos, stone).unwrap();
+            storage.block_mutation_token(pos).unwrap()
+        };
+        let held_slot = PlayerInventory::HOTBAR_BASE;
+        let held = ItemStack::new(water_bucket, 1);
+        state.inventory.slots[held_slot] = held.clone();
+        state.selected_hotbar_slot = 0;
+        let (session_id, _) = register_survival_test_player(
+            &mut state,
+            "BucketResponse",
+            SurvivalState::FULL,
+            &XpState::default(),
+        );
+        let (simulation, mut owner) = simulation_channel();
+        state.simulation = simulation.for_session(session_id);
+        let sessions = Arc::clone(&state.sessions);
+        let world = Arc::clone(&state.world);
+        let plan = BucketUsePlan {
+            edit: BlockEdit {
+                pos,
+                new_state: water,
+            },
+            precondition: super::super::BlockEditPrecondition {
+                pos,
+                expected_state: stone,
+                expected_token: token,
+            },
+            block_facts: Arc::clone(&state.block_facts),
+            inventory: Some(BucketInventoryChange {
+                held_slot,
+                expected_held: held,
+                replacement_item: empty_bucket,
+                replacement_max_stack: 16,
+            }),
+            schedule_fluid_ticks: false,
+        };
+        let mut writer = Vec::new();
+        let mut response = Box::pin(commit_bucket_use_and_respond(
+            &mut state,
+            &mut writer,
+            31,
+            plan,
+        ));
+        let waker = std::task::Waker::noop();
+        let mut context = Context::from_waker(waker);
+        assert!(matches!(
+            std::future::Future::poll(response.as_mut(), &mut context),
+            Poll::Pending
+        ));
+        assert_eq!(
+            owner
+                .process_tick_with_world(&sessions, Some(&world), None, 1)
+                .processed,
+            1
+        );
+        assert!(response.await.unwrap());
+
+        assert_eq!(
+            state.inventory.slots[held_slot],
+            ItemStack::new(empty_bucket, 1)
+        );
+        let mut buf = BytesMut::from(writer.as_slice());
+        let mut block = mc_protocol::frame::try_decode_frame(&mut buf, state.compression)
+            .unwrap()
+            .expect("committed block update");
+        assert_eq!(block.id, BlockUpdate::ID);
+        let update = BlockUpdate::decode(&mut block.body).unwrap();
+        assert_eq!(update.state_id, i32::try_from(water.0).unwrap());
+        let mut ack = mc_protocol::frame::try_decode_frame(&mut buf, state.compression)
+            .unwrap()
+            .expect("block changed acknowledgement");
+        assert_eq!(ack.id, BlockChangedAck::ID);
+        assert_eq!(BlockChangedAck::decode(&mut ack.body).unwrap().sequence, 31);
+        let mut inventory = mc_protocol::frame::try_decode_frame(&mut buf, state.compression)
+            .unwrap()
+            .expect("inventory slot update");
+        assert_eq!(inventory.id, ClientboundContainerSetSlot::ID);
+        assert_eq!(
+            ClientboundContainerSetSlot::decode(&mut inventory.body)
+                .unwrap()
+                .item_stack
+                .item_id,
+            empty_bucket
+        );
+        assert!(buf.is_empty());
+    }
 }

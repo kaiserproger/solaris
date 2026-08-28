@@ -452,6 +452,19 @@ fn item_stack_empty_round_trips_as_single_zero_byte() {
 }
 
 #[test]
+fn item_stack_negative_count_is_malformed_and_does_not_mean_empty() {
+    let mut buf = Vec::new();
+    buf.write_varint(-1);
+    buf.extend_from_slice(&[0x01, 0x00, 0x00]);
+    let mut cur: &[u8] = &buf;
+
+    let error = ItemStack::decode(&mut cur).unwrap_err();
+
+    assert_eq!(error, CodecError::NegativeLength(-1));
+    assert_eq!(cur, &[0x01, 0x00, 0x00]);
+}
+
+#[test]
 fn item_stack_non_empty_round_trips() {
     let stone = ItemStack::new(1, 64);
     let mut buf = Vec::new();

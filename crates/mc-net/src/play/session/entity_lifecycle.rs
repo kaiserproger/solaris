@@ -7,9 +7,7 @@ use crate::play::simulation::SimulationAuthority;
 use crate::play::spawn::chunk_pos_from_coords;
 
 use super::entity_goal_defaults::apply_default_mob_goal;
-#[cfg(test)]
-use super::interaction_geometry::distance_sq;
-use super::interaction_geometry::entity_aabb;
+use super::interaction_geometry::{distance_sq, entity_aabb};
 use super::outbound::{ServerEntitySnapshot, VisibilityDispatch};
 use super::visibility::{
     clear_entity_publication_state_locked, despawn_entity_visibility_locked,
@@ -20,6 +18,24 @@ use super::{SessionEntityGuards, SessionRegistry, SessionRegistryInner, apply_en
 
 pub(super) const ENTITY_EVENT_DEATH_COMPLETE: i8 = 60;
 pub(super) const DEATH_REMOVALS_PER_TICK: usize = 4;
+const NATURAL_MOB_SOFT_DESPAWN_IDLE_TICKS: u64 = 600;
+const NATURAL_MOB_SOFT_DESPAWN_ROLL_BOUND: u32 = 800;
+const JAVA_RANDOM_MULTIPLIER: u64 = 0x5DEECE66D;
+const JAVA_RANDOM_ADDEND: u64 = 0xB;
+const JAVA_RANDOM_MASK: u64 = (1_u64 << 48) - 1;
+
+pub(crate) struct NaturalMobDespawnOutcome {
+    #[cfg(test)]
+    pub(super) removed: usize,
+    pub(super) dispatches: Vec<VisibilityDispatch>,
+}
+
+#[cfg(test)]
+impl NaturalMobDespawnOutcome {
+    pub(crate) const fn removed(&self) -> usize {
+        self.removed
+    }
+}
 
 impl SessionRegistry {
     pub(crate) fn synchronize_entity_lifecycle_epoch(&self, lifecycle_epoch: u64) {
@@ -31,6 +47,105 @@ impl SessionRegistry {
             self.simulation_tick_sender.send_replace(lifecycle_epoch);
         }
         self.entities.advance_lifecycle_epoch(lifecycle_epoch);
+    }
+
+    pub(crate) fn tick_natural_mob_despawn(&self, current_tick: u64) -> NaturalMobDespawnOutcome {
+        let mut inner = self.lock_session_entities("despawn distant natural mobs");
+        let player_positions = inner
+            .sessions
+            .iter()
+            .filter(|(id, _)| {
+                !inner.dead_sessions.contains(id)
+                    && !inner.spectator_sessions.contains(id)
+                    && !inner.client_unloaded_sessions.contains(id)
+            })
+            .map(|(_, session)| Vec3::new(session.pose.x, session.pose.y, session.pose.z))
+            .collect::<Vec<_>>();
+        if player_positions.is_empty() {
+            return NaturalMobDespawnOutcome {
+                #[cfg(test)]
+                removed: 0,
+                dispatches: Vec::new(),
+            };
+        }
+        let mut candidates = inner
+            .natural_hostile_mobs
+            .iter()
+            .chain(&inner.natural_ground_mobs)
+            .chain(&inner.natural_aquatic_mobs)
+            .copied()
+            .collect::<Vec<_>>();
+        candidates.sort_unstable();
+        candidates.dedup();
+        let mut dispatches = Vec::new();
+        #[cfg(test)]
+        let mut removed = 0usize;
+        for entity_id in candidates {
+            let Some(snapshot) = inner.entities.snapshot(entity_id) else {
+                inner.natural_mob_no_action_since_tick.remove(&entity_id);
+                continue;
+            };
+            if snapshot.lifecycle != EntityLifecycle::Alive {
+                continue;
+            }
+            let Some(contract) =
+                mc_data::entity_types::entity_type_contract_26_1_2_by_name(&snapshot.type_name)
+            else {
+                continue;
+            };
+            if !natural_mob_remove_when_far_away(&snapshot.type_name) {
+                inner
+                    .natural_mob_no_action_since_tick
+                    .insert(entity_id, current_tick);
+                continue;
+            }
+            let nearest_distance_sq = player_positions
+                .iter()
+                .map(|player| distance_sq(snapshot.position, *player))
+                .min_by(f64::total_cmp)
+                .expect("non-empty player positions");
+            let category = contract.mob_category();
+            let hard_distance = f64::from(category.despawn_distance());
+            let should_hard_despawn = nearest_distance_sq > hard_distance * hard_distance;
+
+            let no_despawn_distance = f64::from(category.no_despawn_distance());
+            let no_despawn_distance_sq = no_despawn_distance * no_despawn_distance;
+            let no_action_since = inner
+                .natural_mob_no_action_since_tick
+                .entry(entity_id)
+                .or_insert(current_tick);
+            if let Some(last_damage_tick) = snapshot.retained.last_damage_tick
+                && last_damage_tick > *no_action_since
+            {
+                *no_action_since = last_damage_tick;
+            }
+            if nearest_distance_sq < no_despawn_distance_sq {
+                *no_action_since = current_tick;
+            }
+            let no_action_time = current_tick.saturating_sub(*no_action_since);
+            let should_soft_despawn = no_action_time > NATURAL_MOB_SOFT_DESPAWN_IDLE_TICKS
+                && nearest_distance_sq > no_despawn_distance_sq
+                && natural_mob_soft_despawn_roll(snapshot.uuid, current_tick);
+            if !should_hard_despawn && !should_soft_despawn {
+                continue;
+            }
+            let Some((_, mut entity_dispatches)) =
+                remove_server_entity_locked(&mut inner, entity_id)
+            else {
+                continue;
+            };
+            #[cfg(test)]
+            {
+                removed += 1;
+            }
+            dispatches.append(&mut entity_dispatches);
+        }
+        drop(inner);
+        NaturalMobDespawnOutcome {
+            #[cfg(test)]
+            removed,
+            dispatches,
+        }
     }
 
     pub(in crate::play) fn spawn_falling_block(
@@ -88,6 +203,25 @@ impl SessionRegistry {
         dispatches
     }
 
+    #[cfg(test)]
+    pub(crate) fn spawn_script_router_test_entity(
+        &self,
+        entity_type_id: i32,
+        entity_type_name: &str,
+        position: Vec3,
+    ) -> EntityId {
+        let mob_behaviors = self.mob_behavior_table();
+        let mut inner = self.lock_session_entities("spawn script router test entity");
+        let (entity_id, _) = spawn_command_entity_locked(
+            &mut inner,
+            entity_type_id,
+            entity_type_name.to_owned(),
+            position,
+            &mob_behaviors,
+        );
+        entity_id
+    }
+
     pub(in crate::play) fn tick_dying_entities(
         &self,
         _authority: &SimulationAuthority,
@@ -103,6 +237,43 @@ impl SessionRegistry {
             ),
         );
         dispatches
+    }
+}
+
+fn natural_mob_remove_when_far_away(type_name: &str) -> bool {
+    !matches!(
+        type_name,
+        "minecraft:sheep" | "minecraft:pig" | "minecraft:chicken" | "minecraft:cow"
+    )
+}
+
+fn natural_mob_despawn_seed_mix(mut value: u64) -> u64 {
+    value = value.wrapping_add(0x9E37_79B9_7F4A_7C15);
+    value = (value ^ (value >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+    value = (value ^ (value >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+    value ^ (value >> 31)
+}
+
+pub(super) fn natural_mob_soft_despawn_roll(uuid: uuid::Uuid, tick: u64) -> bool {
+    let raw = uuid.as_u128();
+    let seed = natural_mob_despawn_seed_mix(
+        ((raw >> 64) as u64) ^ (raw as u64).rotate_left(23) ^ tick.rotate_left(41),
+    );
+    let mut state = (seed ^ JAVA_RANDOM_MULTIPLIER) & JAVA_RANDOM_MASK;
+    loop {
+        state = state
+            .wrapping_mul(JAVA_RANDOM_MULTIPLIER)
+            .wrapping_add(JAVA_RANDOM_ADDEND)
+            & JAVA_RANDOM_MASK;
+        let bits = (state >> 17) as u32;
+        let value = bits % NATURAL_MOB_SOFT_DESPAWN_ROLL_BOUND;
+        if bits
+            .wrapping_sub(value)
+            .wrapping_add(NATURAL_MOB_SOFT_DESPAWN_ROLL_BOUND - 1) as i32
+            >= 0
+        {
+            return value == 0;
+        }
     }
 }
 
@@ -333,6 +504,7 @@ pub(super) fn clear_removed_entity_tracking_locked(
     inner.natural_hostile_mobs.remove(&entity_id);
     inner.natural_ground_mobs.remove(&entity_id);
     inner.natural_aquatic_mobs.remove(&entity_id);
+    inner.natural_mob_no_action_since_tick.remove(&entity_id);
     inner.sheep_entities.remove(&entity_id);
     update_breeding_tick_tracking_locked(inner, entity_id, None);
     inner.simulation_inputs.remove_terrain_pathing([entity_id]);

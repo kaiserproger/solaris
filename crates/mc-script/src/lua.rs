@@ -1,4 +1,4 @@
-use std::collections::{BTreeSet, HashMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::fmt;
 use std::fs;
 use std::io::Read;
@@ -21,17 +21,20 @@ mod worldgen_tests;
 
 use crate::{
     CommandBatch, CommandBatchError, CommandCapabilities, HostCommandAdmission,
-    MAX_ONLINE_PLAYER_QUERY_LIMIT, MAX_SCRIPT_CHAT_MESSAGE_BYTES, MAX_SCRIPT_CONSOLE_COMMAND_BYTES,
+    MAX_ONLINE_PLAYER_QUERY_LIMIT, MAX_SCRIPT_CHAT_MESSAGE_BYTES,
     MAX_SCRIPT_DISCONNECT_REASON_BYTES, PlayerCommandRegistrationError, RuntimeContext,
     RuntimeError, RuntimeResult, ScriptApiVersion, ScriptAxisAlignedZone,
-    ScriptBatchSubmissionError, ScriptBoundary, ScriptCommand, ScriptDtoError, ScriptEvent,
-    ScriptEventKind, ScriptHostEndpoint, ScriptInventoryMenu, ScriptInventoryMenuItem,
-    ScriptInventoryMenuSlot, ScriptInventoryResourceDelta, ScriptInventoryStorageTransaction,
-    ScriptOnlinePlayersRequest, ScriptPlayerId, ScriptPlayerInventoryTransaction,
-    ScriptPlayerTeleportRequest, ScriptPluginManifest, ScriptPluginStorageCompareAndSwapRequest,
-    ScriptPluginStorageDeleteRequest, ScriptPluginStorageGetRequest, ScriptPosition, ScriptRuntime,
-    ScriptStorageMutation, ScriptVillagerBindingRequest, ScriptVillagerGoal,
-    ScriptVillagerGoalRequest, ScriptZoneProtection, ValidatedScriptPluginManifest,
+    ScriptBatchSubmissionError, ScriptBoundary, ScriptCommand, ScriptDtoError,
+    ScriptEntityDamageRequest, ScriptEvent, ScriptEventKind, ScriptHostEndpoint, ScriptHostInput,
+    ScriptInventoryMenu, ScriptInventoryMenuItem, ScriptInventoryMenuSlot,
+    ScriptInventoryResourceDelta, ScriptInventoryStorageTransaction,
+    ScriptLoaderBlockPlacementRequest, ScriptLoaderItemGrantRequest, ScriptOnlinePlayersRequest,
+    ScriptPlayerId, ScriptPlayerInventoryTransaction, ScriptPlayerTeleportRequest,
+    ScriptPluginManifest, ScriptPluginStorageCompareAndSwapRequest,
+    ScriptPluginStorageDeleteRequest, ScriptPluginStorageGetRequest, ScriptPosition,
+    ScriptReloadCommitError, ScriptRuntime, ScriptStorageMutation, ScriptVillagerBindingRequest,
+    ScriptVillagerGoal, ScriptVillagerGoalRequest, ScriptWorldBlockSetRequest,
+    ScriptWorldTimeSetRequest, ScriptZoneProtection, ValidatedScriptPluginManifest,
     script_boundary_pair,
 };
 
@@ -65,6 +68,7 @@ const MAX_CLIENT_BUNDLE_BYTES: u64 = 64 * 1024 * 1024;
 const MAX_PENDING_PLUGIN_TIMERS: usize = 256;
 const MAX_PLUGIN_TIMER_CALLBACKS_PER_TICK: usize = 8;
 const MAX_PLUGIN_TIMER_DELAY_TICKS: u64 = 630_720_000;
+const MAX_PLUGIN_DISABLE_DIAGNOSTIC_BYTES: usize = 4 * 1024;
 const SOLARIS_LUAU_PRELUDE: &str = "local solaris: any = nil :: any\n";
 
 /// One server-embedded Luau plugin package.
@@ -145,6 +149,9 @@ pub enum LuaHostError {
     PluginIdConflict {
         id: String,
     },
+    DependencyGraph {
+        message: String,
+    },
     WorldgenConflict {
         kind: &'static str,
         first: String,
@@ -170,6 +177,9 @@ impl fmt::Display for LuaHostError {
             Self::StartupChannelClosed => formatter.write_str("Luau host startup channel closed"),
             Self::PluginIdConflict { id } => {
                 write!(formatter, "plugin id {id:?} is declared more than once")
+            }
+            Self::DependencyGraph { message } => {
+                write!(formatter, "invalid plugin dependency graph: {message}")
             }
             Self::WorldgenConflict {
                 kind,
@@ -197,7 +207,309 @@ impl std::error::Error for LuaHostError {}
 #[derive(Debug)]
 pub struct LuaHost {
     loaded_plugins: usize,
-    thread: thread::JoinHandle<()>,
+    reload_sender: tokio::sync::mpsc::WeakSender<ScriptHostInput>,
+    reload_contract: LuaReloadContract,
+    thread: thread::JoinHandle<LuaHostExitReport>,
+}
+
+/// Stage that permanently disabled one plugin while keeping the host alive.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum LuaPluginDisableStage {
+    Handler,
+    BatchRejectionHandler,
+    CommandAdmission,
+}
+
+impl LuaPluginDisableStage {
+    #[must_use]
+    pub const fn contract_name(self) -> &'static str {
+        match self {
+            Self::Handler => "handler",
+            Self::BatchRejectionHandler => "batch_rejection_handler",
+            Self::CommandAdmission => "command_admission",
+        }
+    }
+}
+
+/// Actionable terminal diagnostic retained for a plugin disabled at runtime.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LuaPluginDisableDiagnostic {
+    plugin_id: String,
+    stage: LuaPluginDisableStage,
+    message: String,
+}
+
+impl LuaPluginDisableDiagnostic {
+    fn new(plugin_id: String, stage: LuaPluginDisableStage, message: String) -> Self {
+        Self {
+            plugin_id,
+            stage,
+            message,
+        }
+    }
+
+    #[must_use]
+    pub fn plugin_id(&self) -> &str {
+        &self.plugin_id
+    }
+
+    #[must_use]
+    pub const fn stage(&self) -> LuaPluginDisableStage {
+        self.stage
+    }
+
+    #[must_use]
+    pub fn message(&self) -> &str {
+        &self.message
+    }
+}
+
+/// Why the dedicated Luau host thread stopped.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum LuaHostExitReason {
+    EventQueueClosed,
+    CommandQueueClosed,
+    PlayerCommandAuthorityUnavailable,
+    ProgressObserverClosed,
+    StartupAborted,
+}
+
+impl LuaHostExitReason {
+    #[must_use]
+    pub const fn contract_name(self) -> &'static str {
+        match self {
+            Self::EventQueueClosed => "event_queue_closed",
+            Self::CommandQueueClosed => "command_queue_closed",
+            Self::PlayerCommandAuthorityUnavailable => "player_command_authority_unavailable",
+            Self::ProgressObserverClosed => "progress_observer_closed",
+            Self::StartupAborted => "startup_aborted",
+        }
+    }
+}
+
+/// Deterministic terminal report returned when the Luau host thread is joined.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LuaHostExitReport {
+    loaded_plugins: usize,
+    disabled_plugins: Vec<LuaPluginDisableDiagnostic>,
+    exit_reason: LuaHostExitReason,
+}
+
+impl LuaHostExitReport {
+    fn new(
+        loaded_plugins: usize,
+        disabled_plugins: Vec<LuaPluginDisableDiagnostic>,
+        exit_reason: LuaHostExitReason,
+    ) -> Self {
+        Self {
+            loaded_plugins,
+            disabled_plugins,
+            exit_reason,
+        }
+    }
+
+    #[must_use]
+    pub const fn loaded_plugins(&self) -> usize {
+        self.loaded_plugins
+    }
+
+    #[must_use]
+    pub fn enabled_plugins_at_exit(&self) -> usize {
+        self.loaded_plugins
+            .saturating_sub(self.disabled_plugins.len())
+    }
+
+    #[must_use]
+    pub fn disabled_plugins(&self) -> &[LuaPluginDisableDiagnostic] {
+        &self.disabled_plugins
+    }
+
+    #[must_use]
+    pub const fn exit_reason(&self) -> LuaHostExitReason {
+        self.exit_reason
+    }
+}
+
+/// Why a prepared Luau replacement could not become the active host generation.
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum LuaReloadError {
+    HostClosed,
+    StartupContractChanged { field: &'static str },
+    CandidatePlugin { plugin_id: String, message: String },
+    Reinitialization { plugin_id: String, message: String },
+    CommandQueueFull,
+    CommandRejected { message: String },
+    CommandOwnership { message: String },
+}
+
+impl fmt::Display for LuaReloadError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::HostClosed => formatter.write_str("Luau host is no longer accepting reloads"),
+            Self::StartupContractChanged { field } => write!(
+                formatter,
+                "Luau reload changes restart-only startup contract {field:?}"
+            ),
+            Self::CandidatePlugin { plugin_id, message } => write!(
+                formatter,
+                "Luau reload candidate {plugin_id:?} failed before swap: {message}"
+            ),
+            Self::Reinitialization { plugin_id, message } => write!(
+                formatter,
+                "Luau reload candidate {plugin_id:?} failed server.started reinitialization: {message}"
+            ),
+            Self::CommandQueueFull => formatter
+                .write_str("Luau reload startup commands do not fit the host command queue"),
+            Self::CommandRejected { message } => {
+                write!(
+                    formatter,
+                    "Luau reload startup commands were rejected: {message}"
+                )
+            }
+            Self::CommandOwnership { message } => write!(
+                formatter,
+                "Luau reload could not restore player-command ownership: {message}"
+            ),
+        }
+    }
+}
+
+impl std::error::Error for LuaReloadError {}
+
+/// Successful in-place replacement of one complete Luau host generation.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LuaReloadReport {
+    loaded_plugins: usize,
+    replaced_disabled_plugins: Vec<LuaPluginDisableDiagnostic>,
+}
+
+impl LuaReloadReport {
+    fn new(
+        loaded_plugins: usize,
+        replaced_disabled_plugins: Vec<LuaPluginDisableDiagnostic>,
+    ) -> Self {
+        Self {
+            loaded_plugins,
+            replaced_disabled_plugins,
+        }
+    }
+
+    #[must_use]
+    pub const fn loaded_plugins(&self) -> usize {
+        self.loaded_plugins
+    }
+
+    /// Fault diagnostics from the generation that was successfully replaced.
+    #[must_use]
+    pub fn replaced_disabled_plugins(&self) -> &[LuaPluginDisableDiagnostic] {
+        &self.replaced_disabled_plugins
+    }
+}
+
+pub(crate) struct LuaReloadRequest {
+    prepared: PreparedLuaPlugins,
+    response: tokio::sync::oneshot::Sender<Result<LuaReloadReport, LuaReloadError>>,
+}
+
+impl LuaReloadRequest {
+    fn new(
+        prepared: PreparedLuaPlugins,
+        response: tokio::sync::oneshot::Sender<Result<LuaReloadReport, LuaReloadError>>,
+    ) -> Self {
+        Self { prepared, response }
+    }
+
+    pub(crate) fn reject_host_unavailable(self) {
+        let _ = self.response.send(Err(LuaReloadError::HostClosed));
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct LuaReloadPluginContract {
+    plugin_id: String,
+    player_command_roots: Vec<String>,
+    operator_command_roots: Vec<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct LuaReloadClientBundleContract {
+    owner_plugin_id: String,
+    id: String,
+    version: String,
+    sha256: String,
+    size_bytes: u64,
+    loaders: Vec<LuaClientLoader>,
+    content: Vec<LuaClientContentKind>,
+    permissions: Vec<LuaClientPermission>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct LuaReloadContract {
+    plugins: Vec<LuaReloadPluginContract>,
+    worldgen_ore_profile: Option<LuaWorldgenOreProfile>,
+    worldgen_settlement_contract: Option<String>,
+    client_bundles: Vec<LuaReloadClientBundleContract>,
+}
+
+impl LuaReloadContract {
+    fn from_prepared(prepared: &PreparedLuaPlugins) -> Self {
+        let plugins = prepared
+            .sources
+            .iter()
+            .map(|source| {
+                let mut player_command_roots = source.manifest.player_command_roots().to_vec();
+                player_command_roots.sort();
+                let mut operator_command_roots = source.manifest.operator_command_roots().to_vec();
+                operator_command_roots.sort();
+                LuaReloadPluginContract {
+                    plugin_id: source.manifest.plugin_id().to_owned(),
+                    player_command_roots,
+                    operator_command_roots,
+                }
+            })
+            .collect();
+        let mut client_bundles = prepared
+            .client_bundles
+            .iter()
+            .map(|bundle| LuaReloadClientBundleContract {
+                owner_plugin_id: bundle.owner_plugin_id().to_owned(),
+                id: bundle.id().to_owned(),
+                version: bundle.version().to_owned(),
+                sha256: bundle.sha256().to_owned(),
+                size_bytes: bundle.size_bytes(),
+                loaders: bundle.loaders().to_vec(),
+                content: bundle.content().to_vec(),
+                permissions: bundle.permissions().to_vec(),
+            })
+            .collect::<Vec<_>>();
+        client_bundles.sort_by(|left, right| {
+            (&left.owner_plugin_id, &left.id).cmp(&(&right.owner_plugin_id, &right.id))
+        });
+        Self {
+            plugins,
+            worldgen_ore_profile: prepared.worldgen_ore_profile,
+            worldgen_settlement_contract: prepared
+                .worldgen_settlement_plan
+                .as_ref()
+                .map(LuaSettlementPlan::contract_name),
+            client_bundles,
+        }
+    }
+
+    fn incompatibility(&self, candidate: &Self) -> Option<&'static str> {
+        if self.plugins != candidate.plugins {
+            return Some("plugin_order_or_player_commands");
+        }
+        if self.worldgen_ore_profile != candidate.worldgen_ore_profile
+            || self.worldgen_settlement_contract != candidate.worldgen_settlement_contract
+        {
+            return Some("worldgen");
+        }
+        (self.client_bundles != candidate.client_bundles).then_some("client_bundles")
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -305,6 +617,7 @@ pub struct LuaClientBundle {
     sha256: String,
     size_bytes: u64,
     artifact_path: PathBuf,
+    artifact_bytes: Arc<[u8]>,
     loaders: Vec<LuaClientLoader>,
     content: Vec<LuaClientContentKind>,
     permissions: Vec<LuaClientPermission>,
@@ -458,6 +771,16 @@ impl LuaClientBundle {
     #[must_use]
     pub fn artifact_path(&self) -> &Path {
         &self.artifact_path
+    }
+
+    #[must_use]
+    pub fn artifact_bytes(&self) -> &[u8] {
+        &self.artifact_bytes
+    }
+
+    #[must_use]
+    pub fn artifact_bytes_arc(&self) -> Arc<[u8]> {
+        Arc::clone(&self.artifact_bytes)
     }
 
     #[must_use]
@@ -833,7 +1156,37 @@ impl LuaHost {
         self.loaded_plugins
     }
 
-    pub fn join(self) -> thread::Result<()> {
+    /// Replace plugin source/config inside the existing host boundary.
+    ///
+    /// Reload is intentionally narrow: plugin identity/order, player-command roots,
+    /// worldgen contributions and client bundles are restart-only contracts. The
+    /// candidate is queued in the same FIFO as script events and is fully constructed
+    /// on the host thread before the current generation is swapped out. Successful
+    /// queue admission is the commit-intent boundary: cancelling the caller after that
+    /// point does not cancel the host-owned replacement attempt.
+    pub async fn reload(
+        &self,
+        prepared: PreparedLuaPlugins,
+    ) -> Result<LuaReloadReport, LuaReloadError> {
+        let candidate_contract = LuaReloadContract::from_prepared(&prepared);
+        if let Some(field) = self.reload_contract.incompatibility(&candidate_contract) {
+            return Err(LuaReloadError::StartupContractChanged { field });
+        }
+        let Some(sender) = self.reload_sender.upgrade() else {
+            return Err(LuaReloadError::HostClosed);
+        };
+        let (response_tx, response_rx) = tokio::sync::oneshot::channel();
+        sender
+            .send(ScriptHostInput::LuaReload(LuaReloadRequest::new(
+                prepared,
+                response_tx,
+            )))
+            .await
+            .map_err(|_| LuaReloadError::HostClosed)?;
+        response_rx.await.map_err(|_| LuaReloadError::HostClosed)?
+    }
+
+    pub fn join(self) -> thread::Result<LuaHostExitReport> {
         self.thread.join()
     }
 }
@@ -898,6 +1251,7 @@ pub fn prepare_bundled_luau_plugins(
 }
 
 fn prepare_plugin_sources(sources: Vec<PluginSource>) -> Result<PreparedLuaPlugins, LuaHostError> {
+    let sources = order_plugin_sources(sources)?;
     let mut selected_ore = None;
     let mut ore_owner = None;
     let mut selected_settlement = None;
@@ -951,6 +1305,8 @@ pub fn start_prepared_lua_host(
         NonZeroUsize::new(EVENT_QUEUE_CAPACITY).expect("event queue capacity is non-zero"),
         NonZeroUsize::new(COMMAND_QUEUE_CAPACITY).expect("command queue capacity is non-zero"),
     );
+    let reload_sender = boundary.event_admission.weak_sender.clone();
+    let reload_contract = LuaReloadContract::from_prepared(&prepared);
     let (startup_tx, startup_rx) = std::sync::mpsc::sync_channel(1);
     let strict_startup = prepared.strict_startup;
     let thread = thread::Builder::new()
@@ -974,6 +1330,8 @@ pub fn start_prepared_lua_host(
         boundary,
         LuaHost {
             loaded_plugins,
+            reload_sender,
+            reload_contract,
             thread,
         },
     ))
@@ -988,6 +1346,112 @@ struct PluginSource {
     worldgen_ore_profile: Option<LuaWorldgenOreProfile>,
     worldgen_settlement_plan: Option<LuaSettlementPlan>,
     client_bundles: Vec<LuaClientBundle>,
+}
+
+fn order_plugin_sources(sources: Vec<PluginSource>) -> Result<Vec<PluginSource>, LuaHostError> {
+    if sources.is_empty() {
+        return Ok(sources);
+    }
+
+    let ids = sources
+        .iter()
+        .map(|source| source.manifest.plugin_id().to_owned())
+        .collect::<Vec<_>>();
+    let phases = sources
+        .iter()
+        .map(|source| source.manifest.load_phase())
+        .collect::<Vec<_>>();
+    let mut by_id = BTreeMap::new();
+    for (index, id) in ids.iter().enumerate() {
+        if by_id.insert(id.as_str(), index).is_some() {
+            return Err(LuaHostError::PluginIdConflict { id: id.clone() });
+        }
+    }
+
+    let mut outgoing = vec![BTreeSet::new(); sources.len()];
+    let mut indegree = vec![0_usize; sources.len()];
+    let mut add_edge = |from: usize, to: usize| {
+        if from != to && outgoing[from].insert(to) {
+            indegree[to] += 1;
+        }
+    };
+
+    for (startup_index, phase) in phases.iter().enumerate() {
+        if *phase != crate::ScriptPluginLoadPhase::Startup {
+            continue;
+        }
+        for (post_world_index, candidate_phase) in phases.iter().enumerate() {
+            if *candidate_phase == crate::ScriptPluginLoadPhase::PostWorld {
+                add_edge(startup_index, post_world_index);
+            }
+        }
+    }
+
+    for (source_index, source) in sources.iter().enumerate() {
+        for dependency in source.manifest.dependencies() {
+            let target = by_id.get(dependency.plugin_id()).copied();
+            match dependency.relation() {
+                crate::ScriptPluginDependencyRelation::Required => {
+                    let Some(target_index) = target else {
+                        return Err(LuaHostError::DependencyGraph {
+                            message: format!(
+                                "plugin {:?} requires missing plugin {:?}",
+                                source.manifest.plugin_id(),
+                                dependency.plugin_id()
+                            ),
+                        });
+                    };
+                    add_edge(target_index, source_index);
+                }
+                crate::ScriptPluginDependencyRelation::Optional => {
+                    if let Some(target_index) = target {
+                        add_edge(target_index, source_index);
+                    }
+                }
+                crate::ScriptPluginDependencyRelation::LoadBefore => {
+                    if let Some(target_index) = target {
+                        add_edge(source_index, target_index);
+                    }
+                }
+            }
+        }
+    }
+
+    let mut ready = BTreeSet::new();
+    for (index, count) in indegree.iter().enumerate() {
+        if *count == 0 {
+            ready.insert((ids[index].clone(), index));
+        }
+    }
+    let mut order = Vec::with_capacity(sources.len());
+    while let Some((id, index)) = ready.iter().next().cloned() {
+        ready.remove(&(id, index));
+        order.push(index);
+        for target in outgoing[index].iter().copied() {
+            indegree[target] -= 1;
+            if indegree[target] == 0 {
+                ready.insert((ids[target].clone(), target));
+            }
+        }
+    }
+
+    if order.len() != sources.len() {
+        let cyclic = indegree
+            .iter()
+            .enumerate()
+            .filter_map(|(index, count)| (*count != 0).then_some(ids[index].as_str()))
+            .collect::<Vec<_>>()
+            .join(", ");
+        return Err(LuaHostError::DependencyGraph {
+            message: format!("dependency/load-phase cycle includes: {cyclic}"),
+        });
+    }
+
+    let mut sources = sources.into_iter().map(Some).collect::<Vec<_>>();
+    Ok(order
+        .into_iter()
+        .map(|index| sources[index].take().expect("plugin load index is unique"))
+        .collect())
 }
 
 #[derive(Debug)]
@@ -1024,9 +1488,9 @@ struct DiskManifest {
     version: String,
     api: String,
     #[serde(default)]
-    events: Vec<String>,
+    load_phase: DiskLoadPhase,
     #[serde(default)]
-    console_commands: Vec<String>,
+    events: Vec<String>,
     #[serde(default)]
     spawn_entities: Vec<String>,
     #[serde(default)]
@@ -1175,6 +1639,14 @@ struct DiskSettlementExtension {
     building: String,
 }
 
+#[derive(Debug, Clone, Copy, Default, Deserialize)]
+#[serde(rename_all = "snake_case")]
+enum DiskLoadPhase {
+    Startup,
+    #[default]
+    PostWorld,
+}
+
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct DiskDependency {
@@ -1320,13 +1792,15 @@ fn read_plugin_source(directory: &Path) -> Result<PluginSource, PluginSourceErro
         }
         None => (None, None, Vec::new(), Vec::new(), Vec::new()),
     };
+    let load_phase = match disk.load_phase {
+        DiskLoadPhase::Startup => crate::ScriptPluginLoadPhase::Startup,
+        DiskLoadPhase::PostWorld => crate::ScriptPluginLoadPhase::PostWorld,
+    };
     let mut manifest =
-        ScriptPluginManifest::new(disk.id, disk.name, disk.version, requested_api_version);
+        ScriptPluginManifest::new(disk.id, disk.name, disk.version, requested_api_version)
+            .with_load_phase(load_phase);
     for event in disk.events {
         manifest = manifest.subscribe_event(event);
-    }
-    for root in disk.console_commands {
-        manifest = manifest.declare_console_command_root(root);
     }
     for entity_type in disk.spawn_entities {
         manifest = manifest.declare_spawn_entity_type(entity_type);
@@ -1491,7 +1965,7 @@ fn materialize_client_bundles(
                 ));
             }
         }
-        let artifact_path = validate_client_artifact(
+        let (artifact_path, artifact_bytes) = validate_client_artifact(
             plugin_directory,
             &bundle.artifact,
             bundle.size_bytes,
@@ -1506,6 +1980,7 @@ fn materialize_client_bundles(
             sha256: bundle.sha256,
             size_bytes: bundle.size_bytes,
             artifact_path,
+            artifact_bytes,
             loaders,
             content,
             permissions,
@@ -1519,7 +1994,7 @@ fn validate_client_artifact(
     relative_path: &str,
     declared_size: u64,
     declared_sha256: &str,
-) -> Result<PathBuf, String> {
+) -> Result<(PathBuf, Arc<[u8]>), String> {
     let plugin_root = fs::canonicalize(plugin_directory).map_err(|error| {
         format!(
             "canonicalizing plugin directory {}: {error}",
@@ -1539,7 +2014,14 @@ fn validate_client_artifact(
             artifact_path.display()
         ));
     }
-    let metadata = fs::metadata(&canonical)
+    let mut file = fs::File::open(&canonical).map_err(|error| {
+        format!(
+            "opening client artifact {}: {error}",
+            artifact_path.display()
+        )
+    })?;
+    let metadata = file
+        .metadata()
         .map_err(|error| format!("reading client artifact metadata: {error}"))?;
     if !metadata.is_file() {
         return Err(format!(
@@ -1554,33 +2036,40 @@ fn validate_client_artifact(
             metadata.len()
         ));
     }
-    let mut file = fs::File::open(&canonical).map_err(|error| {
+    let byte_len = usize::try_from(declared_size).map_err(|_| {
         format!(
-            "opening client artifact {}: {error}",
+            "client artifact {} is too large for this platform",
             artifact_path.display()
         )
     })?;
-    let mut digest = Sha256::new();
-    let copied = std::io::copy(&mut file, &mut digest).map_err(|error| {
+    let mut bytes = vec![0_u8; byte_len];
+    file.read_exact(&mut bytes).map_err(|error| {
         format!(
-            "hashing client artifact {}: {error}",
+            "reading client artifact {}: {error}",
             artifact_path.display()
         )
     })?;
-    if copied != declared_size {
+    let mut trailing = [0_u8; 1];
+    if file.read(&mut trailing).map_err(|error| {
+        format!(
+            "checking client artifact {} length: {error}",
+            artifact_path.display()
+        )
+    })? != 0
+    {
         return Err(format!(
-            "client artifact {} changed while hashing",
+            "client artifact {} changed while reading",
             artifact_path.display()
         ));
     }
-    let actual_sha256 = format!("{:x}", digest.finalize());
+    let actual_sha256 = format!("{:x}", Sha256::digest(&bytes));
     if actual_sha256 != declared_sha256 {
         return Err(format!(
             "client artifact {} SHA-256 does not match the manifest",
             artifact_path.display()
         ));
     }
-    Ok(canonical)
+    Ok((canonical, Arc::<[u8]>::from(bytes)))
 }
 
 fn unique_client_values<T>(
@@ -1943,6 +2432,9 @@ fn declare_disk_capability(
         "villagers" => Ok(manifest.declare_villagers()),
         "player_teleport" => Ok(manifest.declare_player_teleport()),
         "player_queries" => Ok(manifest.declare_player_queries()),
+        "entity_damage" => Ok(manifest.declare_entity_damage()),
+        "world_time" => Ok(manifest.declare_world_time()),
+        "world_blocks" => Ok(manifest.declare_world_blocks()),
         _ => Err(format!("unknown plugin capability {capability:?}")),
     }
 }
@@ -2030,13 +2522,87 @@ fn rotating_indices(len: usize, start: usize) -> impl Iterator<Item = usize> {
     (0..len).map(move |offset| (start + offset) % len.max(1))
 }
 
+fn bounded_plugin_disable_diagnostic(mut message: String) -> String {
+    if message.len() <= MAX_PLUGIN_DISABLE_DIAGNOSTIC_BYTES {
+        return message;
+    }
+    let mut end = MAX_PLUGIN_DISABLE_DIAGNOSTIC_BYTES - 3;
+    while !message.is_char_boundary(end) {
+        end -= 1;
+    }
+    message.truncate(end);
+    message.push_str("...");
+    message
+}
+
+struct LuaReloadCandidate {
+    plugins: Vec<LuaPlugin>,
+    manifests: Vec<ValidatedScriptPluginManifest>,
+    startup_batches: Vec<(HostCommandAdmission, CommandBatch)>,
+}
+
+fn build_lua_reload_candidate(
+    prepared: PreparedLuaPlugins,
+) -> Result<LuaReloadCandidate, LuaReloadError> {
+    let mut plugins = Vec::with_capacity(prepared.sources.len());
+    let mut manifests = Vec::with_capacity(prepared.sources.len());
+    for source in prepared.sources {
+        let plugin_id = source.manifest.plugin_id().to_owned();
+        let manifest = source.manifest.clone();
+        let plugin = LuaPlugin::new(source).map_err(|message| LuaReloadError::CandidatePlugin {
+            plugin_id,
+            message: bounded_plugin_disable_diagnostic(message),
+        })?;
+        manifests.push(manifest);
+        plugins.push(plugin);
+    }
+
+    let startup_event = ScriptEvent::server_started();
+    let eligible = plugins
+        .iter()
+        .enumerate()
+        .filter_map(|(index, plugin)| plugin.accepts_event(&startup_event).then_some(index))
+        .collect::<Vec<_>>();
+    let event_budget = HostEventBudget::new(Instant::now());
+    let mut startup_batches = Vec::with_capacity(eligible.len());
+    for (position, index) in eligible.iter().copied().enumerate() {
+        let remaining_plugins = eligible.len() - position;
+        let Some(slot) = event_budget.next_slot(remaining_plugins) else {
+            return Err(LuaReloadError::Reinitialization {
+                plugin_id: plugins[index].id.clone(),
+                message: "aggregate server.started wall-clock budget exhausted".to_owned(),
+            });
+        };
+        let Some(timeout) = slot.remaining() else {
+            return Err(LuaReloadError::Reinitialization {
+                plugin_id: plugins[index].id.clone(),
+                message: "server.started wall-clock budget exhausted before invocation".to_owned(),
+            });
+        };
+        let plugin = &mut plugins[index];
+        let batch = plugin
+            .handle_event(&startup_event, timeout)
+            .map_err(|error| LuaReloadError::Reinitialization {
+                plugin_id: plugin.id.clone(),
+                message: bounded_plugin_disable_diagnostic(format!("{error:?}")),
+            })?;
+        startup_batches.push((plugin.admission.clone(), batch));
+    }
+
+    Ok(LuaReloadCandidate {
+        plugins,
+        manifests,
+        startup_batches,
+    })
+}
+
 fn run_lua_host(
     mut endpoint: ScriptHostEndpoint,
     sources: Vec<PluginSource>,
     strict_startup: bool,
     startup: std::sync::mpsc::SyncSender<Result<usize, LuaHostError>>,
-) {
-    run_lua_host_inner(&mut endpoint, sources, strict_startup, startup, None);
+) -> LuaHostExitReport {
+    run_lua_host_inner(&mut endpoint, sources, strict_startup, startup, None)
 }
 
 fn run_lua_host_inner(
@@ -2045,8 +2611,9 @@ fn run_lua_host_inner(
     strict_startup: bool,
     startup: std::sync::mpsc::SyncSender<Result<usize, LuaHostError>>,
     progress: Option<std::sync::mpsc::SyncSender<&'static str>>,
-) {
+) -> LuaHostExitReport {
     let mut plugins = Vec::new();
+    let mut disabled_plugins = Vec::new();
     let mut loaded_plugin_ids = HashSet::new();
     for source in sources {
         let plugin_id = source.manifest.plugin_id().to_owned();
@@ -2056,7 +2623,11 @@ fn run_lua_host_inner(
                     id: plugin_id,
                     message: "plugin id was already loaded".to_owned(),
                 }));
-                return;
+                return LuaHostExitReport::new(
+                    plugins.len(),
+                    disabled_plugins,
+                    LuaHostExitReason::StartupAborted,
+                );
             }
             warn!(plugin = %plugin_id, "Lua plugin skipped because its id is already loaded");
             continue;
@@ -2067,7 +2638,11 @@ fn run_lua_host_inner(
                     id: plugin_id,
                     message: format!("registering player commands: {error:?}"),
                 }));
-                return;
+                return LuaHostExitReport::new(
+                    plugins.len(),
+                    disabled_plugins,
+                    LuaHostExitReason::StartupAborted,
+                );
             }
             match error {
                 PlayerCommandRegistrationError::RootConflict {
@@ -2088,7 +2663,11 @@ fn run_lua_host_inner(
                 PlayerCommandRegistrationError::AuthorityPoisoned => {
                     warn!("Lua host disabled because player-command authority was poisoned");
                     let _ = startup.send(Ok(0));
-                    return;
+                    return LuaHostExitReport::new(
+                        0,
+                        disabled_plugins,
+                        LuaHostExitReason::PlayerCommandAuthorityUnavailable,
+                    );
                 }
             }
             continue;
@@ -2106,16 +2685,81 @@ fn run_lua_host_inner(
                         id: plugin_id,
                         message: error.to_string(),
                     }));
-                    return;
+                    return LuaHostExitReport::new(
+                        plugins.len(),
+                        disabled_plugins,
+                        LuaHostExitReason::StartupAborted,
+                    );
                 }
                 warn!(plugin = %plugin_id, %error, "Lua plugin skipped during load");
             }
         }
     }
-    let _ = startup.send(Ok(plugins.len()));
+    let loaded_plugins = plugins.len();
+    let _ = startup.send(Ok(loaded_plugins));
 
     let mut fairness_cursor = 0usize;
-    while let Some(event) = endpoint.recv_event_blocking() {
+    loop {
+        let Some(input) = endpoint.recv_lua_input_blocking() else {
+            break;
+        };
+        let event = match input {
+            ScriptHostInput::Event(event) => event,
+            ScriptHostInput::LuaReload(request) => {
+                let LuaReloadRequest { prepared, response } = request;
+                let candidate = match build_lua_reload_candidate(prepared) {
+                    Ok(candidate) => candidate,
+                    Err(error) => {
+                        let _ = response.send(Err(error));
+                        continue;
+                    }
+                };
+                let LuaReloadCandidate {
+                    plugins: candidate_plugins,
+                    manifests,
+                    startup_batches,
+                } = candidate;
+                let reloaded_plugins = candidate_plugins.len();
+                let mut replaced_disabled_plugins = None;
+                let commit = endpoint.commit_lua_reload(&manifests, startup_batches, || {
+                    plugins = candidate_plugins;
+                    fairness_cursor = 0;
+                    replaced_disabled_plugins = Some(std::mem::take(&mut disabled_plugins));
+                });
+                match commit {
+                    Ok(()) => {
+                        info!(loaded = reloaded_plugins, "Lua plugin generation reloaded");
+                        let _ = response.send(Ok(LuaReloadReport::new(
+                            reloaded_plugins,
+                            replaced_disabled_plugins
+                                .expect("successful reload records replaced diagnostics"),
+                        )));
+                    }
+                    Err(ScriptReloadCommitError::QueueFull) => {
+                        let _ = response.send(Err(LuaReloadError::CommandQueueFull));
+                    }
+                    Err(ScriptReloadCommitError::QueueClosed) => {
+                        let _ = response.send(Err(LuaReloadError::HostClosed));
+                        return LuaHostExitReport::new(
+                            loaded_plugins,
+                            disabled_plugins,
+                            LuaHostExitReason::CommandQueueClosed,
+                        );
+                    }
+                    Err(ScriptReloadCommitError::Rejected { error }) => {
+                        let _ = response.send(Err(LuaReloadError::CommandRejected {
+                            message: format!("{error:?}"),
+                        }));
+                    }
+                    Err(ScriptReloadCommitError::Ownership { error }) => {
+                        let _ = response.send(Err(LuaReloadError::CommandOwnership {
+                            message: format!("{error:?}"),
+                        }));
+                    }
+                }
+                continue;
+            }
+        };
         let event_started = Instant::now();
         let eligible = rotating_indices(plugins.len(), fairness_cursor)
             .filter(|&index| plugins[index].accepts_event(&event))
@@ -2149,6 +2793,11 @@ fn run_lua_host_inner(
                     warn!(plugin = %plugin.id, ?error, "Lua plugin disabled after handler failure");
                     endpoint.unregister_player_commands(&plugin.id);
                     plugin.disabled = true;
+                    disabled_plugins.push(LuaPluginDisableDiagnostic::new(
+                        plugin.id.clone(),
+                        LuaPluginDisableStage::Handler,
+                        bounded_plugin_disable_diagnostic(format!("{error:?}")),
+                    ));
                     continue;
                 }
             };
@@ -2170,6 +2819,11 @@ fn run_lua_host_inner(
                         warn!(plugin = %plugin.id, ?error, "Lua plugin disabled after batch-rejection handler failure");
                         endpoint.unregister_player_commands(&plugin.id);
                         plugin.disabled = true;
+                        disabled_plugins.push(LuaPluginDisableDiagnostic::new(
+                            plugin.id.clone(),
+                            LuaPluginDisableStage::BatchRejectionHandler,
+                            bounded_plugin_disable_diagnostic(format!("{error:?}")),
+                        ));
                     }
                 }
                 Err(ScriptBatchSubmissionError::Closed(batch)) => {
@@ -2178,21 +2832,39 @@ fn run_lua_host_inner(
                         let _ =
                             plugin.notify_batch_rejected("queue_closed", command_count, timeout);
                     }
-                    return;
+                    return LuaHostExitReport::new(
+                        loaded_plugins,
+                        disabled_plugins,
+                        LuaHostExitReason::CommandQueueClosed,
+                    );
                 }
                 Err(ScriptBatchSubmissionError::Rejected { error, .. }) => {
                     warn!(plugin = %plugin.id, ?error, "Lua plugin disabled after command admission rejection");
                     endpoint.unregister_player_commands(&plugin.id);
                     plugin.disabled = true;
+                    disabled_plugins.push(LuaPluginDisableDiagnostic::new(
+                        plugin.id.clone(),
+                        LuaPluginDisableStage::CommandAdmission,
+                        bounded_plugin_disable_diagnostic(format!("{error:?}")),
+                    ));
                 }
             }
         }
         if let Some(progress) = &progress
             && progress.send(event.event_name()).is_err()
         {
-            return;
+            return LuaHostExitReport::new(
+                loaded_plugins,
+                disabled_plugins,
+                LuaHostExitReason::ProgressObserverClosed,
+            );
         }
     }
+    LuaHostExitReport::new(
+        loaded_plugins,
+        disabled_plugins,
+        LuaHostExitReason::EventQueueClosed,
+    )
 }
 
 struct LuaPlugin {
@@ -2635,27 +3307,20 @@ fn install_solaris_api(
             )
         })?,
     )?;
-    let console_invocation = Arc::clone(&invocation);
-    api.set(
-        "run_console",
-        lua.create_function(move |_, command: LuaString| {
-            let command = bounded_lua_string(
-                command,
-                "console_command",
-                MAX_SCRIPT_CONSOLE_COMMAND_BYTES,
-                false,
-            )?;
-            push_command(
-                &console_invocation,
-                ScriptCommand::RunConsoleCommand { command },
-            )
-        })?,
-    )?;
     let spawn_invocation = Arc::clone(&invocation);
     api.set(
         "spawn_entity",
         lua.create_function(
-            move |_, (actor, entity_type, x, y, z): (u64, LuaString, f64, f64, f64)| {
+            move |_,
+                  (request_id, actor, entity_type, x, y, z): (
+                LuaString,
+                u64,
+                LuaString,
+                f64,
+                f64,
+                f64,
+            )| {
+                let request_id = bounded_script_id(request_id, "request_id")?;
                 let entity_type = bounded_lua_string(
                     entity_type,
                     "entity_type",
@@ -2669,10 +3334,36 @@ fn install_solaris_api(
                 push_command(
                     &spawn_invocation,
                     ScriptCommand::SpawnEntity {
+                        request_id,
                         actor: ScriptPlayerId::new(actor),
                         entity_type,
                         position,
                     },
+                )
+            },
+        )?,
+    )?;
+    let damage_entity_invocation = Arc::clone(&invocation);
+    api.set(
+        "damage_entity",
+        lua.create_function(
+            move |_, (request_id, entity_id, amount): (LuaString, u64, f64)| {
+                let request_id = bounded_script_id(request_id, "request_id")?;
+                if !amount.is_finite()
+                    || amount <= 0.0
+                    || amount > f64::from(crate::MAX_SCRIPT_ENTITY_DAMAGE)
+                {
+                    return Err(lua_input_error("entity_damage", "invalid"));
+                }
+                let request = ScriptEntityDamageRequest::try_new(
+                    request_id,
+                    crate::ScriptEntityId::new(entity_id),
+                    amount as f32,
+                )
+                .map_err(dto_error)?;
+                push_command(
+                    &damage_entity_invocation,
+                    ScriptCommand::DamageEntity { request },
                 )
             },
         )?,
@@ -2781,45 +3472,51 @@ fn install_solaris_api(
     let place_loader_block_invocation = Arc::clone(&invocation);
     api.set(
         "place_loader_block",
-        lua.create_function(move |_, (block_id, x, y, z): (LuaString, i32, i32, i32)| {
-            let block_id = bounded_lua_string(
-                block_id,
-                "block_id",
-                crate::MAX_SCRIPT_RESOURCE_ID_BYTES,
-                false,
-            )?;
-            crate::validate_script_resource_id(&block_id)
-                .map_err(|_| lua_input_error("block_id", "invalid"))?;
-            push_command(
-                &place_loader_block_invocation,
-                ScriptCommand::PlaceLoaderBlock { block_id, x, y, z },
-            )
-        })?,
-    )?;
-    let grant_loader_block_item_invocation = Arc::clone(&invocation);
-    api.set(
-        "grant_loader_block_item",
         lua.create_function(
-            move |_, (player_id, block_id, count): (u64, LuaString, i64)| {
+            move |_, (request_id, block_id, x, y, z): (LuaString, LuaString, i32, i32, i32)| {
+                let request_id = bounded_script_id(request_id, "request_id")?;
                 let block_id = bounded_lua_string(
                     block_id,
                     "block_id",
                     crate::MAX_SCRIPT_RESOURCE_ID_BYTES,
                     false,
                 )?;
-                crate::validate_script_resource_id(&block_id)
-                    .map_err(|_| lua_input_error("block_id", "invalid"))?;
+                let request =
+                    ScriptLoaderBlockPlacementRequest::try_new(request_id, block_id, x, y, z)
+                        .map_err(dto_error)?;
+                push_command(
+                    &place_loader_block_invocation,
+                    ScriptCommand::PlaceLoaderBlock { request },
+                )
+            },
+        )?,
+    )?;
+    let grant_loader_block_item_invocation = Arc::clone(&invocation);
+    api.set(
+        "grant_loader_block_item",
+        lua.create_function(
+            move |_, (request_id, player_id, block_id, count): (LuaString, u64, LuaString, i64)| {
+                let request_id = bounded_script_id(request_id, "request_id")?;
+                let block_id = bounded_lua_string(
+                    block_id,
+                    "block_id",
+                    crate::MAX_SCRIPT_RESOURCE_ID_BYTES,
+                    false,
+                )?;
                 let count = u8::try_from(count)
                     .ok()
                     .filter(|count| (1..=64).contains(count))
                     .ok_or_else(|| lua_input_error("count", "must be in 1..=64"))?;
+                let request = ScriptLoaderItemGrantRequest::try_new(
+                    request_id,
+                    ScriptPlayerId::new(player_id),
+                    block_id,
+                    count,
+                )
+                .map_err(dto_error)?;
                 push_command(
                     &grant_loader_block_item_invocation,
-                    ScriptCommand::GrantLoaderBlockItem {
-                        player_id: ScriptPlayerId::new(player_id),
-                        block_id,
-                        count,
-                    },
+                    ScriptCommand::GrantLoaderBlockItem { request },
                 )
             },
         )?,
@@ -2870,6 +3567,55 @@ fn install_solaris_api(
                 push_command(
                     &teleport_player_invocation,
                     ScriptCommand::TeleportPlayer { request },
+                )
+            },
+        )?,
+    )?;
+    let set_world_time_invocation = Arc::clone(&invocation);
+    api.set(
+        "set_world_time",
+        lua.create_function(move |_, (request_id, world_time): (LuaString, u64)| {
+            let request_id = bounded_script_id(request_id, "request_id")?;
+            let request =
+                ScriptWorldTimeSetRequest::try_new(request_id, world_time).map_err(dto_error)?;
+            push_command(
+                &set_world_time_invocation,
+                ScriptCommand::SetWorldTime { request },
+            )
+        })?,
+    )?;
+    let set_world_block_invocation = Arc::clone(&invocation);
+    api.set(
+        "set_block",
+        lua.create_function(
+            move |_,
+                  (request_id, dimension, block_id, x, y, z): (
+                LuaString,
+                LuaString,
+                LuaString,
+                i32,
+                i32,
+                i32,
+            )| {
+                let request_id = bounded_script_id(request_id, "request_id")?;
+                let dimension = bounded_lua_string(
+                    dimension,
+                    "dimension",
+                    crate::MAX_SCRIPT_RESOURCE_ID_BYTES,
+                    false,
+                )?;
+                let block_id = bounded_lua_string(
+                    block_id,
+                    "block_id",
+                    crate::MAX_SCRIPT_RESOURCE_ID_BYTES,
+                    false,
+                )?;
+                let request =
+                    ScriptWorldBlockSetRequest::try_new(request_id, dimension, block_id, x, y, z)
+                        .map_err(dto_error)?;
+                push_command(
+                    &set_world_block_invocation,
+                    ScriptCommand::SetWorldBlock { request },
                 )
             },
         )?,
@@ -3771,6 +4517,97 @@ fn event_table(lua: &Lua, event: &ScriptEvent) -> mlua::Result<Table> {
             table.set("committed", failure.is_none())?;
             table.set("failure", failure.map(|failure| failure.as_str()))?;
         }
+        ScriptEventKind::WorldTimeSetResult {
+            request_id,
+            world_time,
+            failure,
+        } => {
+            table.set("request_id", request_id.as_str())?;
+            table.set("world_time", *world_time)?;
+            table.set("committed", failure.is_none())?;
+            table.set("failure", failure.map(|failure| failure.as_str()))?;
+        }
+        ScriptEventKind::WorldBlockSetResult {
+            request_id,
+            dimension,
+            block_id,
+            x,
+            y,
+            z,
+            applied,
+            failure,
+        } => {
+            table.set("request_id", request_id.as_str())?;
+            table.set("dimension", dimension.as_str())?;
+            table.set("block_id", block_id.as_str())?;
+            table.set("x", *x)?;
+            table.set("y", *y)?;
+            table.set("z", *z)?;
+            table.set("applied", *applied)?;
+            table.set("failure", failure.map(|failure| failure.as_str()))?;
+        }
+        ScriptEventKind::LoaderBlockPlacementResult {
+            request_id,
+            block_id,
+            x,
+            y,
+            z,
+            failure,
+        } => {
+            table.set("request_id", request_id.as_str())?;
+            table.set("block_id", block_id.as_str())?;
+            table.set("x", *x)?;
+            table.set("y", *y)?;
+            table.set("z", *z)?;
+            table.set("placed", failure.is_none())?;
+            table.set("failure", failure.map(|failure| failure.as_str()))?;
+        }
+        ScriptEventKind::LoaderItemGrantResult {
+            request_id,
+            player_id,
+            block_id,
+            count,
+            failure,
+        } => {
+            table.set("request_id", request_id.as_str())?;
+            table.set("player_id", player_id.value())?;
+            table.set("block_id", block_id.as_str())?;
+            table.set("count", *count)?;
+            table.set("granted", failure.is_none())?;
+            table.set("failure", failure.map(|failure| failure.as_str()))?;
+        }
+        ScriptEventKind::EntitySpawnResult {
+            request_id,
+            player_id,
+            entity_type,
+            position,
+            failure,
+        } => {
+            table.set("request_id", request_id.as_str())?;
+            table.set("player_id", player_id.value())?;
+            table.set("entity_type", entity_type.as_str())?;
+            table.set("x", position.x())?;
+            table.set("y", position.y())?;
+            table.set("z", position.z())?;
+            table.set("spawned", failure.is_none())?;
+            table.set("failure", failure.map(|failure| failure.as_str()))?;
+        }
+        ScriptEventKind::EntityDamageResult {
+            request_id,
+            entity_id,
+            amount_bits,
+            health_bits,
+            killed,
+            failure,
+        } => {
+            table.set("request_id", request_id.as_str())?;
+            table.set("entity_id", entity_id.value())?;
+            table.set("amount", f32::from_bits(*amount_bits))?;
+            table.set("damaged", failure.is_none())?;
+            table.set("health", health_bits.map(f32::from_bits))?;
+            table.set("killed", *killed)?;
+            table.set("failure", failure.map(|failure| failure.as_str()))?;
+        }
         ScriptEventKind::OnlinePlayersResult {
             request_id,
             players,
@@ -3876,6 +4713,12 @@ fn handler_name(event: &ScriptEvent) -> &'static str {
         ScriptEventKind::PlayerZoneExited { .. } => "on_player_zone_exited",
         ScriptEventKind::ZoneCommandResult { .. } => "on_zone_command_result",
         ScriptEventKind::PlayerTeleportResult { .. } => "on_player_teleport_result",
+        ScriptEventKind::WorldTimeSetResult { .. } => "on_world_time_set_result",
+        ScriptEventKind::WorldBlockSetResult { .. } => "on_world_block_set_result",
+        ScriptEventKind::LoaderBlockPlacementResult { .. } => "on_loader_block_placement_result",
+        ScriptEventKind::LoaderItemGrantResult { .. } => "on_loader_item_grant_result",
+        ScriptEventKind::EntitySpawnResult { .. } => "on_entity_spawn_result",
+        ScriptEventKind::EntityDamageResult { .. } => "on_entity_damage_result",
         ScriptEventKind::OnlinePlayersResult { .. } => "on_player_online_result",
         ScriptEventKind::VillagerBindingResult { .. } => "on_villager_binding_result",
         ScriptEventKind::VillagerGoalResult { .. } => "on_villager_goal_result",
@@ -3938,8 +4781,507 @@ mod tests {
             .unwrap()
     }
 
+    fn world_time_manifest(events: &[&str]) -> ValidatedScriptPluginManifest {
+        let mut manifest =
+            ScriptPluginManifest::new("test-plugin", "Test Plugin", "0.1.0", SCRIPT_API_VERSION)
+                .declare_world_time();
+        for event in events {
+            manifest = manifest.subscribe_event(*event);
+        }
+        manifest.validate().unwrap()
+    }
+
+    fn world_blocks_manifest(events: &[&str]) -> ValidatedScriptPluginManifest {
+        let mut manifest =
+            ScriptPluginManifest::new("test-plugin", "Test Plugin", "0.1.0", SCRIPT_API_VERSION)
+                .declare_world_blocks();
+        for event in events {
+            manifest = manifest.subscribe_event(*event);
+        }
+        manifest.validate().unwrap()
+    }
+
+    fn entity_damage_manifest(events: &[&str]) -> ValidatedScriptPluginManifest {
+        let mut manifest =
+            ScriptPluginManifest::new("test-plugin", "Test Plugin", "0.1.0", SCRIPT_API_VERSION)
+                .declare_entity_damage();
+        for event in events {
+            manifest = manifest.subscribe_event(*event);
+        }
+        manifest.validate().unwrap()
+    }
+
     fn player_context(username: &str) -> ScriptPlayerContext {
         ScriptPlayerContext::new("test-player", username, false, 0.0, 64.0, 0.0)
+    }
+
+    fn plugin_source(
+        manifest: ValidatedScriptPluginManifest,
+        path: &str,
+        source: &str,
+    ) -> PluginSource {
+        PluginSource {
+            manifest,
+            config: toml::Table::new(),
+            source: source.to_owned(),
+            source_path: PathBuf::from(path),
+            worldgen_ore_profile: None,
+            worldgen_settlement_plan: None,
+            client_bundles: Vec::new(),
+        }
+    }
+
+    async fn recv_host_broadcast(boundary: &ScriptBoundary) -> String {
+        let command = tokio::time::timeout(Duration::from_secs(1), boundary.recv_command())
+            .await
+            .expect("script command timeout")
+            .expect("script command queue closed");
+        let admitted = boundary
+            .accept_host_command(command)
+            .expect("host-attached command must remain admissible");
+        let ScriptCommand::BroadcastChatMessage { message } = admitted.request() else {
+            panic!("expected broadcast command, got {:?}", admitted.request());
+        };
+        message.clone()
+    }
+
+    #[test]
+    fn world_time_command_is_capability_gated_and_result_is_targeted() {
+        let mut runtime = LuaScriptRuntime::from_source(
+            world_time_manifest(&["server.tick"]),
+            r#"
+                function on_server_tick(_event)
+                    solaris.set_world_time("set-night", 13000)
+                end
+
+                function on_world_time_set_result(event)
+                    solaris.broadcast(
+                        event.request_id .. ":" .. tostring(event.world_time) .. ":" .. tostring(event.failure)
+                    )
+                end
+            "#,
+            LuaRuntimeLimits::default(),
+        )
+        .unwrap();
+        let controls = RuntimeControls::unrestricted();
+
+        let batch = runtime
+            .handle_event(
+                &ScriptEvent::server_tick(1),
+                RuntimeContext::new(&controls, NonZeroUsize::new(8).unwrap()),
+            )
+            .unwrap();
+        let [ScriptCommand::SetWorldTime { request }] = batch.commands() else {
+            panic!("world-time handler must emit one typed request");
+        };
+        assert_eq!(request.request_id(), "set-night");
+        assert_eq!(request.world_time(), 13_000);
+
+        let event = ScriptEvent::world_time_set_result("test-plugin", request, None).unwrap();
+        assert_eq!(event.target_plugin_id(), Some("test-plugin"));
+        let result = runtime
+            .handle_event(
+                &event,
+                RuntimeContext::new(&controls, NonZeroUsize::new(8).unwrap()),
+            )
+            .unwrap();
+        assert_eq!(
+            result.commands(),
+            &[ScriptCommand::BroadcastChatMessage {
+                message: "set-night:13000:nil".to_owned(),
+            }]
+        );
+    }
+
+    #[test]
+    fn world_time_rejects_values_outside_exact_luau_integer_range() {
+        let controls = RuntimeControls::unrestricted();
+        let mut max_runtime = LuaScriptRuntime::from_source(
+            world_time_manifest(&["server.tick"]),
+            r#"
+                function on_server_tick(_event)
+                    solaris.set_world_time("max", 9007199254740991)
+                end
+            "#,
+            LuaRuntimeLimits::default(),
+        )
+        .unwrap();
+        let max_batch = max_runtime
+            .handle_event(
+                &ScriptEvent::server_tick(1),
+                RuntimeContext::new(&controls, NonZeroUsize::new(8).unwrap()),
+            )
+            .unwrap();
+        assert!(matches!(
+            max_batch.commands(),
+            [ScriptCommand::SetWorldTime { request }]
+                if request.world_time() == crate::MAX_SCRIPT_WORLD_TIME
+        ));
+
+        let mut too_large_runtime = LuaScriptRuntime::from_source(
+            world_time_manifest(&["server.tick"]),
+            r#"
+                function on_server_tick(_event)
+                    solaris.set_world_time("too-large", 9007199254740992)
+                end
+            "#,
+            LuaRuntimeLimits::default(),
+        )
+        .unwrap();
+        assert!(matches!(
+            too_large_runtime.handle_event(
+                &ScriptEvent::server_tick(1),
+                RuntimeContext::new(&controls, NonZeroUsize::new(8).unwrap()),
+            ),
+            Err(RuntimeError::Trap { .. })
+        ));
+        assert!(matches!(
+            ScriptWorldTimeSetRequest::try_new("too-large", crate::MAX_SCRIPT_WORLD_TIME + 1),
+            Err(crate::ScriptDtoError::InvalidBounds)
+        ));
+    }
+
+    #[tokio::test]
+    async fn disk_world_time_capability_emits_host_attested_request() {
+        let root = tempfile::tempdir().unwrap();
+        let plugin = root.path().join("clock-plugin");
+        fs::create_dir(&plugin).unwrap();
+        fs::write(
+            plugin.join("plugin.toml"),
+            r#"id = "clock-plugin"
+name = "Clock Plugin"
+version = "0.1.0"
+api = "0.6.0"
+events = ["server.started"]
+capabilities = ["world_time"]
+"#,
+        )
+        .unwrap();
+        fs::write(
+            plugin.join("main.lua"),
+            r#"
+                function on_server_started(_event)
+                    solaris.set_world_time("dawn", 1000)
+                end
+            "#,
+        )
+        .unwrap();
+
+        let (boundary, host) = start_lua_host(LuaHostConfig::new(root.path())).unwrap();
+        boundary
+            .try_enqueue_event(ScriptEvent::server_started())
+            .unwrap();
+        let command = tokio::time::timeout(Duration::from_secs(1), boundary.recv_command())
+            .await
+            .unwrap()
+            .unwrap();
+        let admitted = boundary.accept_host_command(command).unwrap();
+        assert_eq!(admitted.plugin_id(), "clock-plugin");
+        assert!(matches!(
+            admitted.request(),
+            ScriptCommand::SetWorldTime { request }
+                if request.request_id() == "dawn" && request.world_time() == 1_000
+        ));
+
+        drop(boundary);
+        tokio::task::spawn_blocking(move || host.join())
+            .await
+            .unwrap()
+            .unwrap();
+    }
+
+    #[test]
+    fn world_time_command_without_capability_fails_before_batch_admission() {
+        let mut runtime = LuaScriptRuntime::from_source(
+            manifest(&["server.tick"]),
+            r#"
+                function on_server_tick(_event)
+                    solaris.set_world_time("set-night", 13000)
+                end
+            "#,
+            LuaRuntimeLimits::default(),
+        )
+        .unwrap();
+        let controls = RuntimeControls::unrestricted();
+
+        let error = runtime
+            .handle_event(
+                &ScriptEvent::server_tick(1),
+                RuntimeContext::new(&controls, NonZeroUsize::new(8).unwrap()),
+            )
+            .unwrap_err();
+        assert!(matches!(
+            error,
+            RuntimeError::Trap { message }
+                if message.contains("command capability denied: world_time")
+        ));
+    }
+
+    #[test]
+    fn world_block_command_is_capability_gated_and_result_is_targeted() {
+        let mut runtime = LuaScriptRuntime::from_source(
+            world_blocks_manifest(&["server.tick"]),
+            r#"
+                function on_server_tick(_event)
+                    solaris.set_block("set-stone", "minecraft:overworld", "minecraft:stone", 1, 64, 2)
+                end
+
+                function on_world_block_set_result(event)
+                    solaris.broadcast(
+                        event.request_id .. ":" .. event.dimension .. ":" .. event.block_id .. ":" .. tostring(event.x) .. ":" .. tostring(event.y) .. ":" .. tostring(event.z) .. ":" .. tostring(event.applied) .. ":" .. tostring(event.failure)
+                    )
+                end
+            "#,
+            LuaRuntimeLimits::default(),
+        )
+        .unwrap();
+        let controls = RuntimeControls::unrestricted();
+
+        let batch = runtime
+            .handle_event(
+                &ScriptEvent::server_tick(1),
+                RuntimeContext::new(&controls, NonZeroUsize::new(8).unwrap()),
+            )
+            .unwrap();
+        let [ScriptCommand::SetWorldBlock { request }] = batch.commands() else {
+            panic!("world-block handler must emit one typed request");
+        };
+        assert_eq!(request.request_id(), "set-stone");
+        assert_eq!(request.dimension(), "minecraft:overworld");
+        assert_eq!(request.block_id(), "minecraft:stone");
+        assert_eq!((request.x(), request.y(), request.z()), (1, 64, 2));
+
+        assert!(matches!(
+            ScriptEvent::world_block_set_result("test-plugin", request, false, None),
+            Err(crate::ScriptDtoError::InconsistentResult {
+                field: "world block set result"
+            })
+        ));
+        let event =
+            ScriptEvent::world_block_set_result("test-plugin", request, true, None).unwrap();
+        assert_eq!(event.target_plugin_id(), Some("test-plugin"));
+        let result = runtime
+            .handle_event(
+                &event,
+                RuntimeContext::new(&controls, NonZeroUsize::new(8).unwrap()),
+            )
+            .unwrap();
+        assert_eq!(
+            result.commands(),
+            &[ScriptCommand::BroadcastChatMessage {
+                message: "set-stone:minecraft:overworld:minecraft:stone:1:64:2:true:nil".to_owned(),
+            }]
+        );
+    }
+
+    #[test]
+    fn world_block_command_without_capability_fails_before_batch_admission() {
+        let mut runtime = LuaScriptRuntime::from_source(
+            manifest(&["server.tick"]),
+            r#"
+                function on_server_tick(_event)
+                    solaris.set_block("set-stone", "minecraft:overworld", "minecraft:stone", 1, 64, 2)
+                end
+            "#,
+            LuaRuntimeLimits::default(),
+        )
+        .unwrap();
+        let controls = RuntimeControls::unrestricted();
+
+        let error = runtime
+            .handle_event(
+                &ScriptEvent::server_tick(1),
+                RuntimeContext::new(&controls, NonZeroUsize::new(8).unwrap()),
+            )
+            .unwrap_err();
+        assert!(matches!(
+            error,
+            RuntimeError::Trap { message }
+                if message.contains("command capability denied: world_blocks")
+        ));
+    }
+
+    #[test]
+    fn entity_damage_command_is_capability_gated_and_result_is_targeted() {
+        let mut runtime = LuaScriptRuntime::from_source(
+            entity_damage_manifest(&["server.tick"]),
+            r#"
+                function on_server_tick(_event)
+                    solaris.damage_entity("hit-cow", 77, 2.5)
+                end
+
+                function on_entity_damage_result(event)
+                    solaris.broadcast(
+                        event.request_id .. ":" .. tostring(event.entity_id) .. ":" .. tostring(event.amount) .. ":" .. tostring(event.damaged) .. ":" .. tostring(event.health) .. ":" .. tostring(event.killed) .. ":" .. tostring(event.failure)
+                    )
+                end
+            "#,
+            LuaRuntimeLimits::default(),
+        )
+        .unwrap();
+        let controls = RuntimeControls::unrestricted();
+
+        let batch = runtime
+            .handle_event(
+                &ScriptEvent::server_tick(1),
+                RuntimeContext::new(&controls, NonZeroUsize::new(8).unwrap()),
+            )
+            .unwrap();
+        let [ScriptCommand::DamageEntity { request }] = batch.commands() else {
+            panic!("entity-damage handler must emit one typed request");
+        };
+        assert_eq!(request.request_id(), "hit-cow");
+        assert_eq!(request.entity_id(), crate::ScriptEntityId::new(77));
+        assert_eq!(request.amount(), 2.5);
+
+        assert!(matches!(
+            ScriptEvent::entity_damage_result("test-plugin", request, None, false, None),
+            Err(crate::ScriptDtoError::InconsistentResult {
+                field: "entity damage result"
+            })
+        ));
+        assert!(matches!(
+            ScriptEvent::entity_damage_result("test-plugin", request, Some(1.0), true, None),
+            Err(crate::ScriptDtoError::InconsistentResult {
+                field: "entity damage result"
+            })
+        ));
+
+        let success =
+            ScriptEvent::entity_damage_result("test-plugin", request, Some(7.5), false, None)
+                .unwrap();
+        assert_eq!(success.target_plugin_id(), Some("test-plugin"));
+        let result = runtime
+            .handle_event(
+                &success,
+                RuntimeContext::new(&controls, NonZeroUsize::new(8).unwrap()),
+            )
+            .unwrap();
+        assert_eq!(
+            result.commands(),
+            &[ScriptCommand::BroadcastChatMessage {
+                message: "hit-cow:77:2.5:true:7.5:false:nil".to_owned(),
+            }]
+        );
+
+        let failure = ScriptEvent::entity_damage_result(
+            "test-plugin",
+            request,
+            None,
+            false,
+            Some(crate::ScriptEntityDamageFailure::Rejected),
+        )
+        .unwrap();
+        let result = runtime
+            .handle_event(
+                &failure,
+                RuntimeContext::new(&controls, NonZeroUsize::new(8).unwrap()),
+            )
+            .unwrap();
+        assert_eq!(
+            result.commands(),
+            &[ScriptCommand::BroadcastChatMessage {
+                message: "hit-cow:77:2.5:false:nil:false:rejected".to_owned(),
+            }]
+        );
+    }
+
+    #[test]
+    fn entity_damage_rejects_invalid_bounds_and_missing_capability() {
+        assert!(matches!(
+            ScriptEntityDamageRequest::try_new("zero", crate::ScriptEntityId::new(1), 0.0,),
+            Err(crate::ScriptDtoError::InvalidBounds)
+        ));
+        assert!(matches!(
+            ScriptEntityDamageRequest::try_new(
+                "too-large",
+                crate::ScriptEntityId::new(1),
+                crate::MAX_SCRIPT_ENTITY_DAMAGE + 1.0,
+            ),
+            Err(crate::ScriptDtoError::InvalidBounds)
+        ));
+        assert!(matches!(
+            ScriptEntityDamageRequest::try_new(
+                "entity-id",
+                crate::ScriptEntityId::new(i32::MAX as u64 + 1),
+                1.0,
+            ),
+            Err(crate::ScriptDtoError::InvalidBounds)
+        ));
+
+        let mut runtime = LuaScriptRuntime::from_source(
+            manifest(&["server.tick"]),
+            r#"
+                function on_server_tick(_event)
+                    solaris.damage_entity("hit-cow", 77, 2.5)
+                end
+            "#,
+            LuaRuntimeLimits::default(),
+        )
+        .unwrap();
+        let controls = RuntimeControls::unrestricted();
+        let error = runtime
+            .handle_event(
+                &ScriptEvent::server_tick(1),
+                RuntimeContext::new(&controls, NonZeroUsize::new(8).unwrap()),
+            )
+            .unwrap_err();
+        assert!(matches!(
+            error,
+            RuntimeError::Trap { message }
+                if message.contains("command capability denied: entity_damage")
+        ));
+    }
+
+    #[tokio::test]
+    async fn disk_entity_damage_capability_emits_host_attested_request() {
+        let root = tempfile::tempdir().unwrap();
+        let plugin = root.path().join("combat-plugin");
+        fs::create_dir(&plugin).unwrap();
+        fs::write(
+            plugin.join("plugin.toml"),
+            r#"id = "combat-plugin"
+name = "Combat Plugin"
+version = "0.1.0"
+api = "0.6.0"
+events = ["server.started"]
+capabilities = ["entity_damage"]
+"#,
+        )
+        .unwrap();
+        fs::write(
+            plugin.join("main.lua"),
+            r#"
+                function on_server_started(_event)
+                    solaris.damage_entity("disk-hit", 9, 3.25)
+                end
+            "#,
+        )
+        .unwrap();
+
+        let (boundary, host) = start_lua_host(LuaHostConfig::new(root.path())).unwrap();
+        boundary
+            .try_enqueue_event(ScriptEvent::server_started())
+            .unwrap();
+        let command = tokio::time::timeout(Duration::from_secs(1), boundary.recv_command())
+            .await
+            .unwrap()
+            .unwrap();
+        let admitted = boundary.accept_host_command(command).unwrap();
+        assert_eq!(admitted.plugin_id(), "combat-plugin");
+        assert!(matches!(
+            admitted.request(),
+            ScriptCommand::DamageEntity { request }
+                if request.request_id() == "disk-hit"
+                    && request.entity_id() == crate::ScriptEntityId::new(9)
+                    && request.amount() == 3.25
+        ));
+
+        drop(boundary);
+        tokio::task::spawn_blocking(move || host.join())
+            .await
+            .unwrap()
+            .unwrap();
     }
 
     #[test]
@@ -4057,7 +5399,7 @@ mod tests {
         let command_manifest =
             ScriptPluginManifest::new("test-plugin", "Test Plugin", "0.1.0", SCRIPT_API_VERSION)
                 .declare_player_command_root("hello")
-                .declare_console_command_root("time")
+                .declare_world_time()
                 .validate()
                 .unwrap();
         let mut runtime = LuaScriptRuntime::from_source(
@@ -4070,7 +5412,7 @@ mod tests {
                     )
                     solaris.broadcast("command received")
                     solaris.disconnect(event.player_id, "done")
-                    solaris.run_console("time set day")
+                    solaris.set_world_time("set-day", 1000)
                 end
             "#,
             LuaRuntimeLimits::default(),
@@ -4106,8 +5448,8 @@ mod tests {
                     player_id: ScriptPlayerId::new(7),
                     reason: "done".to_owned(),
                 },
-                ScriptCommand::RunConsoleCommand {
-                    command: "time set day".to_owned(),
+                ScriptCommand::SetWorldTime {
+                    request: ScriptWorldTimeSetRequest::try_new("set-day", 1_000).unwrap(),
                 },
             ]
         );
@@ -4134,7 +5476,13 @@ mod tests {
             spawn_manifest,
             r#"
                 function on_player_command(event)
-                    solaris.spawn_entity(event.player_id, "minecraft:pig", 1.25, 64.0, -2.5)
+                    solaris.spawn_entity("pet-pig", event.player_id, "minecraft:pig", 1.25, 64.0, -2.5)
+                end
+
+                function on_entity_spawn_result(event)
+                    solaris.broadcast(
+                        event.request_id .. ":" .. tostring(event.player_id) .. ":" .. event.entity_type .. ":" .. tostring(event.spawned) .. ":" .. tostring(event.failure)
+                    )
                 end
             "#,
             LuaRuntimeLimits::default(),
@@ -4150,20 +5498,64 @@ mod tests {
         assert_eq!(
             batch.commands(),
             &[ScriptCommand::SpawnEntity {
+                request_id: "pet-pig".to_owned(),
                 actor: ScriptPlayerId::new(7),
                 entity_type: "minecraft:pig".to_owned(),
                 position: crate::ScriptPosition::try_new(1.25, 64.0, -2.5).unwrap(),
             }]
         );
+        let position = ScriptPosition::try_new(1.25, 64.0, -2.5).unwrap();
+        let success = ScriptEvent::entity_spawn_result(
+            "spawn-test",
+            "pet-pig",
+            ScriptPlayerId::new(7),
+            "minecraft:pig",
+            position,
+            None,
+        )
+        .unwrap();
+        let success_batch = runtime
+            .handle_event(
+                &success,
+                RuntimeContext::new(&controls, NonZeroUsize::new(8).unwrap()),
+            )
+            .unwrap();
+        assert_eq!(
+            success_batch.commands(),
+            &[ScriptCommand::BroadcastChatMessage {
+                message: "pet-pig:7:minecraft:pig:true:nil".to_owned(),
+            }]
+        );
+        let failure = ScriptEvent::entity_spawn_result(
+            "spawn-test",
+            "pet-pig",
+            ScriptPlayerId::new(7),
+            "minecraft:pig",
+            position,
+            Some(crate::ScriptEntitySpawnFailure::ActorUnavailable),
+        )
+        .unwrap();
+        let failure_batch = runtime
+            .handle_event(
+                &failure,
+                RuntimeContext::new(&controls, NonZeroUsize::new(8).unwrap()),
+            )
+            .unwrap();
+        assert_eq!(
+            failure_batch.commands(),
+            &[ScriptCommand::BroadcastChatMessage {
+                message: "pet-pig:7:minecraft:pig:false:actor_unavailable".to_owned(),
+            }]
+        );
 
         for source in [
-            r#"solaris.spawn_entity(event.player_id, "minecraft:cow", 1, 64, 1)"#,
-            r#"solaris.spawn_entity(event.player_id, "minecraft:Pig", 1, 64, 1)"#,
-            r#"solaris.spawn_entity(event.player_id, "minecraft:pig", 0 / 0, 64, 1)"#,
-            r#"solaris.spawn_entity(event.player_id, "minecraft:pig", math.huge, 64, 1)"#,
-            r#"solaris.spawn_entity(event.player_id, "minecraft:pig", 30000000.1, 64, 1)"#,
-            r#"solaris.spawn_entity(event.player_id, "minecraft:pig", 1, 20000000.1, 1)"#,
-            r#"solaris.spawn_entity(event.player_id, "minecraft:pig", 1, 64, -30000000.1)"#,
+            r#"solaris.spawn_entity("bad", event.player_id, "minecraft:cow", 1, 64, 1)"#,
+            r#"solaris.spawn_entity("bad", event.player_id, "minecraft:Pig", 1, 64, 1)"#,
+            r#"solaris.spawn_entity("bad", event.player_id, "minecraft:pig", 0 / 0, 64, 1)"#,
+            r#"solaris.spawn_entity("bad", event.player_id, "minecraft:pig", math.huge, 64, 1)"#,
+            r#"solaris.spawn_entity("bad", event.player_id, "minecraft:pig", 30000000.1, 64, 1)"#,
+            r#"solaris.spawn_entity("bad", event.player_id, "minecraft:pig", 1, 20000000.1, 1)"#,
+            r#"solaris.spawn_entity("bad", event.player_id, "minecraft:pig", 1, 64, -30000000.1)"#,
         ] {
             let mut runtime = LuaScriptRuntime::from_source(
                 ScriptPluginManifest::new("spawn-test", "Spawn Test", "0.1.0", SCRIPT_API_VERSION)
@@ -4187,7 +5579,7 @@ mod tests {
 
         let oversized_type = format!("minecraft:{}", "a".repeat(MAX_SCRIPT_RESOURCE_ID_BYTES));
         let source = format!(
-            "function on_player_command(event) solaris.spawn_entity(event.player_id, '{oversized_type}', 1, 64, 1) end"
+            "function on_player_command(event) solaris.spawn_entity('oversized', event.player_id, '{oversized_type}', 1, 64, 1) end"
         );
         let mut runtime = LuaScriptRuntime::from_source(
             ScriptPluginManifest::new("spawn-test", "Spawn Test", "0.1.0", SCRIPT_API_VERSION)
@@ -4229,7 +5621,7 @@ mod tests {
             manifest,
             r#"
                 function on_player_command(event)
-                    solaris.place_loader_block("loader-test:ruby_block", 3, 64, -5)
+                    solaris.place_loader_block("place-ruby", "loader-test:ruby_block", 3, 64, -5)
                 end
             "#,
             LuaRuntimeLimits::default(),
@@ -4245,10 +5637,14 @@ mod tests {
         assert_eq!(
             batch.commands(),
             &[ScriptCommand::PlaceLoaderBlock {
-                block_id: "loader-test:ruby_block".to_owned(),
-                x: 3,
-                y: 64,
-                z: -5,
+                request: ScriptLoaderBlockPlacementRequest::try_new(
+                    "place-ruby",
+                    "loader-test:ruby_block",
+                    3,
+                    64,
+                    -5,
+                )
+                .unwrap(),
             }]
         );
     }
@@ -4273,7 +5669,7 @@ mod tests {
             manifest,
             r#"
                 function on_player_command(event)
-                    solaris.grant_loader_block_item(event.player_id, "loader-test:ruby_block", 3)
+                    solaris.grant_loader_block_item("grant-ruby", event.player_id, "loader-test:ruby_block", 3)
                 end
             "#,
             LuaRuntimeLimits::default(),
@@ -4289,9 +5685,13 @@ mod tests {
         assert_eq!(
             batch.commands(),
             &[ScriptCommand::GrantLoaderBlockItem {
-                player_id: ScriptPlayerId::new(7),
-                block_id: "loader-test:ruby_block".to_owned(),
-                count: 3,
+                request: ScriptLoaderItemGrantRequest::try_new(
+                    "grant-ruby",
+                    ScriptPlayerId::new(7),
+                    "loader-test:ruby_block",
+                    3,
+                )
+                .unwrap(),
             }]
         );
     }
@@ -5129,7 +6529,6 @@ mod tests {
         let manifest =
             ScriptPluginManifest::new("raw-boundary", "Raw Boundary", "0.1.0", SCRIPT_API_VERSION)
                 .subscribe_event("server.tick")
-                .declare_console_command_root("say")
                 .declare_spawn_entity_type("minecraft:pig")
                 .declare_plugin_storage()
                 .declare_inventory_menus()
@@ -5160,13 +6559,8 @@ mod tests {
                 "disconnect_reason:too_long",
             ),
             (
-                "run_console",
-                "solaris.run_console(string.rep('x', 257))",
-                "console_command:too_long",
-            ),
-            (
                 "spawn_entity",
-                "solaris.spawn_entity(7, string.rep('x', 129), 0, 64, 0)",
+                "solaris.spawn_entity('spawn-boundary', 7, string.rep('x', 129), 0, 64, 0)",
                 "entity_type:too_long",
             ),
             (
@@ -5470,10 +6864,621 @@ mod tests {
         ));
 
         drop(boundary);
+        let report = tokio::task::spawn_blocking(move || host.join())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(report.loaded_plugins(), 2);
+        assert_eq!(report.enabled_plugins_at_exit(), 1);
+        assert_eq!(report.exit_reason(), LuaHostExitReason::EventQueueClosed);
+        assert_eq!(report.disabled_plugins().len(), 1);
+        let disabled = &report.disabled_plugins()[0];
+        assert_eq!(disabled.plugin_id(), "test-plugin");
+        assert_eq!(disabled.stage(), LuaPluginDisableStage::Handler);
+        assert!(disabled.message().contains("broken plugin"));
+    }
+
+    #[test]
+    fn joined_host_reports_normal_event_queue_shutdown() {
+        let root = tempfile::tempdir().unwrap();
+        let (boundary, host) = start_lua_host(LuaHostConfig::new(root.path())).unwrap();
+        assert_eq!(host.loaded_plugins(), 0);
+
+        drop(boundary);
+        let report = host.join().unwrap();
+        assert_eq!(report.loaded_plugins(), 0);
+        assert_eq!(report.enabled_plugins_at_exit(), 0);
+        assert!(report.disabled_plugins().is_empty());
+        assert_eq!(report.exit_reason(), LuaHostExitReason::EventQueueClosed);
+    }
+
+    #[test]
+    fn plugin_disable_diagnostic_is_utf8_safe_and_bounded() {
+        let message = "ж".repeat(MAX_PLUGIN_DISABLE_DIAGNOSTIC_BYTES);
+        let bounded = bounded_plugin_disable_diagnostic(message);
+        assert!(bounded.len() <= MAX_PLUGIN_DISABLE_DIAGNOSTIC_BYTES);
+        assert!(bounded.ends_with("..."));
+        assert!(bounded.is_char_boundary(bounded.len()));
+    }
+
+    #[test]
+    fn host_reports_command_queue_closed_distinctly() {
+        let source = PluginSource {
+            manifest: manifest(&["server.tick"]),
+            config: toml::Table::new(),
+            source: r#"
+                function on_server_tick(_event)
+                    solaris.broadcast("queued")
+                end
+            "#
+            .to_owned(),
+            source_path: PathBuf::from("queue-closed/main.lua"),
+            worldgen_ore_profile: None,
+            worldgen_settlement_plan: None,
+            client_bundles: Vec::new(),
+        };
+        let (boundary, endpoint) =
+            script_boundary_pair(NonZeroUsize::new(4).unwrap(), NonZeroUsize::new(1).unwrap());
+        boundary.command_rx.try_lock().unwrap().close();
+        let (startup_tx, startup_rx) = std::sync::mpsc::sync_channel(1);
+        let host = thread::spawn(move || run_lua_host(endpoint, vec![source], false, startup_tx));
+        assert_eq!(startup_rx.recv().unwrap().unwrap(), 1);
+
+        boundary
+            .try_enqueue_event(ScriptEvent::server_tick(1))
+            .unwrap();
+        let report = host.join().unwrap();
+        assert_eq!(report.exit_reason(), LuaHostExitReason::CommandQueueClosed);
+        assert_eq!(report.loaded_plugins(), 1);
+        assert_eq!(report.enabled_plugins_at_exit(), 1);
+        assert!(report.disabled_plugins().is_empty());
+    }
+
+    #[test]
+    fn host_reports_player_command_authority_unavailable_distinctly() {
+        let source = PluginSource {
+            manifest: manifest(&["server.tick"]),
+            config: toml::Table::new(),
+            source: "function on_server_tick(_event) end".to_owned(),
+            source_path: PathBuf::from("authority-unavailable/main.lua"),
+            worldgen_ore_profile: None,
+            worldgen_settlement_plan: None,
+            client_bundles: Vec::new(),
+        };
+        let (boundary, endpoint) =
+            script_boundary_pair(NonZeroUsize::new(4).unwrap(), NonZeroUsize::new(1).unwrap());
+        boundary
+            .player_command_owners
+            .disabled
+            .store(true, Ordering::Release);
+        let (startup_tx, startup_rx) = std::sync::mpsc::sync_channel(1);
+        let host = thread::spawn(move || run_lua_host(endpoint, vec![source], false, startup_tx));
+
+        assert_eq!(startup_rx.recv().unwrap().unwrap(), 0);
+        let report = host.join().unwrap();
+        assert_eq!(
+            report.exit_reason(),
+            LuaHostExitReason::PlayerCommandAuthorityUnavailable
+        );
+        assert_eq!(report.loaded_plugins(), 0);
+        assert_eq!(report.enabled_plugins_at_exit(), 0);
+        assert!(report.disabled_plugins().is_empty());
+        drop(boundary);
+    }
+
+    #[test]
+    fn batch_rejection_handler_disable_is_reported_exactly_once() {
+        let source = PluginSource {
+            manifest: manifest(&["server.tick"]),
+            config: toml::Table::new(),
+            source: r#"
+                function on_server_tick(_event)
+                    solaris.broadcast("would overflow")
+                end
+
+                function on_command_batch_rejected(_event)
+                    error("broken rejection callback")
+                end
+            "#
+            .to_owned(),
+            source_path: PathBuf::from("batch-rejection/main.lua"),
+            worldgen_ore_profile: None,
+            worldgen_settlement_plan: None,
+            client_bundles: Vec::new(),
+        };
+        let (boundary, mut endpoint) =
+            script_boundary_pair(NonZeroUsize::new(4).unwrap(), NonZeroUsize::new(1).unwrap());
+        endpoint
+            .try_submit_command(ScriptCommand::BroadcastChatMessage {
+                message: "occupy command queue".to_owned(),
+            })
+            .unwrap();
+        let (startup_tx, startup_rx) = std::sync::mpsc::sync_channel(1);
+        let (progress_tx, progress_rx) = std::sync::mpsc::sync_channel(2);
+        let host = thread::spawn(move || {
+            run_lua_host_inner(
+                &mut endpoint,
+                vec![source],
+                false,
+                startup_tx,
+                Some(progress_tx),
+            )
+        });
+        assert_eq!(startup_rx.recv().unwrap().unwrap(), 1);
+
+        boundary
+            .try_enqueue_event(ScriptEvent::server_tick(1))
+            .unwrap();
+        boundary
+            .try_enqueue_event(ScriptEvent::server_tick(2))
+            .unwrap();
+        assert_eq!(
+            progress_rx.recv_timeout(Duration::from_secs(1)).unwrap(),
+            "server.tick"
+        );
+        assert_eq!(
+            progress_rx.recv_timeout(Duration::from_secs(1)).unwrap(),
+            "server.tick"
+        );
+        drop(boundary);
+
+        let report = host.join().unwrap();
+        assert_eq!(report.exit_reason(), LuaHostExitReason::EventQueueClosed);
+        assert_eq!(report.disabled_plugins().len(), 1);
+        assert_eq!(report.enabled_plugins_at_exit(), 0);
+        let diagnostic = &report.disabled_plugins()[0];
+        assert_eq!(diagnostic.plugin_id(), "test-plugin");
+        assert_eq!(
+            diagnostic.stage(),
+            LuaPluginDisableStage::BatchRejectionHandler
+        );
+        assert!(diagnostic.message().contains("broken rejection callback"));
+    }
+
+    #[test]
+    fn command_admission_disable_is_reported_exactly_once() {
+        let source = PluginSource {
+            manifest: manifest(&["server.tick"]),
+            config: toml::Table::new(),
+            source: r#"
+                function on_server_tick(_event)
+                    solaris.broadcast("requires admission")
+                end
+            "#
+            .to_owned(),
+            source_path: PathBuf::from("command-admission/main.lua"),
+            worldgen_ore_profile: None,
+            worldgen_settlement_plan: None,
+            client_bundles: Vec::new(),
+        };
+        let (boundary, mut endpoint) =
+            script_boundary_pair(NonZeroUsize::new(4).unwrap(), NonZeroUsize::new(2).unwrap());
+        let ledger = Arc::clone(&boundary.host_admissions);
+        let poisoned = thread::spawn(move || {
+            let _guard = ledger.pending.lock().unwrap();
+            panic!("poison host admission ledger");
+        });
+        assert!(poisoned.join().is_err());
+
+        let (startup_tx, startup_rx) = std::sync::mpsc::sync_channel(1);
+        let (progress_tx, progress_rx) = std::sync::mpsc::sync_channel(2);
+        let host = thread::spawn(move || {
+            run_lua_host_inner(
+                &mut endpoint,
+                vec![source],
+                false,
+                startup_tx,
+                Some(progress_tx),
+            )
+        });
+        assert_eq!(startup_rx.recv().unwrap().unwrap(), 1);
+
+        boundary
+            .try_enqueue_event(ScriptEvent::server_tick(1))
+            .unwrap();
+        boundary
+            .try_enqueue_event(ScriptEvent::server_tick(2))
+            .unwrap();
+        assert_eq!(
+            progress_rx.recv_timeout(Duration::from_secs(1)).unwrap(),
+            "server.tick"
+        );
+        assert_eq!(
+            progress_rx.recv_timeout(Duration::from_secs(1)).unwrap(),
+            "server.tick"
+        );
+        drop(boundary);
+
+        let report = host.join().unwrap();
+        assert_eq!(report.exit_reason(), LuaHostExitReason::EventQueueClosed);
+        assert_eq!(report.disabled_plugins().len(), 1);
+        assert_eq!(report.enabled_plugins_at_exit(), 0);
+        let diagnostic = &report.disabled_plugins()[0];
+        assert_eq!(diagnostic.plugin_id(), "test-plugin");
+        assert_eq!(diagnostic.stage(), LuaPluginDisableStage::CommandAdmission);
+        assert!(diagnostic.message().contains("AdmissionUnavailable"));
+    }
+
+    #[tokio::test]
+    async fn reload_swaps_generation_at_fifo_boundary() {
+        let initial = prepare_plugin_sources(vec![plugin_source(
+            manifest(&["server.tick"]),
+            "reload-old/main.lua",
+            r#"
+                function on_server_tick(_event)
+                    solaris.broadcast("old-generation")
+                end
+            "#,
+        )])
+        .unwrap();
+        let (boundary, host) = start_prepared_lua_host(initial).unwrap();
+        boundary
+            .try_enqueue_event(ScriptEvent::server_tick(1))
+            .unwrap();
+
+        let replacement = prepare_plugin_sources(vec![plugin_source(
+            manifest(&["server.tick"]),
+            "reload-new/main.lua",
+            r#"
+                function on_server_tick(_event)
+                    solaris.broadcast("new-generation")
+                end
+            "#,
+        )])
+        .unwrap();
+        let reload = host.reload(replacement).await.unwrap();
+        assert_eq!(reload.loaded_plugins(), 1);
+        assert!(reload.replaced_disabled_plugins().is_empty());
+
+        boundary
+            .try_enqueue_event(ScriptEvent::server_tick(2))
+            .unwrap();
+        assert_eq!(recv_host_broadcast(&boundary).await, "old-generation");
+        assert_eq!(recv_host_broadcast(&boundary).await, "new-generation");
+
+        drop(boundary);
+        let exit = tokio::task::spawn_blocking(move || host.join())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(exit.exit_reason(), LuaHostExitReason::EventQueueClosed);
+        assert_eq!(exit.enabled_plugins_at_exit(), 1);
+    }
+
+    #[tokio::test]
+    async fn reload_reinitializes_candidate_before_publishing_new_generation() {
+        let initial = prepare_plugin_sources(vec![plugin_source(
+            manifest(&["server.tick"]),
+            "reload-reinit-old/main.lua",
+            "function on_server_tick(_event) solaris.broadcast('reinit-old') end",
+        )])
+        .unwrap();
+        let (boundary, host) = start_prepared_lua_host(initial).unwrap();
+        let replacement = prepare_plugin_sources(vec![plugin_source(
+            manifest(&["server.started", "server.tick"]),
+            "reload-reinit-new/main.lua",
+            r#"
+                function on_server_started(_event)
+                    solaris.broadcast("reload-started")
+                end
+
+                function on_server_tick(_event)
+                    solaris.broadcast("reinit-new")
+                end
+            "#,
+        )])
+        .unwrap();
+
+        host.reload(replacement).await.unwrap();
+        assert_eq!(recv_host_broadcast(&boundary).await, "reload-started");
+        boundary
+            .try_enqueue_event(ScriptEvent::server_tick(1))
+            .unwrap();
+        assert_eq!(recv_host_broadcast(&boundary).await, "reinit-new");
+
+        drop(boundary);
         tokio::task::spawn_blocking(move || host.join())
             .await
             .unwrap()
             .unwrap();
+    }
+
+    #[tokio::test]
+    async fn reload_reinitialization_failure_keeps_previous_generation() {
+        let initial = prepare_plugin_sources(vec![plugin_source(
+            manifest(&["server.tick"]),
+            "reload-reinit-fail-old/main.lua",
+            "function on_server_tick(_event) solaris.broadcast('reinit-still-old') end",
+        )])
+        .unwrap();
+        let (boundary, host) = start_prepared_lua_host(initial).unwrap();
+        let replacement = prepare_plugin_sources(vec![plugin_source(
+            manifest(&["server.started", "server.tick"]),
+            "reload-reinit-fail-new/main.lua",
+            r#"
+                function on_server_started(_event)
+                    error("reload startup failed")
+                end
+
+                function on_server_tick(_event)
+                    solaris.broadcast("must-not-become-active")
+                end
+            "#,
+        )])
+        .unwrap();
+
+        assert!(matches!(
+            host.reload(replacement).await,
+            Err(LuaReloadError::Reinitialization { plugin_id, message })
+                if plugin_id == "test-plugin" && message.contains("reload startup failed")
+        ));
+        boundary
+            .try_enqueue_event(ScriptEvent::server_tick(1))
+            .unwrap();
+        assert_eq!(recv_host_broadcast(&boundary).await, "reinit-still-old");
+
+        drop(boundary);
+        tokio::task::spawn_blocking(move || host.join())
+            .await
+            .unwrap()
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn reload_startup_queue_pressure_keeps_previous_generation() {
+        let initial = prepare_plugin_sources(vec![plugin_source(
+            manifest(&["server.tick"]),
+            "reload-pressure-old/main.lua",
+            r#"
+                function on_server_tick(_event)
+                    for index = 1, 32 do
+                        solaris.broadcast("old-" .. tostring(index))
+                    end
+                end
+            "#,
+        )])
+        .unwrap();
+        let (boundary, host) = start_prepared_lua_host(initial).unwrap();
+        for tick in 1..=8 {
+            boundary
+                .try_enqueue_event(ScriptEvent::server_tick(tick))
+                .unwrap();
+        }
+        let replacement = prepare_plugin_sources(vec![plugin_source(
+            manifest(&["server.started", "server.tick"]),
+            "reload-pressure-new/main.lua",
+            r#"
+                function on_server_started(_event)
+                    solaris.broadcast("startup-needs-capacity")
+                end
+
+                function on_server_tick(_event)
+                    solaris.broadcast("new-generation")
+                end
+            "#,
+        )])
+        .unwrap();
+
+        assert_eq!(
+            host.reload(replacement).await,
+            Err(LuaReloadError::CommandQueueFull)
+        );
+        for _ in 0..COMMAND_QUEUE_CAPACITY {
+            let command = tokio::time::timeout(Duration::from_secs(1), boundary.recv_command())
+                .await
+                .expect("filled command queue did not drain")
+                .expect("command queue closed while draining");
+            drop(command);
+        }
+        boundary
+            .try_enqueue_event(ScriptEvent::server_tick(9))
+            .unwrap();
+        assert_eq!(recv_host_broadcast(&boundary).await, "old-1");
+
+        drop(boundary);
+        tokio::task::spawn_blocking(move || host.join())
+            .await
+            .unwrap()
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn failed_reload_keeps_previous_generation_authoritative() {
+        let initial = prepare_plugin_sources(vec![plugin_source(
+            manifest(&["server.tick"]),
+            "reload-stable/main.lua",
+            r#"
+                function on_server_tick(_event)
+                    solaris.broadcast("still-old")
+                end
+            "#,
+        )])
+        .unwrap();
+        let (boundary, host) = start_prepared_lua_host(initial).unwrap();
+        let broken = prepare_plugin_sources(vec![plugin_source(
+            manifest(&["server.tick"]),
+            "reload-broken/main.lua",
+            "function on_server_tick(",
+        )])
+        .unwrap();
+
+        assert!(matches!(
+            host.reload(broken).await,
+            Err(LuaReloadError::CandidatePlugin { plugin_id, .. }) if plugin_id == "test-plugin"
+        ));
+        boundary
+            .try_enqueue_event(ScriptEvent::server_tick(1))
+            .unwrap();
+        assert_eq!(recv_host_broadcast(&boundary).await, "still-old");
+
+        drop(boundary);
+        tokio::task::spawn_blocking(move || host.join())
+            .await
+            .unwrap()
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn incompatible_reload_contract_is_rejected_before_swap() {
+        let initial = prepare_plugin_sources(vec![plugin_source(
+            manifest(&["server.tick"]),
+            "reload-contract-old/main.lua",
+            r#"
+                function on_server_tick(_event)
+                    solaris.broadcast("contract-old")
+                end
+            "#,
+        )])
+        .unwrap();
+        let (boundary, host) = start_prepared_lua_host(initial).unwrap();
+        let incompatible = prepare_plugin_sources(vec![plugin_source(
+            command_manifest("test-plugin", "new-root"),
+            "reload-contract-new/main.lua",
+            "function on_server_tick(_event) solaris.broadcast('must-not-load') end",
+        )])
+        .unwrap();
+
+        assert_eq!(
+            host.reload(incompatible).await,
+            Err(LuaReloadError::StartupContractChanged {
+                field: "plugin_order_or_player_commands"
+            })
+        );
+        assert!(boundary.player_command_roots().is_empty());
+        boundary
+            .try_enqueue_event(ScriptEvent::server_tick(1))
+            .unwrap();
+        assert_eq!(recv_host_broadcast(&boundary).await, "contract-old");
+
+        drop(boundary);
+        tokio::task::spawn_blocking(move || host.join())
+            .await
+            .unwrap()
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn reload_recovers_faulted_plugin_and_restores_command_ownership() {
+        let command_manifest = command_manifest("test-plugin", "hello");
+        let initial = prepare_plugin_sources(vec![plugin_source(
+            command_manifest.clone(),
+            "reload-faulted/main.lua",
+            r#"
+                function on_player_command(_event)
+                    error("broken generation")
+                end
+            "#,
+        )])
+        .unwrap();
+        let (boundary, host) = start_prepared_lua_host(initial).unwrap();
+        assert_eq!(boundary.player_command_roots(), vec!["hello".to_owned()]);
+        assert_eq!(
+            boundary.try_enqueue_player_command_with_context(
+                ScriptPlayerId::new(7),
+                player_context("Alex"),
+                "hello",
+            ),
+            Ok(PlayerCommandAdmission::Enqueued)
+        );
+
+        let replacement = prepare_plugin_sources(vec![plugin_source(
+            command_manifest,
+            "reload-repaired/main.lua",
+            r#"
+                function on_player_command(_event)
+                    solaris.broadcast("repaired-generation")
+                end
+            "#,
+        )])
+        .unwrap();
+        let reload = host.reload(replacement).await.unwrap();
+        assert_eq!(reload.loaded_plugins(), 1);
+        assert_eq!(reload.replaced_disabled_plugins().len(), 1);
+        let replaced = &reload.replaced_disabled_plugins()[0];
+        assert_eq!(replaced.plugin_id(), "test-plugin");
+        assert_eq!(replaced.stage(), LuaPluginDisableStage::Handler);
+        assert!(replaced.message().contains("broken generation"));
+        assert_eq!(boundary.player_command_roots(), vec!["hello".to_owned()]);
+
+        assert_eq!(
+            boundary.try_enqueue_player_command_with_context(
+                ScriptPlayerId::new(7),
+                player_context("Alex"),
+                "hello",
+            ),
+            Ok(PlayerCommandAdmission::Enqueued)
+        );
+        assert_eq!(recv_host_broadcast(&boundary).await, "repaired-generation");
+
+        drop(boundary);
+        let exit = tokio::task::spawn_blocking(move || host.join())
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(exit.disabled_plugins().is_empty());
+        assert_eq!(exit.enabled_plugins_at_exit(), 1);
+    }
+
+    #[tokio::test]
+    async fn admitted_reload_commits_even_when_response_waiter_is_cancelled() {
+        let initial = prepare_plugin_sources(vec![plugin_source(
+            manifest(&["server.tick"]),
+            "reload-cancel-old/main.lua",
+            "function on_server_tick(_event) solaris.broadcast('cancel-old') end",
+        )])
+        .unwrap();
+        let (boundary, host) = start_prepared_lua_host(initial).unwrap();
+        let replacement = prepare_plugin_sources(vec![plugin_source(
+            manifest(&["server.tick"]),
+            "reload-cancel-new/main.lua",
+            "function on_server_tick(_event) solaris.broadcast('cancel-new') end",
+        )])
+        .unwrap();
+        let sender = host.reload_sender.upgrade().unwrap();
+        let (response_tx, response_rx) = tokio::sync::oneshot::channel();
+        drop(response_rx);
+        sender
+            .send(ScriptHostInput::LuaReload(LuaReloadRequest::new(
+                replacement,
+                response_tx,
+            )))
+            .await
+            .unwrap();
+        drop(sender);
+
+        boundary
+            .try_enqueue_event(ScriptEvent::server_tick(1))
+            .unwrap();
+        assert_eq!(recv_host_broadcast(&boundary).await, "cancel-new");
+
+        drop(boundary);
+        tokio::task::spawn_blocking(move || host.join())
+            .await
+            .unwrap()
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn closed_boundary_rejects_reload_without_keeping_host_alive() {
+        let prepared = || {
+            prepare_plugin_sources(vec![plugin_source(
+                manifest(&["server.tick"]),
+                "reload-close/main.lua",
+                "function on_server_tick(_event) end",
+            )])
+            .unwrap()
+        };
+        let (boundary, host) = start_prepared_lua_host(prepared()).unwrap();
+        drop(boundary);
+        assert_eq!(
+            host.reload(prepared()).await,
+            Err(LuaReloadError::HostClosed)
+        );
+        let exit = tokio::task::spawn_blocking(move || host.join())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(exit.exit_reason(), LuaHostExitReason::EventQueueClosed);
     }
 
     #[test]
@@ -5727,12 +7732,12 @@ mod tests {
     #[test]
     fn lua_permission_errors_render_only_the_bounded_capability_code() {
         let error = command_error(CommandBatchError::PermissionDenied {
-            capability: crate::ScriptCommandCapabilityKind::RunConsoleCommand,
+            capability: crate::ScriptCommandCapabilityKind::EntityDamage,
         });
 
         assert_eq!(
             error.to_string(),
-            "runtime error: command capability denied: run_console_command"
+            "runtime error: command capability denied: entity_damage"
         );
     }
 

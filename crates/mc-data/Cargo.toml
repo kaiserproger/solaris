@@ -12,6 +12,7 @@ repository.workspace = true
 workspace = true
 
 [dependencies]
+mc-domain = { path = "../mc-domain" }
 mc-nbt = { path = "../mc-nbt" }
 serde = { workspace = true }
 serde_json = { workspace = true }

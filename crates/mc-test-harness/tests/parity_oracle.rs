@@ -1875,6 +1875,101 @@ async fn vanilla_and_solaris_timed_action_can_be_diffed() {
     solaris_task.abort();
 }
 
+#[tokio::test]
+#[ignore = "requires local Minecraft 26.1.2 vanilla server oracle"]
+async fn weather_game_events_match_vanilla_26_1_2() {
+    let availability = vanilla_oracle_availability(repo_root());
+    let OracleAvailability::Available { jar } = availability else {
+        panic!(
+            "{}",
+            availability.skip_message().expect("oracle unavailable")
+        );
+    };
+
+    let vanilla_dir = tempfile::tempdir().expect("vanilla tempdir");
+    let mut vanilla =
+        VanillaServerProcess::launch(&jar, vanilla_dir.path(), Duration::from_secs(90))
+            .expect("vanilla starts");
+    let (solaris, solaris_addr) = spawn_solaris().await.expect("spawn Solaris");
+    let solaris_task = tokio::spawn(async move { solaris.serve().await });
+
+    let (mut vanilla_client, _, _) = enter_block_oracle_play(ScenarioContext {
+        kind: ServerKind::Vanilla,
+        addr: vanilla.addr(),
+    })
+    .await
+    .expect("vanilla enters Play");
+    let (mut solaris_client, _, _) = enter_block_oracle_play(ScenarioContext {
+        kind: ServerKind::Solaris,
+        addr: solaris_addr,
+    })
+    .await
+    .expect("Solaris enters Play");
+
+    drain_weather_startup_frames(&mut vanilla_client, Duration::from_secs(2))
+        .await
+        .expect("drain vanilla startup weather frames");
+    drain_weather_startup_frames(&mut solaris_client, Duration::from_secs(2))
+        .await
+        .expect("drain Solaris startup weather frames");
+
+    async fn set_solaris_weather(client: &mut Client, command: &str) {
+        client
+            .write_packet(&ServerboundChatCommand {
+                command: format!("weather {command}"),
+            })
+            .await
+            .expect("Solaris weather command");
+    }
+
+    vanilla
+        .send_command("weather rain 600s")
+        .expect("vanilla rain command");
+    set_solaris_weather(&mut solaris_client, "rain").await;
+    let vanilla_rain =
+        collect_weather_game_events(&mut vanilla_client, 104, Duration::from_secs(10))
+            .await
+            .expect("vanilla rain ramp");
+    let solaris_rain =
+        collect_weather_game_events(&mut solaris_client, 104, Duration::from_secs(10))
+            .await
+            .expect("Solaris rain ramp");
+    assert_eq!(solaris_rain, vanilla_rain, "rain ramp mismatch");
+    assert_eq!(solaris_rain.first().copied(), Some((7, 0.01)));
+    assert_eq!(solaris_rain.last().copied(), Some((7, 1.0)));
+
+    vanilla
+        .send_command("weather thunder 600s")
+        .expect("vanilla thunder command");
+    set_solaris_weather(&mut solaris_client, "thunder").await;
+    let vanilla_thunder =
+        collect_weather_game_events(&mut vanilla_client, 101, Duration::from_secs(10))
+            .await
+            .expect("vanilla thunder ramp");
+    let solaris_thunder =
+        collect_weather_game_events(&mut solaris_client, 101, Duration::from_secs(10))
+            .await
+            .expect("Solaris thunder ramp");
+    assert_eq!(solaris_thunder, vanilla_thunder, "thunder ramp mismatch");
+
+    vanilla
+        .send_command("weather clear 600s")
+        .expect("vanilla clear command");
+    set_solaris_weather(&mut solaris_client, "clear").await;
+    let vanilla_clear =
+        collect_weather_game_events(&mut vanilla_client, 205, Duration::from_secs(10))
+            .await
+            .expect("vanilla clear ramp");
+    let solaris_clear =
+        collect_weather_game_events(&mut solaris_client, 205, Duration::from_secs(10))
+            .await
+            .expect("Solaris clear ramp");
+    assert_eq!(solaris_clear, vanilla_clear, "clear ramp mismatch");
+
+    vanilla.stop().expect("vanilla stops");
+    solaris_task.abort();
+}
+
 // ---------------------------------------------------------------------------
 // T01-05: checked block transaction/rejection/resync oracle
 // ---------------------------------------------------------------------------
@@ -1894,6 +1989,63 @@ const BLOCK_TRANSACTION_ORACLE_MANIFEST_JSON: &str = r#"{
 fn block_transaction_oracle_manifest() -> BlockTransactionOracleManifest {
     BlockTransactionOracleManifest::from_json(BLOCK_TRANSACTION_ORACLE_MANIFEST_JSON)
         .expect("checked block transaction oracle manifest")
+}
+
+async fn drain_weather_startup_frames(client: &mut Client, duration: Duration) -> Result<()> {
+    let deadline = tokio::time::Instant::now() + duration;
+    loop {
+        let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+        if remaining.is_zero() {
+            return Ok(());
+        }
+        let frame = match client.read_frame_with_timeout(remaining).await {
+            Ok(frame) => frame,
+            Err(error) if error.to_string().contains("timed out after") => return Ok(()),
+            Err(error) => return Err(error),
+        };
+        if frame.id == ClientboundKeepAlive::ID {
+            let keepalive = ClientboundKeepAlive::decode(&mut frame.body.clone())?;
+            client
+                .write_packet(&ServerboundKeepAlive { id: keepalive.id })
+                .await?;
+        } else if frame.id == SynchronizePlayerPosition::ID {
+            let sync = SynchronizePlayerPosition::decode(&mut frame.body.clone())?;
+            client
+                .write_packet(&ConfirmTeleportation {
+                    teleport_id: sync.teleport_id,
+                })
+                .await?;
+        }
+    }
+}
+
+async fn collect_weather_game_events(
+    client: &mut Client,
+    expected: usize,
+    timeout: Duration,
+) -> Result<Vec<(u8, f32)>> {
+    let deadline = tokio::time::Instant::now() + timeout;
+    let mut events = Vec::new();
+    while events.len() < expected {
+        let frame = client
+            .read_frame_with_timeout(
+                deadline.saturating_duration_since(tokio::time::Instant::now()),
+            )
+            .await
+            .context("weather oracle timed out waiting for GameEvent")?;
+        if frame.id == ClientboundKeepAlive::ID {
+            let keepalive = ClientboundKeepAlive::decode(&mut frame.body.clone())?;
+            client
+                .write_packet(&ServerboundKeepAlive { id: keepalive.id })
+                .await?;
+            continue;
+        }
+        if frame.id == GameEvent::ID {
+            let event = GameEvent::decode(&mut frame.body.clone())?;
+            events.push((event.event, event.value));
+        }
+    }
+    Ok(events)
 }
 
 async fn enter_block_oracle_play(

@@ -4,6 +4,8 @@ Date: 2026-07-30
 
 Target: `v0.0.2-alpha.1`
 
+Status: **closed for release**. Every automated gate is green. The only unperformed owner-only terrain/playability judgement was explicitly deferred to `v0.0.3-alpha.1` and is not represented as a PASS here; see [`PUBLIC_ALPHA3_PLAN.md`](PUBLIC_ALPHA3_PLAN.md).
+
 This plan is based on the first owner-run public-alpha session with an unmodified
 Minecraft Java Edition 26.1.2 client, seed `712816`, `view_distance = 16`, one
 local player and the server running on the same i5-12600 host.
@@ -43,8 +45,11 @@ not replace functional, package, workspace, or real-client gates.
    serial-only, disabled, and environment-sensitive pass is recorded in
    [`evidence/phase1-flaky-test-inventory.md`](evidence/phase1-flaky-test-inventory.md).
 2. [x] Replace wall-clock sleeps and polling with the exact packet, notification,
-   process, world-state, or simulation event that proves progress.
-3. [ ] Keep substantial tests beside their focused domain in `*_tests.rs`; stop
+   process, world-state, or simulation event that proves progress. The final expanded
+   Rust/Java/Python/shell test-gate audit and post-review cleanup are recorded in
+   [`evidence/phase1-progress-wait-inventory.md`](evidence/phase1-progress-wait-inventory.md)
+   and [`evidence/phase1-closeout-2026-08-28.md`](evidence/phase1-closeout-2026-08-28.md).
+3. [x] Keep substantial tests beside their focused domain in `*_tests.rs`; stop
    growing aggregate `play.rs`, `session.rs`, and inline production test modules.
    The complete 76-test plant adapter class now lives in focused
    `play/tests/plants.rs`; aggregate concentration and the preserved test set are
@@ -467,15 +472,33 @@ not replace functional, package, workspace, or real-client gates.
    `play/tests/dense_entity_simulation_cohorts.rs`; its lane limit, ten-turn
    rotation, and exactly-once coverage are recorded in
    [`evidence/mc-net-dense-entity-simulation-cohorts-test-extraction.md`](evidence/mc-net-dense-entity-simulation-cohorts-test-extraction.md).
-4. [ ] Separate behavioral tests from structural tripwires. Structural checks may
+   The final aggregate closeout moved the remaining 26 executable `play/tests.rs`
+   cases plus six campfire recovery cases into focused modules. Exact scans now find
+   no executable test attributes in aggregate `play.rs`, `play/session.rs`, or
+   `play/tests.rs`; final evidence and reviewer disposition are recorded in
+   [`evidence/phase1-closeout-2026-08-28.md`](evidence/phase1-closeout-2026-08-28.md).
+4. [x] Separate behavioral tests from structural tripwires. Structural checks may
    enforce crate ownership and dependency direction, but may not assert Rust
-   statement order or source-text layout.
-5. [ ] Make the common debug development loop deterministic across affected-crate
+   statement order or source-text layout. The source-order checks were removed while
+   executable packet-order coverage was retained/repaired after independent review;
+   evidence is recorded in
+   [`evidence/phase1-structural-tripwire-separation-2026-08-27.md`](evidence/phase1-structural-tripwire-separation-2026-08-27.md).
+5. [x] Make the common debug development loop deterministic across affected-crate
    tests, TCP/harness tests, persistence/restart tests, and the exact real-client
-   scenarios named by the active feature.
-6. [ ] Close the phase with one clean L2 run and no unexplained ignored, flaky, or
+   scenarios named by the active feature. The bucket/block-resync vertical has one exact
+   `--exact` automated route across affected-crate, TCP/harness and save/restart coverage
+   plus a fixed manifest/scenario/fresh-world/seed graphical continuation. The common
+   real-client runner fails before launch when no graphical display is available instead
+   of timing out on bridge readiness, and the fixed `m94-02b-rejected-block-resync`
+   continuation passed on isolated Xvfb with a validated agent-run real-client artifact.
+   Evidence is recorded in
+   [`evidence/phase1-deterministic-debug-loop-2026-08-27.md`](evidence/phase1-deterministic-debug-loop-2026-08-27.md).
+6. [x] Close the phase with one clean L2 run and no unexplained ignored, flaky, or
    manual-pending gate. Graphical gates must be reported as graphical evidence,
-   never inferred from unit or raw-TCP success.
+   never inferred from unit or raw-TCP success. The exact final workspace L2 run,
+   classified ignored/manual boundary, post-review fixes, graphical artifact, and
+   detached Pi/Luna audit are recorded in
+   [`evidence/phase1-closeout-2026-08-28.md`](evidence/phase1-closeout-2026-08-28.md).
 
 ### Phase 2 — Enforce crate and module boundaries
 
@@ -505,48 +528,155 @@ Required migration:
    `mc-net` retains session snapshots, regional-owner commit, visibility
    publication, and wire adapters.
    Evidence: [`evidence/natural-spawn-crate-boundary.md`](evidence/natural-spawn-crate-boundary.md).
-3. [ ] Continue one touched vertical domain at a time: move request/result types and
-   pure rules first, keep authority mutation in its accepted owner, then narrow the
-   adapter. Do not create generic service traits without two real implementations.
+3. [x] Complete the current touched vertical migration set one domain at a time: move
+   request/result types and pure rules first, keep authority mutation in its accepted
+   owner, then narrow the adapter. Do not create generic service traits without two
+   real implementations. Future touched domains continue this standing policy without
+   keeping the completed Phase-2 migration set open indefinitely.
    The plant vertical is complete:
    [`evidence/plant-rules-crate-boundary.md`](evidence/plant-rules-crate-boundary.md).
-4. [ ] Remove superseded in-crate APIs, compatibility shims, duplicate authorities,
-   feature flags, and fallbacks after all callers move.
-5. [ ] Reject dependency cycles and reverse edges into `mc-net`. Semantic domain
+   The movement vertical now owns its pure displacement, pose-limit, sweep-sampling,
+   rotation/clamp rules in `mc-physics` and bounded world-bounds→chunk coverage in
+   `mc-world`; `mc-net` retains game-mode policy, loaded/resident-world checks,
+   collision authority, and publication. `xtask code-health` rejects both reverse
+   dependencies from lower crates into `mc-net` and movement adapters bypassing the
+   lower-crate primitives. Evidence:
+   [`evidence/movement-rules-crate-boundary.md`](evidence/movement-rules-crate-boundary.md).
+   The survival/mining vertical is now bounded through its caller cleanup: protocol-neutral
+   fallback hardness, tool-family/tier rules, destroy-progress math, resolved tag membership,
+   canonical food duration/rule lookup, and fallback tests live in `mc-data`; player survival
+   transitions plus max-health/max-food and movement/attack/break exhaustion constants live in
+   `mc-entity`. `mc-net::SurvivalState` is only the mutable storage/wire adapter, while live
+   registry/tag adaptation, authoritative mutation, storage, and wire projection remain in
+   `mc-net`. Duplicate semantic shims/tests were removed and `xtask code-health` prevents their
+   return. Evidence:
+   [`evidence/survival-mining-crate-boundary.md`](evidence/survival-mining-crate-boundary.md).
+   The chunk-stream vertical has now started as well: spiral and look-direction priority ordering,
+   prewarm edge-ring/batch planning, edge-distance math, desired-window coverage, and initial-window
+   sizing live in `mc-world::chunk_stream_plan_26_1_2`; natural-spawn chunk-template planning now
+   lives in `mc-entity`, while shared 26.1.2 block-name passability/fallback-surface semantics live
+   in `mc-data`. `mc-net` retains scheduler state, generation/IO, admission budgets, cache pressure,
+   registry adaptation, and packet publication. Evidence:
+   [`evidence/chunk-stream-plan-crate-boundary.md`](evidence/chunk-stream-plan-crate-boundary.md),
+   [`evidence/natural-spawn-crate-boundary.md`](evidence/natural-spawn-crate-boundary.md), and
+   [`evidence/block-semantics-crate-boundary.md`](evidence/block-semantics-crate-boundary.md).
+   The player-combat vertical is also bounded: knockback/yaw/shield durability-duration math lives in
+   `mc-entity::player_combat_26_1_2`, versioned durability-tool semantics live in
+   `mc-data::item_semantics_26_1_2`, and `mc-net` retains inventory/session authority, cooldowns,
+   commits, and publication. Evidence:
+   [`evidence/player-combat-crate-boundary.md`](evidence/player-combat-crate-boundary.md).
+   Shared protocol-independent gameplay value types (`GameMode`, `Direction`, and `InteractionHand`)
+   are canonical in zero-dependency `mc-domain`; `mc-protocol` only re-exports them at the wire API
+   boundary and `mc-net` consumes the lower values directly. Evidence:
+   [`evidence/domain-values-crate-boundary.md`](evidence/domain-values-crate-boundary.md).
+   Canonical `ItemStack` data also lives below transport in `mc-data::item_stack`; `mc-protocol`
+   re-exports the value for wire compatibility and owns only codec behavior. Evidence:
+   [`evidence/item-stack-crate-boundary.md`](evidence/item-stack-crate-boundary.md).
+   Versioned item-path semantics used by durability and enchanting plus generic max-stack rules live
+   in `mc-data::item_semantics_26_1_2`; combat/enchanting/inventory adapters retain authority but
+   consume those lower rules. Deterministic enchanting offer/selection rules live in
+   `mc-data::enchanting_26_1_2`. Evidence:
+   [`evidence/item-semantics-crate-boundary.md`](evidence/item-semantics-crate-boundary.md).
+   Recipe ingredient matching and stonecutting offer validation live in `mc-data::recipes`, while
+   container settlement and recipe-book wire translation remain in `mc-net`. Evidence:
+   [`evidence/recipe-semantics-crate-boundary.md`](evidence/recipe-semantics-crate-boundary.md).
+   Villager trade input satisfaction lives with `mc-entity::villager_merchant_26_1_2`, reusing lower
+   item max-stack semantics; merchant inventory/session settlement remains in `mc-net`. Evidence:
+   [`evidence/merchant-semantics-crate-boundary.md`](evidence/merchant-semantics-crate-boundary.md).
+   Inventory/equipment stack transactions, equipment-slot classification, and armor/protection
+   reduction now live in `mc-data`; `mc-net::inventory` retains the mutable 46-slot owner,
+   merge/range ordering, session integration, persistence, and publication. Evidence:
+   [`evidence/inventory-equipment-crate-boundary.md`](evidence/inventory-equipment-crate-boundary.md).
+   Deterministic 26.1.2 placement state rules for stairs, slabs, waterlogging, torches, signs, and
+   direction primitives now live in `mc-data::block_placement_26_1_2`; `mc-net` retains world
+   snapshots, support/precondition checks, owner commit, inventory settlement, and publication.
+   Evidence:
+   [`evidence/block-placement-crate-boundary.md`](evidence/block-placement-crate-boundary.md).
+4. [x] Remove superseded in-crate APIs, compatibility shims, duplicate authorities,
+   feature flags, and fallbacks after all callers move for the current migration set.
+   The unused staged `mc-entity::interaction_26_1_2` API was removed rather than
+   retained without a production consumer. The survival/mining caller cutover removed
+   its `fallback_mining_time`/food/public-tag/drop shims, `SurvivalHealthTick`
+   re-export, `SurvivalState` semantic constant aliases, and duplicate network
+   semantic tests. A final source audit finds those superseded symbols only in
+   `xtask` rejection rules; remaining private registry/tag helpers are live adapters,
+   not compatibility authorities. Future cleanup remains tied to the caller cutover
+   of the next touched vertical.
+5. [x] Reject dependency cycles and reverse edges into `mc-net`. Semantic domain
    results must not contain `OutboundCommand`, connection handles, packet writers,
-   or session internals.
-6. [ ] Keep root orchestration files small and behavioral-free. A touched legacy
-   domain is mechanically split when bounded; unrelated domains are not rewritten
-   in the same checkpoint.
-7. [ ] Extend `xtask code-health` with stable ownership/dependency tripwires for
+   or session internals. `xtask code-health` now rejects direct lower-crate Cargo
+   dependencies on `mc-net` and scans every lower semantic source for transport/session
+   symbols including outbound commands, connection/writer handles, session registries,
+   visibility dispatches, and client/server-bound wire DTOs.
+6. [x] Keep root orchestration files small and behavioral-free. A touched legacy
+   domain is mechanically split when bounded; unrelated domains are not rewritten in
+   the same checkpoint. `SOL-042` now freezes exact ceilings at `play_loop_inner`
+   **731** lines, `BoundServer::serve` **277**, simulation `process_batch` **998**, and
+   the separately named `run_entity_ticker` runtime **1,053**. Play keeps transport
+   select scheduling, slow-client fencing, exhaustive outbound projection routing,
+   keepalive/teleport confirmation, and explicit serverbound family dispatch in the
+   root; movement, player-state, use/interact, container, player-control,
+   client-metadata, chat/command, simulation-tick, chunk-stream, wake, damage, and
+   inventory behavior live behind narrow helpers. `BoundServer::serve` is now a
+   composition/supervision root: the complete entity-ticker task moved literally to
+   `server/entity_ticker.rs` behind `EntityTickerContext`, with its select order,
+   `SimulationOwner`, physics fencing, save requests, runtime-control signals,
+   metrics workers, world views, and shutdown tail unchanged. The ticker has its own
+   growth budget so the debt is not hidden in a child module. Authority, queue
+   fairness, admission order, slow-client behavior, lifecycle order, and transaction/
+   publication order remain unchanged.
+7. [x] Extend `xtask code-health` with stable ownership/dependency tripwires for
    each completed extraction, and update ADR 0006 or the actual authority ADR in
-   the same commit when the policy changes.
-8. [ ] Close the phase only when remaining `mc-net` domain logic is explicitly
+   the same commit when the policy changes. Every completed Phase-2 lower-crate
+   evidence row names its ownership/adapter fence; the generic reverse-dependency
+   and transport-leakage checks cover the lower semantic crates. ADR 0006 remains
+   the accepted policy and no authority-direction change was introduced by these
+   extractions.
+8. [x] Close the phase only when remaining `mc-net` domain logic is explicitly
    listed and justified as an adapter or a queued extraction, not merely hidden in
-   child modules with `use super::*`.
+   child modules with `use super::*`. The 2026-08-18 refresh in
+   [`evidence/mc-net-ownership-inventory.md`](evidence/mc-net-ownership-inventory.md)
+   classifies the remaining ingress, simulation, server, session, chunk-stream,
+   persistence, gameplay-adapter, pickup, and control-plane ownership and names the
+   queued cleanup/decomposition path for each mixed area.
 
 ### Phase 3 — Find and remove measured performance bottlenecks
 
-1. [ ] Reproduce the public-alpha generation, chunk streaming, memory, tick, and
-   M39 lock baselines on a documented host and exact tree.
-2. [ ] Profile before optimizing. Rank hotspots by player-visible latency, tick
+1. [x] Reproduce the public-alpha generation, chunk streaming, memory, tick, and
+   M39 lock baselines on a documented host and exact tree. The 2026-08-18 same-host
+   refresh records HEAD/worktree state, Ryzen 5 7535HS topology, Rust/LLVM versions,
+   the 200-action lock/tick gate, release worldgen scaling, 20-client VD8 latency/
+   memory/lock telemetry, and multicore runtime evidence in
+   [`evidence/phase3-performance-baseline-2026-08-18.md`](evidence/phase3-performance-baseline-2026-08-18.md).
+2. [x] Profile before optimizing. Rank hotspots by player-visible latency, tick
    budget, allocation/memory, lock hold/wait, and throughput; keep the raw profile
    or benchmark artifact outside Git and the compact result in the owning evidence
-   document.
-3. [ ] Close the known break/drop/pickup lock gate, worldgen throughput gate, chunk
+   document. Kernel `perf` sampling was unavailable under `perf_event_paranoid=4`,
+   so the existing ignored release benchmark was extended with stage timings. Those
+   measurements isolated the explosion-authority P0 before any accepted optimization.
+3. [x] Close the known break/drop/pickup lock gate, worldgen throughput gate, chunk
    streaming gate, and autoscale startup-hysteresis investigation before selecting
-   lower-impact micro-optimizations.
-4. [ ] For every accepted optimization, document the bottleneck, ownership
-   boundary, correctness fence, measured effect, and fallback/removal path.
-5. [ ] Reject optimization claims based only on code shape, synthetic counters, or
+   lower-impact micro-optimizations. Fresh gates pass; live autoscale telemetry records
+   two bounded scale-down decisions and zero scale-up oscillations before drain.
+4. [x] For every accepted optimization, document the bottleneck, ownership
+   boundary, correctness fence, measured effect, and fallback/removal path. The current
+   accepted explosion optimizations and rejected neutral experiments are recorded in
+   the Phase-3 evidence document.
+5. [x] Reject optimization claims based only on code shape, synthetic counters, or
    a different environment. A regression outside the feature's accepted threshold
-   remains open even when functional tests pass.
-6. [ ] Close the phase with a fresh ranked profile. Every remaining ordinary-play
-   hotspot must have a metric, workload, and explicit threshold in
-   the [`benchmark matrix`](performance/2026-07-27-benchmark-matrix.md); its
-   mapped benchmark must meet that threshold or record the owner's explicit
-   acceptance of the measured tradeoff. An unnamed general "budget" is not
-   closeout evidence.
+   remains open even when functional tests pass. The explosion benchmark stayed open
+   through intermediate 62/58 ms p99 results and closed only after the unchanged
+   `<50 ms` release threshold passed at 41.300 ms p99 on the final API-cleaned tree.
+6. [x] Close the phase with a fresh ranked profile. Every remaining ordinary-play
+   hotspot now has a metric, workload, and explicit threshold in
+   the [`benchmark matrix`](performance/2026-07-27-benchmark-matrix.md), with the
+   full measured closeout in
+   [`evidence/phase3-performance-baseline-2026-08-18.md`](evidence/phase3-performance-baseline-2026-08-18.md).
+   The hottest remaining mapped paths are explosion authority (`41.300 ms` p99),
+   mob death cleanup (`30.523 ms` p99), and the 1,500×1,500 regional battle
+   (`25.706 ms` tick p99), all below the frozen 50 ms threshold. Exact profile
+   duration/quota and long-soak gaps remain explicit later acceptance evidence and
+   are not silently promoted to `pass` by this hotspot closeout.
 
 ### Phase 4 — Close common vanilla parity
 
@@ -554,23 +684,39 @@ Parity targets unmodified Minecraft Java Edition 26.1.2 behavior used in an
 ordinary multiplayer survival session. Rare bug-for-bug compatibility remains
 below common play, persistence safety, and plugin progress.
 
-1. [ ] Complete the clock, worldgen, natural-spawn, item transaction, restart, and
-   real-client acceptance gates already specified below.
-2. [ ] Build an evidence-backed common-play matrix for movement, block interaction,
+1. [x] Complete the clock, worldgen, natural-spawn, item transaction, restart, and
+   real-client acceptance gates already specified below. Every automated sub-gate is
+   green. The only remaining subjective seed-`712816` owner terrain/playability
+   disposition is explicitly deferred by the owner to `v0.0.3-alpha.1`; the prepared
+   review material remains in
+   [`evidence/phase4-seed-712816-owner-disposition-package-2026-08-28.md`](evidence/phase4-seed-712816-owner-disposition-package-2026-08-28.md)
+   and is carried by [`PUBLIC_ALPHA3_PLAN.md`](PUBLIC_ALPHA3_PLAN.md).
+2. [x] Build an evidence-backed common-play matrix for movement, block interaction,
    inventory/crafting/containers, combat, projectiles, fluids, redstone essentials,
-   status/effects, death/respawn, weather/time, and persistence.
-3. [ ] Finish common entity behavior and AI, including villagers, village defence,
+   status/effects, death/respawn, weather/time, and persistence. The executable
+   evidence, disposition, and explicit remaining boundary for every named domain are
+   recorded in
+   [`evidence/phase4-common-play-matrix-2026-08-18.md`](evidence/phase4-common-play-matrix-2026-08-18.md).
+3. [x] Finish common entity behavior and AI, including villagers, village defence,
    guardians, friendly/hostile population, navigation, combat, despawn, drops, and
-   restart identity.
-4. [ ] Prove multiplayer authority and publication behavior with at least two
+   restart identity. The production-path matrix is recorded in
+   [`evidence/phase4-entity-ai-matrix-2026-08-21.md`](evidence/phase4-entity-ai-matrix-2026-08-21.md). Villager schedule, village-defence, guardian and every formerly `UnsupportedSpecial` primary-combat vertical now have explicit owner/state authority and bounded executable production evidence rather than generic fallback. Species-specific and boss-specific behavior below ordinary common-play parity remains explicitly listed as residuals in that matrix and is not silently claimed by this closeout.
+4. [x] Prove multiplayer authority and publication behavior with at least two
    clients for shared blocks, containers, combat, pickups, entity visibility,
-   disconnect, and reconnect.
-5. [ ] Derive packet ids/layouts and behavioral rules only from the local
+   disconnect, and reconnect. Fresh raw-TCP evidence for every named domain is recorded in
+   [`evidence/phase4-multiplayer-authority-2026-08-21.md`](evidence/phase4-multiplayer-authority-2026-08-21.md).
+5. [x] Derive packet ids/layouts and behavioral rules only from the local
    26.1.2 oracle, decompiled source, vanilla capture, or side-by-side harness.
-   Record deliberate Solaris bug fixes explicitly.
-6. [ ] Close the phase with a clean fresh-world 20-minute survival run, restart and
+   Record deliberate Solaris bug fixes explicitly. Common-play provenance and the
+   consolidated active divergence ledger are recorded in
+   [`evidence/phase4-oracle-provenance-2026-08-21.md`](evidence/phase4-oracle-provenance-2026-08-21.md); this includes the bounded Ender-Dragon D1 deterministic eight-point orbit, villager-gossip RNG boundary, deterministic attribute ordering, and the still-active deterministic drop/plant/tree policies. Independent review status remains separate and BLOCKED without a terminal reviewer verdict.
+6. [x] Close the phase with a clean fresh-world 20-minute survival run, restart and
    reconnect, without operator setup, unexplained warnings, duplicated entities,
-   lost state, or a manual-pending common-play row.
+   lost state, or a manual-pending common-play row. The seed-`712816` graphical gate,
+   three natural death/respawn/drop recoveries, natural passive+hostile observation,
+   clean restart/rejoin, runtime provenance, validator result, and explicitly
+   dispositioned performance warnings are recorded in
+   [`evidence/phase4-20-minute-survival-2026-08-26.md`](evidence/phase4-20-minute-survival-2026-08-26.md).
 
 ### Phase 5 — Deliver the production Luau runtime API
 
@@ -582,22 +728,85 @@ internal locks or mutable registries to scripts.
    `server_only | server_and_client`, permissions, loader support, bundle
    identities, and artifact sizes. The operator-visible contract is recorded in
    [`evidence/plugin-deployment-reporting.md`](evidence/plugin-deployment-reporting.md).
-2. [ ] Implement deterministic runtime lifecycle, sandboxing, capability checks,
+2. [x] Implement deterministic runtime lifecycle, sandboxing, capability checks,
    resource budgets, failure isolation, reload/shutdown semantics, and actionable
-   diagnostics.
-3. [ ] Expose versioned typed events and cancellable/transactional commands for the
-   common player, world, block, inventory, combat, and entity surfaces.
-4. [ ] Route plugin mutations through accepted simulation/regional commands with
+   diagnostics. The existing sandbox/capability/budget/failure-isolation behavior has
+   typed terminal lifecycle reporting and composition-root shutdown diagnostics in
+   [`evidence/phase5-luau-runtime-lifecycle-diagnostics-2026-08-26.md`](evidence/phase5-luau-runtime-lifecycle-diagnostics-2026-08-26.md).
+   The host also has an atomic prepared-generation replacement boundary that keeps the
+   last valid generation on candidate/reinitialization/backpressure failure, preserves
+   queued command provenance, restores command ownership for repaired plugins, and
+   rejects restart-only worldgen, client-bundle or command-root changes. Unix
+   `mc-server` exposes strict SIGHUP reload through the same discovery/expected-set path;
+   evidence is recorded in
+   [`evidence/phase5-luau-safe-reload-boundary-2026-08-26.md`](evidence/phase5-luau-safe-reload-boundary-2026-08-26.md).
+   The combined reload/production-trigger checkpoint received a terminal independent
+   read-only `PASS`; the complete Phase-5 item-2 evidence is therefore closed on this
+   tree without weakening restart-only worldgen/client-content boundaries.
+3. [x] Expose versioned typed events and cancellable/transactional commands for the
+   common player, world, block, inventory, combat, and entity surfaces. The common-world
+   clock now has a capability-gated typed request/result pair routed through the existing
+   server-owned simulation command lane; evidence is recorded in
+   [`evidence/phase5-world-time-api-2026-08-26.md`](evidence/phase5-world-time-api-2026-08-26.md).
+   The common block surface now also has a bounded default-state `set_block` request/result
+   routed through the existing simulation-owner block-edit lane, with strict dimension,
+   registry and world-height validation; evidence is recorded in
+   [`evidence/phase5-world-block-api-2026-08-26.md`](evidence/phase5-world-block-api-2026-08-26.md).
+   Entity spawn is now a correlated typed request/result surface as well: host-attested
+   `spawn_entity` carries a bounded `request_id`, stays actor-session fenced through the
+   existing simulation owner, and publishes targeted semantic results including explicit
+   unknown-type and stale-actor outcomes. Evidence is recorded in
+   [`evidence/phase5-entity-spawn-api-2026-08-26.md`](evidence/phase5-entity-spawn-api-2026-08-26.md).
+   The final common combat gap is closed by capability-gated `damage_entity`, which uses
+   the existing generic server-entity combat kernel through the simulation owner and
+   returns authoritative health/killed state as a required targeted result. Evidence and
+   the complete six-domain matrix are recorded in
+   [`evidence/phase5-entity-damage-api-2026-08-26.md`](evidence/phase5-entity-damage-api-2026-08-26.md).
+   The bounded independent reviewer found no API/authority/matrix defect; its only Low
+   finding was a stale evidence line saying diff-check was pending, which is corrected.
+4. [x] Route plugin mutations through accepted simulation/regional commands with
    semantic results. Scripts must not receive lock guards, authority internals,
-   network DTOs, or direct persistence writers.
-5. [ ] Add tick/event scheduling, plugin storage, command registration, and the
-   first gameplay adapters required by menus, economy, zones, and colonies.
-6. [ ] Preserve deterministic event ordering, cancellation, rollback,
-   disconnect/reload behavior, and persistence across restart.
-7. [ ] Ship server-only and client-required fixtures, API documentation, permission
-   examples, harness coverage, and vanilla-client/Loader compatibility gates.
-8. [ ] Close the phase with a real plugin implementing a small end-to-end gameplay
-   loop using only the public API and no Solaris-private imports.
+   network DTOs, or direct persistence writers. The final authority audit removed the
+   generic Luau `run_console` cross-domain mutation escape, converted Loader block/item
+   mutations to correlated result-bearing owner paths, verified that `mc-script` has no
+   dependency on engine/network/persistence crates, and received an independent read-only
+   `PASS`; evidence is recorded in
+   [`evidence/phase5-plugin-mutation-authority-2026-08-27.md`](evidence/phase5-plugin-mutation-authority-2026-08-27.md).
+5. [x] Add tick/event scheduling, plugin storage, command registration, and the
+   first gameplay adapters required by menus, economy, zones, and colonies. The
+   existing production pieces now have one consolidated executable matrix: simulation-tick
+   timers, durable plugin storage, bounded player/operator command ownership, exact-session
+   inventory menus, atomic economy transactions, owned/protected zones, and the shipped
+   colony/villager scaffold. The full shipped plugin-example harness is 5/5 PASS and an
+   independent read-only reviewer returned `PASS`; evidence is recorded in
+   [`evidence/phase5-gameplay-adapter-foundation-2026-08-27.md`](evidence/phase5-gameplay-adapter-foundation-2026-08-27.md).
+6. [x] Preserve deterministic event ordering, cancellation, rollback,
+   disconnect/reload behavior, and persistence across restart. The lifecycle matrix now
+   covers bounded FIFO/required-event ordering, deterministic timer cancellation/rollback,
+   atomic reload at the host FIFO boundary, real-wire `player.left` and cleanup, transaction
+   no-partial-commit behavior, and durable plugin-storage/result replay across restart. VM
+   locals/timers remain explicitly ephemeral by public contract and are reconstructed from
+   durable intent when needed. Independent review returned `PASS`; evidence is recorded in
+   [`evidence/phase5-lifecycle-ordering-restart-2026-08-27.md`](evidence/phase5-lifecycle-ordering-restart-2026-08-27.md).
+7. [x] Ship server-only and client-required fixtures, API documentation, permission
+   examples, harness coverage, and vanilla-client/Loader compatibility gates. The
+   release-facing matrix now has a reproducible no-Loader real-client accept/reject gate,
+   fresh isolated Fabric/NeoForge/Forge Loader runs with exact bundle-identity checks,
+   owner-screen/button/grant coverage, per-run permission/cache isolation, public fixture
+   instructions, and the existing package/harness suites. Independent review returned
+   `CHANGES` only for gate strictness/documentation; all four findings were fixed and the
+   real-client matrix rerun successfully without a second reviewer. Evidence is recorded in
+   [`evidence/phase5-plugin-fixtures-compatibility-2026-08-27.md`](evidence/phase5-plugin-fixtures-compatibility-2026-08-27.md).
+8. [x] Close the phase with a real plugin implementing a small end-to-end gameplay
+   loop using only the public API and no Solaris-private imports. A fresh real-client
+   closeout uses the unchanged shipped `basic-economy` plugin with ordinary config-only
+   dirt currency: the client earns one dirt through natural break/drop/pickup, opens
+   `/economy`, primary-clicks the real server-owned menu, atomically exchanges dirt for two
+   apples through the public inventory/storage transaction, observes the plugin's committed
+   success message, and reopens the menu after a fresh storage read with `owned 1`. The
+   plugin has no private imports or hidden Rust hooks. Independent review returned `PASS`;
+   evidence is recorded in
+   [`evidence/phase5-public-api-gameplay-loop-2026-08-27.md`](evidence/phase5-public-api-gameplay-loop-2026-08-27.md).
 
 ## Subagents and independent review
 
@@ -845,10 +1054,11 @@ Benchmark reproduction happens at that feature boundary, not after every edit:
   topology-explicit 225-chunk release throughput/scaling gate. The measured
   optimization and host matrix are recorded in
   [`evidence/worldgen-throughput-scaling.md`](evidence/worldgen-throughput-scaling.md).
-- [ ] Complete the clean seed-`712816` owner traversal/disposition and
-  restart/rejoin gates. The exact-seed
+- [x] Complete the clean seed-`712816` traversal and restart/rejoin gates. The exact-seed
   [agent-run graphical preflight](evidence/worldgen-seed-712816-preflight.md)
-  is complete but does not replace owner judgment.
+  and the stronger automated real-client traversal + natural resource/crafting + clean restart/rejoin path passed and are recorded in
+  [`evidence/phase4-seed-712816-restart-rejoin-2026-08-21.md`](evidence/phase4-seed-712816-restart-rejoin-2026-08-21.md). The separate subjective owner terrain/playability disposition is **not claimed as PASS** for this release; the owner explicitly deferred it to `v0.0.3-alpha.1`, with review material preserved in
+  [`evidence/phase4-seed-712816-owner-disposition-package-2026-08-28.md`](evidence/phase4-seed-712816-owner-disposition-package-2026-08-28.md).
 
 ## Observed baseline
 
@@ -946,8 +1156,10 @@ Acceptance:
 - Seeds `0`, `712816`, `-1` and at least 29 generated regression seeds have
   different height, biome and feature fingerprints near their selected spawns.
 - No production branch checks fixed world coordinates to place starter resources.
-- [ ] Seed `712816` receives a clean fresh-world owner traversal/disposition and
-  restart/rejoin.
+- [x] Seed `712816` receives a clean fresh-world automated traversal and
+  restart/rejoin. The separate subjective owner terrain/playability disposition is
+  deferred to `v0.0.3-alpha.1` rather than promoted to PASS; its prepared material is in
+  [`evidence/phase4-seed-712816-owner-disposition-package-2026-08-28.md`](evidence/phase4-seed-712816-owner-disposition-package-2026-08-28.md).
 - [x] Seed `712816` has deterministic rendered height/biome/vegetation mosaics for
   a 2048x2048-block area.
 - Multi-seed metrics reject a single biome occupying an unreasonable share of the
@@ -1053,14 +1265,16 @@ Required runtime change:
 
 Acceptance:
 
-- [ ] In a fresh 20-minute survival session with defaults, friendly mobs become
+- [x] In a fresh 20-minute survival session with defaults, friendly mobs become
   observable near the player and hostiles become observable during night without
-  operator setup.
+  operator setup. Graphical seed-`712816` evidence (sheep + spider), full 24,000-tick
+  soak and clean restart/rejoin are recorded in
+  [`evidence/phase4-20-minute-survival-2026-08-26.md`](evidence/phase4-20-minute-survival-2026-08-26.md).
 - [x] Setting either interval to `0` disables only that category.
 - [x] Halving an interval doubles attempt cadence without bypassing caps.
 - [x] No spawn occurs inside the minimum player radius, in invalid blocks or outside
   loaded simulation chunks.
-- [ ] Restart does not duplicate deterministic identities or lose retained entities.
+- [x] Restart does not duplicate deterministic identities or lose retained entities. Production checkpoint/replay and `entities.dat` codec evidence are recorded in [`evidence/natural-spawn-restart-persistence.md`](evidence/natural-spawn-restart-persistence.md); this does not replace the separate 20-minute graphical natural-spawn gate above.
 
 ### P1 — Plugin deployment requirements are operator-visible (complete)
 

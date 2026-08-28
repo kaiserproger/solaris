@@ -180,11 +180,13 @@
         "Run the playable gate wrapper with the default Gradle runClient adapter.",
         "Stay connected for a 20-minute survival session on playable.toml.",
         "Walk, jump, collide, break/place common blocks, pick up drops, craft the wood-to-tool loop, and rejoin after a clean restart.",
-        "Capture screenshots for the join, crafting/tool state, and post-restart state."
+        "Without operators, debug commands, spawn fixtures, or spawn-interval overrides, observe at least one naturally present passive mob and at least one naturally present hostile mob during the full day/night window.",
+        "Capture screenshots for the join, crafting/tool state, natural-spawn evidence, and post-restart state."
       ],
       "expected_observations": [
         "No server crash, client disconnect, catastrophic tick stalls, or unrecovered movement desync during the 20-minute window.",
         "Break/place/drop/pickup/crafting-table actions are visible through the real client.",
+        "The report records natural spawn acceptance with both passive_observed=true and hostile_observed=true under playable.toml defaults.",
         "Save/restart/rejoin preserves the edited world and player inventory.",
         "observations.json result is passed only for agent-run-real-client evidence."
       ]
@@ -1463,6 +1465,59 @@
         "The after phase is accepted only with matching before-phase and runner restart evidence.",
         "Secondary receives exactly the item stored by primary before restart through the normal container path.",
         "Primary observes the persisted shared slot empty after the secondary withdrawal, and both clients remain in Play."
+      ]
+    },
+    {
+      "id": "playable-46-generated-ruin-cache",
+      "status": "manual-pending",
+      "bounded_time_minutes": 15,
+      "screenshots_required": true,
+      "no_debug_commands": true,
+      "steps": [
+        "Launch one repo-native Gradle client against a fresh seed-0 playable world.",
+        "Walk to the deterministic generated ruin, discover and open its generated chest, and move the generated loot into player inventory.",
+        "Disconnect, stop Solaris gracefully, restart on the same world directory, and reconnect the same client.",
+        "Return to the same chest, verify it is still present and empty, verify the moved loot remains in inventory, and capture screenshots before and after restart."
+      ],
+      "expected_observations": [
+        "No debug give, teleport, structure placement, container mutation, or save command prepares the state.",
+        "The before phase proves the generated chest is reachable and interactive through normal client paths.",
+        "Runner evidence records a successful before phase, clean stop, restarted server readiness, reconnect, and successful after phase.",
+        "The after phase proves the generated chest and transferred loot preserve the recorded restart invariant."
+      ]
+    },
+    {
+      "id": "playable-46-generated-ruin-cache-before",
+      "status": "manual-pending",
+      "bounded_time_minutes": 9,
+      "screenshots_required": true,
+      "no_debug_commands": true,
+      "steps": [
+        "Connect to a fresh seed-0 playable world and approach the generated ruin center.",
+        "Discover the chest from loaded client block state, open it normally, and move every expected generated loot stack into inventory.",
+        "Close the chest, capture a screenshot, record the chest target and moved-loot invariant, and disconnect before the runner stops Solaris."
+      ],
+      "expected_observations": [
+        "The generated ruin center and generated chest are reached without teleport or structure fixtures.",
+        "The chest opens through the normal interaction path and expected loot moves from chest slots into player inventory.",
+        "The phase passes only after the client closes the chest and records restart state."
+      ]
+    },
+    {
+      "id": "playable-46-generated-ruin-cache-after",
+      "status": "manual-pending",
+      "bounded_time_minutes": 6,
+      "screenshots_required": true,
+      "no_debug_commands": true,
+      "steps": [
+        "After the runner starts Solaris on the same world directory, reconnect the same client.",
+        "Return to the persisted chest target, require the generated chest block to still exist, and reopen it normally.",
+        "Verify moved loot still has the recorded inventory counts and every generated chest slot is empty, then close the screen and capture a screenshot."
+      ],
+      "expected_observations": [
+        "The after phase is accepted only with matching before-phase, clean restart, readiness, and reconnect evidence.",
+        "The generated chest survives restart at the recorded target and reopens through normal client interaction.",
+        "Transferred loot survives in inventory and is not duplicated back into the generated chest."
       ]
     },
     {

@@ -2,7 +2,7 @@ function on_player_command(event)
     if event.root ~= "loader_sapphire" then
         return
     end
-    solaris.grant_loader_block_item(event.player_id, "sapphire-live:sapphire_block", 1)
+    solaris.grant_loader_block_item("grant-sapphire", event.player_id, "sapphire-live:sapphire_block", 1)
     solaris.open_client_screen(event.player_id, "sapphire-live:showcase")
 end
 

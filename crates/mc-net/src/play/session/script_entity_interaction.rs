@@ -1,7 +1,7 @@
 use std::time::Instant;
 
+use mc_domain::GameMode;
 use mc_entity::{EntityId, EntityLifecycle, Vec3};
-use mc_protocol::packets::play::GameMode;
 
 use super::interaction_geometry::{entity_geometry, within_entity_reach};
 use super::{SessionId, SessionRegistry, server_entity_snapshot_from};

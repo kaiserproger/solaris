@@ -16,7 +16,7 @@ use super::super::{SessionRegistry, SessionRegistryInner};
 use super::VisibilityDispatch;
 
 impl SessionRegistry {
-    pub(super) fn commit_unique_herd_candidates(
+    pub(in crate::play::session) fn commit_unique_herd_candidates(
         &self,
         candidates: Vec<SpawnEntity>,
     ) -> Result<Vec<EntitySnapshot>, ()> {
@@ -46,7 +46,7 @@ impl SessionRegistry {
 pub(in crate::play::session) fn install_committed_herd_spawns_locked(
     inner: &mut SessionRegistryInner,
     committed: Vec<EntitySnapshot>,
-    _lifecycle_tick: u64,
+    lifecycle_tick: u64,
 ) -> Vec<VisibilityDispatch> {
     let mut snapshots = Vec::with_capacity(committed.len());
     for entity in committed {
@@ -62,6 +62,9 @@ pub(in crate::play::session) fn install_committed_herd_spawns_locked(
         } else {
             inner.natural_ground_mobs.insert(entity.id);
         }
+        inner
+            .natural_mob_no_action_since_tick
+            .insert(entity.id, lifecycle_tick);
         let aabb = entity_aabb(&entity.type_name);
         let snapshot = server_entity_snapshot_from(entity);
         inner

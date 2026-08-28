@@ -31,7 +31,16 @@ fn entity_physics_query_matches(current: EntityMotionState, expected: &EntityPhy
                 && current.arrow_revision == revision
                 && current.arrow_embedded_block == embedded_block
         }
+        EntityPhysicsKind::HurtingProjectile { revision, .. }
+        | EntityPhysicsKind::ShulkerBullet { revision } => {
+            current.is_hurting_projectile && current.hurting_projectile_revision == revision
+        }
+        EntityPhysicsKind::ThrowableProjectile { revision, .. } => {
+            current.is_throwable_projectile && current.throwable_projectile_revision == revision
+        }
         EntityPhysicsKind::Default
+        | EntityPhysicsKind::Immobile
+        | EntityPhysicsKind::ExternalFlight
         | EntityPhysicsKind::Living
         | EntityPhysicsKind::PowderSnowWalkableLiving
         | EntityPhysicsKind::FallingBlock
@@ -41,6 +50,7 @@ fn entity_physics_query_matches(current: EntityMotionState, expected: &EntityPhy
         && current.velocity == expected.velocity
         && current.on_ground == expected.on_ground
         && current.fall_distance == expected.fall_distance
+        && current.goal_fence == expected.goal_fence
         && arrow_state_matches
 }
 
@@ -57,6 +67,17 @@ pub(super) struct MovementFanoutWork {
     pub(super) index_builds: usize,
     pub(super) index_edge_visits: usize,
     pub(super) exhaustive_membership_checks: usize,
+}
+
+#[cfg(test)]
+fn test_entity_projectile_physics_facts(
+    steps: &[EntityPhysicsStep],
+) -> EntityProjectilePhysicsFacts {
+    EntityProjectilePhysicsFacts {
+        arrows: test_arrow_physics_facts(steps),
+        hurting: Vec::new(),
+        throwable: Vec::new(),
+    }
 }
 
 #[cfg(test)]
@@ -112,6 +133,91 @@ fn record_movement_exhaustive_membership_check() {
 
 const VILLAGER_BRAIN_TICK_INTERVAL: u64 = 20;
 const VILLAGER_BRAIN_COMMIT_BATCH: usize = 64;
+const SHULKER_BULLET_TARGET_SPEED: f64 = 0.15;
+const SHULKER_BULLET_STEERING: f64 = 0.2;
+
+fn shulker_bullet_homing_velocity(current: Vec3, position: Vec3, target: Vec3) -> Option<Vec3> {
+    let delta = Vec3::new(
+        target.x - position.x,
+        target.y - position.y,
+        target.z - position.z,
+    );
+    let length_sq = delta.x * delta.x + delta.y * delta.y + delta.z * delta.z;
+    if !length_sq.is_finite() || length_sq <= 1.0e-14 {
+        return None;
+    }
+    let scale = SHULKER_BULLET_TARGET_SPEED / length_sq.sqrt();
+    let desired = Vec3::new(delta.x * scale, delta.y * scale, delta.z * scale);
+    Some(Vec3::new(
+        current.x + (desired.x - current.x) * SHULKER_BULLET_STEERING,
+        current.y + (desired.y - current.y) * SHULKER_BULLET_STEERING,
+        current.z + (desired.z - current.z) * SHULKER_BULLET_STEERING,
+    ))
+}
+
+fn retarget_active_shulker_bullets(
+    entities: &mut super::entity_owner::EntityOwnerAccess,
+    bullet_ids: &HashSet<EntityId>,
+    targets: &HashMap<i32, Vec3>,
+    kinematics: &mut [EntityKinematics],
+) -> Vec<(EntityId, u64)> {
+    if bullet_ids.is_empty() || targets.is_empty() {
+        return Vec::new();
+    }
+    let projections = entities.simulation_projections_for_ids(bullet_ids);
+    let mut revisions = Vec::with_capacity(projections.len());
+    for projection in projections {
+        let Some(target_entity_id) = projection.shulker_bullet_target_entity_id else {
+            continue;
+        };
+        let Some(target) = targets.get(&target_entity_id).copied() else {
+            continue;
+        };
+        let Some(expected) = entities.snapshot(projection.id) else {
+            continue;
+        };
+        if expected.retained.shulker_bullet
+            != Some(mc_entity::EntityShulkerBulletState::new(target_entity_id))
+        {
+            continue;
+        }
+        let Some(state) = expected.retained.hurting_projectile_state else {
+            continue;
+        };
+        let Some(velocity) =
+            shulker_bullet_homing_velocity(expected.velocity, expected.position, target)
+        else {
+            continue;
+        };
+        let projectile_velocity =
+            mc_entity::projectile_26_1_2::Vec3::new(velocity.x, velocity.y, velocity.z);
+        let Ok(next_state) = state.retarget_velocity(projectile_velocity) else {
+            continue;
+        };
+        let rotation = mc_entity::Rotation {
+            yaw: next_state.projectile.rotation.yaw,
+            pitch: next_state.projectile.rotation.pitch,
+            head_yaw: next_state.projectile.rotation.yaw,
+        };
+        let mut next = expected.clone();
+        next.velocity = velocity;
+        next.rotation = rotation;
+        next.retained.hurting_projectile_state = Some(next_state);
+        if !entities.replace_snapshot_if_current(expected, next) {
+            continue;
+        }
+        if let Some(kinematics) = kinematics
+            .iter_mut()
+            .find(|state| state.id == projection.id)
+        {
+            kinematics.velocity = velocity;
+            kinematics.rotation = rotation;
+        }
+        revisions.push((projection.id, next_state.projectile.revision));
+    }
+    revisions
+}
+
 const VILLAGER_RESTOCK_REACH_SQUARED: f64 = 4.0;
 const VILLAGER_GOSSIP_REACH_SQUARED: f64 = 5.0;
 const VILLAGER_GOSSIP_COOLDOWN_TICKS: u64 = 1_200;
@@ -858,6 +964,7 @@ impl SessionRegistry {
         let recipients = self.movement_recipients.load_full();
         let mut player_positions = Vec::new();
         let mut hostile_target_positions = Vec::new();
+        let mut combat_targets_by_entity_id = HashMap::new();
         for publication in recipients.values() {
             let target = *publication.combat_target();
             let position = Vec3::new(target.pose().x, target.pose().y, target.pose().z);
@@ -866,6 +973,10 @@ impl SessionRegistry {
             }
             if target.is_targetable() {
                 hostile_target_positions.push(position);
+                combat_targets_by_entity_id.insert(
+                    publication.entity_id(),
+                    Vec3::new(position.x, position.y + 0.9, position.z),
+                );
             }
         }
         let terrain_pathing_entities = self.simulation_inputs.terrain_pathing_entities();
@@ -930,6 +1041,8 @@ impl SessionRegistry {
             return Vec::new();
         }
         let mut active_entity_ids = HashSet::new();
+        let mut active_shulker_bullet_ids = HashSet::new();
+        let mut active_exclusive_flight_ids = HashSet::new();
         let mut active_hostile_ids = HashSet::new();
         let mut active_villager_ids = HashSet::new();
         let mut active_villager_population_ids = HashSet::new();
@@ -955,6 +1068,12 @@ impl SessionRegistry {
                     if active_chunks.contains(&chunk) {
                         let type_name = entity.type_name.as_str();
                         active_entity_ids.insert(entity.id);
+                        if type_name == "minecraft:shulker_bullet" {
+                            active_shulker_bullet_ids.insert(entity.id);
+                        }
+                        if type_name == "minecraft:ender_dragon" {
+                            active_exclusive_flight_ids.insert(entity.id);
+                        }
                         if is_hostile_entity(type_name) {
                             active_hostile_ids.insert(entity.id);
                         }
@@ -974,6 +1093,30 @@ impl SessionRegistry {
                                         revision: entity.arrow_revision,
                                         embedded_block: entity.arrow_embedded_block,
                                     }
+                                } else if type_name == "minecraft:ender_dragon" {
+                                    EntityPhysicsKind::ExternalFlight
+                                } else if matches!(
+                                    type_name,
+                                    "minecraft:evoker_fangs" | "minecraft:area_effect_cloud"
+                                ) {
+                                    EntityPhysicsKind::Immobile
+                                } else if type_name == "minecraft:shulker_bullet" {
+                                    EntityPhysicsKind::ShulkerBullet {
+                                        revision: entity.hurting_projectile_revision,
+                                    }
+                                } else if let Some(acceleration_power_bits) =
+                                    entity.hurting_projectile_acceleration_power_bits
+                                {
+                                    EntityPhysicsKind::HurtingProjectile {
+                                        revision: entity.hurting_projectile_revision,
+                                        acceleration_power_bits,
+                                    }
+                                } else if let Some(revision) = entity.throwable_projectile_revision
+                                {
+                                    EntityPhysicsKind::ThrowableProjectile {
+                                        revision: Some(revision),
+                                        gravity_bits: 0.05_f64.to_bits(),
+                                    }
                                 } else if entity_type_uses_aquatic_physics(type_name) {
                                     EntityPhysicsKind::AquaticLiving
                                 } else if type_name == "minecraft:falling_block" {
@@ -992,6 +1135,7 @@ impl SessionRegistry {
                                     EntityPhysicsKind::Default
                                 },
                                 entity.fall_distance,
+                                mc_entity::EntityGoalFence::from_goal(&entity.goal),
                             ),
                         );
                     }
@@ -1079,6 +1223,7 @@ impl SessionRegistry {
         let eligible_goal_entity_ids = active_entity_ids
             .difference(&sheep_grazing_entities)
             .copied()
+            .filter(|entity_id| !active_exclusive_flight_ids.contains(entity_id))
             .collect::<HashSet<_>>();
         let goal_entity_ids =
             entity_goal_ids_due_for_tick(&eligible_goal_entity_ids, tick, simulation_overloaded);
@@ -1088,6 +1233,13 @@ impl SessionRegistry {
             .collect::<HashSet<_>>();
         let prepared_goal_tick =
             entities.prepare_goal_tick_with_pathing_for_ids(tick, &goal_entity_ids);
+        for entity_id in &goal_entity_ids {
+            if let Some(goal_fence) = prepared_goal_tick.goal_fence(*entity_id)
+                && let Some(state) = active_entity_kinds.get_mut(entity_id)
+            {
+                state.2 = goal_fence;
+            }
+        }
         #[cfg(feature = "load-bench")]
         let prepare_us = u64::try_from(prepare_started.elapsed().as_micros()).unwrap_or(u64::MAX);
         drop(entities);
@@ -1178,6 +1330,18 @@ impl SessionRegistry {
         let mut kinematics = applied
             .map(|(_, kinematics)| kinematics)
             .unwrap_or_default();
+        for (entity_id, revision) in retarget_active_shulker_bullets(
+            &mut entities,
+            &active_shulker_bullet_ids,
+            &combat_targets_by_entity_id,
+            &mut kinematics,
+        ) {
+            if let Some((kind, _, _)) = active_entity_kinds.get_mut(&entity_id) {
+                *kind = EntityPhysicsKind::ShulkerBullet {
+                    revision: Some(revision),
+                };
+            }
+        }
         let current_projections = if current_ids.is_empty() {
             HashMap::new()
         } else {
@@ -1188,9 +1352,10 @@ impl SessionRegistry {
                 .collect::<HashMap<_, _>>()
         };
         for id in current_ids {
-            let Some(entity) = current_projections.get(id) else {
+            let Some(projected) = current_projections.get(id) else {
                 continue;
             };
+            let entity = projected;
             if entity.lifecycle != EntityLifecycle::Alive {
                 continue;
             }
@@ -1210,6 +1375,29 @@ impl SessionRegistry {
                             revision: entity.arrow_revision,
                             embedded_block: entity.arrow_embedded_block,
                         }
+                    } else if type_name == "minecraft:ender_dragon" {
+                        EntityPhysicsKind::ExternalFlight
+                    } else if matches!(
+                        type_name,
+                        "minecraft:evoker_fangs" | "minecraft:area_effect_cloud"
+                    ) {
+                        EntityPhysicsKind::Immobile
+                    } else if type_name == "minecraft:shulker_bullet" {
+                        EntityPhysicsKind::ShulkerBullet {
+                            revision: entity.hurting_projectile_revision,
+                        }
+                    } else if let Some(acceleration_power_bits) =
+                        entity.hurting_projectile_acceleration_power_bits
+                    {
+                        EntityPhysicsKind::HurtingProjectile {
+                            revision: entity.hurting_projectile_revision,
+                            acceleration_power_bits,
+                        }
+                    } else if let Some(revision) = entity.throwable_projectile_revision {
+                        EntityPhysicsKind::ThrowableProjectile {
+                            revision: Some(revision),
+                            gravity_bits: 0.05_f64.to_bits(),
+                        }
                     } else if entity_type_uses_aquatic_physics(type_name) {
                         EntityPhysicsKind::AquaticLiving
                     } else if type_name == "minecraft:falling_block" {
@@ -1228,6 +1416,7 @@ impl SessionRegistry {
                         EntityPhysicsKind::Default
                     },
                     entity.fall_distance,
+                    mc_entity::EntityGoalFence::from_goal(&entity.goal),
                 ),
             );
             kinematics.push(EntityKinematics {
@@ -1249,6 +1438,7 @@ impl SessionRegistry {
                 aabb: active_entity_aabbs[&state.id],
                 on_ground: state.on_ground,
                 fall_distance: active_entity_kinds[&state.id].1,
+                goal_fence: active_entity_kinds[&state.id].2,
                 kind: active_entity_kinds[&state.id].0,
             })
             .collect();
@@ -1334,13 +1524,23 @@ impl SessionRegistry {
             let type_id = entity.type_id;
             let entity_id = entity.id;
             let position = entity.position;
-            if is_hostile_entity(&entity.type_name) {
+            let natural_mob = if is_hostile_entity(&entity.type_name) {
                 inner.hostile_entities.insert(entity_id);
                 inner.natural_hostile_mobs.insert(entity_id);
+                true
             } else if entity_type_uses_aquatic_physics(&entity.type_name) {
                 inner.natural_aquatic_mobs.insert(entity_id);
+                true
             } else if entity.animal.is_some() {
                 inner.natural_ground_mobs.insert(entity_id);
+                true
+            } else {
+                false
+            };
+            if natural_mob {
+                inner
+                    .natural_mob_no_action_since_tick
+                    .insert(entity_id, lifecycle_clock);
             }
             if entity.type_name == "minecraft:sheep" {
                 inner.sheep_entities.insert(entity_id);
@@ -1405,13 +1605,13 @@ impl SessionRegistry {
         tick: u64,
         steps: &[EntityPhysicsStep],
     ) {
-        let arrow_physics_facts = test_arrow_physics_facts(steps);
+        let projectile_physics_facts = test_entity_projectile_physics_facts(steps);
         let _ = self.apply_entity_physics_and_dispatch_core(
             None,
             tick,
             None,
             steps,
-            &arrow_physics_facts,
+            &projectile_physics_facts,
         );
     }
 
@@ -1422,26 +1622,26 @@ impl SessionRegistry {
         tick: u64,
         expected: &[EntityPhysicsQuery],
         steps: &[EntityPhysicsStep],
-        arrow_physics_facts: &[ArrowPhysicsFact],
+        projectile_physics_facts: &EntityProjectilePhysicsFacts,
     ) -> Vec<EntityPhysicsStep> {
         self.apply_entity_physics_and_dispatch_core(
             Some(cpu_resources),
             tick,
             Some(expected),
             steps,
-            arrow_physics_facts,
+            projectile_physics_facts,
         )
     }
 
     #[cfg(test)]
     pub(crate) fn apply_entity_physics_and_dispatch(&self, tick: u64, steps: &[EntityPhysicsStep]) {
-        let arrow_physics_facts = test_arrow_physics_facts(steps);
+        let projectile_physics_facts = test_entity_projectile_physics_facts(steps);
         let _ = self.apply_entity_physics_and_dispatch_core(
             None,
             tick,
             None,
             steps,
-            &arrow_physics_facts,
+            &projectile_physics_facts,
         );
     }
 
@@ -1452,12 +1652,59 @@ impl SessionRegistry {
         steps: &[EntityPhysicsStep],
         arrow_physics_facts: &[ArrowPhysicsFact],
     ) {
+        let projectile_physics_facts = EntityProjectilePhysicsFacts {
+            arrows: arrow_physics_facts.to_vec(),
+            hurting: Vec::new(),
+            throwable: Vec::new(),
+        };
         let _ = self.apply_entity_physics_and_dispatch_core(
             None,
             tick,
             None,
             steps,
-            arrow_physics_facts,
+            &projectile_physics_facts,
+        );
+    }
+
+    #[cfg(test)]
+    pub(crate) fn apply_entity_physics_with_hurting_facts_and_dispatch(
+        &self,
+        tick: u64,
+        steps: &[EntityPhysicsStep],
+        hurting_physics_facts: &[HurtingProjectilePhysicsFact],
+    ) {
+        let projectile_physics_facts = EntityProjectilePhysicsFacts {
+            arrows: Vec::new(),
+            hurting: hurting_physics_facts.to_vec(),
+            throwable: Vec::new(),
+        };
+        let _ = self.apply_entity_physics_and_dispatch_core(
+            None,
+            tick,
+            None,
+            steps,
+            &projectile_physics_facts,
+        );
+    }
+
+    #[cfg(test)]
+    pub(crate) fn apply_entity_physics_with_throwable_facts_and_dispatch(
+        &self,
+        tick: u64,
+        steps: &[EntityPhysicsStep],
+        throwable_physics_facts: &[HurtingProjectilePhysicsFact],
+    ) {
+        let projectile_physics_facts = EntityProjectilePhysicsFacts {
+            arrows: Vec::new(),
+            hurting: Vec::new(),
+            throwable: throwable_physics_facts.to_vec(),
+        };
+        let _ = self.apply_entity_physics_and_dispatch_core(
+            None,
+            tick,
+            None,
+            steps,
+            &projectile_physics_facts,
         );
     }
 
@@ -1468,13 +1715,13 @@ impl SessionRegistry {
         expected: &[EntityPhysicsQuery],
         steps: &[EntityPhysicsStep],
     ) {
-        let arrow_physics_facts = test_arrow_physics_facts(steps);
+        let projectile_physics_facts = test_entity_projectile_physics_facts(steps);
         let _ = self.apply_entity_physics_and_dispatch_core(
             None,
             tick,
             Some(expected),
             steps,
-            &arrow_physics_facts,
+            &projectile_physics_facts,
         );
     }
 
@@ -1484,7 +1731,7 @@ impl SessionRegistry {
         tick: u64,
         expected: Option<&[EntityPhysicsQuery]>,
         steps: &[EntityPhysicsStep],
-        arrow_physics_facts: &[ArrowPhysicsFact],
+        projectile_physics_facts: &EntityProjectilePhysicsFacts,
     ) -> Vec<EntityPhysicsStep> {
         let mut scheduled_tracker_ids = steps.iter().map(|step| step.id).collect::<Vec<_>>();
         scheduled_tracker_ids.sort_unstable();
@@ -1554,7 +1801,11 @@ impl SessionRegistry {
             .filter_map(|step| {
                 old_motion
                     .get(&step.id)
-                    .filter(|motion| !motion.is_arrow)
+                    .filter(|motion| {
+                        !motion.is_arrow
+                            && !motion.is_hurting_projectile
+                            && !motion.is_throwable_projectile
+                    })
                     .map(|motion| EntityKinematics {
                         id: step.id,
                         position: step.position,
@@ -1629,9 +1880,33 @@ impl SessionRegistry {
             inner,
             steps,
             &old_motion,
-            arrow_physics_facts,
+            &projectile_physics_facts.arrows,
             &mut dispatches,
         );
+        let dragon_cloud_entity_type_id = self
+            .hostile_area_effect_cloud_entity_type_id
+            .load(Ordering::Acquire);
+        let dragon_cloud_entity_type_id =
+            (dragon_cloud_entity_type_id >= 0).then_some(dragon_cloud_entity_type_id);
+        let (resolved_inner, hurting_steps) = resolve_hurting_projectile_hits_locked(
+            inner,
+            steps,
+            &old_motion,
+            &projectile_physics_facts.hurting,
+            dragon_cloud_entity_type_id,
+            &mut dispatches,
+        );
+        inner = resolved_inner;
+        applied_steps.extend(hurting_steps);
+        let (resolved_inner, throwable_steps) = resolve_throwable_projectile_hits_locked(
+            inner,
+            steps,
+            &old_motion,
+            &projectile_physics_facts.throwable,
+            &mut dispatches,
+        );
+        inner = resolved_inner;
+        applied_steps.extend(throwable_steps);
         let mut rejected_arrows = std::mem::take(&mut inner.arrow_tick_scratch.rejected);
         let mut processed_arrows = std::mem::take(&mut inner.arrow_tick_scratch.processed);
         applied_steps.extend(steps.iter().copied().filter(|step| {

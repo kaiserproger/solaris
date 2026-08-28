@@ -303,7 +303,7 @@ fn accepted_lethal_damage_stages_wake_and_defers_death_publication() {
     ));
     let state = persisted.lock().unwrap().clone();
     let mut dead = state.survival;
-    dead.apply_damage(SurvivalState::MAX_HEALTH);
+    dead.apply_damage(mc_entity::player_survival_26_1_2::MAX_HEALTH);
 
     let outcome = registry.commit_player_survival(
         &SimulationAuthority::for_test(),

@@ -9,7 +9,7 @@ mod commit;
 mod legacy;
 mod periodic;
 
-#[cfg(test)]
+#[cfg(any(test, feature = "load-bench"))]
 pub(in crate::play::session) use commit::install_committed_herd_spawns_locked;
 #[cfg(test)]
 pub(in crate::play::session) use legacy::{

@@ -39,6 +39,10 @@ neoForge {
             gameDirectory.set(file(clientMcpGameDir.get()))
             environment("SOLARIS_CLIENT_MCP_TOKEN", clientMcpToken.get())
             environment("SOLARIS_CLIENT_MCP_PORT", clientMcpPort.get())
+            systemProperty(
+                "solaris.loader.cacheDir",
+                file(clientMcpGameDir.get()).resolve("solaris-loader-cache").absolutePath
+            )
             programArgument("--username")
             programArgument(clientMcpUsername.get())
         }

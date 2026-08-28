@@ -81,6 +81,25 @@ final class AgentHttpBridgeTest {
     }
 
     @Test
+    void convertsCommandErrorsIntoStructuredDiagnosticsInsteadOfDroppingConnection() throws Exception {
+        CommandRegistry registry = new CommandRegistry();
+        registry.register("explode", request -> {
+            throw new AssertionError("long scenario invariant failed");
+        });
+
+        try (AgentHttpBridge bridge = AgentHttpBridge.start("run-secret", 0, registry)) {
+            HttpResponse<String> response = post(bridge.port(), """
+                {"id":31,"secret":"run-secret","command":"explode","payload":{}}
+                """);
+
+            assertEquals(500, response.statusCode());
+            assertTrue(response.body().contains("\"ok\":false"));
+            assertTrue(response.body().contains("\"code\":\"command-error\""));
+            assertTrue(response.body().contains("java.lang.AssertionError: long scenario invariant failed"));
+        }
+    }
+
+    @Test
     void servesObservationWhileLongCommandIsRunning() throws Exception {
         CountDownLatch longCommandStarted = new CountDownLatch(1);
         CountDownLatch releaseLongCommand = new CountDownLatch(1);

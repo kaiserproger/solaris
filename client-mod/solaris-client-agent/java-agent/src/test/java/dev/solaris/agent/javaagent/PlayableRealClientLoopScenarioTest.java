@@ -109,10 +109,12 @@ final class PlayableRealClientLoopScenarioTest {
     @Test
     void fullLoopCraftsToolSoaksAndWritesRestartMarkerWithoutDebugSetup() throws Exception {
         FakeScenarioClient client = new FakeScenarioClient();
+        client.visiblePassiveDuringSoak = true;
+        client.visibleHostileDuringSoak = true;
         Path screenshotsDir = Path.of("build/tmp/playable-04-test/screenshots");
         Files.deleteIfExists(screenshotsDir.getParent().resolve("playable-03-save-restart-marker.properties"));
 
-        ClientScenarioReport report = new PlayableRealClientLoopScenario(Duration.ofMillis(1)).run(
+        ClientScenarioReport report = new PlayableRealClientLoopScenario(Duration.ofMillis(1_050)).run(
             "playable-04-twenty-minute-survival-loop",
             screenshotsDir,
             client
@@ -133,6 +135,10 @@ final class PlayableRealClientLoopScenarioTest {
             "full playable loop must record the survival soak evidence"
         );
         assertTrue(
+            report.observations().stream().anyMatch(entry -> entry.contains("natural spawn acceptance: passed")),
+            "the full playable loop must fail closed unless passive and hostile natural spawn evidence was observed"
+        );
+        assertTrue(
             report.observations().stream().anyMatch(entry -> entry.contains("survival resource work: passed")),
             "the long playable loop must perform useful work instead of standing AFK"
         );
@@ -142,9 +148,32 @@ final class PlayableRealClientLoopScenarioTest {
         );
     }
 
+
+    @Test
+    void fullLoopFailsClosedWhenNaturalSpawnEvidenceNeverAppears() throws Exception {
+        FakeScenarioClient client = new FakeScenarioClient();
+
+        ClientScenarioReport report = new PlayableRealClientLoopScenario(Duration.ofMillis(1)).run(
+            "playable-04-twenty-minute-survival-loop",
+            Path.of("build/tmp/playable-04-natural-spawn-missing-test/screenshots"),
+            client
+        );
+
+        assertEquals("failed", report.result(), () -> String.join("\n", report.observations()));
+        assertTrue(
+            report.observations().stream().anyMatch(entry ->
+                entry.contains("natural spawn acceptance: failed")
+                    && entry.contains("passive_observed=false")
+                    && entry.contains("hostile_observed=false")
+            ),
+            () -> String.join("\n", report.observations())
+        );
+    }
+
     @Test
     void fullLoopDefendsAgainstVisibleHostileDuringSurvivalSoak() throws Exception {
         FakeScenarioClient client = new FakeScenarioClient();
+        client.visiblePassiveDuringSoak = true;
         client.visibleHostileDuringSoak = true;
 
         ClientScenarioReport report = new PlayableRealClientLoopScenario(Duration.ofMillis(1)).run(
@@ -161,8 +190,40 @@ final class PlayableRealClientLoopScenarioTest {
     }
 
     @Test
+    void fullLoopContinuesAfterLocalLogsAreExhaustedOnceUsefulWorkWasProven() throws Exception {
+        FakeScenarioClient client = new FakeScenarioClient();
+        client.visiblePassiveDuringSoak = true;
+        client.visibleHostileDuringSoak = true;
+        client.logsUnavailableDuringSoakAfterTick = 60L;
+
+        ClientScenarioReport report = new PlayableRealClientLoopScenario(Duration.ofSeconds(40)).run(
+            "playable-04-twenty-minute-survival-loop",
+            Path.of("build/tmp/playable-04-resource-exhaustion-test/screenshots"),
+            client
+        );
+
+        assertEquals("passed", report.result(), () -> String.join("\n", report.observations()));
+        assertTrue(
+            report.observations().stream().anyMatch(entry ->
+                entry.contains("survival resource work: exhausted")
+                    && entry.contains("continuing_soak=true")
+            ),
+            () -> String.join("\n", report.observations())
+        );
+        assertTrue(
+            report.observations().stream().anyMatch(entry -> entry.contains("natural spawn acceptance: passed")),
+            "resource exhaustion must not bypass the passive+hostile natural-spawn gate"
+        );
+        assertFalse(
+            client.operations.stream().anyMatch(operation -> operation.contains("far-natural-log")),
+            "periodic survival work must remain nearby-only after initial natural progression"
+        );
+    }
+
+    @Test
     void fullLoopDefendsAgainstVisibleSpiderDuringSurvivalSoak() throws Exception {
         FakeScenarioClient client = new FakeScenarioClient();
+        client.visiblePassiveDuringSoak = true;
         client.visibleHostileDuringSoak = true;
         client.visibleHostileTypeDuringSoak = "minecraft:spider";
 
@@ -180,8 +241,9 @@ final class PlayableRealClientLoopScenarioTest {
     }
 
     @Test
-    void fullLoopEngagesVisibleHostileBeforeItReachesAttackRangeAtNight() throws Exception {
+    void fullLoopObservesDistantHostileAtNightWithoutChargingAcrossTheWorld() throws Exception {
         FakeScenarioClient client = new FakeScenarioClient();
+        client.visiblePassiveDuringSoak = true;
         client.clientTicks = 12_522L;
         client.visibleHostileOutsideReachDuringSoak = true;
 
@@ -196,15 +258,22 @@ final class PlayableRealClientLoopScenarioTest {
             client.operations.contains("visibleEntity:minecraft:zombie|minecraft:skeleton|minecraft:spider:outside-survival-reach"),
             "the long survival gate must scan beyond melee reach once night begins"
         );
-        assertTrue(
+        assertFalse(
             client.operations.stream().anyMatch(operation -> operation.startsWith("attackEntityUntilRemoved:")),
-            "the long survival gate must engage the distant hostile before waiting for damage"
+            "the long survival gate must observe distant natural hostiles without suicidal long-range pursuit"
+        );
+        assertTrue(
+            report.observations().stream().anyMatch(entry ->
+                entry.contains("outside_reach=true") && entry.contains("engagement=deferred")
+            ),
+            () -> String.join("\n", report.observations())
         );
     }
 
     @Test
     void fullLoopDoesNotChaseDistantHostileWhileBadlyInjured() throws Exception {
         FakeScenarioClient client = new FakeScenarioClient();
+        client.visiblePassiveDuringSoak = true;
         client.clientTicks = 12_522L;
         client.healthAfterHostileCombat = 6.0F;
         client.visibleHostileOutsideReachDuringSoak = true;
@@ -223,6 +292,56 @@ final class PlayableRealClientLoopScenarioTest {
     }
 
     @Test
+    void fullLoopDefersHostileAlreadyWithinReachWhenBadlyInjured() throws Exception {
+        FakeScenarioClient client = new FakeScenarioClient();
+        client.visiblePassiveDuringSoak = true;
+        client.visibleHostileDuringSoak = true;
+        client.healthAfterHostileCombat = 6.0F;
+
+        ClientScenarioReport report = new PlayableRealClientLoopScenario(Duration.ofMillis(1)).run(
+            "playable-04-twenty-minute-survival-loop",
+            Path.of("build/tmp/playable-04-injured-within-reach-test/screenshots"),
+            client
+        );
+
+        assertEquals("passed", report.result(), () -> String.join("\n", report.observations()));
+        assertFalse(
+            client.operations.stream().anyMatch(operation -> operation.startsWith("attackEntityUntilRemoved:")),
+            "a badly injured survival player must not start a fresh melee exchange"
+        );
+        assertTrue(
+            report.observations().stream().anyMatch(entry ->
+                entry.contains("within_reach=true") && entry.contains("engagement=deferred_low_health")
+            ),
+            () -> String.join("\n", report.observations())
+        );
+    }
+
+    @Test
+    void fullLoopEngagesHostileAtInclusiveFifteenHealthBoundary() throws Exception {
+        FakeScenarioClient client = new FakeScenarioClient();
+        client.visiblePassiveDuringSoak = true;
+        client.visibleHostileDuringSoak = true;
+        client.healthAfterHostileCombat = 15.0F;
+
+        ClientScenarioReport report = new PlayableRealClientLoopScenario(Duration.ofMillis(1)).run(
+            "playable-04-twenty-minute-survival-loop",
+            Path.of("build/tmp/playable-04-fifteen-health-boundary-test/screenshots"),
+            client
+        );
+
+        assertEquals("passed", report.result(), () -> String.join("\n", report.observations()));
+        assertTrue(
+            client.operations.stream().anyMatch(operation -> operation.startsWith("attackEntityUntilRemoved:")),
+            "exactly 15 health must remain inside the active-defense boundary"
+        );
+        assertFalse(
+            report.observations().stream().anyMatch(entry -> entry.contains("engagement=deferred_low_health")),
+            () -> String.join("\n", report.observations())
+        );
+    }
+
+    @Test
     void survivalSoakTreatsVanillaNightAsUnsafeForLongResourceWork() {
         assertFalse(PlayableRealClientLoopScenario.isNightTime(12_541L));
         assertTrue(PlayableRealClientLoopScenario.isNightTime(12_542L));
@@ -232,25 +351,68 @@ final class PlayableRealClientLoopScenarioTest {
     }
 
     @Test
-    void fullLoopReportsPlayerDeathInsteadOfTickStall() throws Exception {
+    void fullLoopRecoversNaturalCombatDeathAndContinuesServerTimeSoak() throws Exception {
         FakeScenarioClient client = new FakeScenarioClient();
-        client.healthAfterHostileCombat = 0.0F;
-        client.tickProgressDuringSoak = false;
+        client.visiblePassiveDuringSoak = true;
+        client.visibleHostileDuringSoak = true;
+        client.dieOnNextHostileAttack = true;
 
-        ClientScenarioReport report = new PlayableRealClientLoopScenario(Duration.ofMillis(1)).run(
+        ClientScenarioReport report = new PlayableRealClientLoopScenario(Duration.ofMillis(1_050)).run(
             "playable-04-twenty-minute-survival-loop",
-            Path.of("build/tmp/playable-04-death-test/screenshots"),
+            Path.of("build/tmp/playable-04-death-recovery-test/screenshots"),
             client
         );
 
-        assertEquals("failed", report.result());
+        assertEquals("passed", report.result(), () -> String.join("\n", report.observations()));
+        assertTrue(client.operations.contains("waitDeathScreen"));
+        assertTrue(client.operations.contains("respawn"));
         assertTrue(
-            report.observations().stream().anyMatch(entry -> entry.contains("player_died=true")),
+            client.operations.stream().anyMatch(operation -> operation.startsWith("collectIdentity:minecraft:wooden_pickaxe:")),
+            "natural combat death must recover the exact wooden pickaxe death drop"
+        );
+        assertTrue(
+            client.operations.stream().anyMatch(operation -> operation.startsWith("collectIdentity:minecraft:wooden_sword:")),
+            "natural combat death must recover the exact wooden sword death drop"
+        );
+        assertTrue(
+            report.observations().stream().anyMatch(entry ->
+                entry.contains("survival death-drop recovery: passed")
+                    && entry.contains("pickaxe_recovered=true")
+                    && entry.contains("sword_recovered=true")
+            ),
             () -> String.join("\n", report.observations())
         );
-        assertFalse(
-            report.observations().stream().anyMatch(entry -> entry.contains("tick_progress=false")),
-            "a dead client player is not evidence that the server tick loop stopped"
+        assertTrue(
+            report.observations().stream().anyMatch(entry -> entry.contains("recovered_deaths=1")),
+            () -> String.join("\n", report.observations())
+        );
+    }
+
+    @Test
+    void fullLoopDoesNotFoldDeathDropsIntoThePreDeathIdentityBaseline() throws Exception {
+        FakeScenarioClient client = new FakeScenarioClient();
+        client.visiblePassiveDuringSoak = true;
+        client.visibleHostileDuringSoak = true;
+        client.dieDuringDropBaselineAfterTick = 20L;
+
+        ClientScenarioReport report = new PlayableRealClientLoopScenario(Duration.ofMillis(1_050)).run(
+            "playable-04-twenty-minute-survival-loop",
+            Path.of("build/tmp/playable-04-between-iterations-death-test/screenshots"),
+            client
+        );
+
+        assertEquals("passed", report.result(), () -> String.join("\n", report.observations()));
+        assertTrue(client.deathMaterializedDuringDropBaseline);
+        assertTrue(
+            client.operations.stream().anyMatch(operation ->
+                operation.startsWith("waitNewDropIdentity:minecraft:wooden_pickaxe:")
+                    && !operation.contains("entityId=701")
+            ),
+            "the exact death drop must not be captured into the pre-death exclusion baseline"
+        );
+        assertTrue(
+            report.observations().stream().anyMatch(entry -> entry.contains("survival death-drop recovery: passed")),
+            () -> String.join("\n", report.observations())
         );
     }
 
@@ -4408,6 +4570,7 @@ final class PlayableRealClientLoopScenarioTest {
         int shortGrassScans = 0;
         int foodLevel = 20;
         float healthAfterHostileCombat = 20.0F;
+        boolean visiblePassiveDuringSoak = false;
         boolean visibleHostileDuringSoak = false;
         boolean visibleHostileOutsideReachDuringSoak = false;
         String visibleHostileTypeDuringSoak = "minecraft:zombie";
@@ -4416,6 +4579,7 @@ final class PlayableRealClientLoopScenarioTest {
         final String[] containerItemIds = new String[27];
         final int[] containerCounts = new int[27];
         boolean nearLogsAvailable = true;
+        long logsUnavailableDuringSoakAfterTick = Long.MAX_VALUE;
         boolean nearStoneAvailable = true;
         boolean fourthLogIsReachableDownFace = false;
         boolean failPostFurnaceLogApproach = false;
@@ -4436,20 +4600,31 @@ final class PlayableRealClientLoopScenarioTest {
         int missingReachableStoneScansRemaining = 0;
         int rawIronPickupBatchSize = 1;
         int droppedWoodenPickaxes = 0;
+        int droppedWoodenSwords = 0;
+        boolean dieOnNextHostileAttack = false;
+        long dieDuringDropBaselineAfterTick = Long.MAX_VALUE;
+        boolean deathMaterializedDuringDropBaseline = false;
         boolean woodenPickaxePickupObserved = true;
         boolean woodenPickaxeEntityDisappeared = true;
         boolean postDeathWoodenPickaxeEntityVisible = true;
+        boolean postDeathWoodenSwordEntityVisible = true;
         boolean returnPreexistingWoodenPickaxeEntity = false;
         boolean woodenPickaxeIdentityLostBeforePickup = false;
         boolean unrelatedWoodenPickaxePickedUpAfterIdentityLoss = false;
         int preexistingWoodenPickaxeEntityId = -1;
+        int preexistingWoodenSwordEntityId = -1;
         int deathDropWoodenPickaxeEntityId = 701;
+        int deathDropWoodenSwordEntityId = 702;
         boolean craftingTablePlacementObserved = true;
         String craftingTablePlaceUseResult = "success";
         UUID preexistingWoodenPickaxeEntityUuid =
             UUID.fromString("00000000-0000-0000-0000-000000000700");
+        UUID preexistingWoodenSwordEntityUuid =
+            UUID.fromString("00000000-0000-0000-0000-000000000710");
         UUID deathDropWoodenPickaxeEntityUuid =
             UUID.fromString("00000000-0000-0000-0000-000000000701");
+        UUID deathDropWoodenSwordEntityUuid =
+            UUID.fromString("00000000-0000-0000-0000-000000000702");
         int visiblePlayerEntityId = 777;
         int cropSkyLight = 15;
         boolean generatedRuinChestPresent;
@@ -4662,6 +4837,9 @@ final class PlayableRealClientLoopScenarioTest {
             if (!blockIds.contains(logItemId)) {
                 return null;
             }
+            if (woodenSwords > 0 && clientTicks >= logsUnavailableDuringSoakAfterTick) {
+                return null;
+            }
             if (
                 failFirstCampfireReserveLogApproach
                     && !failedCampfireReserveLogApproach
@@ -4830,6 +5008,19 @@ final class PlayableRealClientLoopScenarioTest {
                     true,
                     new ScenarioHeldItem(expectedDropItemId, 1)
                 );
+            } else if ("minecraft:wooden_sword".equals(expectedDropItemId)) {
+                if (droppedWoodenSwords < expectedSelectedCount) {
+                    return new ScenarioBreakResult(false, false, true, false, new ScenarioHeldItem("minecraft:air", 0));
+                }
+                droppedWoodenSwords -= expectedSelectedCount;
+                woodenSwords += expectedSelectedCount;
+                return new ScenarioBreakResult(
+                    true,
+                    true,
+                    true,
+                    true,
+                    new ScenarioHeldItem(expectedDropItemId, 1)
+                );
             } else if ("minecraft:wheat_seeds".equals(expectedDropItemId)) {
                 wheatSeeds += expectedSelectedCount;
             } else if ("minecraft:wheat".equals(expectedDropItemId)) {
@@ -4841,12 +5032,52 @@ final class PlayableRealClientLoopScenarioTest {
         @Override
         public List<ScenarioItemDropIdentity> visibleItemDropIdentities(String itemId) {
             operations.add("visibleDropIdentities:" + itemId);
-            return preexistingWoodenPickaxeEntityId < 0
-                ? List.of()
-                : List.of(new ScenarioItemDropIdentity(
+            if (
+                "minecraft:wooden_pickaxe".equals(itemId)
+                    && !deathMaterializedDuringDropBaseline
+                    && healthAfterHostileCombat > 0.0F
+                    && clientTicks >= dieDuringDropBaselineAfterTick
+            ) {
+                healthAfterHostileCombat = 0.0F;
+                materializeSurvivalDeathDrops();
+                deathMaterializedDuringDropBaseline = true;
+            }
+            List<ScenarioItemDropIdentity> identities = new ArrayList<>();
+            if ("minecraft:wooden_pickaxe".equals(itemId) && preexistingWoodenPickaxeEntityId >= 0) {
+                identities.add(new ScenarioItemDropIdentity(
                     preexistingWoodenPickaxeEntityId,
                     preexistingWoodenPickaxeEntityUuid
                 ));
+            }
+            if ("minecraft:wooden_sword".equals(itemId) && preexistingWoodenSwordEntityId >= 0) {
+                identities.add(new ScenarioItemDropIdentity(
+                    preexistingWoodenSwordEntityId,
+                    preexistingWoodenSwordEntityUuid
+                ));
+            }
+            if (
+                "minecraft:wooden_pickaxe".equals(itemId)
+                    && deathMaterializedDuringDropBaseline
+                    && droppedWoodenPickaxes > 0
+                    && postDeathWoodenPickaxeEntityVisible
+            ) {
+                identities.add(new ScenarioItemDropIdentity(
+                    deathDropWoodenPickaxeEntityId,
+                    deathDropWoodenPickaxeEntityUuid
+                ));
+            }
+            if (
+                "minecraft:wooden_sword".equals(itemId)
+                    && deathMaterializedDuringDropBaseline
+                    && droppedWoodenSwords > 0
+                    && postDeathWoodenSwordEntityVisible
+            ) {
+                identities.add(new ScenarioItemDropIdentity(
+                    deathDropWoodenSwordEntityId,
+                    deathDropWoodenSwordEntityUuid
+                ));
+            }
+            return List.copyOf(identities);
         }
 
         @Override
@@ -4861,15 +5092,32 @@ final class PlayableRealClientLoopScenarioTest {
             if (!postDeathWoodenPickaxeEntityVisible) {
                 return null;
             }
-            return returnPreexistingWoodenPickaxeEntity
-                ? new ScenarioItemDropIdentity(
-                    preexistingWoodenPickaxeEntityId,
-                    preexistingWoodenPickaxeEntityUuid
-                )
-                : new ScenarioItemDropIdentity(
-                    deathDropWoodenPickaxeEntityId,
-                    deathDropWoodenPickaxeEntityUuid
+            if ("minecraft:wooden_pickaxe".equals(itemId)) {
+                ScenarioItemDropIdentity identity = returnPreexistingWoodenPickaxeEntity
+                    ? new ScenarioItemDropIdentity(
+                        preexistingWoodenPickaxeEntityId,
+                        preexistingWoodenPickaxeEntityUuid
+                    )
+                    : new ScenarioItemDropIdentity(
+                        deathDropWoodenPickaxeEntityId,
+                        deathDropWoodenPickaxeEntityUuid
+                    );
+                if (deathMaterializedDuringDropBaseline && excludedIdentities.contains(identity)) {
+                    return null;
+                }
+                return identity;
+            }
+            if ("minecraft:wooden_sword".equals(itemId)) {
+                ScenarioItemDropIdentity identity = new ScenarioItemDropIdentity(
+                    deathDropWoodenSwordEntityId,
+                    deathDropWoodenSwordEntityUuid
                 );
+                if (deathMaterializedDuringDropBaseline && excludedIdentities.contains(identity)) {
+                    return null;
+                }
+                return identity;
+            }
+            return null;
         }
 
         @Override
@@ -4884,14 +5132,21 @@ final class PlayableRealClientLoopScenarioTest {
                 "collectIdentity:" + expectedDropItemId + ":" + expectedIdentity.entityId()
                     + ":" + expectedIdentity.uuid()
             );
-            ScenarioItemDropIdentity deathDropIdentity = new ScenarioItemDropIdentity(
-                deathDropWoodenPickaxeEntityId,
-                deathDropWoodenPickaxeEntityUuid
-            );
-            if (!deathDropIdentity.equals(expectedIdentity)) {
+            ScenarioItemDropIdentity deathDropIdentity = switch (expectedDropItemId) {
+                case "minecraft:wooden_pickaxe" -> new ScenarioItemDropIdentity(
+                    deathDropWoodenPickaxeEntityId,
+                    deathDropWoodenPickaxeEntityUuid
+                );
+                case "minecraft:wooden_sword" -> new ScenarioItemDropIdentity(
+                    deathDropWoodenSwordEntityId,
+                    deathDropWoodenSwordEntityUuid
+                );
+                default -> null;
+            };
+            if (deathDropIdentity == null || !deathDropIdentity.equals(expectedIdentity)) {
                 return new ScenarioBreakResult(true, true, false, false, new ScenarioHeldItem("minecraft:air", 0));
             }
-            if (woodenPickaxeIdentityLostBeforePickup) {
+            if ("minecraft:wooden_pickaxe".equals(expectedDropItemId) && woodenPickaxeIdentityLostBeforePickup) {
                 if (unrelatedWoodenPickaxePickedUpAfterIdentityLoss) {
                     woodenPickaxes += expectedSelectedCount;
                 }
@@ -5325,6 +5580,19 @@ final class PlayableRealClientLoopScenarioTest {
         @Override
         public ScenarioEntityObservation visibleEntity(List<String> entityTypeIds, ScenarioReach reach) {
             operations.add("visibleEntity:" + String.join("|", entityTypeIds) + ":" + reach.label());
+            if (visiblePassiveDuringSoak && entityTypeIds.contains("minecraft:cow")) {
+                visiblePassiveDuringSoak = false;
+                return new ScenarioEntityObservation(
+                    "minecraft:cow",
+                    198,
+                    entityUuid(198),
+                    3.5,
+                    64.0,
+                    3.5,
+                    4.0,
+                    null
+                );
+            }
             boolean shouldReturnHostile = visibleHostileDuringSoak && reach == ScenarioReach.WITHIN_SURVIVAL_REACH;
             shouldReturnHostile |= visibleHostileOutsideReachDuringSoak
                 && reach == ScenarioReach.OUTSIDE_SURVIVAL_REACH;
@@ -5474,6 +5742,12 @@ final class PlayableRealClientLoopScenarioTest {
         @Override
         public boolean attackEntityUntilRemoved(ScenarioEntityObservation entity, Duration timeout) {
             operations.add("attackEntityUntilRemoved:" + entity.entityType() + ":" + entity.entityId());
+            if (dieOnNextHostileAttack) {
+                dieOnNextHostileAttack = false;
+                healthAfterHostileCombat = 0.0F;
+                materializeSurvivalDeathDrops();
+                return false;
+            }
             return true;
         }
 
@@ -5709,17 +5983,37 @@ final class PlayableRealClientLoopScenarioTest {
             return true;
         }
 
+        private void materializeSurvivalDeathDrops() {
+            droppedWoodenPickaxes += woodenPickaxes;
+            droppedWoodenSwords += woodenSwords;
+            woodenPickaxes = 0;
+            woodenSwords = 0;
+        }
+
+        @Override
+        public boolean waitForDeathScreen(Duration duration) {
+            operations.add("waitDeathScreen");
+            if (healthAfterHostileCombat > 0.0F) {
+                return false;
+            }
+            if (droppedWoodenPickaxes == 0 && droppedWoodenSwords == 0) {
+                materializeSurvivalDeathDrops();
+            }
+            return true;
+        }
+
         @Override
         public boolean standOnBlockUntilDeath(ScenarioBlockTarget target, Duration duration) {
             operations.add("standOnBlockUntilDeath:" + target.label() + ":" + target.blockId());
-            droppedWoodenPickaxes += woodenPickaxes;
-            woodenPickaxes = 0;
+            healthAfterHostileCombat = 0.0F;
+            materializeSurvivalDeathDrops();
             return true;
         }
 
         @Override
         public boolean performRespawn(Duration duration) {
             operations.add("respawn");
+            healthAfterHostileCombat = 20.0F;
             return true;
         }
 

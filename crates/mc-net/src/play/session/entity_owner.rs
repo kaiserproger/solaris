@@ -501,9 +501,20 @@ impl EntityOwnerAccess {
             velocity: snapshot.velocity,
             on_ground: snapshot.on_ground,
             fall_distance: snapshot.retained.fall_distance,
+            goal_fence: mc_entity::EntityGoalFence::from_goal(&snapshot.goal),
             is_item: snapshot.type_name == "minecraft:item",
             is_experience: snapshot.type_name == "minecraft:experience_orb",
             is_arrow: snapshot.type_name == "minecraft:arrow",
+            is_hurting_projectile: snapshot.retained.hurting_projectile_state.is_some(),
+            hurting_projectile_revision: snapshot
+                .retained
+                .hurting_projectile_state
+                .map(|state| state.projectile.revision),
+            is_throwable_projectile: snapshot.retained.throwable_projectile_state.is_some(),
+            throwable_projectile_revision: snapshot
+                .retained
+                .throwable_projectile_state
+                .map(|state| state.projectile.revision),
             sends_velocity: !matches!(
                 snapshot.type_name.as_str(),
                 "minecraft:item" | "minecraft:experience_orb"
@@ -739,6 +750,24 @@ impl EntityOwnerAccess {
         let damage = self.resolve(self.handle.damage_if_current(expected, request));
         self.invalidate(id);
         damage
+    }
+
+    pub(super) fn damage_batch_if_current(
+        &mut self,
+        requests: impl IntoIterator<Item = (EntitySnapshot, EntityDamageRequest)>,
+    ) -> Vec<mc_entity::EntityDamage> {
+        let requests = requests.into_iter().collect::<Vec<_>>();
+        let ids = requests
+            .iter()
+            .map(|(snapshot, _)| snapshot.id)
+            .collect::<Vec<_>>();
+        #[cfg(test)]
+        self.record_owner_request();
+        let damages = self.resolve(self.handle.damage_batch_if_current(requests));
+        for id in ids {
+            self.invalidate(id);
+        }
+        damages
     }
 
     pub(super) fn apply_effect_if_current(

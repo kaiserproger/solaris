@@ -16,14 +16,90 @@ use super::{
 use crate::lock_policy::lock_authoritative_mutex;
 use crate::play::simulation::{PlayerSurvivalPlan, SimulationAuthority};
 use crate::play::{GameMode, PlayerPose};
+use mc_entity::dragon_26_1_2::{
+    DragonAirPhase, DragonAirState, DragonPart, dragon_part_damage, part_center,
+};
 use mc_entity::{
     AttributeKind, EntityDamageRequest, EntityEffectRejection, EntityEffectRequest,
     EntityEffectResult, EntityId, EntityLifecycle, EntitySnapshot, Vec3,
 };
+use mc_physics::Aabb;
 use std::time::Instant;
 
 const VILLAGER_WITNESS_FOLLOW_RANGE_DEFAULT: f64 = 16.0;
 const VILLAGER_WITNESS_FOLLOW_RANGE_MAX: f64 = 2_048.0;
+
+struct ResolvedServerAttackTarget {
+    snapshot: EntitySnapshot,
+    reach_position: Vec3,
+    reach_aabb: Aabb,
+    dragon_part: Option<DragonPart>,
+}
+
+fn dragon_part_reach(snapshot: &EntitySnapshot, part: DragonPart) -> Option<(Vec3, Aabb)> {
+    let state = snapshot
+        .retained
+        .dragon_air
+        .unwrap_or_else(|| DragonAirState::new(snapshot.position, snapshot.rotation.yaw));
+    let position = part_center(&state, snapshot.position, snapshot.rotation.yaw, part)?;
+    let dimensions = part.dimensions();
+    Some((
+        position,
+        Aabb {
+            half_width: dimensions.width * 0.5,
+            height: dimensions.height,
+        },
+    ))
+}
+
+fn resolve_server_attack_target_locked(
+    inner: &SessionEntityGuards<'_>,
+    requested_id: EntityId,
+) -> Option<ResolvedServerAttackTarget> {
+    if let Some(snapshot) = inner.entities.snapshot(requested_id) {
+        if snapshot.type_name == "minecraft:ender_dragon" {
+            let (reach_position, reach_aabb) = dragon_part_reach(&snapshot, DragonPart::Body)?;
+            return Some(ResolvedServerAttackTarget {
+                snapshot,
+                reach_position,
+                reach_aabb,
+                dragon_part: Some(DragonPart::Body),
+            });
+        }
+        let reach_aabb = entity_geometry(&snapshot.type_name, snapshot.animal).aabb;
+        return Some(ResolvedServerAttackTarget {
+            reach_position: snapshot.position,
+            reach_aabb,
+            snapshot,
+            dragon_part: None,
+        });
+    }
+
+    let mut dragon_part = None;
+    inner.entities.visit_simulation_entities(|entity| {
+        if dragon_part.is_some()
+            || entity.lifecycle != EntityLifecycle::Alive
+            || entity.type_name != "minecraft:ender_dragon"
+        {
+            return;
+        }
+        let Some(offset) = requested_id.0.checked_sub(entity.id.0) else {
+            return;
+        };
+        if let Some(part) = DragonPart::from_protocol_offset(offset) {
+            dragon_part = Some((entity.id, part));
+        }
+    });
+    let (dragon_id, part) = dragon_part?;
+    let snapshot = inner.entities.snapshot(dragon_id)?;
+    let (reach_position, reach_aabb) = dragon_part_reach(&snapshot, part)?;
+    Some(ResolvedServerAttackTarget {
+        snapshot,
+        reach_position,
+        reach_aabb,
+        dragon_part: Some(part),
+    })
+}
 
 pub(super) fn entity_kill_rewards_locked(
     inner: &SessionEntityGuards<'_>,
@@ -139,6 +215,68 @@ pub(in crate::play) struct ServerEntityPlayerAttack<'a> {
     pub(in crate::play) attacker: Option<(SessionId, &'a PlayerSurvivalPlan)>,
 }
 
+fn attack_dragon_part_locked(
+    inner: &mut SessionEntityGuards<'_>,
+    expected: EntitySnapshot,
+    part: DragonPart,
+    amount: f32,
+) -> Option<EntityAttackOutcome> {
+    let mut state = expected
+        .retained
+        .dragon_air
+        .unwrap_or_else(|| DragonAirState::new(expected.position, expected.rotation.yaw));
+    let resolved = dragon_part_damage(state.phase, part, amount, true)?;
+    let tick = inner.entity_lifecycle_tick;
+    if expected
+        .retained
+        .last_damage_tick
+        .is_some_and(|last| tick.saturating_sub(last) < ENTITY_HURT_INVULNERABLE_TICKS)
+    {
+        return None;
+    }
+
+    let lethal = resolved >= expected.health;
+    let mut next = expected.clone();
+    next.health = if lethal {
+        1.0
+    } else {
+        (expected.health - resolved).max(0.0)
+    };
+    next.retained.last_damage_tick = Some(tick);
+    next.retained.living.invulnerable_time =
+        u32::try_from(ENTITY_HURT_INVULNERABLE_TICKS).unwrap_or(u32::MAX);
+    next.retained.living.hurt_time =
+        u32::try_from(ENTITY_HURT_INVULNERABLE_TICKS).unwrap_or(u32::MAX);
+    next.retained.living.last_hurt = resolved;
+    if lethal {
+        state.phase = DragonAirPhase::Dying;
+        state.death_time = 0;
+        state.fly_target = None;
+        state.clear_target();
+        next.velocity = Vec3::new(0.0, 0.1, 0.0);
+        next.goal = mc_entity::GoalState::Idle;
+    }
+    next.retained.dragon_air = Some(state);
+    if !inner
+        .entities
+        .replace_snapshot_if_current(expected, next.clone())
+    {
+        return None;
+    }
+
+    let damage = mc_entity::EntityDamage {
+        snapshot: next,
+        killed: false,
+    };
+    let mut dispatches = publish_accepted_entity_health_locked(inner, &damage.snapshot);
+    dispatches.extend(entity_event_dispatches_locked(inner, damage.snapshot.id, 2));
+    Some(EntityAttackOutcome::Damaged {
+        damage,
+        dispatches,
+        attacker_costs: None,
+    })
+}
+
 impl SessionRegistry {
     pub(in crate::play) fn apply_server_entity_effect_request(
         &self,
@@ -173,7 +311,13 @@ impl SessionRegistry {
             return PlayerAttackResult::ValidationRejected;
         }
         let mut inner = self.lock_session_entities("player attack server entity");
-        let Some(target) = inner.entities.snapshot(entity_id) else {
+        let Some(ResolvedServerAttackTarget {
+            snapshot: target,
+            reach_position,
+            reach_aabb,
+            dragon_part,
+        }) = resolve_server_attack_target_locked(&inner, entity_id)
+        else {
             return PlayerAttackResult::ValidationRejected;
         };
         if target.item_stack.is_some() {
@@ -228,8 +372,8 @@ impl SessionRegistry {
             .and_then(|state| held_attack_range(&inner.player_combat, state));
         if !within_entity_attack_reach(
             player_pose,
-            target.position,
-            entity_geometry(&target.type_name, target.animal).aabb,
+            reach_position,
+            reach_aabb,
             game_mode,
             attack_range,
         ) {
@@ -242,14 +386,19 @@ impl SessionRegistry {
                 .map(|player| {
                     mc_entity::villager_gossip_26_1_2::VillagerGossipEvent::HurtByPlayer { player }
                 });
-        let Some(mut outcome) = attack_server_entity_locked(
-            &mut inner,
-            entity_id,
-            amount,
-            knockback_origin,
-            &rewards,
-            gossip_event,
-        ) else {
+        let outcome = if let Some(part) = dragon_part {
+            attack_dragon_part_locked(&mut inner, target, part, amount)
+        } else {
+            attack_server_entity_locked(
+                &mut inner,
+                target.id,
+                amount,
+                knockback_origin,
+                &rewards,
+                gossip_event,
+            )
+        };
+        let Some(mut outcome) = outcome else {
             return PlayerAttackResult::AcceptedNoDamage;
         };
         let committed_attacker = attacker.zip(attacker_state.as_mut()).map(
@@ -290,6 +439,29 @@ impl SessionRegistry {
         drop(inner);
         self.append_spawned_xp_pickup_candidates(outcome.dispatches_mut());
         PlayerAttackResult::Damaged(Box::new(outcome))
+    }
+
+    pub(in crate::play) fn damage_script_entity(
+        &self,
+        _authority: &SimulationAuthority,
+        entity_id: EntityId,
+        amount: f32,
+    ) -> Option<EntityAttackOutcome> {
+        let mut outcome = {
+            let mut inner = self.lock_session_entities("damage script entity");
+            let expected = inner.entities.snapshot(entity_id)?;
+            if expected.item_stack.is_some()
+                || server_entity_snapshot_from(expected.clone())
+                    .health
+                    .is_none()
+            {
+                return None;
+            }
+            let rewards = entity_kill_rewards_locked(&inner, &expected);
+            attack_server_entity_locked(&mut inner, entity_id, amount, None, &rewards, None)?
+        };
+        self.append_spawned_xp_pickup_candidates(outcome.dispatches_mut());
+        Some(outcome)
     }
 
     #[cfg(test)]

@@ -13,7 +13,6 @@ import dev.solaris.loader.LoaderScreenDefinition;
 import dev.solaris.loader.LoaderScreenOpen;
 import dev.solaris.loader.minecraft.LoaderRuntimeResourcePack;
 import dev.solaris.loader.minecraft.LoaderMinecraftDisplay;
-import dev.solaris.loader.minecraft.LoaderMinecraftBlock;
 import java.util.Collections;
 import java.util.Comparator;
 import java.util.List;
@@ -326,7 +325,7 @@ public final class SolarisForgeLoader {
                     connection,
                     ignored -> new LoaderPermissionController(
                             LoaderRuntimeSettings.permissionDecisionsFile(),
-                            LoaderMinecraftBlock::carrierStateIds));
+                            SolarisForgeContent::carrierStateIds));
         }
     }
 

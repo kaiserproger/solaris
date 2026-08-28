@@ -173,7 +173,8 @@ fn validate_expected_plugin_set(
 }
 
 fn check_config(path: &Path) -> Result<()> {
-    let cfg = load_config(path)?;
+    let mut cfg = load_config(path)?;
+    cfg.load_access_control_files(path)?;
     let _ip: IpAddr = cfg.network.bind_address.parse().with_context(|| {
         format!(
             "validating network.bind_address `{}`",
@@ -598,7 +599,17 @@ impl From<mc_net::AutoscalePolicy> for EffectiveAutoscalePolicy {
 }
 
 async fn serve(path: &Path) -> Result<()> {
-    let cfg = load_config(path)?;
+    let mut cfg = load_config(path)?;
+    let access_control = cfg.load_access_control_files(path)?;
+    if access_control.files_loaded > 0 {
+        tracing::info!(
+            files = access_control.files_loaded,
+            operators = access_control.operator_identities,
+            whitelist = access_control.whitelist_identities,
+            banned = access_control.banned_identities,
+            "file-backed access control loaded"
+        );
+    }
     validate_runtime_config(&cfg)?;
     let configured_geometry = cfg.data.chunk_geometry().map_err(anyhow::Error::msg)?;
     let world_dir = required_world_dir(&cfg)?;
@@ -876,6 +887,7 @@ async fn serve(path: &Path) -> Result<()> {
         "tags loaded"
     );
     let recipe_source = load_effective_recipes(cfg.data.vanilla_data_dir.as_deref())?;
+    validate_recipe_result_stacks(&recipe_source.recipes, &item_facts)?;
     let recipes = Arc::new(recipe_source.recipes);
     tracing::info!(
         entries = recipes.len(),
@@ -966,37 +978,167 @@ async fn serve(path: &Path) -> Result<()> {
     } else {
         (mc_net::bind(net).await.context("network bind")?, None)
     };
-    let result = run_bound_server(bound, shutdown_handle).await;
+    let result = run_bound_server(
+        bound,
+        shutdown_handle,
+        path,
+        lua_host.as_ref(),
+        cfg.plugins.strict,
+    )
+    .await;
     if let Some(host) = lua_host {
         join_lua_host(host).await?;
     }
     result
 }
 
+#[cfg(unix)]
+struct PluginReloadSignal(tokio::signal::unix::Signal);
+
+#[cfg(not(unix))]
+struct PluginReloadSignal;
+
+impl PluginReloadSignal {
+    #[cfg(unix)]
+    fn new() -> Result<Self> {
+        let signal = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::hangup())
+            .context("installing SIGHUP plugin reload handler")?;
+        Ok(Self(signal))
+    }
+
+    #[cfg(not(unix))]
+    fn new() -> Result<Self> {
+        Ok(Self)
+    }
+
+    #[cfg(unix)]
+    async fn recv(&mut self) {
+        let _ = self.0.recv().await;
+    }
+
+    #[cfg(not(unix))]
+    async fn recv(&mut self) {
+        std::future::pending::<()>().await;
+    }
+}
+
+fn prepare_configured_luau_reload(
+    path: &Path,
+    startup_strict: bool,
+) -> Result<mc_script::PreparedLuaPlugins> {
+    if !startup_strict {
+        bail!("Luau runtime reload requires the server to start with plugins.strict = true");
+    }
+    let config = load_config(path)?;
+    if !config.plugins.strict {
+        bail!("reloaded config must keep plugins.strict = true");
+    }
+    prepare_configured_luau_plugins(&config)?
+        .context("reloaded config no longer enables a Luau plugin host")
+}
+
+async fn reload_configured_luau_plugins(
+    path: PathBuf,
+    startup_strict: bool,
+    host: &mc_script::LuaHost,
+) -> Result<mc_script::LuaReloadReport> {
+    let prepared =
+        tokio::task::spawn_blocking(move || prepare_configured_luau_reload(&path, startup_strict))
+            .await
+            .context("joining Luau reload preparation task")??;
+    host.reload(prepared)
+        .await
+        .context("committing prepared Luau plugin reload")
+}
+
 async fn run_bound_server(
     bound: mc_net::BoundServer,
     shutdown_handle: mc_net::ShutdownHandle,
+    config_path: &Path,
+    lua_host: Option<&mc_script::LuaHost>,
+    startup_plugin_strict: bool,
 ) -> Result<()> {
     // Every exit path drains admitted work and performs exactly one final save.
-    // Ctrl-C only requests shutdown; it then waits for that same lifecycle.
+    // Ctrl-C only requests shutdown; it then waits for that same lifecycle. SIGHUP
+    // prepares/reloads plugins without pausing the network future while files are read.
     let mut run_fut = std::pin::pin!(bound.serve_and_save());
-    let shutdown = async {
+    let mut shutdown = Box::pin(async {
         if let Err(err) = tokio::signal::ctrl_c().await {
             tracing::warn!(error = %err, "ctrl_c handler failed; running without graceful shutdown");
             // Never resolve — let the listener own the lifetime.
             std::future::pending::<()>().await;
         }
-    };
-    tokio::select! {
-        result = &mut run_fut => {
-            result.context("network listener")
-        }
-        () = shutdown => {
-            tracing::info!("shutdown signal received");
-            shutdown_handle.request();
-            match tokio::time::timeout(SHUTDOWN_DRAIN_TIMEOUT, run_fut.as_mut()).await {
-                Ok(result) => result.context("network listener"),
-                Err(_) => anyhow::bail!("shutdown drain and final save timed out"),
+    });
+    let mut plugin_reload = PluginReloadSignal::new()?;
+    loop {
+        tokio::select! {
+            result = run_fut.as_mut() => {
+                return result.context("network listener");
+            }
+            () = shutdown.as_mut() => {
+                tracing::info!("shutdown signal received");
+                shutdown_handle.request();
+                return match tokio::time::timeout(SHUTDOWN_DRAIN_TIMEOUT, run_fut.as_mut()).await {
+                    Ok(result) => result.context("network listener"),
+                    Err(_) => anyhow::bail!("shutdown drain and final save timed out"),
+                };
+            }
+            () = plugin_reload.recv() => {
+                let Some(host) = lua_host else {
+                    tracing::warn!("SIGHUP plugin reload ignored because no Luau host is configured");
+                    continue;
+                };
+                if !startup_plugin_strict {
+                    tracing::warn!(
+                        "SIGHUP plugin reload rejected because the server did not start with plugins.strict = true"
+                    );
+                    continue;
+                }
+                tracing::info!(config = %config_path.display(), "SIGHUP plugin reload requested");
+                let mut reload = Box::pin(reload_configured_luau_plugins(
+                    config_path.to_path_buf(),
+                    startup_plugin_strict,
+                    host,
+                ));
+                let reload_result = tokio::select! {
+                    result = run_fut.as_mut() => {
+                        return result.context("network listener");
+                    }
+                    () = shutdown.as_mut() => {
+                        tracing::info!("shutdown signal received during Luau reload");
+                        shutdown_handle.request();
+                        return match tokio::time::timeout(
+                            SHUTDOWN_DRAIN_TIMEOUT,
+                            run_fut.as_mut(),
+                        )
+                        .await
+                        {
+                            Ok(result) => result.context("network listener"),
+                            Err(_) => anyhow::bail!("shutdown drain and final save timed out"),
+                        };
+                    }
+                    result = reload.as_mut() => result,
+                };
+                match reload_result {
+                    Ok(report) => {
+                        for diagnostic in report.replaced_disabled_plugins() {
+                            tracing::info!(
+                                plugin = diagnostic.plugin_id(),
+                                stage = diagnostic.stage().contract_name(),
+                                message = diagnostic.message(),
+                                "Luau reload replaced a previously disabled plugin generation"
+                            );
+                        }
+                        tracing::info!(
+                            loaded = report.loaded_plugins(),
+                            recovered_disabled = report.replaced_disabled_plugins().len(),
+                            "Luau plugin reload committed"
+                        );
+                    }
+                    Err(error) => {
+                        tracing::warn!(error = %error, "Luau plugin reload rejected");
+                    }
+                }
             }
         }
     }
@@ -1006,9 +1148,31 @@ async fn join_lua_host(host: mc_script::LuaHost) -> Result<()> {
     let result = tokio::task::spawn_blocking(move || host.join())
         .await
         .context("joining Luau host task")?;
-    if result.is_err() {
-        bail!("Luau host thread panicked");
+    let report = match result {
+        Ok(report) => report,
+        Err(_) => bail!("Luau host thread panicked"),
+    };
+    for diagnostic in report.disabled_plugins() {
+        tracing::warn!(
+            plugin = diagnostic.plugin_id(),
+            stage = diagnostic.stage().contract_name(),
+            message = diagnostic.message(),
+            "Luau plugin remained disabled at host shutdown"
+        );
     }
+    if report.exit_reason() != mc_script::LuaHostExitReason::EventQueueClosed {
+        tracing::warn!(
+            exit_reason = report.exit_reason().contract_name(),
+            "Luau plugin host stopped through a non-normal lifecycle path"
+        );
+    }
+    tracing::info!(
+        loaded = report.loaded_plugins(),
+        enabled_at_exit = report.enabled_plugins_at_exit(),
+        disabled = report.disabled_plugins().len(),
+        exit_reason = report.exit_reason().contract_name(),
+        "Luau plugin host stopped"
+    );
     Ok(())
 }
 
@@ -1686,6 +1850,30 @@ struct EffectiveRecipes {
     source: &'static str,
 }
 
+fn validate_recipe_result_stacks(
+    recipes: &[mc_data::recipes::Recipe],
+    item_facts: &mc_data::item_components::ItemFactsTable,
+) -> Result<()> {
+    for recipe in recipes {
+        let Some(max_stack_size) = item_facts
+            .get(&recipe.result.item)
+            .and_then(|facts| facts.max_stack_size)
+        else {
+            continue;
+        };
+        if recipe.result.count > max_stack_size {
+            bail!(
+                "recipe {} produces {} x {}, exceeding the item's max stack size {}",
+                recipe.id,
+                recipe.result.count,
+                recipe.result.item,
+                max_stack_size
+            );
+        }
+    }
+    Ok(())
+}
+
 fn load_effective_recipes(vanilla_data_dir: Option<&Path>) -> Result<EffectiveRecipes> {
     if let Some(vanilla_data_dir) = vanilla_data_dir {
         let root = vanilla_data_dir
@@ -2056,6 +2244,110 @@ mod tests {
         assert!(error.to_string().contains("requires plugins.strict = true"));
     }
 
+    #[tokio::test]
+    async fn strict_config_file_reload_reprepares_and_swaps_luau_generation() {
+        let plugins = tempfile::tempdir().unwrap();
+        let plugin = plugins.path().join("reloadable");
+        std::fs::create_dir(&plugin).unwrap();
+        std::fs::write(
+            plugin.join("plugin.toml"),
+            r#"
+                id = "reloadable"
+                name = "Reloadable"
+                version = "0.1.0"
+                api = "0.6.0"
+                events = ["server.started", "server.tick"]
+            "#,
+        )
+        .unwrap();
+        std::fs::write(
+            plugin.join("main.lua"),
+            "function on_server_tick(_event) solaris.broadcast('old-generation') end",
+        )
+        .unwrap();
+
+        let mut config: ServerConfig = toml::from_str(
+            r#"
+                [server]
+                name = "Reload"
+                motd = "Reload plugins"
+
+                [network]
+                bind_address = "127.0.0.1"
+                port = 25565
+            "#,
+        )
+        .unwrap();
+        config.plugins.directory = Some(plugins.path().to_path_buf());
+        config.plugins.strict = true;
+        config.plugins.expected = vec!["reloadable".to_owned()];
+        let config_root = tempfile::tempdir().unwrap();
+        let config_path = config_root.path().join("server.toml");
+        std::fs::write(&config_path, toml::to_string(&config).unwrap()).unwrap();
+
+        let prepared = prepare_configured_luau_plugins(&config)
+            .unwrap()
+            .expect("strict reload fixture prepares");
+        let (boundary, host) = mc_script::start_prepared_lua_host(prepared).unwrap();
+        std::fs::write(
+            plugin.join("main.lua"),
+            r#"
+                function on_server_started(_event)
+                    solaris.broadcast("reload-started")
+                end
+
+                function on_server_tick(_event)
+                    solaris.broadcast("new-generation")
+                end
+            "#,
+        )
+        .unwrap();
+
+        let report = reload_configured_luau_plugins(config_path, true, &host)
+            .await
+            .unwrap();
+        assert_eq!(report.loaded_plugins(), 1);
+        assert!(report.replaced_disabled_plugins().is_empty());
+
+        let command = tokio::time::timeout(Duration::from_secs(1), boundary.recv_command())
+            .await
+            .unwrap()
+            .unwrap();
+        let admitted = boundary.accept_host_command(command).unwrap();
+        assert!(matches!(
+            admitted.request(),
+            mc_script::ScriptCommand::BroadcastChatMessage { message }
+                if message == "reload-started"
+        ));
+
+        boundary
+            .try_enqueue_event(mc_script::ScriptEvent::server_tick(1))
+            .unwrap();
+        let command = tokio::time::timeout(Duration::from_secs(1), boundary.recv_command())
+            .await
+            .unwrap()
+            .unwrap();
+        let admitted = boundary.accept_host_command(command).unwrap();
+        assert!(matches!(
+            admitted.request(),
+            mc_script::ScriptCommand::BroadcastChatMessage { message }
+                if message == "new-generation"
+        ));
+
+        drop(boundary);
+        host.join().unwrap();
+    }
+
+    #[test]
+    fn luau_reload_requires_strict_startup() {
+        let error = prepare_configured_luau_reload(Path::new("unused.toml"), false).unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("start with plugins.strict = true")
+        );
+    }
+
     #[test]
     fn ensure_world_region_root_creates_legacy_layout_for_missing_world() {
         let tmp = tempfile::tempdir().unwrap();
@@ -2160,6 +2452,73 @@ mod tests {
 
         assert_eq!(startup_spawn_view_distance(&config), 12);
         assert_eq!(runtime_cache_view_distance(&config), 28);
+    }
+
+    #[test]
+    fn runtime_config_rejects_resource_limit_overflows_before_startup() {
+        let world = tempfile::tempdir().unwrap();
+        let mut config: ServerConfig =
+            toml::from_str(include_str!("../../../example.toml")).expect("parse example config");
+        config.data.world_dir = Some(world.path().to_path_buf());
+
+        config.server.max_players = 4_097;
+        let error = validate_runtime_config(&config).unwrap_err();
+        assert!(error.to_string().contains("server.max_players=4097"));
+        config.server.max_players = 20;
+
+        config.chunk_pipeline.chunk_result_queue_size = 262_145;
+        let error = validate_runtime_config(&config).unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("chunk_pipeline.chunk_result_queue_size=262145")
+        );
+        config.chunk_pipeline.chunk_result_queue_size = 256;
+
+        config.chunk_pipeline.chunk_generate_rate = 4_097;
+        let error = validate_runtime_config(&config).unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("chunk_pipeline.chunk_generate_rate=4097")
+        );
+        config.chunk_pipeline.chunk_generate_rate = 8;
+
+        config.simulation.random_tick_speed = 4_097;
+        let error = validate_runtime_config(&config).unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("simulation.random_tick_speed=4097")
+        );
+        config.simulation.random_tick_speed = 3;
+
+        config.chunk_pipeline.compression_level = Some(10);
+        let error = validate_runtime_config(&config).unwrap_err();
+        assert!(error.to_string().contains("compression_level"));
+    }
+
+    #[test]
+    fn runtime_config_accepts_documented_resource_limit_boundaries() {
+        let world = tempfile::tempdir().unwrap();
+        let mut config: ServerConfig =
+            toml::from_str(include_str!("../../../example.toml")).expect("parse example config");
+        config.data.world_dir = Some(world.path().to_path_buf());
+        config.server.max_players = 4_096;
+        config.chunk_pipeline.chunk_send_rate = 4_096;
+        config.chunk_pipeline.chunk_load_rate = 4_096;
+        config.chunk_pipeline.chunk_generate_rate = 4_096;
+        config.chunk_pipeline.chunk_prepare_budget_ms = 1_000;
+        config.chunk_pipeline.chunk_prepare_batch_size = 4_096;
+        config.chunk_pipeline.chunk_result_queue_size = 262_144;
+        config.chunk_pipeline.region_cache_size = 65_536;
+        config.chunk_pipeline.compression_level = Some(9);
+        config.simulation.random_tick_speed = 4_096;
+        config.simulation.save_interval_ticks = 1_728_000;
+        config.simulation.friendly_spawn_interval_ticks = 1_728_000;
+        config.simulation.hostile_spawn_interval_ticks = 1_728_000;
+
+        validate_runtime_config(&config).unwrap();
     }
 
     #[test]
@@ -3020,9 +3379,12 @@ mod tests {
             Err(err) => err,
         };
 
+        let message = format!("{err:#}");
+        assert!(message.contains("required registry entry"));
         assert!(
-            err.to_string()
-                .contains("missing required resolved entries")
+            message.contains("minecraft:stone")
+                || message.contains("minecraft:apple")
+                || message.contains("minecraft:pig")
         );
     }
 
@@ -3425,6 +3787,30 @@ mod tests {
     }
 
     #[test]
+    fn recipe_result_stack_validation_rejects_known_item_overflow() {
+        let item = Identifier::parse("minecraft:test_item").unwrap();
+        let facts = mc_data::item_components::ItemFactsTable::from_entries([(
+            item.clone(),
+            mc_data::item_components::ItemFacts {
+                max_stack_size: Some(16),
+                ..Default::default()
+            },
+        )]);
+        let recipe = mc_data::recipes::Recipe {
+            id: Identifier::parse("minecraft:test_recipe").unwrap(),
+            kind: mc_data::recipes::RecipeKind::Shapeless(mc_data::recipes::ShapelessRecipe {
+                ingredients: vec![mc_data::recipes::Ingredient {
+                    alternatives: vec![mc_data::recipes::IngredientAlternative::Item(item.clone())],
+                }],
+            }),
+            result: mc_data::recipes::RecipeResult { item, count: 17 },
+        };
+
+        let error = validate_recipe_result_stacks(&[recipe], &facts).unwrap_err();
+        assert!(error.to_string().contains("max stack size 16"));
+    }
+
+    #[test]
     fn effective_recipes_reject_configured_sidecar_without_supported_recipes() {
         let tmp = tempfile::tempdir().unwrap();
 
@@ -3488,7 +3874,8 @@ mod tests {
         let bound = mc_net::bind(config).await.expect("bind");
         let metadata = tmp.path().join("solaris").join("world.dat");
         shutdown.request();
-        run_bound_server(bound, shutdown)
+        let config_path = tmp.path().join("unused-config.toml");
+        run_bound_server(bound, shutdown, &config_path, None, false)
             .await
             .expect("production entrypoint drains and performs its sole final save");
         assert!(metadata.exists());

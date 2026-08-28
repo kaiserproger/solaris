@@ -1,7 +1,7 @@
+use mc_data::ItemStack;
 use mc_data::item_components::ItemFactsTable;
 use mc_data::items::ItemRegistry;
 use mc_protocol::codec::Identifier;
-use mc_protocol::packets::play::ItemStack;
 use mc_script::{
     ScriptInventoryResourceDelta, ScriptInventoryStorageTransaction, ScriptStorageMutation,
 };

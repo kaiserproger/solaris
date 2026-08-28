@@ -142,22 +142,25 @@ Projected chunk frames bypass the cross-session prepared-frame cache, so one
 client's runtime id cannot leak to another.
 
 The owning host-attested Luau plugin may call
-`solaris.place_loader_block(block_id, x, y, z)` for its exact verified block
-identity. The server rejects unattested, foreign-owner, unknown, and
-out-of-height requests, then commits the canonical state through the existing
-server-owned block-edit transaction. Publication includes every loaded session
-and applies each recipient's connection-scoped projection.
+`solaris.place_loader_block(request_id, block_id, x, y, z)` for its exact
+verified block identity. The server rejects unattested, foreign-owner, unknown,
+and out-of-world requests before mutation, then commits the canonical state
+through the existing server-owned block-edit transaction. Only after that owner
+outcome does the host publish required targeted `loader.block_placement_result`.
+Publication includes every loaded session and applies each recipient's
+connection-scoped projection.
 
 The same exact owner may call
-`solaris.grant_loader_block_item(player_id, block_id, count)` for a player
-whose current Play session acknowledged that block carrier. Solaris represents
-the item canonically as the known vanilla `minecraft:paper` protocol id plus
-the verified block name and its deterministic
+`solaris.grant_loader_block_item(request_id, player_id, block_id, count)` for a
+player whose current Play session acknowledged that block carrier. Solaris
+represents the item canonically as the known vanilla `minecraft:paper` protocol
+id plus the verified block name and its deterministic
 `minecraft:item_model = solaris_loader:loader_block[_N]` component. The session
 owner merges it under the existing inventory transaction gate, persists the
-updated canonical inventory before publishing it, and rejects a full inventory
-without mutation. The vanilla item registry and client runtime ids remain out
-of persistence.
+updated canonical inventory before publishing it, rejects a full inventory
+without mutation, and returns required targeted `loader.item_grant_result` with
+the exact semantic outcome. The vanilla item registry and client runtime ids
+remain out of persistence.
 
 For `UseItemOn`, Solaris recognizes only a non-empty `minecraft:paper` stack
 with one exact bounded carrier item-model component in the current live session

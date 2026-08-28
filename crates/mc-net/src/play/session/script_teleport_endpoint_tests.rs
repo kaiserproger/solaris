@@ -11,6 +11,7 @@ use super::SessionRegistry;
 use super::outbound::OutboundCommand;
 use crate::login::LoggedInProfile;
 use crate::play::PlayerPose;
+use crate::play::movement::PlayerPoseCommitKind;
 use crate::play::simulation::{
     CommittedPlayerPose, SimulationCommand, SimulationRequestError, SimulationResponse,
 };
@@ -122,6 +123,7 @@ async fn route_with_owner_outcome(
     let (position, completion) = command.into_owner_completion();
     let mut owner_command = SimulationCommand::CommitPlayerPose {
         actor_session: session_id,
+        kind: PlayerPoseCommitKind::Teleport,
         pose: PlayerPose::new(position.x(), position.y(), position.z()),
         exhaustion: 0.0,
         script_teleport_completion: Some(completion),

@@ -22,6 +22,9 @@ use super::lighting::{
     collect_incremental_light_updates_for_applied_edits, compute_incremental_light_updates,
     incremental_light_sources_are_current, persist_baked_light_updates,
 };
+use super::movement::{
+    PlayerMovementAuthorityResources, PlayerMovementRejection, PlayerPoseCommitKind,
+};
 use super::persistence::PersistedEntityCheckpoint;
 #[cfg(test)]
 use super::session::EntityKillRewards;
@@ -35,16 +38,17 @@ use super::session::{
     SurvivalPlacementTransaction, VisibilityDispatch, dispatch_visibility_commands,
 };
 use super::{
-    AppliedBlockEdit, ArrowPhysicsFact, BlockDelta, BlockEdit, BlockEditBatchOutcome,
-    BlockEditPrecondition, BlockMutationSnapshot, CAMPFIRE_BLOCK_ENTITY_TYPE_ID,
-    CampfireCookingState, ChestCommitOutcome, ChestView, ContainerDropPlan, ContainerPlayerPlan,
-    ContainerXpPlan, EntityPhysicsQuery, EntityPhysicsStep, FurnaceCommitOutcome, GameMode,
+    AppliedBlockEdit, BlockDelta, BlockEdit, BlockEditBatchOutcome, BlockEditPrecondition,
+    BlockMutationSnapshot, CAMPFIRE_BLOCK_ENTITY_TYPE_ID, CampfireCookingState, ChestCommitOutcome,
+    ChestView, ContainerDropPlan, ContainerPlayerPlan, ContainerXpPlan, EntityPhysicsQuery,
+    EntityPhysicsStep, EntityProjectilePhysicsFacts, FurnaceCommitOutcome, GameMode,
     PendingCampfireOutput, PlayerInventoryCommitOutcome, PlayerPose, SharedContainerCommit,
     SurvivalState, WorldHandle, air_state_id, block_edit_changes_light,
     chest_menu_state_change_count, chest_slot_stacks, furnace_output_was_taken,
     furnace_slot_stacks, is_campfire_block, schedule_fluid_ticks_near_applied,
     schedule_leaf_ticks_near_applied,
 };
+use mc_data::ItemStack;
 use mc_data::block_facts::BlockFactsTable;
 use mc_data::block_light::BlockLightTable;
 use mc_entity::runtime_26_1_2::TargetKind;
@@ -55,12 +59,11 @@ use mc_entity::{
     RegionOwnershipError, RegionPhase, Rotation, Vec3,
 };
 use mc_physics::BlockMaterialIds;
-use mc_protocol::packets::play::ItemStack;
 use mc_script::ScriptPlayerTeleportFailure;
 use mc_world::{
     BlockMutationToken, BlockPos, BlockRegistry, BlockStateId, ChestBlockEntity,
     FurnaceBlockEntity, ResidentBlockEdit, ResidentBlockEditBatchResult, ResidentBlockPrecondition,
-    ScheduledBlockTick, WorldError, WorldMutationView, WorldStorage,
+    ScheduledBlockTick, WorldError, WorldMutationView, WorldReadView, WorldStorage,
 };
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::Arc;
@@ -193,6 +196,7 @@ pub(crate) enum SimulationRequestError {
     CrossRegion,
     InvalidCommand,
     StaleSession,
+    PlayerMovementRejected(PlayerMovementRejection),
 }
 
 #[derive(Debug)]
@@ -269,6 +273,7 @@ pub(crate) struct SimulationSaveSnapshot {
     pub(crate) world_chunk_journal_watermark: Option<u64>,
     pub(crate) world_time: u64,
     pub(crate) daylight_cycle_enabled: bool,
+    pub(crate) weather: super::session::WeatherState,
     pub(crate) players_sleeping_percentage: u32,
     pub(crate) keep_inventory: bool,
     pub(crate) simulation_tick: u64,
@@ -283,6 +288,7 @@ impl std::fmt::Debug for SimulationSaveSnapshot {
             .field("entities", &self.entities.records.len())
             .field("world_time", &self.world_time)
             .field("daylight_cycle_enabled", &self.daylight_cycle_enabled)
+            .field("weather", &self.weather)
             .field(
                 "players_sleeping_percentage",
                 &self.players_sleeping_percentage,
@@ -356,6 +362,10 @@ pub(super) enum SimulationCommand {
         entity_type_name: String,
         position: Vec3,
     },
+    DamageScriptEntity {
+        entity_id: EntityId,
+        damage: f32,
+    },
     SetWorldTime {
         world_time: u64,
     },
@@ -396,6 +406,7 @@ pub(super) enum SimulationCommand {
     CommitPlayerSurvival(Box<PlayerSurvivalCommand>),
     CommitPlayerPose {
         actor_session: SessionId,
+        kind: PlayerPoseCommitKind,
         pose: super::PlayerPose,
         exhaustion: f32,
         script_teleport_completion: Option<ScriptPlayerTeleportCompletion>,
@@ -457,6 +468,7 @@ impl SimulationCommand {
             #[cfg(test)]
             Self::AttackServerEntity { .. } => "attack_server_entity",
             Self::SpawnCommandEntity { .. } => "spawn_command_entity",
+            Self::DamageScriptEntity { .. } => "damage_script_entity",
             Self::SetWorldTime { .. } => "set_world_time",
             #[cfg(test)]
             Self::EnsureChunkHerd { .. } => "ensure_chunk_herd",
@@ -509,16 +521,28 @@ impl SimulationCommand {
     }
 }
 
-fn regular_player_pose_command(
-    command: &SimulationCommand,
-) -> Option<(SessionId, PlayerPose, f32)> {
+#[derive(Debug, Clone, Copy)]
+pub(super) struct PlayerPoseCommitRequest {
+    pub(super) actor_session: SessionId,
+    pub(super) kind: PlayerPoseCommitKind,
+    pub(super) pose: PlayerPose,
+    pub(super) exhaustion: f32,
+}
+
+fn regular_player_pose_command(command: &SimulationCommand) -> Option<PlayerPoseCommitRequest> {
     match command {
         SimulationCommand::CommitPlayerPose {
             actor_session,
+            kind: PlayerPoseCommitKind::Movement,
             pose,
             exhaustion,
             script_teleport_completion: None,
-        } => Some((*actor_session, *pose, *exhaustion)),
+        } => Some(PlayerPoseCommitRequest {
+            actor_session: *actor_session,
+            kind: PlayerPoseCommitKind::Movement,
+            pose: *pose,
+            exhaustion: *exhaustion,
+        }),
         _ => None,
     }
 }
@@ -539,6 +563,7 @@ pub(super) enum SimulationResponse {
     #[cfg(test)]
     EntityAttack(Option<Box<EntityAttackOutcome>>),
     EntitySpawn(Vec<VisibilityDispatch>),
+    ScriptEntityDamage(Option<ScriptEntityDamageCommit>),
     WorldTimeSet,
     BlockEdits(Result<Box<Option<BlockEditBatchOutcome>>, SimulationRequestError>),
     BlockDrops(Result<Box<Option<BlockEditBatchOutcome>>, SimulationRequestError>),
@@ -562,6 +587,12 @@ pub(super) enum SimulationResponse {
     OpaqueBlockEntity(Result<bool, SimulationRequestError>),
     CampfireUse(Result<Option<Box<CommittedCampfireUse>>, SimulationRequestError>),
     TntIgnition(Result<Option<Box<CommittedTntIgnition>>, SimulationRequestError>),
+}
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub(crate) struct ScriptEntityDamageCommit {
+    pub(crate) health: f32,
+    pub(crate) killed: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -1904,7 +1935,8 @@ impl From<SimulationRequestError> for EntityEffectRequestError {
             | SimulationRequestError::WorldMutationFailed
             | SimulationRequestError::CrossRegion
             | SimulationRequestError::InvalidCommand
-            | SimulationRequestError::StaleSession => Self::Unavailable,
+            | SimulationRequestError::StaleSession
+            | SimulationRequestError::PlayerMovementRejected(_) => Self::Unavailable,
             #[cfg(test)]
             SimulationRequestError::WorldBusy => Self::Busy,
         }
@@ -2194,6 +2226,26 @@ impl SimulationHandle {
             .await?;
         dispatch_visibility_commands(dispatches);
         Ok(())
+    }
+
+    pub(crate) async fn damage_script_entity(
+        &self,
+        entity_id: EntityId,
+        damage: f32,
+    ) -> Result<Option<ScriptEntityDamageCommit>, SimulationRequestError> {
+        if self.session_fence.is_some() || !damage.is_finite() || damage <= 0.0 {
+            return Err(SimulationRequestError::InvalidCommand);
+        }
+        let receiver = self.enqueue_with_fence(
+            None,
+            SimulationCommand::DamageScriptEntity { entity_id, damage },
+        )?;
+        match receiver.await {
+            Ok(Ok(SimulationResponse::ScriptEntityDamage(result))) => Ok(result),
+            Ok(Ok(_)) => Err(SimulationRequestError::ResponseMismatch),
+            Ok(Err(error)) => Err(error),
+            Err(_) => Err(SimulationRequestError::OwnerStopped),
+        }
     }
 
     #[cfg(test)]
@@ -2541,10 +2593,29 @@ impl SimulationHandle {
         pose: super::PlayerPose,
         exhaustion: f32,
     ) -> Result<CommittedPlayerPose, SimulationRequestError> {
+        self.commit_player_pose_with_kind(PlayerPoseCommitKind::Movement, pose, exhaustion)
+            .await
+    }
+
+    pub(super) async fn commit_player_teleport(
+        &self,
+        pose: super::PlayerPose,
+    ) -> Result<CommittedPlayerPose, SimulationRequestError> {
+        self.commit_player_pose_with_kind(PlayerPoseCommitKind::Teleport, pose, 0.0)
+            .await
+    }
+
+    async fn commit_player_pose_with_kind(
+        &self,
+        kind: PlayerPoseCommitKind,
+        pose: super::PlayerPose,
+        exhaustion: f32,
+    ) -> Result<CommittedPlayerPose, SimulationRequestError> {
         let actor_session = self.session_id()?;
         let receiver = self
             .enqueue_player_command_wait(SimulationCommand::CommitPlayerPose {
                 actor_session,
+                kind,
                 pose,
                 exhaustion,
                 script_teleport_completion: None,
@@ -2778,6 +2849,36 @@ impl SimulationHandle {
     }
 }
 
+#[derive(Clone, Copy)]
+pub(crate) struct ExplosionRegistries<'a> {
+    blocks: &'a BlockRegistry,
+    items: &'a mc_data::items::ItemRegistry,
+    entity_types: &'a mc_data::entity_types::EntityTypeRegistry,
+}
+
+impl<'a> ExplosionRegistries<'a> {
+    pub(crate) fn from_config(config: &'a crate::server::ServerConfig) -> Self {
+        Self {
+            blocks: &config.blocks,
+            items: &config.items,
+            entity_types: &config.entity_types,
+        }
+    }
+
+    #[cfg(test)]
+    fn new(
+        blocks: &'a BlockRegistry,
+        items: &'a mc_data::items::ItemRegistry,
+        entity_types: &'a mc_data::entity_types::EntityTypeRegistry,
+    ) -> Self {
+        Self {
+            blocks,
+            items,
+            entity_types,
+        }
+    }
+}
+
 #[derive(Debug)]
 pub(crate) struct SimulationOwner {
     receiver: mpsc::Receiver<SimulationCommandEnvelope>,
@@ -2786,6 +2887,7 @@ pub(crate) struct SimulationOwner {
     metrics: Arc<SimulationQueueMetrics>,
     authority: SimulationAuthority,
     region_ownership: RegionOwnership,
+    player_movement_authority: Option<PlayerMovementAuthorityResources>,
     explosion_random: JavaLegacyRandom,
     #[cfg(test)]
     last_region_routes: Vec<RegionCommandRoute>,
@@ -2859,6 +2961,19 @@ impl BlockDropJournalAppendError {
 }
 
 impl SimulationOwner {
+    pub(crate) fn configure_player_movement_authority(
+        &mut self,
+        world_read: WorldReadView,
+        blocks: Arc<BlockRegistry>,
+        block_facts: Arc<BlockFactsTable>,
+    ) {
+        self.player_movement_authority = Some(PlayerMovementAuthorityResources::new(
+            world_read,
+            blocks,
+            block_facts,
+        ));
+    }
+
     fn prepare_single_lane_region_routes(
         &mut self,
         batch: &[SimulationCommandEnvelope],
@@ -2920,11 +3035,15 @@ impl SimulationOwner {
         #[cfg(test)]
         self.release_retryable_herd_requests(pending.retryable_chunks());
         dispatch_visibility_commands(pending.into_dispatches());
+        sessions.tick_weather(ticks);
         dispatch_visibility_commands(
             sessions
                 .item_pickup_ready_dispatches_owned(&self.authority, sessions.simulation_tick()),
         );
         dispatch_visibility_commands(sessions.tick_sleep_owned(&self.authority));
+        dispatch_visibility_commands(
+            sessions.tick_player_effects_owned(&self.authority, sessions.simulation_tick()),
+        );
         sessions.world_time()
     }
 
@@ -2935,13 +3054,16 @@ impl SimulationOwner {
         world: Option<&WorldHandle>,
         block_light: Option<&BlockLightTable>,
         block_facts: &BlockFactsTable,
-        blocks: &BlockRegistry,
+        registries: ExplosionRegistries<'_>,
         materials: Option<&BlockMaterialIds>,
         zone_protection: F,
     ) -> usize
     where
         F: FnOnce() -> Option<crate::script::ZoneProtectionSnapshot>,
     {
+        let blocks = registries.blocks;
+        let items = registries.items;
+        let entity_types = registries.entity_types;
         let current_tick = sessions.simulation_tick();
         let expired_tnt = sessions.claim_due_primed_tnt(&self.authority, current_tick);
         if expired_tnt.is_empty() {
@@ -2981,11 +3103,10 @@ impl SimulationOwner {
             HashMap::new();
         let mut chained_tnt = HashMap::<EntityId, Vec<_>>::new();
         let mut explosion_drops = HashMap::<EntityId, Vec<_>>::new();
-        let explosion_items = mc_data::items::solaris_required_items();
-        let explosion_item_entity_type_id = mc_data::entity_types::solaris_required_entity_types()
+        let explosion_item_entity_type_id = entity_types
             .id_of(&mc_data::Identifier::parse("minecraft:item").expect("static item entity id"))
             .and_then(|id| i32::try_from(id).ok());
-        let chained_tnt_entity_type_id = mc_data::entity_types::solaris_required_entity_types()
+        let chained_tnt_entity_type_id = entity_types
             .id_of(&mc_data::Identifier::parse(TNT_ENTITY_TYPE_NAME).expect("static TNT entity id"))
             .and_then(|id| i32::try_from(id).ok());
         if let Some(world) = world {
@@ -2995,27 +3116,34 @@ impl SimulationOwner {
                 let air = expired.air;
                 let center = expired.center();
                 let power = expired.power();
-                let Ok(candidates) = plan_explosion_candidates(
-                    center,
-                    power,
-                    &mut self.explosion_random,
-                    |position| {
-                        let state = storage.get_block(position).ok().flatten()?;
-                        let resistance = if state == air {
-                            None
-                        } else {
-                            Some(block_facts.explosion_resistance(state.0)?)
-                        };
-                        Some(ExplosionBlockSample {
-                            resistance,
-                            explodable: zone_protection.as_ref().is_none_or(|protection| {
-                                protection
-                                    .ambient_block_mutation_allowed("minecraft:overworld", position)
-                            }),
-                        })
-                    },
-                ) else {
-                    continue;
+                let candidates = if expired.destroys_blocks() {
+                    let Ok(candidates) = plan_explosion_candidates(
+                        center,
+                        power,
+                        &mut self.explosion_random,
+                        |position| {
+                            let state = storage.get_block(position).ok().flatten()?;
+                            let resistance = if state == air {
+                                None
+                            } else {
+                                Some(block_facts.explosion_resistance(state.0)?)
+                            };
+                            Some(ExplosionBlockSample {
+                                resistance,
+                                explodable: zone_protection.as_ref().is_none_or(|protection| {
+                                    protection.ambient_block_mutation_allowed(
+                                        "minecraft:overworld",
+                                        position,
+                                    )
+                                }),
+                            })
+                        },
+                    ) else {
+                        continue;
+                    };
+                    candidates
+                } else {
+                    HashSet::new()
                 };
 
                 let block_count = i32::try_from(candidates.len()).unwrap_or(i32::MAX);
@@ -3028,8 +3156,14 @@ impl SimulationOwner {
                             let feet = Vec3::new(target.pose.x, target.pose.y, target.pose.z);
                             plan_player_explosion_impact(center, power, feet, |position| {
                                 explosion_collision_boxes(&mut storage, materials, position)
+                                    .or_else(|| (!expired.destroys_blocks()).then(Vec::new))
                             })
-                            .map(|impact| (target.session_id, impact))
+                            .map(|mut impact| {
+                                if !expired.damages_entities() {
+                                    impact.damage = 0.0;
+                                }
+                                (target.session_id, impact)
+                            })
                         })
                         .collect();
                     player_impacts.insert(entity_id, impacts);
@@ -3047,12 +3181,61 @@ impl SimulationOwner {
                                 target.aabb_max,
                                 |position| {
                                     explosion_collision_boxes(&mut storage, materials, position)
+                                        .or_else(|| (!expired.destroys_blocks()).then(Vec::new))
                                 },
                             )
                             .map(|impact: EntityExplosionImpact| {
                                 ServerEntityExplosionImpact {
                                     entity_id: target.entity_id,
-                                    damage: impact.damage,
+                                    damage: if expired.damages_entities() {
+                                        impact.damage
+                                    } else {
+                                        0.0
+                                    },
+                                    knockback: impact.knockback,
+                                }
+                            })
+                        })
+                        .collect();
+                    entity_impacts.insert(entity_id, impacts);
+                } else if !expired.destroys_blocks() {
+                    let impacts = expired
+                        .explosion_targets()
+                        .iter()
+                        .filter_map(|target| {
+                            let feet = Vec3::new(target.pose.x, target.pose.y, target.pose.z);
+                            plan_player_explosion_impact(center, power, feet, |_| Some(Vec::new()))
+                                .map(|mut impact| {
+                                    if !expired.damages_entities() {
+                                        impact.damage = 0.0;
+                                    }
+                                    (target.session_id, impact)
+                                })
+                        })
+                        .collect();
+                    player_impacts.insert(entity_id, impacts);
+                    let impacts = entity_targets
+                        .get(&entity_id)
+                        .into_iter()
+                        .flatten()
+                        .filter_map(|target| {
+                            plan_entity_explosion_impact(
+                                center,
+                                power,
+                                target.position,
+                                target.eye_position,
+                                target.aabb_min,
+                                target.aabb_max,
+                                |_| Some(Vec::new()),
+                            )
+                            .map(|impact: EntityExplosionImpact| {
+                                ServerEntityExplosionImpact {
+                                    entity_id: target.entity_id,
+                                    damage: if expired.damages_entities() {
+                                        impact.damage
+                                    } else {
+                                        0.0
+                                    },
                                     knockback: impact.knockback,
                                 }
                             })
@@ -3136,7 +3319,7 @@ impl SimulationOwner {
                             continue;
                         };
                         for drop in drops {
-                            let Some(item_id) = explosion_items.id_of(&drop.item) else {
+                            let Some(item_id) = items.id_of(&drop.item) else {
                                 continue;
                             };
                             let Ok(count) = drop.count.try_sample(0) else {
@@ -3200,15 +3383,13 @@ impl SimulationOwner {
                 }
             }
 
-            let mut drop_dispatches = Vec::new();
-            for drop in explosion_drops.remove(&entity_id).unwrap_or_default() {
-                drop_dispatches.extend(sessions.spawn_item_drop_owned(
-                    &self.authority,
-                    drop.entity_type_id,
-                    drop.position,
-                    drop.stack,
-                ));
-            }
+            let drops = explosion_drops.remove(&entity_id).unwrap_or_default();
+            let drop_dispatches = sessions.spawn_item_drop_batch_owned(
+                &self.authority,
+                drops
+                    .into_iter()
+                    .map(|drop| (drop.entity_type_id, drop.position, drop.stack)),
+            );
             dispatch_visibility_commands(drop_dispatches);
 
             let block_count = candidate_counts.get(&entity_id).copied().unwrap_or(0);
@@ -3293,6 +3474,11 @@ impl SimulationOwner {
         let (attacks, dispatches) = sessions.tick_hostile_attacks(&self.authority, tick, air);
         dispatch_visibility_commands(dispatches);
         attacks
+    }
+
+    pub(crate) fn tick_dragon_authority(&self, sessions: &SessionRegistry, tick: u64) {
+        dispatch_visibility_commands(sessions.tick_dragon_air_combat(&self.authority, tick));
+        dispatch_visibility_commands(sessions.tick_dragon_breath_clouds(&self.authority, tick));
     }
 
     pub(crate) fn tick_village_defense(
@@ -3472,7 +3658,7 @@ impl SimulationOwner {
         tick: u64,
         expected: &[EntityPhysicsQuery],
         steps: &[EntityPhysicsStep],
-        arrow_physics_facts: &[ArrowPhysicsFact],
+        projectile_physics_facts: &EntityProjectilePhysicsFacts,
     ) -> Vec<EntityPhysicsStep> {
         sessions.apply_entity_physics_if_current_and_dispatch_owned(
             &self.authority,
@@ -3480,7 +3666,7 @@ impl SimulationOwner {
             tick,
             expected,
             steps,
-            arrow_physics_facts,
+            projectile_physics_facts,
         )
     }
 
@@ -4652,6 +4838,706 @@ impl SimulationOwner {
         }
     }
 
+    fn process_regular_player_pose_batch(
+        &self,
+        sessions: &SessionRegistry,
+        first_envelope: SimulationCommandEnvelope,
+        first_pose: PlayerPoseCommitRequest,
+        batch: &mut VecDeque<SimulationCommandEnvelope>,
+    ) -> usize {
+        let mut pose_envelopes = vec![first_envelope];
+        let mut pose_requests = vec![first_pose];
+        while let Some(next) = batch.front() {
+            let Some(request) = regular_player_pose_command(&next.command) else {
+                break;
+            };
+            if next.response_is_closed()
+                || next
+                    .session_fence
+                    .is_some_and(|session_id| !sessions.is_active_session(session_id))
+            {
+                break;
+            }
+            pose_requests.push(request);
+            pose_envelopes.push(batch.pop_front().expect("matching pose command"));
+        }
+        let command_count = pose_envelopes.len();
+        #[cfg(feature = "load-bench")]
+        let command_started = Instant::now();
+        let outcomes = sessions.commit_player_pose_batch(
+            &self.authority,
+            pose_requests,
+            self.player_movement_authority.as_ref(),
+        );
+        #[cfg(feature = "load-bench")]
+        {
+            let command_elapsed_us =
+                u64::try_from(command_started.elapsed().as_micros()).unwrap_or(u64::MAX);
+            self.metrics.record_command_kind_batch(
+                "commit_player_pose",
+                command_count,
+                command_elapsed_us,
+            );
+        }
+        let mut dispatches = Vec::new();
+        let mut responses = Vec::with_capacity(command_count);
+        for outcome in outcomes {
+            match outcome {
+                Ok((mut pose_dispatches, committed)) => {
+                    dispatches.append(&mut pose_dispatches);
+                    responses.push(SimulationResponse::PlayerPose(Ok(committed)));
+                }
+                Err(error) => {
+                    responses.push(SimulationResponse::PlayerPose(Err(error)));
+                }
+            }
+        }
+        dispatch_visibility_commands(dispatches);
+        for (envelope, response) in pose_envelopes.into_iter().zip(responses) {
+            envelope.respond(Ok(response));
+        }
+        self.metrics
+            .processed
+            .fetch_add(command_count as u64, Ordering::Relaxed);
+        command_count
+    }
+
+    fn read_block_snapshot_response(
+        &self,
+        storage: Option<&mut WorldStorage>,
+        world_error: SimulationRequestError,
+        resident_block_snapshot: Option<(BlockPos, BlockMutationSnapshot)>,
+        position: BlockPos,
+    ) -> SimulationResponse {
+        let result = if let Some((snapshot_position, snapshot)) = resident_block_snapshot
+            && snapshot_position == position
+        {
+            Ok(Some(snapshot))
+        } else if let Some(storage) = storage {
+            match storage.get_block(position) {
+                Ok(Some(state)) => Ok(storage
+                    .block_mutation_token(position)
+                    .map(|token| BlockMutationSnapshot { state, token })),
+                Ok(None) => Ok(None),
+                Err(error) => {
+                    self.metrics
+                        .rejected_world_mutation
+                        .fetch_add(1, Ordering::Relaxed);
+                    warn!(%error, ?position, "simulation block snapshot read failed");
+                    Err(SimulationRequestError::WorldMutationFailed)
+                }
+            }
+        } else {
+            self.record_world_access_error(world_error);
+            Err(world_error)
+        };
+        SimulationResponse::BlockSnapshot(result)
+    }
+
+    fn read_chest_snapshot_response(
+        &self,
+        sessions: &SessionRegistry,
+        storage: Option<&mut WorldStorage>,
+        world_error: SimulationRequestError,
+        positions: &[BlockPos],
+    ) -> SimulationResponse {
+        let result = if positions.is_empty()
+            || positions.len() > 2
+            || positions.windows(2).any(|pair| pair[0] == pair[1])
+        {
+            Err(SimulationRequestError::InvalidCommand)
+        } else if let Some(storage) = storage {
+            let mut chests = Vec::with_capacity(positions.len());
+            let mut error = None;
+            for position in positions {
+                match storage.chest_block_entity(*position) {
+                    Ok(Some(chest)) => chests.push(chest),
+                    Ok(None) => {
+                        error = Some(SimulationRequestError::WorldUnavailable);
+                        break;
+                    }
+                    Err(storage_error) => {
+                        self.metrics
+                            .rejected_world_mutation
+                            .fetch_add(1, Ordering::Relaxed);
+                        warn!(%storage_error, ?position, "simulation chest snapshot read failed");
+                        error = Some(SimulationRequestError::WorldMutationFailed);
+                        break;
+                    }
+                }
+            }
+            if let Some(error) = error {
+                Err(error)
+            } else {
+                Ok(Box::new(ChestReadSnapshot {
+                    state_id: sessions.chest_state_id(positions[0]),
+                    view: ChestView { chests },
+                }))
+            }
+        } else {
+            self.record_world_access_error(world_error);
+            Err(world_error)
+        };
+        SimulationResponse::ChestSnapshot(result)
+    }
+
+    fn read_furnace_snapshot_response(
+        &self,
+        sessions: &SessionRegistry,
+        storage: Option<&mut WorldStorage>,
+        world_error: SimulationRequestError,
+        position: BlockPos,
+    ) -> SimulationResponse {
+        let result = if let Some(storage) = storage {
+            match storage.furnace_block_entity(position) {
+                Ok(Some(furnace)) => Ok(Box::new(FurnaceReadSnapshot {
+                    furnace,
+                    state_id: sessions.furnace_state_id(position),
+                })),
+                Ok(None) => Err(SimulationRequestError::WorldUnavailable),
+                Err(storage_error) => {
+                    self.metrics
+                        .rejected_world_mutation
+                        .fetch_add(1, Ordering::Relaxed);
+                    warn!(%storage_error, ?position, "simulation furnace snapshot read failed");
+                    Err(SimulationRequestError::WorldMutationFailed)
+                }
+            }
+        } else {
+            self.record_world_access_error(world_error);
+            Err(world_error)
+        };
+        SimulationResponse::FurnaceSnapshot(result)
+    }
+
+    fn save_barrier_response(
+        &self,
+        sessions: &SessionRegistry,
+        storage: Option<&mut WorldStorage>,
+        world_error: SimulationRequestError,
+        capture_world: bool,
+    ) -> SimulationResponse {
+        let simulation_tick = sessions.simulation_tick();
+        let world_flush_plan = if capture_world {
+            match storage {
+                Some(storage) => match storage.plan_dirty_flush_at_tick(simulation_tick) {
+                    Ok(plan) => Ok(Some(plan)),
+                    Err(error) => {
+                        self.metrics
+                            .rejected_world_mutation
+                            .fetch_add(1, Ordering::Relaxed);
+                        warn!(%error, "simulation save barrier world plan failed");
+                        Err(SimulationRequestError::WorldMutationFailed)
+                    }
+                },
+                None => {
+                    self.record_world_access_error(world_error);
+                    Err(world_error)
+                }
+            }
+        } else {
+            Ok(None)
+        };
+        SimulationResponse::SaveSnapshot(world_flush_plan.map(|world_flush_plan| {
+            let (entities, entity_journal_phases) = sessions.persisted_entity_save_snapshot();
+            Box::new(SimulationSaveSnapshot {
+                players: sessions.persisted_player_states(),
+                entities,
+                entity_journal_phases,
+                world_chunk_journal_watermark: sessions.world_chunk_journal_watermark(),
+                world_time: sessions.world_time(),
+                daylight_cycle_enabled: sessions.daylight_cycle_enabled(),
+                weather: sessions.weather(),
+                players_sleeping_percentage: sessions.players_sleeping_percentage(),
+                keep_inventory: sessions.keep_inventory(),
+                simulation_tick,
+                world_flush_plan,
+            })
+        }))
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn pickup_item_response(
+        &self,
+        sessions: &SessionRegistry,
+        entity_id: EntityId,
+        collector_session: SessionId,
+        expected_item_id: u32,
+        expected_damage: Option<i32>,
+        expected_enchantments: &[mc_data::ItemEnchantment],
+        max_stack: i32,
+    ) -> SimulationResponse {
+        let mut credited = sessions
+            .pickup_item_into_inventory(
+                &self.authority,
+                entity_id,
+                collector_session,
+                expected_item_id,
+                expected_damage,
+                expected_enchantments,
+                max_stack,
+            )
+            .map(Box::new);
+        if let Some(credited) = credited.as_mut() {
+            dispatch_visibility_commands(std::mem::take(&mut credited.dispatches));
+        }
+        SimulationResponse::ItemPickupCredit(credited)
+    }
+
+    fn pickup_experience_response(
+        &self,
+        sessions: &SessionRegistry,
+        entity_id: EntityId,
+        collector_session: SessionId,
+    ) -> SimulationResponse {
+        let mut credited = sessions
+            .pickup_experience_into_player(&self.authority, entity_id, collector_session)
+            .map(Box::new);
+        if let Some(credited) = credited.as_mut() {
+            dispatch_visibility_commands(std::mem::take(&mut credited.dispatches));
+        }
+        SimulationResponse::ExperiencePickupCredit(credited)
+    }
+
+    fn pickup_arrow_response(
+        &self,
+        sessions: &SessionRegistry,
+        entity_id: EntityId,
+        collector_session: SessionId,
+        arrow_item_id: u32,
+        max_stack: i32,
+    ) -> SimulationResponse {
+        let mut credited = sessions
+            .pickup_arrow_into_inventory(
+                &self.authority,
+                entity_id,
+                collector_session,
+                arrow_item_id,
+                max_stack,
+            )
+            .map(Box::new);
+        if let Some(credited) = credited.as_mut() {
+            dispatch_visibility_commands(std::mem::take(&mut credited.dispatches));
+        }
+        SimulationResponse::ArrowPickupCredit(credited)
+    }
+
+    fn player_attack_response(
+        &self,
+        sessions: &SessionRegistry,
+        attacker_session: SessionId,
+        entity_id: EntityId,
+        damage: f32,
+        attacker_costs: Option<&PlayerSurvivalPlan>,
+        cooldown_tick: u64,
+    ) -> SimulationResponse {
+        let authority_tick = sessions.simulation_tick();
+        let mut result = sessions.player_attack_entity(
+            &self.authority,
+            PlayerEntityAttack {
+                attacker_session,
+                entity_id,
+                amount: damage,
+                attacker_costs,
+                authority_tick,
+            },
+        );
+        if let PlayerAttackResult::Damaged(outcome) = &mut result
+            && let EntityAttackOutcome::PlayerDamaged { dispatches, .. } = &mut **outcome
+        {
+            dispatch_visibility_commands(std::mem::take(dispatches));
+        }
+        if !matches!(result, PlayerAttackResult::ValidationRejected) {
+            sessions.publish_player_attack(
+                attacker_session,
+                entity_id.0,
+                cooldown_tick,
+                authority_tick,
+            );
+        }
+        SimulationResponse::PlayerAttack(result)
+    }
+
+    fn entity_effect_response(
+        &self,
+        sessions: &SessionRegistry,
+        command: &ServerEntityEffectCommand,
+    ) -> SimulationResponse {
+        let request = EntityEffectRequest {
+            operation: command.operation.clone(),
+            target_kind: command.target_kind,
+            death_remove_tick: sessions
+                .simulation_tick()
+                .saturating_add(ENTITY_DEATH_TICKS),
+        };
+        let (result, dispatches) = sessions.apply_server_entity_effect_request(
+            &self.authority,
+            command.expected.as_deref().cloned(),
+            command.entity_id,
+            request,
+        );
+        match &result {
+            EntityEffectResult::Applied(applied) => {
+                trace!(
+                    entity_id = applied.snapshot.id.0,
+                    health = applied.snapshot.health,
+                    "server entity effect transaction accepted"
+                );
+            }
+            EntityEffectResult::Rejected(rejection) => {
+                trace!(
+                    entity_id = command.entity_id.0,
+                    ?rejection,
+                    "server entity effect transaction rejected"
+                );
+            }
+        }
+        dispatch_visibility_commands(dispatches);
+        SimulationResponse::EntityEffect(result)
+    }
+
+    fn set_world_time_response(
+        &self,
+        sessions: &SessionRegistry,
+        world_time: u64,
+    ) -> SimulationResponse {
+        let outcome = sessions.set_world_time_owned(&self.authority, world_time);
+        #[cfg(test)]
+        self.release_retryable_herd_requests(outcome.retryable_chunks());
+        dispatch_visibility_commands(outcome.into_dispatches());
+        SimulationResponse::WorldTimeSet
+    }
+
+    fn spawn_command_entity_response(
+        &self,
+        sessions: &SessionRegistry,
+        entity_type_id: i32,
+        entity_type_name: &str,
+        position: Vec3,
+    ) -> SimulationResponse {
+        SimulationResponse::EntitySpawn(sessions.spawn_command_entity(
+            &self.authority,
+            entity_type_id,
+            entity_type_name.to_owned(),
+            position,
+        ))
+    }
+
+    fn script_entity_damage_response(
+        &self,
+        sessions: &SessionRegistry,
+        entity_id: EntityId,
+        damage: f32,
+    ) -> SimulationResponse {
+        let result = sessions
+            .damage_script_entity(&self.authority, entity_id, damage)
+            .map(|mut outcome| {
+                let (health, killed) = match &outcome {
+                    EntityAttackOutcome::Damaged { damage, .. } => (damage.snapshot.health, false),
+                    EntityAttackOutcome::Killed { damage, .. } => (damage.snapshot.health, true),
+                    EntityAttackOutcome::PlayerDamaged { .. } => {
+                        unreachable!("script entity damage never targets players")
+                    }
+                };
+                dispatch_visibility_commands(std::mem::take(outcome.dispatches_mut()));
+                ScriptEntityDamageCommit { health, killed }
+            });
+        SimulationResponse::ScriptEntityDamage(result)
+    }
+
+    fn food_use_response(
+        &self,
+        sessions: &SessionRegistry,
+        command: &FoodUseCommand,
+    ) -> SimulationResponse {
+        let result = if valid_food_use_plan(&command.plan) {
+            Ok(sessions
+                .commit_food_use(&self.authority, command.actor_session, &command.plan)
+                .map(Box::new))
+        } else {
+            Err(SimulationRequestError::InvalidCommand)
+        };
+        SimulationResponse::FoodUse(result)
+    }
+
+    fn animal_feed_response(
+        &self,
+        sessions: &SessionRegistry,
+        command: &AnimalFeedCommand,
+    ) -> SimulationResponse {
+        let result = if valid_animal_feed_plan(&command.plan) {
+            Ok(sessions
+                .commit_animal_feed(&self.authority, command.actor_session, &command.plan)
+                .map(|mut committed| {
+                    dispatch_visibility_commands(std::mem::take(&mut committed.dispatches));
+                    Box::new(committed)
+                }))
+        } else {
+            Err(SimulationRequestError::InvalidCommand)
+        };
+        SimulationResponse::AnimalFeed(result)
+    }
+
+    fn merchant_trade_response(
+        &self,
+        sessions: &SessionRegistry,
+        command: &MerchantTradeCommand,
+    ) -> SimulationResponse {
+        let result = if valid_merchant_trade_plan(&command.plan) {
+            Ok(sessions
+                .commit_merchant_trade(&self.authority, command.actor_session, &command.plan)
+                .map(|mut committed| {
+                    dispatch_visibility_commands(std::mem::take(&mut committed.dispatches));
+                    Box::new(committed)
+                }))
+        } else {
+            Err(SimulationRequestError::InvalidCommand)
+        };
+        SimulationResponse::MerchantTrade(result)
+    }
+
+    fn sheep_shear_response(
+        &self,
+        sessions: &SessionRegistry,
+        command: &SheepShearCommand,
+    ) -> SimulationResponse {
+        let result = if valid_sheep_shear_plan(&command.plan) {
+            Ok(sessions
+                .commit_sheep_shear(&self.authority, command.actor_session, &command.plan)
+                .map(|mut committed| {
+                    dispatch_visibility_commands(std::mem::take(&mut committed.dispatches));
+                    Box::new(committed)
+                }))
+        } else {
+            Err(SimulationRequestError::InvalidCommand)
+        };
+        SimulationResponse::SheepShear(result)
+    }
+
+    fn zombie_villager_cure_response(
+        &self,
+        sessions: &SessionRegistry,
+        command: &ZombieVillagerCureCommand,
+    ) -> SimulationResponse {
+        let result = if valid_zombie_villager_cure_plan(&command.plan) {
+            Ok(sessions
+                .commit_zombie_villager_cure(&self.authority, command.actor_session, &command.plan)
+                .map(|mut committed| {
+                    dispatch_visibility_commands(std::mem::take(&mut committed.dispatches));
+                    Box::new(committed)
+                }))
+        } else {
+            Err(SimulationRequestError::InvalidCommand)
+        };
+        SimulationResponse::ZombieVillagerCure(result)
+    }
+
+    fn player_survival_response(
+        &self,
+        sessions: &SessionRegistry,
+        command: &PlayerSurvivalCommand,
+    ) -> SimulationResponse {
+        let result = if valid_player_survival_plan(&command.plan) {
+            Ok(sessions
+                .commit_player_survival(&self.authority, command.actor_session, &command.plan)
+                .map(|outcome| {
+                    Box::new(match outcome {
+                        PlayerSurvivalCommitOutcome::Committed(mut committed) => {
+                            dispatch_visibility_commands(std::mem::take(&mut committed.dispatches));
+                            PlayerSurvivalCommitOutcome::Committed(committed)
+                        }
+                        rejected => rejected,
+                    })
+                }))
+        } else {
+            Err(SimulationRequestError::InvalidCommand)
+        };
+        SimulationResponse::PlayerSurvival(result)
+    }
+
+    fn player_pose_response(
+        &self,
+        sessions: &SessionRegistry,
+        actor_session: SessionId,
+        kind: PlayerPoseCommitKind,
+        pose: PlayerPose,
+        exhaustion: f32,
+    ) -> SimulationResponse {
+        let result = sessions
+            .commit_player_pose_request(
+                &self.authority,
+                PlayerPoseCommitRequest {
+                    actor_session,
+                    kind,
+                    pose,
+                    exhaustion,
+                },
+                self.player_movement_authority.as_ref(),
+            )
+            .map(|(dispatches, committed)| {
+                dispatch_visibility_commands(dispatches);
+                committed
+            });
+        SimulationResponse::PlayerPose(result)
+    }
+
+    fn player_state_event_response(
+        &self,
+        sessions: &SessionRegistry,
+        actor_session: SessionId,
+        event: PlayerStateEvent,
+    ) -> SimulationResponse {
+        let result = sessions
+            .commit_player_state_event(&self.authority, actor_session, event)
+            .map(dispatch_visibility_commands);
+        SimulationResponse::PlayerStateEvent(result)
+    }
+
+    fn player_inventory_response(
+        &self,
+        sessions: &SessionRegistry,
+        actor_session: SessionId,
+        player: &ContainerPlayerPlan,
+    ) -> SimulationResponse {
+        let mut result = if valid_container_player_plan(player) {
+            sessions
+                .commit_player_inventory(&self.authority, actor_session, player)
+                .map_err(|error| match error {
+                    PlayerInventoryCommitError::MissingPlayer => {
+                        SimulationRequestError::StaleSession
+                    }
+                })
+        } else {
+            Err(SimulationRequestError::InvalidCommand)
+        };
+        if let Ok(PlayerInventoryCommitOutcome::Committed { dispatches, .. }) = &mut result {
+            dispatch_visibility_commands(std::mem::take(dispatches));
+        }
+        SimulationResponse::PlayerInventory(Box::new(result))
+    }
+
+    fn bow_release_response(
+        &self,
+        sessions: &SessionRegistry,
+        command: &BowReleaseCommand,
+    ) -> SimulationResponse {
+        let result = if valid_bow_release_plan(&command.plan) {
+            Ok(sessions
+                .commit_bow_release(&self.authority, command.actor_session, &command.plan)
+                .map(|mut committed| {
+                    dispatch_visibility_commands(std::mem::take(&mut committed.dispatches));
+                    Box::new(committed)
+                }))
+        } else {
+            Err(SimulationRequestError::InvalidCommand)
+        };
+        SimulationResponse::BowRelease(result)
+    }
+
+    fn selected_item_drop_response(
+        &self,
+        sessions: &SessionRegistry,
+        command: &SelectedItemDropCommand,
+    ) -> SimulationResponse {
+        let result = if valid_selected_item_drop_plan(&command.plan) {
+            Ok(sessions
+                .commit_selected_item_drop(&self.authority, command.actor_session, &command.plan)
+                .map(|mut committed| {
+                    dispatch_visibility_commands(std::mem::take(&mut committed.dispatches));
+                    Box::new(committed)
+                }))
+        } else {
+            Err(SimulationRequestError::InvalidCommand)
+        };
+        SimulationResponse::SelectedItemDrop(result)
+    }
+
+    fn chest_commit_response(
+        &self,
+        sessions: &SessionRegistry,
+        storage: Option<&mut WorldStorage>,
+        world_error: SimulationRequestError,
+        request: ChestCommitRequest<'_>,
+    ) -> SimulationResponse {
+        let mut result = self.commit_chest_command(sessions, storage, world_error, request);
+        if let Ok(outcome) = &mut result
+            && let SharedContainerCommit::Committed { dispatches, .. } = outcome.as_mut()
+        {
+            dispatch_visibility_commands(std::mem::take(dispatches));
+        }
+        SimulationResponse::ChestCommit(result)
+    }
+
+    fn furnace_commit_response(
+        &self,
+        sessions: &SessionRegistry,
+        storage: Option<&mut WorldStorage>,
+        world_error: SimulationRequestError,
+        request: FurnaceCommitRequest<'_>,
+    ) -> SimulationResponse {
+        let mut result = self.commit_furnace_command(sessions, storage, world_error, request);
+        if let Ok(outcome) = &mut result
+            && let SharedContainerCommit::Committed { dispatches, .. } = outcome.as_mut()
+        {
+            dispatch_visibility_commands(std::mem::take(dispatches));
+        }
+        SimulationResponse::FurnaceCommit(result)
+    }
+
+    fn opaque_block_entity_response(
+        &self,
+        storage: Option<&mut WorldStorage>,
+        world_error: SimulationRequestError,
+        position: BlockPos,
+        expected_state: BlockStateId,
+        expected_token: BlockMutationToken,
+        bytes: &[u8],
+    ) -> SimulationResponse {
+        SimulationResponse::OpaqueBlockEntity(self.commit_opaque_block_entity_command(
+            storage,
+            world_error,
+            position,
+            expected_state,
+            expected_token,
+            bytes.to_vec(),
+        ))
+    }
+
+    fn campfire_use_response(
+        &self,
+        sessions: &SessionRegistry,
+        storage: Option<&mut WorldStorage>,
+        world_error: SimulationRequestError,
+        command: &CampfireUseCommand,
+    ) -> SimulationResponse {
+        let result = if !valid_campfire_use_plan(&command.plan) {
+            Err(SimulationRequestError::InvalidCommand)
+        } else if let Some(storage) = storage {
+            sessions
+                .commit_campfire_use(
+                    &self.authority,
+                    storage,
+                    command.actor_session,
+                    &command.plan,
+                )
+                .map(|committed| {
+                    committed.map(|committed| {
+                        dispatch_visibility_commands(sessions.block_entity_data_dispatches(
+                            command.plan.position,
+                            Some(command.actor_session),
+                            CAMPFIRE_BLOCK_ENTITY_TYPE_ID,
+                            command.plan.client_nbt.clone(),
+                        ));
+                        Box::new(committed)
+                    })
+                })
+        } else {
+            self.record_world_access_error(world_error);
+            Err(world_error)
+        };
+        SimulationResponse::CampfireUse(result)
+    }
+
     fn process_batch(
         &mut self,
         sessions: &SessionRegistry,
@@ -4728,57 +5614,8 @@ impl SimulationOwner {
                 continue;
             }
             if let Some(first_pose) = regular_player_pose_command(&envelope.command) {
-                let mut pose_envelopes = vec![envelope];
-                let mut pose_requests = vec![first_pose];
-                while let Some(next) = batch.front() {
-                    let Some(request) = regular_player_pose_command(&next.command) else {
-                        break;
-                    };
-                    if next.response_is_closed()
-                        || next
-                            .session_fence
-                            .is_some_and(|session_id| !sessions.is_active_session(session_id))
-                    {
-                        break;
-                    }
-                    pose_requests.push(request);
-                    pose_envelopes.push(batch.pop_front().expect("matching pose command"));
-                }
-                let command_count = pose_envelopes.len();
-                #[cfg(feature = "load-bench")]
-                let command_started = Instant::now();
-                let outcomes = sessions.commit_player_pose_batch(&self.authority, pose_requests);
-                #[cfg(feature = "load-bench")]
-                {
-                    let command_elapsed_us =
-                        u64::try_from(command_started.elapsed().as_micros()).unwrap_or(u64::MAX);
-                    self.metrics.record_command_kind_batch(
-                        "commit_player_pose",
-                        command_count,
-                        command_elapsed_us,
-                    );
-                }
-                let mut dispatches = Vec::new();
-                let mut responses = Vec::with_capacity(command_count);
-                for outcome in outcomes {
-                    match outcome {
-                        Ok((mut pose_dispatches, committed)) => {
-                            dispatches.append(&mut pose_dispatches);
-                            responses.push(SimulationResponse::PlayerPose(Ok(committed)));
-                        }
-                        Err(error) => {
-                            responses.push(SimulationResponse::PlayerPose(Err(error)));
-                        }
-                    }
-                }
-                dispatch_visibility_commands(dispatches);
-                for (envelope, response) in pose_envelopes.into_iter().zip(responses) {
-                    envelope.respond(Ok(response));
-                }
-                processed += command_count;
-                self.metrics
-                    .processed
-                    .fetch_add(command_count as u64, Ordering::Relaxed);
+                processed += self
+                    .process_regular_player_pose_batch(sessions, envelope, first_pose, &mut batch);
                 continue;
             }
             let detached = envelope.is_detached();
@@ -4837,135 +5674,33 @@ impl SimulationOwner {
             #[cfg(feature = "load-bench")]
             let command_started = Instant::now();
             let mut response = match &envelope.command {
-                SimulationCommand::SaveBarrier { capture_world } => {
-                    let simulation_tick = sessions.simulation_tick();
-                    let world_flush_plan = if *capture_world {
-                        match storage.as_deref_mut() {
-                            Some(storage) => {
-                                match storage.plan_dirty_flush_at_tick(simulation_tick) {
-                                    Ok(plan) => Ok(Some(plan)),
-                                    Err(error) => {
-                                        self.metrics
-                                            .rejected_world_mutation
-                                            .fetch_add(1, Ordering::Relaxed);
-                                        warn!(%error, "simulation save barrier world plan failed");
-                                        Err(SimulationRequestError::WorldMutationFailed)
-                                    }
-                                }
-                            }
-                            None => {
-                                self.record_world_access_error(world_error);
-                                Err(world_error)
-                            }
-                        }
-                    } else {
-                        Ok(None)
-                    };
-                    SimulationResponse::SaveSnapshot(world_flush_plan.map(|world_flush_plan| {
-                        let (entities, entity_journal_phases) =
-                            sessions.persisted_entity_save_snapshot();
-                        Box::new(SimulationSaveSnapshot {
-                            players: sessions.persisted_player_states(),
-                            entities,
-                            entity_journal_phases,
-                            world_chunk_journal_watermark: sessions.world_chunk_journal_watermark(),
-                            world_time: sessions.world_time(),
-                            daylight_cycle_enabled: sessions.daylight_cycle_enabled(),
-                            players_sleeping_percentage: sessions.players_sleeping_percentage(),
-                            keep_inventory: sessions.keep_inventory(),
-                            simulation_tick,
-                            world_flush_plan,
-                        })
-                    }))
-                }
-                SimulationCommand::ReadBlockSnapshot { position } => {
-                    let result = if let Some((snapshot_position, snapshot)) =
-                        resident_block_snapshot
-                        && snapshot_position == *position
-                    {
-                        Ok(Some(snapshot))
-                    } else if let Some(storage) = storage.as_deref_mut() {
-                        match storage.get_block(*position) {
-                            Ok(Some(state)) => Ok(storage
-                                .block_mutation_token(*position)
-                                .map(|token| BlockMutationSnapshot { state, token })),
-                            Ok(None) => Ok(None),
-                            Err(error) => {
-                                self.metrics
-                                    .rejected_world_mutation
-                                    .fetch_add(1, Ordering::Relaxed);
-                                warn!(%error, ?position, "simulation block snapshot read failed");
-                                Err(SimulationRequestError::WorldMutationFailed)
-                            }
-                        }
-                    } else {
-                        self.record_world_access_error(world_error);
-                        Err(world_error)
-                    };
-                    SimulationResponse::BlockSnapshot(result)
-                }
-                SimulationCommand::ReadChestSnapshot { positions } => {
-                    let result = if positions.is_empty()
-                        || positions.len() > 2
-                        || positions.windows(2).any(|pair| pair[0] == pair[1])
-                    {
-                        Err(SimulationRequestError::InvalidCommand)
-                    } else if let Some(storage) = storage.as_deref_mut() {
-                        let mut chests = Vec::with_capacity(positions.len());
-                        let mut error = None;
-                        for position in positions {
-                            match storage.chest_block_entity(*position) {
-                                Ok(Some(chest)) => chests.push(chest),
-                                Ok(None) => {
-                                    error = Some(SimulationRequestError::WorldUnavailable);
-                                    break;
-                                }
-                                Err(storage_error) => {
-                                    self.metrics
-                                        .rejected_world_mutation
-                                        .fetch_add(1, Ordering::Relaxed);
-                                    warn!(%storage_error, ?position, "simulation chest snapshot read failed");
-                                    error = Some(SimulationRequestError::WorldMutationFailed);
-                                    break;
-                                }
-                            }
-                        }
-                        if let Some(error) = error {
-                            Err(error)
-                        } else {
-                            Ok(Box::new(ChestReadSnapshot {
-                                state_id: sessions.chest_state_id(positions[0]),
-                                view: ChestView { chests },
-                            }))
-                        }
-                    } else {
-                        self.record_world_access_error(world_error);
-                        Err(world_error)
-                    };
-                    SimulationResponse::ChestSnapshot(result)
-                }
-                SimulationCommand::ReadFurnaceSnapshot { position } => {
-                    let result = if let Some(storage) = storage.as_deref_mut() {
-                        match storage.furnace_block_entity(*position) {
-                            Ok(Some(furnace)) => Ok(Box::new(FurnaceReadSnapshot {
-                                furnace,
-                                state_id: sessions.furnace_state_id(*position),
-                            })),
-                            Ok(None) => Err(SimulationRequestError::WorldUnavailable),
-                            Err(storage_error) => {
-                                self.metrics
-                                    .rejected_world_mutation
-                                    .fetch_add(1, Ordering::Relaxed);
-                                warn!(%storage_error, ?position, "simulation furnace snapshot read failed");
-                                Err(SimulationRequestError::WorldMutationFailed)
-                            }
-                        }
-                    } else {
-                        self.record_world_access_error(world_error);
-                        Err(world_error)
-                    };
-                    SimulationResponse::FurnaceSnapshot(result)
-                }
+                SimulationCommand::SaveBarrier { capture_world } => self.save_barrier_response(
+                    sessions,
+                    storage.as_deref_mut(),
+                    world_error,
+                    *capture_world,
+                ),
+                SimulationCommand::ReadBlockSnapshot { position } => self
+                    .read_block_snapshot_response(
+                        storage.as_deref_mut(),
+                        world_error,
+                        resident_block_snapshot,
+                        *position,
+                    ),
+                SimulationCommand::ReadChestSnapshot { positions } => self
+                    .read_chest_snapshot_response(
+                        sessions,
+                        storage.as_deref_mut(),
+                        world_error,
+                        positions,
+                    ),
+                SimulationCommand::ReadFurnaceSnapshot { position } => self
+                    .read_furnace_snapshot_response(
+                        sessions,
+                        storage.as_deref_mut(),
+                        world_error,
+                        *position,
+                    ),
                 SimulationCommand::PickupItemIntoInventory {
                     entity_id,
                     collector_session,
@@ -4973,39 +5708,19 @@ impl SimulationOwner {
                     expected_damage,
                     expected_enchantments,
                     max_stack,
-                } => {
-                    let mut credited = sessions
-                        .pickup_item_into_inventory(
-                            &self.authority,
-                            *entity_id,
-                            *collector_session,
-                            *expected_item_id,
-                            *expected_damage,
-                            expected_enchantments,
-                            *max_stack,
-                        )
-                        .map(Box::new);
-                    if let Some(credited) = credited.as_mut() {
-                        dispatch_visibility_commands(std::mem::take(&mut credited.dispatches));
-                    }
-                    SimulationResponse::ItemPickupCredit(credited)
-                }
+                } => self.pickup_item_response(
+                    sessions,
+                    *entity_id,
+                    *collector_session,
+                    *expected_item_id,
+                    *expected_damage,
+                    expected_enchantments,
+                    *max_stack,
+                ),
                 SimulationCommand::PickupExperienceIntoPlayer {
                     entity_id,
                     collector_session,
-                } => {
-                    let mut credited = sessions
-                        .pickup_experience_into_player(
-                            &self.authority,
-                            *entity_id,
-                            *collector_session,
-                        )
-                        .map(Box::new);
-                    if let Some(credited) = credited.as_mut() {
-                        dispatch_visibility_commands(std::mem::take(&mut credited.dispatches));
-                    }
-                    SimulationResponse::ExperiencePickupCredit(credited)
-                }
+                } => self.pickup_experience_response(sessions, *entity_id, *collector_session),
                 #[cfg(test)]
                 SimulationCommand::ClaimExperiencePickup {
                     entity_id,
@@ -5025,87 +5740,29 @@ impl SimulationOwner {
                     collector_session,
                     arrow_item_id,
                     max_stack,
-                } => {
-                    let mut credited = sessions
-                        .pickup_arrow_into_inventory(
-                            &self.authority,
-                            *entity_id,
-                            *collector_session,
-                            *arrow_item_id,
-                            *max_stack,
-                        )
-                        .map(Box::new);
-                    if let Some(credited) = credited.as_mut() {
-                        dispatch_visibility_commands(std::mem::take(&mut credited.dispatches));
-                    }
-                    SimulationResponse::ArrowPickupCredit(credited)
-                }
+                } => self.pickup_arrow_response(
+                    sessions,
+                    *entity_id,
+                    *collector_session,
+                    *arrow_item_id,
+                    *max_stack,
+                ),
                 SimulationCommand::PlayerAttackServerEntity {
                     attacker_session,
                     entity_id,
                     damage,
                     attacker_costs,
                     cooldown_tick,
-                } => {
-                    let authority_tick = sessions.simulation_tick();
-                    let mut result = sessions.player_attack_entity(
-                        &self.authority,
-                        PlayerEntityAttack {
-                            attacker_session: *attacker_session,
-                            entity_id: *entity_id,
-                            amount: *damage,
-                            attacker_costs: attacker_costs.as_deref(),
-                            authority_tick,
-                        },
-                    );
-                    if let PlayerAttackResult::Damaged(outcome) = &mut result
-                        && let EntityAttackOutcome::PlayerDamaged { dispatches, .. } =
-                            &mut **outcome
-                    {
-                        dispatch_visibility_commands(std::mem::take(dispatches));
-                    }
-                    if !matches!(result, PlayerAttackResult::ValidationRejected) {
-                        sessions.publish_player_attack(
-                            *attacker_session,
-                            entity_id.0,
-                            *cooldown_tick,
-                            authority_tick,
-                        );
-                    }
-                    SimulationResponse::PlayerAttack(result)
-                }
+                } => self.player_attack_response(
+                    sessions,
+                    *attacker_session,
+                    *entity_id,
+                    *damage,
+                    attacker_costs.as_deref(),
+                    *cooldown_tick,
+                ),
                 SimulationCommand::ApplyServerEntityEffect(command) => {
-                    let request = EntityEffectRequest {
-                        operation: command.operation.clone(),
-                        target_kind: command.target_kind,
-                        death_remove_tick: sessions
-                            .simulation_tick()
-                            .saturating_add(ENTITY_DEATH_TICKS),
-                    };
-                    let (result, dispatches) = sessions.apply_server_entity_effect_request(
-                        &self.authority,
-                        command.expected.as_deref().cloned(),
-                        command.entity_id,
-                        request,
-                    );
-                    match &result {
-                        EntityEffectResult::Applied(applied) => {
-                            trace!(
-                                entity_id = applied.snapshot.id.0,
-                                health = applied.snapshot.health,
-                                "server entity effect transaction accepted"
-                            );
-                        }
-                        EntityEffectResult::Rejected(rejection) => {
-                            trace!(
-                                entity_id = command.entity_id.0,
-                                ?rejection,
-                                "server entity effect transaction rejected"
-                            );
-                        }
-                    }
-                    dispatch_visibility_commands(dispatches);
-                    SimulationResponse::EntityEffect(result)
+                    self.entity_effect_response(sessions, command)
                 }
                 #[cfg(test)]
                 SimulationCommand::AttackServerEntity {
@@ -5128,18 +5785,17 @@ impl SimulationOwner {
                     entity_type_id,
                     entity_type_name,
                     position,
-                } => SimulationResponse::EntitySpawn(sessions.spawn_command_entity(
-                    &self.authority,
+                } => self.spawn_command_entity_response(
+                    sessions,
                     *entity_type_id,
-                    entity_type_name.clone(),
+                    entity_type_name,
                     *position,
-                )),
+                ),
+                SimulationCommand::DamageScriptEntity { entity_id, damage } => {
+                    self.script_entity_damage_response(sessions, *entity_id, *damage)
+                }
                 SimulationCommand::SetWorldTime { world_time } => {
-                    let outcome = sessions.set_world_time_owned(&self.authority, *world_time);
-                    #[cfg(test)]
-                    self.release_retryable_herd_requests(outcome.retryable_chunks());
-                    dispatch_visibility_commands(outcome.into_dispatches());
-                    SimulationResponse::WorldTimeSet
+                    self.set_world_time_response(sessions, *world_time)
                 }
                 #[cfg(test)]
                 SimulationCommand::EnsureChunkHerd { chunk, spawns } => {
@@ -5656,197 +6312,43 @@ impl SimulationOwner {
                     SimulationResponse::BucketUse(result)
                 }
                 SimulationCommand::CommitFoodUse(command) => {
-                    let result = if valid_food_use_plan(&command.plan) {
-                        Ok(sessions
-                            .commit_food_use(&self.authority, command.actor_session, &command.plan)
-                            .map(Box::new))
-                    } else {
-                        Err(SimulationRequestError::InvalidCommand)
-                    };
-                    SimulationResponse::FoodUse(result)
+                    self.food_use_response(sessions, command)
                 }
                 SimulationCommand::CommitAnimalFeed(command) => {
-                    let result = if valid_animal_feed_plan(&command.plan) {
-                        Ok(sessions
-                            .commit_animal_feed(
-                                &self.authority,
-                                command.actor_session,
-                                &command.plan,
-                            )
-                            .map(|mut committed| {
-                                dispatch_visibility_commands(std::mem::take(
-                                    &mut committed.dispatches,
-                                ));
-                                Box::new(committed)
-                            }))
-                    } else {
-                        Err(SimulationRequestError::InvalidCommand)
-                    };
-                    SimulationResponse::AnimalFeed(result)
+                    self.animal_feed_response(sessions, command)
                 }
                 SimulationCommand::CommitMerchantTrade(command) => {
-                    let result = if valid_merchant_trade_plan(&command.plan) {
-                        Ok(sessions
-                            .commit_merchant_trade(
-                                &self.authority,
-                                command.actor_session,
-                                &command.plan,
-                            )
-                            .map(|mut committed| {
-                                dispatch_visibility_commands(std::mem::take(
-                                    &mut committed.dispatches,
-                                ));
-                                Box::new(committed)
-                            }))
-                    } else {
-                        Err(SimulationRequestError::InvalidCommand)
-                    };
-                    SimulationResponse::MerchantTrade(result)
+                    self.merchant_trade_response(sessions, command)
                 }
                 SimulationCommand::CommitSheepShear(command) => {
-                    let result = if valid_sheep_shear_plan(&command.plan) {
-                        Ok(sessions
-                            .commit_sheep_shear(
-                                &self.authority,
-                                command.actor_session,
-                                &command.plan,
-                            )
-                            .map(|mut committed| {
-                                dispatch_visibility_commands(std::mem::take(
-                                    &mut committed.dispatches,
-                                ));
-                                Box::new(committed)
-                            }))
-                    } else {
-                        Err(SimulationRequestError::InvalidCommand)
-                    };
-                    SimulationResponse::SheepShear(result)
+                    self.sheep_shear_response(sessions, command)
                 }
                 SimulationCommand::CommitZombieVillagerCure(command) => {
-                    let result = if valid_zombie_villager_cure_plan(&command.plan) {
-                        Ok(sessions
-                            .commit_zombie_villager_cure(
-                                &self.authority,
-                                command.actor_session,
-                                &command.plan,
-                            )
-                            .map(|mut committed| {
-                                dispatch_visibility_commands(std::mem::take(
-                                    &mut committed.dispatches,
-                                ));
-                                Box::new(committed)
-                            }))
-                    } else {
-                        Err(SimulationRequestError::InvalidCommand)
-                    };
-                    SimulationResponse::ZombieVillagerCure(result)
+                    self.zombie_villager_cure_response(sessions, command)
                 }
                 SimulationCommand::CommitPlayerSurvival(command) => {
-                    let result = if valid_player_survival_plan(&command.plan) {
-                        Ok(sessions
-                            .commit_player_survival(
-                                &self.authority,
-                                command.actor_session,
-                                &command.plan,
-                            )
-                            .map(|outcome| {
-                                Box::new(match outcome {
-                                    PlayerSurvivalCommitOutcome::Committed(mut committed) => {
-                                        dispatch_visibility_commands(std::mem::take(
-                                            &mut committed.dispatches,
-                                        ));
-                                        PlayerSurvivalCommitOutcome::Committed(committed)
-                                    }
-                                    rejected => rejected,
-                                })
-                            }))
-                    } else {
-                        Err(SimulationRequestError::InvalidCommand)
-                    };
-                    SimulationResponse::PlayerSurvival(result)
+                    self.player_survival_response(sessions, command)
                 }
                 SimulationCommand::CommitPlayerPose {
                     actor_session,
+                    kind,
                     pose,
                     exhaustion,
                     ..
-                } => {
-                    let result = sessions
-                        .commit_player_pose(&self.authority, *actor_session, *pose, *exhaustion)
-                        .map(|(dispatches, committed)| {
-                            dispatch_visibility_commands(dispatches);
-                            committed
-                        });
-                    SimulationResponse::PlayerPose(result)
-                }
+                } => self.player_pose_response(sessions, *actor_session, *kind, *pose, *exhaustion),
                 SimulationCommand::CommitPlayerStateEvent {
                     actor_session,
                     event,
-                } => {
-                    let result = sessions
-                        .commit_player_state_event(&self.authority, *actor_session, *event)
-                        .map(dispatch_visibility_commands);
-                    SimulationResponse::PlayerStateEvent(result)
-                }
+                } => self.player_state_event_response(sessions, *actor_session, *event),
                 SimulationCommand::CommitPlayerInventory {
                     actor_session,
                     player,
-                } => {
-                    let mut result = if valid_container_player_plan(player) {
-                        sessions
-                            .commit_player_inventory(&self.authority, *actor_session, player)
-                            .map_err(|error| match error {
-                                PlayerInventoryCommitError::MissingPlayer => {
-                                    SimulationRequestError::StaleSession
-                                }
-                            })
-                    } else {
-                        Err(SimulationRequestError::InvalidCommand)
-                    };
-                    if let Ok(PlayerInventoryCommitOutcome::Committed { dispatches, .. }) =
-                        &mut result
-                    {
-                        dispatch_visibility_commands(std::mem::take(dispatches));
-                    }
-                    SimulationResponse::PlayerInventory(Box::new(result))
-                }
+                } => self.player_inventory_response(sessions, *actor_session, player),
                 SimulationCommand::CommitBowRelease(command) => {
-                    let result = if valid_bow_release_plan(&command.plan) {
-                        Ok(sessions
-                            .commit_bow_release(
-                                &self.authority,
-                                command.actor_session,
-                                &command.plan,
-                            )
-                            .map(|mut committed| {
-                                dispatch_visibility_commands(std::mem::take(
-                                    &mut committed.dispatches,
-                                ));
-                                Box::new(committed)
-                            }))
-                    } else {
-                        Err(SimulationRequestError::InvalidCommand)
-                    };
-                    SimulationResponse::BowRelease(result)
+                    self.bow_release_response(sessions, command)
                 }
                 SimulationCommand::CommitSelectedItemDrop(command) => {
-                    let result = if valid_selected_item_drop_plan(&command.plan) {
-                        Ok(sessions
-                            .commit_selected_item_drop(
-                                &self.authority,
-                                command.actor_session,
-                                &command.plan,
-                            )
-                            .map(|mut committed| {
-                                dispatch_visibility_commands(std::mem::take(
-                                    &mut committed.dispatches,
-                                ));
-                                Box::new(committed)
-                            }))
-                    } else {
-                        Err(SimulationRequestError::InvalidCommand)
-                    };
-                    SimulationResponse::SelectedItemDrop(result)
+                    self.selected_item_drop_response(sessions, command)
                 }
                 SimulationCommand::CommitChest {
                     primary_position,
@@ -5856,29 +6358,20 @@ impl SimulationOwner {
                     expected,
                     updated,
                     player,
-                } => {
-                    let mut result = self.commit_chest_command(
-                        sessions,
-                        storage.as_deref_mut(),
-                        world_error,
-                        ChestCommitRequest {
-                            primary_position: *primary_position,
-                            positions,
-                            expected_state_id: *expected_state_id,
-                            actor_session: *actor_session,
-                            expected,
-                            updated,
-                            player,
-                        },
-                    );
-                    if let Ok(outcome) = &mut result
-                        && let SharedContainerCommit::Committed { dispatches, .. } =
-                            outcome.as_mut()
-                    {
-                        dispatch_visibility_commands(std::mem::take(dispatches));
-                    }
-                    SimulationResponse::ChestCommit(result)
-                }
+                } => self.chest_commit_response(
+                    sessions,
+                    storage.as_deref_mut(),
+                    world_error,
+                    ChestCommitRequest {
+                        primary_position: *primary_position,
+                        positions,
+                        expected_state_id: *expected_state_id,
+                        actor_session: *actor_session,
+                        expected,
+                        updated,
+                        player,
+                    },
+                ),
                 SimulationCommand::CommitFurnace {
                     position,
                     expected_state_id,
@@ -5886,73 +6379,38 @@ impl SimulationOwner {
                     expected,
                     updated,
                     player,
-                } => {
-                    let mut result = self.commit_furnace_command(
-                        sessions,
-                        storage.as_deref_mut(),
-                        world_error,
-                        FurnaceCommitRequest {
-                            position: *position,
-                            expected_state_id: *expected_state_id,
-                            actor_session: *actor_session,
-                            expected,
-                            updated,
-                            player,
-                        },
-                    );
-                    if let Ok(outcome) = &mut result
-                        && let SharedContainerCommit::Committed { dispatches, .. } =
-                            outcome.as_mut()
-                    {
-                        dispatch_visibility_commands(std::mem::take(dispatches));
-                    }
-                    SimulationResponse::FurnaceCommit(result)
-                }
+                } => self.furnace_commit_response(
+                    sessions,
+                    storage.as_deref_mut(),
+                    world_error,
+                    FurnaceCommitRequest {
+                        position: *position,
+                        expected_state_id: *expected_state_id,
+                        actor_session: *actor_session,
+                        expected,
+                        updated,
+                        player,
+                    },
+                ),
                 SimulationCommand::CommitOpaqueBlockEntity {
                     position,
                     expected_state,
                     expected_token,
                     bytes,
-                } => {
-                    SimulationResponse::OpaqueBlockEntity(self.commit_opaque_block_entity_command(
-                        storage.as_deref_mut(),
-                        world_error,
-                        *position,
-                        *expected_state,
-                        *expected_token,
-                        bytes.clone(),
-                    ))
-                }
-                SimulationCommand::CommitCampfireUse(command) => {
-                    let result = if !valid_campfire_use_plan(&command.plan) {
-                        Err(SimulationRequestError::InvalidCommand)
-                    } else if let Some(storage) = storage.as_deref_mut() {
-                        sessions
-                            .commit_campfire_use(
-                                &self.authority,
-                                storage,
-                                command.actor_session,
-                                &command.plan,
-                            )
-                            .map(|committed| {
-                                committed.map(|committed| {
-                                    dispatch_visibility_commands(
-                                        sessions.block_entity_data_dispatches(
-                                            command.plan.position,
-                                            Some(command.actor_session),
-                                            CAMPFIRE_BLOCK_ENTITY_TYPE_ID,
-                                            command.plan.client_nbt.clone(),
-                                        ),
-                                    );
-                                    Box::new(committed)
-                                })
-                            })
-                    } else {
-                        self.record_world_access_error(world_error);
-                        Err(world_error)
-                    };
-                    SimulationResponse::CampfireUse(result)
-                }
+                } => self.opaque_block_entity_response(
+                    storage.as_deref_mut(),
+                    world_error,
+                    *position,
+                    *expected_state,
+                    *expected_token,
+                    bytes,
+                ),
+                SimulationCommand::CommitCampfireUse(command) => self.campfire_use_response(
+                    sessions,
+                    storage.as_deref_mut(),
+                    world_error,
+                    command,
+                ),
                 SimulationCommand::CommitTntIgnition {
                     actor_session,
                     plan,
@@ -6319,8 +6777,8 @@ fn valid_player_survival_plan(plan: &PlayerSurvivalPlan) -> bool {
         state.health.is_finite()
             && state.saturation.is_finite()
             && state.exhaustion.is_finite()
-            && (0.0..=SurvivalState::MAX_HEALTH).contains(&state.health)
-            && (0..=SurvivalState::MAX_FOOD).contains(&state.food)
+            && (0.0..=mc_entity::player_survival_26_1_2::MAX_HEALTH).contains(&state.health)
+            && (0..=mc_entity::player_survival_26_1_2::MAX_FOOD).contains(&state.food)
             && state.saturation >= 0.0
             && state.exhaustion >= 0.0
     };
@@ -8211,7 +8669,8 @@ mod tests {
         let bob_handle = handle.for_session(bob);
         let attack_costs = |position: Vec3| {
             let mut updated_survival = SurvivalState::FULL;
-            updated_survival.add_exhaustion(SurvivalState::ENTITY_ATTACK_EXHAUSTION);
+            updated_survival
+                .add_exhaustion(mc_entity::player_survival_26_1_2::ENTITY_ATTACK_EXHAUSTION);
             PlayerSurvivalPlan {
                 expected_survival: SurvivalState::FULL,
                 updated_survival,
@@ -12936,7 +13395,7 @@ mod tests {
 
         let expected_survival = SurvivalState::FULL;
         let mut updated_survival = expected_survival;
-        updated_survival.apply_damage(SurvivalState::MAX_HEALTH);
+        updated_survival.apply_damage(mc_entity::player_survival_26_1_2::MAX_HEALTH);
         let plan = PlayerSurvivalPlan {
             expected_survival,
             updated_survival,
@@ -16440,7 +16899,11 @@ mod tests {
                     Some(&world),
                     None,
                     &block_facts,
-                    &blocks,
+                    ExplosionRegistries::new(
+                        &blocks,
+                        &mc_data::items::solaris_required_items(),
+                        &mc_data::entity_types::solaris_required_entity_types(),
+                    ),
                     Some(&materials),
                     || panic!("protection snapshot must stay lazy without a due explosion"),
                 )
@@ -16478,7 +16941,11 @@ mod tests {
                     Some(&world),
                     None,
                     &block_facts,
-                    &blocks,
+                    ExplosionRegistries::new(
+                        &blocks,
+                        &mc_data::items::solaris_required_items(),
+                        &mc_data::entity_types::solaris_required_entity_types(),
+                    ),
                     Some(&materials),
                     || Some(zone_protection),
                 )
@@ -16591,7 +17058,11 @@ mod tests {
                         Some(&world),
                         None,
                         &block_facts,
-                        &blocks,
+                        ExplosionRegistries::new(
+                            &blocks,
+                            &mc_data::items::solaris_required_items(),
+                            &mc_data::entity_types::solaris_required_entity_types(),
+                        ),
                         Some(&materials),
                         || None,
                     )
@@ -16702,7 +17173,11 @@ mod tests {
                     None,
                     None,
                     &BlockFactsTable::default(),
-                    &blocks,
+                    ExplosionRegistries::new(
+                        &blocks,
+                        &mc_data::items::solaris_required_items(),
+                        &mc_data::entity_types::solaris_required_entity_types(),
+                    ),
                     None,
                     || None,
                 )

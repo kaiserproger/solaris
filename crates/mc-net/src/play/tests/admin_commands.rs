@@ -104,7 +104,7 @@ fn command_tree_and_suggestions_are_permission_aware() {
     assert_eq!(tree.root_index, 0);
     assert_eq!(
         tree.nodes[0].children,
-        vec![1, 6, 8, 10, 11, 12, 13, 15, 17, 19, 20]
+        vec![1, 6, 8, 10, 11, 12, 13, 15, 17, 19, 20, 27]
     );
     assert_eq!(tree.nodes[20].children, vec![21, 23, 25]);
     assert_eq!(

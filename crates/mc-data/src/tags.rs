@@ -1155,6 +1155,22 @@ pub enum TagError {
         #[source]
         source: serde_json::Error,
     },
+    #[error("tag file {path} uses replace=true, but layered tag replacement is not supported")]
+    ReplaceUnsupported { path: PathBuf },
+    #[error("required nested tag {referenced:?} referenced by {registry}#{tag} is missing")]
+    MissingRequiredTag {
+        registry: String,
+        tag: String,
+        referenced: String,
+    },
+    #[error("required registry entry {value:?} referenced by {registry}#{tag} is missing")]
+    MissingRequiredEntry {
+        registry: String,
+        tag: String,
+        value: String,
+    },
+    #[error("tag dependency cycle in {registry}: {cycle}")]
+    DependencyCycle { registry: String, cycle: String },
 }
 
 /// Resolved tags, grouped by registry id, ready for the
@@ -1186,6 +1202,20 @@ impl TagsData {
     #[must_use]
     pub fn fuel_values(&self) -> &FuelValues {
         &self.fuel_values
+    }
+
+    #[must_use]
+    pub fn contains_raw_id(&self, registry: &str, tag: &str, raw_id: i32) -> bool {
+        let Ok(registry) = Identifier::parse(registry.to_owned()) else {
+            return false;
+        };
+        let Ok(tag) = Identifier::parse(tag.trim_start_matches('#').to_owned()) else {
+            return false;
+        };
+        self.registries
+            .get(&registry)
+            .and_then(|tags| tags.get(&tag))
+            .is_some_and(|entries| entries.binary_search(&raw_id).is_ok())
     }
 
     /// Number of `(registry, tag)` pairs the packet will emit.
@@ -1317,7 +1347,6 @@ fn add_required_block_tags(tags: &mut TagsData, blocks: &[crate::blocks::BlockRe
 #[derive(Deserialize)]
 struct RawTag {
     #[serde(default)]
-    #[allow(dead_code)]
     replace: bool,
     #[serde(default)]
     values: Vec<RawTagValue>,
@@ -1418,6 +1447,9 @@ fn collect_tag_files(
                 &|path, source| TagError::Io { path, source },
                 &|path, source| TagError::TagMalformed { path, source },
             )?;
+            if parsed.replace {
+                return Err(TagError::ReplaceUnsupported { path });
+            }
             raw.insert((registry_id.to_string(), joined), (path, parsed));
             Ok(())
         },
@@ -1431,49 +1463,88 @@ fn resolve(
     raw: &BTreeMap<(String, String), (PathBuf, RawTag)>,
     ours: &VanillaData,
     vanilla_ids: &BTreeMap<String, BTreeMap<String, i32>>,
-    visiting: &mut BTreeSet<String>,
-    seen: &mut BTreeSet<i32>,
-) {
+    stack: &mut Vec<String>,
+    cache: &mut BTreeMap<String, BTreeSet<i32>>,
+) -> Result<BTreeSet<i32>, TagError> {
     let marker = format!("{registry_id}#{tag_path}");
-    if visiting.contains(&marker) {
-        // Cycle — drop the back-edge silently. Vanilla does the same.
-        return;
+    if let Some(resolved) = cache.get(&marker) {
+        return Ok(resolved.clone());
+    }
+    if let Some(cycle_start) = stack.iter().position(|entry| entry == &marker) {
+        let mut cycle = stack[cycle_start..].to_vec();
+        cycle.push(marker.clone());
+        return Err(TagError::DependencyCycle {
+            registry: registry_id.to_owned(),
+            cycle: cycle.join(" -> "),
+        });
     }
     let Some((_, raw_tag)) = raw.get(&(registry_id.to_string(), tag_path.to_string())) else {
-        // Dangling `#tag` reference — vanilla treats as empty.
-        return;
+        return Err(TagError::MissingRequiredTag {
+            registry: registry_id.to_owned(),
+            tag: tag_path.to_owned(),
+            referenced: tag_path.to_owned(),
+        });
     };
-    visiting.insert(marker.clone());
-    for v in &raw_tag.values {
-        let (raw_value, required) = match v {
-            RawTagValue::Plain(s) => (s.as_str(), true),
+
+    stack.push(marker.clone());
+    let mut seen = BTreeSet::new();
+    for value in &raw_tag.values {
+        let (raw_value, required) = match value {
+            RawTagValue::Plain(value) => (value.as_str(), true),
             RawTagValue::Object { id, required } => (id.as_str(), *required),
         };
         if let Some(tag_ref) = raw_value.strip_prefix('#') {
             let inner_path = tag_ref
                 .strip_prefix("minecraft:")
-                .unwrap_or_else(|| tag_ref.split_once(':').map_or(tag_ref, |(_, p)| p));
-            resolve(
+                .unwrap_or_else(|| tag_ref.split_once(':').map_or(tag_ref, |(_, path)| path));
+            let inner_key = (registry_id.to_owned(), inner_path.to_owned());
+            if !raw.contains_key(&inner_key) {
+                if required {
+                    stack.pop();
+                    return Err(TagError::MissingRequiredTag {
+                        registry: registry_id.to_owned(),
+                        tag: tag_path.to_owned(),
+                        referenced: tag_ref.to_owned(),
+                    });
+                }
+                warn!(
+                    registry = %registry_id,
+                    tag = %tag_path,
+                    referenced = %tag_ref,
+                    "optional nested tag is missing; skipping"
+                );
+                continue;
+            }
+            seen.extend(resolve(
                 registry_id,
                 inner_path,
                 raw,
                 ours,
                 vanilla_ids,
-                visiting,
-                seen,
-            );
+                stack,
+                cache,
+            )?);
         } else if let Some(idx) = entry_id_for(registry_id, raw_value, ours, vanilla_ids) {
             seen.insert(idx);
         } else if required {
+            stack.pop();
+            return Err(TagError::MissingRequiredEntry {
+                registry: registry_id.to_owned(),
+                tag: tag_path.to_owned(),
+                value: raw_value.to_owned(),
+            });
+        } else {
             warn!(
                 registry = %registry_id,
                 tag = %tag_path,
                 value = %raw_value,
-                "tag references unknown registry entry; skipping"
+                "optional tag registry entry is missing; skipping"
             );
         }
     }
-    visiting.remove(&marker);
+    stack.pop();
+    cache.insert(marker, seen.clone());
+    Ok(seen)
 }
 
 /// Load the full tag set for `vanilla_dir`. Returns an empty `TagsData`
@@ -1493,18 +1564,17 @@ pub fn load(vanilla_dir: &Path, ours: &VanillaData) -> Result<TagsData, TagError
     }
 
     let mut registries: BTreeMap<Identifier, BTreeMap<Identifier, Vec<i32>>> = BTreeMap::new();
+    let mut cache = BTreeMap::new();
     for (registry_id, tag_path) in raw.keys() {
-        let mut visiting = BTreeSet::new();
-        let mut seen = BTreeSet::new();
-        resolve(
+        let seen = resolve(
             registry_id,
             tag_path,
             &raw,
             ours,
             &vanilla_ids,
-            &mut visiting,
-            &mut seen,
-        );
+            &mut Vec::new(),
+            &mut cache,
+        )?;
 
         let registry_ident =
             Identifier::parse(registry_id.clone()).expect("TAG_ROOTS provides valid identifiers");
@@ -1581,6 +1651,22 @@ mod tests {
     }
 
     #[test]
+    fn contains_raw_id_handles_hash_prefix_and_invalid_identifiers() {
+        let registry = Identifier::parse("minecraft:block").unwrap();
+        let tag = Identifier::parse("minecraft:mineable/pickaxe").unwrap();
+        let tags = TagsData::from_registries(BTreeMap::from([(
+            registry,
+            BTreeMap::from([(tag, vec![1, 4, 9])]),
+        )]));
+
+        assert!(tags.contains_raw_id("minecraft:block", "minecraft:mineable/pickaxe", 4));
+        assert!(tags.contains_raw_id("minecraft:block", "#minecraft:mineable/pickaxe", 9));
+        assert!(!tags.contains_raw_id("minecraft:block", "minecraft:mineable/pickaxe", 8));
+        assert!(!tags.contains_raw_id("bad registry", "minecraft:mineable/pickaxe", 4));
+        assert!(!tags.contains_raw_id("minecraft:block", "bad tag", 4));
+    }
+
+    #[test]
     fn resolves_direct_and_transitive_references() {
         let dir = make_tiny_sidecar();
         let ours = empty_vanilla_data();
@@ -1607,7 +1693,7 @@ mod tests {
     }
 
     #[test]
-    fn cycles_resolve_to_empty_without_panic() {
+    fn cycles_fail_with_dependency_path() {
         let dir = TempDir::new().unwrap();
         let reports = dir.path().join("reports");
         fs::create_dir_all(&reports).unwrap();
@@ -1631,17 +1717,106 @@ mod tests {
         .unwrap();
 
         let ours = empty_vanilla_data();
-        let tags = load(dir.path(), &ours).unwrap();
+        let error = load(dir.path(), &ours).unwrap_err();
+        assert!(matches!(
+            error,
+            TagError::DependencyCycle { cycle, .. }
+                if cycle.contains("minecraft:item#a") && cycle.contains("minecraft:item#b")
+        ));
+    }
+
+    #[test]
+    fn required_missing_nested_tag_fails_but_optional_missing_is_empty() {
+        let dir = TempDir::new().unwrap();
+        let reports = dir.path().join("reports");
+        fs::create_dir_all(&reports).unwrap();
+        fs::write(reports.join("registries.json"), "{}").unwrap();
+        let tags_item = dir
+            .path()
+            .join("data")
+            .join("minecraft")
+            .join("tags")
+            .join("item");
+        fs::create_dir_all(&tags_item).unwrap();
+        fs::write(
+            tags_item.join("required.json"),
+            r##"{ "values": [ "#minecraft:missing" ] }"##,
+        )
+        .unwrap();
+
+        let error = load(dir.path(), &empty_vanilla_data()).unwrap_err();
+        assert!(matches!(
+            error,
+            TagError::MissingRequiredTag { referenced, .. } if referenced == "minecraft:missing"
+        ));
+
+        fs::remove_file(tags_item.join("required.json")).unwrap();
+        fs::write(
+            tags_item.join("optional.json"),
+            r##"{ "values": [ { "id": "#minecraft:missing", "required": false } ] }"##,
+        )
+        .unwrap();
+        let tags = load(dir.path(), &empty_vanilla_data()).unwrap();
         let item_reg = tags
             .registries
             .get(&Identifier::parse("minecraft:item").unwrap())
             .unwrap();
         assert!(
             item_reg
-                .get(&Identifier::parse("minecraft:a").unwrap())
+                .get(&Identifier::parse("minecraft:optional").unwrap())
                 .unwrap()
                 .is_empty()
         );
+    }
+
+    #[test]
+    fn replace_true_is_rejected_until_layered_datapacks_are_supported() {
+        let dir = TempDir::new().unwrap();
+        let reports = dir.path().join("reports");
+        fs::create_dir_all(&reports).unwrap();
+        fs::write(reports.join("registries.json"), "{}").unwrap();
+        let tags_item = dir
+            .path()
+            .join("data")
+            .join("minecraft")
+            .join("tags")
+            .join("item");
+        fs::create_dir_all(&tags_item).unwrap();
+        let path = tags_item.join("replace.json");
+        fs::write(&path, r#"{ "replace": true, "values": [] }"#).unwrap();
+
+        let error = load(dir.path(), &empty_vanilla_data()).unwrap_err();
+        assert!(matches!(error, TagError::ReplaceUnsupported { path: actual } if actual == path));
+    }
+
+    #[test]
+    fn required_missing_registry_entry_fails() {
+        let dir = TempDir::new().unwrap();
+        let reports = dir.path().join("reports");
+        fs::create_dir_all(&reports).unwrap();
+        fs::write(
+            reports.join("registries.json"),
+            r#"{ "minecraft:item": { "entries": {} } }"#,
+        )
+        .unwrap();
+        let tags_item = dir
+            .path()
+            .join("data")
+            .join("minecraft")
+            .join("tags")
+            .join("item");
+        fs::create_dir_all(&tags_item).unwrap();
+        fs::write(
+            tags_item.join("bad.json"),
+            r#"{ "values": [ "minecraft:not_real" ] }"#,
+        )
+        .unwrap();
+
+        let error = load(dir.path(), &empty_vanilla_data()).unwrap_err();
+        assert!(matches!(
+            error,
+            TagError::MissingRequiredEntry { value, .. } if value == "minecraft:not_real"
+        ));
     }
 
     #[test]

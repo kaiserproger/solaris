@@ -1,7 +1,7 @@
 use std::sync::Arc;
 use std::time::Instant;
 
-use mc_protocol::packets::play::ItemStack;
+use mc_data::ItemStack;
 
 use crate::play::inventory::PlayerInventory;
 use crate::play::simulation::SimulationAuthority;

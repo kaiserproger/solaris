@@ -1,9 +1,10 @@
+use mc_data::ItemStack;
 use mc_data::item_components::ItemFactsTable;
 use mc_data::items::ItemRegistry;
 use mc_entity::villager_gossip_26_1_2::VillagerGossipState;
 use mc_entity::villager_merchant_26_1_2::{VillagerMerchantState, VillagerTradeOffer};
 use mc_nbt::Tag;
-use mc_protocol::packets::play::{ItemStack, MerchantItemCost, MerchantOffer};
+use mc_protocol::packets::play::{MerchantItemCost, MerchantOffer};
 
 use crate::play::inventory::{PlayerInventory, can_stack, item_max_stack};
 
@@ -247,7 +248,11 @@ fn take_cost(
 }
 
 fn item_max_stack_for_id(item_facts: &ItemFactsTable, items: &ItemRegistry, item_id: u32) -> i32 {
-    item_max_stack(item_facts, items, &ItemStack::new(item_id, 1))
+    mc_data::item_semantics_26_1_2::max_stack_for_stack(
+        item_facts,
+        items,
+        &ItemStack::new(item_id, 1),
+    )
 }
 
 pub(in crate::play) fn inputs_satisfy_offer(
@@ -255,12 +260,7 @@ pub(in crate::play) fn inputs_satisfy_offer(
     offer: &VillagerTradeOffer,
     modified_cost_a: i32,
 ) -> bool {
-    inputs[0].item_id == offer.cost_a.item_id
-        && inputs[0].count >= modified_cost_a
-        && match offer.cost_b {
-            Some(cost_b) => inputs[1].item_id == cost_b.item_id && inputs[1].count >= cost_b.count,
-            None => inputs[1].is_empty(),
-        }
+    offer.inputs_satisfy(inputs, modified_cost_a)
 }
 
 #[cfg(test)]

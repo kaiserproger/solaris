@@ -74,30 +74,47 @@ async fn accepted_entity_interactions_reach_lua_with_exact_authoritative_snapsho
                 ))
             end
 
+            function on_entity_spawn_result(event: any)
+                if not event.spawned then
+                    solaris.send_message(
+                        event.player_id,
+                        "target-spawn-failed:" .. event.request_id .. ":" .. tostring(event.failure)
+                    )
+                    return
+                end
+                if event.request_id == "far-target" then
+                    solaris.send_message(event.player_id, "far-target-ready")
+                elseif event.request_id == "near-target" then
+                    solaris.send_message(event.player_id, "near-target-ready")
+                else
+                    error("unexpected target spawn result")
+                end
+            end
+
             function on_player_command(event: any)
                 if event.root == "spawn-interaction-target" then
                     spawn_count = spawn_count + 1
                     if spawn_count == 1 then
                         solaris.spawn_entity(
+                            "far-target",
                             event.player_id,
                             "minecraft:villager",
                             event.x + 16.0,
                             event.y,
                             event.z
                         )
-                        solaris.send_message(event.player_id, "far-target-ready")
                     elseif spawn_count == 2 then
                         accepted_x = event.x + 3.0
                         accepted_y = event.y
                         accepted_z = event.z
                         solaris.spawn_entity(
+                            "near-target",
                             event.player_id,
                             "minecraft:villager",
                             event.x + 4.0,
                             event.y,
                             event.z
                         )
-                        solaris.send_message(event.player_id, "near-target-ready")
                     else
                         error("unexpected target spawn request")
                     end

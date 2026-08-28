@@ -47,7 +47,10 @@ public final class LoaderMinecraftBlock {
         if (content.blocks().size() > LoaderBlockCarrier.MAX_CARRIERS) {
             throw new IllegalStateException("Solaris Loader block carrier capacity exceeded");
         }
-        carrierStateIds();
+        // Runtime block-state ids are platform-owned. Fabric/NeoForge use the vanilla
+        // state registry, while Forge 26.1.2 binds custom states through GameData's
+        // block-state id map. The platform-specific ACK supplier performs the exact
+        // state-id round-trip check after resource activation.
     }
 
     public static List<Integer> carrierStateIds() {
@@ -62,9 +65,15 @@ public final class LoaderMinecraftBlock {
             Block block = BuiltInRegistries.BLOCK.getValue(id);
             BlockState state = block.defaultBlockState();
             int stateId = Block.getId(state);
-            if (stateId < 0 || Block.BLOCK_STATE_REGISTRY.byId(stateId) != state) {
+            BlockState roundTrip = stateId < 0 ? null : Block.BLOCK_STATE_REGISTRY.byId(stateId);
+            if (stateId < 0 || roundTrip != state) {
                 throw new IllegalStateException(
-                        "Solaris Loader block carrier has no exact runtime state id");
+                        "Solaris Loader block carrier has no exact runtime state id: carrier="
+                                + id
+                                + ", block_registry_id=" + BuiltInRegistries.BLOCK.getId(block)
+                                + ", state_id=" + stateId
+                                + ", state_registry_size=" + Block.BLOCK_STATE_REGISTRY.size()
+                                + ", roundtrip_same=" + (roundTrip == state));
             }
             stateIds.add(stateId);
         }

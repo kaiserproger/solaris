@@ -1,5 +1,5 @@
 use mc_data::items::ItemRegistry;
-use mc_protocol::packets::play::GameMode;
+use mc_domain::GameMode;
 use mc_script::{
     ScriptCraftingSource, ScriptEntityId, ScriptEvent, ScriptGameMode, ScriptInteractionHand,
     ScriptItemPickupSource, ScriptPlayerContext, ScriptPlayerId, ScriptQueueError,

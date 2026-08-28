@@ -1,6 +1,6 @@
-use mc_data::items::ItemRegistry;
+use mc_data::{ItemStack, items::ItemRegistry};
 use mc_protocol::codec::Identifier;
-use mc_protocol::packets::play::{ContainerInput, ItemStack};
+use mc_protocol::packets::play::ContainerInput;
 use mc_script::{
     ScriptEvent, ScriptInventoryClick, ScriptInventoryMenu, ScriptPlayerContext, ScriptPlayerId,
     ScriptPluginTarget,

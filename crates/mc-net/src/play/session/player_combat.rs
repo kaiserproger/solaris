@@ -4,6 +4,9 @@ use super::outbound::{
     PlayerInventorySlotDelta, PlayerXpDelta, SessionRecipient, ShieldCooldownPublication,
     VisibilityDispatch,
 };
+use super::player_effects::{
+    LEVITATION_EFFECT_ID, apply_player_effect_locked, caller_owned_effect,
+};
 use super::player_state::{
     apply_player_survival_plan_locked, player_attack_cost_plan_matches,
     player_survival_plan_matches,
@@ -27,10 +30,12 @@ use crate::play::inventory::{
 };
 use crate::play::simulation::{PlayerSurvivalPlan, SimulationAuthority};
 use crate::play::{GameMode, PlayerPose};
+use mc_data::ItemStack;
 use mc_entity::{EntityId, Vec3};
-use mc_protocol::packets::play::ItemStack;
 use std::sync::Arc;
 use std::time::Instant;
+
+const SHULKER_BULLET_LEVITATION_TICKS: i32 = 200;
 
 pub(in crate::play) struct PlayerEntityAttack<'a> {
     pub(in crate::play) attacker_session: SessionId,
@@ -651,6 +656,7 @@ pub(super) enum ProjectilePlayerDamagePreview {
 
 pub(super) struct PreparedProjectilePlayerDamage {
     target_session: SessionId,
+    kind: PlayerDamageKind,
     expected_shield: Option<ActiveShield>,
     shield_after_block: Option<ShieldAfterBlock>,
     next_resistance: Option<crate::play::combat::PlayerHurtResistance>,
@@ -757,6 +763,9 @@ pub(super) fn prepare_projectile_player_damage_locked(
             return ProjectilePlayerDamagePreview::Rejected(None);
         }
         updated_survival.apply_damage(applied_damage);
+        if damage.kind == PlayerDamageKind::Fireball {
+            updated_survival.ignite_for_seconds(5.0);
+        }
         if damage.kind.damages_armor() {
             damage_inventory_armor(items, &mut updated_inventory, resolved_damage);
         }
@@ -780,6 +789,7 @@ pub(super) fn prepare_projectile_player_damage_locked(
     };
     let prepared = PreparedProjectilePlayerDamage {
         target_session,
+        kind: damage.kind,
         expected_shield: active_shield,
         shield_after_block,
         next_resistance,
@@ -804,6 +814,7 @@ pub(super) fn commit_projectile_player_damage_locked(
 ) -> bool {
     let PreparedProjectilePlayerDamage {
         target_session,
+        kind,
         expected_shield,
         shield_after_block,
         next_resistance,
@@ -930,6 +941,13 @@ pub(super) fn commit_projectile_player_damage_locked(
             hurt_event,
         },
     });
+    if damage_applied && kind == PlayerDamageKind::ShulkerBullet {
+        damage_dispatches.extend(apply_player_effect_locked(
+            inner,
+            target_session,
+            caller_owned_effect(LEVITATION_EFFECT_ID, SHULKER_BULLET_LEVITATION_TICKS, 0),
+        ));
+    }
     if damage_applied && fresh_hurt {
         damage_dispatches.extend(
             hurt_observers
@@ -973,13 +991,13 @@ mod tests {
     };
     use crate::login::LoggedInProfile;
     use crate::play::combat::{
-        ActiveShield, ShieldUseState, damage_active_shield_slot, damage_active_shield_slots,
-        shield_use_matches, shield_use_matches_slot,
+        ActiveShield, PlayerDamageKind, ShieldUseState, damage_active_shield_slot,
+        damage_active_shield_slots, shield_use_matches, shield_use_matches_slot,
     };
     use crate::play::persistence::PlayerPersistedState;
     use crate::play::session::SessionRegistry;
     use crate::play::simulation::{PlayerSurvivalPlan, SimulationAuthority};
-    use crate::play::{GameMode, PlayerInventory, PlayerPose, SurvivalState};
+    use crate::play::{GameMode, PlayerInventory, PlayerPose};
 
     fn shield_items() -> (ItemRegistry, ItemFactsTable, u32, u32) {
         let shield = Identifier::parse("minecraft:shield").unwrap();
@@ -1322,7 +1340,10 @@ mod tests {
             .find(|(uuid, _, _)| *uuid == target_uuid)
             .map(|(_, state, _)| state)
             .expect("target persistence remains registered");
-        assert_eq!(persisted.survival.health, SurvivalState::MAX_HEALTH);
+        assert_eq!(
+            persisted.survival.health,
+            mc_entity::player_survival_26_1_2::MAX_HEALTH
+        );
         assert_eq!(
             persisted.inventory.slots[PlayerInventory::OFFHAND_SLOT].damage,
             Some(5),
@@ -1572,7 +1593,7 @@ mod tests {
             PlayerEntityAttack {
                 attacker_session: attacker,
                 entity_id: target_entity,
-                amount: SurvivalState::MAX_HEALTH,
+                amount: mc_entity::player_survival_26_1_2::MAX_HEALTH,
                 attacker_costs: None,
                 authority_tick: registry.simulation_tick(),
             },
@@ -1607,9 +1628,10 @@ mod tests {
             survival_plan(&target_state, target_state.inventory.clone(), target_pose);
         target_plan
             .updated_survival
-            .apply_damage(SurvivalState::MAX_HEALTH);
+            .apply_damage(mc_entity::player_survival_26_1_2::MAX_HEALTH);
         let prepared = PreparedProjectilePlayerDamage {
             target_session: target,
+            kind: PlayerDamageKind::Projectile,
             expected_shield: None,
             shield_after_block: None,
             next_resistance: None,
@@ -1717,6 +1739,7 @@ mod tests {
         target_plan.updated_survival.apply_damage(2.0);
         let prepared = PreparedProjectilePlayerDamage {
             target_session: target,
+            kind: PlayerDamageKind::Projectile,
             expected_shield: None,
             shield_after_block: None,
             next_resistance: None,

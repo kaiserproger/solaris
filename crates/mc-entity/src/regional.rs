@@ -13,10 +13,10 @@ use crate::lock_policy::{
 };
 use crate::{
     AnimalBreedingState, EntityDamage, EntityDamageRequest, EntityEffectRequest,
-    EntityEffectResult, EntityGoalCheckpoint, EntityId, EntityItemStack, EntityKinematics,
-    EntityLifecycle, EntityMotionState, EntitySimulationProjection, EntitySnapshot, EntityStore,
-    EntityView, GoalState, GoalTickStats, PathingBudget, PathingProbe, PreparedGoalTick,
-    ResolvedGoalTick, SpawnEntity, Vec3, deterministic_uuid, snapshot_from_spawn,
+    EntityEffectResult, EntityGoalCheckpoint, EntityGoalFence, EntityId, EntityItemStack,
+    EntityKinematics, EntityLifecycle, EntityMotionState, EntitySimulationProjection,
+    EntitySnapshot, EntityStore, EntityView, GoalState, GoalTickStats, PathingBudget, PathingProbe,
+    PreparedGoalTick, ResolvedGoalTick, SpawnEntity, Vec3, deterministic_uuid, snapshot_from_spawn,
 };
 
 mod owner_lane;
@@ -795,6 +795,13 @@ impl RegionalPreparedGoalTick {
             .values()
             .filter(|batch| batch.pathing_request_count() > 0)
             .count()
+    }
+
+    #[must_use]
+    pub fn goal_fence(&self, entity: EntityId) -> Option<EntityGoalFence> {
+        self.goal_inputs
+            .get(&entity)
+            .map(|checkpoint| EntityGoalFence::from_goal(&checkpoint.goal))
     }
 
     pub fn visit_pathing_probe_positions(
@@ -4976,6 +4983,9 @@ impl RegionalOwnerCoordinator {
         }
         let lease = self.ensure_region(key)?;
         let id = self.next_owner_id()?;
+        let next_id_after_reservation =
+            id.0.checked_add(i32::from(entity.reserved_following_ids))
+                .ok_or(RegionOwnerLaneError::InvalidMutation)?;
         let uuid = entity.uuid.unwrap_or_else(|| deterministic_uuid(id));
         if self.uuids.contains_key(&uuid) {
             return Err(RegionOwnerLaneError::InvalidMutation);
@@ -4991,7 +5001,7 @@ impl RegionalOwnerCoordinator {
             }],
         )]);
         self.execute_mutations_with_stats(mutations, sequence, journal_commit)?;
-        self.next_id = id.0;
+        self.next_id = next_id_after_reservation;
         self.locations.insert(id, key);
         self.uuids.insert(uuid, id);
         Ok(id)
@@ -5024,17 +5034,22 @@ impl RegionalOwnerCoordinator {
                     break id;
                 }
             };
+            let reserved_following_ids = entity.reserved_following_ids;
             let uuid = entity.uuid.unwrap_or_else(|| deterministic_uuid(id));
             if self.uuids.contains_key(&uuid) || !pending_uuids.insert(uuid) {
                 return Err(RegionOwnerLaneError::InvalidMutation);
             }
             ids.push(id);
             snapshots.push(snapshot_from_spawn(id, uuid, entity));
+            cursor = cursor
+                .checked_add(i32::from(reserved_following_ids))
+                .ok_or(RegionOwnerLaneError::InvalidMutation)?;
         }
         let expected = snapshots.len();
         if self.insert_snapshots_batch(snapshots)? != expected {
             return Err(RegionOwnerLaneError::InvalidMutation);
         }
+        self.next_id = self.next_id.max(cursor);
         Ok(ids)
     }
 
@@ -5069,6 +5084,7 @@ impl RegionalOwnerCoordinator {
                     break id;
                 }
             };
+            let reserved_following_ids = entity.reserved_following_ids;
             let uuid = if let Some(uuid) = entity.uuid {
                 uuid
             } else {
@@ -5079,6 +5095,9 @@ impl RegionalOwnerCoordinator {
                 uuid
             };
             snapshots.push(snapshot_from_spawn(id, uuid, entity));
+            cursor = cursor
+                .checked_add(i32::from(reserved_following_ids))
+                .ok_or(RegionOwnerLaneError::InvalidMutation)?;
         }
         if snapshots.is_empty() {
             return Ok(Vec::new());
@@ -5087,6 +5106,7 @@ impl RegionalOwnerCoordinator {
         if self.insert_snapshots_batch(snapshots.clone())? != expected {
             return Err(RegionOwnerLaneError::InvalidMutation);
         }
+        self.next_id = self.next_id.max(cursor);
         Ok(snapshots)
     }
 
@@ -8436,6 +8456,9 @@ impl RegionalEntityStore {
             return Err(RegionEntityStoreError::CrossRegionReference);
         }
         let id = self.next_available_id()?;
+        let next_id_after_reservation =
+            id.0.checked_add(i32::from(entity.reserved_following_ids))
+                .ok_or(RegionEntityStoreError::IdExhausted)?;
         let uuid = entity.uuid.unwrap_or_else(|| deterministic_uuid(id));
         if self.uuids.contains_key(&uuid) {
             return Err(RegionEntityStoreError::DuplicateUuid);
@@ -8450,7 +8473,7 @@ impl RegionalEntityStore {
         }
         self.locations.insert(id, lease.key);
         self.uuids.insert(uuid, id);
-        self.next_id = id.0;
+        self.next_id = next_id_after_reservation;
         Ok(id)
     }
 
@@ -8474,12 +8497,15 @@ impl RegionalEntityStore {
                 ))?;
             self.validate_access(phase, lease)?;
             let id = self.next_available_id_after(cursor, &pending_ids)?;
+            let reserved_following_ids = entity.reserved_following_ids;
             let uuid = entity.uuid.unwrap_or_else(|| deterministic_uuid(id));
             if self.uuids.contains_key(&uuid) || !pending_uuids.insert(uuid) {
                 return Err(RegionEntityStoreError::DuplicateUuid);
             }
             pending_ids.insert(id);
-            cursor = id.0;
+            cursor =
+                id.0.checked_add(i32::from(reserved_following_ids))
+                    .ok_or(RegionEntityStoreError::IdExhausted)?;
             pending.push(PendingInsert {
                 key,
                 snapshot: snapshot_from_spawn(id, uuid, entity),
@@ -8490,6 +8516,7 @@ impl RegionalEntityStore {
             .map(|entity| entity.snapshot.id)
             .collect::<Vec<_>>();
         self.insert_prepared_snapshots(phase, pending)?;
+        self.next_id = self.next_id.max(cursor);
         Ok(ids)
     }
 
@@ -12706,6 +12733,46 @@ mod tests {
         assert!(damages[1].killed);
         drop(handle);
         runtime.shutdown().expect("damage batch shutdown");
+    }
+
+    #[test]
+    fn owner_damage_batch_rejects_passenger() {
+        let runtime = super::RegionalOwnerRuntime::from_store(RegionalEntityStore::new(), 1)
+            .expect("one-lane owner runtime");
+        let handle = runtime.handle();
+        let mut boat = SpawnEntity::vehicle(
+            VehicleKind::Boat,
+            0,
+            "minecraft:oak_boat",
+            Vec3::new(0.5, 64.0, 0.5),
+        );
+        boat.vehicle.as_mut().expect("boat state").passenger = Some(EntityId(2));
+        let ids = handle
+            .spawn_batch([boat, cow(Vec3::new(1.5, 64.0, 0.5))])
+            .expect("vehicle and passenger batch");
+        let passenger = ids[1];
+        let expected = handle
+            .snapshot(passenger)
+            .expect("passenger snapshot read")
+            .expect("passenger snapshot");
+
+        assert!(
+            handle
+                .damage_batch_if_current([(expected.clone(), damage_request(5.0))])
+                .expect("conditional passenger damage resolves")
+                .is_empty(),
+            "passenger damage must resolve as an unapplied conditional batch"
+        );
+        assert_eq!(
+            handle
+                .snapshot(passenger)
+                .expect("passenger re-read")
+                .expect("passenger remains")
+                .health,
+            expected.health
+        );
+        drop(handle);
+        runtime.shutdown().expect("passenger damage batch shutdown");
     }
 
     #[test]
@@ -16974,17 +17041,21 @@ mod tests {
             std::fs::create_dir_all(parent).expect("create battle report directory");
         }
         std::fs::write(&report_path, report).expect("write battle report");
+        let tick_p99_us = percentile(&tick_samples, 99);
         println!(
-            "ENTITY_BATTLE_BENCH team_size={TEAM_SIZE} lanes={lanes} actor_budget={ACTOR_BUDGET} ticks={ticks_executed} elapsed_ms={elapsed_ms} alive_a={alive_a} alive_b={alive_b} deaths_a={deaths_a} deaths_b={deaths_b} attacks_planned={attacks_planned} attacks_applied={attacks_applied} retargets={retargets} outside_cohort_targets={targets_outside_actor_cohort} tick_p50_us={} tick_p95_us={} tick_p99_us={} tick_max_us={} goal_p99_us={} movement_p99_us={} attack_p99_us={} retarget_p99_us={} report={}",
+            "ENTITY_BATTLE_BENCH team_size={TEAM_SIZE} lanes={lanes} actor_budget={ACTOR_BUDGET} ticks={ticks_executed} elapsed_ms={elapsed_ms} alive_a={alive_a} alive_b={alive_b} deaths_a={deaths_a} deaths_b={deaths_b} attacks_planned={attacks_planned} attacks_applied={attacks_applied} retargets={retargets} outside_cohort_targets={targets_outside_actor_cohort} tick_p50_us={} tick_p95_us={} tick_p99_us={tick_p99_us} tick_max_us={} goal_p99_us={} movement_p99_us={} attack_p99_us={} retarget_p99_us={} report={}",
             percentile(&tick_samples, 50),
             percentile(&tick_samples, 95),
-            percentile(&tick_samples, 99),
             tick_samples.last().copied().unwrap_or_default(),
             percentile(&goal_samples, 99),
             percentile(&movement_samples, 99),
             percentile(&attack_samples, 99),
             percentile(&retarget_samples, 99),
             report_path.display(),
+        );
+        assert!(
+            tick_p99_us <= 50_000,
+            "integrated 1500v1500 regional battle exceeded the frozen 50 ms tick target at p99: {tick_p99_us} us"
         );
 
         drop(handle);
@@ -17066,8 +17137,9 @@ mod tests {
         assert_eq!(serial_state, parallel_state);
         serial.sort_unstable();
         parallel.sort_unstable();
+        let parallel_p99_us = percentile(&parallel, 99);
         println!(
-            "REGIONAL_OWNER_SCALING_BENCH entities={} regions={REGIONS} iterations={ITERATIONS} parallel_lanes={parallel_lanes} serial_p50_us={} serial_p95_us={} serial_p99_us={} serial_max_us={} parallel_p50_us={} parallel_p95_us={} parallel_p99_us={} parallel_max_us={}",
+            "REGIONAL_OWNER_SCALING_BENCH entities={} regions={REGIONS} iterations={ITERATIONS} parallel_lanes={parallel_lanes} serial_p50_us={} serial_p95_us={} serial_p99_us={} serial_max_us={} parallel_p50_us={} parallel_p95_us={} parallel_p99_us={parallel_p99_us} parallel_max_us={}",
             REGIONS * ENTITIES_PER_REGION,
             percentile(&serial, 50),
             percentile(&serial, 95),
@@ -17075,8 +17147,11 @@ mod tests {
             serial.last().copied().unwrap_or_default(),
             percentile(&parallel, 50),
             percentile(&parallel, 95),
-            percentile(&parallel, 99),
             parallel.last().copied().unwrap_or_default(),
+        );
+        assert!(
+            parallel_p99_us <= 50_000,
+            "2048-entity regional owner exceeded the frozen 50 ms tick target at p99: {parallel_p99_us} us"
         );
 
         let active_regions = 2;
@@ -17085,8 +17160,9 @@ mod tests {
         assert_eq!(active_serial_state, active_parallel_state);
         active_serial.sort_unstable();
         active_parallel.sort_unstable();
+        let active_parallel_p99_us = percentile(&active_parallel, 99);
         println!(
-            "REGIONAL_OWNER_ACTIVE_SUBSET_BENCH entities={} active_entities={} regions={REGIONS} active_regions={active_regions} iterations={ITERATIONS} parallel_lanes={parallel_lanes} serial_p50_us={} serial_p95_us={} serial_p99_us={} serial_max_us={} parallel_p50_us={} parallel_p95_us={} parallel_p99_us={} parallel_max_us={}",
+            "REGIONAL_OWNER_ACTIVE_SUBSET_BENCH entities={} active_entities={} regions={REGIONS} active_regions={active_regions} iterations={ITERATIONS} parallel_lanes={parallel_lanes} serial_p50_us={} serial_p95_us={} serial_p99_us={} serial_max_us={} parallel_p50_us={} parallel_p95_us={} parallel_p99_us={active_parallel_p99_us} parallel_max_us={}",
             REGIONS * ENTITIES_PER_REGION,
             active_regions * ENTITIES_PER_REGION,
             percentile(&active_serial, 50),
@@ -17095,8 +17171,11 @@ mod tests {
             active_serial.last().copied().unwrap_or_default(),
             percentile(&active_parallel, 50),
             percentile(&active_parallel, 95),
-            percentile(&active_parallel, 99),
             active_parallel.last().copied().unwrap_or_default(),
+        );
+        assert!(
+            active_parallel_p99_us <= 50_000,
+            "512-active regional owner subset exceeded the frozen 50 ms tick target at p99: {active_parallel_p99_us} us"
         );
     }
 

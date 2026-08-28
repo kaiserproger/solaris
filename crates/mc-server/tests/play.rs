@@ -17,6 +17,7 @@
 
 use std::net::SocketAddr;
 use std::num::NonZeroUsize;
+use std::path::Path;
 use std::time::Duration;
 
 use bytes::{Buf, BytesMut};
@@ -38,10 +39,10 @@ use mc_protocol::packets::play::{
     ClientboundCustomPayload, ClientboundInitializeBorder, ClientboundPlayerAbilities,
     ClientboundRecipeBookAdd, ClientboundRecipeBookSettings, ClientboundSetHealth,
     ClientboundSetHeldSlot, ClientboundSetTime, ClientboundSystemChat, ClientboundUpdateRecipes,
-    ConfirmTeleportation, EntityEvent, GameEvent, LevelChunkWithLight, LoginPlay, MovePlayerFlags,
-    PlayDisconnect, ServerboundChat, ServerboundChatCommand, ServerboundCustomPayload,
-    ServerboundKeepAlive, ServerboundMovePlayerPos, SetCenterChunk, SetDefaultSpawnPosition,
-    SynchronizePlayerPosition, unpack_block_pos,
+    CommandNodeKind, ConfirmTeleportation, EntityEvent, GameEvent, LevelChunkWithLight, LoginPlay,
+    MovePlayerFlags, PlayDisconnect, ServerboundChat, ServerboundChatCommand,
+    ServerboundCustomPayload, ServerboundKeepAlive, ServerboundMovePlayerPos, SetCenterChunk,
+    SetDefaultSpawnPosition, SynchronizePlayerPosition, unpack_block_pos,
 };
 use mc_protocol::packets::{CustomPayload, Packet};
 use mc_script::{ScriptCommand, ScriptEvent, ScriptEventKind, ScriptHostEndpoint, ScriptPlayerId};
@@ -175,6 +176,43 @@ fn script_server_config(shutdown: mc_net::ShutdownHandle) -> mc_net::ServerConfi
         loader_manifest: None,
         shutdown,
     }
+}
+
+fn access_file_server_config(path: &Path) -> mc_net::ServerConfig {
+    let raw = std::fs::read_to_string(path).expect("read access-control server config");
+    let mut config: mc_server::ServerConfig = toml::from_str(&raw).expect("parse server config");
+    config
+        .load_access_control_files(path)
+        .expect("load file-backed access control");
+    config
+        .to_network(
+            std::sync::Arc::new(mc_data::testing::stub()),
+            std::sync::Arc::new(
+                mc_world::BlockRegistry::from_report(&[]).expect("empty registry builds"),
+            ),
+            None,
+            std::sync::Arc::new(mc_data::tags::TagsData::default()),
+            std::sync::Arc::new(Vec::new()),
+            std::sync::Arc::new(mc_data::loot::LootTables::default()),
+            None,
+            std::sync::Arc::new(mc_data::items::ItemRegistry::default()),
+            std::sync::Arc::new(mc_data::item_components::ItemFactsTable::default()),
+            std::sync::Arc::new(mc_data::block_facts::BlockFactsTable::default()),
+            std::sync::Arc::new(mc_data::entity_types::solaris_required_entity_types()),
+            std::sync::Arc::new(mc_data::biomes::BiomeSpawnRules::default()),
+        )
+        .expect("translate access-control server config")
+}
+
+async fn start_server_from_access_file_config(path: &Path) -> SocketAddr {
+    let bound = mc_net::bind(access_file_server_config(path))
+        .await
+        .expect("bind access-control server");
+    let addr = bound.local_addr().expect("local_addr");
+    tokio::spawn(async move {
+        let _ = bound.serve().await;
+    });
+    addr
 }
 
 async fn write_frame<P: Packet>(stream: &mut TcpStream, packet: &P, compression: Compression) {
@@ -517,6 +555,32 @@ async fn drive_to_play(
     let _ = FinishConfiguration::decode(&mut frame.body).unwrap();
     write_frame(stream, &AcknowledgeFinishConfiguration, compression).await;
     compression
+}
+
+async fn command_roots_for(addr: SocketAddr, name: &str) -> Vec<String> {
+    let mut stream = TcpStream::connect(addr).await.unwrap();
+    let mut rbuf = BytesMut::with_capacity(8192);
+    let compression = drive_to_play(&mut stream, &mut rbuf, addr, name).await;
+    tokio::time::timeout(Duration::from_secs(2), async {
+        loop {
+            let mut frame = read_one_frame(&mut stream, &mut rbuf, compression).await;
+            if frame.id != ClientboundCommands::ID {
+                continue;
+            }
+            let commands = ClientboundCommands::decode(&mut frame.body).unwrap();
+            let root = &commands.nodes[commands.root_index as usize];
+            return root
+                .children
+                .iter()
+                .filter_map(|index| match &commands.nodes[*index as usize].kind {
+                    CommandNodeKind::Literal(root) => Some(root.clone()),
+                    _ => None,
+                })
+                .collect::<Vec<_>>();
+        }
+    })
+    .await
+    .expect("command tree was not delivered within 2s")
 }
 
 #[tokio::test]
@@ -1109,7 +1173,7 @@ async fn lua_plugin_loaded_from_disk_replies_to_join_and_chat_over_the_wire() {
             version = "0.1.0"
             api = "0.6.0"
             events = ["player.joined", "player.chat"]
-            console_commands = ["time"]
+            capabilities = ["world_time"]
         "#,
     )
     .unwrap();
@@ -1132,7 +1196,7 @@ async fn lua_plugin_loaded_from_disk_replies_to_join_and_chat_over_the_wire() {
                 if event.message == "ping" then
                     solaris.send_message(event.player_id, "chat:" .. context(event))
                 elseif event.message == "day" then
-                    solaris.run_console("time set day")
+                    solaris.set_world_time("set-day", 1000)
                 end
             end
         "#,
@@ -1274,6 +1338,7 @@ async fn lua_disk_plugin_spawns_allowlisted_entity_over_the_wire() {
 
             function on_player_command(event: any)
                 solaris.spawn_entity(
+                    "pet-spawn",
                     event.player_id,
                     "minecraft:pig",
                     event.x + 2,
@@ -1360,6 +1425,44 @@ async fn lua_disk_plugin_spawns_allowlisted_entity_over_the_wire() {
         .await
         .expect("Lua host join task failed")
         .expect("Lua host thread panicked");
+}
+
+#[tokio::test]
+async fn file_backed_operator_permissions_reload_across_server_instances() {
+    let temp = tempfile::tempdir().unwrap();
+    let config_path = temp.path().join("server.toml");
+    let operators_path = temp.path().join("ops.json");
+    std::fs::write(
+        &config_path,
+        r#"
+            [server]
+            name = "S"
+            motd = "M"
+
+            [network]
+            bind_address = "127.0.0.1"
+            port = 0
+
+            [admin]
+            operators_file = "ops.json"
+            allow_local_dev_operators = false
+        "#,
+    )
+    .unwrap();
+    std::fs::write(&operators_path, br#"[{"name":"FileOp","level":4}]"#).unwrap();
+
+    let first_addr = start_server_from_access_file_config(&config_path).await;
+    let operator_roots = command_roots_for(first_addr, "FileOp").await;
+    assert!(operator_roots.iter().any(|root| root == "time"));
+    let member_roots = command_roots_for(first_addr, "MemberOne").await;
+    assert!(!member_roots.iter().any(|root| root == "time"));
+
+    std::fs::write(&operators_path, br#"[{"name":"SecondOp","level":4}]"#).unwrap();
+    let restarted_addr = start_server_from_access_file_config(&config_path).await;
+    let former_operator_roots = command_roots_for(restarted_addr, "FileOp").await;
+    assert!(!former_operator_roots.iter().any(|root| root == "time"));
+    let new_operator_roots = command_roots_for(restarted_addr, "SecondOp").await;
+    assert!(new_operator_roots.iter().any(|root| root == "time"));
 }
 
 #[tokio::test]

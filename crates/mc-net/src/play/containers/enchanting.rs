@@ -1,8 +1,8 @@
 use mc_data::Identifier;
+use mc_data::ItemStack;
 use mc_data::item_components::ItemFactsTable;
 use mc_data::items::ItemRegistry;
 use mc_nbt::Tag;
-use mc_protocol::packets::play::ItemStack;
 use mc_world::BlockPos;
 
 use crate::play::inventory::PlayerInventory;
@@ -31,13 +31,7 @@ impl EnchantingTableWindow {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(in crate::play) struct EnchantingOffer {
-    button_id: i32,
-    required_level: i32,
-    lapis_cost: i32,
-    enchantment_level: i32,
-}
+pub(in crate::play) type EnchantingOffer = mc_data::enchanting_26_1_2::EnchantingOffer;
 
 pub(in crate::play) fn enchanting_menu_title_nbt() -> Result<Vec<u8>, mc_protocol::CodecError> {
     let mut out = Vec::new();
@@ -55,71 +49,21 @@ pub(in crate::play) fn enchanting_offer(
     bookshelf_count: u8,
     button_id: i32,
 ) -> Option<EnchantingOffer> {
-    match button_id {
-        0 => Some(EnchantingOffer {
-            button_id,
-            required_level: 1,
-            lapis_cost: 1,
-            enchantment_level: 1,
-        }),
-        1 if bookshelf_count >= 5 => Some(EnchantingOffer {
-            button_id,
-            required_level: 10,
-            lapis_cost: 2,
-            enchantment_level: 2,
-        }),
-        2 if bookshelf_count >= 15 => Some(EnchantingOffer {
-            button_id,
-            required_level: 30,
-            lapis_cost: 3,
-            enchantment_level: 3,
-        }),
-        _ => None,
-    }
+    mc_data::enchanting_26_1_2::enchanting_offer(bookshelf_count, button_id)
 }
 
 pub(in crate::play) fn supported_enchantment_for_item(
     item_facts: &ItemFactsTable,
     item: &Identifier,
 ) -> Option<Identifier> {
-    let enchantment = if item.path().ends_with("_sword") {
-        "minecraft:sharpness"
-    } else if mc_data::armor::builtin().entry(item).is_some() {
-        "minecraft:protection"
-    } else if item_is_efficiency_enchantable(item_facts, item) {
-        "minecraft:efficiency"
-    } else {
-        return None;
-    };
-    Some(Identifier::parse(enchantment).expect("static enchantment identifier"))
-}
-
-fn item_is_mining_loot_enchantable(item: &Identifier) -> bool {
-    matches!(
-        item.path(),
-        path if path.ends_with("_pickaxe")
-            || path.ends_with("_axe")
-            || path.ends_with("_shovel")
-            || path.ends_with("_hoe")
-    )
+    mc_data::enchanting_26_1_2::supported_enchantment_for_item(item_facts, item)
 }
 
 fn additional_enchantment_for_offer(
     item: &Identifier,
     offer: EnchantingOffer,
 ) -> Option<(Identifier, i32)> {
-    if !item_is_mining_loot_enchantable(item) {
-        return None;
-    }
-    let (enchantment, level) = match offer.button_id {
-        1 => ("minecraft:fortune", 2),
-        2 => ("minecraft:silk_touch", 1),
-        _ => return None,
-    };
-    Some((
-        Identifier::parse(enchantment).expect("static enchantment identifier"),
-        level,
-    ))
+    mc_data::enchanting_26_1_2::additional_enchantment_for_offer(item, offer.button_id)
 }
 
 pub(in crate::play) fn enchant_item_candidate(
@@ -255,22 +199,12 @@ pub(in crate::play) fn count_valid_enchanting_bookshelves(
     count
 }
 
+#[cfg(test)]
 pub(in crate::play) fn item_is_efficiency_enchantable(
     item_facts: &ItemFactsTable,
     item: &Identifier,
 ) -> bool {
-    item_facts
-        .get(item)
-        .and_then(|facts| facts.tool.as_ref())
-        .is_some()
-        || matches!(
-            item.path(),
-            path if path.ends_with("_pickaxe")
-                || path.ends_with("_axe")
-                || path.ends_with("_shovel")
-                || path.ends_with("_hoe")
-                || path == "shears"
-        )
+    mc_data::enchanting_26_1_2::item_is_efficiency_enchantable(item_facts, item)
 }
 
 pub(in crate::play) fn enchanting_table_input_projection(

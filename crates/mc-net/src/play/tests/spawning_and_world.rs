@@ -573,7 +573,7 @@ fn survival_damage_heal_and_death_are_clamped() {
     assert!(!state.is_dead());
 
     state.heal(100.0);
-    assert_eq!(state.health, SurvivalState::MAX_HEALTH);
+    assert_eq!(state.health, mc_entity::player_survival_26_1_2::MAX_HEALTH);
 
     state.apply_damage(100.0);
     assert_eq!(state.health, 0.0);
@@ -587,6 +587,7 @@ fn survival_exhaustion_drains_saturation_before_food() {
         food: 20,
         saturation: 1.0,
         exhaustion: 0.0,
+        remaining_fire_ticks: 0,
     };
 
     assert!(!state.add_exhaustion(3.0));
@@ -611,6 +612,7 @@ fn survival_food_addition_clamps_to_food_level() {
         food: 18,
         saturation: 1.0,
         exhaustion: 0.0,
+        remaining_fire_ticks: 0,
     };
 
     state.add_food(10, 30.0);

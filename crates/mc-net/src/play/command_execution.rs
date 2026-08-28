@@ -1,10 +1,12 @@
+use mc_data::ItemStack;
+use mc_domain::GameMode;
 use mc_entity::Vec3;
 use mc_protocol::codec::Identifier;
 use mc_protocol::frame::Compression;
 use mc_protocol::packets::play::{
     ClientCommandAction, ClientboundContainerSetSlot, ClientboundRespawn, ClientboundSetTime,
-    ClientboundSystemChat, GameEvent, GameMode, ItemStack, ServerboundClientCommand,
-    SetCenterChunk, SetDefaultSpawnPosition, pack_block_pos,
+    ClientboundSystemChat, GameEvent, ServerboundClientCommand, SetCenterChunk,
+    SetDefaultSpawnPosition, pack_block_pos,
 };
 use tokio::io::AsyncWriteExt;
 use tracing::{debug, warn};
@@ -19,18 +21,18 @@ use super::block_edit_commit::apply_visible_block_edit_batch_conditionally;
 use super::chunk_stream::ChunkStreamState;
 use super::combat::PlayerDamageKind;
 use super::commands::{
-    AdminCommand, CommandError, CommandPermissions, DebugCommand, SurvivalCommand,
+    AdminCommand, CommandError, CommandPermissions, DebugCommand, SurvivalCommand, WeatherCommand,
     parse_admin_command, player_abilities_for_mode,
 };
 use super::inventory::{PlayerInventory, item_max_stack};
 use super::movement::{PendingTeleport, clamp_player_coordinates, next_player_teleport_id};
 use super::persistence::XpState;
-use super::session::{SessionRegistry, dispatch_visibility_commands};
+use super::session::{SessionRegistry, WeatherKind, dispatch_visibility_commands};
 use super::simulation::SimulationHandle;
 use super::survival::SurvivalState;
 use super::{
     BlockEdit, InteractionState, PlayerPose, air_state_id, clear_shield_use,
-    commit_authoritative_player_pose, commit_player_inventory_candidate,
+    commit_authoritative_player_teleport, commit_player_inventory_candidate,
     commit_player_survival_update, replan_after_movement, send_player_position_sync,
     survival_damage_after_equipment, text_component_nbt, write_inventory_content_resync,
     write_inventory_slot_updates,
@@ -198,7 +200,7 @@ where
                 state.pending_use = None;
             }
             let new_center = player_pose.chunk_pos();
-            commit_authoritative_player_pose(simulation, *player_pose).await?;
+            commit_authoritative_player_teleport(simulation, *player_pose).await?;
             let teleport_id = next_player_teleport_id(next_teleport_id);
             send_player_position_sync(writer, compression, teleport_id, *player_pose).await?;
             *pending_teleport = Some(PendingTeleport::new(
@@ -295,6 +297,15 @@ where
                     .await
             }
         },
+        AdminCommand::Weather(command) => {
+            let weather = match command {
+                WeatherCommand::Clear => WeatherKind::Clear,
+                WeatherCommand::Rain => WeatherKind::Rain,
+                WeatherCommand::Thunder => WeatherKind::Thunder,
+            };
+            sessions.set_weather(weather);
+            send_command_feedback(writer, compression, &format!("Set weather to {command:?}")).await
+        }
         AdminCommand::Debug(command) => {
             apply_debug_command(
                 writer,

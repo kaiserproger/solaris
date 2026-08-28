@@ -20,11 +20,13 @@ individual fixes.
 
 ## Current-tree result
 
-An exact qualified-call search finds no first-party test invocation of
+An exact qualified-call search finds no first-party **test/gate** invocation of
 `tokio::time::sleep`, `tokio::task::yield_now`, `std::thread::sleep`,
-`Thread.sleep`, `time.sleep`, or `asyncio.sleep`. The words `sleep(` and
-`yield_now(` remain only in `xtask` forbidden-token lists used by structural
-ownership checks.
+`Thread.sleep`, `time.sleep`, or `asyncio.sleep`. Two production regional-owner
+coordination loops still call `std::thread::yield_now()`; they are runtime
+backoff points, not test progress synchronization, and are outside this Phase-1
+item's test/gate wait contract. `xtask` also retains forbidden-token string
+literals used by structural ownership checks.
 
 The state-loop candidate inventory has these dispositions:
 
@@ -74,8 +76,10 @@ rg -n -m 20 '(^|[;&|[:space:]])sleep[[:space:]]+[^=(]' \
   tools client-mod --glob '*.sh'
 ```
 
-The first command returns only `xtask` forbidden-token string literals; the
-shell-command form returns no match.
+The qualified-call command returns no test/gate invocation. The broader bare-call
+fence additionally reports the two production regional-owner
+`std::thread::yield_now()` coordination points plus `xtask` forbidden-token
+literals; neither is a test/gate wait. The shell-command form returns no match.
 
 ## Validation
 

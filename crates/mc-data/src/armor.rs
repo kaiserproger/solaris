@@ -44,6 +44,29 @@ pub struct ArmorEntry {
     pub max_damage: i32,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct ArmorStats {
+    pub armor: f32,
+    pub toughness: f32,
+}
+
+#[must_use]
+pub fn armor_reduced_damage(amount: f32, stats: ArmorStats) -> f32 {
+    let damage = amount.max(0.0);
+    let toughness = 2.0 + stats.toughness / 4.0;
+    let real_armor = (stats.armor - damage / toughness)
+        .clamp(stats.armor * 0.2, 20.0)
+        .max(0.0);
+    damage * (1.0 - real_armor / 25.0)
+}
+
+#[must_use]
+pub fn protection_reduced_damage(amount: f32, protection_points: i32) -> f32 {
+    let damage = amount.max(0.0);
+    let points = protection_points.clamp(0, 20) as f32;
+    damage * (1.0 - points / 25.0)
+}
+
 #[derive(Debug, Clone, Default)]
 pub struct ArmorTable {
     items: BTreeMap<Identifier, ArmorEntry>,

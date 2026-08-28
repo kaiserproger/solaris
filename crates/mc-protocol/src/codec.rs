@@ -240,7 +240,7 @@ pub trait ReadMc: Buf {
         }
         let len = len_signed as usize;
         if len > max {
-            return Err(CodecError::StringTooLong { len, max });
+            return Err(CodecError::ArrayTooLong { len, max });
         }
         ensure_remaining(self, len)?;
         let mut bytes = vec![0u8; len];
@@ -421,9 +421,14 @@ pub trait WriteMc: BufMut {
         self.put_slice(uuid.as_bytes());
     }
 
-    fn write_byte_array(&mut self, bytes: &[u8]) {
-        self.write_varint(i32::try_from(bytes.len()).expect("byte array length fits in an i32"));
+    fn write_byte_array(&mut self, bytes: &[u8]) -> Result<(), CodecError> {
+        let len = i32::try_from(bytes.len()).map_err(|_| CodecError::ArrayTooLong {
+            len: bytes.len(),
+            max: i32::MAX as usize,
+        })?;
+        self.write_varint(len);
         self.put_slice(bytes);
+        Ok(())
     }
 }
 
@@ -925,7 +930,7 @@ mod tests {
     fn byte_array_round_trip() {
         let data: Vec<u8> = (0..200).map(|i| (i ^ 0x55) as u8).collect();
         let mut buf = Vec::new();
-        buf.write_byte_array(&data);
+        buf.write_byte_array(&data).unwrap();
         let mut cursor: &[u8] = &buf;
         let read = cursor.read_byte_array(256).unwrap();
         assert_eq!(read, data);

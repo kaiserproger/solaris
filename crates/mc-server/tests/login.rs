@@ -11,6 +11,7 @@
 //! - the listener stays up for parallel clients.
 
 use std::net::SocketAddr;
+use std::path::Path;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -88,8 +89,7 @@ async fn start_server_with_login_access(login_access: mc_net::LoginAccessConfig)
         .await
 }
 
-fn network_config_from_toml(toml_src: &str) -> mc_net::ServerConfig {
-    let cfg: mc_server::ServerConfig = toml::from_str(toml_src).expect("parse config");
+fn network_config_from_server_config(cfg: mc_server::ServerConfig) -> mc_net::ServerConfig {
     cfg.to_network(
         std::sync::Arc::new(mc_data::testing::stub()),
         std::sync::Arc::new(
@@ -109,10 +109,34 @@ fn network_config_from_toml(toml_src: &str) -> mc_net::ServerConfig {
     .expect("network config")
 }
 
+fn network_config_from_toml(toml_src: &str) -> mc_net::ServerConfig {
+    let cfg: mc_server::ServerConfig = toml::from_str(toml_src).expect("parse config");
+    network_config_from_server_config(cfg)
+}
+
+fn network_config_from_path(path: &Path) -> mc_net::ServerConfig {
+    let raw = std::fs::read_to_string(path).expect("read server config");
+    let mut cfg: mc_server::ServerConfig = toml::from_str(&raw).expect("parse server config");
+    cfg.load_access_control_files(path)
+        .expect("load file-backed access control");
+    network_config_from_server_config(cfg)
+}
+
 async fn start_server_from_toml(toml_src: &str) -> SocketAddr {
     let bound = mc_net::bind(network_config_from_toml(toml_src))
         .await
         .expect("bind");
+    let addr = bound.local_addr().expect("local_addr");
+    tokio::spawn(async move {
+        let _ = bound.serve().await;
+    });
+    addr
+}
+
+async fn start_server_from_path(path: &Path) -> SocketAddr {
+    let bound = mc_net::bind(network_config_from_path(path))
+        .await
+        .expect("bind file-backed access server");
     let addr = bound.local_addr().expect("local_addr");
     tokio::spawn(async move {
         let _ = bound.serve().await;
@@ -457,6 +481,64 @@ async fn login_whitelist_rejects_before_compression() {
     assert_eq!(frame.id, LoginDisconnect::ID);
     let disconnect = LoginDisconnect::decode(&mut frame.body).unwrap();
     assert!(disconnect.reason_json.contains("not whitelisted"));
+}
+
+#[tokio::test]
+async fn file_backed_whitelist_and_ban_reload_across_server_instances() {
+    let temp = tempfile::tempdir().unwrap();
+    let config_path = temp.path().join("server.toml");
+    let whitelist_path = temp.path().join("whitelist.json");
+    let banned_path = temp.path().join("banned-players.json");
+    std::fs::write(
+        &config_path,
+        r#"
+            [server]
+            name = "S"
+            motd = "M"
+
+            [network]
+            bind_address = "127.0.0.1"
+            port = 0
+
+            [auth]
+            whitelist_enabled = true
+            whitelist_file = "whitelist.json"
+            banned_players_file = "banned-players.json"
+        "#,
+    )
+    .unwrap();
+    std::fs::write(&whitelist_path, br#"[{"name":"Allowed"}]"#).unwrap();
+    std::fs::write(&banned_path, b"[]").unwrap();
+
+    let first_addr = start_server_from_path(&config_path).await;
+    let compression = drive_to_set_compression(first_addr, "Allowed").await;
+    assert_eq!(compression.threshold, 256);
+    let (mut blocked, mut blocked_buf) = send_login_start(first_addr, "Blocked").await;
+    let mut frame = read_one_frame(&mut blocked, &mut blocked_buf, Compression::Disabled).await;
+    assert_eq!(frame.id, LoginDisconnect::ID);
+    let disconnect = LoginDisconnect::decode(&mut frame.body).unwrap();
+    assert!(disconnect.reason_json.contains("not whitelisted"));
+
+    std::fs::write(
+        &whitelist_path,
+        br#"[{"name":"Allowed"},{"name":"SecondUser"}]"#,
+    )
+    .unwrap();
+    std::fs::write(
+        &banned_path,
+        br#"[{"name":"Allowed","reason":"restart-ban"}]"#,
+    )
+    .unwrap();
+
+    let restarted_addr = start_server_from_path(&config_path).await;
+    let (mut banned, mut banned_buf) = send_login_start(restarted_addr, "Allowed").await;
+    let mut frame = read_one_frame(&mut banned, &mut banned_buf, Compression::Disabled).await;
+    assert_eq!(frame.id, LoginDisconnect::ID);
+    let disconnect = LoginDisconnect::decode(&mut frame.body).unwrap();
+    assert!(disconnect.reason_json.contains("banned"));
+
+    let compression = drive_to_set_compression(restarted_addr, "SecondUser").await;
+    assert_eq!(compression.threshold, 256);
 }
 
 #[tokio::test]

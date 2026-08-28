@@ -277,6 +277,10 @@ pub(in crate::play) fn server_entity_snapshot_from(entity: EntitySnapshot) -> Se
         .retained
         .crossbow_attack
         .is_some_and(EntityCrossbowAttackState::is_charging);
+    let blaze_charged = entity
+        .retained
+        .blaze_attack
+        .is_some_and(mc_entity::EntityBlazeAttackState::is_charged);
     let guardian_attack_target_entity_id = entity
         .retained
         .guardian_beam
@@ -303,6 +307,7 @@ pub(in crate::play) fn server_entity_snapshot_from(entity: EntitySnapshot) -> Se
             .is_some_and(|population| population.age_ticks < 0),
         main_hand_item,
         crossbow_charging,
+        blaze_charged,
         guardian_attack_target_entity_id,
     }
 }

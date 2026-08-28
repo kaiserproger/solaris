@@ -2,7 +2,7 @@ use std::collections::HashMap;
 use std::sync::{Arc, MutexGuard};
 use std::time::Instant;
 
-use mc_protocol::packets::play::ItemStack;
+use mc_data::ItemStack;
 use mc_world::{BlockPos, WorldStorage};
 use tracing::warn;
 

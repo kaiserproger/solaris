@@ -13,8 +13,9 @@ use crate::play::simulation::{
     PlayerSurvivalPlan, SimulationAuthority,
 };
 use crate::play::{ContainerPlayerPlan, PlayerInventoryCommitOutcome};
+use mc_data::ItemStack;
+use mc_domain::GameMode;
 use mc_entity::{EntityItemStack, Vec3};
-use mc_protocol::packets::play::{GameMode, ItemStack};
 use std::sync::atomic::Ordering;
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
@@ -481,7 +482,8 @@ pub(super) fn apply_player_survival_plan_locked(
 
 #[cfg(test)]
 mod tests {
-    use super::*;
+    use super::{PlayerPersistedState, SessionRegistry};
+    use std::sync::{Arc, Mutex};
 
     #[test]
     fn poisoned_player_persistence_fails_stop_with_typed_lock_name() {

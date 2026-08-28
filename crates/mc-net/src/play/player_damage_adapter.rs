@@ -1,6 +1,8 @@
 use mc_data::block_facts::FluidKind;
+use mc_data::item_stack::ItemStack;
+use mc_domain::GameMode;
 use mc_protocol::frame::Compression;
-use mc_protocol::packets::play::{EntityVec3, GameMode, ItemStack};
+use mc_protocol::packets::play::EntityVec3;
 use mc_world::BlockPos;
 use tokio::io::AsyncWriteExt;
 use tracing::debug;

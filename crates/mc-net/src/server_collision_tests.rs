@@ -48,6 +48,7 @@ fn powder_snow_boxes(
         aabb: mc_physics::Aabb::COW,
         on_ground: false,
         fall_distance,
+        goal_fence: mc_entity::EntityGoalFence::Idle,
         kind,
     };
     let input = sample_entity_physics_input(query, world, materials);
@@ -100,6 +101,7 @@ fn sampled_physics_uses_exact_pitcher_crop_collision_shape() {
         aabb: mc_physics::Aabb::COW,
         on_ground: true,
         fall_distance: 0.0,
+        goal_fence: mc_entity::EntityGoalFence::Idle,
         kind: play::EntityPhysicsKind::Living,
     };
     let input = sample_entity_physics_input(query, &mut world, &materials);

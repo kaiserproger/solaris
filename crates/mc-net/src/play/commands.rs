@@ -1,6 +1,7 @@
+use mc_domain::GameMode;
 use mc_protocol::packets::play::{
     ClientboundCommands, ClientboundPlayerAbilities, CommandArgumentParser, CommandNode,
-    CommandStringKind, GameMode,
+    CommandStringKind,
 };
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -51,6 +52,13 @@ pub(crate) enum DebugCommand {
     },
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum WeatherCommand {
+    Clear,
+    Rain,
+    Thunder,
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub(crate) enum AdminCommand {
     DaylightCycle(Option<bool>),
@@ -77,6 +85,7 @@ pub(crate) enum AdminCommand {
         z: f64,
     },
     TimeSet(u64),
+    Weather(WeatherCommand),
     Debug(DebugCommand),
 }
 
@@ -95,9 +104,10 @@ pub(crate) struct CommandSuggestionSet {
 
 const ROOT_COMMANDS: &[&str] = &[
     "debug", "gamemode", "gamerule", "give", "kill", "save-all", "status", "stop", "summon",
-    "time", "tp",
+    "time", "tp", "weather",
 ];
 const GAME_MODES: &[&str] = &["survival", "creative", "adventure", "spectator"];
+const WEATHER_KINDS: &[&str] = &["clear", "rain", "thunder"];
 const GAME_RULES: &[&str] = &[
     "do_daylight_cycle",
     "keep_inventory",
@@ -127,7 +137,7 @@ pub(crate) fn command_tree_packet_with_plugin_roots(
     } else {
         ClientboundCommands {
             nodes: vec![
-                CommandNode::root(vec![1, 6, 8, 10, 11, 12, 13, 15, 17, 19, 20]),
+                CommandNode::root(vec![1, 6, 8, 10, 11, 12, 13, 15, 17, 19, 20, 27]),
                 CommandNode::literal("gamemode", vec![2, 3, 4, 5], false).restricted(true),
                 CommandNode::literal("survival", Vec::new(), true).restricted(true),
                 CommandNode::literal("creative", Vec::new(), true).restricted(true),
@@ -203,6 +213,10 @@ pub(crate) fn command_tree_packet_with_plugin_roots(
                     true,
                 )
                 .restricted(true),
+                CommandNode::literal("weather", vec![28, 29, 30], false).restricted(true),
+                CommandNode::literal("clear", Vec::new(), true).restricted(true),
+                CommandNode::literal("rain", Vec::new(), true).restricted(true),
+                CommandNode::literal("thunder", Vec::new(), true).restricted(true),
             ],
             root_index: 0,
         }
@@ -309,6 +323,12 @@ fn parse_admin_command_inner(command: &str) -> Result<AdminCommand, CommandError
             "Usage: /time set <ticks|day|noon|night|midnight>",
         ));
     }
+    if let Some(weather) = parse_weather_command(command) {
+        return Ok(AdminCommand::Weather(weather));
+    }
+    if command.starts_with("weather") {
+        return Err(CommandError::Usage("Usage: /weather <clear|rain|thunder>"));
+    }
     if let Some(debug) = parse_debug_command(command) {
         return Ok(AdminCommand::Debug(debug));
     }
@@ -354,6 +374,16 @@ pub(crate) fn command_suggestions_with_plugin_roots(
             slash_len + "gamerule ".len() as i32,
             rest,
             GAME_RULES,
+        );
+    }
+    if permissions.can_use_admin_commands()
+        && let Some(rest) = command.strip_prefix("weather ")
+    {
+        return suggestions_for_prefix(
+            input,
+            slash_len + "weather ".len() as i32,
+            rest,
+            WEATHER_KINDS,
         );
     }
     if command.contains(char::is_whitespace) {
@@ -563,6 +593,20 @@ fn parse_time_command(command: &str) -> Option<AdminCommand> {
     Some(AdminCommand::TimeSet(value))
 }
 
+fn parse_weather_command(command: &str) -> Option<WeatherCommand> {
+    let mut parts = command.split_whitespace();
+    if parts.next()? != "weather" {
+        return None;
+    }
+    let weather = match parts.next()? {
+        "clear" => WeatherCommand::Clear,
+        "rain" => WeatherCommand::Rain,
+        "thunder" => WeatherCommand::Thunder,
+        _ => return None,
+    };
+    parts.next().is_none().then_some(weather)
+}
+
 fn parse_survival_command(command: &str) -> Option<SurvivalCommand> {
     let mut parts = command.split_whitespace();
     let name = parts.next()?;
@@ -742,6 +786,42 @@ mod tests {
             .suggestions,
             vec!["adminday".to_owned()]
         );
+    }
+
+    #[test]
+    fn weather_command_is_operator_only_and_suggests_vanilla_states() {
+        assert_eq!(
+            parse_admin_command("weather rain", CommandPermissions::from_op(true)),
+            Ok(AdminCommand::Weather(WeatherCommand::Rain))
+        );
+        assert_eq!(
+            parse_admin_command("weather thunder", CommandPermissions::from_op(false)),
+            Err(CommandError::PermissionDenied)
+        );
+        assert_eq!(
+            parse_admin_command("weather snow", CommandPermissions::from_op(true)),
+            Err(CommandError::Usage("Usage: /weather <clear|rain|thunder>"))
+        );
+        assert_eq!(
+            parse_admin_command("weather rain 2s", CommandPermissions::from_op(true)),
+            Err(CommandError::Usage("Usage: /weather <clear|rain|thunder>")),
+            "duration stays fail-closed until the natural weather scheduler is modelled"
+        );
+        assert_eq!(
+            command_suggestions("weather t", CommandPermissions::from_op(true)).suggestions,
+            vec!["thunder".to_owned()]
+        );
+        assert!(
+            command_suggestions("weather ", CommandPermissions::from_op(false))
+                .suggestions
+                .is_empty()
+        );
+        let tree = command_tree_packet(CommandPermissions::from_op(true));
+        let weather = tree
+            .nodes
+            .iter()
+            .find(|node| matches!(&node.kind, CommandNodeKind::Literal(name) if name == "weather"));
+        assert!(weather.is_some_and(|node| node.restricted && !node.executable));
     }
 
     #[test]

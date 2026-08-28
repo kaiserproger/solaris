@@ -1,7 +1,7 @@
 use super::{ServerEntitySnapshot, SessionEntityGuards, SessionId};
 use crate::play::persistence::PlayerPersistedState;
+use mc_domain::GameMode;
 use mc_entity::Vec3;
-use mc_protocol::packets::play::GameMode;
 use mc_script::{
     ScriptEntityId, ScriptEntityKillSource, ScriptEvent, ScriptGameMode, ScriptPlayerContext,
     ScriptPlayerId,

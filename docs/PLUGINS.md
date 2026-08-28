@@ -291,18 +291,21 @@ vanilla-block substitution. Solaris keeps one full, opaque, non-emitting
 canonical server-owned state after the frozen vanilla state range in the
 server block and light tables and projects it through the exact session's
 mapping in both block updates and chunk palettes. Projected chunk frames are
-not shared across sessions. The owning
-host-attested plugin can place that exact canonical state with
-`solaris.place_loader_block("plugin-id:block-id", x, y, z)`. Solaris rejects a
-foreign or unknown block id and commits accepted coordinates through the
-server-owned block-edit transaction, so world storage never contains a client
-runtime id. The same exact owner can call
-`solaris.grant_loader_block_item(player_id, "plugin-id:block-id", count)` with
-`count` in `1..=64`. The target must be the exact live session that
-acknowledged that block carrier. Solaris merges a canonical
-`minecraft:paper` stack carrying the verified block name and
-`solaris_loader:loader_block` `ITEM_MODEL` into the player's normal inventory,
-persists it before publication, and leaves a full inventory unchanged.
+not shared across sessions. The owning host-attested plugin can request that
+exact canonical state with
+`solaris.place_loader_block(request_id, "plugin-id:block-id", x, y, z)`.
+Solaris rejects a foreign/unknown block id or invalid world position before
+mutation, commits accepted coordinates through the server-owned block-edit
+transaction, and then publishes required targeted
+`loader.block_placement_result`; world storage never contains a client runtime
+id. The same exact owner can call
+`solaris.grant_loader_block_item(request_id, player_id, "plugin-id:block-id", count)`
+with `count` in `1..=64`. The target must be the exact live session that
+acknowledged that block carrier. Solaris merges a canonical `minecraft:paper`
+stack carrying the verified block name and `solaris_loader:loader_block`
+`ITEM_MODEL` into the player's normal inventory, persists it before publication,
+leaves a full inventory unchanged, and returns required targeted
+`loader.item_grant_result` with semantic success/failure.
 When that exact stack is used on a block, only the live session that
 acknowledged the carrier may resolve it to the canonical owner block. Solaris
 then reuses normal survival placement validation and atomically commits the
@@ -320,8 +323,9 @@ Multiple simultaneous block carriers remain a later slice.
 Plugin ids use lowercase ASCII letters, digits, `_`, `-`, or `.`. Command roots
 remain lowercase ASCII literals of at most 64 bytes. Plugin command roots are
 globally exclusive, bounded to 128 roots, and cannot shadow a Solaris built-in.
-`console_commands` and `spawn_entities` remain exact allow-lists. A resource
-identifier must be fully namespaced lowercase ASCII and no more than 128 bytes.
+`spawn_entities` remains an exact allow-list. Cross-domain console execution is
+not part of the plugin API; gameplay mutations use typed commands/results instead.
+A resource identifier must be fully namespaced lowercase ASCII and no more than 128 bytes.
 `relation` is `required`, `optional`, or `load_before`.
 
 Discovery reads at most 128 plugin directories. `plugin.toml` is capped at 64
@@ -367,9 +371,64 @@ configuration skips only that plugin before it can claim command roots.
 | `villagers` | `bind_nearest_villager`, `set_villager_idle`, `move_villager_to` |
 | `player_teleport` | `teleport_player` |
 | `player_queries` | `list_online_players` |
+| `entity_damage` | `damage_entity` |
+| `world_time` | `set_world_time` |
+| `world_blocks` | `set_block` |
 
 An undeclared privileged call fails synchronously in Luau before it enters the
 bounded command batch. Unknown capabilities reject the plugin during discovery.
+
+## Runtime Lifecycle And Diagnostics
+
+Each accepted plugin owns one sandboxed Luau state while all plugin states are
+scheduled serially on the dedicated `solaris-luau-host` thread. A handler trap,
+instruction/memory/wall-clock budget failure, batch-rejection callback failure,
+or host command-admission rejection disables only that plugin. Its player command
+roots are unregistered before the host advances to later events; other plugins
+continue from the same bounded FIFO.
+
+Runtime disablement is retained as a typed host diagnostic rather than existing
+only as a transient log line. Joining `LuaHost` returns `LuaHostExitReport` with
+the startup-loaded count, count still enabled at host exit, every disabled plugin id, the
+disable stage (`handler`, `batch_rejection_handler`, or `command_admission`), a
+UTF-8-safe diagnostic capped at 4 KiB, and the host exit reason. The composition
+root logs that report during shutdown. Normal server shutdown drains admitted
+script work, publishes the required `server.stopping` event, closes event
+admission, and therefore ends the host with `event_queue_closed`; command-queue
+closure or unavailable command authority is reported as a non-normal lifecycle
+exit instead of being indistinguishable from a clean stop.
+
+API `0.6.0` has a narrow prepared replacement boundary through `LuaHost::reload`.
+The caller first builds a complete `PreparedLuaPlugins` candidate; reload rejects
+changes to ordered plugin identity/player-command roots, worldgen contributions, or
+client bundles because those remain restart-only contracts. The accepted request enters
+the same host-input FIFO as ordinary events. Every candidate Luau state is constructed
+before swap, then every subscribed candidate `on_server_started` handler runs under the
+normal bounded host/instruction/memory/wall-clock rules while its output remains staged.
+The host reserves capacity for the complete staged command set and validates host
+admission before commit. Only then does it replace command-root ownership in one write,
+swap the plugin generation, and publish the staged startup commands. Compile,
+`server.started`, command-queue/admission, or command-ownership failure before that
+point leaves the current generation and its ownership intact.
+
+Previous-generation fault diagnostics are returned in `LuaReloadReport`; runtime-local
+state such as timers starts fresh in the new generation. Host commands already emitted
+before the reload barrier remain valid committed output. Once a reload request is
+admitted to the host queue it is commit intent; cancelling the caller does not cancel
+the host-owned attempt.
+
+On Unix, `mc-server` uses `SIGHUP` as the explicit production reload trigger. It
+re-reads the configured TOML on a blocking worker, requires that the server originally
+started with `plugins.strict = true` and that the current file still has strict mode,
+then reruns the normal external/bundled discovery and `plugins.expected` validation
+before calling `LuaHost::reload`. File preparation and the host replacement are awaited
+without pausing the network server future. Other server configuration fields remain the
+startup snapshot: SIGHUP applies only the validated plugin replacement. A server with no
+Luau host or one started in permissive plugin mode logs a rejection instead of treating
+SIGHUP as a successful reload. Non-Unix builds have no SIGHUP trigger.
+
+There is no filesystem watcher, polling cadence, or live client-bundle/worldgen swap;
+those restart-only contracts are rejected by the replacement boundary.
 
 ## Events
 
@@ -405,6 +464,12 @@ targeted event does not need a broad subscription to reach its owner.
 | `player.zone_exited` | `on_player_zone_exited` | player snapshot, `zone_id` |
 | `zone.command_result` | `on_zone_command_result` | `zone_id`, `accepted` |
 | `player.teleport_result` | `on_player_teleport_result` | `request_id`, `player_id`, `x`, `y`, `z`, `committed`, `failure` |
+| `world.time_set_result` | `on_world_time_set_result` | `request_id`, `world_time`, `committed`, `failure` |
+| `world.block_set_result` | `on_world_block_set_result` | `request_id`, `dimension`, `block_id`, `x`, `y`, `z`, `applied`, `failure` |
+| `loader.block_placement_result` | `on_loader_block_placement_result` | `request_id`, `block_id`, `x`, `y`, `z`, `placed`, `failure` |
+| `loader.item_grant_result` | `on_loader_item_grant_result` | `request_id`, `player_id`, `block_id`, `count`, `granted`, `failure` |
+| `entity.spawn_result` | `on_entity_spawn_result` | `request_id`, `player_id`, `entity_type`, `x`, `y`, `z`, `spawned`, `failure` |
+| `entity.damage_result` | `on_entity_damage_result` | `request_id`, `entity_id`, `amount`, `damaged`, `health`, `killed`, `failure` |
 | `player.online_result` | `on_player_online_result` | `request_id`, `players`, `truncated` |
 | `villager.binding_result` | `on_villager_binding_result` | `request_id`, `binding_token`, `binding_expires_at_tick`, `failure` |
 | `villager.goal_result` | `on_villager_goal_result` | `request_id`, `goal`, `accepted`, `failure`, optional `x`, `y`, `z`, `speed` |
@@ -554,11 +619,48 @@ The existing bounded presentation commands remain available:
 solaris.send_message(player_id, text)
 solaris.broadcast(text)
 solaris.disconnect(player_id, reason)
-solaris.run_console(command)
-solaris.spawn_entity(player_id, entity_type, x, y, z)
-solaris.place_loader_block(block_id, x, y, z)
-solaris.grant_loader_block_item(player_id, block_id, count)
+solaris.spawn_entity(request_id, player_id, entity_type, x, y, z)
+solaris.damage_entity(request_id, entity_id, amount)
+solaris.place_loader_block(request_id, block_id, x, y, z)
+solaris.grant_loader_block_item(request_id, player_id, block_id, count)
 ```
+
+`spawn_entity` is a typed entity mutation, not fire-and-forget presentation. The
+plugin must allow-list the exact namespaced type in `spawn_entities`; the host checks
+that declaration before the request can leave the bounded Luau batch. `request_id`
+uses the normal 64-byte script-id grammar, `player_id` is the actor session whose
+simulation fence authorizes the spawn, and the position uses the existing finite
+script coordinate bounds.
+
+After host admission the router resolves the type against the active server entity
+registry and submits the spawn through the actor-fenced simulation owner. Success
+publishes targeted `entity.spawn_result` with the original `request_id`, actor
+`player_id`, type and position, `spawned = true`, and `failure = nil`. A type that
+was declared by the plugin but is absent from the active server registry returns
+`unknown_entity_type` without enqueueing a simulation mutation. A stale/missing actor
+returns `actor_unavailable`; owner queue pressure returns `busy`; a closed, stopped,
+shutting-down, timed-out, or unavailable runtime returns `runtime_unavailable`; other
+owner rejections return `rejected`. Failed results use `spawned = false` and a
+non-nil failure. The result reports simulation-owner commit, not socket delivery or
+client rendering.
+
+`damage_entity` is the bounded common combat primitive for server-owned non-player
+entities. It requires the `entity_damage` capability. `request_id` uses the normal
+64-byte script-id grammar, `entity_id` must fit the server's signed 32-bit entity-id
+space, and `amount` must be finite, positive, and at most 1,000,000. This operation is
+not disguised player melee: it does not invent a player attacker, held item, cooldown,
+knockback, or villager-player gossip attribution.
+
+After host admission the request enters the existing simulation-owner generic entity
+attack kernel. That kernel retains hurt-invulnerability, accepted-health publication,
+death scheduling, and the normal server-entity kill reward path. Success publishes
+required targeted `entity.damage_result` with the original request id/entity id/raw
+amount, `damaged = true`, authoritative post-commit `health`, exact `killed`, and
+`failure = nil`. Missing/non-living targets, hurt-invulnerability, or other definite
+owner rejection return `damaged = false`, `health = nil`, `killed = false`, and
+`failure = "rejected"`. Queue pressure returns `busy`; a closed/stopped/timed-out/
+shutting-down/unavailable owner returns `runtime_unavailable`. The result reports the
+simulation-owner combat commit, not eventual client packet/rendering state.
 
 Plugins with `player_queries` may request one bounded point-in-time snapshot:
 
@@ -743,12 +845,62 @@ players, and 262,144 memberships. A request beyond a bound is rejected without
 partial mutation and logged by the production router. These bounds are server
 admission limits, not operator-configured worker percentages.
 
+Plugins declaring `world_time` may submit one typed authoritative clock mutation:
+
+```luau
+solaris.set_world_time("market-night", 13000)
+```
+
+`request_id` follows the normal 64-byte script-id rule. `world_time` is an integer in
+`0..=9_007_199_254_740_991` (`2^53 - 1`), the largest range in which every integer is
+represented exactly by the Luau number type; larger Rust/Luau requests are rejected
+rather than rounded. The router never writes the session clock directly: it
+submits the request through the server-owned simulation command lane used by other
+clock mutations. Success publishes targeted `world.time_set_result` with the exact
+`request_id`, committed `world_time`, and `failure = nil`. Capacity pressure reports
+`busy`; closed/stopped/shutting-down/unavailable simulation reports
+`runtime_unavailable`; other rejected owner outcomes report `rejected`. The result is
+an owner outcome, not a socket-delivery or client-render confirmation. An undeclared
+`world_time` call traps synchronously before a command enters the host batch.
+
+This is a bounded common-world API primitive, not a generic mutable-world handle.
+Plugins still receive no world storage, clock registry, simulation owner, lock, region,
+or scheduler reference.
+
+Plugins declaring `world_blocks` may replace one root block with the registry default
+state of one namespaced block id:
+
+```luau
+solaris.set_block("market-stone", "minecraft:overworld", "minecraft:stone", 1, 64, 1)
+```
+
+The first API is intentionally closed: `dimension` must be `minecraft:overworld`, the
+block id must exist in the active registry, and the request selects only that block's
+default state. Arbitrary block-state properties, block entities, cross-dimension writes,
+and unbounded edit batches are not exposed. Y must remain inside the server world
+height, while X/Z must remain inside the existing ±30,000,000 script horizontal
+coordinate limit. `request_id` follows the normal 64-byte script-id rule.
+
+After host capability/provenance admission, the router resolves the default state and
+submits one server-owned block edit through the existing simulation-owner command lane;
+it never acquires the world lock directly. Success publishes targeted
+`world.block_set_result`. `applied = true` means the simulation owner accepted and
+applied the requested block-edit batch, including an idempotent same-state write; it is
+not a claim that the prior state differed. Success is exactly `applied = true` with
+`failure = nil`; every rejection is exactly `applied = false` with a non-nil failure, so
+there is no ambiguous `false`/`nil` result. Validation failures use `unknown_block`,
+`unsupported_dimension`, or `out_of_world`; owner capacity pressure uses `busy`;
+closed/stopped/unavailable runtime uses `runtime_unavailable`; other rejected owner
+outcomes use `rejected`. The result is an owner outcome, not confirmation that every
+client rendered the block or received its packets. An undeclared `world_blocks` call
+traps before entering the host batch.
+
 ## Ownership Routing
 
 Luau commands never contain region keys, leases, epochs, locks, sockets, or
 worker handles. The server resolves ownership after admitting the bounded DTO:
 
-- entity spawn enters the simulation owner;
+- entity spawn, world-time mutation, and default-state world-block mutation enter the simulation owner;
 - villager binding and orders enter the current regional entity owner;
 - menus, teleports, and standalone player-inventory transactions enter the
   target player's ordered session lane;

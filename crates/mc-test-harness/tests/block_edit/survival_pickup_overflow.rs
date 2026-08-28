@@ -21,56 +21,6 @@ async fn near_full_inventory_partially_picks_up_and_preserves_remainder_identity
     let (mut client, _) = connect_to_play(addr, "PartialPickup").await;
     drain_until_chunk(&mut client, (0, 0)).await;
 
-    for expected_full_main_slots in 1..=27 {
-        client
-            .write_packet(&ServerboundChatCommand {
-                command: "debug give minecraft:dirt 64 0".into(),
-            })
-            .await
-            .expect("give main-inventory filler");
-        let filled_hotbar = wait_for_container_slot(&mut client, 0, 36, |stack| {
-            stack.item_id == dirt_id && stack.count == 64
-        })
-        .await;
-        client
-            .write_packet(&ServerboundContainerClick {
-                container_id: 0,
-                state_id: filled_hotbar.state_id,
-                slot_num: 36,
-                button_num: 0,
-                container_input: ContainerInput::QuickMove,
-                changed_slots: Vec::new(),
-                carried_item: HashedStack::empty(),
-            })
-            .await
-            .expect("quick-move filler into main inventory");
-        let _ = wait_for_inventory_content(&mut client, |packet| {
-            packet.container_id == 0
-                && packet.items.get(36).is_some_and(|stack| stack.is_empty())
-                && packet.items[9..=35]
-                    .iter()
-                    .filter(|stack| stack.item_id == dirt_id && stack.count == 64)
-                    .count()
-                    == expected_full_main_slots
-        })
-        .await;
-    }
-
-    for hotbar_slot in 1_u8..=8 {
-        client
-            .write_packet(&ServerboundChatCommand {
-                command: format!("debug give minecraft:dirt 64 {hotbar_slot}"),
-            })
-            .await
-            .expect("fill hotbar filler slot");
-        let _ = wait_for_container_slot(
-            &mut client,
-            0,
-            i16::from(36 + hotbar_slot),
-            |stack| stack.item_id == dirt_id && stack.count == 64,
-        )
-        .await;
-    }
     client
         .write_packet(&ServerboundChatCommand {
             command: "debug give minecraft:cobblestone 63 0".into(),
@@ -82,8 +32,116 @@ async fn near_full_inventory_partially_picks_up_and_preserves_remainder_identity
     })
     .await;
 
+    let mut inventory_snapshot = None;
+    let mut expected_main_dirt = 0_i32;
+    for count in [255_i32, 200] {
+        client
+            .write_packet(&ServerboundChatCommand {
+                command: format!("debug give minecraft:dirt {count} 1"),
+            })
+            .await
+            .expect("give bounded main-inventory filler");
+        let filled_hotbar = wait_for_container_slot(&mut client, 0, 37, |stack| {
+            stack.item_id == dirt_id && stack.count == count
+        })
+        .await;
+        client
+            .write_packet(&ServerboundContainerClick {
+                container_id: 0,
+                state_id: filled_hotbar.state_id,
+                slot_num: 37,
+                button_num: 0,
+                container_input: ContainerInput::QuickMove,
+                changed_slots: Vec::new(),
+                carried_item: HashedStack::empty(),
+            })
+            .await
+            .expect("quick-move bounded filler into main inventory");
+        expected_main_dirt += count;
+        inventory_snapshot = Some(
+            wait_for_inventory_content(&mut client, |packet| {
+                packet.container_id == 0
+                    && packet.items.get(37).is_some_and(|stack| stack.is_empty())
+                    && packet.items[9..=35]
+                        .iter()
+                        .filter(|stack| stack.item_id == dirt_id)
+                        .map(|stack| stack.count)
+                        .sum::<i32>()
+                        == expected_main_dirt
+            })
+            .await,
+        );
+    }
+    let mut target_inventory = inventory_snapshot
+        .expect("bounded filler must publish inventory content")
+        .items;
+
     let (mut dropper, _) = connect_to_play(addr, "PartialDropper").await;
     drain_until_chunk(&mut dropper, (0, 0)).await;
+    for _ in 0..7 {
+        dropper
+            .write_packet(&ServerboundChatCommand {
+                command: "debug give minecraft:dirt 255 0".into(),
+            })
+            .await
+            .expect("seed bounded dirt filler entity");
+        let _ = wait_for_container_slot(&mut dropper, 0, 36, |stack| {
+            stack.item_id == dirt_id && stack.count == 255
+        })
+        .await;
+        dropper
+            .write_packet(&ServerboundPlayerAction {
+                action: PlayerActionKind::DropAllItems,
+                position: 0,
+                direction: Direction::Down,
+                sequence: 400,
+            })
+            .await
+            .expect("drop bounded dirt filler entity");
+        let _ = wait_for_container_slot(&mut dropper, 0, 36, |stack| stack.is_empty()).await;
+    }
+
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
+    loop {
+        let full_main = target_inventory[9..=35]
+            .iter()
+            .all(|stack| stack.item_id == dirt_id && stack.count == 64);
+        let full_other_hotbar = target_inventory[37..=44]
+            .iter()
+            .all(|stack| stack.item_id == dirt_id && stack.count == 64);
+        if full_main && full_other_hotbar {
+            break;
+        }
+        let frame = client
+            .read_frame_with_timeout(
+                deadline.saturating_duration_since(tokio::time::Instant::now()),
+            )
+            .await
+            .expect("bounded dirt filler pickup completion");
+        if handle_keepalive(&mut client, frame.id, &frame.body).await {
+            continue;
+        }
+        if frame.id == ClientboundContainerSetSlot::ID {
+            let mut body = frame.body;
+            let packet = ClientboundContainerSetSlot::decode(&mut body)
+                .expect("decode bounded dirt filler slot update");
+            if packet.container_id == 0
+                && let Ok(slot) = usize::try_from(packet.slot)
+                && let Some(target) = target_inventory.get_mut(slot)
+            {
+                *target = packet.item_stack;
+            }
+        } else if frame.id == ClientboundContainerSetContent::ID {
+            let mut body = frame.body;
+            let packet = ClientboundContainerSetContent::decode(&mut body)
+                .expect("decode bounded dirt filler content update");
+            if packet.container_id == 0 {
+                target_inventory = packet.items;
+            }
+        }
+    }
+    assert_eq!(target_inventory[36].item_id, cobblestone_id);
+    assert_eq!(target_inventory[36].count, 63);
     dropper
         .write_packet(&ServerboundChatCommand {
             command: "debug give minecraft:cobblestone 3 0".into(),

@@ -12,20 +12,16 @@ use std::time::Duration;
 
 use anyhow::{Result, bail, ensure};
 use model::{ComparisonOutcome, EntityFact, EvidenceState, ScenarioId, compare_observations};
-use scenarios::run_scenario_catalog;
+use scenarios::{run_isolated_scenario_catalog, run_scenario_catalog};
 use support::{EntityEndpoint, EntityProtocolHarness, OracleGate, SolarisServer, probe_oracle};
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn solaris_entity_scenarios_emit_normalized_or_explicitly_degraded_evidence() {
     let server = SolarisServer::spawn().await.expect("spawn Solaris fixture");
-    let mut harness =
-        EntityProtocolHarness::connect(server.endpoint(), "EntityParityS", Duration::from_secs(12))
+    let observations =
+        run_isolated_scenario_catalog(server.endpoint(), "EntityParityS", Duration::from_secs(12))
             .await
-            .expect("enter Solaris play state");
-
-    let observations = run_scenario_catalog(&mut harness)
-        .await
-        .expect("run Solaris entity scenarios");
+            .expect("run isolated Solaris entity scenarios");
 
     assert_eq!(observations.len(), 6);
     let lifecycle = observation(&observations, ScenarioId::LifecyclePassengerCleanup);
@@ -119,12 +115,6 @@ async fn local_vanilla_and_solaris_entity_scenarios_compare_side_by_side() {
     )
     .expect("launch local vanilla oracle");
     let comparison = async {
-        let mut solaris_harness = EntityProtocolHarness::connect(
-            solaris.endpoint(),
-            "EntityParityS",
-            Duration::from_secs(12),
-        )
-        .await?;
         let mut vanilla_harness = EntityProtocolHarness::connect(
             EntityEndpoint {
                 kind: mc_test_harness::parity::ServerKind::Vanilla,
@@ -141,7 +131,12 @@ async fn local_vanilla_and_solaris_entity_scenarios_compare_side_by_side() {
                 && (line.contains("server operator") || line.contains("Opped"))
         })?;
 
-        let solaris_observations = run_scenario_catalog(&mut solaris_harness).await?;
+        let solaris_observations = run_isolated_scenario_catalog(
+            solaris.endpoint(),
+            "EntityParityS",
+            Duration::from_secs(12),
+        )
+        .await?;
         let vanilla_observations = run_scenario_catalog(&mut vanilla_harness).await?;
         require_complete_parity(&vanilla_observations, &solaris_observations)
     }

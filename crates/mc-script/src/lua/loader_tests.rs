@@ -125,6 +125,11 @@ permissions = [
         bundle.artifact_path(),
         fs::canonicalize(root.join("loader-test/client/rich-content.zip")).unwrap()
     );
+    assert_eq!(bundle.artifact_bytes(), b"x");
+    fs::write(root.join("loader-test/client/rich-content.zip"), b"y").unwrap();
+    assert_eq!(bundle.artifact_bytes(), b"x");
+    fs::remove_file(root.join("loader-test/client/rich-content.zip")).unwrap();
+    assert_eq!(bundle.artifact_bytes(), b"x");
     fs::remove_dir_all(root).unwrap();
 }
 
@@ -331,11 +336,10 @@ async fn shipped_two_owner_live_gate_fixture_is_discoverable_and_runnable() {
                 if provenance.plugin_id() == owner
                     && matches!(
                         request.as_ref(),
-                        ScriptCommand::GrantLoaderBlockItem {
-                            player_id: target,
-                            block_id: requested_block,
-                            count: 1,
-                        } if *target == player_id && requested_block == block_id
+                        ScriptCommand::GrantLoaderBlockItem { request }
+                            if request.player_id() == player_id
+                                && request.block_id() == block_id
+                                && request.count() == 1
                     )
         ));
         let screen = boundary.recv_command().await.unwrap();
@@ -392,4 +396,147 @@ async fn shipped_two_owner_live_gate_fixture_is_discoverable_and_runnable() {
         .await
         .unwrap()
         .unwrap();
+}
+
+fn write_graph_plugin(root: &Path, directory: &str, id: &str, extra_manifest: &str) {
+    let plugin_dir = root.join(directory);
+    fs::create_dir_all(&plugin_dir).unwrap();
+    fs::write(
+        plugin_dir.join("plugin.toml"),
+        format!(
+            r#"
+id = "{id}"
+name = "{id}"
+version = "0.1.0"
+api = "0.6.0"
+{extra_manifest}
+"#
+        ),
+    )
+    .unwrap();
+    fs::write(plugin_dir.join("main.lua"), "").unwrap();
+}
+
+#[test]
+fn dependency_graph_rejects_missing_required_plugin() {
+    let root = plugin_root("missing-required");
+    write_graph_plugin(
+        &root,
+        "dependent",
+        "dependent",
+        r#"
+[[dependencies]]
+id = "missing"
+relation = "required"
+"#,
+    );
+
+    let error = prepare_lua_plugins(LuaHostConfig::new(&root)).unwrap_err();
+    assert!(matches!(
+        error,
+        LuaHostError::DependencyGraph { message }
+            if message.contains("dependent") && message.contains("missing")
+    ));
+    fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn dependency_graph_orders_required_optional_and_load_before_deterministically() {
+    let root = plugin_root("topological-order");
+    write_graph_plugin(
+        &root,
+        "00-dependent",
+        "dependent",
+        r#"
+[[dependencies]]
+id = "base"
+relation = "required"
+"#,
+    );
+    write_graph_plugin(
+        &root,
+        "10-optional",
+        "optional",
+        r#"
+[[dependencies]]
+id = "absent"
+relation = "optional"
+"#,
+    );
+    write_graph_plugin(&root, "20-target", "target", "");
+    write_graph_plugin(
+        &root,
+        "30-before",
+        "before",
+        r#"
+[[dependencies]]
+id = "target"
+relation = "load_before"
+"#,
+    );
+    write_graph_plugin(&root, "99-base", "base", "");
+
+    let prepared = prepare_lua_plugins(LuaHostConfig::new(&root)).unwrap();
+    let order = prepared
+        .discovered_plugins()
+        .map(|plugin| plugin.id().to_owned())
+        .collect::<Vec<_>>();
+    assert!(
+        order.iter().position(|id| id == "base").unwrap()
+            < order.iter().position(|id| id == "dependent").unwrap()
+    );
+    assert!(
+        order.iter().position(|id| id == "before").unwrap()
+            < order.iter().position(|id| id == "target").unwrap()
+    );
+    assert!(order.contains(&"optional".to_owned()));
+    fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn dependency_graph_orders_startup_before_post_world() {
+    let root = plugin_root("phase-order");
+    write_graph_plugin(&root, "00-post", "post", "");
+    write_graph_plugin(&root, "99-start", "start", "load_phase = \"startup\"");
+
+    let prepared = prepare_lua_plugins(LuaHostConfig::new(&root)).unwrap();
+    let order = prepared
+        .discovered_plugins()
+        .map(|plugin| plugin.id().to_owned())
+        .collect::<Vec<_>>();
+    assert_eq!(order, ["start", "post"]);
+    fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn dependency_graph_rejects_cycles_with_diagnostic_ids() {
+    let root = plugin_root("cycle");
+    write_graph_plugin(
+        &root,
+        "a",
+        "a",
+        r#"
+[[dependencies]]
+id = "b"
+relation = "required"
+"#,
+    );
+    write_graph_plugin(
+        &root,
+        "b",
+        "b",
+        r#"
+[[dependencies]]
+id = "a"
+relation = "required"
+"#,
+    );
+
+    let error = prepare_lua_plugins(LuaHostConfig::new(&root)).unwrap_err();
+    assert!(matches!(
+        error,
+        LuaHostError::DependencyGraph { message }
+            if message.contains("a") && message.contains("b") && message.contains("cycle")
+    ));
+    fs::remove_dir_all(root).unwrap();
 }

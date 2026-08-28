@@ -1,6 +1,7 @@
 use super::{
-    BlockChangedAck, BlockEdit, BlockStateId, BlockUpdate, Chunk, ChunkPos, Compression,
-    Identifier, InteractionHand, ItemRegistry, UseItemOnNoOpReason, UseItemOnResyncOptions,
+    BlockChangedAck, BlockEdit, BlockEditPrecondition, BlockStateId, BlockUpdate, Chunk, ChunkPos,
+    Compression, Identifier, InteractionHand, ItemRegistry, UseItemOnNoOpReason,
+    UseItemOnResyncOptions, apply_player_block_edit_batch_conditionally,
     interaction_state_for_items, pack_block_pos, reject_use_item_on_with_resync,
     send_loaded_block_edit_resyncs,
 };
@@ -55,6 +56,66 @@ async fn rejected_visible_block_edit_resyncs_authoritative_cached_state() {
     assert_eq!(update.position, pack_block_pos(pos.x, pos.y, pos.z));
     assert_eq!(update.state_id, 1);
     assert!(buf.is_empty());
+}
+
+#[tokio::test]
+async fn rejected_player_block_edit_resyncs_before_exactly_one_ack() {
+    let mut state = interaction_state_for_items(Arc::new(ItemRegistry::from_report(&[])));
+    let pos = mc_world::BlockPos { x: 1, y: 64, z: 1 };
+    let token = {
+        let mut storage = state.world.lock().await;
+        let cpos = ChunkPos { x: 0, z: 0 };
+        storage
+            .insert_generated_chunk(
+                cpos,
+                Chunk::empty(
+                    cpos,
+                    BlockStateId(0),
+                    Identifier::parse("minecraft:plains").unwrap(),
+                ),
+            )
+            .unwrap();
+        storage.set_block_at(pos, BlockStateId(1)).unwrap();
+        storage.block_mutation_token(pos).unwrap()
+    };
+    let edit = BlockEdit {
+        pos,
+        new_state: BlockStateId(0),
+    };
+    let stale = BlockEditPrecondition {
+        pos,
+        expected_state: BlockStateId(2),
+        expected_token: token,
+    };
+    let mut writer = Vec::new();
+
+    let outcome = apply_player_block_edit_batch_conditionally(
+        &mut state,
+        &mut writer,
+        23,
+        &[edit],
+        &[stale],
+        &[],
+    )
+    .await
+    .unwrap();
+    assert!(outcome.applied.is_empty());
+
+    let mut buf = bytes::BytesMut::from(writer.as_slice());
+    let mut resync = mc_protocol::frame::try_decode_frame(&mut buf, Compression::Disabled)
+        .unwrap()
+        .expect("authoritative resync");
+    assert_eq!(resync.id, BlockUpdate::ID);
+    assert_eq!(BlockUpdate::decode(&mut resync.body).unwrap().state_id, 1);
+    let mut ack = mc_protocol::frame::try_decode_frame(&mut buf, Compression::Disabled)
+        .unwrap()
+        .expect("block changed acknowledgement");
+    assert_eq!(ack.id, BlockChangedAck::ID);
+    assert_eq!(BlockChangedAck::decode(&mut ack.body).unwrap().sequence, 23);
+    assert!(
+        buf.is_empty(),
+        "player block edit must emit exactly one acknowledgement"
+    );
 }
 
 #[tokio::test]

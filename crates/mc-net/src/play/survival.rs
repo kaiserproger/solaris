@@ -2,7 +2,16 @@
 pub(super) use super::combat::is_durability_tool_path;
 pub(super) use super::combat::max_tool_damage_for_path;
 use super::*;
+#[cfg(test)]
+use mc_data::block_mining::VANILLA_SUBMERGED_MINING_SPEED;
+use mc_data::block_mining::{
+    block_break_is_denied as block_path_break_is_denied, destroy_progress_per_tick,
+    fallback_mining_facts, fallback_tool_allows_block_drop, fallback_tool_mining_speed,
+    fallback_tool_suffix_for_path,
+};
 use mc_world::plant_rules_26_1_2::plant_drop_stacks;
+
+use mc_entity::player_survival_26_1_2 as survival_rules;
 
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub(super) struct SurvivalState {
@@ -10,32 +19,16 @@ pub(super) struct SurvivalState {
     pub(super) food: i32,
     pub(super) saturation: f32,
     pub(super) exhaustion: f32,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq)]
-pub(super) enum SurvivalHealthTick {
-    Unchanged,
-    Changed,
-    StarvationDamage(f32),
+    pub(super) remaining_fire_ticks: i32,
 }
 
 impl SurvivalState {
-    pub(super) const MAX_HEALTH: f32 = 20.0;
-    pub(super) const MAX_FOOD: i32 = 20;
-    pub(super) const BLOCK_BREAK_EXHAUSTION: f32 = 0.005;
-    pub(super) const ENTITY_ATTACK_EXHAUSTION: f32 = 0.1;
-    pub(super) const SPRINT_EXHAUSTION_PER_METER: f32 = 0.1;
-    pub(super) const JUMP_EXHAUSTION: f32 = 0.05;
-    pub(super) const SPRINT_JUMP_EXHAUSTION: f32 = 0.2;
-    pub(super) const EXHAUSTION_STEP: f32 = 4.0;
-    const SATURATED_REGEN_TICKS: u32 = 10;
-    const HEALTH_TICK_PERIOD: u32 = 80;
-
     pub(super) const FULL: Self = Self {
-        health: Self::MAX_HEALTH,
-        food: Self::MAX_FOOD,
+        health: survival_rules::MAX_HEALTH,
+        food: survival_rules::MAX_FOOD,
         saturation: 5.0,
         exhaustion: 0.0,
+        remaining_fire_ticks: 0,
     };
 
     pub(super) const fn as_packet(self) -> ClientboundSetHealth {
@@ -46,105 +39,59 @@ impl SurvivalState {
         }
     }
 
+    fn resources(self) -> survival_rules::SurvivalResources {
+        survival_rules::SurvivalResources {
+            health: self.health,
+            food: self.food,
+            saturation: self.saturation,
+            exhaustion: self.exhaustion,
+        }
+    }
+
+    fn apply_resources(&mut self, resources: survival_rules::SurvivalResources) {
+        self.health = resources.health;
+        self.food = resources.food;
+        self.saturation = resources.saturation;
+        self.exhaustion = resources.exhaustion;
+    }
+
     pub(super) fn apply_damage(&mut self, amount: f32) {
-        self.health = (self.health - amount.max(0.0)).clamp(0.0, Self::MAX_HEALTH);
+        self.health = survival_rules::apply_damage(self.health, amount);
     }
 
     pub(super) fn heal(&mut self, amount: f32) {
-        self.health = (self.health + amount.max(0.0)).clamp(0.0, Self::MAX_HEALTH);
+        self.health = survival_rules::heal(self.health, amount);
     }
 
     pub(super) fn add_food(&mut self, food: i32, saturation: f32) {
-        self.food = self.food.saturating_add(food).clamp(0, Self::MAX_FOOD);
-        let current_saturation = if self.saturation.is_finite() {
-            self.saturation.max(0.0)
-        } else {
-            0.0
-        };
-        let added_saturation = if saturation.is_finite() {
-            saturation.max(0.0)
-        } else {
-            0.0
-        };
-        self.saturation = (current_saturation + added_saturation).min(self.food as f32);
+        (self.food, self.saturation) =
+            survival_rules::add_food(self.food, self.saturation, food, saturation);
     }
 
     pub(super) fn is_dead(self) -> bool {
-        self.health <= 0.0
+        survival_rules::is_dead(self.health)
     }
 
     pub(super) fn add_exhaustion(&mut self, amount: f32) -> bool {
         let before_food = self.food;
         let before_saturation = self.saturation;
-        self.food = self.food.clamp(0, Self::MAX_FOOD);
-        self.saturation = if self.saturation.is_finite() {
-            self.saturation.clamp(0.0, self.food as f32)
-        } else {
-            0.0
-        };
-        let current_exhaustion = if self.exhaustion.is_finite() {
-            self.exhaustion.max(0.0)
-        } else {
-            0.0
-        };
-        let added_exhaustion = if amount.is_finite() {
-            amount.max(0.0)
-        } else {
-            0.0
-        };
-        let total = current_exhaustion + added_exhaustion;
-        let total = if total.is_finite() { total } else { f32::MAX };
-        let resource_steps = (Self::MAX_FOOD * 2) as u32;
-        let steps = ((total / Self::EXHAUSTION_STEP).floor() as u32).min(resource_steps);
-        self.exhaustion = total % Self::EXHAUSTION_STEP;
-
-        let saturation_steps = steps.min(self.saturation.ceil() as u32);
-        self.saturation = (self.saturation - saturation_steps as f32).max(0.0);
-        let food_steps = steps - saturation_steps;
-        self.food = self.food.saturating_sub(food_steps as i32).max(0);
+        let updated = survival_rules::add_exhaustion(self.resources(), amount);
+        self.apply_resources(updated);
         self.food != before_food || self.saturation != before_saturation
     }
 
-    pub(super) fn tick_health(&mut self, tick_timer: &mut u32) -> SurvivalHealthTick {
-        if self.is_dead() {
-            *tick_timer = 0;
-            return SurvivalHealthTick::Unchanged;
-        }
+    pub(super) fn tick_health(
+        &mut self,
+        tick_timer: &mut u32,
+    ) -> survival_rules::SurvivalHealthTick {
+        let (updated, outcome) = survival_rules::tick_health(self.resources(), tick_timer);
+        self.apply_resources(updated);
+        outcome
+    }
 
-        if self.saturation > 0.0 && self.food >= Self::MAX_FOOD && self.health < Self::MAX_HEALTH {
-            *tick_timer = tick_timer.saturating_add(1);
-            if *tick_timer < Self::SATURATED_REGEN_TICKS {
-                return SurvivalHealthTick::Unchanged;
-            }
-            *tick_timer = 0;
-            let saturation_spent = self.saturation.min(6.0);
-            self.heal(saturation_spent / 6.0);
-            self.add_exhaustion(saturation_spent);
-            return SurvivalHealthTick::Changed;
-        }
-
-        if self.food >= 18 && self.health < Self::MAX_HEALTH {
-            *tick_timer = tick_timer.saturating_add(1);
-            if *tick_timer < Self::HEALTH_TICK_PERIOD {
-                return SurvivalHealthTick::Unchanged;
-            }
-            *tick_timer = 0;
-            self.heal(1.0);
-            self.add_exhaustion(6.0);
-            return SurvivalHealthTick::Changed;
-        }
-
-        if self.food == 0 {
-            *tick_timer = tick_timer.saturating_add(1);
-            if *tick_timer < Self::HEALTH_TICK_PERIOD {
-                return SurvivalHealthTick::Unchanged;
-            }
-            *tick_timer = 0;
-            return SurvivalHealthTick::StarvationDamage(1.0);
-        }
-
-        *tick_timer = 0;
-        SurvivalHealthTick::Unchanged
+    pub(super) fn ignite_for_seconds(&mut self, seconds: f32) {
+        self.remaining_fire_ticks =
+            mc_entity::fire_26_1_2::ignite_for_seconds(self.remaining_fire_ticks, seconds);
     }
 }
 
@@ -171,9 +118,6 @@ pub(super) struct PendingUse {
     pub(super) kind: UseKind,
 }
 
-const VANILLA_SUBMERGED_MINING_SPEED: f32 = 0.2;
-const FALLBACK_UNKNOWN_DESTROY_SPEED: f32 = 0.8;
-
 pub(super) fn held_item_id(state: &InteractionState) -> Option<u32> {
     held_item_stack(state).map(|held| held.item_id)
 }
@@ -192,219 +136,8 @@ pub(super) fn item_use_ticks(duration: Duration) -> u64 {
     mining_ticks(duration)
 }
 
-fn fallback_mining_facts(block_path: &str) -> mc_data::block_mining::BlockMiningFacts {
-    use mc_data::block_mining::BlockMiningFacts;
-
-    let (destroy_speed, requires_correct_tool_for_drops) = match block_path {
-        "bedrock" | "barrier" | "end_portal_frame" => (-1.0, false),
-        "air"
-        | "cave_air"
-        | "void_air"
-        | "short_grass"
-        | "tall_grass"
-        | "wheat"
-        | "carrots"
-        | "potatoes"
-        | "beetroots"
-        | "nether_wart"
-        | "pumpkin_stem"
-        | "melon_stem"
-        | "attached_pumpkin_stem"
-        | "attached_melon_stem"
-        | "sweet_berry_bush"
-        | "sugar_cane"
-        | "kelp"
-        | "kelp_plant"
-        | "torch"
-        | "wall_torch" => (0.0, false),
-        "cocoa" => (0.2, false),
-        "stone" | "granite" | "diorite" | "andesite" | "calcite" | "tuff" => (1.5, true),
-        "cobblestone" | "mossy_cobblestone" => (2.0, true),
-        "deepslate" => (3.0, true),
-        "cobbled_deepslate" => (3.5, true),
-        "obsidian" | "crying_obsidian" => (50.0, true),
-        "ancient_debris" => (30.0, true),
-        "dirt" | "coarse_dirt" | "rooted_dirt" | "podzol" | "sand" | "red_sand" => (0.5, false),
-        "grass_block" | "gravel" | "clay" => (0.6, false),
-        "crafting_table" | "chest" | "trapped_chest" => (2.5, false),
-        "furnace" | "blast_furnace" | "smoker" => (3.5, true),
-        path if path.starts_with("deepslate_") && path.ends_with("_ore") => (4.5, true),
-        path if path.ends_with("_ore") => (3.0, true),
-        path if path.ends_with("_log")
-            || path.ends_with("_wood")
-            || path.ends_with("_stem")
-            || path.ends_with("_hyphae")
-            || path.ends_with("_planks") =>
-        {
-            (2.0, false)
-        }
-        _ => (FALLBACK_UNKNOWN_DESTROY_SPEED, false),
-    };
-    BlockMiningFacts {
-        destroy_speed,
-        requires_correct_tool_for_drops,
-    }
-}
-
-fn fallback_tool_suffix_for_path(block_path: &str) -> Option<&'static str> {
-    let facts = fallback_mining_facts(block_path);
-    if facts.requires_correct_tool_for_drops
-        || matches!(block_path, "furnace" | "blast_furnace" | "smoker")
-    {
-        return Some("_pickaxe");
-    }
-    if block_path.ends_with("_log")
-        || block_path.ends_with("_wood")
-        || block_path.ends_with("_stem")
-        || block_path.ends_with("_hyphae")
-        || block_path.ends_with("_planks")
-        || matches!(block_path, "crafting_table" | "chest" | "trapped_chest")
-    {
-        return Some("_axe");
-    }
-    if matches!(
-        block_path,
-        "dirt"
-            | "coarse_dirt"
-            | "rooted_dirt"
-            | "podzol"
-            | "grass_block"
-            | "sand"
-            | "red_sand"
-            | "gravel"
-            | "clay"
-    ) {
-        return Some("_shovel");
-    }
-    None
-}
-
-fn fallback_tool_mining_speed(tool_path: Option<&str>, required_suffix: Option<&str>) -> f32 {
-    let Some(tool_path) = tool_path else {
-        return 1.0;
-    };
-    if required_suffix.is_some_and(|suffix| !tool_path.ends_with(suffix)) {
-        return 1.0;
-    }
-
-    for (material, speed) in [
-        ("wooden_", 2.0),
-        ("stone_", 4.0),
-        ("copper_", 5.0),
-        ("iron_", 6.0),
-        ("diamond_", 8.0),
-        ("netherite_", 9.0),
-        ("golden_", 12.0),
-    ] {
-        if tool_path.starts_with(material) {
-            return speed;
-        }
-    }
-    1.0
-}
-
-fn vanilla_destroy_progress_per_tick(
-    destroy_speed: f32,
-    mut item_speed: f32,
-    has_correct_tool_for_drops: bool,
-    on_ground: bool,
-    eye_in_water: bool,
-) -> f32 {
-    if destroy_speed < 0.0 {
-        return 0.0;
-    }
-    if destroy_speed == 0.0 {
-        return f32::INFINITY;
-    }
-    if !item_speed.is_finite() || item_speed < 0.0 {
-        item_speed = 1.0;
-    }
-    if eye_in_water {
-        item_speed *= VANILLA_SUBMERGED_MINING_SPEED;
-    }
-    if !on_ground {
-        item_speed /= 5.0;
-    }
-    let divisor = if has_correct_tool_for_drops {
-        30.0
-    } else {
-        100.0
-    };
-    item_speed / destroy_speed / divisor
-}
-
-#[cfg(test)]
-fn duration_to_full_break(progress_per_tick: f32) -> Duration {
-    if progress_per_tick >= 1.0 {
-        return Duration::ZERO;
-    }
-    if !progress_per_tick.is_finite() || progress_per_tick <= 0.0 {
-        return Duration::MAX;
-    }
-    let ticks = (1.0 / progress_per_tick).ceil() as u64;
-    Duration::from_millis(ticks.max(1).saturating_mul(50))
-}
-
-#[cfg(test)]
-pub(super) fn fallback_mining_time(block_path: &str, tool_path: Option<&str>) -> Duration {
-    let facts = fallback_mining_facts(block_path);
-    let item_speed =
-        fallback_tool_mining_speed(tool_path, fallback_tool_suffix_for_path(block_path));
-    let correct = !facts.requires_correct_tool_for_drops
-        || fallback_tool_allows_block_drop(block_path, tool_path);
-    duration_to_full_break(vanilla_destroy_progress_per_tick(
-        facts.destroy_speed,
-        item_speed,
-        correct,
-        true,
-        false,
-    ))
-}
-
-fn pickaxe_tier(tool_path: &str) -> Option<u8> {
-    let material = tool_path.strip_suffix("_pickaxe")?;
-    match material {
-        "wooden" | "golden" => Some(0),
-        "stone" | "copper" => Some(1),
-        "iron" => Some(2),
-        "diamond" => Some(3),
-        "netherite" => Some(4),
-        _ => None,
-    }
-}
-
-fn required_pickaxe_tier_for_drop(block_path: &str) -> Option<u8> {
-    let block_path = block_path.strip_prefix("deepslate_").unwrap_or(block_path);
-    match block_path {
-        "stone" | "cobblestone" | "deepslate" | "cobbled_deepslate" | "coal_ore"
-        | "nether_gold_ore" | "nether_quartz_ore" => Some(0),
-        "iron_ore" | "copper_ore" | "lapis_ore" => Some(1),
-        "diamond_ore" | "emerald_ore" | "gold_ore" | "redstone_ore" => Some(2),
-        "obsidian" | "crying_obsidian" | "ancient_debris" => Some(3),
-        _ => None,
-    }
-}
-
-pub(super) fn fallback_tool_allows_block_drop(block_path: &str, tool_path: Option<&str>) -> bool {
-    let Some(required_tier) = required_pickaxe_tier_for_drop(block_path) else {
-        return true;
-    };
-    tool_path
-        .and_then(pickaxe_tier)
-        .is_some_and(|tier| tier >= required_tier)
-}
-
-pub(super) fn block_tag_contains(tags: &TagsData, tag: &str, block_raw_id: i32) -> bool {
-    let Ok(block_registry) = Identifier::parse("minecraft:block") else {
-        return false;
-    };
-    let Ok(tag) = Identifier::parse(tag.trim_start_matches('#').to_string()) else {
-        return false;
-    };
-    tags.registries
-        .get(&block_registry)
-        .and_then(|block_tags| block_tags.get(&tag))
-        .is_some_and(|entries| entries.binary_search(&block_raw_id).is_ok())
+fn block_tag_contains(tags: &TagsData, tag: &str, block_raw_id: i32) -> bool {
+    tags.contains_raw_id("minecraft:block", tag, block_raw_id)
 }
 
 fn tool_rule_matches(
@@ -506,7 +239,7 @@ pub(super) fn mining_progress_for_block(
         item_speed += level.saturating_mul(level).saturating_add(1) as f32;
     }
     let has_correct_tool = !mining.requires_correct_tool_for_drops || tool_correct_for_drops;
-    vanilla_destroy_progress_per_tick(
+    destroy_progress_per_tick(
         mining.destroy_speed,
         item_speed,
         has_correct_tool,
@@ -516,12 +249,9 @@ pub(super) fn mining_progress_for_block(
 }
 
 pub(super) fn block_break_is_denied(blocks: &BlockRegistry, block_state: BlockStateId) -> bool {
-    blocks.by_id(block_state).is_some_and(|state| {
-        matches!(
-            state.block.id.path(),
-            "bedrock" | "barrier" | "end_portal_frame"
-        )
-    })
+    blocks
+        .by_id(block_state)
+        .is_some_and(|state| block_path_break_is_denied(state.block.id.path()))
 }
 
 pub(super) async fn mining_target_for(
@@ -596,6 +326,77 @@ pub(super) fn arrow_entity_type_id(entity_types: &EntityTypeRegistry) -> Option<
     let arrow = mc_data::Identifier::parse("minecraft:arrow").expect("static identifier");
     entity_types
         .id_of(&arrow)
+        .and_then(|id| i32::try_from(id).ok())
+}
+
+pub(super) fn small_fireball_entity_type_id(entity_types: &EntityTypeRegistry) -> Option<i32> {
+    let small_fireball =
+        mc_data::Identifier::parse("minecraft:small_fireball").expect("static identifier");
+    entity_types
+        .id_of(&small_fireball)
+        .and_then(|id| i32::try_from(id).ok())
+}
+
+pub(super) fn fireball_entity_type_id(entity_types: &EntityTypeRegistry) -> Option<i32> {
+    let fireball = mc_data::Identifier::parse("minecraft:fireball").expect("static identifier");
+    entity_types
+        .id_of(&fireball)
+        .and_then(|id| i32::try_from(id).ok())
+}
+
+pub(super) fn breeze_wind_charge_entity_type_id(entity_types: &EntityTypeRegistry) -> Option<i32> {
+    let wind_charge =
+        mc_data::Identifier::parse("minecraft:breeze_wind_charge").expect("static identifier");
+    entity_types
+        .id_of(&wind_charge)
+        .and_then(|id| i32::try_from(id).ok())
+}
+
+pub(super) fn dragon_fireball_entity_type_id(entity_types: &EntityTypeRegistry) -> Option<i32> {
+    let dragon_fireball =
+        mc_data::Identifier::parse("minecraft:dragon_fireball").expect("static identifier");
+    entity_types
+        .id_of(&dragon_fireball)
+        .and_then(|id| i32::try_from(id).ok())
+}
+
+pub(super) fn area_effect_cloud_entity_type_id(entity_types: &EntityTypeRegistry) -> Option<i32> {
+    let cloud =
+        mc_data::Identifier::parse("minecraft:area_effect_cloud").expect("static identifier");
+    entity_types
+        .id_of(&cloud)
+        .and_then(|id| i32::try_from(id).ok())
+}
+
+pub(super) fn wither_skull_entity_type_id(entity_types: &EntityTypeRegistry) -> Option<i32> {
+    let wither_skull =
+        mc_data::Identifier::parse("minecraft:wither_skull").expect("static identifier");
+    entity_types
+        .id_of(&wither_skull)
+        .and_then(|id| i32::try_from(id).ok())
+}
+
+pub(super) fn splash_potion_entity_type_id(entity_types: &EntityTypeRegistry) -> Option<i32> {
+    let splash_potion =
+        mc_data::Identifier::parse("minecraft:splash_potion").expect("static identifier");
+    entity_types
+        .id_of(&splash_potion)
+        .and_then(|id| i32::try_from(id).ok())
+}
+
+pub(super) fn shulker_bullet_entity_type_id(entity_types: &EntityTypeRegistry) -> Option<i32> {
+    let shulker_bullet =
+        mc_data::Identifier::parse("minecraft:shulker_bullet").expect("static identifier");
+    entity_types
+        .id_of(&shulker_bullet)
+        .and_then(|id| i32::try_from(id).ok())
+}
+
+pub(super) fn evoker_fangs_entity_type_id(entity_types: &EntityTypeRegistry) -> Option<i32> {
+    let evoker_fangs =
+        mc_data::Identifier::parse("minecraft:evoker_fangs").expect("static identifier");
+    entity_types
+        .id_of(&evoker_fangs)
         .and_then(|id| i32::try_from(id).ok())
 }
 
@@ -887,26 +688,6 @@ fn split_drop_stack(
     stacks
 }
 
-pub(super) fn food_rule_for_item(
-    item_facts: &ItemFactsTable,
-    item: &mc_data::Identifier,
-) -> Option<(mc_data::food::FoodEntry, Duration)> {
-    if let Some(facts) = item_facts.get(item)
-        && let Some(food) = facts.food
-    {
-        let duration = facts
-            .use_duration_ticks
-            .map(|ticks| Duration::from_millis(u64::from(ticks) * 50))
-            .unwrap_or(DEFAULT_FOOD_USE_DURATION);
-        return Some((food, duration));
-    }
-
-    mc_data::food::builtin()
-        .entry(item)
-        .copied()
-        .map(|food| (food, DEFAULT_FOOD_USE_DURATION))
-}
-
 pub(super) fn held_food_use(
     state: &InteractionState,
     held_slot: usize,
@@ -915,10 +696,9 @@ pub(super) fn held_food_use(
     if held.is_empty() {
         return None;
     }
-    let (rule, duration) = state
-        .items
-        .name_of(held.item_id)
-        .and_then(|item| food_rule_for_item(&state.item_facts, item))?;
+    let (rule, duration) = state.items.name_of(held.item_id).and_then(|item| {
+        mc_data::food::rule_for_item(&state.item_facts, item, mc_data::food::DEFAULT_USE_DURATION)
+    })?;
     Some((held.item_id, rule, duration))
 }
 
@@ -1065,50 +845,6 @@ mod tests {
         assert_eq!(mining_ticks(Duration::from_millis(50)), 1);
         assert_eq!(mining_ticks(Duration::from_millis(51)), 2);
         assert_eq!(mining_ticks(Duration::from_millis(1_600)), 32);
-    }
-
-    #[test]
-    fn fallback_mining_uses_vanilla_261_tool_component_speeds() {
-        for (tool, expected_ms) in [
-            ("wooden_pickaxe", 1_150),
-            ("stone_pickaxe", 600),
-            ("copper_pickaxe", 450),
-            ("iron_pickaxe", 400),
-            ("diamond_pickaxe", 300),
-            ("netherite_pickaxe", 250),
-            ("golden_pickaxe", 200),
-        ] {
-            assert_eq!(
-                fallback_mining_time("stone", Some(tool)),
-                Duration::from_millis(expected_ms),
-                "wrong fallback mining speed for {tool}"
-            );
-        }
-    }
-
-    #[test]
-    fn fallback_mining_uses_vanilla_hardness_and_correct_tool_divisor() {
-        assert_eq!(
-            fallback_mining_time("stone", None),
-            Duration::from_millis(7_500)
-        );
-        assert_eq!(
-            fallback_mining_time("oak_log", None),
-            Duration::from_millis(3_000)
-        );
-        assert_eq!(
-            fallback_mining_time("oak_log", Some("stone_axe")),
-            Duration::from_millis(750)
-        );
-        assert_eq!(
-            fallback_mining_time("dirt", None),
-            Duration::from_millis(750)
-        );
-        assert_eq!(
-            fallback_mining_time("cocoa", None),
-            Duration::from_millis(300)
-        );
-        assert_eq!(fallback_mining_time("nether_wart", None), Duration::ZERO);
     }
 
     #[test]

@@ -1,13 +1,12 @@
+use mc_data::ItemStack;
 use mc_data::item_components::ItemFactsTable;
 use mc_data::items::ItemRegistry;
-use mc_data::recipes::{Recipe, RecipeKind};
+use mc_data::recipes::Recipe;
 use mc_data::tags::TagsData;
 use mc_nbt::Tag;
-use mc_protocol::packets::play::ItemStack;
 use mc_world::BlockPos;
 
 use crate::play::inventory::{PlayerInventory, can_stack, item_max_stack};
-use crate::play::recipes::{ingredient_accepts_item, stonecutter_recipe_entry};
 
 pub(in crate::play) const STONECUTTER_MENU_TYPE_ID: i32 = 24;
 pub(in crate::play) const STONECUTTER_MENU_SLOT_COUNT: usize = 38;
@@ -102,13 +101,7 @@ fn recipe_has_advertised_offer(
     tags: &TagsData,
     input: &ItemStack,
 ) -> bool {
-    if stonecutter_recipe_entry(recipe, items, item_facts).is_none() {
-        return false;
-    }
-    let RecipeKind::Stonecutting(stonecutting) = &recipe.kind else {
-        return false;
-    };
-    ingredient_accepts_item(items, tags, input.item_id, &stonecutting.ingredient)
+    mc_data::recipes::stonecutting_recipe_accepts_input(recipe, items, item_facts, tags, input)
 }
 
 fn stonecutter_recipe_for_selection<'a>(

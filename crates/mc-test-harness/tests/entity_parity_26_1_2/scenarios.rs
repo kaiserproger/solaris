@@ -17,10 +17,10 @@ use super::protocol::{
     CLIENTBOUND_DAMAGE_EVENT_ID, CLIENTBOUND_REMOVE_MOB_EFFECT_ID, CLIENTBOUND_SET_EQUIPMENT_ID,
     CLIENTBOUND_UPDATE_ATTRIBUTES_ID, CLIENTBOUND_UPDATE_MOB_EFFECT_ID,
 };
-use super::support::{EntityProtocolHarness, server_label};
+use super::support::{EntityEndpoint, EntityProtocolHarness, server_label};
 
 const PASSENGER_CONTROL_BLOCKER: &str = "Solaris exposes no wire command or interaction path that constructs a passenger graph; summon accepts only entity type and coordinates";
-const PASSIVE_SCHEDULE_BLOCKER: &str = "Solaris has no production caller that advances villager_scheduled_activity and publishes its result as a deterministic wire event";
+const PASSIVE_SCHEDULE_BLOCKER: &str = "the side-by-side parity harness cannot yet construct equivalent persisted villager brain/POI schedule fixtures on Solaris and vanilla; Solaris production schedule movement is covered by villager_schedule_presence";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct ScenarioSpec {
@@ -64,27 +64,48 @@ pub(crate) async fn run_scenario_catalog(
 ) -> Result<Vec<ScenarioObservation>> {
     let mut observations = Vec::new();
     for spec in scenario_catalog() {
-        let observation =
-            tokio::time::timeout(spec.failure_timeout, run_scenario(harness, spec.id))
-                .await
-                .with_context(|| {
-                    format!(
-                        "{} scenario {} timed out after {:?}",
-                        server_label(harness.kind()),
-                        spec.slug,
-                        spec.failure_timeout
-                    )
-                })?
-                .with_context(|| {
-                    format!(
-                        "{} scenario {} failed",
-                        server_label(harness.kind()),
-                        spec.slug
-                    )
-                })?;
-        observations.push(observation);
+        observations.push(run_scenario_spec(harness, spec).await?);
     }
     Ok(observations)
+}
+
+pub(crate) async fn run_isolated_scenario_catalog(
+    endpoint: EntityEndpoint,
+    client_prefix: &str,
+    connect_timeout: Duration,
+) -> Result<Vec<ScenarioObservation>> {
+    let mut observations = Vec::new();
+    for (index, spec) in scenario_catalog().into_iter().enumerate() {
+        let client_name = format!("{client_prefix}{index}");
+        let mut harness = EntityProtocolHarness::connect(endpoint, &client_name, connect_timeout)
+            .await
+            .with_context(|| format!("connect isolated scenario {}", spec.slug))?;
+        observations.push(run_scenario_spec(&mut harness, spec).await?);
+    }
+    Ok(observations)
+}
+
+async fn run_scenario_spec(
+    harness: &mut EntityProtocolHarness,
+    spec: ScenarioSpec,
+) -> Result<ScenarioObservation> {
+    tokio::time::timeout(spec.failure_timeout, run_scenario(harness, spec.id))
+        .await
+        .with_context(|| {
+            format!(
+                "{} scenario {} timed out after {:?}",
+                server_label(harness.kind()),
+                spec.slug,
+                spec.failure_timeout
+            )
+        })?
+        .with_context(|| {
+            format!(
+                "{} scenario {} failed",
+                server_label(harness.kind()),
+                spec.slug
+            )
+        })
 }
 
 async fn run_scenario(
@@ -583,7 +604,7 @@ async fn passive_ai_schedule(harness: &mut EntityProtocolHarness) -> Result<Scen
             &mut aliases,
             &mut observation,
             "subject",
-            "minecraft:cow",
+            "minecraft:villager",
             [anchor[0] - 1.0, anchor[1], anchor[2]],
         )
         .await?;
@@ -819,7 +840,7 @@ mod tests {
     #[test]
     fn unsupported_wire_controls_remain_explicit_production_blockers() {
         assert!(PASSENGER_CONTROL_BLOCKER.contains("no wire command or interaction path"));
-        assert!(PASSIVE_SCHEDULE_BLOCKER.contains("no production caller"));
+        assert!(PASSIVE_SCHEDULE_BLOCKER.contains("equivalent persisted villager brain/POI"));
     }
 
     #[test]

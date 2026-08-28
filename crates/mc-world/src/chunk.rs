@@ -110,6 +110,53 @@ pub struct ChunkPos {
     pub z: i32,
 }
 
+/// Returns every chunk touched by the inclusive world-space X/Z rectangle.
+/// Invalid bounds or rectangles exceeding `max_chunks` fail closed.
+#[must_use]
+pub fn chunk_rectangle_for_world_bounds(
+    min_x: f64,
+    max_x: f64,
+    min_z: f64,
+    max_z: f64,
+    max_chunks: usize,
+) -> Option<Vec<ChunkPos>> {
+    if !min_x.is_finite()
+        || !max_x.is_finite()
+        || !min_z.is_finite()
+        || !max_z.is_finite()
+        || min_x > max_x
+        || min_z > max_z
+        || max_chunks == 0
+    {
+        return None;
+    }
+    let min_cx = world_coordinate_to_chunk(min_x)?;
+    let max_cx = world_coordinate_to_chunk(max_x)?;
+    let min_cz = world_coordinate_to_chunk(min_z)?;
+    let max_cz = world_coordinate_to_chunk(max_z)?;
+    let width = i64::from(max_cx) - i64::from(min_cx) + 1;
+    let depth = i64::from(max_cz) - i64::from(min_cz) + 1;
+    let count = usize::try_from(width.checked_mul(depth)?).ok()?;
+    if count > max_chunks {
+        return None;
+    }
+    let mut chunks = Vec::with_capacity(count);
+    for x in min_cx..=max_cx {
+        for z in min_cz..=max_cz {
+            chunks.push(ChunkPos { x, z });
+        }
+    }
+    Some(chunks)
+}
+
+fn world_coordinate_to_chunk(value: f64) -> Option<i32> {
+    let block = value.floor();
+    if block < f64::from(i32::MIN) || block > f64::from(i32::MAX) {
+        return None;
+    }
+    Some((block as i32).div_euclid(16))
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct BlockPos {
     pub x: i32,
@@ -1526,6 +1573,37 @@ fn world_y_to_section(y: i32) -> Option<(usize, u8)> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn chunk_rectangle_for_world_bounds_handles_edges_negatives_and_caps() {
+        assert_eq!(
+            chunk_rectangle_for_world_bounds(0.0, 15.999, 0.0, 15.999, 4),
+            Some(vec![ChunkPos { x: 0, z: 0 }])
+        );
+        assert_eq!(
+            chunk_rectangle_for_world_bounds(-0.001, 16.0, -16.0, 0.0, 9),
+            Some(vec![
+                ChunkPos { x: -1, z: -1 },
+                ChunkPos { x: -1, z: 0 },
+                ChunkPos { x: 0, z: -1 },
+                ChunkPos { x: 0, z: 0 },
+                ChunkPos { x: 1, z: -1 },
+                ChunkPos { x: 1, z: 0 },
+            ])
+        );
+        assert_eq!(
+            chunk_rectangle_for_world_bounds(-0.001, 16.0, -16.0, 0.0, 5),
+            None
+        );
+        assert_eq!(
+            chunk_rectangle_for_world_bounds(f64::NAN, 0.0, 0.0, 0.0, 1),
+            None
+        );
+        assert_eq!(
+            chunk_rectangle_for_world_bounds(1.0, 0.0, 0.0, 0.0, 1),
+            None
+        );
+    }
 
     fn air() -> BlockStateId {
         BlockStateId(0)

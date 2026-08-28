@@ -52,6 +52,190 @@ pub struct BlockMiningFacts {
     pub requires_correct_tool_for_drops: bool,
 }
 
+pub const VANILLA_SUBMERGED_MINING_SPEED: f32 = 0.2;
+const FALLBACK_UNKNOWN_DESTROY_SPEED: f32 = 0.8;
+
+#[must_use]
+pub fn block_break_is_denied(block_path: &str) -> bool {
+    matches!(block_path, "bedrock" | "barrier" | "end_portal_frame")
+}
+
+#[must_use]
+pub fn fallback_mining_facts(block_path: &str) -> BlockMiningFacts {
+    let (destroy_speed, requires_correct_tool_for_drops) = match block_path {
+        "bedrock" | "barrier" | "end_portal_frame" => (-1.0, false),
+        "air"
+        | "cave_air"
+        | "void_air"
+        | "short_grass"
+        | "tall_grass"
+        | "wheat"
+        | "carrots"
+        | "potatoes"
+        | "beetroots"
+        | "nether_wart"
+        | "pumpkin_stem"
+        | "melon_stem"
+        | "attached_pumpkin_stem"
+        | "attached_melon_stem"
+        | "sweet_berry_bush"
+        | "sugar_cane"
+        | "kelp"
+        | "kelp_plant"
+        | "torch"
+        | "wall_torch" => (0.0, false),
+        "cocoa" => (0.2, false),
+        "stone" | "granite" | "diorite" | "andesite" | "calcite" | "tuff" => (1.5, true),
+        "cobblestone" | "mossy_cobblestone" => (2.0, true),
+        "deepslate" => (3.0, true),
+        "cobbled_deepslate" => (3.5, true),
+        "obsidian" | "crying_obsidian" => (50.0, true),
+        "ancient_debris" => (30.0, true),
+        "dirt" | "coarse_dirt" | "rooted_dirt" | "podzol" | "sand" | "red_sand" => (0.5, false),
+        "grass_block" | "gravel" | "clay" => (0.6, false),
+        "crafting_table" | "chest" | "trapped_chest" => (2.5, false),
+        "furnace" | "blast_furnace" | "smoker" => (3.5, true),
+        path if path.starts_with("deepslate_") && path.ends_with("_ore") => (4.5, true),
+        path if path.ends_with("_ore") => (3.0, true),
+        path if path.ends_with("_log")
+            || path.ends_with("_wood")
+            || path.ends_with("_stem")
+            || path.ends_with("_hyphae")
+            || path.ends_with("_planks") =>
+        {
+            (2.0, false)
+        }
+        _ => (FALLBACK_UNKNOWN_DESTROY_SPEED, false),
+    };
+    BlockMiningFacts {
+        destroy_speed,
+        requires_correct_tool_for_drops,
+    }
+}
+
+#[must_use]
+pub fn fallback_tool_suffix_for_path(block_path: &str) -> Option<&'static str> {
+    let facts = fallback_mining_facts(block_path);
+    if facts.requires_correct_tool_for_drops
+        || matches!(block_path, "furnace" | "blast_furnace" | "smoker")
+    {
+        return Some("_pickaxe");
+    }
+    if block_path.ends_with("_log")
+        || block_path.ends_with("_wood")
+        || block_path.ends_with("_stem")
+        || block_path.ends_with("_hyphae")
+        || block_path.ends_with("_planks")
+        || matches!(block_path, "crafting_table" | "chest" | "trapped_chest")
+    {
+        return Some("_axe");
+    }
+    if matches!(
+        block_path,
+        "dirt"
+            | "coarse_dirt"
+            | "rooted_dirt"
+            | "podzol"
+            | "grass_block"
+            | "sand"
+            | "red_sand"
+            | "gravel"
+            | "clay"
+    ) {
+        return Some("_shovel");
+    }
+    None
+}
+
+#[must_use]
+pub fn fallback_tool_mining_speed(tool_path: Option<&str>, required_suffix: Option<&str>) -> f32 {
+    let Some(tool_path) = tool_path else {
+        return 1.0;
+    };
+    if required_suffix.is_some_and(|suffix| !tool_path.ends_with(suffix)) {
+        return 1.0;
+    }
+    for (material, speed) in [
+        ("wooden_", 2.0),
+        ("stone_", 4.0),
+        ("copper_", 5.0),
+        ("iron_", 6.0),
+        ("diamond_", 8.0),
+        ("netherite_", 9.0),
+        ("golden_", 12.0),
+    ] {
+        if tool_path.starts_with(material) {
+            return speed;
+        }
+    }
+    1.0
+}
+
+fn pickaxe_tier(tool_path: &str) -> Option<u8> {
+    let material = tool_path.strip_suffix("_pickaxe")?;
+    match material {
+        "wooden" | "golden" => Some(0),
+        "stone" | "copper" => Some(1),
+        "iron" => Some(2),
+        "diamond" => Some(3),
+        "netherite" => Some(4),
+        _ => None,
+    }
+}
+
+fn required_pickaxe_tier_for_drop(block_path: &str) -> Option<u8> {
+    let block_path = block_path.strip_prefix("deepslate_").unwrap_or(block_path);
+    match block_path {
+        "stone" | "cobblestone" | "deepslate" | "cobbled_deepslate" | "coal_ore"
+        | "nether_gold_ore" | "nether_quartz_ore" => Some(0),
+        "iron_ore" | "copper_ore" | "lapis_ore" => Some(1),
+        "diamond_ore" | "emerald_ore" | "gold_ore" | "redstone_ore" => Some(2),
+        "obsidian" | "crying_obsidian" | "ancient_debris" => Some(3),
+        _ => None,
+    }
+}
+
+#[must_use]
+pub fn fallback_tool_allows_block_drop(block_path: &str, tool_path: Option<&str>) -> bool {
+    let Some(required_tier) = required_pickaxe_tier_for_drop(block_path) else {
+        return true;
+    };
+    tool_path
+        .and_then(pickaxe_tier)
+        .is_some_and(|tier| tier >= required_tier)
+}
+
+#[must_use]
+pub fn destroy_progress_per_tick(
+    destroy_speed: f32,
+    mut item_speed: f32,
+    has_correct_tool_for_drops: bool,
+    on_ground: bool,
+    eye_in_water: bool,
+) -> f32 {
+    if destroy_speed < 0.0 {
+        return 0.0;
+    }
+    if destroy_speed == 0.0 {
+        return f32::INFINITY;
+    }
+    if !item_speed.is_finite() || item_speed < 0.0 {
+        item_speed = 1.0;
+    }
+    if eye_in_water {
+        item_speed *= VANILLA_SUBMERGED_MINING_SPEED;
+    }
+    if !on_ground {
+        item_speed /= 5.0;
+    }
+    let divisor = if has_correct_tool_for_drops {
+        30.0
+    } else {
+        100.0
+    };
+    item_speed / destroy_speed / divisor
+}
+
 impl BlockMiningTable {
     #[must_use]
     pub fn from_arrays(
@@ -159,6 +343,78 @@ mod tests {
         let path = dir.path().join("block_mining.json");
         fs::write(&path, body).unwrap();
         path
+    }
+
+    #[test]
+    fn fallback_rules_cover_common_tool_families_and_drop_tiers() {
+        assert!(block_break_is_denied("bedrock"));
+        assert!(block_break_is_denied("barrier"));
+        assert!(!block_break_is_denied("stone"));
+        assert_eq!(fallback_mining_facts("stone").destroy_speed, 1.5);
+        assert_eq!(fallback_tool_suffix_for_path("oak_log"), Some("_axe"));
+        assert_eq!(fallback_tool_suffix_for_path("dirt"), Some("_shovel"));
+        assert_eq!(
+            fallback_tool_mining_speed(Some("iron_pickaxe"), Some("_pickaxe")),
+            6.0
+        );
+        assert_eq!(
+            fallback_tool_mining_speed(Some("iron_shovel"), Some("_pickaxe")),
+            1.0
+        );
+        for (tool, speed) in [
+            ("wooden_pickaxe", 2.0),
+            ("stone_pickaxe", 4.0),
+            ("copper_pickaxe", 5.0),
+            ("iron_pickaxe", 6.0),
+            ("diamond_pickaxe", 8.0),
+            ("netherite_pickaxe", 9.0),
+            ("golden_pickaxe", 12.0),
+        ] {
+            assert_eq!(
+                fallback_tool_mining_speed(Some(tool), Some("_pickaxe")),
+                speed,
+                "wrong fallback mining speed for {tool}"
+            );
+        }
+        assert_eq!(fallback_mining_facts("podzol").destroy_speed, 0.5);
+        assert_eq!(
+            fallback_mining_facts("unknown_custom_block").destroy_speed,
+            FALLBACK_UNKNOWN_DESTROY_SPEED
+        );
+        assert_eq!(fallback_mining_facts("nether_wart").destroy_speed, 0.0);
+        assert!(!fallback_tool_allows_block_drop(
+            "iron_ore",
+            Some("wooden_pickaxe")
+        ));
+        assert!(fallback_tool_allows_block_drop(
+            "deepslate_iron_ore",
+            Some("stone_pickaxe")
+        ));
+        assert!(!fallback_tool_allows_block_drop(
+            "obsidian",
+            Some("iron_pickaxe")
+        ));
+        assert!(fallback_tool_allows_block_drop(
+            "obsidian",
+            Some("diamond_pickaxe")
+        ));
+    }
+
+    #[test]
+    fn destroy_progress_applies_submerged_airborne_and_instant_rules() {
+        let base = destroy_progress_per_tick(1.5, 6.0, true, true, false);
+        assert_eq!(base, 6.0 / 1.5 / 30.0);
+        assert!(
+            (destroy_progress_per_tick(1.5, 6.0, true, true, true)
+                - base * VANILLA_SUBMERGED_MINING_SPEED)
+                .abs()
+                < 1.0e-6
+        );
+        assert!(
+            (destroy_progress_per_tick(1.5, 6.0, true, false, false) - base / 5.0).abs() < 1.0e-6
+        );
+        assert_eq!(destroy_progress_per_tick(-1.0, 6.0, true, true, false), 0.0);
+        assert!(destroy_progress_per_tick(0.0, 1.0, false, true, false).is_infinite());
     }
 
     #[test]

@@ -1,8 +1,9 @@
 use mc_data::entity_types::EntityTypeFacts;
 use mc_data::item_components::AttackRangeFacts;
+use mc_domain::GameMode;
 use mc_entity::{AnimalBreedingState, Vec3};
 use mc_physics::Aabb;
-use mc_protocol::packets::play::{GameMode, unpack_block_pos};
+use mc_protocol::packets::play::unpack_block_pos;
 
 use crate::play::PlayerPose;
 use crate::play::spawn::chunk_pos_from_coords;

@@ -58,6 +58,8 @@ fn fill_explosion_volume(storage: &mut WorldStorage) {
 #[ignore = "explicit O3 full explosion authority load benchmark"]
 async fn explosion_authority_load_benchmark_report() {
     let blocks = Arc::new(BlockRegistry::from_report(&benchmark_block_reports()).unwrap());
+    let items = mc_data::items::solaris_required_items();
+    let entity_types = mc_data::entity_types::solaris_required_entity_types();
     let chunk = ChunkPos { x: 0, z: 0 };
     let mut storage = WorldStorage::in_memory(Arc::clone(&blocks));
     storage
@@ -141,6 +143,186 @@ async fn explosion_authority_load_benchmark_report() {
             .unwrap(),
     );
     let materials = mc_physics::BlockMaterialIds::new(0, None, None);
+
+    let profile_center = Vec3::new(8.5, 64.0, 8.5);
+    let mut target_snapshot_us = Vec::with_capacity(QUEUED_EXPLOSIONS);
+    for _ in 0..QUEUED_EXPLOSIONS {
+        let started = Instant::now();
+        black_box(sessions.explosion_entity_targets(&owner.authority, profile_center, 8.0));
+        target_snapshot_us.push(started.elapsed().as_micros());
+    }
+    let mut constant_planner_us = Vec::with_capacity(QUEUED_EXPLOSIONS);
+    let mut constant_random = JavaLegacyRandom::new(0x51_0A_12);
+    for _ in 0..QUEUED_EXPLOSIONS {
+        let started = Instant::now();
+        black_box(
+            plan_explosion_candidates(profile_center, 4.0, &mut constant_random, |_| {
+                Some(ExplosionBlockSample {
+                    resistance: None,
+                    explodable: true,
+                })
+            })
+            .unwrap(),
+        );
+        constant_planner_us.push(started.elapsed().as_micros());
+    }
+    let mut world_planner_us = Vec::with_capacity(QUEUED_EXPLOSIONS);
+    let mut world_random = JavaLegacyRandom::new(0x51_0A_12);
+    {
+        let mut storage = world.lock().await;
+        for _ in 0..QUEUED_EXPLOSIONS {
+            let started = Instant::now();
+            black_box(
+                plan_explosion_candidates(profile_center, 4.0, &mut world_random, |position| {
+                    let state = storage.get_block(position).ok().flatten()?;
+                    let resistance = if state == BlockStateId(0) {
+                        None
+                    } else {
+                        Some(block_facts.explosion_resistance(state.0)?)
+                    };
+                    Some(ExplosionBlockSample {
+                        resistance,
+                        explodable: true,
+                    })
+                })
+                .unwrap(),
+            );
+            world_planner_us.push(started.elapsed().as_micros());
+        }
+    }
+    let profile_targets = sessions.explosion_entity_targets(&owner.authority, profile_center, 8.0);
+    let mut constant_impact_us = Vec::with_capacity(QUEUED_EXPLOSIONS);
+    for _ in 0..QUEUED_EXPLOSIONS {
+        let started = Instant::now();
+        for target in &profile_targets {
+            black_box(plan_entity_explosion_impact(
+                profile_center,
+                4.0,
+                target.position,
+                target.eye_position,
+                target.aabb_min,
+                target.aabb_max,
+                |_| Some(Vec::new()),
+            ));
+        }
+        constant_impact_us.push(started.elapsed().as_micros());
+    }
+    let mut world_impact_us = Vec::with_capacity(QUEUED_EXPLOSIONS);
+    {
+        let mut storage = world.lock().await;
+        for _ in 0..QUEUED_EXPLOSIONS {
+            let started = Instant::now();
+            for target in &profile_targets {
+                black_box(plan_entity_explosion_impact(
+                    profile_center,
+                    4.0,
+                    target.position,
+                    target.eye_position,
+                    target.aabb_min,
+                    target.aabb_max,
+                    |position| explosion_collision_boxes(&mut storage, &materials, position),
+                ));
+            }
+            world_impact_us.push(started.elapsed().as_micros());
+        }
+    }
+    let mut mutation_prepare_us = Vec::with_capacity(QUEUED_EXPLOSIONS);
+    let mut mutation_apply_us = Vec::with_capacity(QUEUED_EXPLOSIONS);
+    let mut mutation_candidates = Vec::with_capacity(QUEUED_EXPLOSIONS);
+    let mut mutation_edits = Vec::with_capacity(QUEUED_EXPLOSIONS);
+    let mut mutation_random = JavaLegacyRandom::new(0x51_0A_12);
+    {
+        let mut storage = world.lock().await;
+        for _ in 0..QUEUED_EXPLOSIONS {
+            fill_explosion_volume(&mut storage);
+            let candidates =
+                plan_explosion_candidates(profile_center, 4.0, &mut mutation_random, |position| {
+                    let state = storage.get_block(position).ok().flatten()?;
+                    let resistance = if state == BlockStateId(0) {
+                        None
+                    } else {
+                        Some(block_facts.explosion_resistance(state.0)?)
+                    };
+                    Some(ExplosionBlockSample {
+                        resistance,
+                        explodable: true,
+                    })
+                })
+                .unwrap();
+            mutation_candidates.push(candidates.len() as u128);
+
+            let mut positions = candidates.into_iter().collect::<Vec<_>>();
+            positions.sort_unstable_by_key(|position| (position.x, position.y, position.z));
+            mutation_random.shuffle(&mut positions);
+            let prepare_started = Instant::now();
+            let mut edits = Vec::new();
+            let mut preconditions = Vec::new();
+            for position in positions {
+                let Some(state) = storage.get_block(position).unwrap() else {
+                    continue;
+                };
+                if state == BlockStateId(0) {
+                    continue;
+                }
+                let Some(token) = storage.block_mutation_token(position) else {
+                    continue;
+                };
+                edits.push(BlockEdit {
+                    pos: position,
+                    new_state: BlockStateId(0),
+                });
+                preconditions.push(BlockEditPrecondition {
+                    pos: position,
+                    expected_state: state,
+                    expected_token: token,
+                });
+            }
+            mutation_prepare_us.push(prepare_started.elapsed().as_micros());
+            mutation_edits.push(edits.len() as u128);
+
+            let apply_started = Instant::now();
+            black_box(apply_block_edit_batch_to_storage_conditionally(
+                &mut storage,
+                None,
+                &edits,
+                &preconditions,
+            ));
+            mutation_apply_us.push(apply_started.elapsed().as_micros());
+        }
+    }
+    target_snapshot_us.sort_unstable();
+    constant_planner_us.sort_unstable();
+    world_planner_us.sort_unstable();
+    constant_impact_us.sort_unstable();
+    world_impact_us.sort_unstable();
+    mutation_prepare_us.sort_unstable();
+    mutation_apply_us.sort_unstable();
+    mutation_candidates.sort_unstable();
+    mutation_edits.sort_unstable();
+    println!(
+        "EXPLOSION_STAGE_BENCH samples={} nearby_targets={} target_snapshot_p50_us={} target_snapshot_p99_us={} constant_planner_p50_us={} constant_planner_p99_us={} world_planner_p50_us={} world_planner_p99_us={} constant_impact_p50_us={} constant_impact_p99_us={} world_impact_p50_us={} world_impact_p99_us={} candidates_p50={} candidates_p99={} edits_p50={} edits_p99={} mutation_prepare_p50_us={} mutation_prepare_p99_us={} mutation_apply_p50_us={} mutation_apply_p99_us={}",
+        QUEUED_EXPLOSIONS,
+        profile_targets.len(),
+        percentile(&target_snapshot_us, 50),
+        percentile(&target_snapshot_us, 99),
+        percentile(&constant_planner_us, 50),
+        percentile(&constant_planner_us, 99),
+        percentile(&world_planner_us, 50),
+        percentile(&world_planner_us, 99),
+        percentile(&constant_impact_us, 50),
+        percentile(&constant_impact_us, 99),
+        percentile(&world_impact_us, 50),
+        percentile(&world_impact_us, 99),
+        percentile(&mutation_candidates, 50),
+        percentile(&mutation_candidates, 99),
+        percentile(&mutation_edits, 50),
+        percentile(&mutation_edits, 99),
+        percentile(&mutation_prepare_us, 50),
+        percentile(&mutation_prepare_us, 99),
+        percentile(&mutation_apply_us, 50),
+        percentile(&mutation_apply_us, 99),
+    );
+
     let mut burst_us = Vec::with_capacity(QUEUED_EXPLOSIONS.div_ceil(EXPLOSIONS_PER_TICK));
     let mut completed = 0;
     let mut mutated_volumes = 0;
@@ -157,7 +339,7 @@ async fn explosion_authority_load_benchmark_report() {
                 Some(&world),
                 None,
                 &block_facts,
-                &blocks,
+                ExplosionRegistries::new(&blocks, &items, &entity_types),
                 Some(&materials),
                 || None,
             )

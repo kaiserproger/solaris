@@ -13,7 +13,8 @@ mod planning;
 mod scheduler;
 
 pub use planning::{
-    MAX_NATURAL_TEMPLATES_PER_CHUNK, NaturalSpawnCapacities, build_herd_spawn_candidates,
+    ChunkHerdPlanningContext, MAX_NATURAL_TEMPLATES_PER_CHUNK, NaturalSpawnCapacities,
+    build_herd_spawn_candidates, chunk_biome_at, herd_surface_y, plan_chunk_herd_templates,
     plan_periodic_category, spawn_far_enough_from_players,
 };
 pub use scheduler::{
@@ -57,6 +58,106 @@ pub fn herd_uuid(chunk: (i32, i32), slot: u8) -> uuid::Uuid {
     let hi = herd_hash(chunk, slot, 0x434F_575F_4845_5244);
     let lo = herd_hash(chunk, slot, 0x5041_5353_4956_4500);
     uuid::Uuid::from_u128(((hi as u128) << 64) | lo as u128)
+}
+
+#[must_use]
+pub fn passive_chunk_spawns(chunk: (i32, i32)) -> bool {
+    chunk == (0, 0) || herd_hash(chunk, 0, 0x4845_5244).is_multiple_of(9)
+}
+
+#[must_use]
+pub fn hostile_chunk_spawns(chunk: (i32, i32)) -> bool {
+    chunk == (0, 0) || herd_hash(chunk, 0, 0x484F_5354_494C_4500).is_multiple_of(8)
+}
+
+#[must_use]
+pub fn sheep_color_for_rolls(
+    climate: mc_data::biomes::SheepColorClimate,
+    outer_roll: u32,
+    common_roll: u32,
+) -> SheepColor {
+    use mc_data::biomes::SheepColorClimate;
+
+    debug_assert!(outer_roll < 100);
+    debug_assert!(common_roll < 500);
+    let common = |default| {
+        if common_roll < 499 {
+            default
+        } else {
+            SheepColor::Pink
+        }
+    };
+    match climate {
+        SheepColorClimate::Temperate => match outer_roll {
+            0..=4 => SheepColor::Black,
+            5..=9 => SheepColor::Gray,
+            10..=14 => SheepColor::LightGray,
+            15..=17 => SheepColor::Brown,
+            _ => common(SheepColor::White),
+        },
+        SheepColorClimate::Warm => match outer_roll {
+            0..=4 => SheepColor::Gray,
+            5..=9 => SheepColor::LightGray,
+            10..=14 => SheepColor::White,
+            15..=17 => SheepColor::Black,
+            _ => common(SheepColor::Brown),
+        },
+        SheepColorClimate::Cold => match outer_roll {
+            0..=4 => SheepColor::LightGray,
+            5..=9 => SheepColor::Gray,
+            10..=14 => SheepColor::White,
+            15..=17 => SheepColor::Brown,
+            _ => common(SheepColor::Black),
+        },
+    }
+}
+
+#[must_use]
+pub fn natural_sheep_color(
+    climate: mc_data::biomes::SheepColorClimate,
+    chunk: (i32, i32),
+    slot: u8,
+) -> SheepColor {
+    let outer_roll = (herd_hash(chunk, slot, 0x5348_4545_505F_434C) % 100) as u32;
+    let common_roll = (herd_hash(chunk, slot, 0x5049_4E4B_5F52_4F4C) % 500) as u32;
+    sheep_color_for_rolls(climate, outer_roll, common_roll)
+}
+
+#[must_use]
+pub fn choose_biome_spawn(
+    entries: &[mc_data::biomes::BiomeSpawnEntry],
+    chunk: (i32, i32),
+    slot: u8,
+) -> Option<&mc_data::biomes::BiomeSpawnEntry> {
+    let total: u32 = entries.iter().map(|entry| entry.weight).sum();
+    if total == 0 {
+        return None;
+    }
+    let mut pick = (herd_hash(chunk, slot, 0x5745_4947_4854_0000) % u64::from(total)) as u32;
+    for entry in entries {
+        if pick < entry.weight {
+            return Some(entry);
+        }
+        pick -= entry.weight;
+    }
+    entries.last()
+}
+
+#[must_use]
+pub fn herd_entry_count(
+    entry: &mc_data::biomes::BiomeSpawnEntry,
+    chunk: (i32, i32),
+    slot: u8,
+) -> usize {
+    let min = entry.min_count.min(entry.max_count).max(1);
+    let max = entry.max_count.max(min);
+    let span = max - min + 1;
+    (min + (herd_hash(chunk, slot, 0x434F_554E_5400_0000) as u32 % span)) as usize
+}
+
+#[must_use]
+pub fn safe_land_spawn_offset(bits: u64) -> f64 {
+    0.48 + (bits & 3) as f64 * 0.01
 }
 
 #[must_use]
@@ -124,6 +225,11 @@ pub fn apply_entity_facts(entity: &mut SpawnEntity) {
         }
         "minecraft:cow" | "minecraft:chicken" => {
             entity.animal = Some(AnimalBreedingState::adult());
+        }
+        "minecraft:ender_dragon" => {
+            // Vanilla clients derive the eight multipart entity ids as parent+1..+8.
+            // Keep those ids unavailable to ordinary server entities.
+            entity.reserved_following_ids = entity.reserved_following_ids.max(8);
         }
         _ => {}
     }

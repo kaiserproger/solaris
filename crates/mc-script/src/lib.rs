@@ -40,12 +40,13 @@ mod tick_delivery_tests;
 #[cfg(feature = "lua-runtime")]
 pub use lua::{
     BundledLuauPlugin, LuaClientBundle, LuaClientBundleDiscovery, LuaClientContentKind,
-    LuaClientLoader, LuaClientPermission, LuaHost, LuaHostConfig, LuaHostError,
-    LuaPluginDeployment, LuaPluginDiscovery, LuaSettlementBuilding, LuaSettlementBuildingRole,
-    LuaSettlementBuildingTemplate, LuaSettlementExtension, LuaSettlementInhabitant,
-    LuaSettlementInhabitantKind, LuaSettlementJob, LuaSettlementPlan, LuaWorldgenOreProfile,
-    LuaWorldgenSettlementProfile, PreparedLuaPlugins, prepare_bundled_luau_plugins,
-    prepare_lua_plugins, start_lua_host, start_prepared_lua_host,
+    LuaClientLoader, LuaClientPermission, LuaHost, LuaHostConfig, LuaHostError, LuaHostExitReason,
+    LuaHostExitReport, LuaPluginDeployment, LuaPluginDisableDiagnostic, LuaPluginDisableStage,
+    LuaPluginDiscovery, LuaReloadError, LuaReloadReport, LuaSettlementBuilding,
+    LuaSettlementBuildingRole, LuaSettlementBuildingTemplate, LuaSettlementExtension,
+    LuaSettlementInhabitant, LuaSettlementInhabitantKind, LuaSettlementJob, LuaSettlementPlan,
+    LuaWorldgenOreProfile, LuaWorldgenSettlementProfile, PreparedLuaPlugins,
+    prepare_bundled_luau_plugins, prepare_lua_plugins, start_lua_host, start_prepared_lua_host,
 };
 
 /// Crate version, exposed so other crates and the binary can report it.
@@ -60,6 +61,10 @@ pub const MAX_SPAWN_ENTITY_TYPES: usize = 32;
 /// Maximum byte length of a script-visible namespaced resource identifier.
 pub const MAX_SCRIPT_RESOURCE_ID_BYTES: usize = 128;
 pub const MAX_SCRIPT_LOADER_INTERACTION_PAYLOAD_BYTES: usize = 4_096;
+/// Largest integer Luau can represent exactly in its number type.
+pub const MAX_SCRIPT_WORLD_TIME: u64 = (1_u64 << 53) - 1;
+/// Maximum raw damage accepted by one bounded plugin combat request.
+pub const MAX_SCRIPT_ENTITY_DAMAGE: f32 = 1_000_000.0;
 
 /// Maximum byte length of a plugin-scoped identifier or request correlation id.
 pub const MAX_SCRIPT_ID_BYTES: usize = 64;
@@ -68,7 +73,6 @@ pub const MAX_SCRIPT_PLAYER_UUID_BYTES: usize = 64;
 pub const MAX_SCRIPT_PLAYER_NAME_BYTES: usize = 16;
 pub const MAX_SCRIPT_CHAT_MESSAGE_BYTES: usize = 4_096;
 pub const MAX_SCRIPT_DISCONNECT_REASON_BYTES: usize = 1_024;
-pub const MAX_SCRIPT_CONSOLE_COMMAND_BYTES: usize = 256;
 pub const MAX_SCRIPT_COMMAND_BATCH: usize = 32;
 pub const MAX_SCRIPT_EVENT_QUEUE_CAPACITY: usize = 1_024;
 pub const MAX_SCRIPT_COMMAND_QUEUE_CAPACITY: usize = 256;
@@ -305,6 +309,274 @@ impl ScriptPlayerTeleportFailure {
     }
 }
 
+/// Typed request to set the authoritative overworld simulation time.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ScriptWorldTimeSetRequest {
+    request_id: String,
+    world_time: u64,
+}
+
+impl ScriptWorldTimeSetRequest {
+    pub fn try_new(request_id: impl AsRef<str>, world_time: u64) -> Result<Self, ScriptDtoError> {
+        if world_time > MAX_SCRIPT_WORLD_TIME {
+            return Err(ScriptDtoError::InvalidBounds);
+        }
+        Ok(Self {
+            request_id: validate_script_id(request_id.as_ref())?,
+            world_time,
+        })
+    }
+
+    pub fn request_id(&self) -> &str {
+        &self.request_id
+    }
+
+    pub const fn world_time(&self) -> u64 {
+        self.world_time
+    }
+}
+
+/// Exact public category for a world-time request that did not commit.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum ScriptWorldTimeSetFailure {
+    Busy,
+    RuntimeUnavailable,
+    Rejected,
+}
+
+impl ScriptWorldTimeSetFailure {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Busy => "busy",
+            Self::RuntimeUnavailable => "runtime_unavailable",
+            Self::Rejected => "rejected",
+        }
+    }
+}
+
+/// Typed request to set one default block state in the authoritative world.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ScriptWorldBlockSetRequest {
+    request_id: String,
+    dimension: String,
+    block_id: String,
+    x: i32,
+    y: i32,
+    z: i32,
+}
+
+impl ScriptWorldBlockSetRequest {
+    pub fn try_new(
+        request_id: impl AsRef<str>,
+        dimension: impl AsRef<str>,
+        block_id: impl AsRef<str>,
+        x: i32,
+        y: i32,
+        z: i32,
+    ) -> Result<Self, ScriptDtoError> {
+        Ok(Self {
+            request_id: validate_script_id(request_id.as_ref())?,
+            dimension: validate_contract_resource_id(dimension.as_ref())?,
+            block_id: validate_contract_resource_id(block_id.as_ref())?,
+            x,
+            y,
+            z,
+        })
+    }
+
+    pub fn request_id(&self) -> &str {
+        &self.request_id
+    }
+
+    pub fn dimension(&self) -> &str {
+        &self.dimension
+    }
+
+    pub fn block_id(&self) -> &str {
+        &self.block_id
+    }
+
+    pub const fn x(&self) -> i32 {
+        self.x
+    }
+
+    pub const fn y(&self) -> i32 {
+        self.y
+    }
+
+    pub const fn z(&self) -> i32 {
+        self.z
+    }
+}
+
+/// Exact public category for a world-block request that did not commit.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum ScriptWorldBlockSetFailure {
+    UnknownBlock,
+    UnsupportedDimension,
+    OutOfWorld,
+    Busy,
+    RuntimeUnavailable,
+    Rejected,
+}
+
+impl ScriptWorldBlockSetFailure {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::UnknownBlock => "unknown_block",
+            Self::UnsupportedDimension => "unsupported_dimension",
+            Self::OutOfWorld => "out_of_world",
+            Self::Busy => "busy",
+            Self::RuntimeUnavailable => "runtime_unavailable",
+            Self::Rejected => "rejected",
+        }
+    }
+}
+
+/// Typed request to place one Loader-owned custom block through world authority.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ScriptLoaderBlockPlacementRequest {
+    request_id: String,
+    block_id: String,
+    x: i32,
+    y: i32,
+    z: i32,
+}
+
+impl ScriptLoaderBlockPlacementRequest {
+    pub fn try_new(
+        request_id: impl AsRef<str>,
+        block_id: impl AsRef<str>,
+        x: i32,
+        y: i32,
+        z: i32,
+    ) -> Result<Self, ScriptDtoError> {
+        Ok(Self {
+            request_id: validate_script_id(request_id.as_ref())?,
+            block_id: validate_contract_resource_id(block_id.as_ref())?,
+            x,
+            y,
+            z,
+        })
+    }
+
+    pub fn request_id(&self) -> &str {
+        &self.request_id
+    }
+
+    pub fn block_id(&self) -> &str {
+        &self.block_id
+    }
+
+    pub const fn x(&self) -> i32 {
+        self.x
+    }
+
+    pub const fn y(&self) -> i32 {
+        self.y
+    }
+
+    pub const fn z(&self) -> i32 {
+        self.z
+    }
+}
+
+/// Exact public category for a Loader custom-block placement that did not commit.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum ScriptLoaderBlockPlacementFailure {
+    LoaderUnavailable,
+    NotOwned,
+    OutOfWorld,
+    Busy,
+    RuntimeUnavailable,
+    Rejected,
+}
+
+impl ScriptLoaderBlockPlacementFailure {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::LoaderUnavailable => "loader_unavailable",
+            Self::NotOwned => "not_owned",
+            Self::OutOfWorld => "out_of_world",
+            Self::Busy => "busy",
+            Self::RuntimeUnavailable => "runtime_unavailable",
+            Self::Rejected => "rejected",
+        }
+    }
+}
+
+/// Typed request to grant one Loader-owned custom block item through player inventory authority.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ScriptLoaderItemGrantRequest {
+    request_id: String,
+    player_id: ScriptPlayerId,
+    block_id: String,
+    count: u8,
+}
+
+impl ScriptLoaderItemGrantRequest {
+    pub fn try_new(
+        request_id: impl AsRef<str>,
+        player_id: ScriptPlayerId,
+        block_id: impl AsRef<str>,
+        count: u8,
+    ) -> Result<Self, ScriptDtoError> {
+        if !(1..=64).contains(&count) {
+            return Err(ScriptDtoError::InvalidBounds);
+        }
+        Ok(Self {
+            request_id: validate_script_id(request_id.as_ref())?,
+            player_id,
+            block_id: validate_contract_resource_id(block_id.as_ref())?,
+            count,
+        })
+    }
+
+    pub fn request_id(&self) -> &str {
+        &self.request_id
+    }
+
+    pub const fn player_id(&self) -> ScriptPlayerId {
+        self.player_id
+    }
+
+    pub fn block_id(&self) -> &str {
+        &self.block_id
+    }
+
+    pub const fn count(&self) -> u8 {
+        self.count
+    }
+}
+
+/// Exact public category for a Loader custom-block item grant that did not commit.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum ScriptLoaderItemGrantFailure {
+    LoaderUnavailable,
+    NotOwned,
+    PlayerUnavailable,
+    InventoryFull,
+    RuntimeUnavailable,
+    Rejected,
+}
+
+impl ScriptLoaderItemGrantFailure {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::LoaderUnavailable => "loader_unavailable",
+            Self::NotOwned => "not_owned",
+            Self::PlayerUnavailable => "player_unavailable",
+            Self::InventoryFull => "inventory_full",
+            Self::RuntimeUnavailable => "runtime_unavailable",
+            Self::Rejected => "rejected",
+        }
+    }
+}
+
 /// Bounded request for a point-in-time connected-player snapshot.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ScriptOnlinePlayersRequest {
@@ -489,6 +761,89 @@ impl ScriptEntityId {
 
     pub const fn value(self) -> u64 {
         self.0
+    }
+}
+
+/// Exact public category for an entity-spawn request that did not commit.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum ScriptEntitySpawnFailure {
+    UnknownEntityType,
+    ActorUnavailable,
+    Busy,
+    RuntimeUnavailable,
+    Rejected,
+}
+
+impl ScriptEntitySpawnFailure {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::UnknownEntityType => "unknown_entity_type",
+            Self::ActorUnavailable => "actor_unavailable",
+            Self::Busy => "busy",
+            Self::RuntimeUnavailable => "runtime_unavailable",
+            Self::Rejected => "rejected",
+        }
+    }
+}
+
+/// Typed request to apply one bounded server-owned damage mutation to a non-player entity.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ScriptEntityDamageRequest {
+    request_id: String,
+    entity_id: ScriptEntityId,
+    amount_bits: u32,
+}
+
+impl ScriptEntityDamageRequest {
+    pub fn try_new(
+        request_id: impl AsRef<str>,
+        entity_id: ScriptEntityId,
+        amount: f32,
+    ) -> Result<Self, ScriptDtoError> {
+        if entity_id.value() > i32::MAX as u64
+            || !amount.is_finite()
+            || !(0.0..=MAX_SCRIPT_ENTITY_DAMAGE).contains(&amount)
+            || amount == 0.0
+        {
+            return Err(ScriptDtoError::InvalidBounds);
+        }
+        Ok(Self {
+            request_id: validate_script_id(request_id.as_ref())?,
+            entity_id,
+            amount_bits: amount.to_bits(),
+        })
+    }
+
+    pub fn request_id(&self) -> &str {
+        &self.request_id
+    }
+
+    pub const fn entity_id(&self) -> ScriptEntityId {
+        self.entity_id
+    }
+
+    pub const fn amount(&self) -> f32 {
+        f32::from_bits(self.amount_bits)
+    }
+}
+
+/// Exact public category for an entity-damage request that did not apply damage.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum ScriptEntityDamageFailure {
+    Busy,
+    RuntimeUnavailable,
+    Rejected,
+}
+
+impl ScriptEntityDamageFailure {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Busy => "busy",
+            Self::RuntimeUnavailable => "runtime_unavailable",
+            Self::Rejected => "rejected",
+        }
     }
 }
 
@@ -1927,6 +2282,137 @@ impl ScriptEvent {
         })
     }
 
+    /// Build the targeted result of one admitted authoritative world-time mutation.
+    pub(crate) fn world_time_set_result(
+        target_plugin_id: impl AsRef<str>,
+        request: &ScriptWorldTimeSetRequest,
+        failure: Option<ScriptWorldTimeSetFailure>,
+    ) -> Result<Self, ScriptDtoError> {
+        Ok(Self {
+            target_plugin_id: Some(validate_target_plugin_id(target_plugin_id.as_ref())?),
+            kind: ScriptEventKind::WorldTimeSetResult {
+                request_id: request.request_id().to_owned(),
+                world_time: request.world_time(),
+                failure,
+            },
+        })
+    }
+
+    /// Build the targeted result of one admitted authoritative default-block mutation.
+    pub(crate) fn world_block_set_result(
+        target_plugin_id: impl AsRef<str>,
+        request: &ScriptWorldBlockSetRequest,
+        applied: bool,
+        failure: Option<ScriptWorldBlockSetFailure>,
+    ) -> Result<Self, ScriptDtoError> {
+        if applied != failure.is_none() {
+            return Err(ScriptDtoError::InconsistentResult {
+                field: "world block set result",
+            });
+        }
+        Ok(Self {
+            target_plugin_id: Some(validate_target_plugin_id(target_plugin_id.as_ref())?),
+            kind: ScriptEventKind::WorldBlockSetResult {
+                request_id: request.request_id().to_owned(),
+                dimension: request.dimension().to_owned(),
+                block_id: request.block_id().to_owned(),
+                x: request.x(),
+                y: request.y(),
+                z: request.z(),
+                applied,
+                failure,
+            },
+        })
+    }
+
+    /// Build the targeted result of one admitted Loader custom-block placement.
+    pub(crate) fn loader_block_placement_result(
+        target_plugin_id: impl AsRef<str>,
+        request: &ScriptLoaderBlockPlacementRequest,
+        failure: Option<ScriptLoaderBlockPlacementFailure>,
+    ) -> Result<Self, ScriptDtoError> {
+        Ok(Self {
+            target_plugin_id: Some(validate_target_plugin_id(target_plugin_id.as_ref())?),
+            kind: ScriptEventKind::LoaderBlockPlacementResult {
+                request_id: request.request_id().to_owned(),
+                block_id: request.block_id().to_owned(),
+                x: request.x(),
+                y: request.y(),
+                z: request.z(),
+                failure,
+            },
+        })
+    }
+
+    /// Build the targeted result of one admitted Loader custom-block item grant.
+    pub(crate) fn loader_item_grant_result(
+        target_plugin_id: impl AsRef<str>,
+        request: &ScriptLoaderItemGrantRequest,
+        failure: Option<ScriptLoaderItemGrantFailure>,
+    ) -> Result<Self, ScriptDtoError> {
+        Ok(Self {
+            target_plugin_id: Some(validate_target_plugin_id(target_plugin_id.as_ref())?),
+            kind: ScriptEventKind::LoaderItemGrantResult {
+                request_id: request.request_id().to_owned(),
+                player_id: request.player_id(),
+                block_id: request.block_id().to_owned(),
+                count: request.count(),
+                failure,
+            },
+        })
+    }
+
+    /// Build the targeted result of one admitted entity-spawn mutation.
+    pub(crate) fn entity_spawn_result(
+        target_plugin_id: impl AsRef<str>,
+        request_id: impl AsRef<str>,
+        actor: ScriptPlayerId,
+        entity_type: impl AsRef<str>,
+        position: ScriptPosition,
+        failure: Option<ScriptEntitySpawnFailure>,
+    ) -> Result<Self, ScriptDtoError> {
+        Ok(Self {
+            target_plugin_id: Some(validate_target_plugin_id(target_plugin_id.as_ref())?),
+            kind: ScriptEventKind::EntitySpawnResult {
+                request_id: validate_script_id(request_id.as_ref())?,
+                player_id: actor,
+                entity_type: validate_contract_resource_id(entity_type.as_ref())?,
+                position,
+                failure,
+            },
+        })
+    }
+
+    /// Build the targeted result of one admitted entity-damage mutation.
+    pub(crate) fn entity_damage_result(
+        target_plugin_id: impl AsRef<str>,
+        request: &ScriptEntityDamageRequest,
+        health: Option<f32>,
+        killed: bool,
+        failure: Option<ScriptEntityDamageFailure>,
+    ) -> Result<Self, ScriptDtoError> {
+        if health.is_some() != failure.is_none()
+            || killed && health.is_none()
+            || health.is_some_and(|health| !health.is_finite() || health < 0.0)
+            || killed && health.is_some_and(|health| health > 0.0)
+        {
+            return Err(ScriptDtoError::InconsistentResult {
+                field: "entity damage result",
+            });
+        }
+        Ok(Self {
+            target_plugin_id: Some(validate_target_plugin_id(target_plugin_id.as_ref())?),
+            kind: ScriptEventKind::EntityDamageResult {
+                request_id: request.request_id().to_owned(),
+                entity_id: request.entity_id(),
+                amount_bits: request.amount().to_bits(),
+                health_bits: health.map(f32::to_bits),
+                killed,
+                failure,
+            },
+        })
+    }
+
     /// Build the targeted result of one admitted connected-player query.
     pub(crate) fn online_players_result(
         target_plugin_id: impl AsRef<str>,
@@ -2064,6 +2550,12 @@ impl ScriptEvent {
             ScriptEventKind::PlayerZoneExited { .. } => "player.zone_exited",
             ScriptEventKind::ZoneCommandResult { .. } => "zone.command_result",
             ScriptEventKind::PlayerTeleportResult { .. } => "player.teleport_result",
+            ScriptEventKind::WorldTimeSetResult { .. } => "world.time_set_result",
+            ScriptEventKind::WorldBlockSetResult { .. } => "world.block_set_result",
+            ScriptEventKind::LoaderBlockPlacementResult { .. } => "loader.block_placement_result",
+            ScriptEventKind::LoaderItemGrantResult { .. } => "loader.item_grant_result",
+            ScriptEventKind::EntitySpawnResult { .. } => "entity.spawn_result",
+            ScriptEventKind::EntityDamageResult { .. } => "entity.damage_result",
             ScriptEventKind::OnlinePlayersResult { .. } => "player.online_result",
             ScriptEventKind::VillagerBindingResult { .. } => "villager.binding_result",
             ScriptEventKind::VillagerGoalResult { .. } => "villager.goal_result",
@@ -2278,8 +2770,82 @@ impl ScriptEvent {
                 validate_script_id(zone_id).map(drop)
             }
             ScriptEventKind::PlayerInventoryTransactionResult { request_id, .. }
-            | ScriptEventKind::PlayerTeleportResult { request_id, .. } => {
+            | ScriptEventKind::PlayerTeleportResult { request_id, .. }
+            | ScriptEventKind::WorldTimeSetResult { request_id, .. } => {
                 validate_script_id(request_id).map(drop)
+            }
+            ScriptEventKind::WorldBlockSetResult {
+                request_id,
+                dimension,
+                block_id,
+                applied,
+                failure,
+                ..
+            } => {
+                validate_script_id(request_id)?;
+                validate_contract_resource_id(dimension)?;
+                validate_contract_resource_id(block_id)?;
+                if *applied != failure.is_none() {
+                    return Err(ScriptDtoError::InconsistentResult {
+                        field: "world block set result",
+                    });
+                }
+                Ok(())
+            }
+            ScriptEventKind::LoaderBlockPlacementResult {
+                request_id,
+                block_id,
+                x,
+                y,
+                z,
+                ..
+            } => ScriptLoaderBlockPlacementRequest::try_new(request_id, block_id, *x, *y, *z)
+                .map(drop),
+            ScriptEventKind::LoaderItemGrantResult {
+                request_id,
+                player_id,
+                block_id,
+                count,
+                ..
+            } => ScriptLoaderItemGrantRequest::try_new(request_id, *player_id, block_id, *count)
+                .map(drop),
+            ScriptEventKind::EntitySpawnResult {
+                request_id,
+                entity_type,
+                position,
+                ..
+            } => {
+                validate_script_id(request_id)?;
+                validate_contract_resource_id(entity_type)?;
+                ScriptPosition::try_new(position.x(), position.y(), position.z())
+                    .ok_or(ScriptDtoError::InvalidBounds)
+                    .map(drop)
+            }
+            ScriptEventKind::EntityDamageResult {
+                request_id,
+                entity_id,
+                amount_bits,
+                health_bits,
+                killed,
+                failure,
+            } => {
+                validate_script_id(request_id)?;
+                ScriptEntityDamageRequest::try_new(
+                    request_id,
+                    *entity_id,
+                    f32::from_bits(*amount_bits),
+                )?;
+                let health = health_bits.map(f32::from_bits);
+                if health.is_some() != failure.is_none()
+                    || *killed && health.is_none()
+                    || health.is_some_and(|health| !health.is_finite() || health < 0.0)
+                    || *killed && health.is_some_and(|health| health > 0.0)
+                {
+                    return Err(ScriptDtoError::InconsistentResult {
+                        field: "entity damage result",
+                    });
+                }
+                Ok(())
             }
             ScriptEventKind::OnlinePlayersResult {
                 request_id,
@@ -2487,6 +3053,51 @@ pub enum ScriptEventKind {
         position: ScriptPosition,
         failure: Option<ScriptPlayerTeleportFailure>,
     },
+    WorldTimeSetResult {
+        request_id: String,
+        world_time: u64,
+        failure: Option<ScriptWorldTimeSetFailure>,
+    },
+    WorldBlockSetResult {
+        request_id: String,
+        dimension: String,
+        block_id: String,
+        x: i32,
+        y: i32,
+        z: i32,
+        applied: bool,
+        failure: Option<ScriptWorldBlockSetFailure>,
+    },
+    LoaderBlockPlacementResult {
+        request_id: String,
+        block_id: String,
+        x: i32,
+        y: i32,
+        z: i32,
+        failure: Option<ScriptLoaderBlockPlacementFailure>,
+    },
+    LoaderItemGrantResult {
+        request_id: String,
+        player_id: ScriptPlayerId,
+        block_id: String,
+        count: u8,
+        failure: Option<ScriptLoaderItemGrantFailure>,
+    },
+    EntitySpawnResult {
+        request_id: String,
+        player_id: ScriptPlayerId,
+        entity_type: String,
+        position: ScriptPosition,
+        failure: Option<ScriptEntitySpawnFailure>,
+    },
+    EntityDamageResult {
+        request_id: String,
+        entity_id: ScriptEntityId,
+        amount_bits: u32,
+        health_bits: Option<u32>,
+        killed: bool,
+        failure: Option<ScriptEntityDamageFailure>,
+    },
     OnlinePlayersResult {
         request_id: String,
         players: Vec<ScriptOnlinePlayerSnapshot>,
@@ -2530,13 +3141,14 @@ pub enum ScriptCommand {
         player_id: ScriptPlayerId,
         reason: String,
     },
-    RunConsoleCommand {
-        command: String,
-    },
     SpawnEntity {
+        request_id: String,
         actor: ScriptPlayerId,
         entity_type: String,
         position: ScriptPosition,
+    },
+    DamageEntity {
+        request: ScriptEntityDamageRequest,
     },
     PluginStorageGet {
         request: ScriptPluginStorageGetRequest,
@@ -2556,15 +3168,10 @@ pub enum ScriptCommand {
         screen_id: String,
     },
     PlaceLoaderBlock {
-        block_id: String,
-        x: i32,
-        y: i32,
-        z: i32,
+        request: ScriptLoaderBlockPlacementRequest,
     },
     GrantLoaderBlockItem {
-        player_id: ScriptPlayerId,
-        block_id: String,
-        count: u8,
+        request: ScriptLoaderItemGrantRequest,
     },
     CloseInventoryMenu {
         player_id: ScriptPlayerId,
@@ -2590,6 +3197,12 @@ pub enum ScriptCommand {
     },
     TeleportPlayer {
         request: ScriptPlayerTeleportRequest,
+    },
+    SetWorldTime {
+        request: ScriptWorldTimeSetRequest,
+    },
+    SetWorldBlock {
+        request: ScriptWorldBlockSetRequest,
     },
     ListOnlinePlayers {
         request: ScriptOnlinePlayersRequest,
@@ -3029,6 +3642,94 @@ impl AdmittedScriptCommand {
         ScriptEvent::player_teleport_result(&self.plugin_id, request, failure)
     }
 
+    pub fn world_time_set_result(
+        self,
+        failure: Option<ScriptWorldTimeSetFailure>,
+    ) -> Result<ScriptEvent, ScriptDtoError> {
+        let ScriptCommand::SetWorldTime { request } = self.request.as_ref() else {
+            return Err(ScriptDtoError::InconsistentResult {
+                field: "world time admission",
+            });
+        };
+        ScriptEvent::world_time_set_result(&self.plugin_id, request, failure)
+    }
+
+    pub fn world_block_set_result(
+        self,
+        applied: bool,
+        failure: Option<ScriptWorldBlockSetFailure>,
+    ) -> Result<ScriptEvent, ScriptDtoError> {
+        let ScriptCommand::SetWorldBlock { request } = self.request.as_ref() else {
+            return Err(ScriptDtoError::InconsistentResult {
+                field: "world block admission",
+            });
+        };
+        ScriptEvent::world_block_set_result(&self.plugin_id, request, applied, failure)
+    }
+
+    pub fn loader_block_placement_result(
+        self,
+        failure: Option<ScriptLoaderBlockPlacementFailure>,
+    ) -> Result<ScriptEvent, ScriptDtoError> {
+        let ScriptCommand::PlaceLoaderBlock { request } = self.request.as_ref() else {
+            return Err(ScriptDtoError::InconsistentResult {
+                field: "loader block placement admission",
+            });
+        };
+        ScriptEvent::loader_block_placement_result(&self.plugin_id, request, failure)
+    }
+
+    pub fn loader_item_grant_result(
+        self,
+        failure: Option<ScriptLoaderItemGrantFailure>,
+    ) -> Result<ScriptEvent, ScriptDtoError> {
+        let ScriptCommand::GrantLoaderBlockItem { request } = self.request.as_ref() else {
+            return Err(ScriptDtoError::InconsistentResult {
+                field: "loader item grant admission",
+            });
+        };
+        ScriptEvent::loader_item_grant_result(&self.plugin_id, request, failure)
+    }
+
+    pub fn entity_spawn_result(
+        self,
+        failure: Option<ScriptEntitySpawnFailure>,
+    ) -> Result<ScriptEvent, ScriptDtoError> {
+        let ScriptCommand::SpawnEntity {
+            request_id,
+            actor,
+            entity_type,
+            position,
+        } = self.request.as_ref()
+        else {
+            return Err(ScriptDtoError::InconsistentResult {
+                field: "entity spawn admission",
+            });
+        };
+        ScriptEvent::entity_spawn_result(
+            &self.plugin_id,
+            request_id,
+            *actor,
+            entity_type,
+            *position,
+            failure,
+        )
+    }
+
+    pub fn entity_damage_result(
+        self,
+        health: Option<f32>,
+        killed: bool,
+        failure: Option<ScriptEntityDamageFailure>,
+    ) -> Result<ScriptEvent, ScriptDtoError> {
+        let ScriptCommand::DamageEntity { request } = self.request.as_ref() else {
+            return Err(ScriptDtoError::InconsistentResult {
+                field: "entity damage admission",
+            });
+        };
+        ScriptEvent::entity_damage_result(&self.plugin_id, request, health, killed, failure)
+    }
+
     pub fn online_players_result(
         self,
         players: Vec<ScriptOnlinePlayerSnapshot>,
@@ -3118,14 +3819,10 @@ impl ScriptCommand {
             | Self::OpenClientScreen { .. }
             | Self::PlaceLoaderBlock { .. }
             | Self::GrantLoaderBlockItem { .. } => None,
-            Self::RunConsoleCommand { command } => {
-                Some(RequiredCommandCapability::RunConsoleCommandRoot {
-                    root: console_command_root(command),
-                })
-            }
             Self::SpawnEntity { entity_type, .. } => {
                 Some(RequiredCommandCapability::SpawnEntityType { entity_type })
             }
+            Self::DamageEntity { .. } => Some(RequiredCommandCapability::EntityDamage),
             Self::PluginStorageGet { .. }
             | Self::PluginStorageCompareAndSwap { .. }
             | Self::PluginStorageDelete { .. } => Some(RequiredCommandCapability::PluginStorage),
@@ -3145,6 +3842,8 @@ impl ScriptCommand {
                 Some(RequiredCommandCapability::Villagers)
             }
             Self::TeleportPlayer { .. } => Some(RequiredCommandCapability::PlayerTeleport),
+            Self::SetWorldTime { .. } => Some(RequiredCommandCapability::WorldTime),
+            Self::SetWorldBlock { .. } => Some(RequiredCommandCapability::WorldBlocks),
             Self::ListOnlinePlayers { .. } => Some(RequiredCommandCapability::PlayerQueries),
         }
     }
@@ -3162,31 +3861,24 @@ impl ScriptCommand {
                 reason,
                 MAX_SCRIPT_DISCONNECT_REASON_BYTES,
             ),
-            Self::RunConsoleCommand { command } => {
-                validate_bounded_nonempty(
-                    "console command",
-                    command,
-                    MAX_SCRIPT_CONSOLE_COMMAND_BYTES,
-                )?;
-                let root = console_command_root(command);
-                if root.is_empty() || root.len() > MAX_PLAYER_COMMAND_ROOT_BYTES {
-                    return Err(ScriptDtoError::InvalidId {
-                        field: "console command root",
-                        actual_bytes: root.len(),
-                    });
-                }
-                Ok(())
-            }
             Self::SpawnEntity {
+                request_id,
                 entity_type,
                 position,
                 ..
             } => {
+                validate_script_id(request_id)?;
                 validate_contract_resource_id(entity_type)?;
                 ScriptPosition::try_new(position.x(), position.y(), position.z())
                     .ok_or(ScriptDtoError::InvalidBounds)
                     .map(drop)
             }
+            Self::DamageEntity { request } => ScriptEntityDamageRequest::try_new(
+                request.request_id(),
+                request.entity_id(),
+                request.amount(),
+            )
+            .map(drop),
             Self::OpenInventoryMenu { menu, .. } => {
                 ScriptInventoryMenu::try_new(menu.id(), menu.title(), menu.slots().to_vec())
                     .map(drop)
@@ -3194,18 +3886,21 @@ impl ScriptCommand {
             Self::OpenClientScreen { screen_id, .. } => {
                 validate_contract_resource_id(screen_id).map(drop)
             }
-            Self::PlaceLoaderBlock { block_id, .. } => {
-                validate_contract_resource_id(block_id).map(drop)
-            }
-            Self::GrantLoaderBlockItem {
-                block_id, count, ..
-            } => {
-                validate_contract_resource_id(block_id)?;
-                if !(1..=64).contains(count) {
-                    return Err(ScriptDtoError::InvalidBounds);
-                }
-                Ok(())
-            }
+            Self::PlaceLoaderBlock { request } => ScriptLoaderBlockPlacementRequest::try_new(
+                request.request_id(),
+                request.block_id(),
+                request.x(),
+                request.y(),
+                request.z(),
+            )
+            .map(drop),
+            Self::GrantLoaderBlockItem { request } => ScriptLoaderItemGrantRequest::try_new(
+                request.request_id(),
+                request.player_id(),
+                request.block_id(),
+                request.count(),
+            )
+            .map(drop),
             Self::UpsertZone { zone } => ScriptAxisAlignedZone::try_new_with_protection(
                 zone.id(),
                 zone.dimension(),
@@ -3271,6 +3966,19 @@ impl ScriptCommand {
                 request.position(),
             )
             .map(drop),
+            Self::SetWorldTime { request } => {
+                ScriptWorldTimeSetRequest::try_new(request.request_id(), request.world_time())
+                    .map(drop)
+            }
+            Self::SetWorldBlock { request } => ScriptWorldBlockSetRequest::try_new(
+                request.request_id(),
+                request.dimension(),
+                request.block_id(),
+                request.x(),
+                request.y(),
+                request.z(),
+            )
+            .map(drop),
             Self::ListOnlinePlayers { request } => {
                 ScriptOnlinePlayersRequest::try_new(request.request_id(), request.limit()).map(drop)
             }
@@ -3329,6 +4037,25 @@ pub(crate) enum ScriptBatchSubmissionError {
     },
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[cfg(feature = "lua-runtime")]
+pub(crate) enum ScriptReloadCommitError {
+    QueueFull,
+    QueueClosed,
+    Rejected {
+        error: CommandBatchError,
+    },
+    Ownership {
+        error: PlayerCommandRegistrationError,
+    },
+}
+
+pub(crate) enum ScriptHostInput {
+    Event(ScriptEvent),
+    #[cfg(feature = "lua-runtime")]
+    LuaReload(lua::LuaReloadRequest),
+}
+
 /// Server-owned side of the script boundary.
 #[derive(Debug, Clone)]
 pub struct ScriptBoundary {
@@ -3341,8 +4068,8 @@ pub struct ScriptBoundary {
 #[derive(Debug)]
 struct ScriptEventAdmission {
     closed: AtomicBool,
-    sender: StdMutex<Option<mpsc::Sender<ScriptEvent>>>,
-    weak_sender: mpsc::WeakSender<ScriptEvent>,
+    sender: StdMutex<Option<mpsc::Sender<ScriptHostInput>>>,
+    weak_sender: mpsc::WeakSender<ScriptHostInput>,
     coalesced_server_tick: Arc<StdMutex<CoalescedServerTick>>,
 }
 
@@ -3353,7 +4080,7 @@ struct CoalescedServerTick {
 }
 
 impl ScriptEventAdmission {
-    fn sender(&self) -> Option<mpsc::Sender<ScriptEvent>> {
+    fn sender(&self) -> Option<mpsc::Sender<ScriptHostInput>> {
         if self.closed.load(Ordering::Acquire) {
             return None;
         }
@@ -3380,10 +4107,12 @@ impl ScriptBoundary {
         let Some(event_tx) = self.event_admission.sender() else {
             return Err(ScriptQueueError::Closed);
         };
-        event_tx.try_send(event).map_err(|error| match error {
-            mpsc::error::TrySendError::Full(_) => ScriptQueueError::Full,
-            mpsc::error::TrySendError::Closed(_) => ScriptQueueError::Closed,
-        })
+        event_tx
+            .try_send(ScriptHostInput::Event(event))
+            .map_err(|error| match error {
+                mpsc::error::TrySendError::Full(_) => ScriptQueueError::Full,
+                mpsc::error::TrySendError::Closed(_) => ScriptQueueError::Closed,
+            })
     }
 
     /// Push the latest simulation tick without blocking or losing timer progress.
@@ -3410,7 +4139,9 @@ impl ScriptBoundary {
             .pending
             .take()
             .map_or(tick, |pending| pending.max(tick));
-        match event_tx.try_send(ScriptEvent::server_tick(latest_tick)) {
+        match event_tx.try_send(ScriptHostInput::Event(ScriptEvent::server_tick(
+            latest_tick,
+        ))) {
             Ok(()) => Ok(()),
             Err(mpsc::error::TrySendError::Full(_)) => {
                 coalesced.pending = Some(latest_tick);
@@ -3429,7 +4160,7 @@ impl ScriptBoundary {
             return Err(ScriptQueueError::Closed);
         };
         event_tx
-            .send(event)
+            .send(ScriptHostInput::Event(event))
             .await
             .map_err(|_| ScriptQueueError::Closed)
     }
@@ -3518,7 +4249,7 @@ impl ScriptBoundary {
 /// Script-host side of the bounded boundary.
 #[derive(Debug)]
 pub struct ScriptHostEndpoint {
-    event_rx: mpsc::Receiver<ScriptEvent>,
+    event_rx: mpsc::Receiver<ScriptHostInput>,
     coalesced_server_tick: Arc<StdMutex<CoalescedServerTick>>,
     coalesced_tick_due: bool,
     highest_delivered_tick: Option<u64>,
@@ -3532,45 +4263,10 @@ impl ScriptHostEndpoint {
     /// Wait asynchronously until an event arrives or the server side closes.
     pub async fn recv_event(&mut self) -> Option<ScriptEvent> {
         loop {
-            if self.coalesced_tick_due {
-                self.coalesced_tick_due = false;
-                if let Some(event) = take_coalesced_server_tick(&self.coalesced_server_tick) {
-                    if let Some(event) = self.accept_monotonic_event(event) {
-                        return Some(event);
-                    }
-                    continue;
-                }
-            }
-            match self.event_rx.try_recv() {
-                Ok(event) => {
-                    self.coalesced_tick_due =
-                        has_coalesced_server_tick(&self.coalesced_server_tick);
-                    if let Some(event) = self.accept_monotonic_event(event) {
-                        return Some(event);
-                    }
-                    continue;
-                }
-                Err(mpsc::error::TryRecvError::Empty) => {}
-                Err(mpsc::error::TryRecvError::Disconnected) => {
-                    let event = take_coalesced_server_tick(&self.coalesced_server_tick)?;
-                    if let Some(event) = self.accept_monotonic_event(event) {
-                        return Some(event);
-                    }
-                    continue;
-                }
-            }
-            if let Some(event) = take_coalesced_server_tick(&self.coalesced_server_tick) {
-                if let Some(event) = self.accept_monotonic_event(event) {
-                    return Some(event);
-                }
-                continue;
-            }
-            let Some(event) = self.event_rx.recv().await else {
-                continue;
-            };
-            self.coalesced_tick_due = has_coalesced_server_tick(&self.coalesced_server_tick);
-            if let Some(event) = self.accept_monotonic_event(event) {
-                return Some(event);
+            match self.recv_input().await? {
+                ScriptHostInput::Event(event) => return Some(event),
+                #[cfg(feature = "lua-runtime")]
+                ScriptHostInput::LuaReload(request) => request.reject_host_unavailable(),
             }
         }
     }
@@ -3578,21 +4274,36 @@ impl ScriptHostEndpoint {
     /// Block the dedicated host thread until an event arrives or the server side closes.
     pub fn recv_event_blocking(&mut self) -> Option<ScriptEvent> {
         loop {
+            match self.recv_input_blocking()? {
+                ScriptHostInput::Event(event) => return Some(event),
+                #[cfg(feature = "lua-runtime")]
+                ScriptHostInput::LuaReload(request) => request.reject_host_unavailable(),
+            }
+        }
+    }
+
+    #[cfg(feature = "lua-runtime")]
+    pub(crate) fn recv_lua_input_blocking(&mut self) -> Option<ScriptHostInput> {
+        self.recv_input_blocking()
+    }
+
+    async fn recv_input(&mut self) -> Option<ScriptHostInput> {
+        loop {
             if self.coalesced_tick_due {
                 self.coalesced_tick_due = false;
                 if let Some(event) = take_coalesced_server_tick(&self.coalesced_server_tick) {
                     if let Some(event) = self.accept_monotonic_event(event) {
-                        return Some(event);
+                        return Some(ScriptHostInput::Event(event));
                     }
                     continue;
                 }
             }
             match self.event_rx.try_recv() {
-                Ok(event) => {
+                Ok(input) => {
                     self.coalesced_tick_due =
                         has_coalesced_server_tick(&self.coalesced_server_tick);
-                    if let Some(event) = self.accept_monotonic_event(event) {
-                        return Some(event);
+                    if let Some(input) = self.accept_input(input) {
+                        return Some(input);
                     }
                     continue;
                 }
@@ -3600,24 +4311,79 @@ impl ScriptHostEndpoint {
                 Err(mpsc::error::TryRecvError::Disconnected) => {
                     let event = take_coalesced_server_tick(&self.coalesced_server_tick)?;
                     if let Some(event) = self.accept_monotonic_event(event) {
-                        return Some(event);
+                        return Some(ScriptHostInput::Event(event));
                     }
                     continue;
                 }
             }
             if let Some(event) = take_coalesced_server_tick(&self.coalesced_server_tick) {
                 if let Some(event) = self.accept_monotonic_event(event) {
-                    return Some(event);
+                    return Some(ScriptHostInput::Event(event));
                 }
                 continue;
             }
-            let Some(event) = self.event_rx.blocking_recv() else {
+            let Some(input) = self.event_rx.recv().await else {
                 continue;
             };
             self.coalesced_tick_due = has_coalesced_server_tick(&self.coalesced_server_tick);
-            if let Some(event) = self.accept_monotonic_event(event) {
-                return Some(event);
+            if let Some(input) = self.accept_input(input) {
+                return Some(input);
             }
+        }
+    }
+
+    fn recv_input_blocking(&mut self) -> Option<ScriptHostInput> {
+        loop {
+            if self.coalesced_tick_due {
+                self.coalesced_tick_due = false;
+                if let Some(event) = take_coalesced_server_tick(&self.coalesced_server_tick) {
+                    if let Some(event) = self.accept_monotonic_event(event) {
+                        return Some(ScriptHostInput::Event(event));
+                    }
+                    continue;
+                }
+            }
+            match self.event_rx.try_recv() {
+                Ok(input) => {
+                    self.coalesced_tick_due =
+                        has_coalesced_server_tick(&self.coalesced_server_tick);
+                    if let Some(input) = self.accept_input(input) {
+                        return Some(input);
+                    }
+                    continue;
+                }
+                Err(mpsc::error::TryRecvError::Empty) => {}
+                Err(mpsc::error::TryRecvError::Disconnected) => {
+                    let event = take_coalesced_server_tick(&self.coalesced_server_tick)?;
+                    if let Some(event) = self.accept_monotonic_event(event) {
+                        return Some(ScriptHostInput::Event(event));
+                    }
+                    continue;
+                }
+            }
+            if let Some(event) = take_coalesced_server_tick(&self.coalesced_server_tick) {
+                if let Some(event) = self.accept_monotonic_event(event) {
+                    return Some(ScriptHostInput::Event(event));
+                }
+                continue;
+            }
+            let Some(input) = self.event_rx.blocking_recv() else {
+                continue;
+            };
+            self.coalesced_tick_due = has_coalesced_server_tick(&self.coalesced_server_tick);
+            if let Some(input) = self.accept_input(input) {
+                return Some(input);
+            }
+        }
+    }
+
+    fn accept_input(&mut self, input: ScriptHostInput) -> Option<ScriptHostInput> {
+        match input {
+            ScriptHostInput::Event(event) => self
+                .accept_monotonic_event(event)
+                .map(ScriptHostInput::Event),
+            #[cfg(feature = "lua-runtime")]
+            ScriptHostInput::LuaReload(request) => Some(ScriptHostInput::LuaReload(request)),
         }
     }
 
@@ -3737,6 +4503,82 @@ impl ScriptHostEndpoint {
     /// Remove every active player command root owned by one plugin.
     pub fn unregister_player_commands(&self, plugin_id: &str) {
         self.player_command_owners.unregister(plugin_id);
+    }
+
+    #[cfg(feature = "lua-runtime")]
+    pub(crate) fn commit_lua_reload<F>(
+        &self,
+        manifests: &[ValidatedScriptPluginManifest],
+        batches: Vec<(HostCommandAdmission, CommandBatch)>,
+        swap: F,
+    ) -> Result<(), ScriptReloadCommitError>
+    where
+        F: FnOnce(),
+    {
+        for (admission, batch) in &batches {
+            for command in batch.commands() {
+                if matches!(command, ScriptCommand::HostAttached { .. }) {
+                    return Err(ScriptReloadCommitError::Rejected {
+                        error: CommandBatchError::ProvenanceRejected,
+                    });
+                }
+                if let Err(error) = command.validate_contract() {
+                    return Err(ScriptReloadCommitError::Rejected {
+                        error: CommandBatchError::InvalidCommand { error },
+                    });
+                }
+                if let Some(capability) = command
+                    .required_capability()
+                    .filter(|capability| !admission.capabilities.allows(*capability))
+                    .map(RequiredCommandCapability::kind)
+                {
+                    return Err(ScriptReloadCommitError::Rejected {
+                        error: CommandBatchError::PermissionDenied { capability },
+                    });
+                }
+            }
+        }
+
+        if self.command_tx.is_closed() {
+            return Err(ScriptReloadCommitError::QueueClosed);
+        }
+        let command_count = batches
+            .iter()
+            .map(|(_, batch)| batch.commands().len())
+            .sum::<usize>();
+        if command_count == 0 {
+            self.player_command_owners
+                .replace_all(manifests)
+                .map_err(|error| ScriptReloadCommitError::Ownership { error })?;
+            swap();
+            return Ok(());
+        }
+
+        let permits =
+            self.command_tx
+                .try_reserve_many(command_count)
+                .map_err(|error| match error {
+                    mpsc::error::TrySendError::Full(()) => ScriptReloadCommitError::QueueFull,
+                    mpsc::error::TrySendError::Closed(()) => ScriptReloadCommitError::QueueClosed,
+                })?;
+        let mut attached = Vec::with_capacity(command_count);
+        for (admission, batch) in batches {
+            let issued = self
+                .host_admissions
+                .issue(Arc::clone(&admission.plugin_id), batch)
+                .map_err(|_| ScriptReloadCommitError::Rejected {
+                    error: CommandBatchError::AdmissionUnavailable,
+                })?;
+            attached.extend(issued);
+        }
+        self.player_command_owners
+            .replace_all(manifests)
+            .map_err(|error| ScriptReloadCommitError::Ownership { error })?;
+        swap();
+        for (permit, command) in permits.zip(attached) {
+            permit.send(command);
+        }
+        Ok(())
     }
 }
 
@@ -3872,6 +4714,64 @@ impl PlayerCommandOwners {
         }
     }
 
+    #[cfg(feature = "lua-runtime")]
+    fn replace_all(
+        &self,
+        manifests: &[ValidatedScriptPluginManifest],
+    ) -> Result<(), PlayerCommandRegistrationError> {
+        if self.disabled.load(Ordering::Acquire) {
+            return Err(PlayerCommandRegistrationError::AuthorityPoisoned);
+        }
+        let mut replacement = BTreeMap::new();
+        let requested = manifests.iter().fold(0_usize, |count, manifest| {
+            count
+                .saturating_add(manifest.player_command_roots().len())
+                .saturating_add(manifest.operator_command_roots().len())
+        });
+        if requested > MAX_PLAYER_COMMAND_ROOTS {
+            return Err(PlayerCommandRegistrationError::RootLimitExceeded {
+                limit: MAX_PLAYER_COMMAND_ROOTS,
+                requested,
+            });
+        }
+        for manifest in manifests {
+            for (root, operator_only) in manifest
+                .player_command_roots()
+                .iter()
+                .map(|root| (root, false))
+                .chain(
+                    manifest
+                        .operator_command_roots()
+                        .iter()
+                        .map(|root| (root, true)),
+                )
+            {
+                if let Some(owner) = replacement.insert(
+                    root.clone(),
+                    PlayerCommandOwner {
+                        plugin_id: manifest.plugin_id().to_owned(),
+                        operator_only,
+                    },
+                ) {
+                    return Err(PlayerCommandRegistrationError::RootConflict {
+                        root: root.clone(),
+                        owner_plugin_id: owner.plugin_id,
+                    });
+                }
+            }
+        }
+        let mut owners = match self.owners.write() {
+            Ok(owners) => owners,
+            Err(poisoned) => {
+                poisoned.into_inner().clear();
+                self.disabled.store(true, Ordering::Release);
+                return Err(PlayerCommandRegistrationError::AuthorityPoisoned);
+            }
+        };
+        *owners = replacement;
+        Ok(())
+    }
+
     fn clear(&self) {
         self.disabled.store(true, Ordering::Release);
         self.clear_poisoned();
@@ -3949,8 +4849,8 @@ fn has_coalesced_server_tick(slot: &StdMutex<CoalescedServerTick>) -> bool {
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 #[non_exhaustive]
 pub enum ScriptCommandCapability {
-    RunConsoleCommandRoot { root: String },
     SpawnEntityType { entity_type: String },
+    EntityDamage,
     PluginStorage,
     InventoryMenus,
     InventoryStorageTransactions,
@@ -3959,14 +4859,16 @@ pub enum ScriptCommandCapability {
     Villagers,
     PlayerTeleport,
     PlayerQueries,
+    WorldTime,
+    WorldBlocks,
 }
 
 /// Stable non-owning category used in public command-admission errors.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 #[non_exhaustive]
 pub enum ScriptCommandCapabilityKind {
-    RunConsoleCommand,
     SpawnEntity,
+    EntityDamage,
     PluginStorage,
     InventoryMenus,
     InventoryStorageTransactions,
@@ -3975,13 +4877,15 @@ pub enum ScriptCommandCapabilityKind {
     Villagers,
     PlayerTeleport,
     PlayerQueries,
+    WorldTime,
+    WorldBlocks,
 }
 
 impl ScriptCommandCapabilityKind {
     pub const fn code(self) -> &'static str {
         match self {
-            Self::RunConsoleCommand => "run_console_command",
             Self::SpawnEntity => "spawn_entity",
+            Self::EntityDamage => "entity_damage",
             Self::PluginStorage => "plugin_storage",
             Self::InventoryMenus => "inventory_menus",
             Self::InventoryStorageTransactions => "inventory_storage_transactions",
@@ -3990,13 +4894,15 @@ impl ScriptCommandCapabilityKind {
             Self::Villagers => "villagers",
             Self::PlayerTeleport => "player_teleport",
             Self::PlayerQueries => "player_queries",
+            Self::WorldTime => "world_time",
+            Self::WorldBlocks => "world_blocks",
         }
     }
 
     pub const fn field(self) -> &'static str {
         match self {
-            Self::RunConsoleCommand => "console command root",
             Self::SpawnEntity => "spawn entity type",
+            Self::EntityDamage => "entity damage",
             Self::PluginStorage => "plugin storage",
             Self::InventoryMenus => "inventory menu",
             Self::InventoryStorageTransactions => "inventory storage transaction",
@@ -4005,14 +4911,16 @@ impl ScriptCommandCapabilityKind {
             Self::Villagers => "villager",
             Self::PlayerTeleport => "player teleport",
             Self::PlayerQueries => "player query",
+            Self::WorldTime => "world time",
+            Self::WorldBlocks => "world block mutation",
         }
     }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum RequiredCommandCapability<'a> {
-    RunConsoleCommandRoot { root: &'a str },
     SpawnEntityType { entity_type: &'a str },
+    EntityDamage,
     PluginStorage,
     InventoryMenus,
     InventoryStorageTransactions,
@@ -4021,13 +4929,15 @@ enum RequiredCommandCapability<'a> {
     Villagers,
     PlayerTeleport,
     PlayerQueries,
+    WorldTime,
+    WorldBlocks,
 }
 
 impl RequiredCommandCapability<'_> {
     const fn kind(self) -> ScriptCommandCapabilityKind {
         match self {
-            Self::RunConsoleCommandRoot { .. } => ScriptCommandCapabilityKind::RunConsoleCommand,
             Self::SpawnEntityType { .. } => ScriptCommandCapabilityKind::SpawnEntity,
+            Self::EntityDamage => ScriptCommandCapabilityKind::EntityDamage,
             Self::PluginStorage => ScriptCommandCapabilityKind::PluginStorage,
             Self::InventoryMenus => ScriptCommandCapabilityKind::InventoryMenus,
             Self::InventoryStorageTransactions => {
@@ -4038,6 +4948,8 @@ impl RequiredCommandCapability<'_> {
             Self::Villagers => ScriptCommandCapabilityKind::Villagers,
             Self::PlayerTeleport => ScriptCommandCapabilityKind::PlayerTeleport,
             Self::PlayerQueries => ScriptCommandCapabilityKind::PlayerQueries,
+            Self::WorldTime => ScriptCommandCapabilityKind::WorldTime,
+            Self::WorldBlocks => ScriptCommandCapabilityKind::WorldBlocks,
         }
     }
 }
@@ -4223,20 +5135,6 @@ impl ScriptPluginManifest {
         self
     }
 
-    /// Declare that this plugin requests access to a console command root.
-    pub fn declare_console_command_root(mut self, root: impl AsRef<str>) -> Self {
-        let root = bounded_manifest_owned(
-            "console command root",
-            root.as_ref(),
-            MAX_PLAYER_COMMAND_ROOT_BYTES,
-            &mut self.preflight_error,
-        );
-        if self.preflight_error.is_none() {
-            self.push_capability(ScriptCommandCapability::RunConsoleCommandRoot { root });
-        }
-        self
-    }
-
     /// Declare one exact entity type this plugin may spawn.
     pub fn declare_spawn_entity_type(mut self, entity_type: impl AsRef<str>) -> Self {
         let entity_type = bounded_manifest_owned(
@@ -4296,6 +5194,24 @@ impl ScriptPluginManifest {
     /// Declare access to bounded connected-player snapshots.
     pub fn declare_player_queries(mut self) -> Self {
         self.push_capability(ScriptCommandCapability::PlayerQueries);
+        self
+    }
+
+    /// Declare access to bounded non-player entity damage requests.
+    pub fn declare_entity_damage(mut self) -> Self {
+        self.push_capability(ScriptCommandCapability::EntityDamage);
+        self
+    }
+
+    /// Declare access to authoritative world-time mutation requests.
+    pub fn declare_world_time(mut self) -> Self {
+        self.push_capability(ScriptCommandCapability::WorldTime);
+        self
+    }
+
+    /// Declare access to authoritative default-state world block mutations.
+    pub fn declare_world_blocks(mut self) -> Self {
+        self.push_capability(ScriptCommandCapability::WorldBlocks);
         self
     }
 
@@ -4480,24 +5396,13 @@ impl ScriptPluginManifest {
             )?;
         }
         for capability in &self.declared_command_capabilities {
-            match capability {
-                ScriptCommandCapability::RunConsoleCommandRoot { root } => {
-                    validate_manifest_field(
-                        "console command root",
-                        root,
-                        MAX_PLAYER_COMMAND_ROOT_BYTES,
-                        false,
-                    )?;
-                }
-                ScriptCommandCapability::SpawnEntityType { entity_type } => {
-                    validate_manifest_field(
-                        "spawn entity type",
-                        entity_type,
-                        MAX_SCRIPT_RESOURCE_ID_BYTES,
-                        false,
-                    )?;
-                }
-                _ => {}
+            if let ScriptCommandCapability::SpawnEntityType { entity_type } = capability {
+                validate_manifest_field(
+                    "spawn entity type",
+                    entity_type,
+                    MAX_SCRIPT_RESOURCE_ID_BYTES,
+                    false,
+                )?;
             }
         }
         for permission in &self.declared_permissions {
@@ -4584,16 +5489,6 @@ impl ScriptPluginManifest {
             Vec::with_capacity(self.declared_command_capabilities.len());
         for capability in &self.declared_command_capabilities {
             match capability {
-                ScriptCommandCapability::RunConsoleCommandRoot { root } => {
-                    let root = validate_command_root(root)?;
-                    if normalized_capabilities.iter().any(
-                        |capability| matches!(capability, ScriptCommandCapability::RunConsoleCommandRoot { root: existing } if existing == &root),
-                    ) {
-                        return Err(ScriptPluginManifestError::DuplicateCommandRoot { root });
-                    }
-                    normalized_capabilities
-                        .push(ScriptCommandCapability::RunConsoleCommandRoot { root });
-                }
                 ScriptCommandCapability::SpawnEntityType { entity_type } => {
                     let entity_type = validate_script_resource_id(entity_type)?;
                     let spawn_count = normalized_capabilities
@@ -4617,14 +5512,17 @@ impl ScriptPluginManifest {
                     normalized_capabilities
                         .push(ScriptCommandCapability::SpawnEntityType { entity_type });
                 }
-                ScriptCommandCapability::PluginStorage
+                ScriptCommandCapability::EntityDamage
+                | ScriptCommandCapability::PluginStorage
                 | ScriptCommandCapability::InventoryMenus
                 | ScriptCommandCapability::InventoryStorageTransactions
                 | ScriptCommandCapability::PlayerInventory
                 | ScriptCommandCapability::Zones
                 | ScriptCommandCapability::Villagers
                 | ScriptCommandCapability::PlayerTeleport
-                | ScriptCommandCapability::PlayerQueries => {
+                | ScriptCommandCapability::PlayerQueries
+                | ScriptCommandCapability::WorldTime
+                | ScriptCommandCapability::WorldBlocks => {
                     if normalized_capabilities.contains(capability) {
                         return Err(ScriptPluginManifestError::DuplicateCapability {
                             capability: capability.clone(),
@@ -4750,11 +5648,11 @@ impl ValidatedScriptPluginManifest {
         let mut capabilities = CommandCapabilities::none();
         for capability in &self.declared_command_capabilities {
             match capability {
-                ScriptCommandCapability::RunConsoleCommandRoot { root } => {
-                    capabilities = capabilities.allow_console_command_root(root);
-                }
                 ScriptCommandCapability::SpawnEntityType { entity_type } => {
                     capabilities = capabilities.allow_spawn_entity_type(entity_type);
+                }
+                ScriptCommandCapability::EntityDamage => {
+                    capabilities = capabilities.allow_entity_damage();
                 }
                 ScriptCommandCapability::PluginStorage => {
                     capabilities = capabilities.allow_plugin_storage();
@@ -4779,6 +5677,12 @@ impl ValidatedScriptPluginManifest {
                 }
                 ScriptCommandCapability::PlayerQueries => {
                     capabilities = capabilities.allow_player_queries();
+                }
+                ScriptCommandCapability::WorldTime => {
+                    capabilities = capabilities.allow_world_time();
+                }
+                ScriptCommandCapability::WorldBlocks => {
+                    capabilities = capabilities.allow_world_blocks();
                 }
             }
         }
@@ -4827,13 +5731,6 @@ pub enum ScriptPluginManifestError {
     },
     DuplicateDependency {
         plugin_id: String,
-    },
-    BlankCommandRoot,
-    UnboundedCommandRoot {
-        root: String,
-    },
-    DuplicateCommandRoot {
-        root: String,
     },
     DuplicateCapability {
         capability: ScriptCommandCapability,
@@ -4919,8 +5816,8 @@ fn is_valid_plugin_version(version: &str) -> bool {
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 #[non_exhaustive]
 pub struct CommandCapabilities {
-    console_command_roots: Vec<String>,
     spawn_entity_types: Vec<String>,
+    entity_damage: bool,
     plugin_storage: bool,
     inventory_menus: bool,
     inventory_storage_transactions: bool,
@@ -4929,25 +5826,14 @@ pub struct CommandCapabilities {
     villagers: bool,
     player_teleport: bool,
     player_queries: bool,
+    world_time: bool,
+    world_blocks: bool,
 }
 
 impl CommandCapabilities {
     /// Return capabilities with no privileged console command roots allowed.
     pub fn none() -> Self {
         Self::default()
-    }
-
-    #[cfg(any(test, feature = "lua-runtime"))]
-    pub(crate) fn allow_console_command_root(mut self, root: impl AsRef<str>) -> Self {
-        let root = console_command_root(root.as_ref());
-        if !self
-            .console_command_roots
-            .iter()
-            .any(|allowed| allowed == root)
-        {
-            self.console_command_roots.push(root.to_owned());
-        }
-        self
     }
 
     #[cfg(any(test, feature = "lua-runtime"))]
@@ -4960,6 +5846,12 @@ impl CommandCapabilities {
         {
             self.spawn_entity_types.push(entity_type);
         }
+        self
+    }
+
+    #[cfg(any(test, feature = "lua-runtime"))]
+    pub(crate) fn allow_entity_damage(mut self) -> Self {
+        self.entity_damage = true;
         self
     }
 
@@ -5011,16 +5903,25 @@ impl CommandCapabilities {
         self
     }
 
+    #[cfg(any(test, feature = "lua-runtime"))]
+    pub(crate) fn allow_world_time(mut self) -> Self {
+        self.world_time = true;
+        self
+    }
+
+    #[cfg(any(test, feature = "lua-runtime"))]
+    pub(crate) fn allow_world_blocks(mut self) -> Self {
+        self.world_blocks = true;
+        self
+    }
+
     fn allows(&self, capability: RequiredCommandCapability<'_>) -> bool {
         match capability {
-            RequiredCommandCapability::RunConsoleCommandRoot { root } => self
-                .console_command_roots
-                .iter()
-                .any(|allowed| allowed == root),
             RequiredCommandCapability::SpawnEntityType { entity_type } => self
                 .spawn_entity_types
                 .iter()
                 .any(|allowed| allowed == entity_type),
+            RequiredCommandCapability::EntityDamage => self.entity_damage,
             RequiredCommandCapability::PluginStorage => self.plugin_storage,
             RequiredCommandCapability::InventoryMenus => self.inventory_menus,
             RequiredCommandCapability::InventoryStorageTransactions => {
@@ -5031,6 +5932,8 @@ impl CommandCapabilities {
             RequiredCommandCapability::Villagers => self.villagers,
             RequiredCommandCapability::PlayerTeleport => self.player_teleport,
             RequiredCommandCapability::PlayerQueries => self.player_queries,
+            RequiredCommandCapability::WorldTime => self.world_time,
+            RequiredCommandCapability::WorldBlocks => self.world_blocks,
         }
     }
 }
@@ -5130,15 +6033,6 @@ impl CommandBatch {
     }
 }
 
-fn console_command_root(command: &str) -> &str {
-    command
-        .trim()
-        .trim_start_matches('/')
-        .split_whitespace()
-        .next()
-        .unwrap_or_default()
-}
-
 fn normalize_event_name(event_name: &str) -> String {
     event_name.trim().to_ascii_lowercase()
 }
@@ -5188,19 +6082,6 @@ fn is_valid_plugin_id(plugin_id: &str) -> bool {
     }
 
     chars.all(|ch| ch.is_ascii_lowercase() || ch.is_ascii_digit() || matches!(ch, '.' | '_' | '-'))
-}
-
-fn validate_command_root(root: &str) -> Result<String, ScriptPluginManifestError> {
-    let root = console_command_root(root);
-    if root.is_empty() {
-        return Err(ScriptPluginManifestError::BlankCommandRoot);
-    }
-    if root.contains('*') {
-        return Err(ScriptPluginManifestError::UnboundedCommandRoot {
-            root: root.to_owned(),
-        });
-    }
-    Ok(root.to_owned())
 }
 
 fn validate_script_resource_id(value: &str) -> Result<String, ScriptPluginManifestError> {
@@ -6000,60 +6881,9 @@ mod tests {
     }
 
     #[test]
-    fn command_capabilities_deny_unlisted_console_commands_without_mutating_batch() {
-        let mut batch = CommandBatch::new(nonzero(1));
-        let denied = ScriptCommand::RunConsoleCommand {
-            command: "stop".to_owned(),
-        };
-
-        assert_eq!(
-            batch.try_push_authorized(denied, &CommandCapabilities::default()),
-            Err(CommandBatchError::PermissionDenied {
-                capability: ScriptCommandCapabilityKind::RunConsoleCommand,
-            })
-        );
-        assert!(batch.commands().is_empty());
-
-        let raw_denied = ScriptCommand::RunConsoleCommand {
-            command: "/stop".to_owned(),
-        };
-        assert_eq!(
-            batch.try_push(raw_denied),
-            Err(CommandBatchError::PermissionDenied {
-                capability: ScriptCommandCapabilityKind::RunConsoleCommand,
-            })
-        );
-        assert!(batch.commands().is_empty());
-
-        let capabilities = CommandCapabilities::default().allow_console_command_root("time");
-        let allowed = ScriptCommand::RunConsoleCommand {
-            command: "/time set day".to_owned(),
-        };
-
-        assert_eq!(
-            allowed.required_capability_kind(),
-            Some(ScriptCommandCapabilityKind::RunConsoleCommand)
-        );
-        batch
-            .try_push_authorized(allowed.clone(), &capabilities)
-            .unwrap();
-        assert_eq!(batch.commands(), std::slice::from_ref(&allowed));
-
-        let extra = ScriptCommand::RunConsoleCommand {
-            command: "/time set noon".to_owned(),
-        };
-        assert_eq!(
-            batch.try_push_authorized(extra, &capabilities),
-            Err(CommandBatchError::Full { limit: nonzero(1) })
-        );
-        assert_eq!(batch.commands(), std::slice::from_ref(&allowed));
-    }
-
-    #[test]
     fn manifest_validation_rejects_unsupported_requested_api_version() {
         let requested = ScriptApiVersion::new(0, 7, 0);
-        let manifest = ScriptPluginManifest::new("daytime", "Daytime", "0.1.0", requested)
-            .declare_console_command_root("time");
+        let manifest = ScriptPluginManifest::new("daytime", "Daytime", "0.1.0", requested);
 
         assert_eq!(
             manifest.validate(),
@@ -6149,11 +6979,13 @@ mod tests {
 
         let position = ScriptPosition::try_new(1.25, 64.0, -2.5).unwrap();
         let pig = ScriptCommand::SpawnEntity {
+            request_id: "pig".to_owned(),
             actor: ScriptPlayerId::new(7),
             entity_type: "minecraft:pig".to_owned(),
             position,
         };
         let cow = ScriptCommand::SpawnEntity {
+            request_id: "cow".to_owned(),
             actor: ScriptPlayerId::new(7),
             entity_type: "minecraft:cow".to_owned(),
             position,
@@ -6178,21 +7010,7 @@ mod tests {
     }
 
     #[test]
-    fn manifest_validation_rejects_duplicate_command_roots_after_normalization() {
-        let manifest = ScriptPluginManifest::new("daytime", "Daytime", "0.1.0", SCRIPT_API_VERSION)
-            .declare_console_command_root("time")
-            .declare_console_command_root("/time set day");
-
-        assert_eq!(
-            manifest.validate(),
-            Err(ScriptPluginManifestError::DuplicateCommandRoot {
-                root: "time".to_owned(),
-            })
-        );
-    }
-
-    #[test]
-    fn manifest_validation_rejects_invalid_ids_and_unbounded_command_roots() {
+    fn manifest_validation_rejects_invalid_plugin_ids() {
         let blank_id = ScriptPluginManifest::new(" ", "Daytime", "0.1.0", SCRIPT_API_VERSION);
         assert_eq!(
             blank_id.validate(),
@@ -6206,23 +7024,6 @@ mod tests {
             Err(ScriptPluginManifestError::InvalidPluginId {
                 plugin_id: "Day Time".to_owned(),
             })
-        );
-
-        let unbounded =
-            ScriptPluginManifest::new("daytime", "Daytime", "0.1.0", SCRIPT_API_VERSION)
-                .declare_console_command_root("*");
-        assert_eq!(
-            unbounded.validate(),
-            Err(ScriptPluginManifestError::UnboundedCommandRoot {
-                root: "*".to_owned(),
-            })
-        );
-
-        let blank = ScriptPluginManifest::new("daytime", "Daytime", "0.1.0", SCRIPT_API_VERSION)
-            .declare_console_command_root(" / ");
-        assert_eq!(
-            blank.validate(),
-            Err(ScriptPluginManifestError::BlankCommandRoot)
         );
     }
 
@@ -6648,24 +7449,22 @@ mod tests {
     #[test]
     fn trusted_host_derives_command_capabilities_from_validated_manifest() {
         let manifest = ScriptPluginManifest::new("daytime", "Daytime", "0.1.0", SCRIPT_API_VERSION)
-            .declare_console_command_root("time");
+            .declare_world_time();
         let validated = manifest.validate().unwrap();
         let capabilities = validated.to_command_capabilities();
 
-        let time_command = ScriptCommand::RunConsoleCommand {
-            command: "/time set day".to_owned(),
+        let world_time_command = ScriptCommand::SetWorldTime {
+            request: ScriptWorldTimeSetRequest::try_new("day", 1_000).unwrap(),
         };
-        let time = time_command.required_capability().unwrap();
-        assert!(capabilities.allows(time));
-        assert!(
-            !capabilities.allows(
-                ScriptCommand::RunConsoleCommand {
-                    command: "/stop".to_owned(),
-                }
-                .required_capability()
-                .unwrap()
-            )
-        );
+        let world_time = world_time_command.required_capability().unwrap();
+        assert!(capabilities.allows(world_time));
+
+        let entity_damage_command = ScriptCommand::DamageEntity {
+            request: ScriptEntityDamageRequest::try_new("hit", ScriptEntityId::new(7), 1.0)
+                .unwrap(),
+        };
+        let entity_damage = entity_damage_command.required_capability().unwrap();
+        assert!(!capabilities.allows(entity_damage));
     }
 
     #[test]
@@ -7180,10 +7979,8 @@ mod tests {
                 player_id: ScriptPlayerId::new(1),
                 reason: "x".repeat(MAX_SCRIPT_DISCONNECT_REASON_BYTES + 1),
             },
-            ScriptCommand::RunConsoleCommand {
-                command: "x".repeat(MAX_SCRIPT_CONSOLE_COMMAND_BYTES + 1),
-            },
             ScriptCommand::SpawnEntity {
+                request_id: "spawn".to_owned(),
                 actor: ScriptPlayerId::new(1),
                 entity_type: "x".repeat(MAX_SCRIPT_RESOURCE_ID_BYTES + 1),
                 position: ScriptPosition::try_new(0.0, 64.0, 0.0).unwrap(),
@@ -7219,25 +8016,12 @@ mod tests {
         assert!(command_debug.len() < 256);
         assert!(!command_debug.contains("secret"));
 
-        let denied_root = "secret_console_root";
-        let denied = endpoint
-            .try_submit_command(ScriptCommand::RunConsoleCommand {
-                command: denied_root.to_owned(),
-            })
-            .unwrap_err();
-        assert_eq!(
-            denied,
-            ScriptCommandSubmissionError::PermissionDenied {
-                capability: ScriptCommandCapabilityKind::RunConsoleCommand,
-            }
-        );
-        assert!(!format!("{denied:?}").contains(denied_root));
-
         let denied_entity = "minecraft:secret_entity";
         let mut batch = CommandBatch::new(nonzero(1));
         let denied = batch
             .try_push_authorized(
                 ScriptCommand::SpawnEntity {
+                    request_id: "spawn".to_owned(),
                     actor: ScriptPlayerId::new(1),
                     entity_type: denied_entity.to_owned(),
                     position: ScriptPosition::try_new(0.0, 64.0, 0.0).unwrap(),

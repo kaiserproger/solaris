@@ -4,7 +4,6 @@ use super::session::{
     toolsmith_merchant_state,
 };
 use super::*;
-use mc_entity::natural_spawn_26_1_2::herd_hash;
 use mc_world::light::compute_chunk_light_in;
 use std::sync::OnceLock;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -192,12 +191,6 @@ pub(super) struct PreparedChunkFrame {
     pub(super) write_timing: ChunkWriteTiming,
 }
 
-#[derive(Clone, Copy)]
-struct LandSpawnSurfaces<'a> {
-    preferred: mc_world::BlockStateId,
-    fallbacks: &'a [mc_world::BlockStateId],
-}
-
 impl PreparedChunkFrame {
     fn prepared_cache_hit(&self) -> Self {
         let mut cached = self.clone();
@@ -281,72 +274,32 @@ struct ChunkPrepareResult {
     outcome: ChunkPrepareOutcome,
 }
 
+#[cfg(test)]
 pub(super) fn passive_chunk_spawns(chunk: (i32, i32)) -> bool {
-    if chunk == (0, 0) {
-        return true;
-    }
-    let h = herd_hash(chunk, 0, 0x4845_5244);
-    h.is_multiple_of(9)
+    mc_entity::natural_spawn_26_1_2::passive_chunk_spawns(chunk)
 }
 
+#[cfg(test)]
 pub(super) fn hostile_chunk_spawns(chunk: (i32, i32)) -> bool {
-    if chunk == (0, 0) {
-        return true;
-    }
-    let h = herd_hash(chunk, 0, 0x484F_5354_494C_4500);
-    h.is_multiple_of(8)
+    mc_entity::natural_spawn_26_1_2::hostile_chunk_spawns(chunk)
 }
 
+#[cfg(test)]
 fn natural_sheep_color(
     climate: mc_data::biomes::SheepColorClimate,
     chunk: (i32, i32),
     slot: u8,
 ) -> mc_entity::SheepColor {
-    let outer_roll = (herd_hash(chunk, slot, 0x5348_4545_505F_434C) % 100) as u32;
-    let common_roll = (herd_hash(chunk, slot, 0x5049_4E4B_5F52_4F4C) % 500) as u32;
-    sheep_color_for_rolls(climate, outer_roll, common_roll)
+    mc_entity::natural_spawn_26_1_2::natural_sheep_color(climate, chunk, slot)
 }
 
+#[cfg(test)]
 fn sheep_color_for_rolls(
     climate: mc_data::biomes::SheepColorClimate,
     outer_roll: u32,
     common_roll: u32,
 ) -> mc_entity::SheepColor {
-    use mc_data::biomes::SheepColorClimate;
-    use mc_entity::SheepColor;
-
-    debug_assert!(outer_roll < 100);
-    debug_assert!(common_roll < 500);
-    let common = |default| {
-        if common_roll < 499 {
-            default
-        } else {
-            SheepColor::Pink
-        }
-    };
-    match climate {
-        SheepColorClimate::Temperate => match outer_roll {
-            0..=4 => SheepColor::Black,
-            5..=9 => SheepColor::Gray,
-            10..=14 => SheepColor::LightGray,
-            15..=17 => SheepColor::Brown,
-            _ => common(SheepColor::White),
-        },
-        SheepColorClimate::Warm => match outer_roll {
-            0..=4 => SheepColor::Gray,
-            5..=9 => SheepColor::LightGray,
-            10..=14 => SheepColor::White,
-            15..=17 => SheepColor::Black,
-            _ => common(SheepColor::Brown),
-        },
-        SheepColorClimate::Cold => match outer_roll {
-            0..=4 => SheepColor::LightGray,
-            5..=9 => SheepColor::Gray,
-            10..=14 => SheepColor::White,
-            15..=17 => SheepColor::Brown,
-            _ => common(SheepColor::Black),
-        },
-    }
+    mc_entity::natural_spawn_26_1_2::sheep_color_for_rolls(climate, outer_roll, common_roll)
 }
 
 pub(super) fn plan_passive_herd(
@@ -358,275 +311,26 @@ pub(super) fn plan_passive_herd(
     rules: &mc_data::biomes::BiomeSpawnRules,
     entity_types: &mc_data::entity_types::EntityTypeRegistry,
 ) -> Vec<HerdSpawn> {
-    let chunk_pos = (chunk.pos.x, chunk.pos.z);
-    let mut spawns = Vec::new();
-    if let Some(surface) = land_surface {
-        let surfaces = LandSpawnSurfaces {
-            preferred: surface,
-            fallbacks: land_fallback_surfaces,
-        };
-        if passive_chunk_spawns(chunk_pos) {
-            plan_group_spawns(
-                chunk,
-                surfaces,
-                passable,
-                "creature",
-                rules,
-                entity_types,
-                &mut spawns,
-            );
-        }
-        plan_hostile_spawns(chunk, surfaces, passable, rules, entity_types, &mut spawns);
-    }
-    if let Some(water) = water.filter(|states| !states.is_empty()) {
-        plan_water_group_spawns(
-            chunk,
+    mc_entity::natural_spawn_26_1_2::plan_chunk_herd_templates(
+        chunk,
+        mc_entity::natural_spawn_26_1_2::ChunkHerdPlanningContext {
+            land_surface,
+            land_fallback_surfaces,
             water,
-            "water_ambient",
-            rules,
-            entity_types,
-            &mut spawns,
-        );
-        plan_water_group_spawns(
-            chunk,
-            water,
-            "water_creature",
-            rules,
-            entity_types,
-            &mut spawns,
-        );
-    }
-    spawns
+            passable,
+            sea_level: DEFAULT_SEA_LEVEL,
+        },
+        rules,
+        entity_types,
+    )
 }
 
-fn plan_hostile_spawns(
-    chunk: &Chunk,
-    surfaces: LandSpawnSurfaces<'_>,
-    passable: &[BlockStateId],
-    rules: &mc_data::biomes::BiomeSpawnRules,
-    entity_types: &mc_data::entity_types::EntityTypeRegistry,
-    out: &mut Vec<HerdSpawn>,
-) {
-    let chunk_pos = (chunk.pos.x, chunk.pos.z);
-    if !hostile_chunk_spawns(chunk_pos) {
-        return;
-    }
-    let slot_base = out.len() as u8;
-    let h = herd_hash(chunk_pos, slot_base, 0x5A4F_4D42_4945_0000);
-    let Some((lx, y, lz)) = herd_spawn_surface(chunk, surfaces, passable, h) else {
-        return;
-    };
-    let Some(biome) = chunk_biome_at(chunk, lx, y, lz) else {
-        return;
-    };
-    for (hostile_index, entry) in rules
-        .entries(biome, "monster")
-        .iter()
-        .filter(|entry| entity_type_is_hostile(entity_types, &entry.entity_type))
-        .take(3)
-        .enumerate()
-    {
-        let Some(entity_type_id) = entity_types
-            .id_of(&entry.entity_type)
-            .and_then(|id| i32::try_from(id).ok())
-        else {
-            continue;
-        };
-        let slot = slot_base + hostile_index as u8;
-        let offset = herd_hash(chunk_pos, slot, 0x484F_5354_494C_4500);
-        out.push(HerdSpawn {
-            chunk: chunk_pos,
-            slot,
-            entity_type_id,
-            entity_type_name: entry.entity_type.as_str().to_string(),
-            position: Vec3::new(
-                f64::from(chunk.pos.x * 16 + i32::from(lx)) + safe_land_spawn_offset(offset),
-                f64::from(y + 1),
-                f64::from(chunk.pos.z * 16 + i32::from(lz)) + safe_land_spawn_offset(offset >> 2),
-            ),
-            hostile: true,
-            sheep_color: None,
-        });
-    }
-}
-
-fn entity_type_is_hostile(
-    entity_types: &mc_data::entity_types::EntityTypeRegistry,
-    entity_type: &Identifier,
-) -> bool {
-    entity_types
-        .facts_of(entity_type)
-        .is_some_and(|facts| facts.category.is_hostile())
-}
-
-fn plan_group_spawns(
-    chunk: &Chunk,
-    surfaces: LandSpawnSurfaces<'_>,
-    passable: &[BlockStateId],
-    group: &str,
-    rules: &mc_data::biomes::BiomeSpawnRules,
-    entity_types: &mc_data::entity_types::EntityTypeRegistry,
-    out: &mut Vec<HerdSpawn>,
-) {
-    let chunk_pos = (chunk.pos.x, chunk.pos.z);
-    let slot_base = out.len() as u8;
-    let h = herd_hash(chunk_pos, slot_base, 0x5350_4157_4E00_0000);
-    let Some((lx, y, lz)) = herd_spawn_surface(chunk, surfaces, passable, h) else {
-        return;
-    };
-    let Some(biome) = chunk_biome_at(chunk, lx, y, lz) else {
-        return;
-    };
-    let Some(entry) = choose_biome_spawn(rules.entries(biome, group), chunk_pos, slot_base) else {
-        return;
-    };
-    let Some(entity_type_id) = entity_types
-        .id_of(&entry.entity_type)
-        .and_then(|id| i32::try_from(id).ok())
-    else {
-        return;
-    };
-    let count = herd_entry_count(entry, chunk_pos, slot_base).min(6);
-    for i in 0..count {
-        let slot = slot_base + i as u8;
-        let offset = herd_hash(chunk_pos, slot, 0x4F46_4653_4554_0000);
-        out.push(HerdSpawn {
-            chunk: chunk_pos,
-            slot,
-            entity_type_id,
-            entity_type_name: entry.entity_type.as_str().to_string(),
-            position: Vec3::new(
-                f64::from(chunk.pos.x * 16 + i32::from(lx)) + safe_land_spawn_offset(offset),
-                f64::from(y + 1),
-                f64::from(chunk.pos.z * 16 + i32::from(lz)) + safe_land_spawn_offset(offset >> 2),
-            ),
-            hostile: false,
-            sheep_color: (entry.entity_type.as_str() == "minecraft:sheep")
-                .then(|| natural_sheep_color(rules.sheep_color_climate(biome), chunk_pos, slot)),
-        });
-    }
-}
-
-fn plan_water_group_spawns(
-    chunk: &Chunk,
-    water: &[mc_world::BlockStateId],
-    group: &str,
-    rules: &mc_data::biomes::BiomeSpawnRules,
-    entity_types: &mc_data::entity_types::EntityTypeRegistry,
-    out: &mut Vec<HerdSpawn>,
-) {
-    let chunk_pos = (chunk.pos.x, chunk.pos.z);
-    let slot_base = out.len() as u8;
-    let h = herd_hash(chunk_pos, slot_base, 0x5741_5445_5200_0000);
-    let lx = 3 + (h as u8 % 10);
-    let lz = 3 + ((h >> 8) as u8 % 10);
-    let Some(spawn_y) = water_spawn_y(chunk, lx, lz, water) else {
-        return;
-    };
-    let Some(biome) = chunk_biome_at(chunk, lx, spawn_y, lz) else {
-        return;
-    };
-    let Some(entry) = choose_biome_spawn(rules.entries(biome, group), chunk_pos, slot_base) else {
-        return;
-    };
-    let Some(entity_type_id) = entity_types
-        .id_of(&entry.entity_type)
-        .and_then(|id| i32::try_from(id).ok())
-    else {
-        return;
-    };
-    let count = herd_entry_count(entry, chunk_pos, slot_base).min(6);
-    for i in 0..count {
-        let slot = slot_base + i as u8;
-        out.push(HerdSpawn {
-            chunk: chunk_pos,
-            slot,
-            entity_type_id,
-            entity_type_name: entry.entity_type.as_str().to_string(),
-            position: Vec3::new(
-                f64::from(chunk.pos.x * 16 + i32::from(lx)) + 0.5,
-                f64::from(spawn_y),
-                f64::from(chunk.pos.z * 16 + i32::from(lz)) + 0.5,
-            ),
-            hostile: false,
-            sheep_color: None,
-        });
-    }
-}
-
-fn water_spawn_y(chunk: &Chunk, lx: u8, lz: u8, water: &[mc_world::BlockStateId]) -> Option<i32> {
-    let mut best_run = None;
-    let mut current_start = None;
-    for y in mc_world::MIN_Y..=DEFAULT_SEA_LEVEL {
-        if chunk
-            .get_block(lx, y, lz)
-            .is_some_and(|state| water.contains(&state))
-        {
-            current_start.get_or_insert(y);
-            continue;
-        }
-        if let Some(start) = current_start.take() {
-            remember_water_run(&mut best_run, start, y - 1);
-        }
-    }
-    if let Some(start) = current_start.take() {
-        remember_water_run(&mut best_run, start, DEFAULT_SEA_LEVEL);
-    }
-
-    best_run.map(|(start, end)| start + (end - start) / 2)
-}
-
-fn remember_water_run(best_run: &mut Option<(i32, i32)>, start: i32, end: i32) {
-    let len = end - start;
-    if best_run
-        .map(|(best_start, best_end)| len > best_end - best_start)
-        .unwrap_or(true)
-    {
-        *best_run = Some((start, end));
-    }
-}
-
-fn choose_biome_spawn(
-    entries: &[mc_data::biomes::BiomeSpawnEntry],
-    chunk: (i32, i32),
-    slot: u8,
-) -> Option<&mc_data::biomes::BiomeSpawnEntry> {
-    let total: u32 = entries.iter().map(|entry| entry.weight).sum();
-    if total == 0 {
-        return None;
-    }
-    let mut pick = (herd_hash(chunk, slot, 0x5745_4947_4854_0000) % u64::from(total)) as u32;
-    for entry in entries {
-        if pick < entry.weight {
-            return Some(entry);
-        }
-        pick -= entry.weight;
-    }
-    entries.last()
-}
-
-fn herd_entry_count(
-    entry: &mc_data::biomes::BiomeSpawnEntry,
-    chunk: (i32, i32),
-    slot: u8,
-) -> usize {
-    let min = entry.min_count.min(entry.max_count).max(1);
-    let max = entry.max_count.max(min);
-    let span = max - min + 1;
-    (min + (herd_hash(chunk, slot, 0x434F_554E_5400_0000) as u32 % span)) as usize
-}
-
+#[cfg(test)]
 fn chunk_biome_at(chunk: &Chunk, lx: u8, y: i32, lz: u8) -> Option<&mc_data::Identifier> {
-    let geometry = chunk.geometry();
-    if !(geometry.min_y()..geometry.max_y()).contains(&y) {
-        return None;
-    }
-    let chunk_y = (y - geometry.min_y()) as usize;
-    let section = chunk.biomes.get(chunk_y / mc_world::SECTION_DIM)?;
-    let local_y = (chunk_y % mc_world::SECTION_DIM) as u8 / mc_world::BIOME_DIM as u8;
-    Some(section.get(lx / 4, local_y, lz / 4))
+    mc_entity::natural_spawn_26_1_2::chunk_biome_at(chunk, lx, y, lz)
 }
 
+#[cfg(test)]
 fn herd_surface_y(
     chunk: &Chunk,
     lx: u8,
@@ -635,158 +339,14 @@ fn herd_surface_y(
     fallback_surfaces: &[BlockStateId],
     passable: &[BlockStateId],
 ) -> Option<(i32, BlockStateId)> {
-    if let Some(y) = chunk.highest_opaque_y(lx, lz)
-        && chunk.get_block(lx, y, lz) == Some(surface)
-    {
-        return Some((y, surface));
-    }
-    if let Some(y) = (mc_world::MIN_Y..mc_world::MAX_Y)
-        .rev()
-        .find(|&y| chunk.get_block(lx, y, lz) == Some(surface))
-    {
-        return Some((y, surface));
-    }
-    herd_land_surface_y(chunk, lx, lz, fallback_surfaces, passable)
-}
-
-fn herd_spawn_surface(
-    chunk: &Chunk,
-    surfaces: LandSpawnSurfaces<'_>,
-    passable: &[BlockStateId],
-    h: u64,
-) -> Option<(u8, i32, u8)> {
-    for attempt in 0..100u64 {
-        let candidate = h.wrapping_add(attempt.wrapping_mul(0x9E37_79B9_7F4A_7C15));
-        let lx = 3 + (candidate as u8 % 10);
-        let lz = 3 + ((candidate >> 8) as u8 % 10);
-        let Some((y, actual_surface)) = herd_surface_y(
-            chunk,
-            lx,
-            lz,
-            surfaces.preferred,
-            surfaces.fallbacks,
-            passable,
-        ) else {
-            continue;
-        };
-        if herd_spawn_clearance(chunk, lx, y + 1, lz, actual_surface, passable) {
-            return Some((lx, y, lz));
-        }
-    }
-    for attempt in 0..100u64 {
-        let candidate = h.wrapping_add(attempt.wrapping_mul(0x9E37_79B9_7F4A_7C15));
-        let lx = 3 + (candidate as u8 % 10);
-        let lz = 3 + ((candidate >> 8) as u8 % 10);
-        let Some((y, actual_surface)) = herd_surface_y(
-            chunk,
-            lx,
-            lz,
-            surfaces.preferred,
-            surfaces.fallbacks,
-            passable,
-        ) else {
-            continue;
-        };
-        if herd_spawn_minimal_clearance(chunk, lx, y + 1, lz, actual_surface, passable) {
-            return Some((lx, y, lz));
-        }
-    }
-    None
-}
-
-fn herd_land_surface_y(
-    chunk: &Chunk,
-    lx: u8,
-    lz: u8,
-    fallback_surfaces: &[BlockStateId],
-    passable: &[BlockStateId],
-) -> Option<(i32, BlockStateId)> {
-    let y = chunk.highest_opaque_y(lx, lz)?;
-    let state = chunk.get_block(lx, y, lz)?;
-    if passable.contains(&state) || !fallback_surfaces.contains(&state) {
-        return None;
-    }
-    if (y + 1..=y + 2).all(|air_y| {
-        chunk
-            .get_block(lx, air_y, lz)
-            .is_some_and(|state| passable.contains(&state))
-    }) {
-        Some((y, state))
-    } else {
-        None
-    }
-}
-
-fn safe_land_spawn_offset(bits: u64) -> f64 {
-    0.48 + (bits & 3) as f64 * 0.01
-}
-
-fn herd_spawn_clearance(
-    chunk: &Chunk,
-    lx: u8,
-    spawn_y: i32,
-    lz: u8,
-    surface: BlockStateId,
-    passable: &[BlockStateId],
-) -> bool {
-    for dx in -1..=1 {
-        for dz in -1..=1 {
-            let x = i32::from(lx) + dx;
-            let z = i32::from(lz) + dz;
-            if !(0..mc_world::SECTION_DIM as i32).contains(&x)
-                || !(0..mc_world::SECTION_DIM as i32).contains(&z)
-            {
-                return false;
-            }
-            let x = x as u8;
-            let z = z as u8;
-            if chunk.get_block(x, spawn_y - 1, z) != Some(surface) {
-                return false;
-            }
-            if !(spawn_y..=spawn_y + 1).all(|y| {
-                chunk
-                    .get_block(x, y, z)
-                    .is_some_and(|state| passable.contains(&state))
-            }) {
-                return false;
-            }
-        }
-    }
-    true
-}
-
-fn herd_spawn_minimal_clearance(
-    chunk: &Chunk,
-    lx: u8,
-    spawn_y: i32,
-    lz: u8,
-    surface: BlockStateId,
-    passable: &[BlockStateId],
-) -> bool {
-    if chunk.get_block(lx, spawn_y - 1, lz) != Some(surface) {
-        return false;
-    }
-    if !(spawn_y..=spawn_y + 1).all(|y| {
-        chunk
-            .get_block(lx, y, lz)
-            .is_some_and(|state| passable.contains(&state))
-    }) {
-        return false;
-    }
-    [(1, 0), (-1, 0), (0, 1), (0, -1)]
-        .into_iter()
-        .any(|(dx, dz)| {
-            let x = i32::from(lx) + dx;
-            let z = i32::from(lz) + dz;
-            (0..mc_world::SECTION_DIM as i32).contains(&x)
-                && (0..mc_world::SECTION_DIM as i32).contains(&z)
-                && chunk.get_block(x as u8, spawn_y - 1, z as u8) == Some(surface)
-                && (spawn_y..=spawn_y + 1).all(|y| {
-                    chunk
-                        .get_block(x as u8, y, z as u8)
-                        .is_some_and(|state| passable.contains(&state))
-                })
-        })
+    mc_entity::natural_spawn_26_1_2::herd_surface_y(
+        chunk,
+        lx,
+        lz,
+        surface,
+        fallback_surfaces,
+        passable,
+    )
 }
 
 pub(crate) fn passive_entity_passable_blocks(blocks: &BlockRegistry) -> Vec<BlockStateId> {
@@ -806,80 +366,11 @@ pub(crate) fn passive_herd_fallback_surface_blocks(blocks: &BlockRegistry) -> Ve
 }
 
 fn passive_herd_fallback_surface_name(name: &str) -> bool {
-    matches!(
-        name,
-        "minecraft:dirt"
-            | "minecraft:coarse_dirt"
-            | "minecraft:podzol"
-            | "minecraft:sand"
-            | "minecraft:red_sand"
-            | "minecraft:snow_block"
-            | "minecraft:moss_block"
-            | "minecraft:mycelium"
-    )
+    mc_data::block_semantics_26_1_2::passive_herd_fallback_surface_name(name)
 }
 
 pub(crate) fn passable_block_name(name: &str) -> bool {
-    matches!(
-        name,
-        "minecraft:air"
-            | "minecraft:short_grass"
-            | "minecraft:tall_grass"
-            | "minecraft:short_dry_grass"
-            | "minecraft:tall_dry_grass"
-            | "minecraft:fern"
-            | "minecraft:large_fern"
-            | "minecraft:dead_bush"
-            | "minecraft:bush"
-            | "minecraft:firefly_bush"
-            | "minecraft:dandelion"
-            | "minecraft:poppy"
-            | "minecraft:blue_orchid"
-            | "minecraft:allium"
-            | "minecraft:azure_bluet"
-            | "minecraft:red_tulip"
-            | "minecraft:orange_tulip"
-            | "minecraft:white_tulip"
-            | "minecraft:pink_tulip"
-            | "minecraft:oxeye_daisy"
-            | "minecraft:cornflower"
-            | "minecraft:lily_of_the_valley"
-            | "minecraft:wither_rose"
-            | "minecraft:torchflower"
-            | "minecraft:open_eyeblossom"
-            | "minecraft:closed_eyeblossom"
-            | "minecraft:sunflower"
-            | "minecraft:lilac"
-            | "minecraft:rose_bush"
-            | "minecraft:peony"
-            | "minecraft:pitcher_plant"
-            | "minecraft:pink_petals"
-            | "minecraft:wildflowers"
-            | "minecraft:sugar_cane"
-            | "minecraft:wheat"
-            | "minecraft:carrots"
-            | "minecraft:potatoes"
-            | "minecraft:beetroots"
-            | "minecraft:torchflower_crop"
-            | "minecraft:pitcher_crop"
-            | "minecraft:melon_stem"
-            | "minecraft:attached_melon_stem"
-            | "minecraft:pumpkin_stem"
-            | "minecraft:attached_pumpkin_stem"
-            | "minecraft:sweet_berry_bush"
-            | "minecraft:nether_wart"
-            | "minecraft:kelp"
-            | "minecraft:kelp_plant"
-            | "minecraft:seagrass"
-            | "minecraft:tall_seagrass"
-            | "minecraft:bubble_column"
-            | "minecraft:torch"
-            | "minecraft:wall_torch"
-            | "minecraft:soul_torch"
-            | "minecraft:soul_wall_torch"
-            | "minecraft:redstone_torch"
-            | "minecraft:redstone_wall_torch"
-    )
+    mc_data::block_semantics_26_1_2::passable_block_name(name)
 }
 
 pub(super) fn desired_chunk_set(
@@ -887,7 +378,12 @@ pub(super) fn desired_chunk_set(
     center_cz: i32,
     view_distance: i32,
 ) -> HashSet<(i32, i32)> {
-    spiral_chunks(center_cx, center_cz, view_distance).collect()
+    mc_world::chunk_stream_plan_26_1_2::desired_chunk_set(
+        center_cx,
+        center_cz,
+        view_distance,
+        crate::MAX_VIEW_DISTANCE,
+    )
 }
 
 impl ChunkStreamState {
@@ -2515,25 +2011,13 @@ pub(super) fn spiral_chunks(
     center_z: i32,
     view_distance: i32,
 ) -> impl Iterator<Item = (i32, i32)> {
-    let vd = view_distance.clamp(0, crate::MAX_VIEW_DISTANCE);
-    let diameter = (2 * vd + 1) as usize;
-    let mut out = Vec::with_capacity(diameter * diameter);
-    out.push((center_x, center_z));
-
-    for r in 1..=vd {
-        for dx in -r..=r {
-            out.push((center_x + dx, center_z - r));
-        }
-        for dz in (-r + 1)..r {
-            out.push((center_x - r, center_z + dz));
-            out.push((center_x + r, center_z + dz));
-        }
-        for dx in -r..=r {
-            out.push((center_x + dx, center_z + r));
-        }
-    }
-
-    out.into_iter()
+    mc_world::chunk_stream_plan_26_1_2::spiral_chunks(
+        center_x,
+        center_z,
+        view_distance,
+        crate::MAX_VIEW_DISTANCE,
+    )
+    .into_iter()
 }
 
 pub(super) fn prioritized_spiral(
@@ -2542,42 +2026,23 @@ pub(super) fn prioritized_spiral(
     view_distance: i32,
     direction_yaw: f32,
 ) -> impl Iterator<Item = (i32, i32, ChunkPriority)> {
-    let mut chunks: Vec<_> = spiral_chunks(center_x, center_z, view_distance).collect();
-    let (forward_x, forward_z) = yaw_forward(direction_yaw);
-    chunks.sort_by(|&(left_x, left_z), &(right_x, right_z)| {
-        let left_dx = left_x - center_x;
-        let left_dz = left_z - center_z;
-        let right_dx = right_x - center_x;
-        let right_dz = right_z - center_z;
-        let left_ring = left_dx.abs().max(left_dz.abs());
-        let right_ring = right_dx.abs().max(right_dz.abs());
-        left_ring
-            .cmp(&right_ring)
-            .then_with(|| {
-                directional_score(right_dx, right_dz, forward_x, forward_z)
-                    .total_cmp(&directional_score(left_dx, left_dz, forward_x, forward_z))
-            })
-            .then_with(|| {
-                directional_lateral(left_dx, left_dz, forward_x, forward_z).total_cmp(
-                    &directional_lateral(right_dx, right_dz, forward_x, forward_z),
-                )
-            })
-            .then_with(|| left_z.cmp(&right_z))
-            .then_with(|| left_x.cmp(&right_x))
-    });
-    chunks
-        .into_iter()
-        .enumerate()
-        .map(move |(sequence, (cx, cz))| {
-            (
-                cx,
-                cz,
-                ChunkPriority {
-                    ring: (cx - center_x).abs().max((cz - center_z).abs()) as u32,
-                    sequence: sequence as u32,
-                },
-            )
-        })
+    mc_world::chunk_stream_plan_26_1_2::prioritize_chunks(
+        center_x,
+        center_z,
+        direction_yaw,
+        spiral_chunks(center_x, center_z, view_distance).collect(),
+    )
+    .into_iter()
+    .map(|(cx, cz, priority)| {
+        (
+            cx,
+            cz,
+            ChunkPriority {
+                ring: priority.ring,
+                sequence: priority.sequence,
+            },
+        )
+    })
 }
 
 pub(super) fn prewarm_edge_ring_chunks(
@@ -2586,55 +2051,22 @@ pub(super) fn prewarm_edge_ring_chunks(
     view_distance: i32,
     direction_yaw: f32,
 ) -> Vec<(i32, i32)> {
-    let vd = view_distance.clamp(0, crate::MAX_VIEW_DISTANCE);
-    let radius = vd + 1;
-    let (forward_x, forward_z) = yaw_forward(direction_yaw);
-    let mut chunks = Vec::new();
-    if forward_x.abs() > forward_z.abs() {
-        let forward_sign = if forward_x.is_sign_negative() { -1 } else { 1 };
-        push_x_prewarm_edge(&mut chunks, center_x, center_z, radius, vd, forward_sign);
-        push_x_prewarm_edge(&mut chunks, center_x, center_z, radius, vd, -forward_sign);
-    } else {
-        let forward_sign = if forward_z.is_sign_negative() { -1 } else { 1 };
-        push_z_prewarm_edge(&mut chunks, center_x, center_z, radius, vd, forward_sign);
-        push_z_prewarm_edge(&mut chunks, center_x, center_z, radius, vd, -forward_sign);
-    }
-
-    let mut remaining = Vec::new();
-    for dx in -radius..=radius {
-        for dz in -radius..=radius {
-            if dx.abs().max(dz.abs()) == radius {
-                remaining.push((center_x + dx, center_z + dz));
-            }
-        }
-    }
-    remaining.sort_by(|&(left_x, left_z), &(right_x, right_z)| {
-        let left_dx = left_x - center_x;
-        let left_dz = left_z - center_z;
-        let right_dx = right_x - center_x;
-        let right_dz = right_z - center_z;
-        directional_score(right_dx, right_dz, forward_x, forward_z)
-            .total_cmp(&directional_score(left_dx, left_dz, forward_x, forward_z))
-            .then_with(|| {
-                directional_lateral(left_dx, left_dz, forward_x, forward_z).total_cmp(
-                    &directional_lateral(right_dx, right_dz, forward_x, forward_z),
-                )
-            })
-            .then_with(|| left_z.cmp(&right_z))
-            .then_with(|| left_x.cmp(&right_x))
-    });
-    for chunk in remaining {
-        push_unique_prewarm_chunk(&mut chunks, chunk);
-    }
-    chunks
+    mc_world::chunk_stream_plan_26_1_2::prewarm_edge_ring_chunks(
+        center_x,
+        center_z,
+        view_distance,
+        crate::MAX_VIEW_DISTANCE,
+        direction_yaw,
+    )
 }
 
+#[cfg(test)]
 fn prewarm_edge_batch_limit(view_distance: i32) -> usize {
-    let vd = view_distance.clamp(0, crate::MAX_VIEW_DISTANCE) as usize;
-    if vd == 0 {
-        return 0;
-    }
-    (3 * (2 * vd + 1)).min(PREWARM_EDGE_RING_LIMIT)
+    mc_world::chunk_stream_plan_26_1_2::prewarm_edge_batch_limit(
+        view_distance,
+        crate::MAX_VIEW_DISTANCE,
+        PREWARM_EDGE_RING_LIMIT,
+    )
 }
 
 fn prewarm_edge_batch_chunks(
@@ -2644,155 +2076,18 @@ fn prewarm_edge_batch_chunks(
     direction_yaw: f32,
     player_pose: PlayerPose,
 ) -> Vec<(i32, i32)> {
-    let vd = view_distance.clamp(0, crate::MAX_VIEW_DISTANCE);
-    if vd == 0 {
-        return Vec::new();
-    }
-    let radius = vd + 1;
-    let (forward_x, forward_z) = yaw_forward(direction_yaw);
-    let mut chunks = Vec::with_capacity(prewarm_edge_batch_limit(vd));
-    if forward_x.abs() > forward_z.abs() {
-        let forward_sign = if forward_x.is_sign_negative() { -1 } else { 1 };
-        let local_z = player_pose.z - f64::from(center_z) * 16.0;
-        let lateral_sign = if local_z <= 8.0 { -1 } else { 1 };
-        let local_x = player_pose.x - f64::from(center_x) * 16.0;
-        let mut edges = [
-            (
-                distance_to_signed_chunk_edge(local_x, forward_sign),
-                0u8,
-                true,
-                forward_sign,
-            ),
-            (
-                distance_to_signed_chunk_edge(local_x, -forward_sign),
-                2u8,
-                true,
-                -forward_sign,
-            ),
-            (
-                distance_to_signed_chunk_edge(local_z, lateral_sign),
-                1u8,
-                false,
-                lateral_sign,
-            ),
-        ];
-        edges.sort_by(|left, right| {
-            left.0
-                .total_cmp(&right.0)
-                .then_with(|| left.1.cmp(&right.1))
-        });
-        for (_, _, x_edge, sign) in edges {
-            if x_edge {
-                push_x_prewarm_edge(&mut chunks, center_x, center_z, radius, vd, sign);
-            } else {
-                push_z_prewarm_edge(&mut chunks, center_x, center_z, radius, vd, sign);
-            }
-        }
-    } else {
-        let forward_sign = if forward_z.is_sign_negative() { -1 } else { 1 };
-        let local_x = player_pose.x - f64::from(center_x) * 16.0;
-        let lateral_sign = if local_x <= 8.0 { -1 } else { 1 };
-        let local_z = player_pose.z - f64::from(center_z) * 16.0;
-        let mut edges = [
-            (
-                distance_to_signed_chunk_edge(local_z, forward_sign),
-                0u8,
-                false,
-                forward_sign,
-            ),
-            (
-                distance_to_signed_chunk_edge(local_z, -forward_sign),
-                2u8,
-                false,
-                -forward_sign,
-            ),
-            (
-                distance_to_signed_chunk_edge(local_x, lateral_sign),
-                1u8,
-                true,
-                lateral_sign,
-            ),
-        ];
-        edges.sort_by(|left, right| {
-            left.0
-                .total_cmp(&right.0)
-                .then_with(|| left.1.cmp(&right.1))
-        });
-        for (_, _, x_edge, sign) in edges {
-            if x_edge {
-                push_x_prewarm_edge(&mut chunks, center_x, center_z, radius, vd, sign);
-            } else {
-                push_z_prewarm_edge(&mut chunks, center_x, center_z, radius, vd, sign);
-            }
-        }
-    }
-
-    if chunks.len() < prewarm_edge_batch_limit(vd) {
-        for chunk in prewarm_edge_ring_chunks(center_x, center_z, vd, direction_yaw) {
-            push_unique_prewarm_chunk(&mut chunks, chunk);
-            if chunks.len() == prewarm_edge_batch_limit(vd) {
-                break;
-            }
-        }
-    }
-    chunks
-}
-
-fn distance_to_signed_chunk_edge(local: f64, sign: i32) -> f64 {
-    let local = local.clamp(0.0, 16.0);
-    if sign < 0 { local } else { 16.0 - local }
-}
-
-fn push_z_prewarm_edge(
-    chunks: &mut Vec<(i32, i32)>,
-    center_x: i32,
-    center_z: i32,
-    radius: i32,
-    vd: i32,
-    sign: i32,
-) {
-    let edge_z = center_z + sign * radius;
-    for dx in -vd..=vd {
-        push_unique_prewarm_chunk(chunks, (center_x + dx, edge_z));
-    }
-}
-
-fn push_x_prewarm_edge(
-    chunks: &mut Vec<(i32, i32)>,
-    center_x: i32,
-    center_z: i32,
-    radius: i32,
-    vd: i32,
-    sign: i32,
-) {
-    let edge_x = center_x + sign * radius;
-    for dz in -vd..=vd {
-        push_unique_prewarm_chunk(chunks, (edge_x, center_z + dz));
-    }
-}
-
-fn push_unique_prewarm_chunk(chunks: &mut Vec<(i32, i32)>, chunk: (i32, i32)) {
-    if !chunks.contains(&chunk) {
-        chunks.push(chunk);
-    }
+    mc_world::chunk_stream_plan_26_1_2::prewarm_edge_batch_chunks(
+        (center_x, center_z),
+        view_distance,
+        crate::MAX_VIEW_DISTANCE,
+        direction_yaw,
+        (player_pose.x, player_pose.z),
+        PREWARM_EDGE_RING_LIMIT,
+    )
 }
 
 fn initial_window_target(view_distance: i32) -> usize {
-    let ring = view_distance.clamp(0, INITIAL_CHUNK_MIN_RING) as usize;
-    (2 * ring + 1).pow(2)
-}
-
-fn yaw_forward(yaw: f32) -> (f64, f64) {
-    let radians = f64::from(yaw).to_radians();
-    (-radians.sin(), radians.cos())
-}
-
-fn directional_score(dx: i32, dz: i32, forward_x: f64, forward_z: f64) -> f64 {
-    f64::from(dx) * forward_x + f64::from(dz) * forward_z
-}
-
-fn directional_lateral(dx: i32, dz: i32, forward_x: f64, forward_z: f64) -> f64 {
-    (f64::from(dx) * forward_z - f64::from(dz) * forward_x).abs()
+    mc_world::chunk_stream_plan_26_1_2::initial_window_target(view_distance, INITIAL_CHUNK_MIN_RING)
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -4355,19 +3650,14 @@ mod tests {
                 chunk.set_block(lx, 64, lz, grass).unwrap();
             }
         }
-        let mut spawns = Vec::new();
-
-        plan_group_spawns(
+        let spawns = plan_passive_herd(
             &chunk,
-            LandSpawnSurfaces {
-                preferred: grass,
-                fallbacks: &[],
-            },
+            Some(grass),
+            &[],
+            None,
             &[air],
-            "creature",
             &rules,
             &entity_types,
-            &mut spawns,
         );
 
         assert_eq!(spawns.len(), 4);

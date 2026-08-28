@@ -1,11 +1,11 @@
 use std::collections::HashSet;
 
+use mc_data::ItemStack;
 use mc_data::items::ItemRegistry;
 use mc_data::tags::TagsData;
 use mc_entity::EntityItemStack;
 use mc_nbt::{ListTag, Tag};
 use mc_protocol::codec::Identifier;
-use mc_protocol::packets::play::ItemStack;
 use mc_world::{BlockRegistry, BlockStateId, Chunk};
 use md5::{Digest, Md5};
 use tracing::warn;

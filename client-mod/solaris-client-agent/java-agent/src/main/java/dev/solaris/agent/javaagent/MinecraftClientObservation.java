@@ -4,6 +4,7 @@ import com.google.gson.JsonArray;
 import com.google.gson.JsonObject;
 import net.minecraft.client.Minecraft;
 import net.minecraft.client.gui.components.ChatComponent;
+import net.minecraft.client.gui.screens.DisconnectedScreen;
 import net.minecraft.client.multiplayer.chat.GuiMessage;
 import net.minecraft.core.BlockPos;
 import net.minecraft.core.registries.BuiltInRegistries;
@@ -39,6 +40,12 @@ final class MinecraftClientObservation {
         observation.addProperty("in_play", inPlay);
         observation.add("screen", screen(minecraft));
         observation.add("recent_chat", recentChat(minecraft));
+        if (minecraft.screen instanceof DisconnectedScreen disconnectedScreen) {
+            observation.addProperty(
+                "disconnect_reason",
+                disconnectedScreen.getNarrationMessage().getString()
+            );
+        }
         if (!inPlay) {
             return observation;
         }

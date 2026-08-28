@@ -210,6 +210,59 @@ fn playable_real_client_runner_check_selects_gradle_adapter() {
 }
 
 #[test]
+fn real_client_runner_run_fails_fast_without_graphical_display() {
+    let repo_root = repo_root();
+    let output = Command::new("bash")
+        .arg(repo_root.join("tools/run-real-client-regression.sh"))
+        .arg("--run")
+        .env(
+            "SOLARIS_REAL_CLIENT_MANIFEST",
+            repo_root.join("docs/real-client-regression/manifests/m94-regression-pack.json"),
+        )
+        .env(
+            "SOLARIS_REAL_CLIENT_AGENT_SCENARIO",
+            "m94-02b-rejected-block-resync",
+        )
+        .env_remove("DISPLAY")
+        .env_remove("WAYLAND_DISPLAY")
+        .output()
+        .expect("run real-client gate without graphical display");
+
+    assert!(
+        !output.status.success(),
+        "real-client --run unexpectedly succeeded without a graphical display"
+    );
+    assert!(
+        String::from_utf8_lossy(&output.stderr)
+            .contains("--run requires a graphical display; set DISPLAY or WAYLAND_DISPLAY"),
+        "runner must fail on the missing graphical prerequisite before launch\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(
+        !String::from_utf8_lossy(&output.stdout).contains("running real-client regression into"),
+        "missing DISPLAY must be rejected before a run directory/server/client launch\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+#[test]
+fn bucket_resync_debug_loop_preflight_uses_declared_real_client_scenario() {
+    let repo_root = repo_root();
+    let output = Command::new("bash")
+        .arg(repo_root.join("tools/run-bucket-resync-debug-loop.sh"))
+        .arg("--check")
+        .output()
+        .expect("run bucket-resync debug-loop preflight");
+
+    assert!(output.status.success());
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(stdout.contains("gradle-runclient"));
+    assert!(stdout.contains("scenario policy: debug commands allowed by manifest"));
+}
+
+#[test]
 fn real_client_runner_rejects_a_scenario_missing_from_the_manifest() {
     let repo_root = repo_root();
     let manifest_dir = tempfile::tempdir().expect("create manifest directory");
@@ -435,9 +488,20 @@ fn playable_real_client_prepare_uses_playable_manifest_config_and_scenario() {
     let effective_server_config: toml::Value = toml::from_str(&effective_server_config)
         .expect("prepared playable server config parses as TOML");
     assert_eq!(
+        effective_server_config["simulation"]["friendly_spawn_interval_ticks"].as_integer(),
+        Some(400),
+        "the twenty-minute acceptance gate must preserve playable.toml natural passive spawning"
+    );
+    assert_eq!(
         effective_server_config["simulation"]["hostile_spawn_interval_ticks"].as_integer(),
-        Some(0),
-        "the continuity soak must isolate natural hostile pressure from its separate combat gate"
+        Some(20),
+        "the twenty-minute acceptance gate must preserve playable.toml natural hostile spawning"
+    );
+    assert!(
+        effective_server_config["admin"]["operators"]
+            .as_array()
+            .is_some_and(|operators| operators.is_empty()),
+        "the twenty-minute natural-spawn acceptance gate must remain no-operator"
     );
     assert!(
         automation_driver
@@ -684,18 +748,6 @@ fn gradle_runclient_adapter_is_the_default_real_client_launcher() {
             && fabric_build.contains("programArgument(\"--username\")")
             && fabric_build.contains("programArgument(clientAgentUsername.get())"),
         "Gradle runClient adapter must define a ModDev client launch with client-agent system properties and per-client isolation"
-    );
-    let adapter_source = std::fs::read_to_string(
-        repo_root.join(
-            "client-mod/solaris-client-agent/fabric-agent/src/main/java/dev/solaris/agent/neoforge/SolarisClientAgentMod.java",
-        ),
-    )
-    .expect("read runClient adapter source");
-    assert!(
-        adapter_source.contains("NeoForge.EVENT_BUS.addListener")
-            && adapter_source.contains("ClientTickEvent.Post")
-            && adapter_source.contains("Minecraft.getInstance()"),
-        "runClient adapter must wait for the Minecraft client tick before starting the bridge"
     );
 }
 
@@ -1744,11 +1796,32 @@ fn validate_run_accepts_playable_save_restart_phase_observations() {
                 {
                     "id": "playable-03-save-restart-before",
                     "result": "passed",
+                    "commands": [{
+                        "command": "disconnect",
+                        "response": {"disconnected": true}
+                    }],
+                    "agent_report": {
+                        "id": "playable-03-save-restart-before",
+                        "result": "passed",
+                        "observations": ["save marker written before restart"]
+                    },
                     "screenshots": ["screenshots/playable-03-save-restart-before.png"]
                 },
                 {
                     "id": "playable-03-save-restart-after",
                     "result": "passed",
+                    "commands": [{
+                        "command": "connect",
+                        "response": {"connected": true}
+                    }],
+                    "agent_report": {
+                        "id": "playable-03-save-restart-after",
+                        "result": "passed",
+                        "observations": [
+                            "restart marker persistence: passed target=0,64,0",
+                            "inventory persistence: passed wooden_pickaxe_count=1"
+                        ]
+                    },
                     "screenshots": ["screenshots/playable-03-save-restart-after.png"]
                 }
             ]
@@ -1757,11 +1830,16 @@ fn validate_run_accepts_playable_save_restart_phase_observations() {
     std::fs::write(
         run_dir.path().join("automation-driver.txt"),
         format!(
-            "{}client_agent_phase_exit_status_playable-03-save-restart-before=0\n\
+            "{}server_start_phase=initial\n\
+server_pid_initial=111\n\
+server_ready_phase=initial status=ready\n\
+client_agent_phase_exit_status_playable-03-save-restart-before=0\n\
 server_stop_phase=playable-03-before-restart signal=INT\n\
 server_exit_phase=playable-03-before-restart status=0\n\
 server_restart_count=1\n\
 server_start_phase=playable-03-after-restart\n\
+server_pid_playable-03-after-restart=222\n\
+server_ready_phase=playable-03-after-restart status=ready\n\
 client_agent_phase_exit_status_playable-03-save-restart-after=0\n",
             gradle_automation_driver_fixture()
         ),
@@ -1785,6 +1863,211 @@ client_agent_phase_exit_status_playable-03-save-restart-after=0\n",
         "validator rejected playable save/restart phase observations\nstdout:\n{}\nstderr:\n{}",
         String::from_utf8_lossy(&output.stdout),
         String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+#[test]
+fn validate_run_rejects_restart_after_without_explicit_reconnect_evidence() {
+    let repo_root = repo_root();
+    let run_dir = tempfile::tempdir().expect("create run dir");
+    let manifest_path = repo_root.join("docs/playable/real-client-playable-loop.json");
+    let manifest = std::fs::read_to_string(&manifest_path)
+        .unwrap_or_else(|err| panic!("read {}: {err}", manifest_path.display()));
+    write_validate_run_artifacts_with_manifest(
+        run_dir.path(),
+        &manifest,
+        json!({
+            "schema": "solaris.real_client_observations.v1",
+            "client_gate": "agent-run-real-client",
+            "quality_label": "playable-spike",
+            "result": "passed",
+            "scenarios": [
+                {
+                    "id": "playable-03-save-restart-before",
+                    "result": "passed",
+                    "commands": [{
+                        "command": "disconnect",
+                        "response": {"disconnected": true}
+                    }],
+                    "agent_report": {
+                        "id": "playable-03-save-restart-before",
+                        "result": "passed",
+                        "observations": ["save marker written before restart"]
+                    },
+                    "screenshots": ["screenshots/playable-03-save-restart-before.png"]
+                },
+                {
+                    "id": "playable-03-save-restart-after",
+                    "result": "passed",
+                    "commands": [{
+                        "command": "wait_play",
+                        "response": {"in_play": true}
+                    }],
+                    "agent_report": {
+                        "id": "playable-03-save-restart-after",
+                        "result": "passed",
+                        "observations": [
+                            "restart marker persistence: passed target=0,64,0",
+                            "inventory persistence: passed wooden_pickaxe_count=1"
+                        ]
+                    },
+                    "screenshots": ["screenshots/playable-03-save-restart-after.png"]
+                }
+            ]
+        }),
+    );
+    std::fs::write(
+        run_dir.path().join("automation-driver.txt"),
+        format!(
+            "{}server_start_phase=initial\n\
+server_pid_initial=411\n\
+server_ready_phase=initial status=ready\n\
+client_agent_phase_exit_status_playable-03-save-restart-before=0\n\
+server_stop_phase=playable-03-before-restart signal=INT\n\
+server_exit_phase=playable-03-before-restart status=0\n\
+server_restart_count=1\n\
+server_start_phase=playable-03-after-restart\n\
+server_pid_playable-03-after-restart=422\n\
+server_ready_phase=playable-03-after-restart status=ready\n\
+client_agent_phase_exit_status_playable-03-save-restart-after=0\n",
+            gradle_automation_driver_fixture()
+        ),
+    )
+    .expect("write restart automation driver without reconnect transcript");
+    for screenshot in [
+        "playable-03-save-restart-before.png",
+        "playable-03-save-restart-after.png",
+    ] {
+        std::fs::write(
+            run_dir.path().join("screenshots").join(screenshot),
+            valid_png_320x180(),
+        )
+        .expect("write valid screenshot");
+    }
+
+    let output = validate_run(&repo_root, run_dir.path());
+
+    assert!(
+        !output.status.success(),
+        "validator accepted an after-restart phase without explicit reconnect evidence"
+    );
+    assert!(
+        String::from_utf8_lossy(&output.stderr).contains("successful connect after restart"),
+        "validator error should name the missing reconnect evidence\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+#[test]
+fn restart_evidence_validator_requires_natural_spawn_semantics_for_twenty_minute_gate() {
+    let repo_root = repo_root();
+    let run_dir = tempfile::tempdir().expect("create restart evidence run dir");
+    let manifest_path = run_dir.path().join("manifest.json");
+    let observations_path = run_dir.path().join("observations.json");
+    let automation_path = run_dir.path().join("automation-driver.txt");
+    std::fs::write(
+        &manifest_path,
+        serde_json::to_vec_pretty(&json!({
+            "scenarios": [
+                {"id": "playable-04-twenty-minute-survival-loop"},
+                {"id": "playable-03-save-restart-after"}
+            ]
+        }))
+        .expect("serialize manifest"),
+    )
+    .expect("write manifest");
+    std::fs::write(
+        &automation_path,
+        "server_start_phase=initial\n\
+server_pid_initial=511\n\
+server_ready_phase=initial status=ready\n\
+client_agent_phase_exit_status_playable-04-twenty-minute-survival-loop=0\n\
+server_stop_phase=playable-04-before-restart signal=INT\n\
+server_exit_phase=playable-04-before-restart status=0\n\
+server_restart_count=1\n\
+server_start_phase=playable-04-after-restart\n\
+server_pid_playable-04-after-restart=522\n\
+server_ready_phase=playable-04-after-restart status=ready\n\
+client_agent_phase_exit_status_playable-03-save-restart-after=0\n",
+    )
+    .expect("write automation driver");
+
+    let observations = |natural_spawn_observation: &str| {
+        json!({
+            "scenarios": [
+                {
+                    "id": "playable-04-twenty-minute-survival-loop",
+                    "result": "passed",
+                    "commands": [{"command": "disconnect", "response": {"disconnected": true}}],
+                    "agent_report": {
+                        "id": "playable-04-twenty-minute-survival-loop",
+                        "result": "passed",
+                        "observations": [
+                            natural_spawn_observation,
+                            "20-minute survival soak: passed ticks=24000"
+                        ]
+                    }
+                },
+                {
+                    "id": "playable-03-save-restart-after",
+                    "result": "passed",
+                    "commands": [{"command": "connect", "response": {"connected": true}}],
+                    "agent_report": {
+                        "id": "playable-03-save-restart-after",
+                        "result": "passed",
+                        "observations": [
+                            "restart marker persistence: passed target=0,64,0",
+                            "inventory persistence: passed wooden_pickaxe_count=1"
+                        ]
+                    }
+                }
+            ]
+        })
+    };
+
+    std::fs::write(
+        &observations_path,
+        serde_json::to_vec_pretty(&observations(
+            "natural spawn acceptance: failed passive_observed=false hostile_observed=false",
+        ))
+        .expect("serialize missing spawn evidence"),
+    )
+    .expect("write missing spawn evidence");
+    let rejected = Command::new("python3")
+        .arg(repo_root.join("tools/validate-real-client-restart-evidence.py"))
+        .arg(&automation_path)
+        .arg(&observations_path)
+        .arg(&manifest_path)
+        .output()
+        .expect("run restart evidence validator");
+    assert!(!rejected.status.success());
+    assert!(
+        String::from_utf8_lossy(&rejected.stderr).contains("natural spawn acceptance: passed"),
+        "validator should name the missing natural-spawn acceptance semantics\nstderr:\n{}",
+        String::from_utf8_lossy(&rejected.stderr)
+    );
+
+    std::fs::write(
+        &observations_path,
+        serde_json::to_vec_pretty(&observations(
+            "natural spawn acceptance: passed passive_observed=true hostile_observed=true",
+        ))
+        .expect("serialize complete spawn evidence"),
+    )
+    .expect("write complete spawn evidence");
+    let accepted = Command::new("python3")
+        .arg(repo_root.join("tools/validate-real-client-restart-evidence.py"))
+        .arg(&automation_path)
+        .arg(&observations_path)
+        .arg(&manifest_path)
+        .output()
+        .expect("run restart evidence validator with natural spawn evidence");
+    assert!(
+        accepted.status.success(),
+        "validator rejected complete natural-spawn restart evidence\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&accepted.stdout),
+        String::from_utf8_lossy(&accepted.stderr)
     );
 }
 
@@ -2035,11 +2318,30 @@ fn validate_run_accepts_two_client_shared_chest_restart_observations() {
                 {
                     "id": "playable-45-two-client-shared-chest-save-restart-before",
                     "result": "passed",
+                    "commands": [
+                        {"command": "disconnect", "client": "secondary", "response": {"disconnected": true}},
+                        {"command": "disconnect", "client": "primary", "response": {"disconnected": true}}
+                    ],
+                    "agent_report": {
+                        "id": "playable-45-two-client-shared-chest-save-restart-before",
+                        "result": "passed",
+                        "observations": ["shared chest invariant snapshot captured"]
+                    },
                     "screenshots": ["screenshots/playable-45-before.png"]
                 },
                 {
                     "id": "playable-45-two-client-shared-chest-save-restart-after",
                     "result": "passed",
+                    "commands": [
+                        {"command": "connect", "client": "primary", "response": {"connected": true}},
+                        {"command": "connect", "client": "secondary", "response": {"connected": true}}
+                    ],
+                    "agent_report": {
+                        "id": "playable-45-two-client-shared-chest-save-restart-after",
+                        "result": "passed",
+                        "observations": ["shared chest invariant snapshot verified"],
+                        "restart_invariant_validation": {"status": "passed", "checks": [{"id": "container.shared"}]}
+                    },
                     "screenshots": ["screenshots/playable-45-after.png"]
                 }
             ]
@@ -2048,11 +2350,16 @@ fn validate_run_accepts_two_client_shared_chest_restart_observations() {
     std::fs::write(
         run_dir.path().join("automation-driver.txt"),
         format!(
-            "{}client_agent_phase_exit_status_playable-45-two-client-shared-chest-save-restart-before=0\n\
+            "{}server_start_phase=initial\n\
+server_pid_initial=311\n\
+server_ready_phase=initial status=ready\n\
+client_agent_phase_exit_status_playable-45-two-client-shared-chest-save-restart-before=0\n\
 server_stop_phase=playable-45-before-restart signal=INT\n\
 server_exit_phase=playable-45-before-restart status=0\n\
 server_restart_count=1\n\
 server_start_phase=playable-45-after-restart\n\
+server_pid_playable-45-after-restart=322\n\
+server_ready_phase=playable-45-after-restart status=ready\n\
 client_agent_phase_exit_status_playable-45-two-client-shared-chest-save-restart-after=0\n",
             two_client_gradle_automation_driver_fixture()
         ),

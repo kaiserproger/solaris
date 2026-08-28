@@ -33,6 +33,15 @@ pub enum MobCombatPolicy {
     Crossbow,
     GuardianBeam,
     CreeperFuse,
+    SmallFireball,
+    SonicBoom,
+    ShulkerBullet,
+    EvokerFangs,
+    LargeFireball,
+    WindCharge,
+    ThrownPotion,
+    WitherSkull,
+    DragonBoss,
     UnsupportedSpecial,
 }
 
@@ -196,17 +205,17 @@ fn combat_policy(name: &'static str, hostile: bool) -> (MobCombatPolicy, Option<
         "minecraft:skeleton" | "minecraft:stray" | "minecraft:bogged" => {
             (MobCombatPolicy::Arrow, None)
         }
-        "minecraft:blaze" => (MobCombatPolicy::UnsupportedSpecial, Some("small_fireball")),
-        "minecraft:breeze" => (MobCombatPolicy::UnsupportedSpecial, Some("wind_charge")),
+        "minecraft:blaze" => (MobCombatPolicy::SmallFireball, None),
+        "minecraft:breeze" => (MobCombatPolicy::WindCharge, None),
         "minecraft:elder_guardian" | "minecraft:guardian" => (MobCombatPolicy::GuardianBeam, None),
-        "minecraft:ender_dragon" => (MobCombatPolicy::UnsupportedSpecial, Some("dragon_boss")),
-        "minecraft:evoker" => (MobCombatPolicy::UnsupportedSpecial, Some("evoker_spell")),
-        "minecraft:ghast" => (MobCombatPolicy::UnsupportedSpecial, Some("large_fireball")),
+        "minecraft:ender_dragon" => (MobCombatPolicy::DragonBoss, None),
+        "minecraft:evoker" => (MobCombatPolicy::EvokerFangs, None),
+        "minecraft:ghast" => (MobCombatPolicy::LargeFireball, None),
         "minecraft:pillager" => (MobCombatPolicy::Crossbow, None),
-        "minecraft:shulker" => (MobCombatPolicy::UnsupportedSpecial, Some("shulker_bullet")),
-        "minecraft:warden" => (MobCombatPolicy::UnsupportedSpecial, Some("sonic_boom")),
-        "minecraft:witch" => (MobCombatPolicy::UnsupportedSpecial, Some("thrown_potion")),
-        "minecraft:wither" => (MobCombatPolicy::UnsupportedSpecial, Some("wither_boss")),
+        "minecraft:shulker" => (MobCombatPolicy::ShulkerBullet, None),
+        "minecraft:warden" => (MobCombatPolicy::SonicBoom, None),
+        "minecraft:witch" => (MobCombatPolicy::ThrownPotion, None),
+        "minecraft:wither" => (MobCombatPolicy::WitherSkull, None),
         _ => (MobCombatPolicy::Melee, None),
     }
 }
@@ -246,9 +255,40 @@ mod tests {
             table.get_by_name("minecraft:creeper").unwrap().combat,
             MobCombatPolicy::CreeperFuse
         );
+        let blaze = table.get_by_name("minecraft:blaze").unwrap();
+        assert_eq!(blaze.combat, MobCombatPolicy::SmallFireball);
+        assert_eq!(blaze.special_attack, None);
         assert_eq!(
             table.get_by_name("minecraft:pillager").unwrap().combat,
             MobCombatPolicy::Crossbow
+        );
+        assert_eq!(
+            table.get_by_name("minecraft:warden").unwrap().combat,
+            MobCombatPolicy::SonicBoom
+        );
+        assert_eq!(
+            table.get_by_name("minecraft:shulker").unwrap().combat,
+            MobCombatPolicy::ShulkerBullet
+        );
+        assert_eq!(
+            table.get_by_name("minecraft:evoker").unwrap().combat,
+            MobCombatPolicy::EvokerFangs
+        );
+        assert_eq!(
+            table.get_by_name("minecraft:ghast").unwrap().combat,
+            MobCombatPolicy::LargeFireball
+        );
+        assert_eq!(
+            table.get_by_name("minecraft:breeze").unwrap().combat,
+            MobCombatPolicy::WindCharge
+        );
+        assert_eq!(
+            table.get_by_name("minecraft:wither").unwrap().combat,
+            MobCombatPolicy::WitherSkull
+        );
+        assert_eq!(
+            table.get_by_name("minecraft:ender_dragon").unwrap().combat,
+            MobCombatPolicy::DragonBoss
         );
         assert_eq!(
             table

@@ -362,3 +362,115 @@ fn periodic_population_refills_after_movement_and_despawn() {
     assert!(records.iter().any(|record| record.snapshot.id == first_id));
     assert!(records.iter().any(|record| record.snapshot.id != first_id));
 }
+
+#[test]
+fn periodic_natural_spawn_restart_preserves_entities_and_rejects_replayed_identities() {
+    const SPAWN_TICK: u64 = 40;
+
+    let (world_read, materials) = spawn_world(SpawnTerrain::Ground, 0);
+    let source = SessionRegistry::new();
+    source.set_world_time(NIGHT_START_TICK);
+    let (_player, _receiver) =
+        register_player(&source, "SpawnRestart", HashSet::from([TEST_CHUNK]), 4);
+    let templates = vec![
+        template(0, 11, "minecraft:cow", 4, 8, false),
+        template(1, 54, "minecraft:zombie", 12, 8, true),
+    ];
+    assert!(source.register_natural_spawn_templates(TEST_CHUNK, templates.clone()));
+
+    let (spawned, _) = source.tick_periodic_natural_spawning(
+        &mut NaturalSpawnScheduler::default(),
+        tick_input(
+            SPAWN_TICK,
+            SPAWN_TICK,
+            SPAWN_TICK,
+            4,
+            Some(&world_read),
+            Some(&materials),
+        ),
+    );
+    assert_eq!(spawned.friendly.committed, 1);
+    assert_eq!(spawned.hostile.committed, 1);
+    source.synchronize_entity_lifecycle_epoch(SPAWN_TICK);
+
+    let (checkpoint, _) = source.persisted_entity_save_snapshot();
+    assert_eq!(checkpoint.lifecycle_clock, SPAWN_TICK);
+    assert_eq!(checkpoint.records.len(), 2);
+    let mut expected = checkpoint
+        .records
+        .iter()
+        .map(|record| record.snapshot.clone())
+        .collect::<Vec<_>>();
+    expected.sort_unstable_by_key(|snapshot| snapshot.id);
+
+    let restored = SessionRegistry::new();
+    assert_eq!(restored.restore_persisted_entities(checkpoint), 2);
+    assert_eq!(restored.simulation_tick(), SPAWN_TICK);
+    let mut actual = restored
+        .persisted_entity_records()
+        .into_iter()
+        .map(|record| record.snapshot)
+        .collect::<Vec<_>>();
+    actual.sort_unstable_by_key(|snapshot| snapshot.id);
+    assert_eq!(
+        actual, expected,
+        "restart must preserve retained mob snapshots exactly"
+    );
+
+    // Move the restored mobs away from their deterministic template positions so a
+    // replay reaches unique-owner identity validation instead of being rejected by
+    // the collision planner first.
+    {
+        let mut guards = restored.lock_session_entities("move restored natural spawns for replay");
+        for (index, snapshot) in actual.iter().enumerate() {
+            let current = guards
+                .entities
+                .snapshot(snapshot.id)
+                .expect("restored natural spawn snapshot");
+            let mut moved = current.clone();
+            moved.position = Vec3::new(320.5 + index as f64, f64::from(TEST_Y), 0.5);
+            assert!(
+                guards
+                    .entities
+                    .replace_snapshot_if_current(current, moved.clone())
+            );
+            track_entity_chunk_locked(&mut guards, snapshot.id, moved.position);
+        }
+    }
+
+    restored.set_world_time(NIGHT_START_TICK);
+    let (_player, _receiver) =
+        register_player(&restored, "SpawnRestart", HashSet::from([TEST_CHUNK]), 4);
+    assert!(restored.register_natural_spawn_templates(TEST_CHUNK, templates));
+    let (replayed, _) = restored.tick_periodic_natural_spawning(
+        &mut NaturalSpawnScheduler::default(),
+        tick_input(
+            SPAWN_TICK,
+            SPAWN_TICK,
+            SPAWN_TICK,
+            4,
+            Some(&world_read),
+            Some(&materials),
+        ),
+    );
+    assert_eq!(replayed.friendly.committed, 0);
+    assert_eq!(replayed.hostile.committed, 0);
+    assert_eq!(replayed.friendly.rejected_duplicate_or_stale, 1);
+    assert_eq!(replayed.hostile.rejected_duplicate_or_stale, 1);
+
+    let records = restored.persisted_entity_records();
+    assert_eq!(
+        records.len(),
+        2,
+        "restart replay must not duplicate deterministic identities"
+    );
+    let restored_uuids = records
+        .iter()
+        .map(|record| record.snapshot.uuid)
+        .collect::<HashSet<_>>();
+    let expected_uuids = expected
+        .iter()
+        .map(|snapshot| snapshot.uuid)
+        .collect::<HashSet<_>>();
+    assert_eq!(restored_uuids, expected_uuids);
+}

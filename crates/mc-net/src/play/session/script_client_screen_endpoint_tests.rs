@@ -33,6 +33,7 @@ fn manifest(content: Vec<LoaderContentKind>, permissions: Vec<LoaderPermission>)
             permissions,
             cache_key: format!("example:screen/1/{}", "a".repeat(64)),
             source_path: None,
+            artifact_bytes: None,
             block_id: None,
             block_name: None,
         }],

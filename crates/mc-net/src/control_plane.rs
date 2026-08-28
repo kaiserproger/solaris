@@ -571,6 +571,8 @@ pub struct RuntimeControlSnapshot {
     pub last_work_decision: RuntimeWorkDecision,
     pub pressure_ticks: u32,
     pub healthy_ticks: u32,
+    pub scale_down_decisions: u64,
+    pub scale_up_decisions: u64,
     pub draining: bool,
     pub application_stop_reason: Option<String>,
 }
@@ -666,6 +668,8 @@ pub struct RuntimeControlPlane {
     last_work_decision: RuntimeWorkDecision,
     pressure_ticks: u32,
     healthy_ticks: u32,
+    scale_down_decisions: u64,
+    scale_up_decisions: u64,
     active_chunk_saturations: usize,
     active_first_chunk_sla_sources: usize,
     draining: bool,
@@ -700,6 +704,8 @@ impl RuntimeControlPlane {
             },
             pressure_ticks: 0,
             healthy_ticks: 0,
+            scale_down_decisions: 0,
+            scale_up_decisions: 0,
             active_chunk_saturations: 0,
             active_first_chunk_sla_sources: 0,
             draining: false,
@@ -1007,12 +1013,23 @@ impl RuntimeControlPlane {
             last_work_decision: self.last_work_decision.clone(),
             pressure_ticks: self.pressure_ticks,
             healthy_ticks: self.healthy_ticks,
+            scale_down_decisions: self.scale_down_decisions,
+            scale_up_decisions: self.scale_up_decisions,
             draining: self.draining,
             application_stop_reason: self.application_stop_reason.clone(),
         }
     }
 
     fn record(&mut self, decision: AutoscaleDecision) -> AutoscaleDecision {
+        match decision.action {
+            AutoscaleAction::ScaleDown => {
+                self.scale_down_decisions = self.scale_down_decisions.saturating_add(1);
+            }
+            AutoscaleAction::ScaleUp => {
+                self.scale_up_decisions = self.scale_up_decisions.saturating_add(1);
+            }
+            AutoscaleAction::Hold => {}
+        }
         self.last_decision = decision.clone();
         decision
     }
@@ -2039,9 +2056,11 @@ mod tests {
         let first = controller.observe(input);
         assert_eq!(first.action, AutoscaleAction::Hold);
         assert_eq!(first.pressure, Some(AutoscalePressure::TickTime));
+        assert_eq!(controller.snapshot().scale_down_decisions, 0);
 
         let second = controller.observe(input);
         assert_eq!(second.action, AutoscaleAction::ScaleDown);
+        assert_eq!(controller.snapshot().scale_down_decisions, 1);
         assert_eq!(second.limits.view_distance, 7);
         assert_eq!(second.limits.chunk_send_rate, 8);
         assert_eq!(
@@ -2091,6 +2110,7 @@ mod tests {
         let restored = controller.observe(healthy_input());
 
         assert_eq!(restored.action, AutoscaleAction::ScaleUp);
+        assert_eq!(controller.snapshot().scale_up_decisions, 1);
         assert_eq!(restored.limits.view_distance, 8);
         assert_eq!(restored.limits.chunk_send_rate, 16);
         assert_eq!(

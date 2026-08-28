@@ -1546,6 +1546,7 @@ fn prepare_region_owner_batch(
     let mut sequences = HashSet::with_capacity(batch.mutations.len());
     let mut inserted_ids = HashSet::new();
     let mut inserted_uuids = HashSet::new();
+    let mut passengers_by_region = HashMap::<RegionKey, HashSet<EntityId>>::new();
     for mutation in &batch.mutations {
         if !sequences.insert(mutation.sequence) {
             return Err(RegionOwnerLaneError::DuplicateSequence);
@@ -1651,12 +1652,18 @@ fn prepare_region_owner_batch(
                 }
             }
             RegionOwnerMutation::DamageIfCurrent { expected, request } => {
+                let passengers = passengers_by_region
+                    .entry(mutation.lease.key)
+                    .or_insert_with(|| {
+                        store
+                            .snapshots()
+                            .filter_map(|snapshot| snapshot_vehicle_reference(&snapshot))
+                            .collect()
+                    });
                 if !request.is_valid()
                     || store.snapshot(expected.id).as_ref() != Some(expected.as_ref())
                     || expected.lifecycle != crate::EntityLifecycle::Alive
-                    || store
-                        .snapshots()
-                        .any(|snapshot| snapshot_vehicle_reference(&snapshot) == Some(expected.id))
+                    || passengers.contains(&expected.id)
                 {
                     return Err(RegionOwnerLaneError::InvalidMutation);
                 }

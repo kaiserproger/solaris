@@ -313,32 +313,7 @@ pub(super) fn ingredient_accepts_item(
     item_id: u32,
     ingredient: &mc_data::recipes::Ingredient,
 ) -> bool {
-    ingredient
-        .alternatives
-        .iter()
-        .any(|alternative| ingredient_alternative_accepts_item(items, tags, item_id, alternative))
-}
-
-fn ingredient_alternative_accepts_item(
-    items: &ItemRegistry,
-    tags: &TagsData,
-    item_id: u32,
-    alternative: &mc_data::recipes::IngredientAlternative,
-) -> bool {
-    match alternative {
-        mc_data::recipes::IngredientAlternative::Item(item) => items.id_of(item) == Some(item_id),
-        mc_data::recipes::IngredientAlternative::Tag(tag) => {
-            let item_registry = Identifier::parse("minecraft:item").expect("static identifier");
-            tags.registries
-                .get(&item_registry)
-                .and_then(|item_tags| item_tags.get(tag))
-                .is_some_and(|entries| {
-                    entries
-                        .iter()
-                        .any(|entry| u32::try_from(*entry).ok() == Some(item_id))
-                })
-        }
-    }
+    mc_data::recipes::ingredient_accepts_item(items, tags, item_id, ingredient)
 }
 
 fn inventory_has_room_for_output(state: &InteractionState, item_id: u32, count: i32) -> bool {

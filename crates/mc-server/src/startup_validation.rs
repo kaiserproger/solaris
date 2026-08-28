@@ -9,6 +9,19 @@ use mc_server::ServerConfig;
 pub(crate) const WORLD_CONTRACT_SCHEMA: u32 = 3;
 const WORLD_CONTRACT_FILE: &str = "world.json";
 
+const MAX_PLAYERS: u32 = 4_096;
+const MAX_SERVER_NAME_BYTES: usize = 256;
+const MAX_MOTD_BYTES: usize = 32_767;
+const MAX_CHUNK_RATE: u32 = 4_096;
+const MAX_CHUNK_PREPARE_BUDGET_MS: u64 = 1_000;
+const MAX_CHUNK_PREPARE_BATCH_SIZE: usize = 4_096;
+const MAX_CHUNK_RESULT_QUEUE_SIZE: usize = 262_144;
+const MAX_REGION_CACHE_SIZE: usize = 65_536;
+const MAX_RANDOM_TICK_SPEED: u32 = 4_096;
+const MAX_SIMULATION_INTERVAL_TICKS: u64 = 1_728_000;
+const MAX_DERIVED_OUTBOUND_QUEUE: usize = 1_048_576;
+const OUTBOUND_COMMANDS_PER_PLAYER_BURST: usize = 8;
+
 #[derive(Debug, serde::Deserialize, serde::Serialize)]
 pub(crate) struct PersistedWorldContract {
     pub(crate) schema: u32,
@@ -87,8 +100,126 @@ pub(crate) fn validate_runtime_config(config: &ServerConfig) -> Result<()> {
             mc_net::MAX_VIEW_DISTANCE,
         );
     }
-    if config.simulation.save_interval_ticks == 0 {
-        bail!("simulation.save_interval_ticks must be greater than 0");
+    if config.server.max_players > MAX_PLAYERS {
+        bail!(
+            "server.max_players={} exceeds safe maximum {}",
+            config.server.max_players,
+            MAX_PLAYERS
+        );
+    }
+    if config.server.name.len() > MAX_SERVER_NAME_BYTES {
+        bail!(
+            "server.name length {} exceeds safe maximum {} bytes",
+            config.server.name.len(),
+            MAX_SERVER_NAME_BYTES
+        );
+    }
+    if config.server.motd.len() > MAX_MOTD_BYTES {
+        bail!(
+            "server.motd length {} exceeds safe maximum {} bytes",
+            config.server.motd.len(),
+            MAX_MOTD_BYTES
+        );
+    }
+    for (field, value) in [
+        (
+            "chunk_pipeline.chunk_send_rate",
+            config.chunk_pipeline.chunk_send_rate,
+        ),
+        (
+            "chunk_pipeline.chunk_load_rate",
+            config.chunk_pipeline.chunk_load_rate,
+        ),
+        (
+            "chunk_pipeline.chunk_generate_rate",
+            config.chunk_pipeline.chunk_generate_rate,
+        ),
+    ] {
+        if value == 0 || value > MAX_CHUNK_RATE {
+            bail!("{field}={value} must be between 1 and {MAX_CHUNK_RATE}");
+        }
+    }
+    if config.chunk_pipeline.chunk_prepare_budget_ms > MAX_CHUNK_PREPARE_BUDGET_MS {
+        bail!(
+            "chunk_pipeline.chunk_prepare_budget_ms={} exceeds safe maximum {}",
+            config.chunk_pipeline.chunk_prepare_budget_ms,
+            MAX_CHUNK_PREPARE_BUDGET_MS
+        );
+    }
+    if !(1..=MAX_CHUNK_PREPARE_BATCH_SIZE).contains(&config.chunk_pipeline.chunk_prepare_batch_size)
+    {
+        bail!(
+            "chunk_pipeline.chunk_prepare_batch_size={} must be between 1 and {}",
+            config.chunk_pipeline.chunk_prepare_batch_size,
+            MAX_CHUNK_PREPARE_BATCH_SIZE
+        );
+    }
+    if !(1..=MAX_CHUNK_RESULT_QUEUE_SIZE).contains(&config.chunk_pipeline.chunk_result_queue_size) {
+        bail!(
+            "chunk_pipeline.chunk_result_queue_size={} must be between 1 and {}",
+            config.chunk_pipeline.chunk_result_queue_size,
+            MAX_CHUNK_RESULT_QUEUE_SIZE
+        );
+    }
+    if !(1..=MAX_REGION_CACHE_SIZE).contains(&config.chunk_pipeline.region_cache_size) {
+        bail!(
+            "chunk_pipeline.region_cache_size={} must be between 1 and {}",
+            config.chunk_pipeline.region_cache_size,
+            MAX_REGION_CACHE_SIZE
+        );
+    }
+    if config
+        .chunk_pipeline
+        .compression_level
+        .is_some_and(|level| level > 9)
+    {
+        bail!("chunk_pipeline.compression_level must be between 0 and 9");
+    }
+    if config.simulation.random_tick_speed > MAX_RANDOM_TICK_SPEED {
+        bail!(
+            "simulation.random_tick_speed={} exceeds safe maximum {}",
+            config.simulation.random_tick_speed,
+            MAX_RANDOM_TICK_SPEED
+        );
+    }
+    if config.simulation.save_interval_ticks == 0
+        || config.simulation.save_interval_ticks > MAX_SIMULATION_INTERVAL_TICKS
+    {
+        bail!(
+            "simulation.save_interval_ticks={} must be between 1 and {}",
+            config.simulation.save_interval_ticks,
+            MAX_SIMULATION_INTERVAL_TICKS
+        );
+    }
+    for (field, value) in [
+        (
+            "simulation.friendly_spawn_interval_ticks",
+            config.simulation.friendly_spawn_interval_ticks,
+        ),
+        (
+            "simulation.hostile_spawn_interval_ticks",
+            config.simulation.hostile_spawn_interval_ticks,
+        ),
+    ] {
+        if value > MAX_SIMULATION_INTERVAL_TICKS {
+            bail!("{field}={value} exceeds safe maximum {MAX_SIMULATION_INTERVAL_TICKS}");
+        }
+    }
+    let player_burst = usize::try_from(config.server.max_players)
+        .ok()
+        .and_then(|players| players.checked_mul(OUTBOUND_COMMANDS_PER_PLAYER_BURST))
+        .ok_or_else(|| anyhow::anyhow!("server.max_players overflows derived outbound queue"))?;
+    let derived_outbound_queue = config
+        .chunk_pipeline
+        .chunk_result_queue_size
+        .max(16)
+        .max(player_burst);
+    if derived_outbound_queue > MAX_DERIVED_OUTBOUND_QUEUE {
+        bail!(
+            "derived outbound queue capacity {} exceeds safe maximum {}",
+            derived_outbound_queue,
+            MAX_DERIVED_OUTBOUND_QUEUE
+        );
     }
     let mut bundled_plugins = BTreeSet::new();
     for plugin in &config.plugins.bundled {

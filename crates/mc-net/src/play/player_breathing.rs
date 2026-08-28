@@ -1,4 +1,5 @@
-use mc_protocol::packets::play::{ENTITY_DATA_AIR_SUPPLY_INDEX, EntityDataValue, GameMode};
+use mc_domain::GameMode;
+use mc_protocol::packets::play::{ENTITY_DATA_AIR_SUPPLY_INDEX, EntityDataValue};
 
 pub(super) const PLAYER_AIR_SUPPLY_METADATA_INDEX: u8 = ENTITY_DATA_AIR_SUPPLY_INDEX;
 

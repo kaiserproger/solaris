@@ -14,8 +14,7 @@ Do not pre-read the roadmap, all milestones, readiness documents, or archives.
 
 ## Default Mission
 
-Move the highest-value current blocker through one finite checkpoint using the
-protocol and budgets in `AGENTS.md`. Apply this order:
+The second-alpha plan is closed. Use [`PUBLIC_ALPHA3_PLAN.md`](PUBLIC_ALPHA3_PLAN.md) as the current carry-over queue unless the owner gives a newer explicit task. Move the highest-value current blocker through one finite checkpoint using the protocol and budgets in `AGENTS.md`. Apply this order:
 
 1. A red real-client or wire-level playable regression.
 2. A common gameplay path missing authoritative mutation or sad-path coverage.
@@ -47,7 +46,8 @@ touched behavior and its reachable failure branches.
 ## Checkpoint
 
 Before a code commit, run the selected validation tier from `AGENTS.md`. Record skipped
-vanilla, client, performance, concurrency, and soak gates exactly. Update only
+vanilla, client, performance, concurrency, and soak gates exactly. These records are
+checkpoint summaries, not per-command progress reports. Update only
 the canonical owner document for the task; do not copy the same status into
 every roadmap, milestone, readiness file, and archive.
 

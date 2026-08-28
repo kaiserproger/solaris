@@ -30,8 +30,9 @@ claims against:
 - Existing Solaris worlds and plugins may require deletion or manual adaptation
   after an alpha update. Backward compatibility is not promised before `1.0`.
 - Report reproducible bugs with the server version, config, client version, logs,
-  and the smallest reproduction. The remaining release path is tracked in
-  [`docs/PUBLIC_ALPHA_PLAN.md`](docs/PUBLIC_ALPHA_PLAN.md).
+  and the smallest reproduction. The completed second-alpha plan is archived in
+  [`docs/PUBLIC_ALPHA_PLAN.md`](docs/PUBLIC_ALPHA_PLAN.md); current carry-over work
+  for the third alpha is tracked in [`docs/PUBLIC_ALPHA3_PLAN.md`](docs/PUBLIC_ALPHA3_PLAN.md).
 
 ## Build
 
@@ -50,7 +51,7 @@ alias, so pin the alpha tag explicitly:
 
 ```sh
 curl -fsSL https://raw.githubusercontent.com/kaiserproger/solaris/main/install.sh | \
-  SOLARIS_VERSION="v0.0.1-alpha.1" bash
+  SOLARIS_VERSION="v0.0.2-alpha.1" bash
 ```
 
 The installer writes `solaris` to `$HOME/.local/bin` for a regular user and to
@@ -59,7 +60,7 @@ release pinned:
 
 ```sh
 curl -fsSL https://raw.githubusercontent.com/kaiserproger/solaris/main/install.sh | \
-  SOLARIS_INSTALL_DIR="$HOME/bin" SOLARIS_VERSION="v0.0.1-alpha.1" bash
+  SOLARIS_INSTALL_DIR="$HOME/bin" SOLARIS_VERSION="v0.0.2-alpha.1" bash
 ```
 
 The script downloads the matching GitHub release archive, verifies its published

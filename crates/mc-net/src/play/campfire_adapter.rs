@@ -1,9 +1,8 @@
 use std::collections::HashSet;
 
-use mc_data::items::ItemRegistry;
-use mc_protocol::packets::play::{
-    ClientboundBlockEntityData, GameMode, InteractionHand, ItemStack, pack_block_pos,
-};
+use mc_data::{ItemStack, items::ItemRegistry};
+use mc_domain::{GameMode, InteractionHand};
+use mc_protocol::packets::play::{ClientboundBlockEntityData, pack_block_pos};
 use mc_world::SECTION_DIM;
 use tokio::io::AsyncWriteExt;
 use tracing::{debug, info, warn};

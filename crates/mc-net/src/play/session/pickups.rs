@@ -18,11 +18,11 @@ use crate::play::campfire::PendingCampfireOutput;
 use crate::play::inventory::{PlayerInventory, can_stack, item_max_stack};
 use crate::play::persistence::{PlayerPersistedState, XpState};
 use crate::play::simulation::SimulationAuthority;
+use mc_data::ItemStack;
 use mc_entity::{
     EntityId, EntityItemPickupOwnerBlock, EntityItemStack, EntityLifecycle, EntitySnapshot,
     SpawnEntity, Vec3,
 };
-use mc_protocol::packets::play::ItemStack;
 use std::collections::HashSet;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
@@ -303,34 +303,52 @@ impl SessionRegistry {
 
     pub(in crate::play) fn spawn_item_drop_owned(
         &self,
-        _authority: &SimulationAuthority,
+        authority: &SimulationAuthority,
         entity_type_id: i32,
         position: Vec3,
         stack: EntityItemStack,
     ) -> Vec<VisibilityDispatch> {
-        if stack.is_empty() {
+        self.spawn_item_drop_batch_owned(authority, [(entity_type_id, position, stack)])
+    }
+
+    pub(in crate::play) fn spawn_item_drop_batch_owned(
+        &self,
+        _authority: &SimulationAuthority,
+        drops: impl IntoIterator<Item = (i32, Vec3, EntityItemStack)>,
+    ) -> Vec<VisibilityDispatch> {
+        let drops = drops
+            .into_iter()
+            .filter(|(_, _, stack)| !stack.is_empty())
+            .collect::<Vec<_>>();
+        if drops.is_empty() {
             return Vec::new();
         }
+        let expected_count = drops.len();
         let lifecycle_tick = self.simulation_tick();
-        let entity = item_drop_entity(entity_type_id, position, stack, lifecycle_tick);
+        let entities = drops.into_iter().map(|(entity_type_id, position, stack)| {
+            item_drop_entity(entity_type_id, position, stack, lifecycle_tick)
+        });
         let owner_started = Instant::now();
         let snapshots = {
-            let mut entities = self.lock_entities("commit item drop");
-            entities.spawn_unique_batch([entity])
+            let mut owner = self.lock_entities("commit item drop batch");
+            owner.spawn_unique_batch(entities)
         };
         let owner_commit_us = owner_started.elapsed().as_micros() as u64;
         assert_eq!(
             snapshots.len(),
-            1,
-            "regional entity owner returned a partial successful item-drop spawn"
+            expected_count,
+            "regional entity owner returned a partial successful item-drop batch"
         );
+        let entity_count = snapshots.len();
         let publish_started = Instant::now();
         let dispatches = self.publish_item_drop_snapshots(snapshots);
+        let publish_us = publish_started.elapsed().as_micros() as u64;
         tracing::debug!(
             owner_commit_us,
-            publish_us = publish_started.elapsed().as_micros() as u64,
+            publish_us,
+            entity_count,
             dispatches = dispatches.len(),
-            "item drop transaction phases"
+            "item drop batch transaction phases"
         );
         dispatches
     }

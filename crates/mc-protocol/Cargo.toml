@@ -13,6 +13,7 @@ workspace = true
 
 [dependencies]
 mc-data = { path = "../mc-data" }
+mc-domain = { path = "../mc-domain" }
 mc-nbt = { path = "../mc-nbt" }
 bytes = { workspace = true }
 flate2 = { workspace = true }

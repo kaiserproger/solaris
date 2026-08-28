@@ -4,6 +4,49 @@ Date: 2026-07-30
 
 Checkpoint base: `5770c432a849d90b88bd14b7f3f0e262cfd9d709`
 
+## Phase-2 refresh — 2026-08-18
+
+The numeric inventory below is the original 2026-07-30 selection snapshot and is
+kept as historical evidence. The current tree has since completed multiple bounded
+lower-crate cutovers. Current source, focused tests, and `xtask code-health` are the
+authority for ownership; the old physical-line totals are not reused as current
+measurements.
+
+Completed lower-crate ownership now includes movement geometry, bounded chunk
+coverage and chunk-stream planning, natural-spawn planning, shared block semantics,
+player survival/combat rules, protocol-independent gameplay values, canonical
+`ItemStack`, inventory/equipment transactions, item/enchanting semantics, recipe
+semantics, villager trade-input semantics, and deterministic block-placement state
+rules. The corresponding `docs/evidence/*-crate-boundary.md` records name the
+retained `mc-net` adapter and the code-health fence for each cutover.
+
+The remaining `mc-net` logic is classified explicitly rather than being accepted
+because it happens to live in a child module:
+
+| Remaining area | Current ownership justification | Next disposition |
+| --- | --- | --- |
+| `play.rs` / `play_loop_inner` | Play packet decode, connection-local state, slow-client fencing, owner requests, and wire publication are legitimate transport/orchestration responsibilities. Movement, player-state, use/interact, container, player-control, client-metadata, chat/command, simulation-tick, chunk-stream, damage, wake, and inventory behavior now live in narrow family helpers. The root keeps select scheduling, exhaustive outbound projection routing, keepalive/teleport confirmation, liveness/rate admission, and explicit family dispatch. The frozen gateway is **731 lines**, down from 1,522 before `SOL-042`. | Keep the current transport root; future cuts require a concrete cohesive family rather than replacing the remaining outbound projection match with a generic god-dispatch. |
+| `play/simulation.rs` / `process_batch` | Simulation queue admission, regional/world authority access, commit dispatch, response fencing, metrics, and post-commit publication coordination belong to the simulation owner. Pose batching, read/save/pickup/attack/effect response families, survival/player-item routing, chest/furnace publication, and opaque-block-entity/campfire response adapters now live in owner-local helpers. The frozen gateway is **998 lines**, down from 1,439 before `SOL-042`. | Keep owner coordination; the gateway is now sub-1,000 and future cuts are selected only when mutation/publication order remains literal rather than by line count alone. |
+| `server.rs` / `BoundServer::serve` | Listener lifecycle, composition, startup/shutdown supervision, runtime wiring, owner drain, and error propagation are composition-root work. Script-commit setup/drain, world/save/dirty setup, command-task wiring, admitted-connection spawning, and the complete entity-ticker runtime now live outside the root. The frozen gateway is **277 lines**, down from 1,553 before `SOL-042`. | Keep the composition root at this boundary; gameplay/entity tick behavior must not return to `serve`. |
+| `server/entity_ticker.rs` / `run_entity_ticker` | The entity runtime owns tick cadence, `SimulationOwner`, command-vs-tick fairness, entity physics fencing, natural/entity/world ticks, periodic save requests, runtime-control work budgets, metrics/memory-pressure workers, and the final simulation drain. Moving it out of `serve` changed no branch order or authority. The runtime has its own frozen **1,053-line** ceiling so child-module extraction cannot hide growth. | Keep this explicitly classified runtime; future decomposition must be by coherent tick phase with focused evidence, never by line count alone. |
+| `play/session.rs` and authority children | Session indexes, lock acquisition, immutable snapshots, CAS/transaction authority, and publication adapters are accepted session ownership. | Keep concrete owner adapters; code-health prevents completed semantic definitions from returning to the parent/root. |
+| `play/chunk_stream.rs` | Scheduler state, generation/IO, prepare admission, cache/backpressure, autoscale limits, and packet publication are runtime stream ownership; pure ordering/window/prewarm math is already in `mc-world`. | Keep runtime scheduler/IO adapter; extract additional pure rules only when a touched path exposes one. |
+| `play/persistence.rs` / `play/world_journal.rs` | Crash/recovery, journal, checkpoint, and durable world/player/entity coordination are authority-sensitive persistence state machines. | Keep until a separately evidenced recovery-safe ownership cut exists; do not mechanically split for line count. |
+| `play/inventory.rs`, containers, recipes, merchant, combat, placement, survival adapters | Mutable session/container/player state, registry adaptation, commit settlement, cooldowns, persistence, and wire projection remain after pure rules moved to lower crates. | Keep these adapters. The survival/mining caller/shim cleanup is complete; future wrapper/fallback deletion is tied to the next touched vertical rather than speculative global cleanup. |
+| `play/session/pickups.rs` | Item/XP/arrow claim tokens, inventory credit, regional entity commit, exact readiness indexing, and dispatch are one authority-sensitive flow. | Keep the proven claim/commit path while the 200-action lock gate is green; only split publication in a separately fenced checkpoint. |
+| login/configuration/loader/connection/control-plane surfaces | Protocol state machines, admission, negotiated Loader transport, liveness, and operator runtime control are network/control-plane responsibilities. | Keep in `mc-net`; these are not gameplay-semantic extraction targets. |
+
+Generic code-health checks reject direct lower-crate Cargo dependencies on `mc-net`
+and reject transport/session symbols in lower semantic crates. Domain-specific checks
+pin every completed cutover and require the network adapters to consume the lower
+owner. The current Phase-2 migration set is closed: no known superseded touched-domain
+shim remains, all mixed runtime areas are explicitly classified, and root growth is
+fenced at Play 731 / server 277 / simulation 998 with the extracted entity ticker
+separately fenced at 1,053. Large exact source moves in this checkpoint used the
+owner-authorized local shell path where CodexPro's targeted `edit` false-positive guard
+blocked the giant file; the resulting source was reviewed and validated by the normal
+Rust/test/code-health gates.
+
 ## Method
 
 The inventory measures the current Rust sources under `crates/mc-net`:

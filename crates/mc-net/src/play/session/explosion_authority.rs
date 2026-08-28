@@ -1,7 +1,8 @@
-use std::collections::{HashMap, HashSet};
-
-use mc_entity::{EntityId, EntityLifecycle, SpawnEntity, Vec3};
+use mc_entity::{
+    EntityDamageRequest, EntityExplosionInteraction, EntityId, EntityLifecycle, SpawnEntity, Vec3,
+};
 use mc_world::BlockStateId;
+use std::collections::{HashMap, HashSet};
 
 use crate::play::CREEPER_EXPLOSION_POWER;
 use crate::play::PlayerPose;
@@ -10,7 +11,9 @@ use crate::play::explosions::{PlayerExplosionImpact, TNT_ENTITY_TYPE_NAME, explo
 use crate::play::simulation::SimulationAuthority;
 use crate::play::survival::{entity_item_stack, mob_xp_value};
 
-use super::entity_combat::attack_server_entity_locked;
+use super::entity_combat::{
+    begin_server_entity_death_locked, publish_accepted_entity_health_locked,
+};
 use super::entity_lifecycle::{
     nearby_entity_candidate_ids_locked, remove_server_entity_state_locked,
     track_entity_chunk_locked,
@@ -25,9 +28,9 @@ use super::visibility::{
     spawn_entity_visibility_locked, visible_entity_observers_locked,
 };
 use super::{
-    EntityAttackOutcome, EntityKillRewards, SessionEntityGuards, SessionId, SessionRegistry,
-    SessionRegistryInner, entity_kill_drop_stacks, player_collision_position,
-    record_entity_dispatches_locked,
+    ENTITY_DEATH_TICKS, ENTITY_HURT_INVULNERABLE_TICKS, EntityKillRewards, SessionEntityGuards,
+    SessionId, SessionRegistry, SessionRegistryInner, entity_kill_drop_stacks,
+    player_collision_position, record_entity_dispatches_locked,
 };
 
 pub(in crate::play) const EXPLOSIONS_PER_TICK: usize = 1;
@@ -37,6 +40,8 @@ pub(in crate::play) struct ExpiredPrimedTnt {
     pub(in crate::play) position: Vec3,
     pub(in crate::play) air: mc_world::BlockStateId,
     power: f32,
+    destroys_blocks: bool,
+    damages_entities: bool,
     center_y_offset: f64,
     snapshot: ServerEntitySnapshot,
     observer_ids: Vec<SessionId>,
@@ -76,6 +81,14 @@ impl ExpiredPrimedTnt {
 
     pub(in crate::play) fn power(&self) -> f32 {
         self.power
+    }
+
+    pub(in crate::play) fn destroys_blocks(&self) -> bool {
+        self.destroys_blocks
+    }
+
+    pub(in crate::play) fn damages_entities(&self) -> bool {
+        self.damages_entities
     }
 
     pub(in crate::play) fn explosion_targets(&self) -> &[ExplosionPlayerTarget] {
@@ -118,7 +131,9 @@ impl ExpiredPrimedTnt {
                 continue;
             }
             let impact = impacts.get(&recipient_id).copied();
-            if let Some(impact) = impact {
+            if let Some(impact) = impact
+                && impact.damage > 0.0
+            {
                 dispatches.push(VisibilityDispatch {
                     recipient: recipient.clone(),
                     command: OutboundCommand::DamagePlayer {
@@ -204,64 +219,111 @@ impl SessionRegistry {
         _authority: &SimulationAuthority,
         impacts: &[ServerEntityExplosionImpact],
     ) -> Vec<VisibilityDispatch> {
-        let mut dispatches = {
-            let mut inner = self.lock_session_entities("apply explosion entity impacts");
-            let mut dispatches = Vec::new();
-            for impact in impacts {
-                if !impact.damage.is_finite()
-                    || impact.damage <= 0.0
-                    || !impact.knockback.is_finite()
-                {
-                    continue;
-                }
-                let Some(target) = inner.entities.snapshot(impact.entity_id) else {
-                    continue;
-                };
-                let rewards = EntityKillRewards {
-                    items: inner.arrow_kill_rewards.item_entity_type_id.map_or_else(
-                        Vec::new,
-                        |entity_type_id| {
-                            entity_kill_drop_stacks(
-                                &inner.arrow_kill_rewards,
-                                &target.type_name,
-                                target.animal,
-                                target.id.0 as i64 as u64,
-                            )
-                            .into_iter()
-                            .map(|drop| (entity_type_id, entity_item_stack(drop)))
-                            .collect()
+        let mut dispatches =
+            {
+                let mut inner = self.lock_session_entities("apply explosion entity impacts");
+                let tick = inner.entity_lifecycle_tick;
+                let mut accepted = Vec::new();
+                let mut knockback_only = Vec::new();
+                let mut requests = Vec::new();
+                for impact in impacts {
+                    if !impact.damage.is_finite()
+                        || impact.damage < 0.0
+                        || !impact.knockback.is_finite()
+                    {
+                        continue;
+                    }
+                    let Some(target) = inner.entities.snapshot(impact.entity_id) else {
+                        continue;
+                    };
+                    if target.lifecycle != EntityLifecycle::Alive {
+                        continue;
+                    }
+                    if impact.damage == 0.0 {
+                        if impact.knockback != Vec3::ZERO {
+                            knockback_only.push(*impact);
+                        }
+                        continue;
+                    }
+                    if target.retained.last_damage_tick.is_some_and(|last| {
+                        tick.saturating_sub(last) < ENTITY_HURT_INVULNERABLE_TICKS
+                    }) {
+                        continue;
+                    }
+                    let rewards = EntityKillRewards {
+                        items: inner.arrow_kill_rewards.item_entity_type_id.map_or_else(
+                            Vec::new,
+                            |entity_type_id| {
+                                entity_kill_drop_stacks(
+                                    &inner.arrow_kill_rewards,
+                                    &target.type_name,
+                                    target.animal,
+                                    target.id.0 as i64 as u64,
+                                )
+                                .into_iter()
+                                .map(|drop| (entity_type_id, entity_item_stack(drop)))
+                                .collect()
+                            },
+                        ),
+                        experience: inner.arrow_kill_rewards.xp_orb_entity_type_id.map(
+                            |entity_type_id| (entity_type_id, mob_xp_value(&target.type_name)),
+                        ),
+                    };
+                    requests.push((
+                        target,
+                        EntityDamageRequest {
+                            amount: impact.damage,
+                            tick,
+                            death_remove_tick: tick.saturating_add(ENTITY_DEATH_TICKS),
+                            villager_gossip_event: None,
                         },
-                    ),
-                    experience: inner
-                        .arrow_kill_rewards
-                        .xp_orb_entity_type_id
-                        .map(|entity_type_id| (entity_type_id, mob_xp_value(&target.type_name))),
-                };
-                let Some(mut outcome) = attack_server_entity_locked(
-                    &mut inner,
-                    impact.entity_id,
-                    impact.damage,
-                    None,
-                    &rewards,
-                    None,
-                ) else {
-                    continue;
-                };
-                if matches!(outcome, EntityAttackOutcome::Damaged { .. }) {
-                    outcome
-                        .dispatches_mut()
-                        .extend(entity_event_dispatches_locked(&inner, impact.entity_id, 2));
-                    let knockback = apply_explosion_knockback_locked(
+                    ));
+                    accepted.push((*impact, rewards));
+                }
+
+                let mut damages = inner
+                    .entities
+                    .damage_batch_if_current(requests)
+                    .into_iter()
+                    .map(|damage| (damage.snapshot.id, damage))
+                    .collect::<HashMap<_, _>>();
+                let mut dispatches = Vec::new();
+                for (impact, rewards) in accepted {
+                    let Some(damage) = damages.remove(&impact.entity_id) else {
+                        continue;
+                    };
+                    let health_dispatches =
+                        publish_accepted_entity_health_locked(&mut inner, &damage.snapshot);
+                    if damage.killed {
+                        let (_, mut death_dispatches) =
+                            begin_server_entity_death_locked(&mut inner, &damage, &rewards);
+                        death_dispatches.splice(0..0, health_dispatches);
+                        dispatches.append(&mut death_dispatches);
+                        continue;
+                    }
+
+                    let mut impact_dispatches = health_dispatches;
+                    impact_dispatches.extend(entity_event_dispatches_locked(
+                        &inner,
+                        impact.entity_id,
+                        2,
+                    ));
+                    impact_dispatches.extend(apply_explosion_knockback_locked(
                         &mut inner,
                         impact.entity_id,
                         impact.knockback,
-                    );
-                    outcome.dispatches_mut().extend(knockback);
+                    ));
+                    dispatches.append(&mut impact_dispatches);
                 }
-                dispatches.append(outcome.dispatches_mut());
-            }
-            dispatches
-        };
+                for impact in knockback_only {
+                    dispatches.extend(apply_explosion_knockback_locked(
+                        &mut inner,
+                        impact.entity_id,
+                        impact.knockback,
+                    ));
+                }
+                dispatches
+            };
         self.append_spawned_xp_pickup_candidates(&mut dispatches);
         dispatches
     }
@@ -308,19 +370,38 @@ impl SessionRegistry {
                 if entity.lifecycle != EntityLifecycle::Alive {
                     return None;
                 }
-                let retained = entity.retained.primed_tnt?;
-                if retained.expires_tick > current_tick {
-                    schedule_primed_tnt_deadline_locked(
-                        &mut inner,
-                        entity_id,
-                        Some(retained.expires_tick),
-                    );
+                let (expires_tick, air, power, destroys_blocks, damages_entities, center_y_offset) =
+                    if let Some(retained) = entity.retained.primed_tnt {
+                        let is_creeper = entity.type_name == "minecraft:creeper";
+                        (
+                            retained.expires_tick,
+                            mc_world::BlockStateId(retained.air_block_state),
+                            if is_creeper {
+                                CREEPER_EXPLOSION_POWER
+                            } else {
+                                4.0
+                            },
+                            true,
+                            true,
+                            if is_creeper { 0.0 } else { 0.06125 },
+                        )
+                    } else {
+                        let pending = entity.retained.pending_explosion?;
+                        (
+                            pending.expires_tick,
+                            mc_world::BlockStateId(pending.air_block_state),
+                            pending.power(),
+                            pending.interaction == EntityExplosionInteraction::Mob,
+                            pending.damage_entities,
+                            0.0,
+                        )
+                    };
+                if expires_tick > current_tick {
+                    schedule_primed_tnt_deadline_locked(&mut inner, entity_id, Some(expires_tick));
                     return None;
                 }
                 let snapshot = remove_server_entity_state_locked(&mut inner, entity_id)?;
                 let observer_ids = remove_entity_visibility_locked(&mut inner, entity_id);
-                let is_creeper = snapshot.type_name == "minecraft:creeper";
-                let center_y_offset = if is_creeper { 0.0 } else { 0.06125 };
                 let center = Vec3::new(
                     snapshot.position.x,
                     snapshot.position.y + center_y_offset,
@@ -340,12 +421,10 @@ impl SessionRegistry {
                 Some(ExpiredPrimedTnt {
                     entity_id,
                     position: snapshot.position,
-                    air: mc_world::BlockStateId(retained.air_block_state),
-                    power: if is_creeper {
-                        CREEPER_EXPLOSION_POWER
-                    } else {
-                        4.0
-                    },
+                    air,
+                    power,
+                    destroys_blocks,
+                    damages_entities,
                     center_y_offset,
                     snapshot,
                     observer_ids,

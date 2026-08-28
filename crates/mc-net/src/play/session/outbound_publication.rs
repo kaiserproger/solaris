@@ -2,6 +2,7 @@ use std::sync::Arc;
 
 use mc_protocol::codec::Identifier;
 
+use super::entity_lifecycle::NaturalMobDespawnOutcome;
 use super::outbound::{
     OutboundCommand, SessionRecipient, VisibilityDispatch, dispatch_visibility_commands,
 };
@@ -9,6 +10,10 @@ use super::visibility::{session_recipients, visibility_dispatches};
 use super::{SessionId, SessionRegistry};
 
 impl SessionRegistry {
+    pub(crate) fn publish_natural_mob_despawn(&self, outcome: NaturalMobDespawnOutcome) {
+        dispatch_visibility_commands(outcome.dispatches);
+    }
+
     pub(crate) fn disconnect_player(&self, player_id: u64, reason: String) -> bool {
         let dispatch = {
             let inner = self.lock_inner("extension disconnect player");

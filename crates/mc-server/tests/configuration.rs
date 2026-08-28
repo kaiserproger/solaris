@@ -100,6 +100,7 @@ fn loader_manifest() -> mc_net::LoaderManifest {
             permissions: vec![mc_net::LoaderPermission::OpenScreens],
             cache_key: format!("example:screen/1/{}", "a".repeat(64)),
             source_path: None,
+            artifact_bytes: None,
             block_id: None,
             block_name: None,
         }],
@@ -558,7 +559,9 @@ async fn configuration_loader_streams_only_the_exact_requested_artifact() {
     manifest.bundles[0].sha256 = sha256.clone();
     manifest.bundles[0].size_bytes = artifact.len() as u64;
     manifest.bundles[0].cache_key = format!("example:screen/1/{sha256}");
-    manifest.bundles[0].source_path = Some(artifact_path);
+    manifest.bundles[0].source_path = Some(artifact_path.clone());
+    manifest.bundles[0].artifact_bytes = Some(std::sync::Arc::from(artifact.clone()));
+    fs::write(&artifact_path, vec![0x7b; artifact.len()]).unwrap();
     let addr = start_server_with_data_and_loader(
         std::sync::Arc::new(mc_data::testing::stub()),
         Some(std::sync::Arc::new(manifest.clone())),

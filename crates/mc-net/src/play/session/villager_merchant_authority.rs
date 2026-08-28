@@ -1,7 +1,8 @@
 use std::time::Instant;
 
+use mc_data::ItemStack;
+use mc_domain::GameMode;
 use mc_entity::{EntityId, EntityLifecycle};
-use mc_protocol::packets::play::{GameMode, ItemStack};
 
 use crate::play::containers::inputs_satisfy_offer;
 use crate::play::inventory::can_stack;

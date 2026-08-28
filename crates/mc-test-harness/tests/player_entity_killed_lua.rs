@@ -37,6 +37,8 @@ async fn player_entity_killed_reaches_lua_once_after_the_lethal_melee_commit() {
         r#"
             --!strict
 
+            local spawn_count = 0
+
             function on_player_entity_killed(event: any)
                 local expected = {
                     name = true, player_id = true, context_verified = true,
@@ -72,7 +74,9 @@ async fn player_entity_killed_reaches_lua_once_after_the_lethal_melee_commit() {
 
             function on_player_command(event: any)
                 if event.root == "spawn-kill-target" then
+                    spawn_count = spawn_count + 1
                     solaris.spawn_entity(
+                        "kill-target-" .. tostring(spawn_count),
                         event.player_id,
                         "minecraft:chicken",
                         event.x + 1.0,

@@ -1,21 +1,241 @@
+use std::collections::HashSet;
+use std::sync::Arc;
+
 use mc_data::block_facts::{BlockFactsTable, FluidKind};
 use mc_data::collision_shapes::{CollisionShapeTable, vanilla_collision_shapes};
+use mc_domain::GameMode;
 use mc_protocol::packets::play::MovePlayerFlags;
-use mc_world::{BlockPos, BlockRegistry, BlockStateId, WorldReadSnapshot};
+use mc_world::{BlockPos, BlockRegistry, BlockStateId, ChunkPos, WorldReadSnapshot, WorldReadView};
 use tracing::debug;
 
 use crate::error::ConnectionError;
 
 use super::PlayerPose;
 use super::campfire::{is_campfire_block, is_lit_campfire_block};
-use super::chunk_stream::passable_block_name;
-use super::survival::SurvivalState;
+use mc_data::block_semantics_26_1_2::passable_block_name;
 
 const PLAYER_HORIZONTAL_COORDINATE_LIMIT: f64 = 30_000_000.0;
 const PLAYER_VERTICAL_COORDINATE_LIMIT: f64 = 20_000_000.0;
 const COLLISION_DEFLATION: f64 = 1.0e-5_f32 as f64;
 const POWDER_SNOW_FALLING_TOP: f64 = 0.9_f32 as f64;
 const POWDER_SNOW_FALL_DISTANCE: f64 = 2.5;
+const PLAYER_BODY_HALF_WIDTH: f64 = 0.3;
+const PLAYER_SURVIVAL_MOVEMENT_LIMIT: f64 = 10.0;
+const PLAYER_FLYING_MOVEMENT_LIMIT: f64 = 16.0;
+const PLAYER_SWEEP_SAMPLE_STEP: f64 = 1.0 / 32.0;
+const PLAYER_EMBEDDED_ESCAPE_LIMIT: f64 = 0.5;
+const PLAYER_MOVEMENT_MAX_CHUNKS: usize = 9;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum PlayerPoseCommitKind {
+    Movement,
+    Teleport,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum PlayerMovementRejection {
+    InvalidPose,
+    Displacement,
+    DestinationUnloaded,
+    DestinationOutsideWorld,
+    SweptCollision,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum PlayerMovementAuthorityError {
+    Rejected(PlayerMovementRejection),
+    WorldUnavailable,
+}
+
+#[derive(Clone)]
+pub(super) struct PlayerMovementAuthorityResources {
+    world_read: WorldReadView,
+    blocks: Arc<BlockRegistry>,
+    block_facts: Arc<BlockFactsTable>,
+}
+
+impl std::fmt::Debug for PlayerMovementAuthorityResources {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("PlayerMovementAuthorityResources")
+            .finish_non_exhaustive()
+    }
+}
+
+impl PlayerMovementAuthorityResources {
+    pub(super) fn new(
+        world_read: WorldReadView,
+        blocks: Arc<BlockRegistry>,
+        block_facts: Arc<BlockFactsTable>,
+    ) -> Self {
+        Self {
+            world_read,
+            blocks,
+            block_facts,
+        }
+    }
+
+    pub(super) fn validate_movement(
+        &self,
+        loaded_chunks: &HashSet<(i32, i32)>,
+        old_pose: PlayerPose,
+        new_pose: PlayerPose,
+        game_mode: GameMode,
+        walks_on_powder_snow: bool,
+    ) -> Result<(), PlayerMovementAuthorityError> {
+        if !valid_authoritative_pose(new_pose) {
+            return Err(PlayerMovementAuthorityError::Rejected(
+                PlayerMovementRejection::InvalidPose,
+            ));
+        }
+
+        let delta = player_pose_delta(old_pose, new_pose);
+        let movement_limit = match game_mode {
+            GameMode::Creative | GameMode::Spectator => PLAYER_FLYING_MOVEMENT_LIMIT,
+            GameMode::Survival | GameMode::Adventure => PLAYER_SURVIVAL_MOVEMENT_LIMIT,
+        };
+        let displacement = mc_physics::Vec3::new(delta.0, delta.1, delta.2);
+        if !mc_physics::displacement_within_limit(displacement, movement_limit) {
+            return Err(PlayerMovementAuthorityError::Rejected(
+                PlayerMovementRejection::Displacement,
+            ));
+        }
+
+        // Rotation/flags-only updates do not need to re-prove world residency for an
+        // already authoritative position. A shrinking stance transition is safe for
+        // the same reason; expanding the collision volume still requires a snapshot.
+        if displacement == mc_physics::Vec3::ZERO
+            && new_pose.body_height() <= old_pose.body_height()
+        {
+            return Ok(());
+        }
+
+        let Some(destination_chunks) = player_body_chunks(new_pose) else {
+            return Err(PlayerMovementAuthorityError::Rejected(
+                PlayerMovementRejection::InvalidPose,
+            ));
+        };
+        if destination_chunks
+            .iter()
+            .any(|chunk| !loaded_chunks.contains(&(chunk.x, chunk.z)))
+        {
+            return Err(PlayerMovementAuthorityError::Rejected(
+                PlayerMovementRejection::DestinationUnloaded,
+            ));
+        }
+
+        let Some(swept_chunks) = swept_player_chunks(old_pose, new_pose) else {
+            return Err(PlayerMovementAuthorityError::Rejected(
+                PlayerMovementRejection::Displacement,
+            ));
+        };
+        let snapshot = self.world_read.snapshot_chunks(&swept_chunks);
+        if swept_chunks
+            .iter()
+            .any(|chunk| !snapshot.contains_chunk(*chunk))
+        {
+            return Err(PlayerMovementAuthorityError::WorldUnavailable);
+        }
+        for chunk in &destination_chunks {
+            let Some(chunk) = snapshot.chunk(*chunk) else {
+                return Err(PlayerMovementAuthorityError::WorldUnavailable);
+            };
+            let geometry = chunk.geometry();
+            if new_pose.y < f64::from(geometry.min_y())
+                || new_pose.y + new_pose.body_height() > f64::from(geometry.max_y())
+            {
+                return Err(PlayerMovementAuthorityError::Rejected(
+                    PlayerMovementRejection::DestinationOutsideWorld,
+                ));
+            }
+        }
+
+        let context = PlayerCollisionContext::from_pose(old_pose, walks_on_powder_snow);
+        let old_collides = player_pose_collides_with_solid_in_snapshot_with_context(
+            &self.block_facts,
+            &self.blocks,
+            &snapshot,
+            old_pose,
+            context,
+        );
+        if old_collides
+            && mc_physics::displacement_within_limit(displacement, PLAYER_EMBEDDED_ESCAPE_LIMIT)
+            && !player_pose_collides_with_solid_in_snapshot_with_context(
+                &self.block_facts,
+                &self.blocks,
+                &snapshot,
+                new_pose,
+                context,
+            )
+        {
+            return Ok(());
+        }
+
+        let Some(steps) = mc_physics::sweep_sample_count(displacement, PLAYER_SWEEP_SAMPLE_STEP)
+        else {
+            return Err(PlayerMovementAuthorityError::Rejected(
+                PlayerMovementRejection::Displacement,
+            ));
+        };
+        for step in 1..=steps {
+            let t = step as f64 / steps as f64;
+            let mut sample = new_pose;
+            sample.x = old_pose.x + delta.0 * t;
+            sample.y = old_pose.y + delta.1 * t;
+            sample.z = old_pose.z + delta.2 * t;
+            if player_pose_collides_with_solid_in_snapshot_with_context(
+                &self.block_facts,
+                &self.blocks,
+                &snapshot,
+                sample,
+                context,
+            ) {
+                return Err(PlayerMovementAuthorityError::Rejected(
+                    PlayerMovementRejection::SweptCollision,
+                ));
+            }
+        }
+        Ok(())
+    }
+}
+
+pub(super) fn valid_authoritative_pose(pose: PlayerPose) -> bool {
+    mc_physics::authoritative_pose_within_limits(
+        mc_physics::Vec3::new(pose.x, pose.y, pose.z),
+        pose.yaw,
+        pose.pitch,
+        PLAYER_HORIZONTAL_COORDINATE_LIMIT,
+        PLAYER_VERTICAL_COORDINATE_LIMIT,
+    )
+}
+
+fn player_pose_delta(old_pose: PlayerPose, new_pose: PlayerPose) -> (f64, f64, f64) {
+    (
+        new_pose.x - old_pose.x,
+        new_pose.y - old_pose.y,
+        new_pose.z - old_pose.z,
+    )
+}
+
+fn player_body_chunks(pose: PlayerPose) -> Option<Vec<ChunkPos>> {
+    mc_world::chunk_rectangle_for_world_bounds(
+        pose.x - PLAYER_BODY_HALF_WIDTH,
+        pose.x + PLAYER_BODY_HALF_WIDTH,
+        pose.z - PLAYER_BODY_HALF_WIDTH,
+        pose.z + PLAYER_BODY_HALF_WIDTH,
+        PLAYER_MOVEMENT_MAX_CHUNKS,
+    )
+}
+
+fn swept_player_chunks(old_pose: PlayerPose, new_pose: PlayerPose) -> Option<Vec<ChunkPos>> {
+    mc_world::chunk_rectangle_for_world_bounds(
+        old_pose.x.min(new_pose.x) - PLAYER_BODY_HALF_WIDTH,
+        old_pose.x.max(new_pose.x) + PLAYER_BODY_HALF_WIDTH,
+        old_pose.z.min(new_pose.z) - PLAYER_BODY_HALF_WIDTH,
+        old_pose.z.max(new_pose.z) + PLAYER_BODY_HALF_WIDTH,
+        PLAYER_MOVEMENT_MAX_CHUNKS,
+    )
+}
 
 #[derive(Debug, Clone, Copy)]
 pub(super) struct PlayerCollisionContext {
@@ -46,28 +266,20 @@ pub(super) struct AcceptedAbsoluteMovement {
 }
 
 pub(super) fn validate_player_rotation(yaw: f32, pitch: f32) -> Result<(), ConnectionError> {
-    if yaw.is_finite() && pitch.is_finite() {
-        Ok(())
-    } else {
-        Err(ConnectionError::InvalidPlayerMovement)
-    }
+    mc_physics::rotation_is_finite(yaw, pitch)
+        .then_some(())
+        .ok_or(ConnectionError::InvalidPlayerMovement)
 }
 
 pub(super) fn clamp_player_coordinates(x: f64, y: f64, z: f64) -> (f64, f64, f64) {
-    (
-        x.clamp(
-            -PLAYER_HORIZONTAL_COORDINATE_LIMIT,
-            PLAYER_HORIZONTAL_COORDINATE_LIMIT,
-        ),
-        y.clamp(
-            -PLAYER_VERTICAL_COORDINATE_LIMIT,
-            PLAYER_VERTICAL_COORDINATE_LIMIT,
-        ),
-        z.clamp(
-            -PLAYER_HORIZONTAL_COORDINATE_LIMIT,
-            PLAYER_HORIZONTAL_COORDINATE_LIMIT,
-        ),
+    let input = mc_physics::Vec3::new(x, y, z);
+    let position = mc_physics::clamp_world_position(
+        input,
+        PLAYER_HORIZONTAL_COORDINATE_LIMIT,
+        PLAYER_VERTICAL_COORDINATE_LIMIT,
     )
+    .unwrap_or(input);
+    (position.x, position.y, position.z)
 }
 
 pub(super) fn clamp_player_pose(mut pose: PlayerPose) -> PlayerPose {
@@ -124,12 +336,16 @@ pub(super) fn player_water_overlap_in_snapshot(
 }
 
 pub(super) fn refresh_player_fall_state(old_pose: PlayerPose, new_pose: &mut PlayerPose) {
-    if new_pose.in_water || new_pose.flags.on_ground {
-        new_pose.fall_start_y = new_pose.y;
-    } else if old_pose.flags.on_ground || old_pose.in_water {
-        new_pose.fall_start_y = old_pose.y.max(new_pose.y);
-    } else {
-        new_pose.fall_start_y = old_pose.fall_start_y.max(new_pose.y);
+    if let Some(fall_start_y) = mc_physics::next_fall_start_y(
+        old_pose.y,
+        old_pose.fall_start_y,
+        old_pose.flags.on_ground,
+        old_pose.in_water,
+        new_pose.y,
+        new_pose.flags.on_ground,
+        new_pose.in_water,
+    ) {
+        new_pose.fall_start_y = fall_start_y;
     }
 }
 
@@ -211,13 +427,27 @@ fn player_collision_state_intersects(
     let block_min_y = f64::from(block_pos.y);
     let block_min_z = f64::from(block_pos.z);
     let player_half_width = 0.3;
+    let body = [
+        pose.x - player_half_width,
+        pose.y,
+        pose.z - player_half_width,
+        pose.x + player_half_width,
+        pose.y + pose.body_height(),
+        pose.z + player_half_width,
+    ];
     let intersects = |[min_x, min_y, min_z, max_x, max_y, max_z]: [f64; 6]| {
-        pose.x - player_half_width < block_min_x + max_x - COLLISION_DEFLATION
-            && pose.x + player_half_width > block_min_x + min_x + COLLISION_DEFLATION
-            && pose.y < block_min_y + max_y - COLLISION_DEFLATION
-            && pose.y + pose.body_height() > block_min_y + min_y + COLLISION_DEFLATION
-            && pose.z - player_half_width < block_min_z + max_z - COLLISION_DEFLATION
-            && pose.z + player_half_width > block_min_z + min_z + COLLISION_DEFLATION
+        mc_physics::aabb_intersects_deflated_obstacle(
+            body,
+            [
+                block_min_x + min_x,
+                block_min_y + min_y,
+                block_min_z + min_z,
+                block_min_x + max_x,
+                block_min_y + max_y,
+                block_min_z + max_z,
+            ],
+            COLLISION_DEFLATION,
+        )
     };
 
     let exact_shape = collision_shapes.get_for_state(
@@ -383,7 +613,8 @@ pub(super) fn movement_exhaustion(old_pose: PlayerPose, new_pose: PlayerPose) ->
     let horizontal_distance = dx.hypot(dz);
     let mut exhaustion = 0.0;
     if new_pose.sprinting && horizontal_distance > 0.0 {
-        exhaustion += horizontal_distance as f32 * SurvivalState::SPRINT_EXHAUSTION_PER_METER;
+        exhaustion += horizontal_distance as f32
+            * mc_entity::player_survival_26_1_2::SPRINT_EXHAUSTION_PER_METER;
     }
     if new_pose.input.jump
         && old_pose.flags.on_ground
@@ -391,9 +622,9 @@ pub(super) fn movement_exhaustion(old_pose: PlayerPose, new_pose: PlayerPose) ->
         && new_pose.y > old_pose.y
     {
         exhaustion += if new_pose.sprinting {
-            SurvivalState::SPRINT_JUMP_EXHAUSTION
+            mc_entity::player_survival_26_1_2::SPRINT_JUMP_EXHAUSTION
         } else {
-            SurvivalState::JUMP_EXHAUSTION
+            mc_entity::player_survival_26_1_2::JUMP_EXHAUSTION
         };
     }
     exhaustion

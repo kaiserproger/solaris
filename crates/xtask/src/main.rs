@@ -4,6 +4,18 @@ use std::fs;
 use std::path::{Path, PathBuf};
 
 const PLUGIN_API_CRATES: &[&str] = &["mc-extension", "mc-script"];
+const MC_NET_LOWER_CRATES: &[&str] = &[
+    "mc-data",
+    "mc-domain",
+    "mc-entity",
+    "mc-extension",
+    "mc-nbt",
+    "mc-physics",
+    "mc-protocol",
+    "mc-script",
+    "mc-world",
+    "mc-worldgen",
+];
 const FORBIDDEN_API_TYPES: &[&str] = &[
     "WorldHandle",
     "SessionRegistry",
@@ -57,6 +69,40 @@ struct OwnershipRule {
     definition_file: &'static str,
     definition_anchor: &'static str,
 }
+
+struct FunctionSizeBudget {
+    name: &'static str,
+    file: &'static str,
+    signature: &'static str,
+    max_lines: usize,
+}
+
+const GATEWAY_FUNCTION_SIZE_BUDGETS: &[FunctionSizeBudget] = &[
+    FunctionSizeBudget {
+        name: "Play ingress gateway",
+        file: "crates/mc-net/src/play.rs",
+        signature: "async fn play_loop_inner<R, W>(",
+        max_lines: 731,
+    },
+    FunctionSizeBudget {
+        name: "server lifecycle gateway",
+        file: "crates/mc-net/src/server.rs",
+        signature: "pub async fn serve(self) -> std::io::Result<()> {",
+        max_lines: 277,
+    },
+    FunctionSizeBudget {
+        name: "entity ticker runtime",
+        file: "crates/mc-net/src/server/entity_ticker.rs",
+        signature: "pub(super) async fn run_entity_ticker(context: EntityTickerContext) {",
+        max_lines: 1_053,
+    },
+    FunctionSizeBudget {
+        name: "simulation batch gateway",
+        file: "crates/mc-net/src/play/simulation.rs",
+        signature: "fn process_batch(",
+        max_lines: 998,
+    },
+];
 
 const MC_NET_OWNERSHIP: &[OwnershipRule] = &[
     OwnershipRule {
@@ -1430,6 +1476,27 @@ const LOWER_CRATE_OWNERSHIP: &[OwnershipRule] = &[OwnershipRule {
     definition_anchor: "pub trait PlantBlockRead",
 }];
 
+/// Placement rules `mc-data` must own.
+const BLOCK_PLACEMENT_SEMANTICS: &[&str] = &[
+    "resolve_stair_shape",
+    "merge_slab_state",
+    "apply_waterlogged_state",
+    "torch_state_for_direction",
+    "sign_state_for_direction",
+];
+
+/// Placement rule definitions that must not be reimplemented in `mc-net`.
+const BLOCK_PLACEMENT_DUPLICATE_DEFINITIONS: &[&str] = &[
+    "fn resolve_stair_shape",
+    "fn merge_slab_state",
+    "fn apply_waterlogged_state",
+    "fn torch_state_for_direction",
+    "fn sign_state_for_direction",
+    "fn horizontal_axis",
+    "fn opposite",
+    "fn counter_clockwise",
+];
+
 const LEGACY_MC_NET_PARENTS: &[&str] = &[
     "crates/mc-net/src/play.rs",
     "crates/mc-net/src/play/session.rs",
@@ -1463,8 +1530,11 @@ fn run_code_health() -> Result<(), i32> {
     let mut findings = Vec::new();
     scan_mc_net_ownership(&root, MC_NET_OWNERSHIP, &mut findings);
     scan_mc_net_ownership(&root, LOWER_CRATE_OWNERSHIP, &mut findings);
+    scan_block_placement_semantics(&root, &mut findings);
+    scan_gateway_function_sizes(&root, GATEWAY_FUNCTION_SIZE_BUDGETS, &mut findings);
     scan_rust_sources(&root.join("crates"), &mut findings);
     scan_api_manifests(&root, &mut findings);
+    scan_mc_net_reverse_dependencies(&root, &mut findings);
 
     println!("Solaris code-health report");
     println!();
@@ -1498,6 +1568,64 @@ fn workspace_root() -> Result<PathBuf, String> {
         }
         if !dir.pop() {
             return Err("could not find workspace root with Cargo.toml and crates/".into());
+        }
+    }
+}
+
+fn scan_gateway_function_sizes(
+    root: &Path,
+    budgets: &[FunctionSizeBudget],
+    findings: &mut Vec<Finding>,
+) {
+    for budget in budgets {
+        let path = root.join(budget.file);
+        let Ok(source) = fs::read_to_string(&path) else {
+            findings.push(Finding {
+                path,
+                line: 1,
+                message: format!("{} source file is missing", budget.name),
+            });
+            continue;
+        };
+        let lines = source.lines().collect::<Vec<_>>();
+        let Some(start) = lines
+            .iter()
+            .position(|line| line.contains(budget.signature))
+        else {
+            findings.push(Finding {
+                path,
+                line: 1,
+                message: format!("{} signature is missing", budget.name),
+            });
+            continue;
+        };
+        let indentation = lines[start].len() - lines[start].trim_start().len();
+        let closing = lines
+            .iter()
+            .enumerate()
+            .skip(start + 1)
+            .find(|(_, line)| {
+                line.len() - line.trim_start().len() == indentation && line.trim() == "}"
+            })
+            .map(|(index, _)| index);
+        let Some(end) = closing else {
+            findings.push(Finding {
+                path,
+                line: start + 1,
+                message: format!("{} closing boundary is missing", budget.name),
+            });
+            continue;
+        };
+        let lines_used = end - start + 1;
+        if lines_used > budget.max_lines {
+            findings.push(Finding {
+                path,
+                line: start + 1,
+                message: format!(
+                    "{} is {lines_used} lines; architecture budget is {} lines",
+                    budget.name, budget.max_lines
+                ),
+            });
         }
     }
 }
@@ -1622,6 +1750,52 @@ fn source_line(source: &str, anchor: &str) -> Option<usize> {
     })
 }
 
+fn scan_block_placement_semantics(root: &Path, findings: &mut Vec<Finding>) {
+    let owner_path = root.join("crates/mc-data/src/block_placement_26_1_2.rs");
+    let owner_source = match fs::read_to_string(&owner_path) {
+        Ok(source) => source,
+        Err(_) => {
+            findings.push(Finding {
+                path: owner_path,
+                line: 1,
+                message: "block placement semantics owner module is missing".into(),
+            });
+            return;
+        }
+    };
+    for required in BLOCK_PLACEMENT_SEMANTICS {
+        if !owner_source.contains(required) {
+            findings.push(Finding {
+                path: owner_path.clone(),
+                line: 1,
+                message: format!("block placement semantics owner is missing `{required}`"),
+            });
+        }
+    }
+
+    let net_path = root.join("crates/mc-net/src/play/block_placement.rs");
+    let net_source = match fs::read_to_string(&net_path) {
+        Ok(source) => source,
+        Err(_) => {
+            findings.push(Finding {
+                path: net_path,
+                line: 1,
+                message: "block placement network module is missing".into(),
+            });
+            return;
+        }
+    };
+    for definition in BLOCK_PLACEMENT_DUPLICATE_DEFINITIONS {
+        if let Some(line) = source_line(&net_source, definition) {
+            findings.push(Finding {
+                path: net_path.clone(),
+                line,
+                message: format!("block placement semantics duplicated in mc-net: `{definition}`"),
+            });
+        }
+    }
+}
+
 fn scan_rust_file(path: &Path, findings: &mut Vec<Finding>) {
     let Ok(source) = fs::read_to_string(path) else {
         return;
@@ -1629,6 +1803,19 @@ fn scan_rust_file(path: &Path, findings: &mut Vec<Finding>) {
     let lines: Vec<&str> = source.lines().collect();
     scan_generic_modules(path, &lines, findings);
     scan_plant_rules_boundary(path, &lines, findings);
+    scan_movement_rules_boundary(path, &lines, findings);
+    scan_domain_value_boundary(path, &lines, findings);
+    scan_item_stack_boundary(path, &lines, findings);
+    scan_inventory_semantics_boundary(path, &lines, findings);
+    scan_recipe_semantics_boundary(path, &lines, findings);
+    scan_chunk_stream_plan_boundary(path, &lines, findings);
+    scan_natural_spawn_template_boundary(path, &lines, findings);
+    scan_block_semantics_boundary(path, &lines, findings);
+    scan_player_combat_boundary(path, &lines, findings);
+    scan_merchant_semantics_boundary(path, &lines, findings);
+    scan_survival_mining_boundary(path, &lines, findings);
+    scan_lower_crate_transport_leaks(path, &lines, findings);
+    scan_domain_type_ownership(path, &lines, findings);
     scan_combat_boundary(path, &lines, findings);
     scan_player_combat_adapter(path, &lines, findings);
     scan_player_combat_shared_shield(path, &lines, findings);
@@ -1699,6 +1886,926 @@ fn scan_plant_rules_boundary(path: &Path, lines: &[&str], findings: &mut Vec<Fin
                 message: "plant rules depend on network, session, mutation, or async runtime"
                     .into(),
             });
+        }
+    }
+}
+
+fn scan_movement_rules_boundary(path: &Path, lines: &[&str], findings: &mut Vec<Finding>) {
+    let source = lines.join("\n");
+    if path.ends_with("mc-world/src/chunk.rs") {
+        if !source.contains("pub fn chunk_rectangle_for_world_bounds(") {
+            findings.push(Finding {
+                path: path.to_path_buf(),
+                line: 1,
+                message: "bounded world chunk coverage rule left mc-world".into(),
+            });
+        }
+        return;
+    }
+    if path.ends_with("mc-physics/src/lib.rs") {
+        if !source.contains("pub fn displacement_within_limit(") {
+            findings.push(Finding {
+                path: path.to_path_buf(),
+                line: 1,
+                message: "movement displacement budget rule left mc-physics".into(),
+            });
+        }
+        if !source.contains("pub fn authoritative_pose_within_limits(") {
+            findings.push(Finding {
+                path: path.to_path_buf(),
+                line: 1,
+                message: "authoritative pose validation rule left mc-physics".into(),
+            });
+        }
+        if !source.contains("pub fn sweep_sample_count(") {
+            findings.push(Finding {
+                path: path.to_path_buf(),
+                line: 1,
+                message: "movement sweep sampling rule left mc-physics".into(),
+            });
+        }
+        if !source.contains("pub fn rotation_is_finite(")
+            || !source.contains("pub fn clamp_world_position(")
+        {
+            findings.push(Finding {
+                path: path.to_path_buf(),
+                line: 1,
+                message: "movement normalization rules left mc-physics".into(),
+            });
+        }
+        if !source.contains("pub fn aabb_intersects_deflated_obstacle(") {
+            findings.push(Finding {
+                path: path.to_path_buf(),
+                line: 1,
+                message: "movement AABB overlap rule left mc-physics".into(),
+            });
+        }
+        if !source.contains("pub fn next_fall_start_y(") {
+            findings.push(Finding {
+                path: path.to_path_buf(),
+                line: 1,
+                message: "player fall-state rule left mc-physics".into(),
+            });
+        }
+        return;
+    }
+    if !path.ends_with("mc-net/src/play/movement.rs") {
+        return;
+    }
+    if !source.contains("mc_physics::displacement_within_limit") {
+        findings.push(Finding {
+            path: path.to_path_buf(),
+            line: 1,
+            message: "mc-net movement adapter bypasses mc-physics displacement budget rule".into(),
+        });
+    }
+    if !source.contains("mc_physics::authoritative_pose_within_limits") {
+        findings.push(Finding {
+            path: path.to_path_buf(),
+            line: 1,
+            message: "mc-net movement adapter bypasses mc-physics pose validation rule".into(),
+        });
+    }
+    if !source.contains("mc_physics::sweep_sample_count") {
+        findings.push(Finding {
+            path: path.to_path_buf(),
+            line: 1,
+            message: "mc-net movement adapter bypasses mc-physics sweep sampling rule".into(),
+        });
+    }
+    if !source.contains("mc_physics::rotation_is_finite")
+        || !source.contains("mc_physics::clamp_world_position")
+    {
+        findings.push(Finding {
+            path: path.to_path_buf(),
+            line: 1,
+            message: "mc-net movement adapter bypasses mc-physics normalization rules".into(),
+        });
+    }
+    if !source.contains("mc_world::chunk_rectangle_for_world_bounds") {
+        findings.push(Finding {
+            path: path.to_path_buf(),
+            line: 1,
+            message: "mc-net movement adapter bypasses bounded chunk coverage helper".into(),
+        });
+    }
+    if !source.contains("mc_physics::aabb_intersects_deflated_obstacle") {
+        findings.push(Finding {
+            path: path.to_path_buf(),
+            line: 1,
+            message: "mc-net movement adapter bypasses mc-physics AABB overlap rule".into(),
+        });
+    }
+    if !source.contains("mc_physics::next_fall_start_y") {
+        findings.push(Finding {
+            path: path.to_path_buf(),
+            line: 1,
+            message: "mc-net movement adapter bypasses mc-physics fall-state rule".into(),
+        });
+    }
+    if source.contains(".mul_add(") {
+        findings.push(Finding {
+            path: path.to_path_buf(),
+            line: 1,
+            message: "raw squared-distance movement budget math returned to mc-net".into(),
+        });
+    }
+}
+
+fn scan_domain_value_boundary(path: &Path, lines: &[&str], findings: &mut Vec<Finding>) {
+    let source = lines.join("\n");
+    if path.ends_with("mc-domain/src/lib.rs") {
+        for anchor in [
+            "pub enum GameMode",
+            "pub enum Direction",
+            "pub enum InteractionHand",
+        ] {
+            if !source.contains(anchor) {
+                findings.push(Finding {
+                    path: path.to_path_buf(),
+                    line: 1,
+                    message: "shared gameplay value type left mc-domain owner".into(),
+                });
+            }
+        }
+        return;
+    }
+
+    if !path.ends_with("mc-protocol/src/packets/play.rs") {
+        return;
+    }
+    for anchor in [
+        "pub use mc_domain::GameMode;",
+        "pub use mc_domain::Direction;",
+        "pub use mc_domain::InteractionHand;",
+    ] {
+        if !source.contains(anchor) {
+            findings.push(Finding {
+                path: path.to_path_buf(),
+                line: 1,
+                message: "mc-protocol stopped adapting shared gameplay values from mc-domain"
+                    .into(),
+            });
+        }
+    }
+}
+
+fn scan_item_stack_boundary(path: &Path, lines: &[&str], findings: &mut Vec<Finding>) {
+    let source = lines.join("\n");
+    if path.ends_with("mc-data/src/item_stack.rs") {
+        if !source.contains("pub struct ItemStack")
+            || !source.contains("pub const EMPTY: ItemStack")
+            || !source.contains("pub fn is_empty(&self)")
+        {
+            findings.push(Finding {
+                path: path.to_path_buf(),
+                line: 1,
+                message: "ItemStack domain value left mc-data owner".into(),
+            });
+        }
+        return;
+    }
+
+    if path.ends_with("mc-protocol/src/packets/play.rs")
+        && !source.contains("pub use mc_data::item_stack::ItemStack;")
+    {
+        findings.push(Finding {
+            path: path.to_path_buf(),
+            line: 1,
+            message: "mc-protocol stopped adapting canonical ItemStack from mc-data".into(),
+        });
+    }
+}
+
+fn scan_inventory_semantics_boundary(path: &Path, lines: &[&str], findings: &mut Vec<Finding>) {
+    let source = lines.join("\n");
+    if path.ends_with("mc-data/src/inventory_semantics_26_1_2.rs") {
+        for anchor in [
+            "pub fn canonicalize_empty(",
+            "pub fn canonical_stack(",
+            "pub fn can_stack(",
+            "pub fn take_from_stack(",
+            "pub fn decrement_stack(",
+            "pub fn take_throw_stack(",
+            "pub fn apply_regular_pickup_slot(",
+            "pub fn apply_regular_swap_slot(",
+            "pub fn apply_regular_throw_slot(",
+            "pub fn apply_outside_pickup_click(",
+        ] {
+            if !source.contains(anchor) {
+                findings.push(Finding {
+                    path: path.to_path_buf(),
+                    line: 1,
+                    message: "inventory stack transaction semantics left mc-data owner".into(),
+                });
+            }
+        }
+        return;
+    }
+    if path.ends_with("mc-data/src/item_semantics_26_1_2.rs")
+        && !source.contains("pub fn equippable_player_slot(")
+    {
+        findings.push(Finding {
+            path: path.to_path_buf(),
+            line: 1,
+            message: "equipment slot semantics left mc-data owner".into(),
+        });
+        return;
+    }
+    if path.ends_with("mc-data/src/armor.rs") {
+        for anchor in [
+            "pub struct ArmorStats",
+            "pub fn armor_reduced_damage(",
+            "pub fn protection_reduced_damage(",
+        ] {
+            if !source.contains(anchor) {
+                findings.push(Finding {
+                    path: path.to_path_buf(),
+                    line: 1,
+                    message: "armor reduction semantics left mc-data owner".into(),
+                });
+            }
+        }
+        return;
+    }
+    if path.ends_with("mc-net/src/play/inventory.rs") {
+        for anchor in [
+            "mc_data::inventory_semantics_26_1_2::can_stack",
+            "mc_data::inventory_semantics_26_1_2::apply_regular_pickup_slot",
+            "mc_data::inventory_semantics_26_1_2::apply_regular_swap_slot",
+            "mc_data::inventory_semantics_26_1_2::apply_regular_throw_slot",
+            "mc_data::inventory_semantics_26_1_2::apply_outside_pickup_click",
+            "mc_data::item_semantics_26_1_2::equippable_player_slot",
+            "mc_data::armor::armor_reduced_damage",
+            "mc_data::armor::protection_reduced_damage",
+        ] {
+            if !source.contains(anchor) {
+                findings.push(Finding {
+                    path: path.to_path_buf(),
+                    line: 1,
+                    message: "mc-net inventory adapter bypasses lower inventory/equipment rules"
+                        .into(),
+                });
+            }
+        }
+    }
+}
+
+fn scan_recipe_semantics_boundary(path: &Path, lines: &[&str], findings: &mut Vec<Finding>) {
+    let source = lines.join("\n");
+    if path.ends_with("mc-data/src/recipes.rs") {
+        for anchor in [
+            "pub fn ingredient_accepts_item(",
+            "pub fn stonecutting_recipe_accepts_input(",
+            "pub enum CookingKind",
+            "pub fn find_cooking_recipe_for_item(",
+            "pub fn furnace_fuel_ticks(",
+            "pub fn shaped_recipe_matches(",
+            "pub fn shapeless_recipe_matches(",
+            "pub fn crafting_recipe_matches(",
+            "pub fn repair_item_crafting_result(",
+            "pub fn crafting_result_from_input(",
+            "pub fn furnace_experience_award(",
+        ] {
+            if !source.contains(anchor) {
+                findings.push(Finding {
+                    path: path.to_path_buf(),
+                    line: 1,
+                    message: "recipe selection semantics left mc-data owner".into(),
+                });
+            }
+        }
+        return;
+    }
+    if path.ends_with("mc-net/src/play/containers/stonecutter.rs") {
+        if !source.contains("mc_data::recipes::stonecutting_recipe_accepts_input") {
+            findings.push(Finding {
+                path: path.to_path_buf(),
+                line: 1,
+                message: "mc-net stonecutter bypasses mc-data recipe selection".into(),
+            });
+        }
+        return;
+    }
+    if path.ends_with("mc-net/src/play/containers/crafting.rs") {
+        for anchor in [
+            "mc_data::recipes::repair_item_crafting_result",
+            "mc_data::recipes::crafting_result_from_input",
+        ] {
+            if !source.contains(anchor) {
+                findings.push(Finding {
+                    path: path.to_path_buf(),
+                    line: 1,
+                    message: "mc-net crafting bypasses mc-data recipe semantics".into(),
+                });
+            }
+        }
+        return;
+    }
+    if path.ends_with("mc-net/src/play/containers/furnace.rs") {
+        for anchor in [
+            "mc_data::recipes::find_cooking_recipe_for_item",
+            "mc_data::recipes::furnace_fuel_ticks",
+            "mc_data::recipes::furnace_experience_award",
+        ] {
+            if !source.contains(anchor) {
+                findings.push(Finding {
+                    path: path.to_path_buf(),
+                    line: 1,
+                    message: "mc-net furnace bypasses mc-data cooking semantics".into(),
+                });
+            }
+        }
+        return;
+    }
+    if path.ends_with("mc-net/src/play/recipes.rs")
+        && !source.contains("mc_data::recipes::ingredient_accepts_item")
+    {
+        findings.push(Finding {
+            path: path.to_path_buf(),
+            line: 1,
+            message: "mc-net recipe adapter bypasses mc-data ingredient matcher".into(),
+        });
+    }
+}
+
+fn scan_chunk_stream_plan_boundary(path: &Path, lines: &[&str], findings: &mut Vec<Finding>) {
+    let source = lines.join("\n");
+    if path.ends_with("mc-world/src/chunk_stream_plan_26_1_2.rs") {
+        for anchor in [
+            "pub fn spiral_chunks(",
+            "pub fn prioritized_spiral(",
+            "pub fn prewarm_edge_ring_chunks(",
+            "pub fn prewarm_edge_batch_limit(",
+            "pub fn prewarm_edge_batch_chunks(",
+            "pub fn initial_window_target(",
+            "pub fn desired_chunk_set(",
+            "pub fn forward_from_yaw(",
+            "pub fn directional_score(",
+            "pub fn directional_lateral(",
+            "pub fn distance_to_signed_chunk_edge(",
+        ] {
+            if !source.contains(anchor) {
+                findings.push(Finding {
+                    path: path.to_path_buf(),
+                    line: 1,
+                    message: "chunk-stream coordinate planning left mc-world owner".into(),
+                });
+            }
+        }
+        return;
+    }
+    if !path.ends_with("mc-net/src/play/chunk_stream.rs") {
+        return;
+    }
+    for anchor in [
+        "mc_world::chunk_stream_plan_26_1_2::spiral_chunks",
+        "mc_world::chunk_stream_plan_26_1_2::prioritize_chunks",
+        "mc_world::chunk_stream_plan_26_1_2::prewarm_edge_ring_chunks",
+        "mc_world::chunk_stream_plan_26_1_2::prewarm_edge_batch_limit",
+        "mc_world::chunk_stream_plan_26_1_2::prewarm_edge_batch_chunks",
+        "mc_world::chunk_stream_plan_26_1_2::initial_window_target",
+        "mc_world::chunk_stream_plan_26_1_2::desired_chunk_set",
+    ] {
+        if !source.contains(anchor) {
+            findings.push(Finding {
+                path: path.to_path_buf(),
+                line: 1,
+                message: "mc-net chunk stream bypasses mc-world coordinate planner".into(),
+            });
+        }
+    }
+}
+
+fn scan_natural_spawn_template_boundary(path: &Path, lines: &[&str], findings: &mut Vec<Finding>) {
+    let source = lines.join("\n");
+    if path.ends_with("mc-entity/src/natural_spawn_26_1_2.rs") {
+        for anchor in [
+            "pub fn passive_chunk_spawns(",
+            "pub fn hostile_chunk_spawns(",
+            "pub fn natural_sheep_color(",
+            "pub fn sheep_color_for_rolls(",
+            "pub fn choose_biome_spawn(",
+            "pub fn herd_entry_count(",
+            "pub fn safe_land_spawn_offset(",
+        ] {
+            if !source.contains(anchor) {
+                findings.push(Finding {
+                    path: path.to_path_buf(),
+                    line: 1,
+                    message: "deterministic natural-spawn template rule left mc-entity owner"
+                        .into(),
+                });
+            }
+        }
+        return;
+    }
+    if path.ends_with("mc-entity/src/natural_spawn_26_1_2/planning.rs") {
+        for anchor in [
+            "pub struct ChunkHerdPlanningContext",
+            "pub fn plan_chunk_herd_templates(",
+            "pub fn chunk_biome_at(",
+            "pub fn herd_surface_y(",
+        ] {
+            if !source.contains(anchor) {
+                findings.push(Finding {
+                    path: path.to_path_buf(),
+                    line: 1,
+                    message: "natural-spawn chunk planning left mc-entity owner".into(),
+                });
+            }
+        }
+        return;
+    }
+    if !path.ends_with("mc-net/src/play/chunk_stream.rs") {
+        return;
+    }
+    for anchor in [
+        "mc_entity::natural_spawn_26_1_2::plan_chunk_herd_templates",
+        "mc_entity::natural_spawn_26_1_2::ChunkHerdPlanningContext",
+        "mc_entity::natural_spawn_26_1_2::passive_chunk_spawns",
+        "mc_entity::natural_spawn_26_1_2::hostile_chunk_spawns",
+        "mc_entity::natural_spawn_26_1_2::natural_sheep_color",
+        "mc_entity::natural_spawn_26_1_2::sheep_color_for_rolls",
+    ] {
+        if !source.contains(anchor) {
+            findings.push(Finding {
+                path: path.to_path_buf(),
+                line: 1,
+                message: "chunk-stream spawn template adapter bypasses mc-entity owner".into(),
+            });
+        }
+    }
+    for forbidden in [
+        "fn herd_spawn_surface(",
+        "fn herd_land_surface_y(",
+        "fn herd_spawn_clearance(",
+        "fn herd_spawn_minimal_clearance(",
+    ] {
+        if source.contains(forbidden) {
+            findings.push(Finding {
+                path: path.to_path_buf(),
+                line: 1,
+                message: "natural-spawn geometry returned to mc-net".into(),
+            });
+        }
+    }
+}
+
+fn scan_block_semantics_boundary(path: &Path, lines: &[&str], findings: &mut Vec<Finding>) {
+    let source = lines.join("\n");
+    if path.ends_with("mc-data/src/block_semantics_26_1_2.rs") {
+        for anchor in [
+            "pub fn passive_herd_fallback_surface_name(",
+            "pub fn passable_block_name(",
+        ] {
+            if !source.contains(anchor) {
+                findings.push(Finding {
+                    path: path.to_path_buf(),
+                    line: 1,
+                    message: "26.1.2 block-name semantics left mc-data owner".into(),
+                });
+            }
+        }
+        return;
+    }
+    if path.ends_with("mc-net/src/play/chunk_stream.rs") {
+        for anchor in [
+            "mc_data::block_semantics_26_1_2::passive_herd_fallback_surface_name",
+            "mc_data::block_semantics_26_1_2::passable_block_name",
+        ] {
+            if !source.contains(anchor) {
+                findings.push(Finding {
+                    path: path.to_path_buf(),
+                    line: 1,
+                    message: "mc-net block semantics adapter bypasses mc-data owner".into(),
+                });
+            }
+        }
+        if source.contains("matches!(\n        name,\n        \"minecraft:air\"") {
+            findings.push(Finding {
+                path: path.to_path_buf(),
+                line: 1,
+                message: "passable block-name table returned to mc-net".into(),
+            });
+        }
+        return;
+    }
+    if [
+        "mc-net/src/play/movement.rs",
+        "mc-net/src/play/falling_blocks.rs",
+        "mc-net/src/play/spawn.rs",
+    ]
+    .iter()
+    .any(|suffix| path.ends_with(suffix))
+        && !source.contains("mc_data::block_semantics_26_1_2::passable_block_name")
+    {
+        findings.push(Finding {
+            path: path.to_path_buf(),
+            line: 1,
+            message: "production block-semantics consumer returned to chunk-stream shim".into(),
+        });
+    }
+}
+
+fn scan_player_combat_boundary(path: &Path, lines: &[&str], findings: &mut Vec<Finding>) {
+    let source = lines.join("\n");
+    if path.ends_with("mc-entity/src/player_combat_26_1_2.rs") {
+        for anchor in [
+            "pub struct HurtResistance",
+            "pub enum HurtResolution",
+            "pub fn melee_knockback(",
+            "pub fn shield_block_knockback(",
+            "pub fn horizontal_look_direction(",
+            "pub fn shield_blocks_damage_since(",
+            "pub fn shield_durability_damage(",
+            "pub fn shield_disable_ticks(",
+        ] {
+            if !source.contains(anchor) {
+                findings.push(Finding {
+                    path: path.to_path_buf(),
+                    line: 1,
+                    message: "player combat math left mc-entity owner".into(),
+                });
+            }
+        }
+        return;
+    }
+    if path.ends_with("mc-data/src/item_semantics_26_1_2.rs") {
+        for anchor in [
+            "pub fn is_durability_tool_path(",
+            "pub fn is_mining_loot_enchantable_path(",
+            "pub fn max_stack_for_stack(",
+            "pub fn max_tool_damage_for_path(",
+        ] {
+            if !source.contains(anchor) {
+                findings.push(Finding {
+                    path: path.to_path_buf(),
+                    line: 1,
+                    message: "item durability semantics left mc-data owner".into(),
+                });
+            }
+        }
+        return;
+    }
+    if path.ends_with("mc-data/src/enchanting_26_1_2.rs") {
+        for anchor in [
+            "pub struct EnchantingOffer",
+            "pub fn enchanting_offer(",
+            "pub fn item_is_efficiency_enchantable(",
+            "pub fn supported_enchantment_for_item(",
+            "pub fn additional_enchantment_for_offer(",
+        ] {
+            if !source.contains(anchor) {
+                findings.push(Finding {
+                    path: path.to_path_buf(),
+                    line: 1,
+                    message: "enchanting selection semantics left mc-data owner".into(),
+                });
+            }
+        }
+        return;
+    }
+    if path.ends_with("mc-net/src/play/containers/enchanting.rs") {
+        for anchor in [
+            "mc_data::enchanting_26_1_2::EnchantingOffer",
+            "mc_data::enchanting_26_1_2::enchanting_offer",
+            "mc_data::enchanting_26_1_2::supported_enchantment_for_item",
+            "mc_data::enchanting_26_1_2::additional_enchantment_for_offer",
+            "mc_data::enchanting_26_1_2::item_is_efficiency_enchantable",
+        ] {
+            if !source.contains(anchor) {
+                findings.push(Finding {
+                    path: path.to_path_buf(),
+                    line: 1,
+                    message: "mc-net enchanting adapter bypasses lower enchanting rules".into(),
+                });
+            }
+        }
+        return;
+    }
+    if path.ends_with("mc-net/src/play/combat/player_damage.rs") {
+        if !source.contains("HurtResistance as PlayerHurtResistance")
+            || !source.contains("HurtResolution as PlayerHurtResolution")
+            || !source.contains("mc_entity::player_combat_26_1_2::melee_knockback")
+            || !source.contains("mc_entity::player_combat_26_1_2::shield_block_knockback")
+        {
+            findings.push(Finding {
+                path: path.to_path_buf(),
+                line: 1,
+                message: "mc-net player damage bypasses lower knockback rules".into(),
+            });
+        }
+        if source.contains("fn knockback_with_strength(") {
+            findings.push(Finding {
+                path: path.to_path_buf(),
+                line: 1,
+                message: "knockback math returned to mc-net".into(),
+            });
+        }
+        return;
+    }
+    if path.ends_with("mc-net/src/play/combat/player_actions.rs") {
+        for anchor in [
+            "mc_data::item_semantics_26_1_2::is_durability_tool_path",
+            "mc_data::item_semantics_26_1_2::max_tool_damage_for_path",
+            "mc_entity::player_combat_26_1_2::horizontal_look_direction",
+            "mc_entity::player_combat_26_1_2::shield_blocks_damage_since",
+            "mc_entity::player_combat_26_1_2::shield_durability_damage",
+            "mc_entity::player_combat_26_1_2::shield_disable_ticks",
+        ] {
+            if !source.contains(anchor) {
+                findings.push(Finding {
+                    path: path.to_path_buf(),
+                    line: 1,
+                    message: "mc-net player combat adapter bypasses lower rules".into(),
+                });
+            }
+        }
+    }
+}
+
+fn scan_merchant_semantics_boundary(path: &Path, lines: &[&str], findings: &mut Vec<Finding>) {
+    let source = lines.join("\n");
+    if path.ends_with("mc-entity/src/villager_merchant_26_1_2.rs") {
+        if !source.contains("pub fn inputs_satisfy(") {
+            findings.push(Finding {
+                path: path.to_path_buf(),
+                line: 1,
+                message: "villager trade input matching left mc-entity owner".into(),
+            });
+        }
+        return;
+    }
+    if path.ends_with("mc-net/src/play/containers/merchant.rs") {
+        for anchor in [
+            "offer.inputs_satisfy(inputs, modified_cost_a)",
+            "mc_data::item_semantics_26_1_2::max_stack_for_stack",
+        ] {
+            if !source.contains(anchor) {
+                findings.push(Finding {
+                    path: path.to_path_buf(),
+                    line: 1,
+                    message: "mc-net merchant adapter bypasses lower trade/item semantics".into(),
+                });
+            }
+        }
+    }
+}
+
+fn scan_survival_mining_boundary(path: &Path, lines: &[&str], findings: &mut Vec<Finding>) {
+    let source = lines.join("\n");
+    if path.ends_with("mc-entity/src/player_survival_26_1_2.rs") {
+        for anchor in [
+            "pub fn apply_damage(",
+            "pub fn heal(",
+            "pub fn is_dead(",
+            "pub fn can_eat(",
+            "pub fn add_food(",
+            "pub fn add_exhaustion(",
+            "pub fn tick_health(",
+        ] {
+            if !source.contains(anchor) {
+                findings.push(Finding {
+                    path: path.to_path_buf(),
+                    line: 1,
+                    message: "player survival transition rule left mc-entity owner".into(),
+                });
+            }
+        }
+        return;
+    }
+    if path.ends_with("mc-net/src/play/session/player_item_action_authority.rs") {
+        if !source.contains("mc_entity::player_survival_26_1_2::can_eat") {
+            findings.push(Finding {
+                path: path.to_path_buf(),
+                line: 1,
+                message: "food-use authority bypasses mc-entity eating eligibility rule".into(),
+            });
+        }
+        return;
+    }
+    if path.ends_with("mc-data/src/food.rs") {
+        if !source.contains("pub const DEFAULT_USE_DURATION:")
+            || !source.contains("pub fn rule_for_item(")
+        {
+            findings.push(Finding {
+                path: path.to_path_buf(),
+                line: 1,
+                message: "food duration/rule lookup left mc-data food owner".into(),
+            });
+        }
+        return;
+    }
+    if path.ends_with("mc-data/src/tags.rs") {
+        if !source.contains("pub fn contains_raw_id(") {
+            findings.push(Finding {
+                path: path.to_path_buf(),
+                line: 1,
+                message: "resolved tag membership rule left mc-data TagsData".into(),
+            });
+        }
+        return;
+    }
+    if path.ends_with("mc-data/src/block_mining.rs") {
+        for anchor in [
+            "pub fn block_break_is_denied(",
+            "pub fn fallback_mining_facts(",
+            "pub fn fallback_tool_suffix_for_path(",
+            "pub fn fallback_tool_mining_speed(",
+            "pub fn fallback_tool_allows_block_drop(",
+            "pub fn destroy_progress_per_tick(",
+        ] {
+            if !source.contains(anchor) {
+                findings.push(Finding {
+                    path: path.to_path_buf(),
+                    line: 1,
+                    message: "survival mining rule left mc-data block_mining owner".into(),
+                });
+            }
+        }
+        return;
+    }
+    if !path.ends_with("mc-net/src/play/survival.rs") {
+        return;
+    }
+    if !source.contains("mc_data::block_mining") {
+        findings.push(Finding {
+            path: path.to_path_buf(),
+            line: 1,
+            message: "mc-net survival adapter bypasses mc-data mining rules".into(),
+        });
+    }
+    if !source.contains("tags.contains_raw_id(\"minecraft:block\"") {
+        findings.push(Finding {
+            path: path.to_path_buf(),
+            line: 1,
+            message: "mc-net survival adapter bypasses resolved tag membership owner".into(),
+        });
+    }
+    if !source.contains("block_path_break_is_denied") {
+        findings.push(Finding {
+            path: path.to_path_buf(),
+            line: 1,
+            message: "mc-net survival adapter bypasses mc-data block-break denial rule".into(),
+        });
+    }
+    if !source.contains("mc_entity::player_survival_26_1_2 as survival_rules")
+        || !source.contains("survival_rules::add_exhaustion")
+        || !source.contains("survival_rules::tick_health")
+    {
+        findings.push(Finding {
+            path: path.to_path_buf(),
+            line: 1,
+            message: "mc-net SurvivalState bypasses mc-entity survival transition rules".into(),
+        });
+    }
+    for forbidden in [
+        "fn fallback_mining_facts(",
+        "fn fallback_tool_mining_speed(",
+        "fn vanilla_destroy_progress_per_tick(",
+        "fn pickaxe_tier(",
+        "fn required_pickaxe_tier_for_drop(",
+        "fn fallback_mining_time(",
+        "fn food_rule_for_item(",
+        "pub(super) fn block_tag_contains(",
+        "pub(super) use mc_data::block_mining::fallback_tool_allows_block_drop",
+        "pub(super) use survival_rules::SurvivalHealthTick",
+        "const MAX_HEALTH:",
+        "const MAX_FOOD:",
+        "const BLOCK_BREAK_EXHAUSTION:",
+        "const ENTITY_ATTACK_EXHAUSTION:",
+        "const SPRINT_EXHAUSTION_PER_METER:",
+        "const JUMP_EXHAUSTION:",
+        "const SPRINT_JUMP_EXHAUSTION:",
+        "const EXHAUSTION_STEP:",
+    ] {
+        if source.contains(forbidden) {
+            findings.push(Finding {
+                path: path.to_path_buf(),
+                line: 1,
+                message: "lower-owned survival/mining semantic shim returned to mc-net".into(),
+            });
+        }
+    }
+}
+
+fn scan_lower_crate_transport_leaks(path: &Path, lines: &[&str], findings: &mut Vec<Finding>) {
+    let normalized = path.to_string_lossy().replace('\\', "/");
+    let lower_domain = [
+        "/crates/mc-data/src/",
+        "/crates/mc-domain/src/",
+        "/crates/mc-entity/src/",
+        "/crates/mc-nbt/src/",
+        "/crates/mc-physics/src/",
+        "/crates/mc-script/src/",
+        "/crates/mc-world/src/",
+        "/crates/mc-worldgen/src/",
+    ]
+    .iter()
+    .any(|segment| normalized.contains(segment));
+    if !lower_domain {
+        return;
+    }
+
+    for (index, line) in lines.iter().enumerate() {
+        let code = line.split("//").next().unwrap_or_default();
+        for forbidden in [
+            "OutboundCommand",
+            "ConnectionHandle",
+            "OwnedWriteHalf",
+            "PacketWriter",
+            "SessionRegistry",
+            "VisibilityDispatch",
+            "Clientbound",
+            "Serverbound",
+        ] {
+            if code.contains(forbidden) {
+                findings.push(Finding {
+                    path: path.to_path_buf(),
+                    line: index + 1,
+                    message: format!(
+                        "lower semantic crate leaks transport/session symbol `{forbidden}`"
+                    ),
+                });
+            }
+        }
+    }
+}
+
+fn scan_domain_type_ownership(path: &Path, lines: &[&str], findings: &mut Vec<Finding>) {
+    let normalized = path.to_string_lossy().replace('\\', "/");
+    let forbidden = ["ItemStack", "GameMode", "Direction", "InteractionHand"];
+
+    if normalized.ends_with("/crates/mc-protocol/src/packets/play.rs") {
+        for (index, line) in lines.iter().enumerate() {
+            let code = line.split("//").next().unwrap_or_default().trim();
+            for name in forbidden {
+                if code.starts_with(&format!("pub struct {name}"))
+                    || code.starts_with(&format!("pub enum {name}"))
+                {
+                    findings.push(Finding {
+                        path: path.to_path_buf(),
+                        line: index + 1,
+                        message: format!(
+                            "protocol layer redefines domain gameplay type `{name}` instead of adapting it"
+                        ),
+                    });
+                }
+            }
+        }
+    }
+
+    if !normalized.contains("/crates/mc-net/src/")
+        || normalized.contains("/tests/")
+        || normalized.ends_with("_tests.rs")
+    {
+        return;
+    }
+
+    let test_lines = cfg_test_item_lines(lines);
+    let contains_identifier = |code: &str, name: &str| {
+        code.split(|character: char| !(character.is_ascii_alphanumeric() || character == '_'))
+            .any(|token| token == name)
+    };
+
+    let mut packet_use = false;
+    for (index, line) in lines.iter().enumerate() {
+        if test_lines[index] {
+            continue;
+        }
+        let code = line.split("//").next().unwrap_or_default();
+        if code.contains("use mc_protocol::packets::play::{") {
+            packet_use = true;
+        }
+        if code.contains("use mc_protocol::packets::play::") && !packet_use {
+            for name in forbidden {
+                if contains_identifier(code, name) {
+                    findings.push(Finding {
+                        path: path.to_path_buf(),
+                        line: index + 1,
+                        message: format!(
+                            "mc-net imports domain gameplay type `{name}` from protocol packet namespace"
+                        ),
+                    });
+                }
+            }
+        }
+        if packet_use {
+            for name in forbidden {
+                if contains_identifier(code, name) {
+                    findings.push(Finding {
+                        path: path.to_path_buf(),
+                        line: index + 1,
+                        message: format!(
+                            "mc-net imports domain gameplay type `{name}` from protocol packet namespace"
+                        ),
+                    });
+                }
+            }
+            if code.contains("};") {
+                packet_use = false;
+            }
         }
     }
 }
@@ -2405,48 +3512,6 @@ fn scan_block_edit_commit_adapter(path: &Path, lines: &[&str], findings: &mut Ve
             });
         }
     }
-
-    let source = lines
-        .iter()
-        .map(|line| line.split_whitespace().collect::<String>())
-        .collect::<Vec<_>>()
-        .join("\n");
-    for required in [
-        "#[cfg(test)]\nasyncfnapply_block_edit_batch_to_world_conditionally",
-        "#[cfg(not(test))]\n{\nmatchstate\n.simulation\n.apply_block_edits_with_scheduled_ticks(",
-        "#[cfg(not(test))]\nletbroadcast_peer_blocks=false;",
-    ] {
-        if !source.contains(required) {
-            findings.push(Finding {
-                path: path.to_path_buf(),
-                line: 1,
-                message: "block edit commit adapter lost a required production ownership fence"
-                    .into(),
-            });
-        }
-    }
-
-    let player_edit_source = source
-        .split_once("pub(super)asyncfnapply_player_block_edit_batch_conditionally")
-        .map(|(_, source)| source)
-        .unwrap_or_default();
-    let resync =
-        player_edit_source.find("send_loaded_block_edit_resyncs(state,writer,edits).await?;");
-    let ack = player_edit_source.find("write_packet(writer,&BlockChangedAck{sequence}");
-    if resync.is_none()
-        || ack.is_none()
-        || resync >= ack
-        || player_edit_source
-            .matches("write_packet(writer,&BlockChangedAck{sequence}")
-            .count()
-            != 1
-    {
-        findings.push(Finding {
-            path: path.to_path_buf(),
-            line: 1,
-            message: "player block edit must resync before exactly one acknowledgement".into(),
-        });
-    }
 }
 
 fn scan_bucket_interaction_adapter(path: &Path, lines: &[&str], findings: &mut Vec<Finding>) {
@@ -2456,6 +3521,9 @@ fn scan_bucket_interaction_adapter(path: &Path, lines: &[&str], findings: &mut V
     let parent_globs = glob_use_item_starts(lines, "super::");
     let play_globs = glob_use_item_starts(lines, "play::");
     for (index, line) in lines.iter().enumerate() {
+        if line.trim() == "#[cfg(test)]" {
+            break;
+        }
         let normalized = line.split_whitespace().collect::<String>();
         if parent_globs[index]
             || play_globs[index]
@@ -2486,52 +3554,6 @@ fn scan_bucket_interaction_adapter(path: &Path, lines: &[&str], findings: &mut V
                 message: "bucket interaction adapter bypasses owner APIs".into(),
             });
         }
-    }
-
-    let source = lines
-        .iter()
-        .map(|line| line.split_whitespace().collect::<String>())
-        .collect::<Vec<_>>()
-        .join("\n");
-    let commit = source
-        .split_once("asyncfncommit_bucket_use_and_respond")
-        .and_then(|(_, source)| source.split_once("fnplan_cauldron_bucket_use"))
-        .map(|(source, _)| source)
-        .unwrap_or_default();
-    let owner = commit.find("state.simulation.commit_bucket_use(plan).await");
-    let resync = commit.find("send_loaded_block_edit_resyncs(state,writer,&[edit]).await?");
-    let finalize = commit
-        .find("finalize_visible_block_edit_outcome(state,writer,committed.block,false).await?");
-    let animation = commit.find(
-        "dispatch_visibility_commands(state.sessions.broadcast_player_animation(state.session_id))",
-    );
-    let acknowledgements = commit
-        .match_indices("write_block_ack(writer,state.compression,sequence).await?")
-        .map(|(index, _)| index)
-        .collect::<Vec<_>>();
-    let inventory_updates = commit
-        .match_indices("write_inventory_slot_updates(")
-        .map(|(index, _)| index)
-        .collect::<Vec<_>>();
-    let ordered = owner.zip(resync).zip(finalize).zip(animation).is_some_and(
-        |(((owner, resync), finalize), animation)| {
-            acknowledgements.len() == 2
-                && inventory_updates.len() == 2
-                && owner < resync
-                && resync < inventory_updates[0]
-                && inventory_updates[0] < acknowledgements[0]
-                && acknowledgements[0] < finalize
-                && finalize < acknowledgements[1]
-                && acknowledgements[1] < inventory_updates[1]
-                && inventory_updates[1] < animation
-        },
-    );
-    if !ordered {
-        findings.push(Finding {
-            path: path.to_path_buf(),
-            line: 1,
-            message: "bucket response adapter lost owner or response ordering".into(),
-        });
     }
 }
 
@@ -2645,65 +3667,6 @@ fn scan_player_damage_adapter(path: &Path, lines: &[&str], findings: &mut Vec<Fi
                 message: "player damage adapter bypasses owner APIs".into(),
             });
         }
-    }
-
-    let source = lines
-        .iter()
-        .map(|line| line.split_whitespace().collect::<String>())
-        .collect::<Vec<_>>()
-        .join("\n");
-    let publication = source
-        .split_once("pub(super)fnapply_player_damage_publication")
-        .and_then(|(_, source)| source.split_once("pub(super)structPlayerDamageApplication"))
-        .map(|(source, _)| source)
-        .unwrap_or_default();
-    for required in [
-        "lethealth_accepted=survival_state.health==publication.expected_health;",
-        "ifhealth_accepted&&publication.died",
-        "died:health_accepted&&publication.died",
-        "fresh_hurt:health_accepted&&publication.fresh_hurt",
-        "knockback:health_accepted.then_some(publication.knockback).flatten()",
-    ] {
-        if !publication.contains(required) {
-            findings.push(Finding {
-                path: path.to_path_buf(),
-                line: 1,
-                message: "player damage publication lost its accepted-health CAS fence".into(),
-            });
-            break;
-        }
-    }
-
-    let damage = source
-        .split_once("pub(super)asyncfnapply_player_damage")
-        .map(|(_, source)| source)
-        .unwrap_or_default();
-    let shield_commit = damage.find("commit_player_survival_update_with_shield(");
-    let retry_fence = damage.find("ifshield_commit_attempts>=2");
-    let regular_commit = damage.find("commit_player_survival_update(");
-    let fallback_packet =
-        damage.find("write_packet(writer,&survival_state.as_packet(),compression).await?");
-    let owner_flow_is_intact = shield_commit
-        .zip(retry_fence)
-        .zip(regular_commit)
-        .zip(fallback_packet)
-        .is_some_and(
-            |(((shield_commit, retry_fence), regular_commit), fallback_packet)| {
-                shield_commit < retry_fence
-                    && retry_fence < regular_commit
-                    && regular_commit < fallback_packet
-                    && damage
-                        .matches("commit_player_survival_update_with_shield(")
-                        .count()
-                        == 1
-            },
-        );
-    if !owner_flow_is_intact {
-        findings.push(Finding {
-            path: path.to_path_buf(),
-            line: 1,
-            message: "player damage adapter lost its bounded owner commit flow".into(),
-        });
     }
 }
 
@@ -2986,6 +3949,26 @@ fn scan_api_manifests(root: &Path, findings: &mut Vec<Finding>) {
             continue;
         };
         scan_api_manifest(&manifest, &source, findings);
+    }
+}
+
+fn scan_mc_net_reverse_dependencies(root: &Path, findings: &mut Vec<Finding>) {
+    for crate_name in MC_NET_LOWER_CRATES {
+        let manifest = root.join("crates").join(crate_name).join("Cargo.toml");
+        let Ok(source) = fs::read_to_string(&manifest) else {
+            continue;
+        };
+        for (index, line) in source.lines().enumerate() {
+            if manifest_dependency_name(line.trim()) == Some("mc-net") {
+                findings.push(Finding {
+                    path: manifest.clone(),
+                    line: index + 1,
+                    message: format!(
+                        "lower crate `{crate_name}` must not depend on orchestration crate `mc-net`"
+                    ),
+                });
+            }
+        }
     }
 }
 

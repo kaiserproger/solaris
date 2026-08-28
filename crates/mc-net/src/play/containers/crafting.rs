@@ -1,10 +1,10 @@
 use mc_data::Identifier;
+use mc_data::ItemStack;
 use mc_data::item_components::ItemFactsTable;
 use mc_data::items::ItemRegistry;
 use mc_data::recipes::Recipe;
 use mc_data::tags::TagsData;
 use mc_nbt::Tag;
-use mc_protocol::packets::play::ItemStack;
 
 use super::quickcraft::{
     QuickCraftClick, QuickCraftOutcome, QuickCraftState, QuickCraftStep,
@@ -15,7 +15,6 @@ use crate::play::inventory::{
     can_place_in_player_slot, can_stack, equippable_slot_for_item, hotbar_swap_slot,
     item_max_stack, pickup_click_max_stack, player_swap_slot,
 };
-use crate::play::recipes::ingredient_accepts_item;
 
 pub(in crate::play) const CRAFTING_MENU_TYPE_ID: i32 = 12;
 pub(in crate::play) const CRAFTING_MENU_SLOT_COUNT: usize = 46;
@@ -61,136 +60,13 @@ pub(in crate::play) fn crafting_player_slot(menu_slot: usize) -> Option<usize> {
     }
 }
 
-fn shaped_recipe_matches(
-    items: &ItemRegistry,
-    tags: &TagsData,
-    input: &[ItemStack; 9],
-    shaped: &mc_data::recipes::ShapedRecipe,
-) -> bool {
-    let height = shaped.pattern.len();
-    let width = shaped
-        .pattern
-        .iter()
-        .map(|row| row.chars().count())
-        .max()
-        .unwrap_or(0);
-    if height == 0 || width == 0 || height > 3 || width > 3 {
-        return false;
-    }
-
-    for top in 0..=(3 - height) {
-        'left: for left in 0..=(3 - width) {
-            for row in 0..3 {
-                for col in 0..3 {
-                    let stack = &input[row * 3 + col];
-                    let ingredient =
-                        if row >= top && row < top + height && col >= left && col < left + width {
-                            shaped
-                                .pattern
-                                .get(row - top)
-                                .and_then(|pattern_row| pattern_row.chars().nth(col - left))
-                                .filter(|ch| *ch != ' ')
-                                .and_then(|ch| shaped.key.get(&ch))
-                        } else {
-                            None
-                        };
-                    match ingredient {
-                        Some(ingredient)
-                            if !stack.is_empty()
-                                && ingredient_accepts_item(
-                                    items,
-                                    tags,
-                                    stack.item_id,
-                                    ingredient,
-                                ) => {}
-                        None if stack.is_empty() => {}
-                        _ => continue 'left,
-                    }
-                }
-            }
-            return true;
-        }
-    }
-    false
-}
-
-fn shapeless_recipe_matches(
-    items: &ItemRegistry,
-    tags: &TagsData,
-    input: &[ItemStack; 9],
-    shapeless: &mc_data::recipes::ShapelessRecipe,
-) -> bool {
-    let stacks: Vec<_> = input.iter().filter(|stack| !stack.is_empty()).collect();
-    if stacks.len() != shapeless.ingredients.len() {
-        return false;
-    }
-    let mut used = vec![false; shapeless.ingredients.len()];
-    for stack in stacks {
-        let Some((idx, _)) = shapeless
-            .ingredients
-            .iter()
-            .enumerate()
-            .find(|(idx, ingredient)| {
-                !used[*idx] && ingredient_accepts_item(items, tags, stack.item_id, ingredient)
-            })
-        else {
-            return false;
-        };
-        used[idx] = true;
-    }
-    true
-}
-
-fn crafting_recipe_matches(
-    items: &ItemRegistry,
-    tags: &TagsData,
-    input: &[ItemStack; 9],
-    recipe: &mc_data::recipes::Recipe,
-) -> bool {
-    match &recipe.kind {
-        mc_data::recipes::RecipeKind::Shaped(shaped) => {
-            shaped_recipe_matches(items, tags, input, shaped)
-        }
-        mc_data::recipes::RecipeKind::Shapeless(shapeless) => {
-            shapeless_recipe_matches(items, tags, input, shapeless)
-        }
-        mc_data::recipes::RecipeKind::Smelting(_)
-        | mc_data::recipes::RecipeKind::Blasting(_)
-        | mc_data::recipes::RecipeKind::Smoking(_)
-        | mc_data::recipes::RecipeKind::CampfireCooking(_)
-        | mc_data::recipes::RecipeKind::Stonecutting(_) => false,
-    }
-}
-
+#[cfg(test)]
 pub(in crate::play) fn repair_item_crafting_result(
     items: &ItemRegistry,
     item_facts: &ItemFactsTable,
     input: &[ItemStack; 9],
 ) -> Option<ItemStack> {
-    let mut occupied = input.iter().filter(|stack| !stack.is_empty());
-    let first = occupied.next()?;
-    let second = occupied.next()?;
-    if occupied.next().is_some()
-        || first.item_id != second.item_id
-        || first.count != 1
-        || second.count != 1
-    {
-        return None;
-    }
-
-    let first_damage = first.damage?;
-    let second_damage = second.damage?;
-    let item = items.name_of(first.item_id)?;
-    let max_damage = item_facts.get(item)?.max_damage?;
-    let max_damage = i32::try_from(max_damage).ok()?;
-    if max_damage <= 0 {
-        return None;
-    }
-
-    let remaining = max_damage.saturating_sub(first_damage)
-        + max_damage.saturating_sub(second_damage)
-        + max_damage / 20;
-    Some(ItemStack::new(first.item_id, 1).with_damage((max_damage - remaining).max(0)))
+    mc_data::recipes::repair_item_crafting_result(items, item_facts, input)
 }
 
 pub(in crate::play) fn crafting_result_from_input(
@@ -200,18 +76,7 @@ pub(in crate::play) fn crafting_result_from_input(
     recipes: &[mc_data::recipes::Recipe],
     input: &[ItemStack; 9],
 ) -> ItemStack {
-    if let Some(result) = repair_item_crafting_result(items, item_facts, input) {
-        return result;
-    }
-    recipes
-        .iter()
-        .find(|recipe| crafting_recipe_matches(items, tags, input, recipe))
-        .and_then(|recipe| {
-            let item_id = items.id_of(&recipe.result.item)?;
-            let count = i32::try_from(recipe.result.count).ok()?;
-            (count > 0).then(|| ItemStack::new(item_id, count))
-        })
-        .unwrap_or(ItemStack::EMPTY)
+    mc_data::recipes::crafting_result_from_input(items, item_facts, tags, recipes, input)
 }
 
 pub(in crate::play) fn refresh_crafting_result(

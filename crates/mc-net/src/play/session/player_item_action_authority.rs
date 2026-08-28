@@ -1,9 +1,15 @@
 use std::time::Instant;
 
+use mc_data::ItemStack;
 use mc_data::block_light::BlockLightTable;
+use mc_domain::GameMode;
 use mc_entity::{EntityItemStack, Vec3};
-use mc_protocol::packets::play::{GameMode, ItemStack};
 
+use super::explosion_authority::spawn_primed_tnt_locked;
+use super::pickups::{block_item_pickup_for_owner_locked, spawn_item_drop_entity_locked};
+use super::projectiles::spawn_arrow_locked;
+use super::visibility::spawn_entity_visibility_locked;
+use super::{SessionId, SessionRegistry};
 use crate::play::BlockEdit;
 use crate::play::block_edit_commit::apply_block_edit_batch_to_storage_conditionally;
 use crate::play::explosions::{CommittedTntIgnition, TNT_FUSE_TICKS, TntIgnitionPlan};
@@ -12,13 +18,6 @@ use crate::play::simulation::{
     BowReleasePlan, CommittedBowRelease, CommittedFoodUse, CommittedSelectedItemDrop, FoodUsePlan,
     SelectedItemDropPlan, SimulationAuthority, SimulationRequestError,
 };
-use crate::play::survival::SurvivalState;
-
-use super::explosion_authority::spawn_primed_tnt_locked;
-use super::pickups::{block_item_pickup_for_owner_locked, spawn_item_drop_entity_locked};
-use super::projectiles::spawn_arrow_locked;
-use super::visibility::spawn_entity_visibility_locked;
-use super::{SessionId, SessionRegistry};
 
 impl SessionRegistry {
     pub(in crate::play) fn commit_tnt_ignition(
@@ -128,8 +127,10 @@ impl SessionRegistry {
             PlayerInventory::HOTBAR_BASE + usize::from(player_state.selected_hotbar_slot);
         if (plan.held_slot != PlayerInventory::OFFHAND_SLOT && plan.held_slot != selected_slot)
             || player_state.survival != plan.expected_survival
-            || player_state.survival.is_dead()
-            || player_state.survival.food >= SurvivalState::MAX_FOOD
+            || !mc_entity::player_survival_26_1_2::can_eat(
+                player_state.survival.health,
+                player_state.survival.food,
+            )
         {
             return None;
         }

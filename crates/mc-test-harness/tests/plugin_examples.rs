@@ -754,6 +754,7 @@ async fn shipped_inventory_plugins_work_over_wire() {
         mc_world::WorldStorage::open_with_capacity(world_dir.path(), Arc::clone(&blocks), 49)
             .expect("open disk-backed world")
             .with_item_registry(Arc::clone(&items))
+            .with_spawn(mc_world::WorldSpawn::new(20, 20))
             .with_generator(generator);
     let shutdown = mc_net::ShutdownHandle::default();
     let cfg = mc_net::ServerConfig {
@@ -827,13 +828,13 @@ async fn shipped_inventory_plugins_work_over_wire() {
         .expect("move outside catalog zone");
     client
         .write_packet(&ServerboundMovePlayerPos {
-            x: 32.0,
+            x: 26.0,
             y: sync.y,
-            z: 32.0,
+            z: 26.0,
             flags: MovePlayerFlags::new(true, false),
         })
         .await
-        .expect("enter catalog zone");
+        .expect("enter catalog zone within movement budget");
 
     let initial_menu = wait_for_catalog_menu(
         &mut client,
@@ -1218,13 +1219,19 @@ fn write_villager_fixture_plugin(destination_root: &Path) {
 
             function on_player_joined(event: any)
                 solaris.spawn_entity(
+                    "fixture-villager",
                     event.player_id,
                     "minecraft:villager",
                     event.x + 1,
                     event.y,
                     event.z
                 )
-                solaris.send_message(event.player_id, "fixture-villager-ready")
+            end
+
+            function on_entity_spawn_result(event: any)
+                if event.request_id == "fixture-villager" and event.spawned then
+                    solaris.send_message(event.player_id, "fixture-villager-ready")
+                end
             end
 
             function on_player_command(event: any)
@@ -1507,40 +1514,44 @@ async fn wait_for_colony_startup(
     villager_type_id: i32,
     expected_position: (f64, f64, f64),
 ) -> i32 {
-    tokio::time::timeout(Duration::from_secs(5), async {
-        let mut fixture_ready = false;
-        let mut colony_ready = false;
-        let mut villager_entity_id = None;
-        loop {
-            let mut frame = client.read_frame().await.expect("colony startup frame");
-            if frame.id == AddEntity::ID {
-                let entity = AddEntity::decode(&mut frame.body).expect("decode villager spawn");
-                if entity.entity_type_id == villager_type_id
-                    && (entity.x - expected_position.0).abs() < 0.01
-                    && (entity.y - expected_position.1).abs() < 0.01
-                    && (entity.z - expected_position.2).abs() < 0.01
-                {
-                    villager_entity_id = Some(entity.entity_id);
-                }
-            } else if frame.id == ClientboundSystemChat::ID {
-                let chat = ClientboundSystemChat::decode(&mut frame.body)
-                    .expect("decode colony startup chat");
-                match literal_text_component_text(&chat.content_nbt).as_str() {
-                    "fixture-villager-ready" => fixture_ready = true,
-                    "Starter Colony plugin ready." => colony_ready = true,
-                    _ => {}
-                }
-            }
-            if fixture_ready
-                && colony_ready
-                && let Some(entity_id) = villager_entity_id
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+    let mut fixture_ready = false;
+    let mut colony_ready = false;
+    let mut villager_entity_id = None;
+    loop {
+        let mut frame = tokio::time::timeout_at(deadline, client.read_frame())
+            .await
+            .unwrap_or_else(|_| {
+                panic!(
+                    "colony startup readiness timeout: fixture_ready={fixture_ready}, colony_ready={colony_ready}, villager_entity_id={villager_entity_id:?}, expected_position={expected_position:?}"
+                )
+            })
+            .expect("colony startup frame");
+        if frame.id == AddEntity::ID {
+            let entity = AddEntity::decode(&mut frame.body).expect("decode villager spawn");
+            if entity.entity_type_id == villager_type_id
+                && (entity.x - expected_position.0).abs() < 0.01
+                && (entity.y - expected_position.1).abs() < 0.01
+                && (entity.z - expected_position.2).abs() < 0.01
             {
-                return entity_id;
+                villager_entity_id = Some(entity.entity_id);
+            }
+        } else if frame.id == ClientboundSystemChat::ID {
+            let chat =
+                ClientboundSystemChat::decode(&mut frame.body).expect("decode colony startup chat");
+            match literal_text_component_text(&chat.content_nbt).as_str() {
+                "fixture-villager-ready" => fixture_ready = true,
+                "Starter Colony plugin ready." => colony_ready = true,
+                _ => {}
             }
         }
-    })
-    .await
-    .expect("colony startup readiness timeout")
+        if fixture_ready
+            && colony_ready
+            && let Some(entity_id) = villager_entity_id
+        {
+            return entity_id;
+        }
+    }
 }
 
 async fn wait_for_entity_removal(client: &mut Client, entity_id: i32) {

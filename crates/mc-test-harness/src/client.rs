@@ -26,11 +26,11 @@ use mc_protocol::packets::handshake::{Handshake, NextState};
 use mc_protocol::packets::login::{LoginAcknowledged, LoginStart, LoginSuccess, SetCompression};
 use mc_protocol::packets::play::{
     ClientboundChangeDifficulty, ClientboundPlayerAbilities, ClientboundSetHeldSlot, EntityEvent,
-    LoginPlay,
+    LoginPlay, PlayDisconnect,
 };
 use mc_protocol::{PROTOCOL_VERSION, RawFrame};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use tokio::net::TcpStream;
+use tokio::net::{TcpSocket, TcpStream};
 use uuid::Uuid;
 
 /// Minimal raw-TCP client. Speaks the wire protocol our server speaks
@@ -90,6 +90,26 @@ impl Client {
         let stream = TcpStream::connect(addr)
             .await
             .with_context(|| format!("connect to {addr}"))?;
+        Self::from_stream(stream)
+    }
+
+    pub async fn connect_from(addr: SocketAddr, local_addr: SocketAddr) -> Result<Self> {
+        let socket = if addr.is_ipv4() {
+            TcpSocket::new_v4()?
+        } else {
+            TcpSocket::new_v6()?
+        };
+        socket
+            .bind(local_addr)
+            .with_context(|| format!("bind load-test client to {local_addr}"))?;
+        let stream = socket
+            .connect(addr)
+            .await
+            .with_context(|| format!("connect from {local_addr} to {addr}"))?;
+        Self::from_stream(stream)
+    }
+
+    fn from_stream(stream: TcpStream) -> Result<Self> {
         stream.set_nodelay(true)?;
         Ok(Self {
             stream,
@@ -288,7 +308,22 @@ impl Client {
 
     /// Read the fixed Play-entry prelude Solaris emits before the command tree.
     pub async fn read_play_login(&mut self) -> Result<LoginPlay> {
-        let login = self.read_typed::<LoginPlay>().await?;
+        let mut frame = self.read_frame().await?;
+        if frame.id == PlayDisconnect::ID {
+            let disconnect = PlayDisconnect::decode(&mut frame.body)?;
+            bail!(
+                "disconnected while entering Play: {}",
+                String::from_utf8_lossy(&disconnect.reason_nbt)
+            );
+        }
+        if frame.id != LoginPlay::ID {
+            bail!(
+                "unexpected packet id entering Play: want 0x{:02X}, got 0x{:02X}",
+                LoginPlay::ID,
+                frame.id
+            );
+        }
+        let login = LoginPlay::decode(&mut frame.body)?;
         let _: ClientboundChangeDifficulty = self.read_typed().await?;
         let _: ClientboundPlayerAbilities = self.read_typed().await?;
         let _: ClientboundSetHeldSlot = self.read_typed().await?;

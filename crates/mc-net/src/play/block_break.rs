@@ -1,9 +1,9 @@
 use std::sync::Arc;
 
+use mc_data::ItemStack;
+use mc_domain::{Direction, GameMode};
 use mc_entity::Vec3;
-use mc_protocol::packets::play::{
-    Direction, GameMode, ItemStack, ServerboundPlayerAction, unpack_block_pos,
-};
+use mc_protocol::packets::play::{ServerboundPlayerAction, unpack_block_pos};
 use tokio::io::AsyncWriteExt;
 use tracing::{debug, warn};
 
@@ -1000,7 +1000,10 @@ where
     W: AsyncWriteExt + Unpin,
 {
     let mut updated_survival = *survival_state;
-    if changed && updated_survival.add_exhaustion(SurvivalState::BLOCK_BREAK_EXHAUSTION) {
+    if changed
+        && updated_survival
+            .add_exhaustion(mc_entity::player_survival_26_1_2::BLOCK_BREAK_EXHAUSTION)
+    {
         let expected_inventory = state.inventory.clone();
         commit_player_survival_update(
             state,

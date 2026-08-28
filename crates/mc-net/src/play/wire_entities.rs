@@ -8,6 +8,8 @@ use mc_protocol::packets::play::{
     VILLAGER_ENTITY_DATA_INDEX,
 };
 
+// Entity 0..7, LivingEntity 8..14, Mob 15, Blaze flags byte 16 (bit 0 = charged).
+const BLAZE_ENTITY_DATA_FLAGS_INDEX_26_1_2: u8 = 16;
 // Entity 0..7, LivingEntity 8..14, Mob 15, Raider 16, Pillager charging flag 17.
 const PILLAGER_ENTITY_DATA_CHARGING_CROSSBOW_INDEX_26_1_2: u8 = 17;
 // Entity 0..7, LivingEntity 8..14, Mob 15, Guardian moving flag 16, target id 17.
@@ -386,6 +388,12 @@ where
         }
         values.push(villager_entity_data(villager));
     }
+    if entity.type_name == "minecraft:blaze" && entity.blaze_charged {
+        values.push(EntityDataValue::Byte {
+            index: BLAZE_ENTITY_DATA_FLAGS_INDEX_26_1_2,
+            value: 1,
+        });
+    }
     if entity.type_name == "minecraft:pillager" && entity.crossbow_charging {
         values.push(EntityDataValue::Boolean {
             index: PILLAGER_ENTITY_DATA_CHARGING_CROSSBOW_INDEX_26_1_2,
@@ -452,6 +460,12 @@ where
             value: entity.villager_baby,
         });
         values.push(villager_entity_data(villager));
+    }
+    if entity.type_name == "minecraft:blaze" {
+        values.push(EntityDataValue::Byte {
+            index: BLAZE_ENTITY_DATA_FLAGS_INDEX_26_1_2,
+            value: i8::from(entity.blaze_charged),
+        });
     }
     if entity.type_name == "minecraft:pillager" {
         values.push(EntityDataValue::Boolean {
@@ -748,6 +762,7 @@ mod tests {
             villager_baby: false,
             main_hand_item: Some(EntityItemStack::new(321, 1)),
             crossbow_charging: charging,
+            blaze_charged: false,
             guardian_attack_target_entity_id: 0,
         }
     }
@@ -804,6 +819,59 @@ mod tests {
         }
     }
 
+    fn blaze_snapshot(charged: bool) -> ServerEntitySnapshot {
+        ServerEntitySnapshot {
+            id: EntityId(45),
+            uuid: uuid::Uuid::from_u128(45),
+            type_id: 63,
+            type_name: "minecraft:blaze".to_owned(),
+            position: Vec3::new(1.5, 64.0, 1.5),
+            rotation: Rotation::ZERO,
+            velocity: Vec3::ZERO,
+            on_ground: false,
+            health: Some(20.0),
+            item_stack: None,
+            experience_value: None,
+            block_state: None,
+            animal: None,
+            villager: None,
+            villager_baby: false,
+            main_hand_item: None,
+            crossbow_charging: false,
+            blaze_charged: charged,
+            guardian_attack_target_entity_id: 0,
+        }
+    }
+
+    #[tokio::test]
+    async fn blaze_metadata_encodes_charged_transitions() {
+        for charged in [true, false] {
+            let entity = blaze_snapshot(charged);
+            let mut writer = Vec::new();
+
+            send_entity_data(&mut writer, Compression::Disabled, &entity)
+                .await
+                .unwrap();
+
+            let mut bytes = BytesMut::from(writer.as_slice());
+            let mut frame = mc_protocol::frame::try_decode_frame(&mut bytes, Compression::Disabled)
+                .unwrap()
+                .expect("set blaze entity data frame");
+            assert_eq!(frame.id, ClientboundSetEntityData::ID);
+            let packet = ClientboundSetEntityData::decode(&mut frame.body).unwrap();
+            assert_eq!(packet.entity_id, entity.id.0);
+            assert!(packet.values.iter().any(|value| {
+                matches!(
+                    value,
+                    EntityDataValue::Byte { index, value }
+                        if *index == BLAZE_ENTITY_DATA_FLAGS_INDEX_26_1_2
+                            && *value == i8::from(charged)
+                )
+            }));
+            assert!(bytes.is_empty());
+        }
+    }
+
     fn guardian_snapshot(target_entity_id: i32) -> ServerEntitySnapshot {
         ServerEntitySnapshot {
             id: EntityId(44),
@@ -823,6 +891,7 @@ mod tests {
             villager_baby: false,
             main_hand_item: None,
             crossbow_charging: false,
+            blaze_charged: false,
             guardian_attack_target_entity_id: target_entity_id,
         }
     }
@@ -909,6 +978,7 @@ mod tests {
             villager_baby: false,
             main_hand_item: None,
             crossbow_charging: false,
+            blaze_charged: false,
             guardian_attack_target_entity_id: 0,
         };
         let mut writer = Vec::new();

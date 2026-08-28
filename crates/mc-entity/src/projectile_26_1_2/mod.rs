@@ -26,16 +26,20 @@
 
 mod arrow;
 mod hit_order;
+mod hurting;
 mod lifecycle;
 mod throwable;
 
 pub use arrow::*;
 pub use hit_order::*;
+pub use hurting::*;
 pub use lifecycle::*;
 pub use throwable::*;
 
 #[cfg(test)]
 mod arrow_tests;
+#[cfg(test)]
+mod hurting_tests;
 #[cfg(test)]
 mod lifecycle_tests;
 #[cfg(test)]

@@ -10,9 +10,9 @@ git config.
 
 "Do not overthink/overengineer every possible case until you explain exactly WHY it is needed and user agrees with you. Write as simple and clear as possible. Always ask user first what they fucking want."
 
-"Always double-check your work. Spawn another agent to give clear, concise second POV on your work. Do not do anything that isn't needed right now as it probably won't ever be needed."
+"Always double-check your work. Spawn another agent to give clear, concise second POV on your work. Do not do anything that isn't needed right now as it probably won't ever be needed. Verification and reporting happen at meaningful checkpoints, not after every command, tiny fix, or intermediate discovery."
 
-"On receiving new user request, first finish what you've started before taking new user request UNTIL it is explicitly required by user to take right now."
+"On receiving new user request, first finish what you've started before taking new user request UNTIL it is explicitly required by user to take right now. Continue execution through a meaningful checkpoint; do not stop only to report intermediate progress."
 
 Operational meaning:
 
@@ -25,11 +25,15 @@ Operational meaning:
 - Queue a newer request until active work closes unless the owner explicitly
   interrupts or replaces it. `Stop`, `стоп`, `забей`, `поправка`, or an
   explicit replacement switches now after safe process/worktree inspection.
+- Status updates are checkpoint-level summaries. Do not interrupt implementation
+  flow for routine commands, passing tests, formatting fixes, or small discoveries.
   `Retry` or `продолжай` first revalidates current state.
 - Self-check, then use exactly one independent read-only reviewer. Larger agent
   pipelines require explicit owner authorization.
 
 ## Autonomous Goal Protocol
+
+Execution should continue until a meaningful checkpoint or blocker. Intermediate command output is not a user-facing milestone.
 
 The persistent `/goal` objective is a north star, not the unit of work. Each
 continuation executes exactly one finite checkpoint supplied in

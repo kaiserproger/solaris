@@ -1,5 +1,5 @@
-use super::chunk_stream::passable_block_name;
 use super::*;
+use mc_data::block_semantics_26_1_2::passable_block_name;
 
 /// Pack `(x, y, z)` into vanilla's `BlockPos` `i64` representation.
 pub(super) fn pack_block_pos(x: i32, y: i32, z: i32) -> i64 {

@@ -45,6 +45,10 @@ pub enum CodecError {
         max: usize,
     },
 
+    /// A length-prefixed byte array exceeds the caller or wire-format ceiling.
+    #[error("byte array length {len} exceeds maximum {max}")]
+    ArrayTooLong { len: usize, max: usize },
+
     /// A length-prefixed string contained bytes that are not valid UTF-8.
     #[error("invalid UTF-8 in string")]
     InvalidUtf8,

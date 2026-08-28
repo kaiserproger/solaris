@@ -208,6 +208,36 @@ async fn command_tree_gamemode_and_feedback_round_trip() {
         next_system_chat_text(&mut client).await,
         "players_sleeping_percentage = 50"
     );
+
+    client
+        .write_packet(&ServerboundChatCommand {
+            command: "weather rain".to_string(),
+        })
+        .await
+        .expect("set rainy weather");
+    assert_eq!(
+        next_system_chat_text(&mut client).await,
+        "Set weather to Rain"
+    );
+    loop {
+        let outcome = client
+            .wait_for_frame_id_with_timeout_and_limits(
+                GameEvent::ID,
+                Duration::from_secs(5),
+                LATENCY_SENSITIVE_FRAME_WAIT_LIMITS,
+            )
+            .await
+            .expect("weather event frame");
+        let event =
+            GameEvent::decode(&mut outcome.frame.body.clone()).expect("decode weather event");
+        if event.event == GameEvent::EVENT_RAIN_LEVEL_CHANGE && event.value > 0.0 {
+            assert!(
+                event.value <= 0.2,
+                "first observed rain level was not on the vanilla ramp: {event:?}"
+            );
+            break;
+        }
+    }
 }
 
 #[tokio::test]
@@ -1548,7 +1578,7 @@ async fn lua_villager_goal_reaches_the_regional_owner_and_returns_targeted_resul
             name = "Villager Goals"
             version = "0.1.0"
             api = "0.6.0"
-            events = ["player.joined", "server.tick"]
+            events = ["player.joined"]
             capabilities = ["villagers"]
             spawn_entities = ["minecraft:villager"]
         "#,
@@ -1558,19 +1588,18 @@ async fn lua_villager_goal_reaches_the_regional_owner_and_returns_targeted_resul
         plugin.join("main.lua"),
         r#"
             local joined_player = nil
-            local bind_on_tick = false
 
             function on_player_joined(event: any)
                 joined_player = event.player_id
-                solaris.spawn_entity(event.player_id, "minecraft:villager", 1, -59, 1)
-                bind_on_tick = true
+                solaris.spawn_entity("spawn", event.player_id, "minecraft:villager", 1, -59, 1)
             end
 
-            function on_server_tick(_event: any)
-                if bind_on_tick then
-                    bind_on_tick = false
-                    solaris.bind_nearest_villager("bind", 0, -59, 0, 16)
+            function on_entity_spawn_result(event: any)
+                if not event.spawned then
+                    solaris.send_message(joined_player, "villager-spawn:" .. tostring(event.failure))
+                    return
                 end
+                solaris.bind_nearest_villager("bind", 0, -59, 0, 16)
             end
 
             function on_villager_binding_result(event: any)
@@ -2203,7 +2232,7 @@ async fn lua_operator_command_is_hidden_from_non_operators_and_routes_for_operat
             version = "0.1.0"
             api = "0.6.0"
             operator_commands = ["adminday"]
-            console_commands = ["time"]
+            capabilities = ["world_time"]
         "#,
     )
     .expect("write plugin manifest");
@@ -2211,7 +2240,7 @@ async fn lua_operator_command_is_hidden_from_non_operators_and_routes_for_operat
         plugin.join("main.lua"),
         r#"
             function on_player_command(event: any)
-                solaris.run_console("time set day")
+                solaris.set_world_time("admin-day", 1000)
                 solaris.send_message(event.player_id, "admin-day:" .. event.username)
             end
         "#,

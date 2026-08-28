@@ -57,6 +57,19 @@ async fn embedded_playable_flat_move_jump_input_and_wall_collision_behave() {
 
     client
         .write_packet(&ServerboundMovePlayerPosRot {
+            x: 0.5,
+            y: f64::from(player_y),
+            z: 10.5,
+            yaw: 90.0,
+            pitch: 0.0,
+            flags: MovePlayerFlags::new(true, false),
+        })
+        .await
+        .expect("move across embedded flat ground within movement budget");
+    assert_no_position_correction(&mut client, Duration::from_millis(300)).await;
+
+    client
+        .write_packet(&ServerboundMovePlayerPosRot {
             x: 1.5,
             y: f64::from(player_y),
             z: 10.5,
@@ -65,7 +78,7 @@ async fn embedded_playable_flat_move_jump_input_and_wall_collision_behave() {
             flags: MovePlayerFlags::new(true, false),
         })
         .await
-        .expect("move across embedded flat ground");
+        .expect("finish embedded flat-ground movement");
     assert_no_position_correction(&mut client, Duration::from_millis(300)).await;
 
     client
@@ -141,12 +154,17 @@ async fn embedded_playable_short_session_soak_keeps_clients_responsive() {
     for idx in 0..4 {
         tasks.push(tokio::spawn(async move {
             let (mut client, sync) = connect_to_play(addr, &format!("P2Soak{idx}")).await;
-            drain_until_chunk(&mut client, (0, 0)).await;
+            let spawn_chunk = (
+                (sync.x.floor() as i32).div_euclid(16),
+                (sync.z.floor() as i32).div_euclid(16),
+            );
+            drain_until_chunk(&mut client, spawn_chunk).await;
             let actual_spawn_y = sync.y.floor() as i32;
             assert!(
                 (player_y - 1..=player_y).contains(&actual_spawn_y),
                 "soak spawn should stay on the prepared surface: {actual_spawn_y}"
             );
+            let on_ground = actual_spawn_y == floor_y + 1;
 
             for step in 0..8 {
                 client
@@ -156,7 +174,7 @@ async fn embedded_playable_short_session_soak_keeps_clients_responsive() {
                         z: sync.z + (idx as f64 * 0.25),
                         yaw: 0.0,
                         pitch: 0.0,
-                        flags: MovePlayerFlags::new(true, false),
+                        flags: MovePlayerFlags::new(on_ground, false),
                     })
                     .await
                     .expect("send soak movement");

@@ -1,8 +1,13 @@
 use std::cell::RefCell;
 
 use mc_data::Identifier;
+use mc_data::block_placement_26_1_2::{
+    PlacementBlockState, SignState, StairCell, StairNeighborState, StairProperties,
+    apply_waterlogged_state, can_merge_slab, merge_slab_state, opposite, resolve_stair_shape,
+    sign_state_for_direction, torch_state_for_direction,
+};
+use mc_domain::Direction;
 use mc_nbt::{ListTag, Tag};
-use mc_protocol::packets::play::Direction;
 use mc_world::{BlockPos, BlockRegistry, BlockState, BlockStateId, WorldReadSnapshot};
 
 use super::{
@@ -99,14 +104,15 @@ pub(super) fn plan_block_placement(
 
     let snapshot = snapshot?;
     let target_state = snapshot.get_cached_block(pos)?;
-    let placed_state = if same_slab_can_merge(blocks, placed_state, target_state) {
-        slab_replacement_state(blocks, target_state, placed_state)?
-    } else {
-        waterlogged_placement_state(blocks, target_state, placed_state)?
-    };
+    let placed_state = merge_or_waterlogged(blocks, target_state, placed_state)?;
     let placed = blocks.by_id(placed_state)?;
     if is_stair_identity(placed) {
-        stair_properties(blocks, placed_state)?;
+        if !matches!(
+            classify_stair_state(blocks, placed_state),
+            StairState::Valid(_)
+        ) {
+            return None;
+        }
         return plan_stair_placement(blocks, snapshot, pos, target_state, placed_state);
     }
     if placed.block.id.path() == "torch" {
@@ -200,13 +206,15 @@ pub(super) fn same_slab_can_replace(
     clicked_face: Direction,
     clicked_relative_hit_y: f32,
 ) -> bool {
-    if !same_slab_can_merge(blocks, held_state, clicked_state) {
+    let Some(held) = blocks.by_id(held_state) else {
         return false;
-    }
+    };
     let Some(clicked) = blocks.by_id(clicked_state) else {
         return false;
     };
-
+    if !can_merge_slab(&to_neutral(held), &to_neutral(clicked)) {
+        return false;
+    }
     match property(clicked, "type") {
         Some("bottom") => {
             clicked_face == Direction::Up
@@ -230,9 +238,13 @@ pub(super) fn adjacent_placement_target_is_replaceable(
     target_state: BlockStateId,
     air: BlockStateId,
 ) -> bool {
+    let held = blocks.by_id(held_state);
+    let target = blocks.by_id(target_state);
     target_state == air
         || is_water_state(blocks, target_state)
-        || same_slab_can_merge(blocks, held_state, target_state)
+        || held
+            .zip(target)
+            .is_some_and(|(held, target)| can_merge_slab(&to_neutral(held), &to_neutral(target)))
 }
 
 fn is_water_state(blocks: &BlockRegistry, state: BlockStateId) -> bool {
@@ -241,54 +253,27 @@ fn is_water_state(blocks: &BlockRegistry, state: BlockStateId) -> bool {
         .is_some_and(|state| state.block.id.as_str() == "minecraft:water")
 }
 
-fn same_slab_can_merge(
-    blocks: &BlockRegistry,
-    held_state: BlockStateId,
-    target_state: BlockStateId,
-) -> bool {
-    let Some(held) = blocks.by_id(held_state) else {
-        return false;
-    };
-    let Some(target) = blocks.by_id(target_state) else {
-        return false;
-    };
-    held.block.id.path().ends_with("_slab")
-        && held.block.id == target.block.id
-        && matches!(property(target, "type"), Some("bottom" | "top"))
-}
-
-fn slab_replacement_state(
+fn merge_or_waterlogged(
     blocks: &BlockRegistry,
     target_state: BlockStateId,
     placed_state: BlockStateId,
 ) -> Option<BlockStateId> {
-    if !same_slab_can_merge(blocks, placed_state, target_state) {
-        return None;
-    }
-    let replaced = blocks.by_id(target_state)?;
-
-    let mut properties = replaced.properties.clone();
-    set_prop_if_present(&mut properties, "type", "double");
-    set_prop_if_present(&mut properties, "waterlogged", "false");
-    blocks.by_name_and_props(&replaced.block.id, &properties)
-}
-
-fn waterlogged_placement_state(
-    blocks: &BlockRegistry,
-    target_state: BlockStateId,
-    placed_state: BlockStateId,
-) -> Option<BlockStateId> {
+    let target = blocks.by_id(target_state)?;
     let placed = blocks.by_id(placed_state)?;
-    if !placed.block.id.path().ends_with("_slab") && !is_stair_identity(placed) {
-        return Some(placed_state);
+    let resolved = merge_slab_state(&to_neutral(target), &to_neutral(placed))
+        .unwrap_or_else(|| apply_waterlogged_state(&to_neutral(placed), &to_neutral(target)));
+    to_state_id(blocks, &resolved)
+}
+
+fn to_neutral(state: &BlockState) -> PlacementBlockState {
+    PlacementBlockState {
+        block_id: state.block.id.as_str().to_string(),
+        properties: state.properties.clone(),
     }
-    let waterlogged = is_water_state(blocks, target_state);
-    sibling_state_with_property(
-        blocks,
-        placed,
-        "waterlogged",
-        if waterlogged { "true" } else { "false" },
-    )
+}
+
+fn to_state_id(blocks: &BlockRegistry, state: &PlacementBlockState) -> Option<BlockStateId> {
+    blocks.by_name_and_props(&Identifier::parse(&state.block_id).ok()?, &state.properties)
 }
 
 fn plan_stair_placement(
@@ -365,7 +350,8 @@ pub(super) fn plan_stair_state_transition(
         |read_pos| transition_block_at(world, &read_positions, pos, new_state, read_pos);
     let target_state = match new_stair {
         StairState::Valid(_) => {
-            stair_state_with_shape_from(blocks, pos, new_state, &provisional_block_at)?
+            let neighbors = build_stair_neighbor_state(blocks, &provisional_block_at, pos)?;
+            stair_state_with_resolved_shape(blocks, new_state, neighbors)?
         }
         StairState::NotStair => new_state,
         StairState::Malformed => return None,
@@ -397,8 +383,12 @@ pub(super) fn plan_stair_state_transition(
                 positions.push(neighbor_pos);
             }
         }
-        let Some(updated) =
-            stair_state_with_shape_from(blocks, neighbor_pos, neighbor_state, &block_at)
+        let neighbors = match build_stair_neighbor_state(blocks, &block_at, neighbor_pos) {
+            Some(neighbors) => neighbors,
+            None if ordinary_transition => continue,
+            None => return None,
+        };
+        let Some(updated) = stair_state_with_resolved_shape(blocks, neighbor_state, neighbors)
         else {
             if ordinary_transition {
                 continue;
@@ -464,17 +454,25 @@ fn stair_state_with_shape(
             .then_some(placed_state)
             .or_else(|| snapshot.get_cached_block(read_pos))
     };
-    stair_state_with_shape_from(blocks, stair_pos, stair_state, &block_at)
+    let neighbors = build_stair_neighbor_state(blocks, &block_at, stair_pos)?;
+    stair_state_with_resolved_shape(blocks, stair_state, neighbors)
 }
 
-fn stair_state_with_shape_from(
+fn stair_state_with_resolved_shape(
     blocks: &BlockRegistry,
-    stair_pos: BlockPos,
     stair_state: BlockStateId,
-    block_at: &impl Fn(BlockPos) -> Option<BlockStateId>,
+    neighbors: StairNeighborState,
 ) -> Option<BlockStateId> {
-    let shape = stairs_shape_from(blocks, stair_pos, stair_state, block_at)?;
-    sibling_state_with_property(blocks, blocks.by_id(stair_state)?, "shape", shape)
+    let StairState::Valid(current) = classify_stair_state(blocks, stair_state) else {
+        return None;
+    };
+    let shape = resolve_stair_shape(current, neighbors)?;
+    sibling_state_with_property(
+        blocks,
+        blocks.by_id(stair_state)?,
+        "shape",
+        shape.property_value(),
+    )
 }
 
 #[cfg(test)]
@@ -491,97 +489,38 @@ fn stairs_shape(
             .then_some(placed_state)
             .or_else(|| snapshot.get_cached_block(read_pos))
     };
-    stairs_shape_from(blocks, pos, state, &block_at)
-}
-
-fn stairs_shape_from(
-    blocks: &BlockRegistry,
-    pos: BlockPos,
-    state: BlockStateId,
-    block_at: &impl Fn(BlockPos) -> Option<BlockStateId>,
-) -> Option<&'static str> {
-    let StairState::Valid(stair) = classify_stair_state(blocks, state) else {
+    let neighbors = build_stair_neighbor_state(blocks, &block_at, pos)?;
+    let StairState::Valid(current) = classify_stair_state(blocks, state) else {
         return None;
     };
-
-    let behind_state = block_at(relative(pos, stair.facing))?;
-    match classify_stair_state(blocks, behind_state) {
-        StairState::Malformed => return None,
-        StairState::NotStair => {}
-        StairState::Valid(behind)
-            if stair.top == behind.top
-                && horizontal_axis(stair.facing) != horizontal_axis(behind.facing)
-                && can_take_stair_shape(
-                    blocks,
-                    &block_at,
-                    pos,
-                    stair,
-                    opposite(behind.facing),
-                )? =>
-        {
-            return Some(if behind.facing == counter_clockwise(stair.facing) {
-                "outer_left"
-            } else {
-                "outer_right"
-            });
-        }
-        StairState::Valid(_) => {}
-    }
-
-    let front_state = block_at(relative(pos, opposite(stair.facing)))?;
-    match classify_stair_state(blocks, front_state) {
-        StairState::Malformed => return None,
-        StairState::NotStair => {}
-        StairState::Valid(front)
-            if stair.top == front.top
-                && horizontal_axis(stair.facing) != horizontal_axis(front.facing)
-                && can_take_stair_shape(blocks, &block_at, pos, stair, front.facing)? =>
-        {
-            return Some(if front.facing == counter_clockwise(stair.facing) {
-                "inner_left"
-            } else {
-                "inner_right"
-            });
-        }
-        StairState::Valid(_) => {}
-    }
-
-    Some("straight")
+    resolve_stair_shape(current, neighbors).map(|shape| shape.property_value())
 }
 
-fn can_take_stair_shape(
+fn build_stair_neighbor_state(
     blocks: &BlockRegistry,
     block_at: &impl Fn(BlockPos) -> Option<BlockStateId>,
     pos: BlockPos,
-    stair: StairProperties,
-    neighbor_direction: Direction,
-) -> Option<bool> {
-    match classify_stair_state(blocks, block_at(relative(pos, neighbor_direction))?) {
-        StairState::NotStair => Some(true),
-        StairState::Malformed => None,
-        StairState::Valid(neighbor) => {
-            Some(neighbor.facing != stair.facing || neighbor.top != stair.top)
-        }
-    }
+) -> Option<StairNeighborState> {
+    Some(StairNeighborState {
+        north: classify_stair_cell(blocks, block_at(relative(pos, Direction::North))?),
+        south: classify_stair_cell(blocks, block_at(relative(pos, Direction::South))?),
+        west: classify_stair_cell(blocks, block_at(relative(pos, Direction::West))?),
+        east: classify_stair_cell(blocks, block_at(relative(pos, Direction::East))?),
+    })
 }
 
-#[derive(Clone, Copy)]
-struct StairProperties {
-    facing: Direction,
-    top: bool,
+fn classify_stair_cell(blocks: &BlockRegistry, state: BlockStateId) -> StairCell {
+    match classify_stair_state(blocks, state) {
+        StairState::NotStair => StairCell::NotStair,
+        StairState::Valid(properties) => StairCell::Stair(properties),
+        StairState::Malformed => StairCell::Malformed,
+    }
 }
 
 enum StairState {
     NotStair,
     Valid(StairProperties),
     Malformed,
-}
-
-fn stair_properties(blocks: &BlockRegistry, state: BlockStateId) -> Option<StairProperties> {
-    match classify_stair_state(blocks, state) {
-        StairState::Valid(properties) => Some(properties),
-        StairState::NotStair | StairState::Malformed => None,
-    }
 }
 
 fn classify_stair_state(blocks: &BlockRegistry, state: BlockStateId) -> StairState {
@@ -696,31 +635,6 @@ fn is_horizontal(direction: Direction) -> bool {
     )
 }
 
-fn horizontal_axis(direction: Direction) -> bool {
-    matches!(direction, Direction::West | Direction::East)
-}
-
-fn opposite(direction: Direction) -> Direction {
-    match direction {
-        Direction::Down => Direction::Up,
-        Direction::Up => Direction::Down,
-        Direction::North => Direction::South,
-        Direction::South => Direction::North,
-        Direction::West => Direction::East,
-        Direction::East => Direction::West,
-    }
-}
-
-fn counter_clockwise(direction: Direction) -> Direction {
-    match direction {
-        Direction::North => Direction::West,
-        Direction::South => Direction::East,
-        Direction::West => Direction::South,
-        Direction::East => Direction::North,
-        Direction::Down | Direction::Up => unreachable!("stair facing is horizontal"),
-    }
-}
-
 fn torch_placement_state(
     blocks: &BlockRegistry,
     standing_state: BlockStateId,
@@ -728,47 +642,19 @@ fn torch_placement_state(
     pos: BlockPos,
     direction: Direction,
 ) -> Option<(BlockStateId, BlockEditPrecondition)> {
-    let (new_state, support, support_face) = match direction {
-        Direction::Up => (
-            standing_state,
-            BlockPos {
-                y: pos.y - 1,
-                ..pos
-            },
-            Direction::Up,
-        ),
-        Direction::North | Direction::South | Direction::West | Direction::East => {
-            let facing = direction_to_horizontal_facing(direction)?;
-            let wall_torch = Identifier::parse("minecraft:wall_torch").expect("static identifier");
-            let new_state = blocks
-                .by_name_and_props(&wall_torch, &[("facing".to_string(), facing.to_string())])?;
-            let support = match direction {
-                Direction::North => BlockPos {
-                    z: pos.z + 1,
-                    ..pos
-                },
-                Direction::South => BlockPos {
-                    z: pos.z - 1,
-                    ..pos
-                },
-                Direction::West => BlockPos {
-                    x: pos.x + 1,
-                    ..pos
-                },
-                Direction::East => BlockPos {
-                    x: pos.x - 1,
-                    ..pos
-                },
-                Direction::Down | Direction::Up => {
-                    unreachable!("horizontal direction matched above")
-                }
-            };
-            (new_state, support, direction)
-        }
-        Direction::Down => return None,
+    let torch = torch_state_for_direction(direction)?;
+    let new_state = if torch.block_id == "minecraft:torch" {
+        standing_state
+    } else {
+        let wall_torch = Identifier::parse(torch.block_id).ok()?;
+        blocks.by_name_and_props(
+            &wall_torch,
+            &[("facing".to_string(), torch.facing?.to_string())],
+        )?
     };
+    let support = relative(pos, opposite(direction));
     let support_state = snapshot.get_cached_block(support)?;
-    if !has_full_sturdy_face(blocks, support_state, support_face) {
+    if !has_full_sturdy_face(blocks, support_state, direction) {
         return None;
     }
     Some((
@@ -962,18 +848,19 @@ pub(super) fn sign_placement_state(
     player_pose: PlayerPose,
     direction: Direction,
 ) -> Option<BlockStateId> {
+    let sign_state = sign_state_for_direction(direction, player_pose.yaw)?;
     let path = state.block.id.path();
     if path.ends_with("_wall_sign") {
-        return direction_to_horizontal_facing(direction)
-            .and_then(|facing| sibling_state_with_property(blocks, state, "facing", facing));
+        let SignState::Wall { facing } = sign_state else {
+            return None;
+        };
+        return sibling_state_with_property(blocks, state, "facing", facing);
     }
     if is_editable_sign_state(state) {
-        return sibling_state_with_property(
-            blocks,
-            state,
-            "rotation",
-            &sign_rotation_from_yaw(player_pose.yaw).to_string(),
-        );
+        let SignState::Standing { rotation } = sign_state else {
+            return None;
+        };
+        return sibling_state_with_property(blocks, state, "rotation", &rotation.to_string());
     }
     None
 }
@@ -1054,20 +941,6 @@ fn sign_text_nbt(lines: &[String]) -> Tag {
     ])
 }
 
-fn direction_to_horizontal_facing(direction: Direction) -> Option<&'static str> {
-    match direction {
-        Direction::North => Some("north"),
-        Direction::South => Some("south"),
-        Direction::West => Some("west"),
-        Direction::East => Some("east"),
-        Direction::Down | Direction::Up => None,
-    }
-}
-
-fn sign_rotation_from_yaw(yaw: f32) -> u8 {
-    ((yaw.rem_euclid(360.0) / 22.5).round() as i32).rem_euclid(16) as u8
-}
-
 pub(super) fn door_half_state(
     blocks: &BlockRegistry,
     state: &BlockState,
@@ -1114,6 +987,7 @@ mod tests {
     use std::sync::Arc;
 
     use mc_data::Identifier;
+    use mc_data::block_placement_26_1_2::{counter_clockwise, opposite};
     use mc_data::blocks::{BlockReport, BlockStateReport};
     use mc_protocol::packets::play::Direction;
     use mc_world::{BlockPos, BlockRegistry, BlockStateId};
@@ -1123,9 +997,8 @@ mod tests {
     };
     use super::super::{BlockEdit, PlayerPose};
     use super::{
-        counter_clockwise, opposite, placement_snapshot_positions, plan_block_placement, relative,
-        same_slab_can_replace, stair_shape_dependency_positions, stair_state_with_shape,
-        stairs_shape,
+        placement_snapshot_positions, plan_block_placement, relative, same_slab_can_replace,
+        stair_shape_dependency_positions, stair_state_with_shape, stairs_shape,
     };
 
     fn simple_block(id: u32, name: &str) -> BlockReport {
@@ -1298,7 +1171,7 @@ mod tests {
     }
 
     fn clockwise(direction: Direction) -> Direction {
-        opposite(counter_clockwise(direction))
+        opposite(counter_clockwise(direction).expect("stair direction is horizontal"))
     }
 
     #[test]
@@ -1541,7 +1414,7 @@ mod tests {
                         (
                             "outer_left",
                             Some(relative(pos, facing)),
-                            Some(counter_clockwise(facing)),
+                            Some(counter_clockwise(facing).expect("stair direction is horizontal")),
                         ),
                         (
                             "outer_right",
@@ -1551,7 +1424,7 @@ mod tests {
                         (
                             "inner_left",
                             Some(relative(pos, opposite(facing))),
-                            Some(counter_clockwise(facing)),
+                            Some(counter_clockwise(facing).expect("stair direction is horizontal")),
                         ),
                         (
                             "inner_right",

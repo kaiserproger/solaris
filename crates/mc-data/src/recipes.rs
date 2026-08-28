@@ -37,8 +37,18 @@ pub enum RecipeDataError {
     MissingKey { path: PathBuf, key: char },
     #[error("invalid ingredient in {path}: alternatives must not be empty")]
     EmptyIngredient { path: PathBuf },
-    #[error("invalid shaped recipe pattern in {path}: rows must be non-empty and rectangular")]
+    #[error(
+        "invalid shaped recipe pattern in {path}: pattern must be a non-empty 1..=3 by 1..=3 character grid"
+    )]
     InvalidPattern { path: PathBuf },
+    #[error("shaped recipe {path} declares unused key {key:?}")]
+    UnusedKey { path: PathBuf, key: char },
+    #[error("invalid shapeless recipe ingredient count {count} in {path}: expected 1..=9")]
+    InvalidIngredientCount { path: PathBuf, count: usize },
+    #[error("invalid recipe result count {count} in {path}: expected a positive count")]
+    InvalidResultCount { path: PathBuf, count: u32 },
+    #[error("invalid cooking time {value} in {path}: expected a positive tick count")]
+    InvalidCookingTime { path: PathBuf, value: u32 },
     #[error("invalid cooking experience {value} in {path}")]
     InvalidCookingExperience { path: PathBuf, value: f64 },
 }
@@ -93,6 +103,296 @@ pub struct Ingredient {
 pub enum IngredientAlternative {
     Item(Identifier),
     Tag(Identifier),
+}
+
+#[must_use]
+pub fn ingredient_accepts_item(
+    items: &crate::items::ItemRegistry,
+    tags: &crate::tags::TagsData,
+    item_id: u32,
+    ingredient: &Ingredient,
+) -> bool {
+    ingredient
+        .alternatives
+        .iter()
+        .any(|alternative| match alternative {
+            IngredientAlternative::Item(item) => items.id_of(item) == Some(item_id),
+            IngredientAlternative::Tag(tag) => i32::try_from(item_id)
+                .ok()
+                .is_some_and(|raw_id| tags.contains_raw_id("minecraft:item", tag.as_str(), raw_id)),
+        })
+}
+
+#[must_use]
+pub fn stonecutting_recipe_accepts_input(
+    recipe: &Recipe,
+    items: &crate::items::ItemRegistry,
+    item_facts: &crate::item_components::ItemFactsTable,
+    tags: &crate::tags::TagsData,
+    input: &crate::ItemStack,
+) -> bool {
+    if input.is_empty() {
+        return false;
+    }
+    let RecipeKind::Stonecutting(stonecutting) = &recipe.kind else {
+        return false;
+    };
+    if recipe.result.item.as_str() == "minecraft:air" {
+        return false;
+    }
+    let Some(result_item_id) = items.id_of(&recipe.result.item) else {
+        return false;
+    };
+    let Ok(count) = i32::try_from(recipe.result.count) else {
+        return false;
+    };
+    let result = crate::ItemStack::new(result_item_id, count);
+    if count <= 0
+        || count > crate::item_semantics_26_1_2::max_stack_for_stack(item_facts, items, &result)
+    {
+        return false;
+    }
+    ingredient_accepts_item(items, tags, input.item_id, &stonecutting.ingredient)
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CookingKind {
+    Furnace,
+    Smoker,
+    BlastFurnace,
+}
+
+#[must_use]
+pub fn find_cooking_recipe_for_item(
+    recipes: &[Recipe],
+    items: &crate::items::ItemRegistry,
+    tags: &crate::tags::TagsData,
+    kind: CookingKind,
+    item_id: u32,
+) -> Option<Recipe> {
+    recipes.iter().find_map(|recipe| {
+        let cooking = match (&recipe.kind, kind) {
+            (RecipeKind::Smelting(cooking), CookingKind::Furnace) => cooking,
+            (RecipeKind::Smoking(cooking), CookingKind::Smoker) => cooking,
+            (RecipeKind::Blasting(cooking), CookingKind::BlastFurnace) => cooking,
+            _ => return None,
+        };
+        ingredient_accepts_item(items, tags, item_id, &cooking.ingredient).then(|| recipe.clone())
+    })
+}
+
+#[must_use]
+pub fn furnace_fuel_ticks(
+    tags: &crate::tags::TagsData,
+    kind: CookingKind,
+    item_id: u32,
+) -> Option<i16> {
+    let ticks = tags.fuel_values().burn_duration(item_id)?;
+    Some(match kind {
+        CookingKind::Furnace => ticks,
+        CookingKind::Smoker | CookingKind::BlastFurnace => ticks / 2,
+    })
+}
+
+#[must_use]
+pub fn shaped_recipe_matches(
+    items: &crate::items::ItemRegistry,
+    tags: &crate::tags::TagsData,
+    input: &[crate::ItemStack; 9],
+    shaped: &ShapedRecipe,
+) -> bool {
+    let height = shaped.pattern.len();
+    let width = shaped
+        .pattern
+        .iter()
+        .map(|row| row.chars().count())
+        .max()
+        .unwrap_or(0);
+    if height == 0 || width == 0 || height > 3 || width > 3 {
+        return false;
+    }
+    for top in 0..=(3 - height) {
+        'left: for left in 0..=(3 - width) {
+            for row in 0..3 {
+                for col in 0..3 {
+                    let stack = &input[row * 3 + col];
+                    let ingredient =
+                        if row >= top && row < top + height && col >= left && col < left + width {
+                            shaped
+                                .pattern
+                                .get(row - top)
+                                .and_then(|pattern_row| pattern_row.chars().nth(col - left))
+                                .filter(|ch| *ch != ' ')
+                                .and_then(|ch| shaped.key.get(&ch))
+                        } else {
+                            None
+                        };
+                    match ingredient {
+                        Some(ingredient)
+                            if !stack.is_empty()
+                                && ingredient_accepts_item(
+                                    items,
+                                    tags,
+                                    stack.item_id,
+                                    ingredient,
+                                ) => {}
+                        None if stack.is_empty() => {}
+                        _ => continue 'left,
+                    }
+                }
+            }
+            return true;
+        }
+    }
+    false
+}
+
+#[must_use]
+pub fn shapeless_recipe_matches(
+    items: &crate::items::ItemRegistry,
+    tags: &crate::tags::TagsData,
+    input: &[crate::ItemStack; 9],
+    shapeless: &ShapelessRecipe,
+) -> bool {
+    let stacks: Vec<_> = input.iter().filter(|stack| !stack.is_empty()).collect();
+    if stacks.len() != shapeless.ingredients.len() {
+        return false;
+    }
+    let mut used = vec![false; shapeless.ingredients.len()];
+    for stack in stacks {
+        let Some((idx, _)) = shapeless
+            .ingredients
+            .iter()
+            .enumerate()
+            .find(|(idx, ingredient)| {
+                !used[*idx] && ingredient_accepts_item(items, tags, stack.item_id, ingredient)
+            })
+        else {
+            return false;
+        };
+        used[idx] = true;
+    }
+    true
+}
+
+#[must_use]
+pub fn crafting_recipe_matches(
+    items: &crate::items::ItemRegistry,
+    tags: &crate::tags::TagsData,
+    input: &[crate::ItemStack; 9],
+    recipe: &Recipe,
+) -> bool {
+    match &recipe.kind {
+        RecipeKind::Shaped(shaped) => shaped_recipe_matches(items, tags, input, shaped),
+        RecipeKind::Shapeless(shapeless) => shapeless_recipe_matches(items, tags, input, shapeless),
+        RecipeKind::Smelting(_)
+        | RecipeKind::Blasting(_)
+        | RecipeKind::Smoking(_)
+        | RecipeKind::CampfireCooking(_)
+        | RecipeKind::Stonecutting(_) => false,
+    }
+}
+
+#[must_use]
+pub fn repair_item_crafting_result(
+    items: &crate::items::ItemRegistry,
+    item_facts: &crate::item_components::ItemFactsTable,
+    input: &[crate::ItemStack; 9],
+) -> Option<crate::ItemStack> {
+    let mut occupied = input.iter().filter(|stack| !stack.is_empty());
+    let first = occupied.next()?;
+    let second = occupied.next()?;
+    if occupied.next().is_some()
+        || first.item_id != second.item_id
+        || first.count != 1
+        || second.count != 1
+    {
+        return None;
+    }
+    let first_damage = first.damage?;
+    let second_damage = second.damage?;
+    let item = items.name_of(first.item_id)?;
+    let max_damage = i32::try_from(item_facts.get(item)?.max_damage?).ok()?;
+    if max_damage <= 0 {
+        return None;
+    }
+    let remaining = max_damage.saturating_sub(first_damage)
+        + max_damage.saturating_sub(second_damage)
+        + max_damage / 20;
+    Some(crate::ItemStack::new(first.item_id, 1).with_damage((max_damage - remaining).max(0)))
+}
+
+#[must_use]
+pub fn crafting_result_from_input(
+    items: &crate::items::ItemRegistry,
+    item_facts: &crate::item_components::ItemFactsTable,
+    tags: &crate::tags::TagsData,
+    recipes: &[Recipe],
+    input: &[crate::ItemStack; 9],
+) -> crate::ItemStack {
+    if let Some(result) = repair_item_crafting_result(items, item_facts, input) {
+        return result;
+    }
+    recipes
+        .iter()
+        .find(|recipe| crafting_recipe_matches(items, tags, input, recipe))
+        .and_then(|recipe| {
+            let item_id = items.id_of(&recipe.result.item)?;
+            let count = i32::try_from(recipe.result.count).ok()?;
+            (count > 0).then(|| crate::ItemStack::new(item_id, count))
+        })
+        .unwrap_or(crate::ItemStack::EMPTY)
+}
+
+#[must_use]
+pub fn furnace_experience_award(
+    recipes: &[Recipe],
+    recipes_used: &std::collections::BTreeMap<String, i32>,
+    seed: u64,
+) -> i32 {
+    let mut total = 0_u64;
+    for (recipe_id, count) in recipes_used {
+        let Ok(count) = u64::try_from(*count) else {
+            continue;
+        };
+        let Some(recipe) = recipes
+            .iter()
+            .find(|recipe| recipe.id.as_str() == recipe_id)
+        else {
+            continue;
+        };
+        let experience_milli = match &recipe.kind {
+            RecipeKind::Smelting(recipe)
+            | RecipeKind::Blasting(recipe)
+            | RecipeKind::Smoking(recipe) => recipe.experience_milli,
+            RecipeKind::Shaped(_)
+            | RecipeKind::Shapeless(_)
+            | RecipeKind::CampfireCooking(_)
+            | RecipeKind::Stonecutting(_) => continue,
+        };
+        let scaled = count.saturating_mul(u64::from(experience_milli));
+        let mut recipe_award = scaled / 1_000;
+        let remainder = scaled % 1_000;
+        if remainder > 0 {
+            let mut recipe_seed = seed ^ 0xCBF2_9CE4_8422_2325;
+            for byte in recipe_id.bytes() {
+                recipe_seed ^= u64::from(byte);
+                recipe_seed = recipe_seed.wrapping_mul(0x0000_0100_0000_01B3);
+            }
+            if splitmix64(recipe_seed) % 1_000 < remainder {
+                recipe_award = recipe_award.saturating_add(1);
+            }
+        }
+        total = total.saturating_add(recipe_award);
+    }
+    total.min(i32::MAX as u64) as i32
+}
+
+fn splitmix64(mut value: u64) -> u64 {
+    value = value.wrapping_add(0x9E37_79B9_7F4A_7C15);
+    value = (value ^ (value >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+    value = (value ^ (value >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+    value ^ (value >> 31)
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -246,6 +546,7 @@ fn parse_shaped_recipe(
         key.insert(ch, parse_ingredient(path, raw_ingredient)?);
     }
 
+    let mut used_keys = BTreeMap::new();
     for row in &raw.pattern {
         for ch in row.chars().filter(|ch| *ch != ' ') {
             if !key.contains_key(&ch) {
@@ -254,7 +555,14 @@ fn parse_shaped_recipe(
                     key: ch,
                 });
             }
+            used_keys.insert(ch, ());
         }
+    }
+    if let Some((&unused, _)) = key.iter().find(|(ch, _)| !used_keys.contains_key(ch)) {
+        return Err(RecipeDataError::UnusedKey {
+            path: path.to_path_buf(),
+            key: unused,
+        });
     }
 
     Ok(Recipe {
@@ -272,6 +580,12 @@ fn parse_shapeless_recipe(
     id: Identifier,
     raw: RawShapelessRecipe,
 ) -> Result<Recipe, RecipeDataError> {
+    if !(1..=9).contains(&raw.ingredients.len()) {
+        return Err(RecipeDataError::InvalidIngredientCount {
+            path: path.to_path_buf(),
+            count: raw.ingredients.len(),
+        });
+    }
     let ingredients = raw
         .ingredients
         .into_iter()
@@ -291,6 +605,12 @@ fn parse_smelting_recipe(
     raw: RawSmeltingRecipe,
     raw_kind: String,
 ) -> Result<Recipe, RecipeDataError> {
+    if raw.cooking_time == 0 {
+        return Err(RecipeDataError::InvalidCookingTime {
+            path: path.to_path_buf(),
+            value: raw.cooking_time,
+        });
+    }
     let smelting = SmeltingRecipe {
         ingredient: parse_ingredient(path, raw.ingredient)?,
         cooking_time: raw.cooking_time,
@@ -311,12 +631,20 @@ fn parse_smelting_recipe(
 }
 
 fn validate_pattern(path: &Path, pattern: &[String]) -> Result<(), RecipeDataError> {
-    let Some(width) = pattern.first().map(String::len) else {
+    if !(1..=3).contains(&pattern.len()) {
+        return Err(RecipeDataError::InvalidPattern {
+            path: path.to_path_buf(),
+        });
+    }
+    let Some(width) = pattern.first().map(|row| row.chars().count()) else {
         return Err(RecipeDataError::InvalidPattern {
             path: path.to_path_buf(),
         });
     };
-    if width == 0 || pattern.iter().any(|row| row.len() != width) {
+    if !(1..=3).contains(&width)
+        || pattern.iter().any(|row| row.chars().count() != width)
+        || pattern.iter().all(|row| row.chars().all(|ch| ch == ' '))
+    {
         return Err(RecipeDataError::InvalidPattern {
             path: path.to_path_buf(),
         });
@@ -372,6 +700,12 @@ fn parse_result(path: &Path, raw: RawResult) -> Result<RecipeResult, RecipeDataE
         RawResult::Object { id, count } => (id, count),
         RawResult::Id(id) => (id, default_count()),
     };
+    if count == 0 {
+        return Err(RecipeDataError::InvalidResultCount {
+            path: path.to_path_buf(),
+            count,
+        });
+    }
     Ok(RecipeResult {
         item: parse_id(path, item)?,
         count,
@@ -513,6 +847,107 @@ mod tests {
             std::fs::create_dir_all(parent).unwrap();
         }
         std::fs::write(path, body).unwrap();
+    }
+
+    fn parse_test_recipe(value: serde_json::Value) -> Result<Option<Recipe>, RecipeDataError> {
+        parse_recipe_value(
+            Path::new("test.json"),
+            Identifier::parse("minecraft:test").unwrap(),
+            value,
+        )
+    }
+
+    #[test]
+    fn shaped_recipe_enforces_vanilla_grid_and_character_width() {
+        let unicode = parse_test_recipe(serde_json::json!({
+            "type": "minecraft:crafting_shaped",
+            "pattern": ["界界"],
+            "key": {"界": "minecraft:stone"},
+            "result": {"id": "minecraft:stone"}
+        }))
+        .unwrap();
+        assert!(unicode.is_some());
+
+        for pattern in [
+            serde_json::json!(["####"]),
+            serde_json::json!(["#", "#", "#", "#"]),
+            serde_json::json!(["   "]),
+        ] {
+            let error = parse_test_recipe(serde_json::json!({
+                "type": "minecraft:crafting_shaped",
+                "pattern": pattern,
+                "key": {"#": "minecraft:stone"},
+                "result": {"id": "minecraft:stone"}
+            }))
+            .unwrap_err();
+            assert!(matches!(error, RecipeDataError::InvalidPattern { .. }));
+        }
+    }
+
+    #[test]
+    fn shaped_recipe_rejects_unused_declared_key() {
+        let error = parse_test_recipe(serde_json::json!({
+            "type": "minecraft:crafting_shaped",
+            "pattern": ["#"],
+            "key": {
+                "#": "minecraft:stone",
+                "X": "minecraft:dirt"
+            },
+            "result": {"id": "minecraft:stone"}
+        }))
+        .unwrap_err();
+        assert!(matches!(error, RecipeDataError::UnusedKey { key: 'X', .. }));
+    }
+
+    #[test]
+    fn shapeless_recipe_requires_one_to_nine_ingredients() {
+        let empty = parse_test_recipe(serde_json::json!({
+            "type": "minecraft:crafting_shapeless",
+            "ingredients": [],
+            "result": {"id": "minecraft:stone"}
+        }))
+        .unwrap_err();
+        assert!(matches!(
+            empty,
+            RecipeDataError::InvalidIngredientCount { count: 0, .. }
+        ));
+
+        let too_many = parse_test_recipe(serde_json::json!({
+            "type": "minecraft:crafting_shapeless",
+            "ingredients": vec!["minecraft:stone"; 10],
+            "result": {"id": "minecraft:stone"}
+        }))
+        .unwrap_err();
+        assert!(matches!(
+            too_many,
+            RecipeDataError::InvalidIngredientCount { count: 10, .. }
+        ));
+    }
+
+    #[test]
+    fn recipes_reject_zero_result_count_and_zero_cooking_time() {
+        let zero_result = parse_test_recipe(serde_json::json!({
+            "type": "minecraft:crafting_shapeless",
+            "ingredients": ["minecraft:stone"],
+            "result": {"id": "minecraft:stone", "count": 0}
+        }))
+        .unwrap_err();
+        assert!(matches!(
+            zero_result,
+            RecipeDataError::InvalidResultCount { count: 0, .. }
+        ));
+
+        let zero_time = parse_test_recipe(serde_json::json!({
+            "type": "minecraft:smelting",
+            "ingredient": "minecraft:iron_ore",
+            "result": {"id": "minecraft:iron_ingot"},
+            "cooking_time": 0
+        }))
+        .unwrap_err();
+        assert!(matches!(
+            zero_time,
+            RecipeDataError::InvalidCookingTime { value: 0, .. }
+        ));
     }
 
     #[test]

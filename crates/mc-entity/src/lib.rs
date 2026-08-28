@@ -15,14 +15,18 @@ use uuid::Uuid;
 #[allow(dead_code)]
 pub(crate) mod ai_core_26_1_2;
 pub mod attributes_26_1_2;
+pub mod dragon_26_1_2;
 pub mod effects_26_1_2;
 mod entity_scale_26_1_2;
 pub mod equipment_26_1_2;
+pub mod fire_26_1_2;
 pub mod living_26_1_2;
 mod lock_policy;
 pub mod mob_control_26_1_2;
 pub mod natural_spawn_26_1_2;
 pub mod navigation_26_1_2;
+pub mod player_combat_26_1_2;
+pub mod player_survival_26_1_2;
 pub mod projectile_26_1_2;
 mod regional;
 mod runtime;
@@ -387,6 +391,8 @@ pub struct SpawnEntity {
     pub vehicle: Option<VehicleState>,
     pub animal: Option<AnimalBreedingState>,
     pub retained: EntityRetainedState,
+    /// Allocator-only id span reserved immediately after this entity.
+    pub reserved_following_ids: u8,
 }
 
 impl SpawnEntity {
@@ -408,7 +414,14 @@ impl SpawnEntity {
             vehicle: None,
             animal: None,
             retained: EntityRetainedState::default(),
+            reserved_following_ids: 0,
         }
+    }
+
+    #[must_use]
+    pub const fn reserve_following_ids(mut self, count: u8) -> Self {
+        self.reserved_following_ids = count;
+        self
     }
 
     #[must_use]
@@ -453,8 +466,14 @@ pub struct EntityRetainedState {
     pub living: EntityLivingRetainedState,
     #[serde(default)]
     pub fall_distance: f64,
+    #[serde(default)]
+    pub remaining_fire_ticks: i32,
     pub active_effects: Option<EntityActiveEffectsState>,
     pub arrow_state: Option<projectile_26_1_2::ArrowState>,
+    #[serde(default)]
+    pub hurting_projectile_state: Option<projectile_26_1_2::HurtingProjectileState>,
+    #[serde(skip)]
+    pub throwable_projectile_state: Option<projectile_26_1_2::ThrowableState>,
     pub last_damage_tick: Option<u64>,
     pub death_remove_tick: Option<u64>,
     pub sheep_grazing_ticks: Option<u8>,
@@ -470,10 +489,45 @@ pub struct EntityRetainedState {
     pub villager_food_recipient: Option<EntityId>,
     pub primed_tnt: Option<EntityPrimedTntState>,
     #[serde(default)]
+    pub pending_explosion: Option<EntityPendingExplosionState>,
+    #[serde(default)]
     pub crossbow_attack: Option<EntityCrossbowAttackState>,
+    /// Runtime-only BlazeAttackGoal step/deadline. Vanilla does not persist goal-local timers.
+    #[serde(skip)]
+    pub blaze_attack: Option<EntityBlazeAttackState>,
+    /// Runtime-only GhastShootFireballGoal charge timer.
+    #[serde(skip)]
+    pub ghast_attack: Option<EntityGhastAttackState>,
+    /// Runtime-only Breeze Shoot behavior state.
+    #[serde(skip)]
+    pub breeze_attack: Option<EntityBreezeAttackState>,
+    /// Runtime-only Witch ranged-attack cadence.
+    #[serde(skip)]
+    pub witch_attack: Option<EntityWitchAttackState>,
+    #[serde(default)]
+    pub witch_potion: Option<EntityWitchPotionKind>,
+    /// Runtime-only Ender Dragon D1 air-combat owner state.
+    #[serde(skip)]
+    pub dragon_air: Option<dragon_26_1_2::DragonAirState>,
+    /// Runtime-only DragonFireball area-effect cloud lifecycle.
+    #[serde(skip)]
+    pub dragon_breath_cloud: Option<EntityDragonBreathCloudState>,
     /// Runtime attack-goal state. Vanilla does not persist the active beam target.
     #[serde(skip)]
     pub guardian_beam: Option<EntityGuardianBeamState>,
+    /// Runtime-only Warden sonic-boom behavior state; Brain memories are not entity NBT here.
+    #[serde(skip)]
+    pub warden_sonic_boom: Option<EntityWardenSonicBoomState>,
+    /// Runtime-only Shulker ranged-attack cadence.
+    #[serde(skip)]
+    pub shulker_attack: Option<EntityShulkerAttackState>,
+    #[serde(default)]
+    pub shulker_bullet: Option<EntityShulkerBulletState>,
+    /// Runtime-only Evoker fangs spell cadence.
+    #[serde(skip)]
+    pub evoker_attack: Option<EntityEvokerAttackState>,
+    #[serde(default)]
+    pub evoker_fangs: Option<EntityEvokerFangState>,
     #[serde(default)]
     pub villager: Option<VillagerData>,
     #[serde(default)]
@@ -517,6 +571,131 @@ impl EntityCrossbowAttackState {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct EntityBlazeAttackState {
+    pub attack_step: u8,
+    pub deadline_tick: u64,
+}
+
+impl EntityBlazeAttackState {
+    #[must_use]
+    pub const fn new(attack_step: u8, deadline_tick: u64) -> Self {
+        Self {
+            attack_step,
+            deadline_tick,
+        }
+    }
+
+    #[must_use]
+    pub const fn is_charged(self) -> bool {
+        self.attack_step != 0
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct EntityGhastAttackState {
+    pub charge_time: i32,
+}
+
+impl EntityGhastAttackState {
+    #[must_use]
+    pub const fn new(charge_time: i32) -> Self {
+        Self { charge_time }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum EntityBreezeAttackPhase {
+    Charging,
+    Recovery,
+    Cooldown,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct EntityBreezeAttackState {
+    pub phase: EntityBreezeAttackPhase,
+    pub target_session: u64,
+    pub target_entity_id: i32,
+    pub deadline_tick: u64,
+}
+
+impl EntityBreezeAttackState {
+    #[must_use]
+    pub const fn new(
+        phase: EntityBreezeAttackPhase,
+        target_session: u64,
+        target_entity_id: i32,
+        deadline_tick: u64,
+    ) -> Self {
+        Self {
+            phase,
+            target_session,
+            target_entity_id,
+            deadline_tick,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct EntityWitchAttackState {
+    pub target_session: u64,
+    pub target_entity_id: i32,
+    pub deadline_tick: u64,
+}
+
+impl EntityWitchAttackState {
+    #[must_use]
+    pub const fn new(target_session: u64, target_entity_id: i32, deadline_tick: u64) -> Self {
+        Self {
+            target_session,
+            target_entity_id,
+            deadline_tick,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum EntityWitchPotionKind {
+    Harming,
+    Slowness,
+    Poison,
+    Weakness,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct EntityDragonBreathCloudVictim {
+    pub session_id: u64,
+    pub next_apply_tick: u64,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct EntityDragonBreathCloudState {
+    pub owner_entity_id: i32,
+    pub age_ticks: u32,
+    pub duration_ticks: u32,
+    pub radius: f32,
+    pub radius_per_tick: f32,
+    pub amplifier: u8,
+    pub reapplication_delay_ticks: u32,
+    pub victims: Vec<EntityDragonBreathCloudVictim>,
+}
+
+impl EntityDragonBreathCloudState {
+    #[must_use]
+    pub fn dragon_fireball(owner_entity_id: i32) -> Self {
+        Self {
+            owner_entity_id,
+            age_ticks: 0,
+            duration_ticks: 600,
+            radius: 3.0,
+            radius_per_tick: (7.0 - 3.0) / 600.0,
+            amplifier: 1,
+            reapplication_delay_ticks: 20,
+            victims: Vec::new(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum EntityGuardianBeamPhase {
     Warmup,
     Beam,
@@ -551,6 +730,114 @@ impl EntityGuardianBeamState {
         match self.phase {
             EntityGuardianBeamPhase::Warmup => 0,
             EntityGuardianBeamPhase::Beam => self.target_entity_id,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum EntityWardenSonicBoomPhase {
+    Charging,
+    Recovery,
+    Cooldown,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct EntityWardenSonicBoomState {
+    pub phase: EntityWardenSonicBoomPhase,
+    pub target_session: u64,
+    pub target_entity_id: i32,
+    pub deadline_tick: u64,
+}
+
+impl EntityWardenSonicBoomState {
+    #[must_use]
+    pub const fn new(
+        phase: EntityWardenSonicBoomPhase,
+        target_session: u64,
+        target_entity_id: i32,
+        deadline_tick: u64,
+    ) -> Self {
+        Self {
+            phase,
+            target_session,
+            target_entity_id,
+            deadline_tick,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct EntityShulkerAttackState {
+    pub deadline_tick: u64,
+}
+
+impl EntityShulkerAttackState {
+    #[must_use]
+    pub const fn new(deadline_tick: u64) -> Self {
+        Self { deadline_tick }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct EntityShulkerBulletState {
+    pub target_entity_id: i32,
+}
+
+impl EntityShulkerBulletState {
+    #[must_use]
+    pub const fn new(target_entity_id: i32) -> Self {
+        Self { target_entity_id }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum EntityEvokerAttackPhase {
+    Warmup,
+    Casting,
+    Cooldown,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct EntityEvokerAttackState {
+    pub phase: EntityEvokerAttackPhase,
+    pub target_session: u64,
+    pub target_entity_id: i32,
+    pub deadline_tick: u64,
+}
+
+impl EntityEvokerAttackState {
+    #[must_use]
+    pub const fn new(
+        phase: EntityEvokerAttackPhase,
+        target_session: u64,
+        target_entity_id: i32,
+        deadline_tick: u64,
+    ) -> Self {
+        Self {
+            phase,
+            target_session,
+            target_entity_id,
+            deadline_tick,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct EntityEvokerFangState {
+    pub owner_entity_id: i32,
+    pub warmup_delay_ticks: i32,
+    pub life_ticks: i32,
+    pub sent_spike_event: bool,
+}
+
+impl EntityEvokerFangState {
+    #[must_use]
+    pub const fn new(owner_entity_id: i32, warmup_delay_ticks: i32) -> Self {
+        Self {
+            owner_entity_id,
+            warmup_delay_ticks,
+            life_ticks: 22,
+            sent_spike_event: false,
         }
     }
 }
@@ -611,6 +898,45 @@ pub struct EntityPrimedTntState {
     pub air_block_state: u32,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum EntityExplosionInteraction {
+    Mob,
+    Trigger,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct EntityPendingExplosionState {
+    pub expires_tick: u64,
+    pub power_bits: u32,
+    pub interaction: EntityExplosionInteraction,
+    pub damage_entities: bool,
+    pub air_block_state: u32,
+}
+
+impl EntityPendingExplosionState {
+    #[must_use]
+    pub fn new(
+        expires_tick: u64,
+        power: f32,
+        interaction: EntityExplosionInteraction,
+        damage_entities: bool,
+        air_block_state: u32,
+    ) -> Option<Self> {
+        (power.is_finite() && power > 0.0).then_some(Self {
+            expires_tick,
+            power_bits: power.to_bits(),
+            interaction,
+            damage_entities,
+            air_block_state,
+        })
+    }
+
+    #[must_use]
+    pub const fn power(self) -> f32 {
+        f32::from_bits(self.power_bits)
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct EntityKinematics {
     pub id: EntityId,
@@ -634,11 +960,16 @@ pub struct EntityMotionState {
     pub velocity: Vec3,
     pub on_ground: bool,
     pub fall_distance: f64,
+    pub goal_fence: EntityGoalFence,
     pub is_item: bool,
     pub is_experience: bool,
     pub is_arrow: bool,
     pub arrow_revision: Option<u64>,
     pub arrow_embedded_block: Option<projectile_26_1_2::BlockPosition>,
+    pub is_hurting_projectile: bool,
+    pub hurting_projectile_revision: Option<u64>,
+    pub is_throwable_projectile: bool,
+    pub throwable_projectile_revision: Option<u64>,
     pub sends_velocity: bool,
 }
 
@@ -667,6 +998,7 @@ pub struct EntitySimulationProjection {
     pub attack_damage: f64,
     pub goal: GoalState,
     pub primed_tnt: bool,
+    pub guardian_beam_active: bool,
     pub has_item_stack: bool,
     pub has_experience_value: bool,
     pub has_block_state: bool,
@@ -675,6 +1007,12 @@ pub struct EntitySimulationProjection {
     pub fall_distance: f64,
     pub arrow_revision: Option<u64>,
     pub arrow_embedded_block: Option<projectile_26_1_2::BlockPosition>,
+    pub hurting_projectile_revision: Option<u64>,
+    pub hurting_projectile_acceleration_power_bits: Option<u64>,
+    pub hurting_projectile_air_inertia_bits: Option<u64>,
+    pub hurting_projectile_water_inertia_bits: Option<u64>,
+    pub throwable_projectile_revision: Option<u64>,
+    pub shulker_bullet_target_entity_id: Option<i32>,
     pub sheep_grazing_ticks: Option<u8>,
     pub villager: Option<VillagerData>,
     pub villager_schedule: Option<villager_26_1_2::VillagerScheduleKind>,
@@ -915,6 +1253,65 @@ pub enum GoalState {
         target: Vec3,
         speed: f64,
     },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum EntityGoalFence {
+    Idle,
+    Wander {
+        speed_bits: u64,
+        period_ticks: u32,
+    },
+    AquaticWander {
+        speed_bits: u64,
+        vertical_speed_bits: u64,
+        period_ticks: u32,
+    },
+    FollowTarget {
+        target: EntityId,
+        speed_bits: u64,
+    },
+    FollowPosition {
+        x_bits: u64,
+        y_bits: u64,
+        z_bits: u64,
+        speed_bits: u64,
+    },
+}
+
+impl EntityGoalFence {
+    #[must_use]
+    pub fn from_goal(goal: &GoalState) -> Self {
+        match goal {
+            GoalState::Idle => Self::Idle,
+            GoalState::Wander {
+                speed,
+                period_ticks,
+            } => Self::Wander {
+                speed_bits: speed.to_bits(),
+                period_ticks: *period_ticks,
+            },
+            GoalState::AquaticWander {
+                speed,
+                vertical_speed,
+                period_ticks,
+            } => Self::AquaticWander {
+                speed_bits: speed.to_bits(),
+                vertical_speed_bits: vertical_speed.to_bits(),
+                period_ticks: *period_ticks,
+            },
+            GoalState::FollowTarget { target, speed } => Self::FollowTarget {
+                target: *target,
+                speed_bits: speed.to_bits(),
+            },
+            GoalState::FollowPosition { target, speed } => Self::FollowPosition {
+                x_bits: target.x.to_bits(),
+                y_bits: target.y.to_bits(),
+                z_bits: target.z.to_bits(),
+                speed_bits: speed.to_bits(),
+            },
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

@@ -7,7 +7,7 @@
 
 use bytes::{Buf, BufMut};
 
-use super::ItemStack;
+use super::{ItemStack, ItemStackWireCodec};
 use crate::CodecError;
 use crate::codec::{Identifier, ReadMc, WriteMc, read_bounded_vec};
 use crate::packets::Packet;

@@ -58,7 +58,11 @@ public final class ClientCommands {
             }
             return versionedSnapshot(executor, client);
         });
-        registry.registerConcurrent("observe", request -> executor.callOnClientThread(client::observe));
+        registry.registerConcurrent("observe", request -> executor.callOnClientThread(() -> {
+            JsonObject observation = client.observe();
+            observation.addProperty("state_version", client.stateVersion());
+            return observation;
+        }));
         registry.registerConcurrent("read_block", request -> {
             JsonObject payload = request.payload();
             int x = boundedInt(payload, "x", Integer.MIN_VALUE, Integer.MAX_VALUE);

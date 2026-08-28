@@ -374,7 +374,7 @@ write_real_client_server_config() {
   operators="$(real_client_operator_list)"
   case "$AGENT_SCENARIO" in
     playable-04-twenty-minute-survival-loop)
-      hostile_spawn_interval_override="0"
+      hostile_spawn_interval_override=""
       ;;
     playable-*)
       hostile_spawn_interval_override="20"
@@ -1082,6 +1082,8 @@ for after_scenario, required_before_scenarios in restart_prerequisites.items():
         )
         sys.exit(1)
 PY
+  python3 "$REPO_ROOT/tools/validate-real-client-restart-evidence.py" \
+    "$automation_driver" "$observations_file" "$manifest_file"
 }
 
 validate_server_log() {
@@ -1135,6 +1137,11 @@ PY
 
 if [[ "$MODE" == "check" || "$MODE" == "run" ]]; then
   SCENARIO_NO_DEBUG="$(requested_scenario_no_debug)"
+fi
+
+if [[ "$MODE" == "run" && -z "${DISPLAY:-}" && -z "${WAYLAND_DISPLAY:-}" ]]; then
+  printf 'error: --run requires a graphical display; set DISPLAY or WAYLAND_DISPLAY\n' >&2
+  exit 1
 fi
 
 if [[ "$MODE" == "check" ]]; then

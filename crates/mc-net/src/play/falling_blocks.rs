@@ -9,12 +9,12 @@ use mc_world::{
     BlockPos, BlockRegistry, BlockStateId, ChunkPos, MAX_Y, MIN_Y, SECTION_DIM, WorldReadSnapshot,
 };
 
-use super::chunk_stream::passable_block_name;
 use super::survival::{block_drop_stacks_with_facts_from, entity_item_stack};
 use super::{
     AppliedBlockEdit, BlockEdit, BlockEditPrecondition, BlockPlanningRead, SnapshotPlanningWorld,
     SnapshotReadPrecondition,
 };
+use mc_data::block_semantics_26_1_2::passable_block_name;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct LandedFallingBlock {

@@ -450,6 +450,7 @@
       "status": "manual-pending",
       "bounded_time_minutes": 20,
       "screenshots_required": true,
+      "no_debug_commands": false,
       "steps": [
         "Observe nearby passive, hostile, or aquatic entity movement if present; record pathing stalls or visibility desyncs.",
         "Exercise melee combat with a common mob if available and record damage, knockback, drops, and XP visibility.",

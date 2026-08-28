@@ -16,7 +16,9 @@ use mc_entity::{
 use std::cell::RefCell;
 use std::collections::BTreeSet;
 use std::ops::{Deref, DerefMut};
-use std::sync::atomic::{AtomicBool, AtomicI32, AtomicU32, AtomicU64, AtomicUsize, Ordering};
+use std::sync::atomic::{
+    AtomicBool, AtomicI32, AtomicU8, AtomicU32, AtomicU64, AtomicUsize, Ordering,
+};
 use std::sync::{Mutex, MutexGuard};
 
 mod campfire_authority;
@@ -34,6 +36,10 @@ mod entity_goal_defaults;
 mod entity_lifecycle;
 mod entity_owner;
 pub(crate) use entity_owner::entity_owner_fatal_from_panic;
+mod dragon_authority;
+#[cfg(test)]
+#[path = "session/dragon_authority_tests.rs"]
+mod dragon_authority_tests;
 mod entity_physics_class;
 mod entity_simulation;
 mod entity_spawn_facts;
@@ -66,6 +72,7 @@ mod passive_mobs;
 mod pathing;
 mod pickups;
 mod player_combat;
+mod player_effects;
 mod player_item_action_authority;
 mod player_pose_adapter;
 mod player_pose_authority;
@@ -134,6 +141,9 @@ mod villager_merchant_tests;
 pub(crate) use village_defense::VillageDefenseReport;
 mod villager_population;
 mod visibility;
+mod weather;
+pub(in crate::play) use weather::WeatherProjection;
+pub(crate) use weather::{WeatherKind, WeatherState};
 mod zombie_villager;
 
 pub(super) fn prewarm_canonical_pathing_state_facts() -> usize {
@@ -226,10 +236,13 @@ pub(in crate::play) use pickups::{
 use pickups::{spawn_item_drop_locked, spawn_xp_orb_locked};
 pub(super) use player_combat::PlayerEntityAttack;
 use player_pose_authority::filter_current_expected_entity_snapshots;
-use projectiles::resolve_arrow_entity_hits_locked;
 #[cfg(test)]
 use projectiles::{
     arrow_entity_candidate_snapshots_locked, segment_aabb_intersection_t, spawn_arrow_locked,
+};
+use projectiles::{
+    resolve_arrow_entity_hits_locked, resolve_hurting_projectile_hits_locked,
+    resolve_throwable_projectile_hits_locked,
 };
 pub(in crate::play) use script_loader_item_endpoint::{
     LoaderItemGrantCommand, apply_loader_item_grant,
@@ -344,7 +357,7 @@ impl EntityAttackOutcome {
         }
     }
 
-    fn dispatches_mut(&mut self) -> &mut Vec<VisibilityDispatch> {
+    pub(super) fn dispatches_mut(&mut self) -> &mut Vec<VisibilityDispatch> {
         match self {
             Self::Damaged { dispatches, .. }
             | Self::Killed { dispatches, .. }
@@ -408,6 +421,7 @@ struct SessionRegistryInner {
     natural_hostile_mobs: HashSet<EntityId>,
     natural_ground_mobs: HashSet<EntityId>,
     natural_aquatic_mobs: HashSet<EntityId>,
+    natural_mob_no_action_since_tick: HashMap<EntityId, u64>,
     sheep_entities: HashSet<EntityId>,
     published_entity_snapshots: HashMap<EntityId, ServerEntitySnapshot>,
     entity_type_aabbs: HashMap<i32, mc_physics::Aabb>,
@@ -435,6 +449,7 @@ struct SessionRegistryInner {
     primed_tnt_deadline_by_id: HashMap<EntityId, u64>,
     last_primed_tnt_claim_tick: Option<u64>,
     player_persistence: HashMap<SessionId, Arc<Mutex<PlayerPersistedState>>>,
+    player_effects: HashMap<SessionId, player_effects::PlayerEffectsState>,
     player_hurt_resistance: HashMap<SessionId, PlayerHurtResistance>,
     active_shields: HashMap<SessionId, ActiveShield>,
     shield_disabled_until: HashMap<SessionId, u64>,
@@ -543,6 +558,15 @@ pub(crate) struct SessionRegistry {
     villager_brain_profile: arc_swap::ArcSwap<mc_entity::villager_26_1_2::VillagerBrainProfile>,
     mob_behavior_table: arc_swap::ArcSwap<mc_data::mob_behavior_26_1_2::MobBehaviorTable>,
     hostile_arrow_entity_type_id: AtomicI32,
+    hostile_small_fireball_entity_type_id: AtomicI32,
+    hostile_fireball_entity_type_id: AtomicI32,
+    hostile_breeze_wind_charge_entity_type_id: AtomicI32,
+    hostile_dragon_fireball_entity_type_id: AtomicI32,
+    hostile_area_effect_cloud_entity_type_id: AtomicI32,
+    hostile_wither_skull_entity_type_id: AtomicI32,
+    hostile_splash_potion_entity_type_id: AtomicI32,
+    hostile_shulker_bullet_entity_type_id: AtomicI32,
+    hostile_evoker_fangs_entity_type_id: AtomicI32,
     prepared_cache: Mutex<PreparedChunkCache>,
     entities: SessionEntityOwners,
     world_chunk_journal: Mutex<Option<super::world_journal::WorldChunkJournal>>,
@@ -555,6 +579,9 @@ pub(crate) struct SessionRegistry {
     outbound_pressure: Arc<OutboundPressureMetrics>,
     world_time: AtomicU64,
     daylight_cycle_enabled: AtomicBool,
+    weather_kind: AtomicU8,
+    rain_level_bits: AtomicU32,
+    thunder_level_bits: AtomicU32,
     scheduled_block_tick_in_flight: AtomicBool,
     players_sleeping_percentage: AtomicU32,
     entity_lifecycle_tick: AtomicU64,
@@ -827,6 +854,33 @@ impl SessionRegistry {
             .expect("test regional entity owner runtime must start")
     }
 
+    #[cfg(test)]
+    pub(crate) fn register_script_router_test_session(&self, name: &str) -> SessionId {
+        let profile = crate::login::LoggedInProfile {
+            uuid: crate::login::offline_uuid(name),
+            name: name.to_owned(),
+        };
+        let (tx, _rx) = tokio::sync::mpsc::channel(8);
+        let session = self
+            .register(
+                &profile,
+                (0, 0),
+                2,
+                std::collections::HashSet::new(),
+                tx,
+                PlayerPose::new(0.5, 64.0, 0.5),
+            )
+            .0;
+        self.replace_view(
+            session,
+            (0, 0),
+            2,
+            std::collections::HashSet::from([(0, 0)]),
+        );
+        self.mark_loaded(session, (0, 0));
+        session
+    }
+
     fn try_with_entity_owner_lanes_and_journal(
         lane_count: usize,
         journal: Option<Box<dyn mc_entity::RegionalDecisionJournal>>,
@@ -862,6 +916,15 @@ impl SessionRegistry {
                 mc_data::mob_behavior_26_1_2::MobBehaviorTable::vanilla_26_1_2(),
             ),
             hostile_arrow_entity_type_id: AtomicI32::new(-1),
+            hostile_small_fireball_entity_type_id: AtomicI32::new(-1),
+            hostile_fireball_entity_type_id: AtomicI32::new(-1),
+            hostile_breeze_wind_charge_entity_type_id: AtomicI32::new(-1),
+            hostile_dragon_fireball_entity_type_id: AtomicI32::new(-1),
+            hostile_area_effect_cloud_entity_type_id: AtomicI32::new(-1),
+            hostile_wither_skull_entity_type_id: AtomicI32::new(-1),
+            hostile_splash_potion_entity_type_id: AtomicI32::new(-1),
+            hostile_shulker_bullet_entity_type_id: AtomicI32::new(-1),
+            hostile_evoker_fangs_entity_type_id: AtomicI32::new(-1),
             prepared_cache: Mutex::new(PreparedChunkCache::default()),
             entities,
             world_chunk_journal: Mutex::new(None),
@@ -874,6 +937,9 @@ impl SessionRegistry {
             outbound_pressure: Arc::new(OutboundPressureMetrics::default()),
             world_time: AtomicU64::new(0),
             daylight_cycle_enabled: AtomicBool::new(true),
+            weather_kind: AtomicU8::new(WeatherKind::Clear.as_u8()),
+            rain_level_bits: AtomicU32::new(0.0_f32.to_bits()),
+            thunder_level_bits: AtomicU32::new(0.0_f32.to_bits()),
             scheduled_block_tick_in_flight: AtomicBool::new(false),
             players_sleeping_percentage: AtomicU32::new(DEFAULT_PLAYERS_SLEEPING_PERCENTAGE),
             entity_lifecycle_tick: AtomicU64::new(0),
@@ -1863,6 +1929,60 @@ impl SessionRegistry {
         };
         self.hostile_arrow_entity_type_id
             .store(arrow_entity_type_id.unwrap_or(-1), Ordering::Release);
+    }
+
+    pub(crate) fn configure_hostile_small_fireball_entity_type(&self, entity_type_id: Option<i32>) {
+        self.hostile_small_fireball_entity_type_id
+            .store(entity_type_id.unwrap_or(-1), Ordering::Release);
+    }
+
+    pub(crate) fn configure_hostile_fireball_entity_type(&self, entity_type_id: Option<i32>) {
+        self.hostile_fireball_entity_type_id
+            .store(entity_type_id.unwrap_or(-1), Ordering::Release);
+    }
+
+    pub(crate) fn configure_hostile_breeze_wind_charge_entity_type(
+        &self,
+        entity_type_id: Option<i32>,
+    ) {
+        self.hostile_breeze_wind_charge_entity_type_id
+            .store(entity_type_id.unwrap_or(-1), Ordering::Release);
+    }
+
+    pub(crate) fn configure_hostile_dragon_fireball_entity_type(
+        &self,
+        entity_type_id: Option<i32>,
+    ) {
+        self.hostile_dragon_fireball_entity_type_id
+            .store(entity_type_id.unwrap_or(-1), Ordering::Release);
+    }
+
+    pub(crate) fn configure_hostile_area_effect_cloud_entity_type(
+        &self,
+        entity_type_id: Option<i32>,
+    ) {
+        self.hostile_area_effect_cloud_entity_type_id
+            .store(entity_type_id.unwrap_or(-1), Ordering::Release);
+    }
+
+    pub(crate) fn configure_hostile_wither_skull_entity_type(&self, entity_type_id: Option<i32>) {
+        self.hostile_wither_skull_entity_type_id
+            .store(entity_type_id.unwrap_or(-1), Ordering::Release);
+    }
+
+    pub(crate) fn configure_hostile_splash_potion_entity_type(&self, entity_type_id: Option<i32>) {
+        self.hostile_splash_potion_entity_type_id
+            .store(entity_type_id.unwrap_or(-1), Ordering::Release);
+    }
+
+    pub(crate) fn configure_hostile_shulker_bullet_entity_type(&self, entity_type_id: Option<i32>) {
+        self.hostile_shulker_bullet_entity_type_id
+            .store(entity_type_id.unwrap_or(-1), Ordering::Release);
+    }
+
+    pub(crate) fn configure_hostile_evoker_fangs_entity_type(&self, entity_type_id: Option<i32>) {
+        self.hostile_evoker_fangs_entity_type_id
+            .store(entity_type_id.unwrap_or(-1), Ordering::Release);
     }
 
     pub(crate) fn configure_player_combat(

@@ -30,6 +30,19 @@ async fn embedded_generated_seed_survival_crafts_tool_and_persists_without_debug
 
     let mut world = embedded_disk_world(&data, world_dir.path());
     let target = find_generated_tree_loop_target(&mut world, &data, air_state);
+    for y in target.stand_surface_y + 1..=target.stand_surface_y + 8 {
+        world
+            .set_block_at(
+                mc_world::BlockPos {
+                    x: target.stand_x,
+                    y,
+                    z: target.stand_z,
+                },
+                air_state,
+            )
+            .expect("clear generated spawn column");
+    }
+    world = world.with_spawn(mc_world::WorldSpawn::new(target.stand_x, target.stand_z));
     let log_item_id = embedded_item_id(&data, &target.log_block_id);
     let wood_family = target
         .log_block_id
@@ -58,8 +71,18 @@ async fn embedded_generated_seed_survival_crafts_tool_and_persists_without_debug
     let addr = bound.local_addr().expect("local_addr");
     let serve = tokio::spawn(async move { bound.serve_and_save().await });
 
-    let (mut client, _) = connect_to_play(addr, "P2GeneratedWood").await;
-    drain_until_chunk(&mut client, (0, 0)).await;
+    let (mut client, sync) = connect_to_play(addr, "P2GeneratedWood").await;
+    drain_until_chunk(
+        &mut client,
+        (target.stand_x.div_euclid(16), target.stand_z.div_euclid(16)),
+    )
+    .await;
+    let spawn_dx = sync.x - (f64::from(target.stand_x) + 0.5);
+    let spawn_dz = sync.z - (f64::from(target.stand_z) + 0.5);
+    assert!(
+        spawn_dx.mul_add(spawn_dx, spawn_dz * spawn_dz) <= 16.0,
+        "generated safe spawn must remain within survival reach of the selected tree target: {sync:?}"
+    );
     move_without_position_correction(
         &mut client,
         f64::from(target.stand_x) + 0.5,

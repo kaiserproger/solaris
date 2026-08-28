@@ -8,6 +8,7 @@ pub mod anvil;
 pub mod atomic_file;
 pub mod block;
 pub mod chunk;
+pub mod chunk_stream_plan_26_1_2;
 pub mod light;
 pub mod plant_rules_26_1_2;
 pub mod resident;
@@ -22,6 +23,7 @@ pub use chunk::{
     FurnaceSlot, HEIGHTMAP_BITS, HEIGHTMAP_LEN, Heightmap, HopperBlockEntity, LIGHT_LAYER_BYTES,
     MAX_Y, MIN_SECTION_Y, MIN_Y, OVERWORLD_GEOMETRY, SECTION_COUNT, ScheduledBlockTick,
     ScheduledFluidTick, SectionLight, SettlementInhabitantMarker, SettlementVacantHomeMarker,
+    chunk_rectangle_for_world_bounds,
 };
 pub use resident::{
     JournalStampResult, ResidentAppliedBlockEdit, ResidentBlockEdit, ResidentBlockEditBatchResult,

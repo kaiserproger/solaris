@@ -23,6 +23,24 @@ impl ThrowableState {
     }
 }
 
+/// Applies the exact vanilla throwable gravity-then-inertia velocity step.
+pub fn next_throwable_velocity(
+    mut velocity: super::Vec3,
+    gravity: f64,
+    no_gravity: bool,
+    in_water: bool,
+) -> Option<super::Vec3> {
+    if !velocity.is_finite() || !gravity.is_finite() || gravity < 0.0 {
+        return None;
+    }
+    if !no_gravity && gravity != 0.0 {
+        velocity.y -= gravity;
+    }
+    let inertia = if in_water { WATER_INERTIA } else { AIR_INERTIA };
+    let velocity = velocity.scale(inertia);
+    velocity.is_finite().then_some(velocity)
+}
+
 #[derive(Debug)]
 pub struct ThrowableTickInput<'a> {
     pub stamp: InputStamp,

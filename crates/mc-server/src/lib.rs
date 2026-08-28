@@ -4,8 +4,10 @@
 //!
 //! Part of the Solaris engine.
 
+use std::collections::BTreeSet;
+use std::io::Read;
 use std::net::{IpAddr, SocketAddr};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use anyhow::{Context, bail};
@@ -24,6 +26,9 @@ use serde::{Deserialize, Serialize};
 
 /// Crate version, exposed so other crates and the binary can report it.
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");
+
+const MAX_ACCESS_CONTROL_FILE_BYTES: u64 = 1024 * 1024;
+const MAX_ACCESS_CONTROL_FILE_ENTRIES: usize = 4096;
 
 /// Top-level server configuration loaded from a TOML file at startup.
 #[derive(Debug, Serialize, Deserialize)]
@@ -232,6 +237,8 @@ pub struct PluginSection {
 pub struct AdminSection {
     #[serde(default)]
     pub operators: Vec<String>,
+    #[serde(default)]
+    pub operators_file: Option<PathBuf>,
     #[serde(default = "default_allow_local_dev_operators")]
     pub allow_local_dev_operators: bool,
 }
@@ -248,7 +255,174 @@ pub struct AuthSection {
     #[serde(default)]
     pub whitelist: Vec<String>,
     #[serde(default)]
+    pub whitelist_file: Option<PathBuf>,
+    #[serde(default)]
     pub banned_players: Vec<String>,
+    #[serde(default)]
+    pub banned_players_file: Option<PathBuf>,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct AccessControlLoadReport {
+    pub files_loaded: usize,
+    pub operator_identities: usize,
+    pub whitelist_identities: usize,
+    pub banned_identities: usize,
+}
+
+#[derive(Debug, Deserialize)]
+struct AccessControlProfileEntry {
+    #[serde(default)]
+    name: Option<String>,
+    #[serde(default)]
+    uuid: Option<String>,
+}
+
+impl ServerConfig {
+    /// Merge optional file-backed access-control profiles into the inline TOML policy.
+    ///
+    /// Relative paths are resolved from the directory containing `config_path`.
+    /// File entries use vanilla-style JSON objects with `name` and/or `uuid`; extra
+    /// fields such as operator level or ban metadata are ignored deliberately.
+    pub fn load_access_control_files(
+        &mut self,
+        config_path: &Path,
+    ) -> anyhow::Result<AccessControlLoadReport> {
+        let mut report = AccessControlLoadReport::default();
+
+        if let Some(path) = self.admin.operators_file.clone() {
+            let entries = load_access_control_file(config_path, &path, "admin.operators_file")?;
+            report.files_loaded += 1;
+            report.operator_identities = entries.len();
+            self.admin.operators.extend(entries);
+        }
+        if let Some(path) = self.auth.whitelist_file.clone() {
+            let entries = load_access_control_file(config_path, &path, "auth.whitelist_file")?;
+            report.files_loaded += 1;
+            report.whitelist_identities = entries.len();
+            self.auth.whitelist.extend(entries);
+        }
+        if let Some(path) = self.auth.banned_players_file.clone() {
+            let entries = load_access_control_file(config_path, &path, "auth.banned_players_file")?;
+            report.files_loaded += 1;
+            report.banned_identities = entries.len();
+            self.auth.banned_players.extend(entries);
+        }
+
+        Ok(report)
+    }
+}
+
+fn load_access_control_file(
+    config_path: &Path,
+    configured_path: &Path,
+    field: &'static str,
+) -> anyhow::Result<Vec<String>> {
+    let path = resolve_config_relative_path(config_path, configured_path);
+    let file = std::fs::File::open(&path)
+        .with_context(|| format!("opening {field} from {}", path.display()))?;
+    let metadata = file
+        .metadata()
+        .with_context(|| format!("reading {field} metadata from {}", path.display()))?;
+    if !metadata.is_file() {
+        bail!("{field} must point to a regular file: {}", path.display());
+    }
+    if metadata.len() > MAX_ACCESS_CONTROL_FILE_BYTES {
+        bail!(
+            "{field} exceeds the {} byte limit: {}",
+            MAX_ACCESS_CONTROL_FILE_BYTES,
+            path.display()
+        );
+    }
+
+    let mut bytes = Vec::with_capacity(
+        usize::try_from(metadata.len().min(MAX_ACCESS_CONTROL_FILE_BYTES)).unwrap_or(0),
+    );
+    file.take(MAX_ACCESS_CONTROL_FILE_BYTES + 1)
+        .read_to_end(&mut bytes)
+        .with_context(|| format!("reading bounded {field} from {}", path.display()))?;
+    if bytes.len() as u64 > MAX_ACCESS_CONTROL_FILE_BYTES {
+        bail!(
+            "{field} grew beyond the {} byte limit while reading: {}",
+            MAX_ACCESS_CONTROL_FILE_BYTES,
+            path.display()
+        );
+    }
+    let profiles: Vec<AccessControlProfileEntry> = serde_json::from_slice(&bytes)
+        .with_context(|| format!("parsing {field} JSON from {}", path.display()))?;
+    if profiles.len() > MAX_ACCESS_CONTROL_FILE_ENTRIES {
+        bail!(
+            "{field} from {} contains {} entries; maximum is {}",
+            path.display(),
+            profiles.len(),
+            MAX_ACCESS_CONTROL_FILE_ENTRIES
+        );
+    }
+
+    let mut entries = BTreeSet::new();
+    for (index, profile) in profiles.into_iter().enumerate() {
+        let mut populated = false;
+        if let Some(name) = profile.name {
+            entries.insert(validate_access_control_name(&name, field, &path, index)?);
+            populated = true;
+        }
+        if let Some(raw_uuid) = profile.uuid {
+            let raw_uuid = raw_uuid.trim();
+            if raw_uuid.is_empty() {
+                bail!(
+                    "{field} entry {index} from {} contains an empty uuid",
+                    path.display()
+                );
+            }
+            let uuid = uuid::Uuid::parse_str(raw_uuid).map_err(|_| {
+                anyhow::anyhow!(
+                    "{field} entry {index} from {} contains an invalid uuid",
+                    path.display()
+                )
+            })?;
+            entries.insert(uuid.to_string());
+            populated = true;
+        }
+        if !populated {
+            bail!(
+                "{field} entry {index} from {} must contain name and/or uuid",
+                path.display()
+            );
+        }
+    }
+
+    Ok(entries.into_iter().collect())
+}
+
+fn resolve_config_relative_path(config_path: &Path, configured_path: &Path) -> PathBuf {
+    if configured_path.is_absolute() {
+        return configured_path.to_path_buf();
+    }
+    config_path
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."))
+        .join(configured_path)
+}
+
+fn validate_access_control_name(
+    raw: &str,
+    field: &'static str,
+    path: &Path,
+    index: usize,
+) -> anyhow::Result<String> {
+    let name = raw.trim();
+    if !(3..=16).contains(&name.len())
+        || !name
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || byte == b'_')
+    {
+        bail!(
+            "{field} entry {index} from {} contains an invalid Minecraft username; expected 3..=16 ASCII letters, digits, or `_`",
+            path.display()
+        );
+    }
+    Ok(name.to_ascii_lowercase())
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
@@ -371,6 +545,7 @@ impl Default for AdminSection {
     fn default() -> Self {
         Self {
             operators: Vec::new(),
+            operators_file: None,
             allow_local_dev_operators: default_allow_local_dev_operators(),
         }
     }
@@ -1217,6 +1392,218 @@ mod tests {
         assert!(
             message.contains("random_tick_chunk_budget")
                 || message.contains("scheduled_fluid_tick_budget")
+        );
+    }
+
+    #[test]
+    fn file_backed_access_control_resolves_relative_paths_and_merges_identities() {
+        let temp = tempfile::tempdir().unwrap();
+        let config_path = temp.path().join("server.toml");
+        std::fs::write(
+            temp.path().join("ops.json"),
+            r#"[
+                {"name":"FileOp","uuid":"11111111-1111-1111-1111-111111111111","level":4,"bypassesPlayerLimit":false},
+                {"name":"SecondOp"}
+            ]"#,
+        )
+        .unwrap();
+        std::fs::write(
+            temp.path().join("whitelist.json"),
+            r#"[{"name":"Allowed","uuid":"22222222-2222-2222-2222-222222222222"}]"#,
+        )
+        .unwrap();
+        std::fs::write(
+            temp.path().join("banned-players.json"),
+            r#"[{"name":"Banned","uuid":"33333333-3333-3333-3333-333333333333","reason":"test"}]"#,
+        )
+        .unwrap();
+
+        let mut cfg: ServerConfig = toml::from_str(
+            r#"
+                [server]
+                name = "S"
+                motd = "M"
+
+                [network]
+                bind_address = "127.0.0.1"
+                port = 25565
+
+                [admin]
+                operators = ["InlineOp"]
+                operators_file = "ops.json"
+
+                [auth]
+                whitelist_enabled = true
+                whitelist = ["InlineAllowed"]
+                whitelist_file = "whitelist.json"
+                banned_players = ["InlineBan"]
+                banned_players_file = "banned-players.json"
+            "#,
+        )
+        .unwrap();
+
+        let report = cfg.load_access_control_files(&config_path).unwrap();
+        assert_eq!(report.files_loaded, 3);
+        assert_eq!(report.operator_identities, 3);
+        assert_eq!(report.whitelist_identities, 2);
+        assert_eq!(report.banned_identities, 2);
+        assert!(cfg.admin.operators.iter().any(|entry| entry == "InlineOp"));
+        assert!(cfg.admin.operators.iter().any(|entry| entry == "fileop"));
+        assert!(
+            cfg.admin
+                .operators
+                .iter()
+                .any(|entry| entry == "11111111-1111-1111-1111-111111111111")
+        );
+        assert!(cfg.auth.whitelist.iter().any(|entry| entry == "allowed"));
+        assert!(
+            cfg.auth
+                .whitelist
+                .iter()
+                .any(|entry| entry == "22222222-2222-2222-2222-222222222222")
+        );
+        assert!(
+            cfg.auth
+                .banned_players
+                .iter()
+                .any(|entry| entry == "banned")
+        );
+        assert!(
+            cfg.auth
+                .banned_players
+                .iter()
+                .any(|entry| entry == "33333333-3333-3333-3333-333333333333")
+        );
+    }
+
+    #[test]
+    fn file_backed_access_control_fails_closed_for_bad_files() {
+        let temp = tempfile::tempdir().unwrap();
+        let config_path = temp.path().join("server.toml");
+        let access_path = temp.path().join("whitelist.json");
+        let config_src = r#"
+            [server]
+            name = "S"
+            motd = "M"
+
+            [network]
+            bind_address = "127.0.0.1"
+            port = 25565
+
+            [auth]
+            whitelist_enabled = true
+            whitelist_file = "whitelist.json"
+        "#;
+
+        let mut cfg: ServerConfig = toml::from_str(config_src).unwrap();
+        assert!(cfg.load_access_control_files(&config_path).is_err());
+
+        std::fs::write(&access_path, b"{}").unwrap();
+        let mut cfg: ServerConfig = toml::from_str(config_src).unwrap();
+        assert!(cfg.load_access_control_files(&config_path).is_err());
+
+        std::fs::write(&access_path, br#"[{}]"#).unwrap();
+        let mut cfg: ServerConfig = toml::from_str(config_src).unwrap();
+        let error = cfg
+            .load_access_control_files(&config_path)
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("must contain name and/or uuid"));
+        assert!(error.contains(&access_path.display().to_string()));
+
+        std::fs::write(&access_path, br#"[{"name":"bad name"}]"#).unwrap();
+        let mut cfg: ServerConfig = toml::from_str(config_src).unwrap();
+        let error = cfg
+            .load_access_control_files(&config_path)
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("invalid Minecraft username"));
+        assert!(error.contains(&access_path.display().to_string()));
+        assert!(!error.contains("bad name"));
+
+        std::fs::write(&access_path, br#"[{"uuid":"not-a-uuid"}]"#).unwrap();
+        let mut cfg: ServerConfig = toml::from_str(config_src).unwrap();
+        let error = cfg
+            .load_access_control_files(&config_path)
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("invalid uuid"));
+        assert!(error.contains(&access_path.display().to_string()));
+        assert!(!error.contains("not-a-uuid"));
+
+        let too_many = (0..=MAX_ACCESS_CONTROL_FILE_ENTRIES)
+            .map(|index| format!(r#"{{"name":"User{index:04}"}}"#))
+            .collect::<Vec<_>>()
+            .join(",");
+        std::fs::write(&access_path, format!("[{too_many}]")).unwrap();
+        let mut cfg: ServerConfig = toml::from_str(config_src).unwrap();
+        let error = cfg
+            .load_access_control_files(&config_path)
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("maximum is 4096"));
+        assert!(error.contains(&access_path.display().to_string()));
+
+        std::fs::write(
+            &access_path,
+            vec![b' '; usize::try_from(MAX_ACCESS_CONTROL_FILE_BYTES).unwrap() + 1],
+        )
+        .unwrap();
+        let mut cfg: ServerConfig = toml::from_str(config_src).unwrap();
+        assert!(
+            cfg.load_access_control_files(&config_path)
+                .unwrap_err()
+                .to_string()
+                .contains("exceeds")
+        );
+    }
+
+    #[test]
+    fn file_backed_access_control_reloads_on_fresh_server_config() {
+        let temp = tempfile::tempdir().unwrap();
+        let config_path = temp.path().join("server.toml");
+        let whitelist_path = temp.path().join("whitelist.json");
+        let config_src = r#"
+            [server]
+            name = "S"
+            motd = "M"
+
+            [network]
+            bind_address = "127.0.0.1"
+            port = 25565
+
+            [auth]
+            whitelist_enabled = true
+            whitelist_file = "whitelist.json"
+        "#;
+
+        std::fs::write(&whitelist_path, br#"[{"name":"FirstUser"}]"#).unwrap();
+        let mut first: ServerConfig = toml::from_str(config_src).unwrap();
+        first.load_access_control_files(&config_path).unwrap();
+        assert!(
+            first
+                .auth
+                .whitelist
+                .iter()
+                .any(|entry| entry == "firstuser")
+        );
+
+        std::fs::write(&whitelist_path, br#"[{"name":"SecondUser"}]"#).unwrap();
+        let mut restarted: ServerConfig = toml::from_str(config_src).unwrap();
+        restarted.load_access_control_files(&config_path).unwrap();
+        assert!(
+            !restarted
+                .auth
+                .whitelist
+                .iter()
+                .any(|entry| entry == "firstuser")
+        );
+        assert!(
+            restarted
+                .auth
+                .whitelist
+                .iter()
+                .any(|entry| entry == "seconduser")
         );
     }
 

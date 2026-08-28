@@ -1,10 +1,11 @@
 use std::time::Instant;
 
+use mc_data::ItemStack;
+use mc_domain::GameMode;
 use mc_entity::zombie_villager_26_1_2::{
     conversion_duration_from_seed, finish_conversion, start_conversion,
 };
 use mc_entity::{AttributeKind, EntityLifecycle, EntitySnapshot, SpawnEntity};
-use mc_protocol::packets::play::{GameMode, ItemStack};
 
 use crate::play::inventory::PlayerInventory;
 use crate::play::simulation::{

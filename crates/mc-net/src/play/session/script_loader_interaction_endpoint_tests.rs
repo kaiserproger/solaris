@@ -25,6 +25,7 @@ fn manifest(owner: &str) -> LoaderManifest {
             permissions: vec![LoaderPermission::SendInteractions],
             cache_key: format!("{owner}:ui/1/{}", "a".repeat(64)),
             source_path: None,
+            artifact_bytes: None,
             block_id: None,
             block_name: None,
         }],

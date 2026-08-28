@@ -142,6 +142,9 @@ struct AiPathState(RetainedPathState);
 #[derive(Component, Clone)]
 struct GameplayDecisionState {
     arrow_state: Option<crate::projectile_26_1_2::ArrowState>,
+    hurting_projectile_state: Option<crate::projectile_26_1_2::HurtingProjectileState>,
+    throwable_projectile_state: Option<crate::projectile_26_1_2::ThrowableState>,
+    remaining_fire_ticks: i32,
     last_damage_tick: Option<u64>,
     death_remove_tick: Option<u64>,
     sheep_grazing_ticks: Option<u8>,
@@ -151,8 +154,21 @@ struct GameplayDecisionState {
     item_pickup_claim: Option<u64>,
     villager_food_recipient: Option<EntityId>,
     primed_tnt: Option<crate::EntityPrimedTntState>,
+    pending_explosion: Option<crate::EntityPendingExplosionState>,
     crossbow_attack: Option<crate::EntityCrossbowAttackState>,
+    blaze_attack: Option<crate::EntityBlazeAttackState>,
+    ghast_attack: Option<crate::EntityGhastAttackState>,
+    breeze_attack: Option<crate::EntityBreezeAttackState>,
+    witch_attack: Option<crate::EntityWitchAttackState>,
+    witch_potion: Option<crate::EntityWitchPotionKind>,
+    dragon_air: Option<crate::dragon_26_1_2::DragonAirState>,
+    dragon_breath_cloud: Option<crate::EntityDragonBreathCloudState>,
     guardian_beam: Option<crate::EntityGuardianBeamState>,
+    warden_sonic_boom: Option<crate::EntityWardenSonicBoomState>,
+    shulker_attack: Option<crate::EntityShulkerAttackState>,
+    shulker_bullet: Option<crate::EntityShulkerBulletState>,
+    evoker_attack: Option<crate::EntityEvokerAttackState>,
+    evoker_fangs: Option<crate::EntityEvokerFangState>,
     villager: Option<crate::VillagerData>,
     villager_brain: Option<crate::villager_26_1_2::VillagerBrainState>,
     villager_gossip: Option<crate::villager_gossip_26_1_2::VillagerGossipState>,
@@ -677,9 +693,11 @@ impl EntityRuntime {
         let entity_type = entity.get::<EntityTypeState>()?;
         let transform = entity.get::<TransformState>()?;
         let motion = entity.get::<MotionState>()?;
-        let arrow_state = entity
-            .get::<GameplayDecisionState>()
-            .and_then(|gameplay| gameplay.arrow_state);
+        let goal = entity.get::<AiGoalState>()?;
+        let gameplay = entity.get::<GameplayDecisionState>()?;
+        let arrow_state = gameplay.arrow_state;
+        let hurting_projectile_state = gameplay.hurting_projectile_state;
+        let throwable_projectile_state = gameplay.throwable_projectile_state;
         Some(EntityMotionState {
             id: identity.id,
             position: transform.position,
@@ -687,6 +705,7 @@ impl EntityRuntime {
             velocity: motion.velocity,
             on_ground: motion.on_ground,
             fall_distance: motion.fall_distance,
+            goal_fence: crate::EntityGoalFence::from_goal(&goal.0),
             is_item: entity_type.name == "minecraft:item",
             is_experience: entity_type.name == "minecraft:experience_orb",
             is_arrow: entity_type.name == "minecraft:arrow",
@@ -694,6 +713,12 @@ impl EntityRuntime {
             arrow_embedded_block: arrow_state
                 .filter(|state| state.in_ground)
                 .and_then(|state| state.last_block_position),
+            is_hurting_projectile: hurting_projectile_state.is_some(),
+            hurting_projectile_revision: hurting_projectile_state
+                .map(|state| state.projectile.revision),
+            is_throwable_projectile: throwable_projectile_state.is_some(),
+            throwable_projectile_revision: throwable_projectile_state
+                .map(|state| state.projectile.revision),
             sends_velocity: !matches!(
                 entity_type.name.as_str(),
                 "minecraft:item" | "minecraft:experience_orb"
@@ -1321,8 +1346,11 @@ fn insert_snapshot_into_world(world: &mut World, snapshot: EntitySnapshot) -> bo
         path,
         living: retained_living,
         fall_distance,
+        remaining_fire_ticks,
         active_effects,
         arrow_state,
+        hurting_projectile_state,
+        throwable_projectile_state,
         last_damage_tick,
         death_remove_tick,
         sheep_grazing_ticks,
@@ -1332,8 +1360,21 @@ fn insert_snapshot_into_world(world: &mut World, snapshot: EntitySnapshot) -> bo
         item_pickup_claim,
         villager_food_recipient,
         primed_tnt,
+        pending_explosion,
         crossbow_attack,
+        blaze_attack,
+        ghast_attack,
+        breeze_attack,
+        witch_attack,
+        witch_potion,
+        dragon_air,
+        dragon_breath_cloud,
         guardian_beam,
+        warden_sonic_boom,
+        shulker_attack,
+        shulker_bullet,
+        evoker_attack,
+        evoker_fangs,
         villager,
         villager_brain,
         villager_gossip,
@@ -1354,7 +1395,9 @@ fn insert_snapshot_into_world(world: &mut World, snapshot: EntitySnapshot) -> bo
     };
     let needs_breeding_tick = lifecycle == EntityLifecycle::Alive
         && animal.is_some_and(AnimalBreedingState::needs_breeding_tick);
-    let is_projectile = type_name == "minecraft:arrow";
+    let is_projectile = type_name == "minecraft:arrow"
+        || hurting_projectile_state.is_some()
+        || throwable_projectile_state.is_some();
     let is_sheep = lifecycle == EntityLifecycle::Alive
         && type_name == "minecraft:sheep"
         && animal.is_some_and(|animal| animal.sheep_wool.is_some());
@@ -1379,6 +1422,9 @@ fn insert_snapshot_into_world(world: &mut World, snapshot: EntitySnapshot) -> bo
         AiPathState(path),
         GameplayDecisionState {
             arrow_state,
+            hurting_projectile_state,
+            throwable_projectile_state,
+            remaining_fire_ticks,
             last_damage_tick,
             death_remove_tick,
             sheep_grazing_ticks,
@@ -1388,8 +1434,21 @@ fn insert_snapshot_into_world(world: &mut World, snapshot: EntitySnapshot) -> bo
             item_pickup_claim,
             villager_food_recipient,
             primed_tnt,
+            pending_explosion,
             crossbow_attack,
+            blaze_attack,
+            ghast_attack,
+            breeze_attack,
+            witch_attack,
+            witch_potion,
+            dragon_air,
+            dragon_breath_cloud,
             guardian_beam,
+            warden_sonic_boom,
+            shulker_attack,
+            shulker_bullet,
+            evoker_attack,
+            evoker_fangs,
             villager,
             villager_brain,
             villager_gossip,
@@ -1469,7 +1528,9 @@ fn restore_snapshot_in_world(
         && snapshot
             .animal
             .is_some_and(|animal| animal.sheep_wool.is_some());
-    let is_projectile = snapshot.type_name == "minecraft:arrow";
+    let is_projectile = snapshot.type_name == "minecraft:arrow"
+        || snapshot.retained.hurting_projectile_state.is_some()
+        || snapshot.retained.throwable_projectile_state.is_some();
     let EntitySnapshot {
         id,
         uuid: _,
@@ -1494,8 +1555,11 @@ fn restore_snapshot_in_world(
         path,
         living: retained_living,
         fall_distance,
+        remaining_fire_ticks,
         active_effects,
         arrow_state,
+        hurting_projectile_state,
+        throwable_projectile_state,
         last_damage_tick,
         death_remove_tick,
         sheep_grazing_ticks,
@@ -1505,8 +1569,21 @@ fn restore_snapshot_in_world(
         item_pickup_claim,
         villager_food_recipient,
         primed_tnt,
+        pending_explosion,
         crossbow_attack,
+        blaze_attack,
+        ghast_attack,
+        breeze_attack,
+        witch_attack,
+        witch_potion,
+        dragon_air,
+        dragon_breath_cloud,
         guardian_beam,
+        warden_sonic_boom,
+        shulker_attack,
+        shulker_bullet,
+        evoker_attack,
+        evoker_fangs,
         villager,
         villager_brain,
         villager_gossip,
@@ -1550,6 +1627,9 @@ fn restore_snapshot_in_world(
             AiPathState(path),
             GameplayDecisionState {
                 arrow_state,
+                hurting_projectile_state,
+                throwable_projectile_state,
+                remaining_fire_ticks,
                 last_damage_tick,
                 death_remove_tick,
                 sheep_grazing_ticks,
@@ -1559,8 +1639,21 @@ fn restore_snapshot_in_world(
                 item_pickup_claim,
                 villager_food_recipient,
                 primed_tnt,
+                pending_explosion,
                 crossbow_attack,
+                blaze_attack,
+                ghast_attack,
+                breeze_attack,
+                witch_attack,
+                witch_potion,
+                dragon_air,
+                dragon_breath_cloud,
                 guardian_beam,
+                warden_sonic_boom,
+                shulker_attack,
+                shulker_bullet,
+                evoker_attack,
+                evoker_fangs,
                 villager,
                 villager_brain,
                 villager_gossip,
@@ -1660,8 +1753,11 @@ fn snapshot_from_world(world: &World, id: EntityId) -> Option<EntitySnapshot> {
                 death_time: living.state.death_time,
             },
             fall_distance: motion.fall_distance,
+            remaining_fire_ticks: gameplay.remaining_fire_ticks,
             active_effects: active_effects_snapshot(entity.get::<ActiveEffectsState>()),
             arrow_state: gameplay.arrow_state,
+            hurting_projectile_state: gameplay.hurting_projectile_state,
+            throwable_projectile_state: gameplay.throwable_projectile_state,
             last_damage_tick: gameplay.last_damage_tick,
             death_remove_tick: gameplay.death_remove_tick,
             sheep_grazing_ticks: gameplay.sheep_grazing_ticks,
@@ -1671,8 +1767,21 @@ fn snapshot_from_world(world: &World, id: EntityId) -> Option<EntitySnapshot> {
             item_pickup_claim: gameplay.item_pickup_claim,
             villager_food_recipient: gameplay.villager_food_recipient,
             primed_tnt: gameplay.primed_tnt,
+            pending_explosion: gameplay.pending_explosion,
             crossbow_attack: gameplay.crossbow_attack,
+            blaze_attack: gameplay.blaze_attack,
+            ghast_attack: gameplay.ghast_attack,
+            breeze_attack: gameplay.breeze_attack,
+            witch_attack: gameplay.witch_attack,
+            witch_potion: gameplay.witch_potion,
+            dragon_air: gameplay.dragon_air,
+            dragon_breath_cloud: gameplay.dragon_breath_cloud.clone(),
             guardian_beam: gameplay.guardian_beam,
+            warden_sonic_boom: gameplay.warden_sonic_boom,
+            shulker_attack: gameplay.shulker_attack,
+            shulker_bullet: gameplay.shulker_bullet,
+            evoker_attack: gameplay.evoker_attack,
+            evoker_fangs: gameplay.evoker_fangs,
             villager: gameplay.villager,
             villager_brain: gameplay.villager_brain.clone(),
             villager_gossip: gameplay.villager_gossip.clone(),
@@ -1719,6 +1828,8 @@ fn entity_simulation_projection_from_world(
     let goal = entity.get::<AiGoalState>()?;
     let gameplay = entity.get::<GameplayDecisionState>()?;
     let arrow_state = gameplay.arrow_state;
+    let hurting_projectile_state = gameplay.hurting_projectile_state;
+    let throwable_projectile_state = gameplay.throwable_projectile_state;
     let villager_brain = gameplay.villager_brain.as_ref();
 
     Some(EntitySimulationProjection {
@@ -1739,6 +1850,7 @@ fn entity_simulation_projection_from_world(
             .unwrap_or(0.0),
         goal: goal.0.clone(),
         primed_tnt: gameplay.primed_tnt.is_some(),
+        guardian_beam_active: gameplay.guardian_beam.is_some(),
         has_item_stack: entity.get::<ItemStackState>().is_some(),
         has_experience_value: entity.get::<ExperienceState>().is_some(),
         has_block_state: entity.get::<FallingBlockState>().is_some(),
@@ -1749,6 +1861,19 @@ fn entity_simulation_projection_from_world(
         arrow_embedded_block: arrow_state
             .filter(|state| state.in_ground)
             .and_then(|state| state.last_block_position),
+        hurting_projectile_revision: hurting_projectile_state
+            .map(|state| state.projectile.revision),
+        hurting_projectile_acceleration_power_bits: hurting_projectile_state
+            .map(|state| state.acceleration_power.to_bits()),
+        hurting_projectile_air_inertia_bits: hurting_projectile_state
+            .map(|state| state.air_inertia.to_bits()),
+        hurting_projectile_water_inertia_bits: hurting_projectile_state
+            .map(|state| state.water_inertia.to_bits()),
+        throwable_projectile_revision: throwable_projectile_state
+            .map(|state| state.projectile.revision),
+        shulker_bullet_target_entity_id: gameplay
+            .shulker_bullet
+            .map(|state| state.target_entity_id),
         sheep_grazing_ticks: gameplay.sheep_grazing_ticks,
         villager: gameplay.villager,
         villager_schedule: villager_brain.map(|brain| brain.schedule),
@@ -1809,8 +1934,11 @@ fn entity_view_from_world(world: &World, id: EntityId) -> Option<EntityView<'_>>
                 death_time: living.state.death_time,
             },
             fall_distance: motion.fall_distance,
+            remaining_fire_ticks: gameplay.remaining_fire_ticks,
             active_effects: active_effects_snapshot(entity.get::<ActiveEffectsState>()),
             arrow_state: gameplay.arrow_state,
+            hurting_projectile_state: gameplay.hurting_projectile_state,
+            throwable_projectile_state: gameplay.throwable_projectile_state,
             last_damage_tick: gameplay.last_damage_tick,
             death_remove_tick: gameplay.death_remove_tick,
             sheep_grazing_ticks: gameplay.sheep_grazing_ticks,
@@ -1820,8 +1948,21 @@ fn entity_view_from_world(world: &World, id: EntityId) -> Option<EntityView<'_>>
             item_pickup_claim: gameplay.item_pickup_claim,
             villager_food_recipient: gameplay.villager_food_recipient,
             primed_tnt: gameplay.primed_tnt,
+            pending_explosion: gameplay.pending_explosion,
             crossbow_attack: gameplay.crossbow_attack,
+            blaze_attack: gameplay.blaze_attack,
+            ghast_attack: gameplay.ghast_attack,
+            breeze_attack: gameplay.breeze_attack,
+            witch_attack: gameplay.witch_attack,
+            witch_potion: gameplay.witch_potion,
+            dragon_air: gameplay.dragon_air,
+            dragon_breath_cloud: gameplay.dragon_breath_cloud.clone(),
             guardian_beam: gameplay.guardian_beam,
+            warden_sonic_boom: gameplay.warden_sonic_boom,
+            shulker_attack: gameplay.shulker_attack,
+            shulker_bullet: gameplay.shulker_bullet,
+            evoker_attack: gameplay.evoker_attack,
+            evoker_fangs: gameplay.evoker_fangs,
             villager: gameplay.villager,
             villager_brain: gameplay.villager_brain.clone(),
             villager_gossip: gameplay.villager_gossip.clone(),

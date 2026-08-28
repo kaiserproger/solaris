@@ -1,6 +1,6 @@
 use mc_data::block_facts::BlockFactsTable;
 use mc_data::block_light::BlockLightTable;
-use mc_protocol::packets::play::GameMode;
+use mc_domain::GameMode;
 use mc_world::{BlockPos, BlockRegistry, ChunkPos, SECTION_DIM, WorldReadSnapshot, WorldReadView};
 
 use super::campfire::is_campfire_block;

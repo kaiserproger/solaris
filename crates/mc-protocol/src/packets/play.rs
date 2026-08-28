@@ -833,9 +833,8 @@ pub fn pack_chunk_pos(x: i32, z: i32) -> i64 {
     ((x as i64) & 0xFFFF_FFFF) | (((z as i64) & 0xFFFF_FFFF) << 32)
 }
 
-/// `Game Event` (CB). Used here for one specific game event:
-/// `start_waiting_for_level_chunks`, sent right after Login (Play) to
-/// tell the client "you can stop showing the loading screen".
+/// `Game Event` (CB). Vanilla uses this packet for client-global state transitions
+/// including weather, game-mode changes, and the post-login level-chunk loading fence.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct GameEvent {
     pub event: u8,
@@ -843,7 +842,11 @@ pub struct GameEvent {
 }
 
 impl GameEvent {
+    pub const EVENT_START_RAINING: u8 = 1;
+    pub const EVENT_STOP_RAINING: u8 = 2;
     pub const EVENT_CHANGE_GAME_MODE: u8 = 3;
+    pub const EVENT_RAIN_LEVEL_CHANGE: u8 = 7;
+    pub const EVENT_THUNDER_LEVEL_CHANGE: u8 = 8;
     pub const EVENT_START_WAITING_FOR_CHUNKS: u8 = 13;
 }
 
@@ -2679,7 +2682,7 @@ impl LightData {
                     max: Self::LIGHT_LAYER_BYTES,
                 });
             }
-            buf.write_byte_array(layer);
+            buf.write_byte_array(layer)?;
         }
         Ok(())
     }
@@ -2758,7 +2761,7 @@ impl Packet for LevelChunkWithLight {
                 max: MAX_CHUNK_DATA_LEN,
             });
         }
-        buf.write_byte_array(&self.data);
+        buf.write_byte_array(&self.data)?;
 
         let be_count =
             i32::try_from(self.block_entities.len()).map_err(|_| CodecError::StringTooLong {
@@ -2887,35 +2890,7 @@ impl Packet for SetCenterChunk {
 // Serverbound
 // -----------------------------------------------------------------------
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum GameMode {
-    Survival,
-    Creative,
-    Adventure,
-    Spectator,
-}
-
-impl GameMode {
-    #[must_use]
-    pub const fn id(self) -> i32 {
-        match self {
-            Self::Survival => 0,
-            Self::Creative => 1,
-            Self::Adventure => 2,
-            Self::Spectator => 3,
-        }
-    }
-
-    #[must_use]
-    pub const fn from_id(id: i32) -> Self {
-        match id {
-            1 => Self::Creative,
-            2 => Self::Adventure,
-            3 => Self::Spectator,
-            _ => Self::Survival,
-        }
-    }
-}
+pub use mc_domain::GameMode;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ServerboundChangeGameMode {
@@ -3698,7 +3673,7 @@ impl Packet for ServerboundInteract {
     fn decode<B: Buf>(buf: &mut B) -> Result<Self, CodecError> {
         Ok(Self {
             entity_id: buf.read_varint()?,
-            hand: InteractionHand::from_wire(buf.read_varint()?)?,
+            hand: interaction_hand_from_wire(buf.read_varint()?)?,
             location: read_lp_vec3(buf)?,
             using_secondary_action: buf.read_bool()?,
         })
@@ -4095,51 +4070,15 @@ impl PlayerActionKind {
     }
 }
 
-/// Direction of a `BlockPos` face — six values matching
-/// `net.minecraft.core.Direction` ordinals (`DOWN, UP, NORTH,
-/// SOUTH, WEST, EAST`).
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum Direction {
-    Down = 0,
-    Up = 1,
-    North = 2,
-    South = 3,
-    West = 4,
-    East = 5,
-}
+/// Direction of a `BlockPos` face. The gameplay value lives in `mc-domain`;
+/// this module owns only its wire adaptation.
+pub use mc_domain::Direction;
 
-impl Direction {
-    fn from_wire(v: i32) -> Result<Self, CodecError> {
-        Ok(match v {
-            0 => Self::Down,
-            1 => Self::Up,
-            2 => Self::North,
-            3 => Self::South,
-            4 => Self::West,
-            5 => Self::East,
-            other => {
-                return Err(CodecError::StringTooLong {
-                    len: other as usize,
-                    max: 5,
-                });
-            }
-        })
-    }
-
-    /// `(dx, dy, dz)` unit normal of the face. Used by the
-    /// place-block handler to compute the target cell from the
-    /// clicked face.
-    #[must_use]
-    pub fn normal(self) -> (i32, i32, i32) {
-        match self {
-            Self::Down => (0, -1, 0),
-            Self::Up => (0, 1, 0),
-            Self::North => (0, 0, -1),
-            Self::South => (0, 0, 1),
-            Self::West => (-1, 0, 0),
-            Self::East => (1, 0, 0),
-        }
-    }
+fn direction_from_wire(value: i32) -> Result<Direction, CodecError> {
+    Direction::from_ordinal(value).ok_or(CodecError::StringTooLong {
+        len: value as usize,
+        max: 5,
+    })
 }
 
 /// `Serverbound Player Action` (SB). Carries break-start /
@@ -4300,7 +4239,7 @@ impl Packet for ServerboundPlayerAction {
     fn decode<B: Buf>(buf: &mut B) -> Result<Self, CodecError> {
         let action = PlayerActionKind::from_wire(buf.read_varint()?)?;
         let position = buf.read_i64()?;
-        let direction = Direction::from_wire(buf.read_varint()?)?;
+        let direction = direction_from_wire(buf.read_varint()?)?;
         let sequence = buf.read_varint()?;
         Ok(Self {
             action,
@@ -4311,26 +4250,15 @@ impl Packet for ServerboundPlayerAction {
     }
 }
 
-/// Which hand was used. Vanilla VarInt: 0 = main, 1 = off.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum InteractionHand {
-    MainHand = 0,
-    OffHand = 1,
-}
+/// Which hand was used. The gameplay value lives in `mc-domain`; this
+/// module owns only its VarInt wire adaptation.
+pub use mc_domain::InteractionHand;
 
-impl InteractionHand {
-    fn from_wire(v: i32) -> Result<Self, CodecError> {
-        Ok(match v {
-            0 => Self::MainHand,
-            1 => Self::OffHand,
-            other => {
-                return Err(CodecError::StringTooLong {
-                    len: other as usize,
-                    max: 1,
-                });
-            }
-        })
-    }
+fn interaction_hand_from_wire(value: i32) -> Result<InteractionHand, CodecError> {
+    InteractionHand::from_ordinal(value).ok_or(CodecError::StringTooLong {
+        len: value as usize,
+        max: 1,
+    })
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -4351,7 +4279,7 @@ impl Packet for ServerboundSwing {
 
     fn decode<B: Buf>(buf: &mut B) -> Result<Self, CodecError> {
         Ok(Self {
-            hand: InteractionHand::from_wire(buf.read_varint()?)?,
+            hand: interaction_hand_from_wire(buf.read_varint()?)?,
         })
     }
 }
@@ -4399,9 +4327,9 @@ impl Packet for ServerboundUseItemOn {
     }
 
     fn decode<B: Buf>(buf: &mut B) -> Result<Self, CodecError> {
-        let hand = InteractionHand::from_wire(buf.read_varint()?)?;
+        let hand = interaction_hand_from_wire(buf.read_varint()?)?;
         let position = buf.read_i64()?;
-        let direction = Direction::from_wire(buf.read_varint()?)?;
+        let direction = direction_from_wire(buf.read_varint()?)?;
         let cursor_x = buf.read_f32()?;
         let cursor_y = buf.read_f32()?;
         let cursor_z = buf.read_f32()?;
@@ -4447,7 +4375,7 @@ impl Packet for ServerboundUseItem {
 
     fn decode<B: Buf>(buf: &mut B) -> Result<Self, CodecError> {
         Ok(Self {
-            hand: InteractionHand::from_wire(buf.read_varint()?)?,
+            hand: interaction_hand_from_wire(buf.read_varint()?)?,
             sequence: buf.read_varint()?,
             y_rot: buf.read_f32()?,
             x_rot: buf.read_f32()?,
@@ -4497,86 +4425,17 @@ fn sign_extend_12(v: i32) -> i32 {
 // M6 — Inventory packets
 // ---------------------------------------------------------------------
 
-/// One slot of a vanilla container. The modern wire format encodes an
-/// empty stack as a single zero-byte `count` VarInt; a non-empty stack
-/// is `(count, item_id, components_to_add, components_to_remove,
-/// [DataComponentPatch entries...])`.
-#[derive(Debug, Clone, PartialEq, Eq, Default)]
-pub struct ItemStack {
-    /// `0` ⇒ empty slot; `count > 0` ⇒ `count` copies of `item_id`.
-    pub count: i32,
-    /// Item-registry id (the protocol_id from
-    /// `data/vanilla/reports/registries.json:minecraft:item`).
-    pub item_id: u32,
-    /// Narrow M23 component support: `minecraft:damage`, encoded as
-    /// DataComponents registration id 3 with a VarInt integer payload.
-    pub damage: Option<i32>,
-    /// `minecraft:enchantments`, encoded as a registry-id to level map.
-    pub enchantments: Vec<mc_data::ItemEnchantment>,
-    /// `minecraft:custom_name`, limited to the literal text-component shape
-    /// used by Solaris script menus.
-    pub custom_name: Option<String>,
-    /// `minecraft:item_model`, encoded as one namespaced resource identifier.
-    pub item_model: Option<std::sync::Arc<Identifier>>,
+/// Canonical inventory state lives in `mc-data`; this module only owns its
+/// Java Edition wire encoding/decoding.
+pub use mc_data::item_stack::ItemStack;
+
+pub(super) trait ItemStackWireCodec: Sized {
+    fn encode<B: BufMut>(&self, buf: &mut B) -> Result<(), CodecError>;
+    fn decode<B: Buf>(buf: &mut B) -> Result<Self, CodecError>;
 }
 
-impl ItemStack {
-    /// An empty slot.
-    pub const EMPTY: ItemStack = ItemStack {
-        count: 0,
-        item_id: 0,
-        damage: None,
-        enchantments: Vec::new(),
-        custom_name: None,
-        item_model: None,
-    };
-
-    #[must_use]
-    pub fn is_empty(&self) -> bool {
-        self.count <= 0
-    }
-
-    #[must_use]
-    pub fn new(item_id: u32, count: i32) -> Self {
-        Self {
-            count,
-            item_id,
-            damage: None,
-            enchantments: Vec::new(),
-            custom_name: None,
-            item_model: None,
-        }
-    }
-
-    #[must_use]
-    pub fn with_damage(mut self, damage: i32) -> Self {
-        self.damage = Some(damage.max(0));
-        self
-    }
-
-    #[must_use]
-    pub fn with_enchantment(mut self, id: Identifier, level: i32) -> Self {
-        self.enchantments.retain(|enchantment| enchantment.id != id);
-        self.enchantments
-            .push(mc_data::ItemEnchantment { id, level });
-        self.enchantments
-            .sort_unstable_by(|left, right| left.id.cmp(&right.id));
-        self
-    }
-
-    #[must_use]
-    pub fn with_custom_name(mut self, name: impl Into<String>) -> Self {
-        self.custom_name = Some(name.into());
-        self
-    }
-
-    #[must_use]
-    pub fn with_item_model(mut self, model: Identifier) -> Self {
-        self.item_model = Some(std::sync::Arc::new(model));
-        self
-    }
-
-    pub fn encode<B: BufMut>(&self, buf: &mut B) -> Result<(), CodecError> {
+impl ItemStackWireCodec for ItemStack {
+    fn encode<B: BufMut>(&self, buf: &mut B) -> Result<(), CodecError> {
         if self.is_empty() {
             buf.write_varint(0);
             return Ok(());
@@ -4619,9 +4478,12 @@ impl ItemStack {
         Ok(())
     }
 
-    pub fn decode<B: Buf>(buf: &mut B) -> Result<Self, CodecError> {
+    fn decode<B: Buf>(buf: &mut B) -> Result<Self, CodecError> {
         let count = buf.read_varint()?;
-        if count <= 0 {
+        if count < 0 {
+            return Err(CodecError::NegativeLength(count));
+        }
+        if count == 0 {
             return Ok(Self::EMPTY);
         }
         let item_id = buf.read_varint()? as u32;

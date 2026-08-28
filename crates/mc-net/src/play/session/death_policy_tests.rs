@@ -9,7 +9,7 @@ use crate::play::persistence::{PlayerPersistedState, XpState};
 use crate::play::simulation::{
     PlayerSurvivalCommitOutcome, PlayerSurvivalPlan, SimulationAuthority,
 };
-use crate::play::{PlayerInventory, PlayerPose, SurvivalState, recoverable_death_xp};
+use crate::play::{PlayerInventory, PlayerPose, recoverable_death_xp};
 
 fn register_policy_session(registry: &SessionRegistry, name: &str) -> SessionId {
     let profile = LoggedInProfile {
@@ -59,7 +59,7 @@ fn player_death_inventory_xp_policy_is_atomic_and_idempotent() {
 
         let before = persisted.lock().expect("test lock poisoned").clone();
         let mut dead = before.survival;
-        dead.apply_damage(SurvivalState::MAX_HEALTH);
+        dead.apply_damage(mc_entity::player_survival_26_1_2::MAX_HEALTH);
         let plan = PlayerSurvivalPlan {
             expected_survival: before.survival,
             updated_survival: dead,
@@ -203,7 +203,7 @@ fn stale_keep_inventory_death_plan_rejects_without_side_effects() {
     registry.register_player_persistence(session, Arc::clone(&persisted));
     let before = persisted.lock().expect("test lock poisoned").clone();
     let mut dead = before.survival;
-    dead.apply_damage(SurvivalState::MAX_HEALTH);
+    dead.apply_damage(mc_entity::player_survival_26_1_2::MAX_HEALTH);
 
     let outcome = registry
         .commit_player_survival(

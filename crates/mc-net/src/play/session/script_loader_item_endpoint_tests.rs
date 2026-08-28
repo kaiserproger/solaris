@@ -37,6 +37,7 @@ fn loader_manifest() -> LoaderManifest {
             permissions: vec![LoaderPermission::RegisterBlocks],
             cache_key: format!("example:block/1/{}", "a".repeat(64)),
             source_path: None,
+            artifact_bytes: None,
             block_id: Some("example:ruby_block".to_owned()),
             block_name: Some("Ruby Block".to_owned()),
         }],

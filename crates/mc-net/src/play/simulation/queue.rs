@@ -1,7 +1,7 @@
 use super::request_wait::SimulationResponseReceiver;
 use super::{
-    JavaLegacyRandom, PlayerPose, RegionOwnership, SessionId, SimulationAuthority,
-    SimulationCommand, SimulationHandle, SimulationOutcome, SimulationOwner,
+    JavaLegacyRandom, PlayerPose, PlayerPoseCommitKind, RegionOwnership, SessionId,
+    SimulationAuthority, SimulationCommand, SimulationHandle, SimulationOutcome, SimulationOwner,
     SimulationRequestError, command_is_background, command_orders_earlier_herds,
 };
 #[cfg(feature = "load-bench")]
@@ -448,6 +448,7 @@ impl SimulationHandle {
             sequence,
             command: SimulationCommand::CommitPlayerPose {
                 actor_session: session_id,
+                kind: PlayerPoseCommitKind::Teleport,
                 pose,
                 exhaustion: 0.0,
                 script_teleport_completion: Some(completion),
@@ -846,6 +847,7 @@ fn simulation_channel_with_capacity_and_explosion_seed(
             metrics,
             authority: SimulationAuthority(()),
             region_ownership: RegionOwnership::new(),
+            player_movement_authority: None,
             explosion_random: JavaLegacyRandom::new(explosion_seed),
             #[cfg(test)]
             last_region_routes: Vec::new(),

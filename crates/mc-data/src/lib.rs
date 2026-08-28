@@ -43,15 +43,21 @@ pub mod block_explosion;
 pub mod block_facts;
 pub mod block_light;
 pub mod block_mining;
+pub mod block_placement_26_1_2;
+pub mod block_semantics_26_1_2;
 pub mod blocks;
 pub mod collision_shapes;
 pub mod damage_types;
+pub mod enchanting_26_1_2;
 mod entity_contract_26_1_2;
 pub mod entity_types;
 pub mod food;
 pub mod fuel_values;
 pub mod identifier;
+pub mod inventory_semantics_26_1_2;
 pub mod item_components;
+pub mod item_semantics_26_1_2;
+pub mod item_stack;
 pub mod items;
 pub mod loot;
 pub mod mob_behavior_26_1_2;
@@ -66,6 +72,7 @@ pub mod worldgen_ores;
 pub mod worldgen_structures;
 
 pub use identifier::{Identifier, IdentifierError};
+pub use item_stack::ItemStack;
 pub use resource_path::{OpenedResource, ResourcePath, ResourcePathError};
 
 /// Crate version, exposed so other crates and the binary can report it.

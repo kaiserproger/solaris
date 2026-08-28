@@ -21,6 +21,11 @@ loom {
     runs {
         create("clientMcp") {
             client()
+            runDirectory.set(file(clientMcpGameDir.get()))
+            property(
+                "solaris.loader.cacheDir",
+                file(clientMcpGameDir.get()).resolve("solaris-loader-cache").absolutePath
+            )
         }
     }
 }

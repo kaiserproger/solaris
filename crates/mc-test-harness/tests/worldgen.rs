@@ -302,7 +302,10 @@ async fn generated_playable_ruin_chest_loot_moves_to_inventory_and_survives_rest
         Arc::clone(&blocks),
         Arc::clone(&items),
         Arc::clone(&generator),
-        world_dir.path(),
+        (
+            world_dir.path(),
+            mc_world::WorldSpawn::new(chest_pos.x - 1, chest_pos.z),
+        ),
         shutdown.clone(),
         "generated ruin chest first run",
     ))
@@ -362,7 +365,10 @@ async fn generated_playable_ruin_chest_loot_moves_to_inventory_and_survives_rest
         Arc::clone(&blocks),
         Arc::clone(&items),
         generator,
-        world_dir.path(),
+        (
+            world_dir.path(),
+            mc_world::WorldSpawn::new(chest_pos.x - 1, chest_pos.z),
+        ),
         shutdown.clone(),
         "generated ruin chest restart",
     ))
@@ -404,17 +410,19 @@ fn ruin_server_config<G>(
     blocks: Arc<mc_world::BlockRegistry>,
     items: Arc<mc_data::items::ItemRegistry>,
     generator: Arc<G>,
-    world_dir: &std::path::Path,
+    world_setup: (&std::path::Path, mc_world::WorldSpawn),
     shutdown: mc_net::ShutdownHandle,
     motd: &str,
 ) -> mc_net::ServerConfig
 where
     G: ChunkGenerator + 'static,
 {
+    let (world_dir, spawn) = world_setup;
     std::fs::create_dir_all(world_dir.join("region")).expect("create ruin region directory");
     let world = mc_world::WorldStorage::open_with_capacity(world_dir, Arc::clone(&blocks), 49)
         .expect("open ruin disk world")
         .with_item_registry(Arc::clone(&items))
+        .with_spawn(spawn)
         .with_generator(generator as Arc<dyn ChunkGenerator>);
     mc_net::ServerConfig {
         bind_address: "127.0.0.1:0".parse().expect("loopback address"),
@@ -492,7 +500,7 @@ async fn move_to_ruin_and_wait_for_resident_chunk(
     client
         .write_packet(&ServerboundMovePlayerPosRot {
             x: f64::from(chest_pos.x) - 0.5,
-            y: f64::from(chest_pos.y),
+            y: f64::from(chest_pos.y + 1),
             z: f64::from(chest_pos.z) + 0.5,
             yaw: 0.0,
             pitch: 0.0,
@@ -939,7 +947,7 @@ async fn generated_village_food_share_birth_wire_and_restart_are_stable_inner() 
         Arc::clone(&blocks),
         Arc::clone(&items),
         Arc::clone(&generator),
-        world_dir.path(),
+        (world_dir.path(), mc_world::WorldSpawn::default()),
         shutdown.clone(),
         "generated village population first run",
     ))
@@ -990,7 +998,7 @@ async fn generated_village_food_share_birth_wire_and_restart_are_stable_inner() 
         blocks,
         items,
         generator,
-        world_dir.path(),
+        (world_dir.path(), mc_world::WorldSpawn::default()),
         shutdown.clone(),
         "generated village population restart",
     ))
@@ -1275,7 +1283,7 @@ async fn run_generated_village_observation(
         Arc::clone(&fixture.blocks),
         Arc::clone(&fixture.items),
         Arc::clone(&fixture.generator),
-        fixture.world_dir,
+        (fixture.world_dir, mc_world::WorldSpawn::default()),
         shutdown.clone(),
         "generated village villager gate",
     ))

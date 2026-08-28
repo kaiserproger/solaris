@@ -2,7 +2,7 @@ function on_player_command(event)
     if event.root ~= "loader_ruby" then
         return
     end
-    solaris.grant_loader_block_item(event.player_id, "ruby-live:ruby_block", 1)
+    solaris.grant_loader_block_item("grant-ruby", event.player_id, "ruby-live:ruby_block", 1)
     solaris.open_client_screen(event.player_id, "ruby-live:showcase")
 end
 

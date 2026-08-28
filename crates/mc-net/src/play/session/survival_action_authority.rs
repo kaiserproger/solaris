@@ -1,8 +1,8 @@
 use std::sync::Arc;
 use std::time::Instant;
 
+use mc_data::ItemStack;
 use mc_data::block_light::BlockLightTable;
-use mc_protocol::packets::play::ItemStack;
 use tracing::warn;
 
 use crate::play::block_edit_commit::{

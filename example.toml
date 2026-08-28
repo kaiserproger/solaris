@@ -16,13 +16,20 @@ online_mode = false
 # hasJoined verification to reject proxying an authenticated session.
 prevent_proxy_connections = false
 whitelist_enabled = false
+# Inline names/UUIDs are merged with the optional JSON profile file on each startup.
 whitelist = []
+# Relative paths are resolved from this config file's directory. Explicit missing,
+# malformed, oversized, or invalid files fail startup and `--check`.
+# whitelist_file = "whitelist.json"
 banned_players = []
+# banned_players_file = "banned-players.json"
 
 [admin]
-# OP access is fail-closed by default. Add names or offline UUIDs here, or set
-# allow_local_dev_operators = true only for throwaway local development.
+# OP access is fail-closed by default. Inline names/UUIDs are merged with the
+# optional vanilla-style JSON profile file on each startup.
 operators = []
+# operators_file = "ops.json"
+# allow_local_dev_operators = true only for throwaway loopback development.
 allow_local_dev_operators = false
 
 [plugins]

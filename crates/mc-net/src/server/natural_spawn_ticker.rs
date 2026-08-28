@@ -29,6 +29,8 @@ impl NaturalSpawnTicker {
         world_read: Option<&WorldReadView>,
         materials: Option<&BlockMaterialIds>,
     ) {
+        let despawn_outcome = sessions.tick_natural_mob_despawn(tick);
+        sessions.publish_natural_mob_despawn(despawn_outcome);
         sessions.tick_and_dispatch_periodic_natural_spawning(
             &mut self.scheduler,
             NaturalSpawnTickInput {

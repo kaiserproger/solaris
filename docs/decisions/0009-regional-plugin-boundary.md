@@ -71,10 +71,16 @@ does not exist yet.
 
 ## Ordering and consistency
 
-The current host consumes its bounded event FIFO on one thread and invokes one
-handler at a time. Each plugin therefore observes serial handler execution
-without pretending the server is single-threaded. If the host is later split
-into per-plugin workers, each plugin must retain its admitted FIFO order.
+The current host consumes its bounded input FIFO on one thread and invokes one
+handler at a time. Ordinary events and a prepared Luau generation replacement use
+that same private host queue, so the replacement is a serial barrier for ordinary
+queued events: inputs processed before it use the old generation and later inputs use
+the new generation. Already emitted host commands remain committed output and keep
+their admission tickets across the barrier. Coalesced `server.tick` delivery retains
+its existing latest-value semantics rather than being redefined as a strict FIFO
+record. Each plugin therefore observes serial handler execution without pretending the
+server is single-threaded. If the host is later split into per-plugin workers, each
+plugin must retain its admitted ordering and reload barrier semantics.
 
 Queries return immutable snapshots with an explicit observed revision. A
 transaction rechecks that revision or the narrower generation named by its DTO.
@@ -103,7 +109,14 @@ default and cannot weaken per-plugin FIFO ordering.
 `mc-script` already provides isolated Luau states multiplexed by one serial host
 thread, bounded immutable DTOs, capability-gated command batches, targeted
 result events, instruction and memory limits, and generic typed protected
-zones. `mc-net` already has production adapters for storage, zones, menus,
+zones. Runtime failure isolation survives into a typed terminal `LuaHostExitReport`:
+shutdown can distinguish a normal drained event-queue close from non-normal host
+exits and enumerate bounded per-plugin disable diagnostics without exposing the VM,
+queue, lock, or owner internals. Prepared reload uses that same private host-input
+serialization point: candidate VMs and their bounded `server.started` work are staged,
+command capacity/admission and command-root ownership are committed before generation
+swap, and Unix `mc-server` exposes strict SIGHUP preparation without replacing the
+`ScriptBoundary`. `mc-net` already has production adapters for storage, zones, menus,
 player inventory transactions, teleports, and opaque villager bindings/goals.
 Colony identity, homes, roles, orders, limits, and persistence are not Rust
 runtime concepts: the shipped Luau plugin owns them and maps its vocabulary to

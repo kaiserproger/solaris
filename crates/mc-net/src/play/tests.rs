@@ -30,6 +30,7 @@ mod button_planning;
 mod button_runtime_edges;
 mod campfire_cooking;
 mod chest;
+mod chunk_stream_memory_wait;
 mod client_view_distance;
 mod collision_correction_entry;
 mod collision_correction_escape;
@@ -39,6 +40,7 @@ mod container_title_nbt;
 mod crafting_table_open;
 mod death_xp;
 mod debug_commands;
+mod dense_entity_scheduling;
 mod dense_entity_simulation_cohorts;
 mod direct_response_write_stall;
 mod door_toggles;
@@ -64,12 +66,15 @@ mod gamemode_commands;
 mod held_sharpness_damage;
 mod inventory_settlement;
 mod item_block_mapping;
+mod keepalive;
 mod leaf_distance_ticks;
+mod login_persistence;
 mod movement_block_reads;
 mod natural_random_ticks;
 mod oracle_aabb_deflation_boundary;
 mod oriented_stair_collision;
 mod outbound_channel_close;
+mod outbound_delivery;
 mod outbound_pressure_draining;
 mod outbound_write_stall;
 mod outside_slot_sentinel;
@@ -83,6 +88,7 @@ mod pickup;
 mod plants;
 mod play_custom_payload;
 mod player_damage;
+mod player_movement_survival;
 mod powder_snow_collision_correction;
 mod powder_snow_dynamic_shape;
 mod powder_snow_equipment_context;
@@ -92,6 +98,7 @@ mod redstone_pistons;
 mod rejected_inventory_drag;
 mod scheduled_buttons;
 mod scheduled_hoppers;
+mod script_inventory_owner;
 mod shield;
 mod stale_container_updates;
 mod stale_inventory_drag;
@@ -101,11 +108,13 @@ mod synthetic_slab_identity_collision;
 mod tall_narrow_fence_collision;
 mod teleport_command_pending_confirmation;
 mod teleport_id_allocator;
+mod text_component_codec;
 mod toggle_planning;
 mod top_slab_collision;
 mod torch_campfire_collision;
 mod unrelated_state_collision;
 mod use_item_on_preflight;
+mod world_time;
 mod wrong_property_slab_collision;
 
 use stonecutter::{stonecutter_test_items, stonecutter_test_recipe};
@@ -120,44 +129,6 @@ fn no_script_player_context(session_id: SessionId) -> ScriptPlayerContext {
         64.0,
         0.5,
     )
-}
-
-#[test]
-fn session_owner_script_inventory_commit_updates_live_and_durable_state_together() {
-    let items = Arc::new(mc_data::items::solaris_required_items());
-    let mut state = interaction_state_for_items(Arc::clone(&items));
-    state.item_facts = Arc::new(mc_data::item_components::solaris_required_item_facts());
-    let apple = items
-        .id_of(&Identifier::parse("minecraft:apple").unwrap())
-        .unwrap();
-    let emerald = items
-        .id_of(&Identifier::parse("minecraft:emerald").unwrap())
-        .unwrap();
-    state.inventory.slots[9] = ItemStack::new(apple, 3);
-    let transaction = mc_script::ScriptPlayerInventoryTransaction::try_new(
-        "owner-exchange",
-        mc_script::ScriptPlayerId::new(state.session_id),
-        vec![
-            mc_script::ScriptInventoryResourceDelta::try_new("minecraft:apple", -2).unwrap(),
-            mc_script::ScriptInventoryResourceDelta::try_new("minecraft:emerald", 4).unwrap(),
-        ],
-    )
-    .unwrap();
-
-    assert_eq!(
-        commit_session_owner_script_player_inventory(&mut state, &transaction),
-        Ok(())
-    );
-    assert_eq!(state.inventory.slots[9], ItemStack::new(apple, 1));
-    assert!(
-        state.inventory.slots[9..=44]
-            .iter()
-            .any(|stack| *stack == ItemStack::new(emerald, 4))
-    );
-    assert_eq!(
-        state.player_persistence.lock().unwrap().inventory.slots,
-        state.inventory.slots
-    );
 }
 
 async fn run_scheduled_block_ticks(
@@ -236,237 +207,11 @@ async fn run_scheduled_fluid_ticks(
         .await
 }
 
-#[tokio::test]
-async fn chunk_stream_wait_wakes_on_memory_sample_change() {
-    let memory_pressure = crate::memory_pressure::MemoryPressureHandle::with_sample(
-        crate::memory_pressure::MemoryPressureSnapshot {
-            used_mb: 900,
-            limit_mb: 1_000,
-        },
-    );
-    let mut memory_changes = memory_pressure.subscribe();
-    let sessions = SessionRegistry::new();
-    let prepared_generation = sessions.prepared_change_generation();
-
-    let wake = wait_for_chunk_stream_wake(
-        Arc::new(tokio::sync::Notify::new()),
-        &sessions,
-        prepared_generation,
-        Some(&mut memory_changes),
-    );
-    tokio::pin!(wake);
-
-    memory_pressure.set_sample(crate::memory_pressure::MemoryPressureSnapshot {
-        used_mb: 100,
-        limit_mb: 1_000,
-    });
-
-    tokio::time::timeout(Duration::from_secs(1), wake)
-        .await
-        .expect("memory sample event must wake the chunk stream");
-}
-
 fn props(entries: &[(&str, &str)]) -> BTreeMap<String, String> {
     entries
         .iter()
         .map(|(key, value)| ((*key).to_string(), (*value).to_string()))
         .collect()
-}
-
-#[test]
-fn player_pose_metadata_reports_swimming_and_shared_flags() {
-    let mut pose = PlayerPose::new(0.5, 62.0, 0.5);
-    pose.in_water = true;
-    pose.swimming = true;
-    pose.sprinting = true;
-
-    assert_eq!(pose.entity_pose(), EntityPose::Swimming);
-    assert_eq!(pose.shared_flags() & 0x08, 0x08);
-    assert_eq!(pose.shared_flags() & 0x10, 0x10);
-}
-
-#[test]
-fn survival_movement_exhaustion_tracks_sprint_and_sprint_jump_distance() {
-    let mut old = PlayerPose::new(0.5, 72.0, 0.5);
-    old.flags = MovePlayerFlags::new(true, false);
-    let mut standing_jump = PlayerPose::new(0.5, 73.0, 0.5);
-    standing_jump.flags = MovePlayerFlags::new(false, false);
-    standing_jump.input.jump = true;
-
-    assert_eq!(
-        movement_exhaustion(old, standing_jump),
-        SurvivalState::JUMP_EXHAUSTION
-    );
-
-    let mut walking = PlayerPose::new(4.5, 72.0, 0.5);
-
-    assert_eq!(movement_exhaustion(old, walking), 0.0);
-
-    walking.sprinting = true;
-    let sprint_exhaustion = movement_exhaustion(old, walking);
-    assert!(sprint_exhaustion > 0.0);
-
-    let mut sprint_jump = walking;
-    sprint_jump.y = 73.0;
-    sprint_jump.flags = MovePlayerFlags::new(false, false);
-    sprint_jump.input.jump = true;
-
-    assert!(movement_exhaustion(old, sprint_jump) > sprint_exhaustion);
-}
-
-#[test]
-fn player_movement_clamps_extreme_coordinates_and_rejects_non_finite_values() {
-    let finite = AcceptedAbsoluteMovement {
-        x: 1.0,
-        y: 64.0,
-        z: -2.0,
-        yaw_pitch: Some((90.0, 15.0)),
-        flags: MovePlayerFlags::new(true, false),
-    };
-    assert_eq!(
-        normalize_absolute_player_movement(finite)
-            .expect("finite movement is accepted")
-            .x,
-        1.0
-    );
-
-    let clamped = normalize_absolute_player_movement(AcceptedAbsoluteMovement {
-        x: f64::MAX,
-        y: -f64::MAX,
-        z: -f64::MAX,
-        ..finite
-    })
-    .expect("finite extreme movement is clamped");
-    assert_eq!(clamped.x, 30_000_000.0);
-    assert_eq!(clamped.y, -20_000_000.0);
-    assert_eq!(clamped.z, -30_000_000.0);
-
-    for movement in [
-        AcceptedAbsoluteMovement {
-            x: f64::NAN,
-            ..finite
-        },
-        AcceptedAbsoluteMovement {
-            y: f64::INFINITY,
-            ..finite
-        },
-        AcceptedAbsoluteMovement {
-            z: f64::NEG_INFINITY,
-            ..finite
-        },
-        AcceptedAbsoluteMovement {
-            yaw_pitch: Some((f32::NAN, 0.0)),
-            ..finite
-        },
-        AcceptedAbsoluteMovement {
-            yaw_pitch: Some((0.0, f32::INFINITY)),
-            ..finite
-        },
-    ] {
-        assert!(matches!(
-            normalize_absolute_player_movement(movement),
-            Err(ConnectionError::InvalidPlayerMovement)
-        ));
-    }
-
-    assert!(matches!(
-        validate_player_rotation(f32::NEG_INFINITY, 0.0),
-        Err(ConnectionError::InvalidPlayerMovement)
-    ));
-}
-
-#[test]
-fn survival_food_update_saturates_extreme_input() {
-    let mut state = SurvivalState::FULL;
-
-    state.add_food(i32::MAX, f32::MAX);
-
-    assert_eq!(state.food, SurvivalState::MAX_FOOD);
-    assert_eq!(state.saturation, SurvivalState::MAX_FOOD as f32);
-}
-
-#[test]
-fn survival_exhaustion_handles_extreme_input_in_bounded_work() {
-    let mut state = SurvivalState::FULL;
-
-    assert!(state.add_exhaustion(f32::MAX));
-
-    assert_eq!(state.food, 0);
-    assert_eq!(state.saturation, 0.0);
-    assert!(state.exhaustion.is_finite());
-    assert!((0.0..SurvivalState::EXHAUSTION_STEP).contains(&state.exhaustion));
-
-    assert!(!state.add_exhaustion(f32::INFINITY));
-    assert!(state.exhaustion.is_finite());
-}
-
-#[test]
-fn clientbound_session_world_time_separates_monotonic_and_overworld_clocks() {
-    let sessions = SessionRegistry::new();
-    sessions.set_world_time(12_345);
-    sessions.advance_world_time(7);
-
-    let packet = clientbound_session_world_time(&sessions);
-    assert_eq!(packet.game_time, 7);
-    assert_eq!(
-        packet.overworld_clock,
-        Some(mc_protocol::packets::play::WorldClockUpdate {
-            total_ticks: 12_352,
-            partial_tick: 0.0,
-            rate: 1.0,
-        })
-    );
-
-    sessions.set_daylight_cycle_enabled(false);
-    sessions.advance_world_time(5);
-    let frozen = clientbound_session_world_time(&sessions);
-    assert_eq!(frozen.game_time, 12);
-    assert_eq!(
-        frozen.overworld_clock,
-        Some(mc_protocol::packets::play::WorldClockUpdate {
-            total_ticks: 12_352,
-            partial_tick: 0.0,
-            rate: 0.0,
-        })
-    );
-
-    sessions.set_daylight_cycle_enabled(true);
-    sessions.advance_world_time(3);
-    assert_eq!(sessions.world_time(), 12_355);
-    assert_eq!(sessions.simulation_tick(), 15);
-
-    assert_eq!(clientbound_world_time(u64::MAX, 1, 1.0).game_time, i64::MAX);
-}
-
-#[test]
-fn text_component_nbt_reports_oversized_text_instead_of_panicking() {
-    let oversized = "x".repeat(usize::from(u16::MAX) + 1);
-
-    let err = text_component_nbt(&oversized).expect_err("oversized NBT string should fail");
-
-    assert!(matches!(err, mc_protocol::CodecError::Nbt(_)));
-}
-
-#[test]
-fn login_rejects_corrupt_player_state_without_overwriting_it() {
-    let tmp = tempfile::tempdir().unwrap();
-    let uuid = uuid::Uuid::from_u128(0x1234);
-    let path = tmp.path().join(format!("playerdata/{uuid}.dat"));
-    std::fs::create_dir_all(path.parent().unwrap()).unwrap();
-    let corrupt = b"not gzip nbt";
-    std::fs::write(&path, corrupt).unwrap();
-    let items = ItemRegistry::from_report(&[]);
-
-    let error = load_player_state_for_login(
-        tmp.path(),
-        uuid,
-        &items,
-        PlayerPersistedState::new_default(PlayerPose::new(0.5, 64.0, 0.5)),
-    )
-    .expect_err("corrupt playerdata must reject login");
-
-    assert!(error.to_string().contains("player state load failed"));
-    assert_eq!(std::fs::read(path).unwrap(), corrupt);
 }
 
 struct StalledWriter;
@@ -550,355 +295,6 @@ fn play_loop_slow_client_test_config() -> crate::server::ServerConfig {
         loader_manifest: None,
         shutdown: crate::server::ShutdownHandle::default(),
     }
-}
-
-#[tokio::test]
-async fn initial_play_sync_sends_recipe_update_once_before_recipe_book_packets() {
-    let mut config = play_loop_slow_client_test_config();
-    config.items = stonecutter_test_items();
-    config.recipes = Arc::new(vec![stonecutter_test_recipe()]);
-    let sessions = Arc::new(SessionRegistry::new());
-    let (simulation, _owner) = simulation_channel();
-    let profile = LoggedInProfile {
-        uuid: crate::login::offline_uuid("InitialRecipeSync"),
-        name: "InitialRecipeSync".to_owned(),
-    };
-    let mut reader = tokio::io::empty();
-    let mut writer = Vec::new();
-    let mut buf = BytesMut::new();
-
-    let result = handle(
-        &mut reader,
-        &mut writer,
-        &mut buf,
-        Compression::Disabled,
-        &profile,
-        &[],
-        CommandPermissions { op: false },
-        &config,
-        crate::server::ConnectionWorld::default(),
-        sessions,
-        ChunkPipelineResources::with_limits(1, 1),
-        None,
-        None,
-        simulation,
-        Vec::new(),
-        None,
-        None,
-        None,
-        None,
-    )
-    .await;
-    assert!(matches!(result, Err(ConnectionError::Eof)));
-
-    let mut frames = bytes::BytesMut::from(writer.as_slice());
-    let mut packet_ids = Vec::new();
-    while let Some(frame) =
-        mc_protocol::frame::try_decode_frame(&mut frames, Compression::Disabled).unwrap()
-    {
-        packet_ids.push(frame.id);
-    }
-    let update_positions = packet_ids
-        .iter()
-        .enumerate()
-        .filter_map(|(index, id)| {
-            (*id == mc_protocol::packets::play::ClientboundUpdateRecipes::ID).then_some(index)
-        })
-        .collect::<Vec<_>>();
-    let settings = packet_ids
-        .iter()
-        .position(|id| *id == ClientboundRecipeBookSettings::ID)
-        .expect("initial recipe book settings packet");
-    let recipes = packet_ids
-        .iter()
-        .position(|id| *id == mc_protocol::packets::play::ClientboundRecipeBookAdd::ID)
-        .expect("initial recipe book add packet");
-
-    assert_eq!(update_positions.len(), 1);
-    assert!(update_positions[0] < settings);
-    assert!(settings < recipes);
-}
-
-#[test]
-fn outbound_command_queue_capacity_scales_with_player_burst() {
-    let mut config = play_loop_slow_client_test_config();
-    config.max_players = 20;
-    config.chunk_pipeline.chunk_result_queue_size = 8;
-
-    assert_eq!(
-        outbound_command_queue_capacity(&config),
-        20 * OUTBOUND_COMMANDS_PER_PLAYER_BURST
-    );
-}
-
-#[test]
-fn outbound_command_queue_capacity_preserves_larger_configured_queue() {
-    let mut config = play_loop_slow_client_test_config();
-    config.max_players = 2;
-    config.chunk_pipeline.chunk_result_queue_size = 512;
-
-    assert_eq!(outbound_command_queue_capacity(&config), 512);
-}
-
-#[tokio::test]
-async fn outbound_command_write_timeout_sheds_stalled_client() {
-    let mut writer = StalledWriter;
-    let (mut writer, blocked) = SlowClientWriteGuard::new(&mut writer);
-
-    let outcome = slow_client_outbound_write_timeout(
-        write_packet(
-            &mut writer,
-            &EntityEvent {
-                entity_id: 1,
-                event_id: 2,
-            },
-            Compression::Disabled,
-        ),
-        blocked,
-        Duration::from_millis(1),
-    )
-    .await
-    .expect("stalled outbound write timeout should close cleanly");
-
-    assert_eq!(outcome, OutboundWriteOutcome::TimedOut);
-}
-
-#[tokio::test]
-async fn outbound_command_timeout_starts_only_after_write_blocks() {
-    let (domain_started, domain_started_rx) = oneshot::channel();
-    let (release_domain, release_domain_rx) = oneshot::channel();
-    let release_task = tokio::spawn(async move {
-        domain_started_rx.await.expect("domain work should start");
-        release_domain
-            .send(())
-            .expect("command should still await domain work");
-    });
-    let mut bytes = Vec::new();
-    let (mut writer, blocked) = SlowClientWriteGuard::new(&mut bytes);
-
-    let outcome = slow_client_outbound_write_timeout(
-        async {
-            domain_started.send(()).expect("release task should wait");
-            release_domain_rx
-                .await
-                .expect("domain work should be released by its event");
-            write_packet(
-                &mut writer,
-                &EntityEvent {
-                    entity_id: 1,
-                    event_id: 2,
-                },
-                Compression::Disabled,
-            )
-            .await
-        },
-        blocked,
-        Duration::ZERO,
-    )
-    .await
-    .expect("pre-write domain work must not trip a client write timeout");
-    release_task.await.expect("release task should finish");
-
-    assert_eq!(outcome, OutboundWriteOutcome::Sent);
-    assert!(!bytes.is_empty());
-}
-
-#[tokio::test]
-async fn chunk_stream_write_timeout_sheds_stalled_client() {
-    let sessions = SessionRegistry::new();
-    let start_timeouts = sessions.pressure_snapshot().slow_client_write_timeouts;
-
-    let step = slow_client_chunk_stream_step_timeout(
-        &sessions,
-        91,
-        std::future::pending::<Result<ChunkStreamStep, ConnectionError>>(),
-        Duration::ZERO,
-    )
-    .await
-    .expect("stalled chunk write should close cleanly");
-
-    assert_eq!(step, None);
-    assert_eq!(
-        sessions.pressure_snapshot().slow_client_write_timeouts,
-        start_timeouts + 1
-    );
-}
-
-#[test]
-fn keepalive_tracker_only_accepts_the_matching_echo() {
-    let mut keepalive = KeepAliveTracker::new();
-    let request_id = keepalive.record_request().expect("first request");
-
-    assert!(!keepalive.record_response(request_id + 1));
-    assert_eq!(keepalive.pending_id(), Some(request_id));
-    assert!(keepalive.record_response(request_id));
-    assert_eq!(keepalive.pending_id(), None);
-}
-
-#[test]
-fn keepalive_tracker_never_replaces_an_unanswered_request() {
-    let mut keepalive = KeepAliveTracker::new();
-    let request_id = keepalive.record_request().expect("first request");
-
-    assert_eq!(keepalive.record_request(), None);
-    assert_eq!(keepalive.pending_id(), Some(request_id));
-    assert!(keepalive.record_response(request_id));
-    assert!(keepalive.record_request().is_some());
-}
-
-#[test]
-fn keepalive_timeout_requires_the_whole_connection_to_be_idle() {
-    let mut keepalive = KeepAliveTracker::new();
-    keepalive.record_request().expect("first request");
-    keepalive.pending_since = Some(Instant::now() - KEEPALIVE_TIMEOUT - Duration::from_secs(1));
-
-    keepalive.record_inbound_activity();
-    assert_eq!(keepalive.timed_out(KEEPALIVE_TIMEOUT), None);
-
-    keepalive.last_inbound_at = Instant::now() - KEEPALIVE_TIMEOUT - Duration::from_secs(1);
-    assert!(keepalive.timed_out(KEEPALIVE_TIMEOUT).is_some());
-}
-
-#[test]
-fn only_exact_recognized_packets_refresh_overdue_keepalive_activity() {
-    let mut keepalive = KeepAliveTracker::new();
-    keepalive.record_request().expect("first request");
-    keepalive.pending_since = Some(Instant::now() - KEEPALIVE_TIMEOUT - Duration::from_secs(1));
-    keepalive.last_inbound_at = Instant::now() - KEEPALIVE_TIMEOUT - Duration::from_secs(1);
-
-    let unknown = liveness::validate_serverbound_play_frame(0x7fff, &Bytes::new()).unwrap();
-    assert!(!unknown);
-    assert!(keepalive.timed_out(KEEPALIVE_TIMEOUT).is_some());
-
-    let mut valid = BytesMut::new();
-    ConfirmTeleportation { teleport_id: 7 }
-        .encode(&mut valid)
-        .unwrap();
-    assert!(
-        liveness::validate_serverbound_play_frame(ConfirmTeleportation::ID, &valid.freeze())
-            .unwrap()
-    );
-    keepalive.record_inbound_activity();
-    assert_eq!(keepalive.timed_out(KEEPALIVE_TIMEOUT), None);
-}
-
-#[test]
-fn dense_entity_movement_tracking_rotates_bounded_shards() {
-    let entity_count = ENTITY_MOVEMENT_TARGET_UPDATES_PER_TRACKING_TURN * 10;
-    let mut visits = vec![0; entity_count];
-
-    for turn in 0..10 {
-        let tick = turn * ENTITY_MOVE_SEND_INTERVAL_TICKS;
-        let mut due = 0;
-        for (ordinal, visits) in visits.iter_mut().enumerate() {
-            if ordinary_entity_is_due_for_movement_tracking(
-                ordinal,
-                tick,
-                entity_count,
-                ENTITY_MOVEMENT_TARGET_UPDATES_PER_TRACKING_TURN,
-            ) {
-                *visits += 1;
-                due += 1;
-            }
-        }
-        assert_eq!(due, ENTITY_MOVEMENT_TARGET_UPDATES_PER_TRACKING_TURN);
-    }
-    assert!(visits.into_iter().all(|visits| visits == 1));
-}
-
-#[test]
-fn movement_tracking_uses_the_runtime_publication_budget_without_gaps() {
-    let publication_budget = ENTITY_MOVEMENT_TARGET_UPDATES_PER_TRACKING_TURN * 2;
-    let entity_count = publication_budget * 4;
-    let mut visits = vec![0; entity_count];
-
-    for turn in 0..4 {
-        let tick = turn * ENTITY_MOVE_SEND_INTERVAL_TICKS;
-        let mut due = 0;
-        for (ordinal, visits) in visits.iter_mut().enumerate() {
-            if ordinary_entity_is_due_for_movement_tracking(
-                ordinal,
-                tick,
-                entity_count,
-                publication_budget,
-            ) {
-                *visits += 1;
-                due += 1;
-            }
-        }
-        assert_eq!(due, publication_budget);
-    }
-    assert!(visits.into_iter().all(|visits| visits == 1));
-}
-
-#[test]
-fn dense_natural_movement_tracking_rotates_every_tick() {
-    let entity_count = ENTITY_MOVEMENT_TARGET_UPDATES_PER_TRACKING_TURN * 10;
-    let entities = (0..entity_count)
-        .map(|id| EntityId(i32::try_from(id).unwrap()))
-        .collect::<HashSet<_>>();
-    let mut visits = vec![0; entity_count];
-
-    for tick in 0..10 {
-        let due = bounded_entity_ids_due_for_tick(
-            &entities,
-            tick,
-            ENTITY_MOVEMENT_TARGET_UPDATES_PER_TRACKING_TURN,
-        );
-        assert_eq!(due.len(), ENTITY_MOVEMENT_TARGET_UPDATES_PER_TRACKING_TURN);
-        for entity in due {
-            visits[usize::try_from(entity.0).unwrap()] += 1;
-        }
-    }
-    assert!(visits.into_iter().all(|visits| visits == 1));
-}
-
-#[test]
-fn dense_entity_goal_updates_rotate_bounded_cohorts() {
-    let entity_count = ENTITY_GOAL_UPDATES_PER_TICK * 10;
-    let entities = (0..entity_count)
-        .map(|id| EntityId(i32::try_from(id).unwrap()))
-        .collect::<HashSet<_>>();
-    let mut visits = vec![0; entity_count];
-
-    for tick in 0..10 {
-        let due = entity_goal_ids_due_for_tick(&entities, tick, true);
-        assert_eq!(due.len(), ENTITY_GOAL_UPDATES_PER_TICK);
-        for entity in due {
-            visits[usize::try_from(entity.0).unwrap()] += 1;
-        }
-    }
-    assert!(visits.into_iter().all(|visits| visits == 1));
-}
-
-#[test]
-fn dense_entity_simulation_cohorts_are_stratified_across_regions() {
-    const REGION_COUNT: usize = 16;
-    const ENTITIES_PER_REGION: usize = 2_500;
-    const LIMIT: usize = 1_000;
-    let entities = (0..REGION_COUNT * ENTITIES_PER_REGION)
-        .map(|id| EntityId(i32::try_from(id).unwrap()))
-        .collect::<HashSet<_>>();
-
-    let due = bounded_entity_ids_due_for_tick(&entities, 17, LIMIT);
-    let mut per_region = [0usize; REGION_COUNT];
-    for entity in due {
-        let region = usize::try_from(entity.0).unwrap() / ENTITIES_PER_REGION;
-        per_region[region] += 1;
-    }
-
-    assert_eq!(per_region.iter().sum::<usize>(), LIMIT);
-    assert!(per_region.iter().all(|count| (62..=63).contains(count)));
-}
-
-#[test]
-fn ordinary_entity_goal_updates_keep_full_tick_cadence() {
-    let entity_count = ENTITY_GOAL_UPDATES_PER_TICK + 88;
-    let entities = (0..entity_count)
-        .map(|id| EntityId(i32::try_from(id).unwrap()))
-        .collect::<HashSet<_>>();
-
-    assert_eq!(entity_goal_ids_due_for_tick(&entities, 7, false), entities);
 }
 
 fn state(id: u32, default: bool, properties: &[(&str, &str)]) -> BlockStateReport {
@@ -1747,8 +1143,15 @@ fn button_and_door_test_registry() -> mc_world::BlockRegistry {
     .unwrap()
 }
 
-fn interaction_state_for_items(items: Arc<ItemRegistry>) -> InteractionState {
+pub(super) fn interaction_state_for_items(items: Arc<ItemRegistry>) -> InteractionState {
     let blocks = Arc::new(mc_world::BlockRegistry::from_report(&[]).unwrap());
+    interaction_state_for_items_and_blocks(items, blocks)
+}
+
+pub(super) fn interaction_state_for_items_and_blocks(
+    items: Arc<ItemRegistry>,
+    blocks: Arc<mc_world::BlockRegistry>,
+) -> InteractionState {
     let storage = mc_world::WorldStorage::in_memory(Arc::clone(&blocks));
     let world_read = storage.read_view();
     let world = Arc::new(tokio::sync::Mutex::new(storage));
@@ -1908,7 +1311,7 @@ fn start_survival_test_owner(
     (stop, task)
 }
 
-fn register_survival_test_player(
+pub(super) fn register_survival_test_player(
     state: &mut InteractionState,
     name: &str,
     survival: SurvivalState,

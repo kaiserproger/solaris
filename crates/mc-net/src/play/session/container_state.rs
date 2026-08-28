@@ -6,7 +6,7 @@ use std::time::Instant;
 use crate::lock_policy::lock_authoritative_mutex;
 use crate::play::ContainerPlayerPlan;
 use crate::play::inventory::PlayerInventory;
-use mc_protocol::packets::play::ItemStack;
+use mc_data::ItemStack;
 use tokio::sync::mpsc;
 
 use super::outbound::{

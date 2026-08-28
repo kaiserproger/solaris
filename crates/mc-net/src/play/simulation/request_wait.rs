@@ -184,21 +184,23 @@ mod tests {
             })
             .unwrap();
         let session = handle.for_session(7);
-        let waiting = tokio::spawn(async move {
-            session
-                .enqueue_player_command_wait(SimulationCommand::SaveBarrier {
-                    capture_world: false,
-                })
-                .await
+        let waiting = session.enqueue_player_command_wait(SimulationCommand::SaveBarrier {
+            capture_world: false,
         });
-        tokio::task::yield_now().await;
+        tokio::pin!(waiting);
+        let waker = std::task::Waker::noop();
+        let mut context = std::task::Context::from_waker(waker);
+        assert!(matches!(
+            std::future::Future::poll(waiting.as_mut(), &mut context),
+            std::task::Poll::Pending
+        ));
         tokio::time::advance(
             super::super::SIMULATION_QUEUE_ADMISSION_TIMEOUT + Duration::from_millis(1),
         )
         .await;
 
         assert_eq!(
-            waiting.await.unwrap().unwrap_err(),
+            waiting.await.unwrap_err(),
             SimulationRequestError::QueueAdmissionTimeout
         );
         assert_eq!(handle.snapshot().queue_admission_timeouts, 1);

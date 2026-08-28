@@ -1,8 +1,8 @@
 use std::sync::Arc;
 
+use mc_data::ItemStack;
 use mc_data::item_components::ItemFactsTable;
 use mc_data::items::ItemRegistry;
-use mc_protocol::packets::play::ItemStack;
 use mc_script::ScriptPlayerInventoryFailure;
 use tokio::sync::oneshot;
 

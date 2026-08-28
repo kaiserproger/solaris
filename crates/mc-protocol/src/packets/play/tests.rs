@@ -1463,7 +1463,7 @@ fn level_chunk_with_light_rejects_oversized_chunk_data_on_decode() {
     buf.write_varint((MAX_CHUNK_DATA_LEN + 1) as i32);
     let mut cursor: &[u8] = &buf;
     let err = LevelChunkWithLight::decode(&mut cursor).unwrap_err();
-    assert!(matches!(err, CodecError::StringTooLong { .. }));
+    assert!(matches!(err, CodecError::ArrayTooLong { .. }));
 }
 
 // ---- M5.a: serverbound interaction packets ----

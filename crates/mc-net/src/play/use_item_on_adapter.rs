@@ -1,13 +1,14 @@
 use std::sync::Arc;
 
-use mc_data::items::ItemRegistry;
+use mc_data::{ItemStack, items::ItemRegistry};
+use mc_domain::{Direction, GameMode, InteractionHand};
 use mc_entity::Vec3;
 use mc_protocol::codec::Identifier;
 use mc_protocol::frame::Compression;
 use mc_protocol::packets::play::{
     BlockChangedAck, BlockUpdate, ClientboundBlockEntityData, ClientboundContainerSetSlot,
-    ClientboundOpenSignEditor, Direction, GameMode, InteractionHand, ItemStack,
-    ServerboundSignUpdate, ServerboundUseItemOn, pack_block_pos, unpack_block_pos,
+    ClientboundOpenSignEditor, ServerboundSignUpdate, ServerboundUseItemOn, pack_block_pos,
+    unpack_block_pos,
 };
 use mc_world::{BlockRegistry, ChunkPos, SECTION_DIM};
 use tokio::io::AsyncWriteExt;

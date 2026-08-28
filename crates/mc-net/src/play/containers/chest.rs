@@ -1,6 +1,6 @@
+use mc_data::ItemStack;
 use mc_data::item_components::ItemFactsTable;
 use mc_data::items::ItemRegistry;
-use mc_protocol::packets::play::ItemStack;
 use mc_world::{BlockPos, ChestBlockEntity};
 
 use super::furnace::{furnace_slot_to_stack, stack_to_furnace_slot};

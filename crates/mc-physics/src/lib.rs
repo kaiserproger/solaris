@@ -40,6 +40,150 @@ impl Vec3 {
     }
 }
 
+/// Returns whether a displacement is finite and fits inside the supplied
+/// Euclidean per-step budget. Invalid budgets fail closed.
+#[must_use]
+pub fn displacement_within_limit(displacement: Vec3, max_distance: f64) -> bool {
+    if !max_distance.is_finite() || max_distance < 0.0 {
+        return false;
+    }
+    let distance_sq = displacement.x.mul_add(
+        displacement.x,
+        displacement
+            .y
+            .mul_add(displacement.y, displacement.z * displacement.z),
+    );
+    distance_sq.is_finite() && distance_sq <= max_distance * max_distance
+}
+
+/// Returns whether an authoritative pose contains only finite values and stays
+/// inside the supplied absolute coordinate limits. Invalid limits fail closed.
+#[must_use]
+pub fn authoritative_pose_within_limits(
+    position: Vec3,
+    yaw: f32,
+    pitch: f32,
+    horizontal_limit: f64,
+    vertical_limit: f64,
+) -> bool {
+    horizontal_limit.is_finite()
+        && horizontal_limit >= 0.0
+        && vertical_limit.is_finite()
+        && vertical_limit >= 0.0
+        && position.x.is_finite()
+        && position.y.is_finite()
+        && position.z.is_finite()
+        && yaw.is_finite()
+        && pitch.is_finite()
+        && position.x.abs() <= horizontal_limit
+        && position.z.abs() <= horizontal_limit
+        && position.y.abs() <= vertical_limit
+}
+
+/// Returns the number of linear sweep samples required so no axis advances
+/// farther than `max_step` between samples. Invalid inputs fail closed.
+#[must_use]
+pub fn sweep_sample_count(displacement: Vec3, max_step: f64) -> Option<usize> {
+    if !max_step.is_finite() || max_step <= 0.0 {
+        return None;
+    }
+    if !displacement.x.is_finite() || !displacement.y.is_finite() || !displacement.z.is_finite() {
+        return None;
+    }
+    let max_axis = displacement
+        .x
+        .abs()
+        .max(displacement.y.abs())
+        .max(displacement.z.abs());
+    let steps = (max_axis / max_step).ceil().max(1.0);
+    (steps <= usize::MAX as f64).then_some(steps as usize)
+}
+
+#[must_use]
+pub fn rotation_is_finite(yaw: f32, pitch: f32) -> bool {
+    yaw.is_finite() && pitch.is_finite()
+}
+
+/// Clamps a finite world position to the supplied absolute horizontal/vertical
+/// limits. Invalid positions or limits fail closed.
+#[must_use]
+pub fn clamp_world_position(
+    position: Vec3,
+    horizontal_limit: f64,
+    vertical_limit: f64,
+) -> Option<Vec3> {
+    if !horizontal_limit.is_finite()
+        || horizontal_limit < 0.0
+        || !vertical_limit.is_finite()
+        || vertical_limit < 0.0
+        || !position.x.is_finite()
+        || !position.y.is_finite()
+        || !position.z.is_finite()
+    {
+        return None;
+    }
+    Some(Vec3::new(
+        position.x.clamp(-horizontal_limit, horizontal_limit),
+        position.y.clamp(-vertical_limit, vertical_limit),
+        position.z.clamp(-horizontal_limit, horizontal_limit),
+    ))
+}
+
+/// Tests strict overlap between a body AABB and an obstacle AABB after shrinking
+/// the obstacle by `deflation` on every face. Invalid boxes fail closed.
+#[must_use]
+pub fn aabb_intersects_deflated_obstacle(
+    body: [f64; 6],
+    obstacle: [f64; 6],
+    deflation: f64,
+) -> bool {
+    if !deflation.is_finite()
+        || deflation < 0.0
+        || body
+            .iter()
+            .chain(obstacle.iter())
+            .any(|value| !value.is_finite())
+        || body[0] > body[3]
+        || body[1] > body[4]
+        || body[2] > body[5]
+        || obstacle[0] > obstacle[3]
+        || obstacle[1] > obstacle[4]
+        || obstacle[2] > obstacle[5]
+    {
+        return false;
+    }
+    body[0] < obstacle[3] - deflation
+        && body[3] > obstacle[0] + deflation
+        && body[1] < obstacle[4] - deflation
+        && body[4] > obstacle[1] + deflation
+        && body[2] < obstacle[5] - deflation
+        && body[5] > obstacle[2] + deflation
+}
+
+/// Computes the retained fall-start height after an accepted movement update.
+/// Non-finite heights fail closed by returning `None`.
+#[must_use]
+pub fn next_fall_start_y(
+    old_y: f64,
+    old_fall_start_y: f64,
+    old_on_ground: bool,
+    old_in_water: bool,
+    new_y: f64,
+    new_on_ground: bool,
+    new_in_water: bool,
+) -> Option<f64> {
+    if !old_y.is_finite() || !old_fall_start_y.is_finite() || !new_y.is_finite() {
+        return None;
+    }
+    Some(if new_on_ground || new_in_water {
+        new_y
+    } else if old_on_ground || old_in_water {
+        old_y.max(new_y)
+    } else {
+        old_fall_start_y.max(new_y)
+    })
+}
+
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct Aabb {
     pub half_width: f64,
@@ -77,12 +221,14 @@ impl BlockMaterial {
 pub struct BlockCollisionHeight(u8);
 
 impl BlockCollisionHeight {
-    pub const FULL_BLOCK: Self = Self::from_sixteenths(16);
+    pub const FULL_BLOCK: Self = Self(16);
 
     #[must_use]
-    pub const fn from_sixteenths(height: u8) -> Self {
-        assert!(height > 0 && height <= 16);
-        Self(height)
+    pub const fn from_sixteenths(height: u8) -> Option<Self> {
+        if height == 0 || height > 16 {
+            return None;
+        }
+        Some(Self(height))
     }
 
     #[must_use]
@@ -97,7 +243,9 @@ pub struct BlockCollisionBox {
 }
 
 impl BlockCollisionBox {
-    pub const FULL_BLOCK: Self = Self::from_sixteenths(0, 0, 0, 16, 16, 16);
+    pub const FULL_BLOCK: Self = Self {
+        coordinates: [0, 0, 0, 4096, 4096, 4096],
+    };
 
     #[must_use]
     pub const fn from_sixteenths(
@@ -107,9 +255,11 @@ impl BlockCollisionBox {
         max_x: u8,
         max_y: u8,
         max_z: u8,
-    ) -> Self {
-        assert!(min_x < max_x && min_y < max_y && min_z < max_z);
-        Self {
+    ) -> Option<Self> {
+        if min_x >= max_x || min_y >= max_y || min_z >= max_z {
+            return None;
+        }
+        Some(Self {
             coordinates: [
                 min_x as i16 * 256,
                 min_y as i16 * 256,
@@ -118,17 +268,18 @@ impl BlockCollisionBox {
                 max_y as i16 * 256,
                 max_z as i16 * 256,
             ],
-        }
+        })
     }
 
     #[must_use]
-    pub const fn from_fixed_4096(coordinates: [i16; 6]) -> Self {
-        assert!(
-            coordinates[0] < coordinates[3]
-                && coordinates[1] < coordinates[4]
-                && coordinates[2] < coordinates[5]
-        );
-        Self { coordinates }
+    pub const fn from_fixed_4096(coordinates: [i16; 6]) -> Option<Self> {
+        if coordinates[0] >= coordinates[3]
+            || coordinates[1] >= coordinates[4]
+            || coordinates[2] >= coordinates[5]
+        {
+            return None;
+        }
+        Some(Self { coordinates })
     }
 
     #[must_use]
@@ -326,10 +477,11 @@ pub trait BlockSampler {
     }
 
     fn collision_boxes_at(&self, x: i32, y: i32, z: i32, emit: &mut dyn FnMut(BlockCollisionBox)) {
-        if let Some(height) = self.collision_height_at(x, y, z) {
-            emit(BlockCollisionBox::from_sixteenths(
-                0, 0, 0, 16, height.0, 16,
-            ));
+        if let Some(height) = self.collision_height_at(x, y, z)
+            && let Some(collision_box) =
+                BlockCollisionBox::from_sixteenths(0, 0, 0, 16, height.0, 16)
+        {
+            emit(collision_box);
         }
     }
 }
@@ -507,6 +659,15 @@ fn valid_step_input(body: EntityBody, config: PhysicsConfig) -> bool {
     ];
     finite_values.into_iter().all(f64::is_finite)
         && config.tick_seconds > 0.0
+        && config.gravity >= 0.0
+        && config.terminal_velocity <= 0.0
+        && (0.0..=1.0).contains(&config.ground_friction)
+        && (0.0..=1.0).contains(&config.air_drag)
+        && (0.0..=1.0).contains(&config.vertical_air_drag)
+        && (0.0..=1.0).contains(&config.water_drag)
+        && config.water_buoyancy >= 0.0
+        && config.step_height >= 0.0
+        && config.jump_speed >= 0.0
         && body.aabb.half_width > 0.0
         && body.aabb.half_width <= MAX_BODY_EXTENT
         && body.aabb.height > 0.0
@@ -594,7 +755,9 @@ fn collision_boxes_for_motion<S: BlockSampler>(
     let scan_min_y = body.min_y + desired.y.min(-step_height);
     let scan_max_y = body.max_y + desired.y.max(step_height);
     let max_local_y = f64::from(sampler.max_collision_box_y()) / 16.0;
-    assert!(max_local_y > 0.0, "collision box max_y must be positive");
+    if max_local_y <= 0.0 {
+        return None;
+    }
     let min_y = (scan_min_y - max_local_y).floor() as i32 + 1;
     let max_y = scan_max_y.ceil() as i32 - 1;
     let scan_cells = inclusive_range_len(min_x, max_x)
@@ -778,19 +941,7 @@ fn resolve_horizontal_sweep(
         }
     }
 
-    Vec3::new(
-        if axis_was_clipped(desired.x, resolved.x) {
-            0.0
-        } else {
-            desired.x
-        },
-        0.0,
-        if axis_was_clipped(desired.z, resolved.z) {
-            0.0
-        } else {
-            desired.z
-        },
-    )
+    Vec3::new(resolved.x, 0.0, resolved.z)
 }
 
 fn first_sweep_hit(
@@ -964,6 +1115,371 @@ mod tests {
     use super::*;
     use std::cell::Cell;
 
+    fn unit_body() -> WorldAabb {
+        WorldAabb {
+            min_x: 0.0,
+            min_y: 0.0,
+            min_z: 0.0,
+            max_x: 1.0,
+            max_y: 1.0,
+            max_z: 1.0,
+        }
+    }
+
+    fn wall_x(min_x: f64) -> WorldAabb {
+        WorldAabb {
+            min_x,
+            min_y: -1.0,
+            min_z: -10.0,
+            max_x: min_x + 1.0,
+            max_y: 2.0,
+            max_z: 10.0,
+        }
+    }
+
+    fn wall_z(min_z: f64) -> WorldAabb {
+        WorldAabb {
+            min_x: -10.0,
+            min_y: -1.0,
+            min_z,
+            max_x: 10.0,
+            max_y: 2.0,
+            max_z: min_z + 1.0,
+        }
+    }
+
+    #[test]
+    fn displacement_budget_is_euclidean_and_fails_closed() {
+        assert!(displacement_within_limit(Vec3::new(6.0, 8.0, 0.0), 10.0));
+        assert!(!displacement_within_limit(
+            Vec3::new(6.0, 8.000_001, 0.0),
+            10.0,
+        ));
+        assert!(!displacement_within_limit(
+            Vec3::new(f64::NAN, 0.0, 0.0),
+            10.0,
+        ));
+        assert!(!displacement_within_limit(Vec3::ZERO, f64::INFINITY));
+        assert!(!displacement_within_limit(Vec3::ZERO, -1.0));
+    }
+
+    #[test]
+    fn authoritative_pose_limits_accept_edges_and_reject_invalid_values() {
+        assert!(authoritative_pose_within_limits(
+            Vec3::new(30_000_000.0, 20_000_000.0, -30_000_000.0),
+            180.0,
+            -90.0,
+            30_000_000.0,
+            20_000_000.0,
+        ));
+        assert!(!authoritative_pose_within_limits(
+            Vec3::new(30_000_000.001, 0.0, 0.0),
+            0.0,
+            0.0,
+            30_000_000.0,
+            20_000_000.0,
+        ));
+        assert!(!authoritative_pose_within_limits(
+            Vec3::ZERO,
+            f32::NAN,
+            0.0,
+            30_000_000.0,
+            20_000_000.0,
+        ));
+        assert!(!authoritative_pose_within_limits(
+            Vec3::ZERO,
+            0.0,
+            f32::INFINITY,
+            30_000_000.0,
+            20_000_000.0,
+        ));
+        assert!(!authoritative_pose_within_limits(
+            Vec3::ZERO,
+            0.0,
+            0.0,
+            -1.0,
+            20_000_000.0,
+        ));
+    }
+
+    #[test]
+    fn sweep_sample_count_bounds_axis_progress_and_rejects_invalid_inputs() {
+        assert_eq!(sweep_sample_count(Vec3::ZERO, 1.0 / 32.0), Some(1));
+        assert_eq!(
+            sweep_sample_count(Vec3::new(1.0, -0.25, 0.5), 1.0 / 32.0),
+            Some(32)
+        );
+        assert_eq!(sweep_sample_count(Vec3::new(1.01, 0.0, 0.0), 0.5), Some(3));
+        assert_eq!(sweep_sample_count(Vec3::new(f64::NAN, 0.0, 0.0), 0.5), None);
+        assert_eq!(sweep_sample_count(Vec3::ZERO, 0.0), None);
+        assert_eq!(sweep_sample_count(Vec3::ZERO, f64::INFINITY), None);
+    }
+
+    #[test]
+    fn rotation_and_position_normalization_fail_closed() {
+        assert!(rotation_is_finite(180.0, -90.0));
+        assert!(!rotation_is_finite(f32::NAN, 0.0));
+        assert_eq!(
+            clamp_world_position(Vec3::new(12.0, -30.0, 40.0), 20.0, 25.0),
+            Some(Vec3::new(12.0, -25.0, 20.0))
+        );
+        assert_eq!(
+            clamp_world_position(Vec3::new(f64::NAN, 0.0, 0.0), 20.0, 25.0),
+            None
+        );
+        assert_eq!(clamp_world_position(Vec3::ZERO, -1.0, 25.0), None);
+    }
+
+    #[test]
+    fn deflated_obstacle_intersection_is_strict_and_fail_closed() {
+        let body = [0.0, 0.0, 0.0, 0.6, 1.8, 0.6];
+        assert!(aabb_intersects_deflated_obstacle(
+            body,
+            [0.59, 0.0, 0.0, 1.59, 1.0, 1.0],
+            1.0e-5,
+        ));
+        assert!(!aabb_intersects_deflated_obstacle(
+            body,
+            [0.6, 0.0, 0.0, 1.6, 1.0, 1.0],
+            0.0,
+        ));
+        assert!(!aabb_intersects_deflated_obstacle(
+            body,
+            [f64::NAN, 0.0, 0.0, 1.0, 1.0, 1.0],
+            0.0,
+        ));
+        assert!(!aabb_intersects_deflated_obstacle(
+            body,
+            [1.0, 0.0, 0.0, 0.0, 1.0, 1.0],
+            0.0,
+        ));
+        assert!(!aabb_intersects_deflated_obstacle(
+            body,
+            [0.0, 0.0, 0.0, 1.0, 1.0, 1.0],
+            -1.0,
+        ));
+    }
+
+    #[test]
+    fn fall_start_height_tracks_ground_water_and_airborne_history() {
+        assert_eq!(
+            next_fall_start_y(12.0, 15.0, false, false, 10.0, true, false),
+            Some(10.0)
+        );
+        assert_eq!(
+            next_fall_start_y(12.0, 15.0, false, false, 10.0, false, true),
+            Some(10.0)
+        );
+        assert_eq!(
+            next_fall_start_y(12.0, 15.0, true, false, 10.0, false, false),
+            Some(12.0)
+        );
+        assert_eq!(
+            next_fall_start_y(12.0, 15.0, false, true, 13.0, false, false),
+            Some(13.0)
+        );
+        assert_eq!(
+            next_fall_start_y(12.0, 15.0, false, false, 10.0, false, false),
+            Some(15.0)
+        );
+        assert_eq!(
+            next_fall_start_y(f64::NAN, 15.0, false, false, 10.0, false, false),
+            None
+        );
+    }
+
+    #[test]
+    fn horizontal_sweep_preserves_partial_x_travel_and_reports_collision() {
+        let result = resolve_movement(
+            unit_body(),
+            Vec3::new(1.0, 0.0, 0.0),
+            &[wall_x(1.4)],
+            false,
+            0.0,
+        );
+
+        assert!((result.delta.x - 0.4).abs() < 1.0e-12);
+        assert_eq!(result.delta.z, 0.0);
+        assert!(result.collided);
+    }
+
+    #[test]
+    fn horizontal_sweep_preserves_partial_z_travel_symmetrically() {
+        let result = resolve_movement(
+            unit_body(),
+            Vec3::new(0.0, 0.0, 1.0),
+            &[wall_z(1.4)],
+            false,
+            0.0,
+        );
+
+        assert!((result.delta.z - 0.4).abs() < 1.0e-12);
+        assert_eq!(result.delta.x, 0.0);
+        assert!(result.collided);
+    }
+
+    #[test]
+    fn horizontal_sweep_slides_along_wall_after_partial_contact() {
+        let result = resolve_movement(
+            unit_body(),
+            Vec3::new(1.0, 0.0, 1.0),
+            &[wall_x(1.4)],
+            false,
+            0.0,
+        );
+
+        assert!((result.delta.x - 0.4).abs() < 1.0e-12);
+        assert!((result.delta.z - 1.0).abs() < 1.0e-12);
+        assert!(result.collided);
+    }
+
+    #[test]
+    fn horizontal_sweep_stops_at_diagonal_corner_without_discarding_travel() {
+        let result = resolve_movement(
+            unit_body(),
+            Vec3::new(1.0, 0.0, 1.0),
+            &[wall_x(1.4), wall_z(1.4)],
+            false,
+            0.0,
+        );
+
+        assert!((result.delta.x - 0.4).abs() < 1.0e-12);
+        assert!((result.delta.z - 0.4).abs() < 1.0e-12);
+        assert!(result.collided);
+    }
+
+    #[test]
+    fn horizontal_sweep_partial_travel_is_symmetric_for_negative_direction() {
+        let obstacle = WorldAabb {
+            min_x: -1.4,
+            min_y: -1.0,
+            min_z: -10.0,
+            max_x: -0.4,
+            max_y: 2.0,
+            max_z: 10.0,
+        };
+        let result = resolve_movement(
+            unit_body(),
+            Vec3::new(-1.0, 0.0, 0.0),
+            &[obstacle],
+            false,
+            0.0,
+        );
+
+        assert!((result.delta.x + 0.4).abs() < 1.0e-12);
+        assert!(result.collided);
+    }
+
+    #[test]
+    fn horizontal_sweep_exact_endpoint_contact_keeps_full_delta() {
+        let result = resolve_movement(
+            unit_body(),
+            Vec3::new(1.0, 0.0, 0.0),
+            &[wall_x(2.0)],
+            false,
+            0.0,
+        );
+
+        assert_eq!(result.delta, Vec3::new(1.0, 0.0, 0.0));
+        assert!(!result.collided);
+    }
+
+    #[test]
+    fn public_collision_constructors_reject_invalid_geometry_without_panicking() {
+        assert_eq!(BlockCollisionHeight::from_sixteenths(0), None);
+        assert_eq!(BlockCollisionHeight::from_sixteenths(17), None);
+        assert!(BlockCollisionHeight::from_sixteenths(16).is_some());
+        assert_eq!(BlockCollisionBox::from_sixteenths(1, 0, 0, 1, 1, 1), None);
+        assert_eq!(BlockCollisionBox::from_fixed_4096([0, 0, 0, 0, 1, 1]), None);
+        assert!(BlockCollisionBox::from_sixteenths(0, 0, 0, 16, 24, 16).is_some());
+    }
+
+    #[test]
+    fn invalid_physics_coefficients_fail_closed() {
+        let body = EntityBody {
+            position: Vec3::new(0.5, 64.0, 0.5),
+            velocity: Vec3::new(1.0, 0.0, 0.0),
+            aabb: Aabb::COW,
+            on_ground: true,
+        };
+        let invalid = [
+            PhysicsConfig {
+                gravity: -1.0,
+                ..PhysicsConfig::default()
+            },
+            PhysicsConfig {
+                terminal_velocity: 1.0,
+                ..PhysicsConfig::default()
+            },
+            PhysicsConfig {
+                ground_friction: -0.1,
+                ..PhysicsConfig::default()
+            },
+            PhysicsConfig {
+                air_drag: 1.1,
+                ..PhysicsConfig::default()
+            },
+            PhysicsConfig {
+                vertical_air_drag: -0.1,
+                ..PhysicsConfig::default()
+            },
+            PhysicsConfig {
+                water_drag: 1.1,
+                ..PhysicsConfig::default()
+            },
+            PhysicsConfig {
+                water_buoyancy: -1.0,
+                ..PhysicsConfig::default()
+            },
+            PhysicsConfig {
+                step_height: -0.1,
+                ..PhysicsConfig::default()
+            },
+            PhysicsConfig {
+                jump_speed: -0.1,
+                ..PhysicsConfig::default()
+            },
+        ];
+
+        for config in invalid {
+            let result = step_entity(
+                body,
+                &FlatWorld {
+                    ground_y: 63,
+                    water_y: None,
+                },
+                config,
+            );
+            assert_eq!(result.body.position, body.position);
+            assert_eq!(result.body.velocity, Vec3::ZERO);
+        }
+    }
+
+    #[test]
+    fn invalid_sampler_collision_height_fails_closed_without_panicking() {
+        struct InvalidSampler;
+        impl BlockSampler for InvalidSampler {
+            fn material_at(&self, _x: i32, _y: i32, _z: i32) -> BlockMaterial {
+                BlockMaterial::Air
+            }
+
+            fn max_collision_box_y(&self) -> u8 {
+                0
+            }
+        }
+
+        let body = EntityBody {
+            position: Vec3::new(0.5, 64.0, 0.5),
+            velocity: Vec3::new(1.0, 0.0, 0.0),
+            aabb: Aabb::COW,
+            on_ground: false,
+        };
+        let result = step_entity(body, &InvalidSampler, PhysicsConfig::default());
+        assert_eq!(result.body.position, body.position);
+        assert_eq!(result.body.velocity, Vec3::ZERO);
+        assert!(result.horizontal_collision);
+    }
+
     #[test]
     fn cow_fallback_aabb_matches_vanilla_adult_dimensions() {
         assert_eq!(
@@ -1017,7 +1533,7 @@ mod tests {
 
         fn collision_height_at(&self, x: i32, y: i32, z: i32) -> Option<BlockCollisionHeight> {
             self.material_at(x, y, z).is_solid().then_some(if x == 0 {
-                BlockCollisionHeight::from_sixteenths(15)
+                BlockCollisionHeight::from_sixteenths(15).expect("valid test collision height")
             } else {
                 BlockCollisionHeight::FULL_BLOCK
             })
@@ -1045,7 +1561,10 @@ mod tests {
             if y <= 62 {
                 emit(BlockCollisionBox::FULL_BLOCK);
             } else if x == 1 && y == 63 && z == 0 {
-                emit(BlockCollisionBox::from_sixteenths(0, 0, 0, 16, 8, 16));
+                emit(
+                    BlockCollisionBox::from_sixteenths(0, 0, 0, 16, 8, 16)
+                        .expect("valid test collision box"),
+                );
             }
         }
     }
@@ -1071,7 +1590,10 @@ mod tests {
             if y <= 62 {
                 emit(BlockCollisionBox::FULL_BLOCK);
             } else if x == 1 && y == 63 && z == 0 {
-                emit(BlockCollisionBox::from_sixteenths(6, 0, 6, 10, 24, 10));
+                emit(
+                    BlockCollisionBox::from_sixteenths(6, 0, 6, 10, 24, 10)
+                        .expect("valid test collision box"),
+                );
             }
         }
 
@@ -1101,8 +1623,14 @@ mod tests {
             if y <= 62 {
                 emit(BlockCollisionBox::FULL_BLOCK);
             } else if x == 1 && y == 63 && z == 0 {
-                emit(BlockCollisionBox::from_sixteenths(0, 0, 0, 16, 8, 16));
-                emit(BlockCollisionBox::from_sixteenths(0, 8, 0, 16, 16, 8));
+                emit(
+                    BlockCollisionBox::from_sixteenths(0, 0, 0, 16, 8, 16)
+                        .expect("valid test collision box"),
+                );
+                emit(
+                    BlockCollisionBox::from_sixteenths(0, 8, 0, 16, 16, 8)
+                        .expect("valid test collision box"),
+                );
             }
         }
     }
@@ -1128,9 +1656,15 @@ mod tests {
             if y <= 62 {
                 emit(BlockCollisionBox::FULL_BLOCK);
             } else if x == 1 && y == 63 && z == 0 {
-                emit(BlockCollisionBox::from_sixteenths(0, 0, 0, 16, 8, 16));
+                emit(
+                    BlockCollisionBox::from_sixteenths(0, 0, 0, 16, 8, 16)
+                        .expect("valid test collision box"),
+                );
             } else if x == 1 && y == 64 && z == 0 {
-                emit(BlockCollisionBox::from_sixteenths(0, 12, 0, 16, 16, 16));
+                emit(
+                    BlockCollisionBox::from_sixteenths(0, 12, 0, 16, 16, 16)
+                        .expect("valid test collision box"),
+                );
             }
         }
     }
@@ -1302,7 +1836,7 @@ mod tests {
         let stepped = result.body;
 
         assert!(result.horizontal_collision);
-        assert_eq!(stepped.position.x, body.position.x);
+        assert!((stepped.position.x - 0.55).abs() < 1.0e-9);
         assert_eq!(stepped.velocity.x, 0.0);
         assert_eq!(stepped.velocity.y, 0.0);
         assert!(stepped.on_ground);
@@ -1320,7 +1854,7 @@ mod tests {
         let result = step_entity(body, &SweptWallWorld, PhysicsConfig::default());
 
         assert!(result.horizontal_collision);
-        assert_eq!(result.body.position.x, body.position.x);
+        assert!((result.body.position.x - 1.55).abs() < 1.0e-9);
         assert_eq!(result.body.velocity.x, 0.0);
     }
 
@@ -1336,7 +1870,7 @@ mod tests {
         let result = step_entity(body, &SweptWallWorld, PhysicsConfig::default());
 
         assert!(result.horizontal_collision);
-        assert_eq!(result.body.position.x, body.position.x);
+        assert!((result.body.position.x - 1.55).abs() < 1.0e-9);
         assert!(result.body.position.z > body.position.z);
         assert_eq!(result.body.velocity.x, 0.0);
         assert!(result.body.velocity.z > 0.0);
@@ -1361,8 +1895,8 @@ mod tests {
         );
 
         assert!(result.horizontal_collision);
-        assert_eq!(result.body.position.x, body.position.x);
-        assert_eq!(result.body.position.z, body.position.z);
+        assert!((result.body.position.x - 0.75).abs() < 1.0e-9);
+        assert!((result.body.position.z - 0.75).abs() < 1.0e-9);
         assert_eq!(result.body.velocity.x, 0.0);
         assert_eq!(result.body.velocity.z, 0.0);
     }
@@ -1386,8 +1920,8 @@ mod tests {
         );
 
         assert!(result.horizontal_collision);
-        assert_eq!(result.body.position.x, body.position.x);
-        assert_eq!(result.body.position.z, body.position.z);
+        assert!((result.body.position.x - 2.25).abs() < 1.0e-9);
+        assert!((result.body.position.z - 2.25).abs() < 1.0e-9);
         assert_eq!(result.body.velocity.x, 0.0);
         assert_eq!(result.body.velocity.z, 0.0);
     }
@@ -1452,7 +1986,9 @@ mod tests {
         let result = step_entity(body, &SweptWallWorld, PhysicsConfig::living_entity());
 
         assert!(result.horizontal_collision);
-        assert_eq!(result.body.position, body.position);
+        assert!((result.body.position.x - 1.55).abs() < 1.0e-9);
+        assert_eq!(result.body.position.y, body.position.y);
+        assert_eq!(result.body.position.z, body.position.z);
         assert_eq!(result.body.velocity, Vec3::ZERO);
         assert!(result.body.on_ground);
     }
@@ -1622,7 +2158,7 @@ mod tests {
         let stepped = result.body;
 
         assert!(result.horizontal_collision);
-        assert_eq!(stepped.position.x, body.position.x);
+        assert!((stepped.position.x - 0.55).abs() < 1.0e-9);
         assert!(
             stepped.position.y > 64.0 && stepped.position.y < 65.0,
             "{stepped:?}"
@@ -1730,7 +2266,7 @@ mod tests {
         let result = step_entity(body, &IsolatedFenceWorld, PhysicsConfig::living_entity());
 
         assert!(result.horizontal_collision);
-        assert_eq!(result.body.position.x, body.position.x);
+        assert!((result.body.position.x - 1.175).abs() < 1.0e-9);
         assert_eq!(result.body.velocity.x, 0.0);
     }
 
@@ -1749,7 +2285,7 @@ mod tests {
         let result = step_entity(body, &IsolatedFenceWorld, PhysicsConfig::living_entity());
 
         assert!(result.horizontal_collision);
-        assert_eq!(result.body.position.x, body.position.x);
+        assert!((result.body.position.x - 1.175).abs() < 1.0e-9);
         assert_eq!(result.body.velocity.x, 0.0);
     }
 
@@ -1768,7 +2304,7 @@ mod tests {
         let result = step_entity(body, &IsolatedFenceWorld, PhysicsConfig::living_entity());
 
         assert!(result.horizontal_collision);
-        assert_eq!(result.body.position.x, body.position.x);
+        assert!((result.body.position.x - 1.175).abs() < 1.0e-9);
         assert_eq!(result.body.velocity.x, 0.0);
     }
 
@@ -1784,7 +2320,7 @@ mod tests {
         let result = step_entity(body, &SlabUnderLowCeilingWorld, PhysicsConfig::default());
 
         assert!(result.horizontal_collision);
-        assert_eq!(result.body.position.x, body.position.x);
+        assert!((result.body.position.x - 0.55).abs() < 1.0e-9);
         assert!((result.body.position.y - 63.0).abs() < 1.0e-9);
     }
 
@@ -1828,7 +2364,7 @@ mod tests {
         let result = step_entity(body, &world, PhysicsConfig::living_entity());
 
         assert!(result.horizontal_collision);
-        assert_eq!(result.body.position.x, body.position.x);
+        assert!((result.body.position.x - 0.55).abs() < 1.0e-9);
         assert!(result.body.position.z > body.position.z);
         assert_eq!(result.body.velocity.x, 0.0);
         assert!(result.body.velocity.z > 0.0);

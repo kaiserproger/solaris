@@ -1,6 +1,7 @@
 use std::time::Instant;
 
-use mc_protocol::packets::play::{EntityDataValue, GameMode};
+use mc_domain::GameMode;
+use mc_protocol::packets::play::EntityDataValue;
 
 use crate::play::persistence::SpawnState;
 use crate::play::simulation::{PlayerStateEvent, SimulationAuthority, SimulationRequestError};

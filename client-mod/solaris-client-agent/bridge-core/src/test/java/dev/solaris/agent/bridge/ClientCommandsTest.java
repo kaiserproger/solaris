@@ -155,6 +155,7 @@ final class ClientCommandsTest {
         );
 
         assertEquals("minecraft:overworld", observed.get("dimension").getAsString());
+        assertEquals(client.stateVersion, observed.get("state_version").getAsLong());
         assertEquals("minecraft:stone", block.get("block_id").getAsString());
         assertEquals(List.of(10, 64, -3), client.readBlockPosition);
         assertEquals(2, executor.calls);

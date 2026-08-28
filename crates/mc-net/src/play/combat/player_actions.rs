@@ -1,15 +1,15 @@
 use mc_data::item_components::ItemFactsTable;
+use mc_data::item_stack::ItemStack;
 use mc_data::items::ItemRegistry;
+use mc_domain::{GameMode, InteractionHand};
 use mc_entity::Vec3;
-use mc_protocol::packets::play::{
-    GameMode, InteractionHand, ItemStack, LIVING_ENTITY_FLAG_OFF_HAND,
-    LIVING_ENTITY_FLAG_USING_ITEM,
-};
+use mc_protocol::packets::play::{LIVING_ENTITY_FLAG_OFF_HAND, LIVING_ENTITY_FLAG_USING_ITEM};
 
 const PLAYER_BASE_ATTACK_SPEED: f32 = 4.0;
 const ATTACK_RECHARGE_TICKS_PER_SECOND: f32 = 20.0;
-pub(in crate::play) const SHIELD_ACTIVATION_DELAY_TICKS: u64 = 5;
-pub(in crate::play) const SHIELD_FRONT_ARC_DOT_MIN: f64 = 0.0;
+#[cfg(test)]
+pub(in crate::play) const SHIELD_ACTIVATION_DELAY_TICKS: u64 =
+    mc_entity::player_combat_26_1_2::SHIELD_ACTIVATION_DELAY_TICKS;
 pub(in crate::play) const SHIELD_FALLBACK_MAX_DAMAGE: i32 = 336;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -173,38 +173,15 @@ pub(in crate::play) fn weapon_attacks_damage_held_item(game_mode: GameMode) -> b
 }
 
 pub(in crate::play) fn is_durability_tool_path(path: &str) -> bool {
-    path.ends_with("_axe")
-        || path.ends_with("_hoe")
-        || path.ends_with("_pickaxe")
-        || path.ends_with("_shovel")
-        || path.ends_with("_sword")
+    mc_data::item_semantics_26_1_2::is_durability_tool_path(path)
 }
 
 pub(in crate::play) fn max_tool_damage_for_path(path: &str) -> Option<i32> {
-    if !is_durability_tool_path(path) {
-        return None;
-    }
-    let max = if path.starts_with("wooden_") {
-        59
-    } else if path.starts_with("stone_") {
-        131
-    } else if path.starts_with("iron_") {
-        250
-    } else if path.starts_with("diamond_") {
-        1561
-    } else if path.starts_with("golden_") {
-        32
-    } else if path.starts_with("netherite_") {
-        2031
-    } else {
-        return None;
-    };
-    Some(max)
+    mc_data::item_semantics_26_1_2::max_tool_damage_for_path(path)
 }
 
 pub(in crate::play) fn player_horizontal_look_direction(yaw: f32) -> Vec3 {
-    let yaw = f64::from(yaw).to_radians();
-    Vec3::new(-yaw.sin(), 0.0, yaw.cos())
+    mc_entity::player_combat_26_1_2::horizontal_look_direction(yaw)
 }
 
 pub(in crate::play) fn shield_hand_slot(
@@ -334,18 +311,7 @@ pub(in crate::play) fn damage_active_shield_slot(
 }
 
 pub(in crate::play) fn shield_durability_damage(blocked_damage: f32) -> i32 {
-    if blocked_damage < 3.0 {
-        return 0;
-    }
-    if !blocked_damage.is_finite() {
-        return i32::MAX;
-    }
-    let scaled = blocked_damage.max(0.0).floor();
-    if scaled >= (i32::MAX - 1) as f32 {
-        i32::MAX
-    } else {
-        (scaled as i32).saturating_add(1).max(1)
-    }
+    mc_entity::player_combat_26_1_2::shield_durability_damage(blocked_damage)
 }
 
 pub(in crate::play) fn shield_disable_ticks(
@@ -362,11 +328,7 @@ pub(in crate::play) fn shield_disable_ticks(
     let scale = item_facts
         .get(shield)
         .and_then(|facts| facts.blocks_attacks_disable_cooldown_scale)?;
-    if !seconds.is_finite() || !scale.is_finite() || seconds <= 0.0 || scale <= 0.0 {
-        return None;
-    }
-    let ticks = (seconds * scale * 20.0).round();
-    (ticks > 0.0 && ticks <= u64::MAX as f32).then_some(ticks as u64)
+    mc_entity::player_combat_26_1_2::shield_disable_ticks(seconds, scale)
 }
 
 pub(in crate::play) fn shield_blocks_damage(
@@ -395,24 +357,13 @@ pub(in crate::play) fn shield_blocks_damage_since(
     current_tick: u64,
     started_tick: u64,
 ) -> bool {
-    if current_tick.saturating_sub(started_tick) < SHIELD_ACTIVATION_DELAY_TICKS {
-        return false;
-    }
-    let Some(source_origin) = source_origin else {
-        return false;
-    };
-    let incoming = Vec3::new(
-        source_origin.x - player_position.x,
-        0.0,
-        source_origin.z - player_position.z,
-    );
-    let incoming_len = (incoming.x * incoming.x + incoming.z * incoming.z).sqrt();
-    if incoming_len <= f64::EPSILON {
-        return false;
-    }
-    let look = player_horizontal_look_direction(player_yaw);
-    let dot = (look.x * incoming.x + look.z * incoming.z) / incoming_len;
-    dot >= SHIELD_FRONT_ARC_DOT_MIN
+    mc_entity::player_combat_26_1_2::shield_blocks_damage_since(
+        player_position,
+        player_yaw,
+        source_origin,
+        current_tick,
+        started_tick,
+    )
 }
 
 fn held_item_id(held: &ItemStack) -> Option<u32> {

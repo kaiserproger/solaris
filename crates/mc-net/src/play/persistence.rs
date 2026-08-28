@@ -899,6 +899,7 @@ fn sync_regional_journal_directory(_path: &Path) -> Result<(), RegionalDecisionJ
 pub(crate) struct WorldPersistedMetadata {
     pub(crate) world_time: u64,
     pub(crate) daylight_cycle_enabled: bool,
+    pub(crate) weather: super::session::WeatherState,
     pub(crate) players_sleeping_percentage: u32,
     pub(crate) keep_inventory: bool,
     pub(crate) world_identity: String,
@@ -1399,16 +1400,19 @@ pub(super) fn load_player_state(
         state.game_mode = GameMode::from_id(game_mode);
     }
     if let Some(health) = float_field(&fields, "Health") {
-        state.survival.health = health.clamp(0.0, SurvivalState::MAX_HEALTH);
+        state.survival.health = health.clamp(0.0, mc_entity::player_survival_26_1_2::MAX_HEALTH);
     }
     if let Some(food) = int_field(&fields, "foodLevel") {
-        state.survival.food = food.clamp(0, SurvivalState::MAX_FOOD);
+        state.survival.food = food.clamp(0, mc_entity::player_survival_26_1_2::MAX_FOOD);
     }
     if let Some(saturation) = float_field(&fields, "foodSaturationLevel") {
         state.survival.saturation = saturation.max(0.0);
     }
     if let Some(exhaustion) = float_field(&fields, "foodExhaustionLevel") {
         state.survival.exhaustion = exhaustion.max(0.0);
+    }
+    if let Some(fire) = int_field(&fields, "Fire") {
+        state.survival.remaining_fire_ticks = fire;
     }
     if let Some(slot) = int_field(&fields, "SelectedItemSlot") {
         state.selected_hotbar_slot = slot.clamp(0, 8) as u8;
@@ -1513,6 +1517,16 @@ pub(crate) fn save_player_state(
         &mut fields,
         "foodExhaustionLevel",
         Tag::Float(state.survival.exhaustion),
+    );
+    set_field(
+        &mut fields,
+        "Fire",
+        Tag::Short(
+            state
+                .survival
+                .remaining_fire_ticks
+                .clamp(i32::from(i16::MIN), i32::from(i16::MAX)) as i16,
+        ),
     );
     set_field(
         &mut fields,
@@ -1806,6 +1820,9 @@ pub(crate) fn load_persisted_entities(
         })?;
         if let Some(fall_distance) = float_field(fields, "FallDistance") {
             retained.fall_distance = f64::from(fall_distance);
+        }
+        if let Some(fire) = int_field(fields, "Fire") {
+            retained.remaining_fire_ticks = fire;
         }
         let head_yaw = float_field(fields, ENTITY_HEAD_YAW_FIELD).ok_or_else(|| {
             PlayerPersistenceError::InvalidValue {
@@ -2243,9 +2260,36 @@ pub(crate) fn load_world_metadata(
             });
         }
     };
+    let weather_kind =
+        match field(&fields, "SolarisWeatherState") {
+            Some(Tag::Byte(value)) => super::session::WeatherKind::from_u8(*value as u8)
+                .ok_or_else(|| PlayerPersistenceError::InvalidValue {
+                    path: path.clone(),
+                    field: "SolarisWeatherState",
+                })?,
+            None => super::session::WeatherKind::Clear,
+            _ => {
+                return Err(PlayerPersistenceError::InvalidValue {
+                    path: path.clone(),
+                    field: "SolarisWeatherState",
+                });
+            }
+        };
+    let rain_level = int_field(&fields, "SolarisRainLevelBits")
+        .map(|bits| f32::from_bits(bits as u32))
+        .unwrap_or(0.0);
+    let thunder_level = int_field(&fields, "SolarisThunderLevelBits")
+        .map(|bits| f32::from_bits(bits as u32))
+        .unwrap_or(0.0);
+    let weather = super::session::WeatherState::new(weather_kind, rain_level, thunder_level)
+        .ok_or_else(|| PlayerPersistenceError::InvalidValue {
+            path: path.clone(),
+            field: "SolarisWeatherState",
+        })?;
     Ok(Some(WorldPersistedMetadata {
         world_time: long_field(&fields, "SolarisWorldTime").unwrap_or(0) as u64,
         daylight_cycle_enabled,
+        weather,
         players_sleeping_percentage,
         keep_inventory,
         world_identity: string_field(&fields, "SolarisWorldIdentity")
@@ -2271,6 +2315,18 @@ pub(crate) fn save_world_metadata(
         (
             "SolarisDaylightCycleEnabled".into(),
             Tag::Byte(i8::from(metadata.daylight_cycle_enabled)),
+        ),
+        (
+            "SolarisWeatherState".into(),
+            Tag::Byte(metadata.weather.kind().as_u8() as i8),
+        ),
+        (
+            "SolarisRainLevelBits".into(),
+            Tag::Int(metadata.weather.rain_level().to_bits() as i32),
+        ),
+        (
+            "SolarisThunderLevelBits".into(),
+            Tag::Int(metadata.weather.thunder_level().to_bits() as i32),
         ),
         (
             "SolarisPlayersSleepingPercentage".into(),
@@ -2356,6 +2412,15 @@ fn entity_tag(
         (
             "FallDistance".into(),
             Tag::Float(entity.retained.fall_distance as f32),
+        ),
+        (
+            "Fire".into(),
+            Tag::Short(
+                entity
+                    .retained
+                    .remaining_fire_ticks
+                    .clamp(i32::from(i16::MIN), i32::from(i16::MAX)) as i16,
+            ),
         ),
         ("Health".into(), Tag::Float(entity.health)),
         (ENTITY_ATTRIBUTES_FIELD.into(), Tag::String(attributes)),
@@ -3899,8 +3964,9 @@ mod tests {
         record_samples.sort_unstable();
         clear_samples.sort_unstable();
         total_samples.sort_unstable();
+        let total_p99_us = percentile(&total_samples, 99);
         println!(
-            "REGIONAL_JOURNAL_FSYNC_BENCH iterations={ITERATIONS} record_p50_us={} record_p95_us={} record_p99_us={} clear_p50_us={} clear_p95_us={} clear_p99_us={} total_p50_us={} total_p95_us={} total_p99_us={} total_max_us={}",
+            "REGIONAL_JOURNAL_FSYNC_BENCH iterations={ITERATIONS} record_p50_us={} record_p95_us={} record_p99_us={} clear_p50_us={} clear_p95_us={} clear_p99_us={} total_p50_us={} total_p95_us={} total_p99_us={total_p99_us} total_max_us={}",
             percentile(&record_samples, 50),
             percentile(&record_samples, 95),
             percentile(&record_samples, 99),
@@ -3909,8 +3975,11 @@ mod tests {
             percentile(&clear_samples, 99),
             percentile(&total_samples, 50),
             percentile(&total_samples, 95),
-            percentile(&total_samples, 99),
             total_samples.last().copied().unwrap_or_default(),
+        );
+        assert!(
+            total_p99_us <= 50_000,
+            "regional decision journal durability exceeded the frozen 50 ms tick target at p99: {total_p99_us} us"
         );
     }
 
@@ -4381,6 +4450,67 @@ mod tests {
     }
 
     #[test]
+    fn natural_spawn_identity_and_retained_state_round_trip_entities_dat() {
+        let tmp = tempfile::tempdir().unwrap();
+        let items = items();
+        let entity_types = entity_types();
+        let cow_name = Identifier::parse("minecraft:cow").unwrap();
+        let cow_type = i32::try_from(entity_types.id_of(&cow_name).unwrap()).unwrap();
+        let uuid = mc_entity::natural_spawn_26_1_2::herd_uuid((2, 0), 3);
+        let mut animal = mc_entity::AnimalBreedingState::adult();
+        animal.love_ticks = 37;
+        let mut retained = mc_entity::EntityRetainedState::default();
+        retained.spawn_tick = 40;
+        retained.fall_distance = 2.25;
+        let snapshot = EntitySnapshot {
+            id: EntityId(404),
+            uuid,
+            type_id: cow_type,
+            type_name: cow_name.to_string(),
+            position: Vec3::new(40.5, 65.0, 8.5),
+            rotation: mc_entity::Rotation::ZERO,
+            velocity: Vec3::new(0.1, 0.0, -0.1),
+            on_ground: true,
+            item_stack: None,
+            experience_value: None,
+            block_state: None,
+            lifecycle: EntityLifecycle::Alive,
+            health: 10.0,
+            attributes: mc_entity::AttributeSet::vanilla_mob_defaults(),
+            goal: GoalState::Idle,
+            vehicle: None,
+            animal: Some(animal),
+            retained,
+        };
+        let checkpoint = PersistedEntityCheckpoint::new(
+            80,
+            [PersistedEntityRecord::from_snapshot_at_lifecycle_clock(
+                snapshot.clone(),
+                80,
+            )],
+        );
+
+        save_persisted_entity_records(tmp.path(), &items, &checkpoint).unwrap();
+        let loaded = load_persisted_entities(tmp.path(), &items, &entity_types).unwrap();
+
+        assert_eq!(loaded.lifecycle_clock, 80);
+        assert_eq!(loaded.records.len(), 1);
+        let restored = &loaded.records[0].snapshot;
+        assert_eq!(restored.id, snapshot.id);
+        assert_eq!(restored.uuid, uuid);
+        assert_eq!(restored.type_id, snapshot.type_id);
+        assert_eq!(restored.type_name, snapshot.type_name);
+        assert_eq!(restored.position, snapshot.position);
+        assert_eq!(restored.velocity, snapshot.velocity);
+        assert_eq!(restored.animal, snapshot.animal);
+        assert_eq!(restored.retained.spawn_tick, snapshot.retained.spawn_tick);
+        assert_eq!(
+            restored.retained.fall_distance,
+            snapshot.retained.fall_distance
+        );
+    }
+
+    #[test]
     fn entity_item_stack_persistence_preserves_modelled_components() {
         let items = items();
         let efficiency = Identifier::parse("minecraft:efficiency").unwrap();
@@ -4604,6 +4734,12 @@ mod tests {
         let metadata = WorldPersistedMetadata {
             world_time: 12345,
             daylight_cycle_enabled: false,
+            weather: super::session::WeatherState::new(
+                super::session::WeatherKind::Thunder,
+                0.75,
+                0.25,
+            )
+            .unwrap(),
             players_sleeping_percentage: 50,
             keep_inventory: true,
             world_identity: world_identity(tmp.path()),
@@ -4629,6 +4765,7 @@ mod tests {
 
         let loaded = load_world_metadata(tmp.path()).unwrap().unwrap();
 
+        assert_eq!(loaded.weather, super::session::WeatherState::CLEAR);
         assert_eq!(loaded.players_sleeping_percentage, 100);
         assert!(!loaded.keep_inventory);
         assert!(loaded.daylight_cycle_enabled);

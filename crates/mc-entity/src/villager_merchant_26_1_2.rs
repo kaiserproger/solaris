@@ -127,6 +127,18 @@ impl VillagerTradeOffer {
         self.uses >= self.max_uses
     }
 
+    #[must_use]
+    pub fn inputs_satisfy(&self, inputs: &[mc_data::ItemStack; 2], modified_cost_a: i32) -> bool {
+        inputs[0].item_id == self.cost_a.item_id
+            && inputs[0].count >= modified_cost_a
+            && match self.cost_b {
+                Some(cost_b) => {
+                    inputs[1].item_id == cost_b.item_id && inputs[1].count >= cost_b.count
+                }
+                None => inputs[1].is_empty(),
+            }
+    }
+
     fn record_use(&mut self) -> Result<(), VillagerMerchantError> {
         if self.is_out_of_stock() {
             return Err(VillagerMerchantError::OutOfStock);

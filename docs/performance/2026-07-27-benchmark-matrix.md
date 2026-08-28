@@ -119,6 +119,46 @@ The matrix exposed stale or semantically incorrect fixtures. The fixes preserve 
 - the bounded survival replay finishes each active client’s VD1 stream before introducing the paused reader;
 - `inhabited_time` and off-tick checkpoint I/O are reported as separate stages.
 
+## 2026-08-18 same-host Phase-3 refresh
+
+A fresh current-tree run on the same Ryzen 5 7535HS / 6C12T host class is recorded in [`../evidence/phase3-performance-baseline-2026-08-18.md`](../evidence/phase3-performance-baseline-2026-08-18.md). The worktree is intentionally dirty and based at `7d378936a8c81905102fad52bae9d37869cdd930`; results are therefore a current-worktree stabilization checkpoint, not a clean-commit release claim.
+
+Key refreshed results:
+
+| Workload | Fresh result | Frozen/current disposition |
+| --- | ---: | --- |
+| 200-action break/drop/pickup | tick p99 `5.305 ms`, max `9.267 ms`; session max hold `574 us`; player-persistence max hold `418 us` | PASS |
+| revision-10 worldgen, six physical CPUs | median `2,689.834 chunks/s` | PASS; floor `743.578 chunks/s` |
+| 20-client same-spawn VD8 release | first-chunk p99 `32 ms`; full-window p99 `1.805 s`; tick p99/max `1.136/1.826 ms`; RSS `406 MiB` | PASS focused; still not the 20-minute envelope |
+| multicore login/chunk/broadcast | `5.083 s`; session/world max hold `494/6 us` | PASS |
+| live autoscale startup slice | `2` scale-down, `0` scale-up decisions before drain | hysteresis investigation closed; no startup oscillation observed |
+| explosion authority, 4,096 background entities / 64 TNT | p50/p95/p99 `28.321/39.432/41.300 ms` | **PASS**, frozen p99 `<50 ms` |
+| mob combat/death cleanup, 4,096 entities | lethal p99 `16.300 ms`; cleanup p99 `30.523 ms` | PASS |
+| regional decision journal fsync | record/total p99 `5.985/6.003 ms` | PASS, explicit p99 `<=50 ms` gate |
+
+The explosion benchmark initially failed at `234.639 ms` p99 on this same current worktree. Stage profiling isolated repeated item-drop owner transactions and repeated O(targets × entities) passenger-validation scans; accepted fixes reduced the final p99 below the existing budget without changing the threshold. The evidence document records the profiling and rejected neutral experiments.
+
+### Fresh ranked hotspot closeout
+
+Every currently identified ordinary-play hotspot now has a named workload and threshold. The frozen profile contract supplies the 50 ms tick p99 ceiling, the balanced first-chunk target is 1,500 ms, authoritative lock max hold is 250 ms, and the revision-10 worldgen floor remains 743.578 chunks/s.
+
+| Rank | Workload | Threshold | Fresh result |
+| ---: | --- | --- | ---: |
+| 1 | explosion authority | p99 `<50 ms` | `41.300 ms` |
+| 2 | 4,096-entity death cleanup | p99 `<50 ms` | `30.523 ms` |
+| 3 | 1,500×1,500 regional battle | tick p99 `<=50 ms` | `25.706 ms` |
+| 4 | 2,048-entity four-lane owner | p99 `<=50 ms` | `12.195 ms` |
+| 5 | emissive full light recompute | invocation `<50 ms` | `11.073 ms` upper estimate |
+| 6 | regional decision journal | total p99 `<=50 ms` | `6.003 ms` |
+| 7 | break/drop/pickup | tick p99 `<=50 ms`; lock hold `<250 ms` | `5.305 ms`; max hold `<0.6 ms` |
+| 8 | 512-entity regional actor overhead | p99 `<=50 ms` | `3.004 ms` |
+| 9 | balanced VD8 chunk streaming | first p99 `<=1500 ms`; tick p99 `<=50 ms`; no reliable loss | `32 ms`; `1.136 ms`; zero loss |
+| 10 | dense ECS, 1,000 active | per-tick `<50 ms` | `0.498 ms` |
+| 11 | sparse ECS, 10,000 / 32 active | per-tick `<50 ms` | `0.018 ms` |
+| throughput | revision-10 worldgen, six physical CPUs | `>=743.578 chunks/s` | `2,689.834 chunks/s` |
+
+The entity battle, full-set regional owner, active-subset regional owner, mob combat, explosion authority, and regional fsync reports now carry explicit machine assertions for their 50 ms threshold where that threshold is the applicable frozen contract. Exact low/balanced/high duration/quota envelopes below remain separate profile-acceptance evidence and cannot be inferred from this hotspot ranking.
+
 ## Remaining matrix gaps
 
 - exact low profile under `2 vCPU / 4 GiB / 10 min`;

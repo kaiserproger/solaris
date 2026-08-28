@@ -1,18 +1,13 @@
+use mc_data::ItemStack;
 use mc_data::item_components::ItemFactsTable;
 use mc_data::items::ItemRegistry;
 use mc_protocol::codec::Identifier;
-use mc_protocol::packets::play::ItemStack;
 
 use super::InteractionState;
-use super::survival::max_tool_damage_for_path;
 
 static EMPTY_STACK: ItemStack = ItemStack::EMPTY;
 
-#[derive(Debug, Clone, Copy, PartialEq)]
-pub(crate) struct ArmorStats {
-    pub(crate) armor: f32,
-    pub(crate) toughness: f32,
-}
+pub(crate) type ArmorStats = mc_data::armor::ArmorStats;
 
 /// 46-slot player inventory (window 0).
 ///
@@ -306,41 +301,15 @@ impl PlayerInventory {
 }
 
 fn canonicalize_empty(stack: &mut ItemStack) {
-    if stack.is_empty() {
-        *stack = ItemStack::EMPTY;
-    }
+    mc_data::inventory_semantics_26_1_2::canonicalize_empty(stack);
 }
 
-fn canonical_stack(mut stack: ItemStack) -> ItemStack {
-    canonicalize_empty(&mut stack);
-    stack
+fn canonical_stack(stack: ItemStack) -> ItemStack {
+    mc_data::inventory_semantics_26_1_2::canonical_stack(stack)
 }
 
 pub(crate) fn can_stack(left: &ItemStack, right: &ItemStack) -> bool {
-    !left.is_empty()
-        && !right.is_empty()
-        && left.item_id == right.item_id
-        && left.damage == right.damage
-        && left.custom_name == right.custom_name
-        && left.item_model == right.item_model
-        && enchantments_equal_in_canonical_order(&left.enchantments, &right.enchantments)
-}
-
-fn enchantments_equal_in_canonical_order(
-    left: &[mc_data::ItemEnchantment],
-    right: &[mc_data::ItemEnchantment],
-) -> bool {
-    if left == right {
-        return true;
-    }
-    if left.len() != right.len() {
-        return false;
-    }
-    let mut left = left.iter().collect::<Vec<_>>();
-    let mut right = right.iter().collect::<Vec<_>>();
-    left.sort_unstable();
-    right.sort_unstable();
-    left == right
+    mc_data::inventory_semantics_26_1_2::can_stack(left, right)
 }
 
 pub(crate) fn item_max_stack(
@@ -348,68 +317,17 @@ pub(crate) fn item_max_stack(
     items: &ItemRegistry,
     stack: &ItemStack,
 ) -> i32 {
-    if stack.is_empty() || stack.damage.is_some() {
-        return 1;
-    }
-    let Some(name) = items.name_of(stack.item_id) else {
-        return 64;
-    };
-    if let Some(max_stack) = item_facts
-        .get(name)
-        .and_then(|facts| facts.max_stack_size)
-        .and_then(|value| i32::try_from(value).ok())
-    {
-        return max_stack.max(1);
-    }
-    let path = name.path();
-    if max_tool_damage_for_path(path).is_some()
-        || matches!(
-            path,
-            "shield"
-                | "bow"
-                | "crossbow"
-                | "trident"
-                | "fishing_rod"
-                | "shears"
-                | "flint_and_steel"
-                | "water_bucket"
-                | "lava_bucket"
-        )
-        || path.ends_with("_helmet")
-        || path.ends_with("_chestplate")
-        || path.ends_with("_leggings")
-        || path.ends_with("_boots")
-    {
-        1
-    } else if path == "bucket" {
-        16
-    } else {
-        64
-    }
+    mc_data::item_semantics_26_1_2::max_stack_for_stack(item_facts, items, stack)
 }
 
+#[cfg(test)]
 pub(crate) fn take_from_slot(slot: &mut ItemStack, count: i32) -> ItemStack {
-    canonicalize_empty(slot);
-    if slot.is_empty() || count <= 0 {
-        return ItemStack::EMPTY;
-    }
-    let moved = slot.count.min(count);
-    let mut out = slot.clone();
-    out.count = moved;
-    slot.count = slot.count.checked_sub(moved).unwrap_or_default();
-    if slot.count <= 0 {
-        *slot = ItemStack::EMPTY;
-    }
-    out
+    mc_data::inventory_semantics_26_1_2::take_from_stack(slot, count)
 }
 
+#[cfg(test)]
 pub(crate) fn decrement_cursor(cursor: &mut ItemStack) {
-    canonicalize_empty(cursor);
-    if cursor.count <= 1 {
-        *cursor = ItemStack::EMPTY;
-        return;
-    }
-    cursor.count = cursor.count.checked_sub(1).unwrap_or_default();
+    mc_data::inventory_semantics_26_1_2::decrement_stack(cursor);
 }
 
 pub(crate) fn hotbar_swap_slot(button: i8) -> Option<usize> {
@@ -422,13 +340,9 @@ pub(crate) fn player_swap_slot(button: i8) -> Option<usize> {
     hotbar_swap_slot(button).or_else(|| (button == 40).then_some(PlayerInventory::OFFHAND_SLOT))
 }
 
+#[cfg(test)]
 pub(crate) fn take_throw_stack(slot: &mut ItemStack, button: i8) -> Option<ItemStack> {
-    canonicalize_empty(slot);
-    match button {
-        0 => (!slot.is_empty()).then(|| take_from_slot(slot, 1)),
-        1 => (!slot.is_empty()).then(|| std::mem::take(slot)),
-        _ => None,
-    }
+    mc_data::inventory_semantics_26_1_2::take_throw_stack(slot, button)
 }
 
 pub(crate) fn pickup_click_max_stack(
@@ -447,84 +361,18 @@ pub(crate) fn pickup_click_max_stack(
 
 pub(crate) fn apply_regular_pickup_slot(
     carried_item: &mut ItemStack,
-    mut slot_stack: ItemStack,
+    slot_stack: ItemStack,
     button: i8,
     max_stack: i32,
     can_place_carried: bool,
 ) -> Option<ItemStack> {
-    canonicalize_empty(carried_item);
-    canonicalize_empty(&mut slot_stack);
-    if !(button == 0 || button == 1) {
-        return None;
-    }
-    if max_stack <= 0 {
-        return None;
-    }
-
-    let cursor = carried_item.clone();
-    if button == 0 {
-        if cursor.is_empty() {
-            if slot_stack.is_empty() {
-                return None;
-            }
-            *carried_item = slot_stack;
-            return Some(ItemStack::EMPTY);
-        }
-        if !can_place_carried {
-            return None;
-        }
-        if slot_stack.is_empty() {
-            *carried_item = ItemStack::EMPTY;
-            return Some(cursor);
-        }
-        if can_stack(&slot_stack, &cursor) && slot_stack.count < max_stack {
-            let moved = max_stack.checked_sub(slot_stack.count)?.min(cursor.count);
-            if moved <= 0 {
-                return None;
-            }
-            let mut new_slot = slot_stack;
-            new_slot.count = new_slot.count.checked_add(moved)?;
-            carried_item.count = carried_item.count.checked_sub(moved)?;
-            if carried_item.count <= 0 {
-                *carried_item = ItemStack::EMPTY;
-            }
-            return Some(new_slot);
-        }
-        *carried_item = slot_stack;
-        return Some(cursor);
-    }
-
-    if cursor.is_empty() {
-        if slot_stack.is_empty() {
-            return None;
-        }
-        let moved = slot_stack.count / 2 + (slot_stack.count & 1);
-        let mut new_cursor = slot_stack.clone();
-        new_cursor.count = moved;
-        let mut remaining = slot_stack;
-        remaining.count = remaining.count.checked_sub(moved)?;
-        if remaining.count <= 0 {
-            remaining = ItemStack::EMPTY;
-        }
-        *carried_item = new_cursor;
-        return Some(remaining);
-    }
-    if !can_place_carried {
-        return None;
-    }
-    if slot_stack.is_empty() {
-        let mut one = cursor;
-        one.count = 1;
-        decrement_cursor(carried_item);
-        return Some(one);
-    }
-    if can_stack(&slot_stack, &cursor) && slot_stack.count < max_stack {
-        let mut new_slot = slot_stack;
-        new_slot.count = new_slot.count.checked_add(1)?;
-        decrement_cursor(carried_item);
-        return Some(new_slot);
-    }
-    None
+    mc_data::inventory_semantics_26_1_2::apply_regular_pickup_slot(
+        carried_item,
+        slot_stack,
+        button,
+        max_stack,
+        can_place_carried,
+    )
 }
 
 pub(crate) fn apply_regular_swap_slot(
@@ -533,36 +381,26 @@ pub(crate) fn apply_regular_swap_slot(
     can_place_swap: bool,
     can_place_clicked: bool,
 ) -> Option<(ItemStack, ItemStack)> {
-    (can_place_swap && can_place_clicked).then_some((swap, clicked))
+    mc_data::inventory_semantics_26_1_2::apply_regular_swap_slot(
+        clicked,
+        swap,
+        can_place_swap,
+        can_place_clicked,
+    )
 }
 
 pub(crate) fn apply_regular_throw_slot(
     slot_stack: ItemStack,
     button: i8,
 ) -> Option<(ItemStack, ItemStack)> {
-    let mut stack = slot_stack;
-    let dropped = take_throw_stack(&mut stack, button)?;
-    Some((stack, dropped))
+    mc_data::inventory_semantics_26_1_2::apply_regular_throw_slot(slot_stack, button)
 }
 
 pub(crate) fn apply_outside_pickup_click(
     carried_item: &mut ItemStack,
     button: i8,
 ) -> Option<ItemStack> {
-    canonicalize_empty(carried_item);
-    if carried_item.is_empty() {
-        return None;
-    }
-    match button {
-        0 => Some(std::mem::take(carried_item)),
-        1 => {
-            let mut dropped = carried_item.clone();
-            dropped.count = 1;
-            decrement_cursor(carried_item);
-            Some(dropped)
-        }
-        _ => None,
-    }
+    mc_data::inventory_semantics_26_1_2::apply_outside_pickup_click(carried_item, button)
 }
 
 pub(crate) fn can_place_in_player_slot(
@@ -585,17 +423,7 @@ pub(crate) fn equippable_slot_for_item(
     items: &ItemRegistry,
     item_id: u32,
 ) -> Option<usize> {
-    match item_facts
-        .get(items.name_of(item_id)?)?
-        .equippable_slot
-        .as_deref()?
-    {
-        "head" => Some(5),
-        "chest" => Some(6),
-        "legs" => Some(7),
-        "feet" => Some(8),
-        _ => None,
-    }
+    mc_data::item_semantics_26_1_2::equippable_player_slot(item_facts, items, item_id)
 }
 
 pub(crate) fn armor_entry_for_item(
@@ -640,18 +468,11 @@ fn equipped_protection_points(items: &ItemRegistry, inventory: &PlayerInventory)
 }
 
 pub(crate) fn armor_reduced_damage(amount: f32, stats: ArmorStats) -> f32 {
-    let damage = amount.max(0.0);
-    let toughness = 2.0 + stats.toughness / 4.0;
-    let real_armor = (stats.armor - damage / toughness)
-        .clamp(stats.armor * 0.2, 20.0)
-        .max(0.0);
-    damage * (1.0 - real_armor / 25.0)
+    mc_data::armor::armor_reduced_damage(amount, stats)
 }
 
 pub(crate) fn protection_reduced_damage(amount: f32, protection_points: i32) -> f32 {
-    let damage = amount.max(0.0);
-    let points = protection_points.clamp(0, 20) as f32;
-    damage * (1.0 - points / 25.0)
+    mc_data::armor::protection_reduced_damage(amount, protection_points)
 }
 
 pub(crate) fn survival_damage_after_armor(state: Option<&InteractionState>, amount: f32) -> f32 {

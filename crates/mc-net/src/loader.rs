@@ -1,10 +1,10 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::io::{Cursor, Read};
 use std::path::{Path, PathBuf};
-use std::sync::OnceLock;
+use std::sync::{Arc, OnceLock};
 
 use bytes::BufMut;
-use mc_data::Identifier;
+use mc_data::{Identifier, ItemStack};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
@@ -64,6 +64,9 @@ pub struct LoaderBundle {
     /// Canonical server-local source; never crosses the wire.
     #[serde(skip)]
     pub source_path: Option<PathBuf>,
+    /// Immutable artifact bytes verified at startup; never crosses the wire as manifest data.
+    #[serde(skip)]
+    pub artifact_bytes: Option<Arc<[u8]>>,
     /// Owner block identity read from the verified artifact; never crosses the wire.
     #[serde(skip)]
     pub block_id: Option<String>,
@@ -142,6 +145,7 @@ impl LoaderManifest {
                         .collect(),
                     cache_key: bundle.cache_key(),
                     source_path: Some(bundle.artifact_path().to_path_buf()),
+                    artifact_bytes: Some(bundle.artifact_bytes_arc()),
                     block_id: block.as_ref().map(|block| block.id.clone()),
                     block_name: block.map(|block| block.name),
                 })
@@ -357,7 +361,7 @@ impl LoaderManifest {
         block_id: &str,
         count: u8,
         items: &mc_data::items::ItemRegistry,
-    ) -> Option<mc_protocol::packets::play::ItemStack> {
+    ) -> Option<ItemStack> {
         let bundle = self.bundles.iter().find(|bundle| {
             bundle.owner == plugin_id
                 && bundle.block_id.as_deref() == Some(block_id)
@@ -370,7 +374,7 @@ impl LoaderManifest {
         let paper = Identifier::parse("minecraft:paper").ok()?;
         let paper_id = items.id_of(&paper)?;
         Some(
-            mc_protocol::packets::play::ItemStack::new(paper_id, i32::from(count))
+            ItemStack::new(paper_id, i32::from(count))
                 .with_custom_name(name)
                 .with_item_model(loader_block_item_model(carrier_index)),
         )
@@ -388,7 +392,7 @@ impl LoaderManifest {
     pub fn requested_artifact(
         &self,
         request: &LoaderArtifactRequest,
-    ) -> Result<(&LoaderBundle, &Path), LoaderHandshakeError> {
+    ) -> Result<(&LoaderBundle, &[u8]), LoaderHandshakeError> {
         if request.protocol != self.protocol {
             return Err(LoaderHandshakeError::Protocol {
                 expected: self.protocol,
@@ -402,12 +406,12 @@ impl LoaderManifest {
             .ok_or_else(|| LoaderHandshakeError::UnknownBundleRequest {
                 cache_key: request.cache_key.clone(),
             })?;
-        let path = bundle.source_path.as_deref().ok_or_else(|| {
+        let bytes = bundle.artifact_bytes.as_deref().ok_or_else(|| {
             LoaderHandshakeError::ArtifactUnavailable {
                 cache_key: request.cache_key.clone(),
             }
         })?;
-        Ok((bundle, path))
+        Ok((bundle, bytes))
     }
 }
 
@@ -475,12 +479,12 @@ impl LoaderBlockProjection {
         items: &mc_data::items::ItemRegistry,
         state: mc_world::BlockStateId,
         count: i32,
-    ) -> Option<mc_protocol::packets::play::ItemStack> {
+    ) -> Option<ItemStack> {
         let world_state = self.world_states.get(&state)?;
         let paper = Identifier::parse("minecraft:paper").expect("static paper item id");
         let paper_id = items.id_of(&paper)?;
         Some(
-            mc_protocol::packets::play::ItemStack::new(paper_id, count)
+            ItemStack::new(paper_id, count)
                 .with_custom_name(&world_state.item_name)
                 .with_item_model(world_state.item_model.clone()),
         )
@@ -632,7 +636,8 @@ fn read_declared_block(
     {
         return Ok(None);
     }
-    read_block_from_artifact(
+    read_block_from_artifact_bytes(
+        bundle.artifact_bytes(),
         bundle.artifact_path(),
         bundle.owner_plugin_id(),
         bundle.size_bytes(),
@@ -641,17 +646,15 @@ fn read_declared_block(
     .map(Some)
 }
 
-fn read_block_from_artifact(
+fn read_block_from_artifact_bytes(
+    bytes: &[u8],
     artifact_path: &Path,
     owner: &str,
     expected_size: u64,
     expected_sha256: &str,
 ) -> Result<VerifiedLoaderBlock, LoaderHandshakeError> {
-    let bytes = std::fs::read(artifact_path).map_err(|error| {
-        LoaderHandshakeError::ArtifactIndex(format!("reading {}: {error}", artifact_path.display()))
-    })?;
     if bytes.len() as u64 != expected_size
-        || format!("{:x}", Sha256::digest(&bytes)) != expected_sha256
+        || format!("{:x}", Sha256::digest(bytes)) != expected_sha256
     {
         return Err(LoaderHandshakeError::ArtifactIndex(format!(
             "{} changed after plugin artifact verification",
@@ -990,6 +993,7 @@ mod tests {
                 ],
                 cache_key: format!("example:rich-content/1/{}", "a".repeat(64)),
                 source_path: None,
+                artifact_bytes: None,
                 block_id: None,
                 block_name: None,
             }],
@@ -1104,7 +1108,7 @@ mod tests {
         assert_eq!(
             manifest.world_block_item("example", "example:ruby_block", 3, &items),
             Some(
-                mc_protocol::packets::play::ItemStack::new(777, 3)
+                ItemStack::new(777, 3)
                     .with_custom_name("Ruby Block")
                     .with_item_model(Identifier::parse("solaris_loader:loader_block").unwrap())
             )
@@ -1244,17 +1248,17 @@ mod tests {
         let sha256 = format!("{:x}", Sha256::digest(&bytes));
 
         assert_eq!(
-            read_block_from_artifact(&path, "example", size, &sha256)
+            read_block_from_artifact_bytes(&bytes, &path, "example", size, &sha256)
                 .unwrap()
                 .id,
             "example:ruby_block"
         );
         assert!(matches!(
-            read_block_from_artifact(&path, "other", size, &sha256),
+            read_block_from_artifact_bytes(&bytes, &path, "other", size, &sha256),
             Err(LoaderHandshakeError::ArtifactIndex(_))
         ));
         assert!(matches!(
-            read_block_from_artifact(&path, "example", size, &"0".repeat(64)),
+            read_block_from_artifact_bytes(&bytes, &path, "example", size, &"0".repeat(64)),
             Err(LoaderHandshakeError::ArtifactIndex(_))
         ));
     }
@@ -1263,15 +1267,16 @@ mod tests {
     fn exact_request_resolves_only_the_manifest_artifact() {
         let mut manifest = manifest();
         manifest.bundles[0].source_path = Some(PathBuf::from("/plugin/client/rich.zip"));
+        manifest.bundles[0].artifact_bytes = Some(Arc::from(&b"verified artifact"[..]));
         let request = LoaderArtifactRequest {
             protocol: LOADER_PROTOCOL_VERSION,
             cache_key: manifest.bundles[0].cache_key.clone(),
         };
 
-        let (bundle, path) = manifest.requested_artifact(&request).unwrap();
+        let (bundle, bytes) = manifest.requested_artifact(&request).unwrap();
 
         assert_eq!(bundle.id, "rich-content");
-        assert_eq!(path, Path::new("/plugin/client/rich.zip"));
+        assert_eq!(bytes, b"verified artifact");
         let unknown = LoaderArtifactRequest {
             cache_key: format!("{}-other", request.cache_key),
             ..request

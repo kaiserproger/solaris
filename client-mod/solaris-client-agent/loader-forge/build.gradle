@@ -63,6 +63,8 @@ minecraft {
             environment 'MOD_CLASSES', '{source_roots}'
             environment 'SOLARIS_CLIENT_MCP_TOKEN', clientMcpToken.get()
             environment 'SOLARIS_CLIENT_MCP_PORT', clientMcpPort.get()
+            systemProperty 'solaris.loader.cacheDir',
+                file(clientMcpGameDir.get()).toPath().resolve('solaris-loader-cache').toFile().absolutePath
             systemProperty 'forge.enableGameTest', 'true'
             mods {
                 solaris_loader {
