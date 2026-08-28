@@ -77,13 +77,24 @@ jobs:
         run: tools/build-loader-live-gate-fixture.sh --check
       - name: Test shared and platform Loader modules
         working-directory: client-mod/solaris-client-agent
-        run: >-
-          ./gradlew
-          :loader-core:test
-          :loader-fabric:test
-          :loader-neoforge:test
-          :loader-forge:test
-          --no-daemon
+        run: |
+          set -u -o pipefail
+          status=1
+          for attempt in 1 2 3; do
+            if ./gradlew \
+              :loader-core:test \
+              :loader-fabric:test \
+              :loader-neoforge:test \
+              :loader-forge:test \
+              --no-daemon; then
+              status=0
+              break
+            fi
+            if [[ "$attempt" != "3" ]]; then
+              echo "::warning::Loader Gradle attempt ${attempt} failed; retrying dependency resolution"
+            fi
+          done
+          exit "$status"
 
   release-tools:
     name: Release tools
