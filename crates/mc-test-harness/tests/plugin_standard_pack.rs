@@ -837,16 +837,18 @@ async fn satisfy_startup_reads(boundary: &ScriptBoundary, seeded_towns: Option<(
             "{plugin_id} must read durable key {expected_key} on server start, saw {:?}",
             admitted.request()
         );
-        let result = if plugin_id == "solaris-towns" && seeded_towns.is_some() {
-            let (value, version) =
-                seeded_towns.expect("seeded towns startup record was just checked to be present");
-            admitted
-                .plugin_storage_get_result(Some(value), Some(version))
-                .expect("seeded towns startup storage result")
+        let seeded = if plugin_id == "solaris-towns" {
+            seeded_towns
         } else {
-            admitted
+            None
+        };
+        let result = match seeded {
+            Some((value, version)) => admitted
+                .plugin_storage_get_result(Some(value), Some(version))
+                .expect("seeded towns startup storage result"),
+            None => admitted
                 .plugin_storage_get_result(None, None)
-                .expect("empty startup storage result")
+                .expect("empty startup storage result"),
         };
         boundary
             .try_enqueue_event(result)

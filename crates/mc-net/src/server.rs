@@ -3469,16 +3469,16 @@ async fn step_entity_physics_inputs(
     }
 
     #[cfg(feature = "load-bench")]
-    log_entity_physics_batch_profile(
+    log_entity_physics_batch_profile(&EntityPhysicsBatchProfile {
         input_count,
         workers,
         batch_size,
-        elapsed_us(started),
+        total_us: elapsed_us(started),
         admission_wait_total_us,
         admission_wait_max_us,
-        &worker_us,
-        &kind_counts,
-    );
+        worker_us: &worker_us,
+        kind_counts: &kind_counts,
+    });
     steps
 }
 
@@ -3550,16 +3550,29 @@ fn entity_physics_batch_us_summary(samples_us: &[u64]) -> (u64, u64, u64) {
 }
 
 #[cfg(feature = "load-bench")]
-fn log_entity_physics_batch_profile(
+struct EntityPhysicsBatchProfile<'a> {
     input_count: usize,
     workers: usize,
     batch_size: usize,
     total_us: u64,
     admission_wait_total_us: u64,
     admission_wait_max_us: u64,
-    worker_us: &std::sync::Mutex<Vec<u64>>,
-    kind_counts: &[usize; 7],
-) {
+    worker_us: &'a std::sync::Mutex<Vec<u64>>,
+    kind_counts: &'a [usize; 7],
+}
+
+#[cfg(feature = "load-bench")]
+fn log_entity_physics_batch_profile(profile: &EntityPhysicsBatchProfile<'_>) {
+    let EntityPhysicsBatchProfile {
+        input_count,
+        workers,
+        batch_size,
+        total_us,
+        admission_wait_total_us,
+        admission_wait_max_us,
+        worker_us,
+        kind_counts,
+    } = profile;
     let samples_us = worker_us
         .lock()
         .map(|samples| samples.clone())

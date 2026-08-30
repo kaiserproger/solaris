@@ -881,10 +881,11 @@ impl Drop for PhysicsApplyProfile {
         if self.input_steps <= 256 {
             return;
         }
-        let movement_plan_us = self
-            .movement_plan_started
-            .then(|| Self::elapsed_us(self.phase_started))
-            .unwrap_or(0);
+        let movement_plan_us = if self.movement_plan_started {
+            Self::elapsed_us(self.phase_started)
+        } else {
+            0
+        };
         let total_us = Self::elapsed_us(self.total_started);
         eprintln!(
             "PHYSICS_APPLY_PROFILE tick={} total_us={total_us} preflight_us={} owner_apply_us={} publication_refresh_us={} locked_publish_us={} movement_plan_us={} input_steps={} filtered={} effective={} applied_kinematics={} applied_steps={} tracker_inputs={} movements={} chunk_crossings={} publication_retries={}",
