@@ -13,6 +13,22 @@ pub const COLLISION_UNITS_PER_BLOCK: i16 = 4096;
 const HEADER_LEN: usize = 32;
 const MISSING_SHAPE: u16 = u16::MAX;
 static VANILLA_COLLISION_SHAPES: OnceLock<CollisionShapeTable> = OnceLock::new();
+static VANILLA_COLLISION_CLASSES: OnceLock<Box<[CollisionClass]>> = OnceLock::new();
+
+/// Coarse collision classification for a single block state, derived from the
+/// exact [`CollisionShapeTable`] data without any block-name heuristics.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[repr(u8)]
+pub enum CollisionClass {
+    /// The state id is outside the table or has no recorded shape.
+    Missing,
+    /// The recorded shape contains no collision boxes.
+    Empty,
+    /// The recorded shape is exactly one full-block cube.
+    FullCube,
+    /// Any other recorded shape.
+    Complex,
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct CollisionBox {
@@ -266,6 +282,31 @@ impl CollisionShapeTable {
 #[must_use]
 pub fn vanilla_collision_shapes() -> &'static CollisionShapeTable {
     VANILLA_COLLISION_SHAPES.get_or_init(|| CollisionShapeTable::from_binary(RAW_COLLISION_SHAPES))
+}
+
+/// Returns the [`CollisionClass`] for a block state id in O(1) after one-time
+/// lazy initialization of a dense per-state class table.
+#[must_use]
+pub fn vanilla_collision_class(state_id: u32) -> CollisionClass {
+    let classes = VANILLA_COLLISION_CLASSES.get_or_init(|| {
+        let table = vanilla_collision_shapes();
+        (0..table.covered_state_count() as u32)
+            .map(|state| classify_collision_shape(table.get(state)))
+            .collect()
+    });
+    classes
+        .get(state_id as usize)
+        .copied()
+        .unwrap_or(CollisionClass::Missing)
+}
+
+fn classify_collision_shape(shape: Option<CollisionShape<'_>>) -> CollisionClass {
+    match shape {
+        None => CollisionClass::Missing,
+        Some(shape) if shape.is_empty() => CollisionClass::Empty,
+        Some(shape) if shape.is_full_cube() => CollisionClass::FullCube,
+        Some(_) => CollisionClass::Complex,
+    }
 }
 
 fn state_fingerprint(block: &Identifier, properties: &[(String, String)]) -> u64 {

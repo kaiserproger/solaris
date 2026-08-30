@@ -526,6 +526,12 @@ async fn drive_to_play(
 
     // Configuration: enabled features, KnownPacks round trip, registries, ack.
     let mut frame = read_one_frame(stream, buf, compression).await;
+    assert_eq!(
+        frame.id,
+        mc_protocol::packets::configuration::ClientboundCustomPayload::ID
+    );
+    mc_protocol::packets::configuration::ClientboundCustomPayload::decode(&mut frame.body).unwrap();
+    let mut frame = read_one_frame(stream, buf, compression).await;
     assert_eq!(frame.id, UpdateEnabledFeatures::ID);
     let _ = UpdateEnabledFeatures::decode(&mut frame.body).unwrap();
     let mut frame = read_one_frame(stream, buf, compression).await;

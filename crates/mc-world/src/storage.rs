@@ -1165,10 +1165,11 @@ impl WorldStorage {
             let Some(evict) = self.lru.pop_front() else {
                 return false;
             };
-            if self
-                .resident
-                .snapshot(evict)
-                .is_some_and(|chunk| chunk.dirty)
+            if self.read_view.chunk_is_retained(evict)
+                || self
+                    .resident
+                    .snapshot(evict)
+                    .is_some_and(|chunk| chunk.dirty)
             {
                 self.lru.push_back(evict);
                 continue;
@@ -2238,6 +2239,34 @@ mod tests {
 
         assert_eq!(world.mutation_view().schedule_fluid_ticks(&[tick]), 0);
         assert_eq!(notifications.load(Ordering::SeqCst), 0);
+    }
+
+    #[test]
+    fn retained_read_chunk_is_not_evicted_until_last_release() {
+        let registry = Arc::new(BlockRegistry::from_report(&[]).expect("empty registry builds"));
+        let mut world = WorldStorage::in_memory_with_capacity(registry, 1);
+        let position = ChunkPos { x: 0, z: 0 };
+        let biome = mc_data::Identifier::parse("minecraft:plains").unwrap();
+        world
+            .insert_generated_chunk(position, Chunk::empty(position, BlockStateId(0), biome))
+            .unwrap();
+        world.get_chunk_mut(position).unwrap().unwrap().dirty = false;
+        let read_view = world.read_view();
+        read_view.retain_chunk(position);
+        read_view.retain_chunk(position);
+        assert_eq!(read_view.retained_chunk_count(position), 2);
+
+        assert!(!world.evict_clean_chunk());
+        assert!(world.cached_chunk_snapshot(position).is_some());
+        assert!(read_view.release_chunk(position));
+        assert_eq!(read_view.retained_chunk_count(position), 1);
+        assert!(!world.evict_clean_chunk());
+
+        assert!(read_view.release_chunk(position));
+        assert_eq!(read_view.retained_chunk_count(position), 0);
+        assert!(world.evict_clean_chunk());
+        assert!(world.cached_chunk_snapshot(position).is_none());
+        assert!(!read_view.release_chunk(position));
     }
 
     #[test]

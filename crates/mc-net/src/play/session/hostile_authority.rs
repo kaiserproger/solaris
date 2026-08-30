@@ -1323,6 +1323,76 @@ pub(super) struct HostileScanProbe {
     pub(super) resume: std::sync::mpsc::Receiver<()>,
 }
 
+/// Load-bench-only phase accounting for `tick_hostile_attacks`. Accumulates
+/// per-phase microseconds over a bounded tick window and emits one concise
+/// `HOSTILE_ATTACK_PHASE` line per window; everything here compiles out of
+/// builds without the `load-bench` feature.
+#[cfg(feature = "load-bench")]
+#[derive(Debug, Default)]
+pub(crate) struct HostileAttackPhaseMetrics {
+    window_ticks: std::sync::atomic::AtomicU64,
+    loaded_total: std::sync::atomic::AtomicU64,
+    projected_total: std::sync::atomic::AtomicU64,
+    due_total: std::sync::atomic::AtomicU64,
+    fang_prepass_us: std::sync::atomic::AtomicU64,
+    projection_fetch_us: std::sync::atomic::AtomicU64,
+    classify_period_us: std::sync::atomic::AtomicU64,
+    target_snapshot_us: std::sync::atomic::AtomicU64,
+    attack_planning_us: std::sync::atomic::AtomicU64,
+    entity_commit_us: std::sync::atomic::AtomicU64,
+    spawn_publish_us: std::sync::atomic::AtomicU64,
+    validation_dispatch_us: std::sync::atomic::AtomicU64,
+}
+
+#[cfg(feature = "load-bench")]
+impl HostileAttackPhaseMetrics {
+    const EMIT_WINDOW_TICKS: u64 = 100;
+
+    fn note_loaded(&self, loaded: usize, projected: usize) {
+        self.loaded_total
+            .fetch_add(loaded as u64, Ordering::Relaxed);
+        self.projected_total
+            .fetch_add(projected as u64, Ordering::Relaxed);
+    }
+
+    fn note_due(&self, due: usize) {
+        self.due_total.fetch_add(due as u64, Ordering::Relaxed);
+    }
+
+    fn add(&self, counter: &std::sync::atomic::AtomicU64, elapsed: std::time::Duration) {
+        counter.fetch_add(
+            u64::try_from(elapsed.as_micros()).unwrap_or(u64::MAX),
+            Ordering::Relaxed,
+        );
+    }
+
+    fn maybe_emit(&self, tick: u64) {
+        if self.window_ticks.fetch_add(1, Ordering::Relaxed) + 1 < Self::EMIT_WINDOW_TICKS {
+            return;
+        }
+        let ticks = self.window_ticks.swap(0, Ordering::Relaxed).max(1);
+        let loaded_mean = self.loaded_total.swap(0, Ordering::Relaxed) / ticks;
+        if loaded_mean == 0 {
+            return;
+        }
+        let mean =
+            |counter: &std::sync::atomic::AtomicU64| counter.swap(0, Ordering::Relaxed) / ticks;
+        let projected_mean = mean(&self.projected_total);
+        let due_mean = mean(&self.due_total);
+        let fang_prepass_us = mean(&self.fang_prepass_us);
+        let projection_fetch_us = mean(&self.projection_fetch_us);
+        let classify_period_us = mean(&self.classify_period_us);
+        let target_snapshot_us = mean(&self.target_snapshot_us);
+        let attack_planning_us = mean(&self.attack_planning_us);
+        let entity_commit_us = mean(&self.entity_commit_us);
+        let spawn_publish_us = mean(&self.spawn_publish_us);
+        let validation_dispatch_us = mean(&self.validation_dispatch_us);
+        eprintln!(
+            "HOSTILE_ATTACK_PHASE tick={tick} window_ticks={ticks} loaded={loaded_mean} projected={projected_mean} due={due_mean} fang_us={fang_prepass_us} projection_fetch_us={projection_fetch_us} classify_us={classify_period_us} targets_us={target_snapshot_us} planning_us={attack_planning_us} commit_us={entity_commit_us} spawn_publish_us={spawn_publish_us} validate_dispatch_us={validation_dispatch_us}"
+        );
+    }
+}
+
 #[cfg(test)]
 #[derive(Debug)]
 pub(super) struct HostileCommitProbe {
@@ -1429,10 +1499,27 @@ impl SessionRegistry {
     }
 
     fn tick_evoker_fangs(&self) -> Vec<VisibilityDispatch> {
+        if self.evoker_fang_count.load(Ordering::Acquire) == 0 {
+            return Vec::new();
+        }
         let active_ids = self.active_simulation_entities.load_full();
         if active_ids.is_empty() {
             return Vec::new();
         }
+        let mut ids = {
+            let inner = self.lock_inner("scan active evoker fangs");
+            inner
+                .evoker_fang_entities
+                .iter()
+                .copied()
+                .filter(|id| active_ids.contains(id))
+                .collect::<Vec<_>>()
+        };
+        if ids.is_empty() {
+            return Vec::new();
+        }
+        ids.sort_unstable();
+        let fang_ids = ids.iter().copied().collect::<HashSet<_>>();
         let targets = self
             .movement_recipients
             .load_full()
@@ -1448,26 +1535,6 @@ impl SessionRegistry {
                 })
             })
             .collect::<Vec<_>>();
-        let mut ids = {
-            let entities = self.lock_entities("scan active evoker fangs");
-            entities.prefetch(&active_ids);
-            active_ids
-                .iter()
-                .copied()
-                .filter(|&id| {
-                    entities.snapshot(id).is_some_and(|snapshot| {
-                        snapshot.type_name == "minecraft:evoker_fangs"
-                            && snapshot.lifecycle == EntityLifecycle::Alive
-                            && snapshot.retained.evoker_fangs.is_some()
-                    })
-                })
-                .collect::<Vec<_>>()
-        };
-        if ids.is_empty() {
-            return Vec::new();
-        }
-        ids.sort_unstable();
-        let fang_ids = ids.iter().copied().collect::<HashSet<_>>();
         let fang_aabb = entity_aabb("minecraft:evoker_fangs");
         let horizontal_reach = fang_aabb.half_width + 0.2 + 0.3;
         let mut inner = self.lock_session_entities("tick evoker fangs");
@@ -1551,125 +1618,146 @@ impl SessionRegistry {
         tick: u64,
         air: BlockStateId,
     ) -> (usize, Vec<VisibilityDispatch>) {
+        #[cfg(feature = "load-bench")]
+        let metrics = &self.hostile_attack_phase_metrics;
+        #[cfg(feature = "load-bench")]
+        let fang_prepass_started = std::time::Instant::now();
         let fang_dispatches = self.tick_evoker_fangs();
+        #[cfg(feature = "load-bench")]
+        metrics.add(&metrics.fang_prepass_us, fang_prepass_started.elapsed());
         let loaded_entity_ids = self.active_hostile_entities.load_full();
         if loaded_entity_ids.is_empty() {
             return (0, fang_dispatches);
         }
+        #[cfg(feature = "load-bench")]
+        let projection_fetch_started = std::time::Instant::now();
         let mob_behaviors = self.mob_behavior_table();
-        let mut hostiles = Vec::new();
+        #[cfg(test)]
+        self.pause_during_hostile_scan_for_test();
+        let projections = self
+            .lock_entities("project hostile attack candidates")
+            .simulation_projections_for_ids(&loaded_entity_ids);
+        #[cfg(feature = "load-bench")]
         {
-            let entities = self.lock_entities("scan hostile attack candidates");
+            metrics.add(
+                &metrics.projection_fetch_us,
+                projection_fetch_started.elapsed(),
+            );
+            metrics.note_loaded(loaded_entity_ids.len(), projections.len());
+        }
+        #[cfg(feature = "load-bench")]
+        let classify_started = std::time::Instant::now();
+        let mut hostiles = Vec::with_capacity(projections.len());
+        for entity in projections {
             #[cfg(test)]
-            self.pause_during_hostile_scan_for_test();
-            entities.visit_simulation_entities_for_ids(&loaded_entity_ids, |entity| {
-                #[cfg(test)]
-                self.hostile_entity_scan_visits
-                    .fetch_add(1, Ordering::Relaxed);
-                if entity.lifecycle != EntityLifecycle::Alive {
-                    return;
-                }
-                let Some(profile) = mob_behaviors.get_by_name(entity.type_name) else {
-                    return;
-                };
-                let kind = match profile.combat {
-                    MobCombatPolicy::CreeperFuse => HostileAttackKind::Creeper,
-                    MobCombatPolicy::Arrow => HostileAttackKind::Skeleton,
-                    MobCombatPolicy::Crossbow => HostileAttackKind::Crossbow,
-                    MobCombatPolicy::GuardianBeam => HostileAttackKind::GuardianBeam {
-                        elder: entity.type_name == "minecraft:elder_guardian",
-                        follow_range: entity
-                            .attributes
-                            .base(&AttributeKind::FollowRange)
-                            .unwrap_or(16.0)
-                            .clamp(1.0, 2_048.0),
-                        attack_damage: entity
-                            .attributes
-                            .base(&AttributeKind::AttackDamage)
-                            .filter(|damage| damage.is_finite() && *damage > 0.0)
-                            .unwrap_or(if entity.type_name == "minecraft:elder_guardian" {
-                                8.0
-                            } else {
-                                6.0
-                            }) as f32,
+            self.hostile_entity_scan_visits
+                .fetch_add(1, Ordering::Relaxed);
+            if entity.lifecycle != EntityLifecycle::Alive {
+                continue;
+            }
+            let Some(profile) = mob_behaviors.get_by_name(&entity.type_name) else {
+                continue;
+            };
+            let kind = match profile.combat {
+                MobCombatPolicy::CreeperFuse => HostileAttackKind::Creeper,
+                MobCombatPolicy::Arrow => HostileAttackKind::Skeleton,
+                MobCombatPolicy::Crossbow => HostileAttackKind::Crossbow,
+                MobCombatPolicy::GuardianBeam => HostileAttackKind::GuardianBeam {
+                    elder: &*entity.type_name == "minecraft:elder_guardian",
+                    follow_range: entity.follow_range.clamp(1.0, 2_048.0),
+                    attack_damage: if entity.attack_damage.is_finite() && entity.attack_damage > 0.0
+                    {
+                        entity.attack_damage as f32
+                    } else if &*entity.type_name == "minecraft:elder_guardian" {
+                        8.0
+                    } else {
+                        6.0
                     },
-                    MobCombatPolicy::SmallFireball => HostileAttackKind::SmallFireball {
-                        follow_range: entity
-                            .attributes
-                            .base(&AttributeKind::FollowRange)
-                            .unwrap_or(48.0)
-                            .clamp(1.0, 2_048.0),
-                        attack_damage: entity
-                            .attributes
-                            .base(&AttributeKind::AttackDamage)
-                            .filter(|damage| damage.is_finite() && *damage > 0.0)
-                            .unwrap_or(6.0) as f32,
+                },
+                MobCombatPolicy::SmallFireball => HostileAttackKind::SmallFireball {
+                    follow_range: entity.follow_range.clamp(1.0, 2_048.0),
+                    attack_damage: if entity.attack_damage.is_finite() && entity.attack_damage > 0.0
+                    {
+                        entity.attack_damage as f32
+                    } else {
+                        6.0
                     },
-                    MobCombatPolicy::SonicBoom => HostileAttackKind::SonicBoom,
-                    MobCombatPolicy::ShulkerBullet => HostileAttackKind::ShulkerBullet,
-                    MobCombatPolicy::EvokerFangs => HostileAttackKind::EvokerFangs,
-                    MobCombatPolicy::LargeFireball => HostileAttackKind::LargeFireball,
-                    MobCombatPolicy::WindCharge => HostileAttackKind::WindCharge,
-                    MobCombatPolicy::ThrownPotion => HostileAttackKind::ThrownPotion,
-                    MobCombatPolicy::WitherSkull => HostileAttackKind::WitherSkull,
-                    // Ender Dragon owns movement/combat in dragon_authority; never
-                    // fall through to the common hostile planner or generic melee.
-                    MobCombatPolicy::DragonBoss => return,
-                    MobCombatPolicy::Melee => HostileAttackKind::Melee {
-                        attack_damage: entity
-                            .attributes
-                            .base(&AttributeKind::AttackDamage)
-                            .unwrap_or(3.0) as f32,
+                },
+                MobCombatPolicy::SonicBoom => HostileAttackKind::SonicBoom,
+                MobCombatPolicy::ShulkerBullet => HostileAttackKind::ShulkerBullet,
+                MobCombatPolicy::EvokerFangs => HostileAttackKind::EvokerFangs,
+                MobCombatPolicy::LargeFireball => HostileAttackKind::LargeFireball,
+                MobCombatPolicy::WindCharge => HostileAttackKind::WindCharge,
+                MobCombatPolicy::ThrownPotion => HostileAttackKind::ThrownPotion,
+                MobCombatPolicy::WitherSkull => HostileAttackKind::WitherSkull,
+                // Ender Dragon owns movement/combat in dragon_authority; never
+                // fall through to the common hostile planner or generic melee.
+                MobCombatPolicy::DragonBoss => continue,
+                MobCombatPolicy::Melee => HostileAttackKind::Melee {
+                    attack_damage: if entity.attack_damage.is_finite() && entity.attack_damage > 0.0
+                    {
+                        entity.attack_damage as f32
+                    } else {
+                        3.0
                     },
-                    MobCombatPolicy::None | MobCombatPolicy::UnsupportedSpecial => return,
-                };
-                let period = match kind {
-                    HostileAttackKind::Creeper
-                    | HostileAttackKind::Crossbow
-                    | HostileAttackKind::GuardianBeam { .. }
-                    | HostileAttackKind::SmallFireball { .. }
-                    | HostileAttackKind::SonicBoom
-                    | HostileAttackKind::ShulkerBullet
-                    | HostileAttackKind::EvokerFangs
-                    | HostileAttackKind::LargeFireball
-                    | HostileAttackKind::WindCharge
-                    | HostileAttackKind::ThrownPotion => 1,
-                    HostileAttackKind::WitherSkull => WITHER_SKULL_SHOT_PERIOD_TICKS,
-                    HostileAttackKind::Skeleton => SKELETON_SHOT_PERIOD_TICKS,
-                    HostileAttackKind::Melee { .. } => HOSTILE_MELEE_PERIOD_TICKS,
-                };
-                let phase = u64::from(entity.id.0.unsigned_abs());
-                if !tick.wrapping_add(phase).is_multiple_of(period) {
-                    return;
-                }
-                hostiles.push(HostileAttackTickEntity {
-                    id: entity.id,
-                    kind,
-                    position: entity.position,
-                    rotation: entity.rotation,
-                    goal: entity.goal.clone(),
-                    crossbow_attack: entity.retained.crossbow_attack,
-                    blaze_attack: entity.retained.blaze_attack,
-                    ghast_attack: entity.retained.ghast_attack,
-                    breeze_attack: entity.retained.breeze_attack,
-                    guardian_beam: entity.retained.guardian_beam,
-                    warden_sonic_boom: entity.retained.warden_sonic_boom,
-                    shulker_attack: entity.retained.shulker_attack,
-                    evoker_attack: entity.retained.evoker_attack,
-                    witch_attack: entity.retained.witch_attack,
-                });
+                },
+                MobCombatPolicy::None | MobCombatPolicy::UnsupportedSpecial => continue,
+            };
+            let period = match kind {
+                HostileAttackKind::Creeper
+                | HostileAttackKind::Crossbow
+                | HostileAttackKind::GuardianBeam { .. }
+                | HostileAttackKind::SmallFireball { .. }
+                | HostileAttackKind::SonicBoom
+                | HostileAttackKind::ShulkerBullet
+                | HostileAttackKind::EvokerFangs
+                | HostileAttackKind::LargeFireball
+                | HostileAttackKind::WindCharge
+                | HostileAttackKind::ThrownPotion => 1,
+                HostileAttackKind::WitherSkull => WITHER_SKULL_SHOT_PERIOD_TICKS,
+                HostileAttackKind::Skeleton => SKELETON_SHOT_PERIOD_TICKS,
+                HostileAttackKind::Melee { .. } => HOSTILE_MELEE_PERIOD_TICKS,
+            };
+            let phase = u64::from(entity.id.0.unsigned_abs());
+            if !tick.wrapping_add(phase).is_multiple_of(period) {
+                continue;
+            }
+            hostiles.push(HostileAttackTickEntity {
+                id: entity.id,
+                kind,
+                position: entity.position,
+                rotation: entity.rotation,
+                goal: entity.goal,
+                crossbow_attack: entity.crossbow_attack,
+                blaze_attack: entity.blaze_attack,
+                ghast_attack: entity.ghast_attack,
+                breeze_attack: entity.breeze_attack,
+                guardian_beam: entity.guardian_beam,
+                warden_sonic_boom: entity.warden_sonic_boom,
+                shulker_attack: entity.shulker_attack,
+                evoker_attack: entity.evoker_attack,
+                witch_attack: entity.witch_attack,
             });
+        }
+        #[cfg(feature = "load-bench")]
+        {
+            metrics.add(&metrics.classify_period_us, classify_started.elapsed());
+            metrics.note_due(hostiles.len());
         }
         #[cfg(test)]
         self.hostile_attack_candidates
             .fetch_add(hostiles.len() as u64, Ordering::Relaxed);
         if hostiles.is_empty() {
+            #[cfg(feature = "load-bench")]
+            metrics.maybe_emit(tick);
             return (0, fang_dispatches);
         }
         let needs_witch_effect_facts = hostiles
             .iter()
             .any(|hostile| matches!(hostile.kind, HostileAttackKind::ThrownPotion));
 
+        #[cfg(feature = "load-bench")]
+        let targets_started = std::time::Instant::now();
         let targets = self
             .movement_recipients
             .load_full()
@@ -1687,6 +1775,8 @@ impl SessionRegistry {
                 })
             })
             .collect::<Vec<_>>();
+        #[cfg(feature = "load-bench")]
+        metrics.add(&metrics.target_snapshot_us, targets_started.elapsed());
         let arrow_entity_type_id = self.hostile_arrow_entity_type_id.load(Ordering::Acquire);
         let arrow_entity_type_id = (arrow_entity_type_id >= 0).then_some(arrow_entity_type_id);
         let small_fireball_entity_type_id = self
@@ -1723,6 +1813,8 @@ impl SessionRegistry {
         let evoker_fangs_entity_type_id =
             (evoker_fangs_entity_type_id >= 0).then_some(evoker_fangs_entity_type_id);
 
+        #[cfg(feature = "load-bench")]
+        let planning_started = std::time::Instant::now();
         let mut creeper_fuses = Vec::new();
         let mut arrow_attacks = Vec::new();
         let mut small_fireball_attacks = Vec::new();
@@ -1937,6 +2029,10 @@ impl SessionRegistry {
             }
         }
 
+        #[cfg(feature = "load-bench")]
+        metrics.add(&metrics.attack_planning_us, planning_started.elapsed());
+        #[cfg(feature = "load-bench")]
+        let commit_started = std::time::Instant::now();
         let creeper_ignitions = if creeper_fuses.is_empty() {
             0
         } else {
@@ -2438,6 +2534,8 @@ impl SessionRegistry {
             }
         }
 
+        #[cfg(feature = "load-bench")]
+        metrics.add(&metrics.entity_commit_us, commit_started.elapsed());
         if arrow_attacks.is_empty()
             && small_fireball_attacks.is_empty()
             && wither_skull_attacks.is_empty()
@@ -2450,8 +2548,12 @@ impl SessionRegistry {
             && committed_wind_charges.is_empty()
             && committed_witch_potions.is_empty()
         {
+            #[cfg(feature = "load-bench")]
+            metrics.maybe_emit(tick);
             return (creeper_ignitions, dispatches);
         }
+        #[cfg(feature = "load-bench")]
+        let spawn_publish_started = std::time::Instant::now();
 
         let spawned_arrows = if arrow_attacks.is_empty() {
             Vec::new()
@@ -3010,6 +3112,10 @@ impl SessionRegistry {
             }
         }
 
+        #[cfg(feature = "load-bench")]
+        metrics.add(&metrics.spawn_publish_us, spawn_publish_started.elapsed());
+        #[cfg(feature = "load-bench")]
+        let validation_started = std::time::Instant::now();
         if !committed_guardian_attacks.is_empty() {
             let guardian_ids = committed_guardian_attacks
                 .iter()
@@ -3297,6 +3403,14 @@ impl SessionRegistry {
             }
         }
 
+        #[cfg(feature = "load-bench")]
+        {
+            metrics.add(
+                &metrics.validation_dispatch_us,
+                validation_started.elapsed(),
+            );
+            metrics.maybe_emit(tick);
+        }
         (attacks + creeper_ignitions, dispatches)
     }
 

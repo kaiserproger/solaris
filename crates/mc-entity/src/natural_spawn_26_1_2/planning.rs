@@ -8,8 +8,7 @@ use crate::{
     EntityLifecycle, EntitySimulationProjection, SpawnEntity, Vec3,
     natural_spawn_26_1_2::{
         HerdSpawn, MAX_HOSTILE_SPAWNS_PER_CHUNK, MAX_PASSIVE_SPAWNS_PER_CHUNK,
-        MIN_ENTITY_SPAWN_DISTANCE_FROM_PLAYER, VANILLA_CREATURE_MOB_CAP, VANILLA_HOSTILE_MOB_CAP,
-        VANILLA_WATER_CREATURE_MOB_CAP, apply_default_mob_goal, apply_entity_facts,
+        MIN_ENTITY_SPAWN_DISTANCE_FROM_PLAYER, apply_default_mob_goal, apply_entity_facts,
         choose_biome_spawn, entity_aabb, entity_type_uses_aquatic_physics, herd_entry_count,
         herd_hash, herd_uuid, hostile_chunk_spawns, is_hostile_entity, natural_sheep_color,
         passive_chunk_spawns, safe_land_spawn_offset,
@@ -28,11 +27,18 @@ pub struct NaturalSpawnCapacities {
 }
 
 impl NaturalSpawnCapacities {
-    pub fn from_counts(hostile: usize, ground: usize, aquatic: usize) -> Self {
+    pub fn from_counts_and_caps(
+        hostile: usize,
+        ground: usize,
+        aquatic: usize,
+        hostile_cap: usize,
+        ground_cap: usize,
+        aquatic_cap: usize,
+    ) -> Self {
         Self {
-            hostile: VANILLA_HOSTILE_MOB_CAP.saturating_sub(hostile),
-            ground: VANILLA_CREATURE_MOB_CAP.saturating_sub(ground),
-            aquatic: VANILLA_WATER_CREATURE_MOB_CAP.saturating_sub(aquatic),
+            hostile: hostile_cap.saturating_sub(hostile),
+            ground: ground_cap.saturating_sub(ground),
+            aquatic: aquatic_cap.saturating_sub(aquatic),
         }
     }
 
@@ -56,6 +62,7 @@ impl NaturalSpawnCapacities {
 enum SpawnTerrainRejection {
     Unloaded,
     BlockOrFluid,
+    Time,
     Darkness,
 }
 
@@ -71,7 +78,8 @@ pub fn plan_periodic_category(
     accepted_boxes: &mut Vec<(Vec3, Aabb)>,
     capacities: &mut NaturalSpawnCapacities,
     tick: u64,
-    nighttime: bool,
+    world_time: u64,
+    thundering: bool,
     mob_behaviors: &mc_data::mob_behavior_26_1_2::MobBehaviorTable,
 ) -> (NaturalSpawnCategoryReport, Vec<SpawnEntity>) {
     let mut report = NaturalSpawnCategoryReport {
@@ -95,10 +103,6 @@ pub fn plan_periodic_category(
             .filter(|template| template.hostile == (category == NaturalSpawnCategory::Hostile))
         {
             report.templates_considered = report.templates_considered.saturating_add(1);
-            if category == NaturalSpawnCategory::Hostile && !nighttime {
-                report.rejected_time = report.rejected_time.saturating_add(1);
-                continue;
-            }
             if accepted_in_chunk >= per_chunk_cap {
                 report.rejected_cap = report.rejected_cap.saturating_add(1);
                 continue;
@@ -111,7 +115,15 @@ pub fn plan_periodic_category(
                 report.rejected_player_distance = report.rejected_player_distance.saturating_add(1);
                 continue;
             }
-            match periodic_spawn_terrain_admission(category, template, world_snapshot, materials) {
+            match periodic_spawn_terrain_admission(
+                category,
+                template,
+                world_snapshot,
+                materials,
+                world_time,
+                tick,
+                thundering,
+            ) {
                 Ok(()) => {}
                 Err(SpawnTerrainRejection::Unloaded) => {
                     report.rejected_unloaded = report.rejected_unloaded.saturating_add(1);
@@ -120,6 +132,10 @@ pub fn plan_periodic_category(
                 Err(SpawnTerrainRejection::BlockOrFluid) => {
                     report.rejected_block_or_fluid =
                         report.rejected_block_or_fluid.saturating_add(1);
+                    continue;
+                }
+                Err(SpawnTerrainRejection::Time) => {
+                    report.rejected_time = report.rejected_time.saturating_add(1);
                     continue;
                 }
                 Err(SpawnTerrainRejection::Darkness) => {
@@ -181,10 +197,15 @@ fn periodic_spawn_terrain_admission(
     template: &HerdSpawn,
     world_snapshot: Option<&WorldReadSnapshot>,
     materials: Option<&BlockMaterialIds>,
+    world_time: u64,
+    attempt_tick: u64,
+    thundering: bool,
 ) -> Result<(), SpawnTerrainRejection> {
     let snapshot = world_snapshot.ok_or(SpawnTerrainRejection::Unloaded)?;
     let materials = materials.ok_or(SpawnTerrainRejection::Unloaded)?;
     let position = template.position;
+    let spawn_block_x = position.x.floor() as i32;
+    let spawn_block_z = position.z.floor() as i32;
     let aabb = entity_aabb(&template.entity_type_name);
     let min_x = (position.x - aabb.half_width + f64::EPSILON).floor() as i32;
     let max_x = (position.x + aabb.half_width - f64::EPSILON).floor() as i32;
@@ -197,9 +218,9 @@ fn periodic_spawn_terrain_admission(
     if !aquatic {
         let support = snapshot
             .get_cached_block(BlockPos {
-                x: position.x.floor() as i32,
+                x: spawn_block_x,
                 y: min_y.saturating_sub(1),
-                z: position.z.floor() as i32,
+                z: spawn_block_z,
             })
             .ok_or(SpawnTerrainRejection::Unloaded)?;
         if !materials.classify(support.0).is_solid() {
@@ -225,20 +246,116 @@ fn periodic_spawn_terrain_admission(
 
     if category == NaturalSpawnCategory::Hostile {
         let chunk_pos = ChunkPos {
-            x: min_x.div_euclid(mc_world::SECTION_DIM as i32),
-            z: min_z.div_euclid(mc_world::SECTION_DIM as i32),
+            x: spawn_block_x.div_euclid(mc_world::SECTION_DIM as i32),
+            z: spawn_block_z.div_euclid(mc_world::SECTION_DIM as i32),
         };
         let chunk = snapshot
             .chunk(chunk_pos)
             .ok_or(SpawnTerrainRejection::Unloaded)?;
         let light = ChunkLight::from_chunk(&chunk).ok_or(SpawnTerrainRejection::Darkness)?;
-        let local_x = min_x.rem_euclid(mc_world::SECTION_DIM as i32) as u8;
-        let local_z = min_z.rem_euclid(mc_world::SECTION_DIM as i32) as u8;
-        if light.block_at(local_x, min_y, local_z) != 0 {
+        let local_x = spawn_block_x.rem_euclid(mc_world::SECTION_DIM as i32) as u8;
+        let local_z = spawn_block_z.rem_euclid(mc_world::SECTION_DIM as i32) as u8;
+        let sky = light.sky_at(local_x, min_y, local_z);
+        let block = light.block_at(local_x, min_y, local_z);
+        let sky_roll = (herd_hash(
+            template.chunk,
+            template.slot,
+            attempt_tick ^ 0x534B_595F_524F_4C4C,
+        ) & 31) as u8;
+        if sky > sky_roll {
+            return Err(SpawnTerrainRejection::Time);
+        }
+        if block > 0 {
+            return Err(SpawnTerrainRejection::Darkness);
+        }
+        let sky_darken = if thundering {
+            10
+        } else {
+            overworld_sky_darken_26_1_2(world_time)
+        };
+        let raw_brightness = block.max(sky.saturating_sub(sky_darken));
+        let spawn_light_roll = (herd_hash(
+            template.chunk,
+            template.slot,
+            attempt_tick ^ 0x4C49_4748_545F_524F,
+        ) & 7) as u8;
+        if raw_brightness > spawn_light_roll {
             return Err(SpawnTerrainRejection::Darkness);
         }
     }
     Ok(())
+}
+
+fn overworld_sky_darken_26_1_2(world_time: u64) -> u8 {
+    let tick = (world_time % 24_000) as f32;
+    let factor = if (133.0..=11_867.0).contains(&tick) {
+        1.0
+    } else if (11_867.0..13_670.0).contains(&tick) {
+        lerp_timeline(tick, 11_867.0, 13_670.0, 1.0, 0.266_666_68)
+    } else if (13_670.0..=22_330.0).contains(&tick) {
+        0.266_666_68
+    } else {
+        let wrapped_tick = if tick < 133.0 { tick + 24_000.0 } else { tick };
+        lerp_timeline(wrapped_tick, 22_330.0, 24_133.0, 0.266_666_68, 1.0)
+    };
+    (15.0 - 15.0 * factor) as u8
+}
+
+fn lerp_timeline(tick: f32, start: f32, end: f32, from: f32, to: f32) -> f32 {
+    let progress = (tick - start) / (end - start);
+    from + (to - from) * progress
+}
+
+#[cfg(test)]
+mod light_time_tests {
+    use mc_data::Identifier;
+    use mc_world::{BlockStateId, Chunk, ChunkPos};
+
+    use super::{LandSpawnSurfaces, hostile_spawn_positions, overworld_sky_darken_26_1_2};
+
+    #[test]
+    fn overworld_sky_darken_follows_26_1_2_day_timeline() {
+        assert_eq!(overworld_sky_darken_26_1_2(6_000), 0);
+        assert_eq!(overworld_sky_darken_26_1_2(13_000), 6);
+        assert_eq!(overworld_sky_darken_26_1_2(13_670), 11);
+        assert_eq!(overworld_sky_darken_26_1_2(18_000), 11);
+        assert_eq!(overworld_sky_darken_26_1_2(23_000), 6);
+    }
+
+    #[test]
+    fn hostile_template_positions_include_enclosed_cave_and_surface() {
+        let air = BlockStateId(0);
+        let stone = BlockStateId(1);
+        let plains = Identifier::parse("minecraft:plains").unwrap();
+        let mut chunk = Chunk::empty(ChunkPos { x: 0, z: 0 }, air, plains);
+        for x in 0..16 {
+            for z in 0..16 {
+                chunk.set_block(x, 40, z, stone).unwrap();
+                chunk.set_block(x, 43, z, stone).unwrap();
+                chunk.set_block(x, 64, z, stone).unwrap();
+            }
+        }
+
+        let positions = hostile_spawn_positions(
+            &chunk,
+            LandSpawnSurfaces {
+                preferred: stone,
+                fallbacks: &[],
+            },
+            &[air],
+            0x4341_5645_5F51_4100,
+        );
+
+        assert_eq!(positions.len(), 3);
+        assert!(
+            positions.iter().any(|(_, y, _)| *y < 64),
+            "expected an underground hostile template position: {positions:?}"
+        );
+        assert!(
+            positions.iter().any(|(_, y, _)| *y == 65),
+            "expected a surface fallback hostile template position: {positions:?}"
+        );
+    }
 }
 
 fn entity_aabbs_intersect(
@@ -405,26 +522,28 @@ fn plan_hostile_spawns(
     }
     let slot_base = out.len() as u8;
     let h = herd_hash(chunk_pos, slot_base, 0x5A4F_4D42_4945_0000);
-    let Some((lx, y, lz)) = herd_spawn_surface(chunk, surfaces, passable, h) else {
-        return;
-    };
-    let Some(biome) = chunk_biome_at(chunk, lx, y, lz) else {
-        return;
-    };
-    for (hostile_index, entry) in rules
-        .entries(biome, "monster")
-        .iter()
-        .filter(|entry| entity_type_is_hostile(entity_types, &entry.entity_type))
-        .take(3)
+    for (hostile_index, (lx, spawn_y, lz)) in hostile_spawn_positions(chunk, surfaces, passable, h)
+        .into_iter()
         .enumerate()
     {
+        let Some(biome) = chunk_biome_at(chunk, lx, spawn_y, lz) else {
+            continue;
+        };
+        let slot = slot_base + hostile_index as u8;
+        let Some(entry) = rules
+            .entries(biome, "monster")
+            .iter()
+            .filter(|entry| entity_type_is_hostile(entity_types, &entry.entity_type))
+            .nth(hostile_index)
+        else {
+            continue;
+        };
         let Some(entity_type_id) = entity_types
             .id_of(&entry.entity_type)
             .and_then(|id| i32::try_from(id).ok())
         else {
             continue;
         };
-        let slot = slot_base + hostile_index as u8;
         let offset = herd_hash(chunk_pos, slot, 0x484F_5354_494C_4500);
         out.push(HerdSpawn {
             chunk: chunk_pos,
@@ -433,13 +552,98 @@ fn plan_hostile_spawns(
             entity_type_name: entry.entity_type.as_str().to_string(),
             position: Vec3::new(
                 f64::from(chunk.pos.x * 16 + i32::from(lx)) + safe_land_spawn_offset(offset),
-                f64::from(y + 1),
+                f64::from(spawn_y),
                 f64::from(chunk.pos.z * 16 + i32::from(lz)) + safe_land_spawn_offset(offset >> 2),
             ),
             hostile: true,
             sheep_color: None,
         });
     }
+}
+
+fn hostile_spawn_positions(
+    chunk: &Chunk,
+    surfaces: LandSpawnSurfaces<'_>,
+    passable: &[BlockStateId],
+    seed: u64,
+) -> Vec<(u8, i32, u8)> {
+    const MAX_POSITIONS: usize = 3;
+    const MAX_CAVE_POSITIONS: usize = 2;
+    const CAVE_COLUMN_PROBES: u64 = 12;
+
+    let geometry = chunk.geometry();
+    let min_spawn_y = geometry.min_y().saturating_add(1);
+    let mut positions = Vec::with_capacity(MAX_POSITIONS);
+
+    for column_attempt in 0..CAVE_COLUMN_PROBES {
+        let candidate = seed.wrapping_add(column_attempt.wrapping_mul(0x9E37_79B9_7F4A_7C15));
+        let lx = 1 + (candidate as u8 % 14);
+        let lz = 1 + ((candidate >> 8) as u8 % 14);
+        let Some(surface_y) = (geometry.min_y()..geometry.max_y()).rev().find(|&y| {
+            chunk
+                .get_block(lx, y, lz)
+                .is_some_and(|state| !passable.contains(&state))
+        }) else {
+            continue;
+        };
+        let max_spawn_y = surface_y
+            .saturating_sub(1)
+            .min(geometry.max_y().saturating_sub(2));
+        if max_spawn_y < min_spawn_y {
+            continue;
+        }
+        let span = u64::try_from(max_spawn_y - min_spawn_y + 1).unwrap_or(1);
+        let start = (candidate >> 16) % span;
+        for offset in 0..span {
+            let spawn_y = min_spawn_y + i32::try_from((start + offset) % span).unwrap_or(0);
+            let position = (lx, spawn_y, lz);
+            if hostile_land_spawn_cell_clear(chunk, lx, spawn_y, lz, passable)
+                && !positions.contains(&position)
+            {
+                positions.push(position);
+                break;
+            }
+        }
+        if positions.len() >= MAX_CAVE_POSITIONS {
+            break;
+        }
+    }
+
+    for surface_attempt in 0..16_u64 {
+        if positions.len() >= MAX_POSITIONS {
+            break;
+        }
+        let surface_seed = seed
+            .wrapping_add(0x5355_5246_4143_4500)
+            .wrapping_add(surface_attempt.wrapping_mul(0xC2B2_AE3D_27D4_EB4F));
+        let Some((lx, support_y, lz)) = herd_spawn_surface(chunk, surfaces, passable, surface_seed)
+        else {
+            continue;
+        };
+        let position = (lx, support_y + 1, lz);
+        if !positions.contains(&position) {
+            positions.push(position);
+        }
+    }
+
+    positions
+}
+
+fn hostile_land_spawn_cell_clear(
+    chunk: &Chunk,
+    lx: u8,
+    spawn_y: i32,
+    lz: u8,
+    passable: &[BlockStateId],
+) -> bool {
+    chunk
+        .get_block(lx, spawn_y - 1, lz)
+        .is_some_and(|support| !passable.contains(&support))
+        && (spawn_y..=spawn_y + 1).all(|y| {
+            chunk
+                .get_block(lx, y, lz)
+                .is_some_and(|state| passable.contains(&state))
+        })
 }
 
 fn entity_type_is_hostile(

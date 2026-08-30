@@ -12,3 +12,4 @@ repository.workspace = true
 workspace = true
 
 [dependencies]
+smallvec = "1.15.1"

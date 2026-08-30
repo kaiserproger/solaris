@@ -30,6 +30,7 @@ mod lock_metrics;
 mod lock_policy;
 mod login;
 mod memory_pressure;
+mod operator_metrics;
 mod play;
 mod runtime_entity_budget;
 mod runtime_tick_metrics;
@@ -66,17 +67,23 @@ pub use lock_metrics::reset_lock_pressure_metrics;
 pub use lock_metrics::{LockMetricSnapshot, LockMetricsSnapshot, lock_pressure_snapshot};
 pub use lock_policy::{RuntimeLockPoisonMetricsSnapshot, runtime_lock_poison_metrics_snapshot};
 pub use login::{LoginAccessConfig, offline_uuid};
+pub use mc_entity::natural_spawn_26_1_2::{NaturalSpawnCategoryReport, NaturalSpawnReport};
+pub use operator_metrics::{
+    OperatorCounterSnapshot, RetainedNaturalSpawnReport, RetainedSaveReport,
+    operator_counter_snapshot,
+};
 pub use play::{
     DEFAULT_VIEW_DISTANCE, EntityEffectHandle, EntityEffectRequestError, ITEM_DESPAWN_AGE_TICKS,
-    PlayerAttackObservation, RandomTickPolicy,
+    MAX_NATURAL_SPAWN_CAP, MAX_NATURAL_SPAWN_CHUNK_BUDGET, PlayerAttackObservation,
+    RandomTickPolicy,
 };
 pub use runtime_tick_metrics::{RuntimeLatencyPercentiles, RuntimeTickPercentiles};
 pub use script::PluginStorageStartError;
 pub use server::{
-    BoundServer, CommandPermissionConfig, EntityBehaviorHandle, OutboundPressureHandle,
-    OutboundPressureSnapshot, RuntimeTelemetryHandle, RuntimeTelemetrySnapshot, SaveAllReport,
-    SaveAllTimings, SaveHandle, ServerConfig, ShutdownHandle, WorldHandle, bind,
-    bind_with_extension, bind_with_scripts, run,
+    BoundServer, CommandPermissionConfig, EntityBehaviorHandle, OperatorFactsHandle,
+    OutboundPressureHandle, OutboundPressureSnapshot, RuntimeTelemetryHandle,
+    RuntimeTelemetrySnapshot, SaveAllReport, SaveAllTimings, SaveHandle, ServerConfig,
+    ShutdownHandle, WorldHandle, bind, bind_with_extension, bind_with_scripts, run,
 };
 #[cfg(feature = "load-bench")]
 pub use server::{

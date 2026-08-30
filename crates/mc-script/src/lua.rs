@@ -515,14 +515,14 @@ impl LuaReloadContract {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[non_exhaustive]
 pub enum LuaWorldgenOreProfile {
-    GeologicalDeposits,
+    RealisticDeposits,
 }
 
 impl LuaWorldgenOreProfile {
     #[must_use]
     pub const fn contract_name(self) -> &'static str {
         match self {
-            Self::GeologicalDeposits => "geological_deposits",
+            Self::RealisticDeposits => "realistic_deposits",
         }
     }
 }
@@ -1575,7 +1575,7 @@ struct DiskWorldgen {
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "snake_case")]
 enum DiskWorldgenOreProfile {
-    GeologicalDeposits,
+    RealisticDeposits,
 }
 
 #[derive(Debug, Deserialize)]
@@ -1773,8 +1773,8 @@ fn read_plugin_source(directory: &Path) -> Result<PluginSource, PluginSourceErro
         }
         Some(worldgen) => {
             let ore_profile = worldgen.ore_profile.map(|profile| match profile {
-                DiskWorldgenOreProfile::GeologicalDeposits => {
-                    LuaWorldgenOreProfile::GeologicalDeposits
+                DiskWorldgenOreProfile::RealisticDeposits => {
+                    LuaWorldgenOreProfile::RealisticDeposits
                 }
             });
             let settlement_profile = worldgen.settlement_profile.map(|profile| match profile {

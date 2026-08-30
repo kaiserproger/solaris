@@ -1,6 +1,7 @@
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::fmt;
 use std::ops::Range;
+use std::sync::Arc;
 
 use bevy_ecs::component::Component;
 use bevy_ecs::entity::Entity as EcsEntity;
@@ -36,7 +37,7 @@ struct StableIdentity {
 #[derive(Component)]
 struct EntityTypeState {
     protocol_id: i32,
-    name: String,
+    name: Arc<str>,
 }
 
 #[derive(Component)]
@@ -706,9 +707,9 @@ impl EntityRuntime {
             on_ground: motion.on_ground,
             fall_distance: motion.fall_distance,
             goal_fence: crate::EntityGoalFence::from_goal(&goal.0),
-            is_item: entity_type.name == "minecraft:item",
-            is_experience: entity_type.name == "minecraft:experience_orb",
-            is_arrow: entity_type.name == "minecraft:arrow",
+            is_item: &*entity_type.name == "minecraft:item",
+            is_experience: &*entity_type.name == "minecraft:experience_orb",
+            is_arrow: &*entity_type.name == "minecraft:arrow",
             arrow_revision: arrow_state.map(|state| state.projectile.revision),
             arrow_embedded_block: arrow_state
                 .filter(|state| state.in_ground)
@@ -720,7 +721,7 @@ impl EntityRuntime {
             throwable_projectile_revision: throwable_projectile_state
                 .map(|state| state.projectile.revision),
             sends_velocity: !matches!(
-                entity_type.name.as_str(),
+                &*entity_type.name,
                 "minecraft:item" | "minecraft:experience_orb"
             ),
         })
@@ -1405,7 +1406,7 @@ fn insert_snapshot_into_world(world: &mut World, snapshot: EntitySnapshot) -> bo
         StableIdentity { id, uuid },
         EntityTypeState {
             protocol_id: type_id,
-            name: type_name,
+            name: type_name.into(),
         },
         TransformState { position, rotation },
         MotionState {
@@ -1513,7 +1514,7 @@ fn restore_snapshot_in_world(
         .get::<StableIdentity>()
         .is_some_and(|identity| identity.id == snapshot.id && identity.uuid == snapshot.uuid);
     let type_matches = current.get::<EntityTypeState>().is_some_and(|entity_type| {
-        entity_type.protocol_id == snapshot.type_id && entity_type.name == snapshot.type_name
+        entity_type.protocol_id == snapshot.type_id && *entity_type.name == *snapshot.type_name
     });
     if !identity_matches || (!allow_type_change && !type_matches) {
         return false;
@@ -1610,7 +1611,7 @@ fn restore_snapshot_in_world(
         entity.insert((
             EntityTypeState {
                 protocol_id: type_id,
-                name: type_name,
+                name: type_name.into(),
             },
             TransformState { position, rotation },
             MotionState {
@@ -1727,7 +1728,7 @@ fn snapshot_from_world(world: &World, id: EntityId) -> Option<EntitySnapshot> {
         id: identity.id,
         uuid: identity.uuid,
         type_id: entity_type.protocol_id,
-        type_name: entity_type.name.clone(),
+        type_name: entity_type.name.to_string(),
         position: transform.position,
         rotation: transform.rotation,
         velocity: motion.velocity,
@@ -1875,6 +1876,15 @@ fn entity_simulation_projection_from_world(
             .shulker_bullet
             .map(|state| state.target_entity_id),
         sheep_grazing_ticks: gameplay.sheep_grazing_ticks,
+        crossbow_attack: gameplay.crossbow_attack,
+        blaze_attack: gameplay.blaze_attack,
+        ghast_attack: gameplay.ghast_attack,
+        breeze_attack: gameplay.breeze_attack,
+        guardian_beam: gameplay.guardian_beam,
+        warden_sonic_boom: gameplay.warden_sonic_boom,
+        shulker_attack: gameplay.shulker_attack,
+        evoker_attack: gameplay.evoker_attack,
+        witch_attack: gameplay.witch_attack,
         villager: gameplay.villager,
         villager_schedule: villager_brain.map(|brain| brain.schedule),
         villager_last_slept_tick: villager_brain.and_then(|brain| brain.last_slept_tick),
@@ -2114,7 +2124,7 @@ fn apply_input_commands(world: &mut World) {
                         .is_some_and(|state| state.0 == EntityLifecycle::Alive);
                     let is_sheep = entity
                         .get::<EntityTypeState>()
-                        .is_some_and(|entity_type| entity_type.name == "minecraft:sheep");
+                        .is_some_and(|entity_type| &*entity_type.name == "minecraft:sheep");
                     entity.insert(AnimalState(animal));
                     (
                         is_alive && animal.needs_breeding_tick(),

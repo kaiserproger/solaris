@@ -7,8 +7,8 @@ use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
 
 use super::{
-    RegionKey, RegionLease, RegionPhase, add_goal_tick_stats, goal_reference,
-    order_vehicle_group_for_removal, snapshot_vehicle_reference,
+    CompactEntityKinematicsFence, RegionKey, RegionLease, RegionPhase, add_goal_tick_stats,
+    goal_reference, order_vehicle_group_for_removal, snapshot_vehicle_reference,
 };
 
 use crate::lock_policy::lock_authoritative_mutex;
@@ -18,6 +18,18 @@ use crate::{
     EntitySnapshot, EntityStore, GoalState, GoalTickStats, PreparedGoalTick, ResolvedGoalTick,
     Vec3,
 };
+
+#[derive(Debug, Clone, Copy)]
+pub(super) struct FencedKinematicsCandidate {
+    pub expected: CompactEntityKinematicsFence,
+}
+
+#[derive(Debug, Clone)]
+pub(super) struct FencedKinematicsRead {
+    pub lane: usize,
+    pub candidates: Vec<FencedKinematicsCandidate>,
+    pub state_version: u64,
+}
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum RegionOwnerMutation {
@@ -57,6 +69,11 @@ pub enum RegionOwnerMutation {
     },
     SetKinematicsBatchIfCurrent {
         expected: Vec<EntitySnapshot>,
+        states: Vec<EntityKinematics>,
+    },
+    SetKinematicsBatchIfVersion {
+        expected_state_version: u64,
+        previous: Vec<CompactEntityKinematicsFence>,
         states: Vec<EntityKinematics>,
     },
     DamageIfCurrent {
@@ -242,7 +259,7 @@ enum RegionOwnerLaneMessage {
     },
     AliveKinematicsForIds {
         entities: Vec<(RegionLease, EntityId)>,
-        reply: std::sync::mpsc::Sender<Result<Vec<EntityKinematics>, RegionOwnerLaneError>>,
+        reply: std::sync::mpsc::Sender<Result<FencedKinematicsRead, RegionOwnerLaneError>>,
     },
     NearestVillager {
         leases: Vec<RegionLease>,
@@ -450,7 +467,7 @@ impl RegionalOwnerLaneReader {
     pub(super) fn request_alive_kinematics_for_ids(
         &self,
         entities: Vec<(RegionLease, EntityId)>,
-    ) -> Result<Receiver<Result<Vec<EntityKinematics>, RegionOwnerLaneError>>, RegionOwnerLaneError>
+    ) -> Result<Receiver<Result<FencedKinematicsRead, RegionOwnerLaneError>>, RegionOwnerLaneError>
     {
         let (reply, states) = channel();
         self.sender
@@ -1355,19 +1372,38 @@ fn run_region_owner_lane(
                 let mut states = Vec::new();
                 if error.is_none() {
                     for (key, ids) in ids_by_region {
-                        states.extend(
-                            regions
-                                .get_mut(&key)
-                                .expect("validated regional kinematics route")
-                                .1
-                                .alive_kinematics_for_ids(&ids),
-                        );
+                        let store = &mut regions
+                            .get_mut(&key)
+                            .expect("validated regional kinematics route")
+                            .1;
+                        states.extend(store.alive_kinematics_for_ids(&ids).into_iter().filter_map(
+                            |state| {
+                                let view = store.view(state.id)?;
+                                Some(FencedKinematicsCandidate {
+                                    expected: CompactEntityKinematicsFence {
+                                        id: state.id,
+                                        uuid: view.uuid,
+                                        lifecycle: view.lifecycle,
+                                        expected: state,
+                                        pickup_claimed: view.retained.item_pickup_claim.is_some(),
+                                        // Reverse passenger membership is checked from the coordinator's
+                                        // O(1) topology index before the token is issued and again from a
+                                        // per-region passenger set during atomic lane preparation.
+                                        vehicle_attached: view.vehicle.is_some(),
+                                    },
+                                })
+                            },
+                        ));
                     }
-                    states.sort_unstable_by_key(|state| state.id);
+                    states.sort_unstable_by_key(|candidate| candidate.expected.id);
                 }
                 let _ = reply.send(match error {
                     Some(error) => Err(error),
-                    None => Ok(states),
+                    None => Ok(FencedKinematicsRead {
+                        lane,
+                        candidates: states,
+                        state_version: state_version.load(Ordering::Acquire),
+                    }),
                 });
             }
             RegionOwnerLaneMessage::NearestVillager {
@@ -1651,13 +1687,55 @@ fn prepare_region_owner_batch(
                     return Err(RegionOwnerLaneError::InvalidMutation);
                 }
             }
+            RegionOwnerMutation::SetKinematicsBatchIfVersion {
+                expected_state_version,
+                previous,
+                states,
+            } => {
+                let passengers = passengers_by_region
+                    .entry(mutation.lease.key)
+                    .or_insert_with(|| {
+                        store
+                            .views()
+                            .filter_map(|view| view.vehicle.and_then(|vehicle| vehicle.passenger))
+                            .collect()
+                    });
+                let mut ids = HashSet::with_capacity(previous.len());
+                if *expected_state_version != current_state_version
+                    || previous.is_empty()
+                    || previous.len() != states.len()
+                    || previous.iter().zip(states).any(|(previous, state)| {
+                        let Some(current) = store.view(previous.id) else {
+                            return true;
+                        };
+                        !previous.eligible()
+                            || previous.id != state.id
+                            || !ids.insert(previous.id)
+                            || !state.is_finite()
+                            || RegionKey::from_position(previous.expected.position)
+                                != Some(mutation.lease.key)
+                            || RegionKey::from_position(state.position) != Some(mutation.lease.key)
+                            || current.uuid != previous.uuid
+                            || current.lifecycle != previous.lifecycle
+                            || current.position != previous.expected.position
+                            || current.rotation != previous.expected.rotation
+                            || current.velocity != previous.expected.velocity
+                            || current.on_ground != previous.expected.on_ground
+                            || current.retained.item_pickup_claim.is_some()
+                            || current.vehicle.is_some()
+                            || passengers.contains(&previous.id)
+                    })
+                {
+                    return Err(RegionOwnerLaneError::InvalidMutation);
+                }
+            }
             RegionOwnerMutation::DamageIfCurrent { expected, request } => {
                 let passengers = passengers_by_region
                     .entry(mutation.lease.key)
                     .or_insert_with(|| {
                         store
-                            .snapshots()
-                            .filter_map(|snapshot| snapshot_vehicle_reference(&snapshot))
+                            .views()
+                            .filter_map(|view| view.vehicle.and_then(|vehicle| vehicle.passenger))
                             .collect()
                     });
                 if !request.is_valid()
@@ -1921,6 +1999,24 @@ fn apply_prepared_region_owner_batch(
                     undo.push(RegionOwnerUndo::KinematicsBatch {
                         lease: mutation.lease,
                         states: previous,
+                    });
+                }
+                applied
+            }
+            RegionOwnerMutation::SetKinematicsBatchIfVersion {
+                expected_state_version: _,
+                previous,
+                states,
+            } => {
+                let expected_count = states.len();
+                let applied = store.apply_kinematics(states) == expected_count;
+                if applied {
+                    undo.push(RegionOwnerUndo::KinematicsBatch {
+                        lease: mutation.lease,
+                        states: previous
+                            .into_iter()
+                            .map(|previous| previous.expected)
+                            .collect(),
                     });
                 }
                 applied
@@ -2267,6 +2363,9 @@ fn rollback_region_owner_undo(
             }
             RegionOwnerMutation::SetKinematicsBatchIfCurrent { .. } => {
                 unreachable!("kinematics batch undo restores directly")
+            }
+            RegionOwnerMutation::SetKinematicsBatchIfVersion { .. } => {
+                unreachable!("versioned kinematics batch undo restores directly")
             }
             RegionOwnerMutation::DamageIfCurrent { .. } => {
                 unreachable!("damage undo restores snapshot directly")

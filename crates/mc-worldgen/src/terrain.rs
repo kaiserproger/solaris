@@ -51,6 +51,7 @@ pub enum TerrainGeneratorError {
 
 pub const SEA_LEVEL: i32 = 63;
 const RIVER_BIOME_WIDTH: f64 = 0.025;
+const CLIMATE_TRANSITION_WIDTH: f64 = 0.08;
 const BEACH_HEIGHT_ABOVE_SEA: i32 = 2;
 /// Number of dirt cells between grass cap and stone.
 const DIRT_DEPTH: i32 = 3;
@@ -210,6 +211,7 @@ pub struct TerrainGenerator {
     biomes: BiomeRules,
     ores: OreRules,
     geological_ores: Option<GeologicalOreRules>,
+    ore_generation_profile: &'static str,
     structures: StructureRules,
     decorations: DecorationBlocks,
     worldgen_mode: WorldgenMode,
@@ -508,6 +510,16 @@ fn world_block_coordinate(chunk: i32, local: u8) -> i32 {
     i32::try_from(coordinate).expect("chunk lies outside the supported i32 block-coordinate range")
 }
 
+fn climate_above(value: f64, threshold: f64, domain: f64) -> bool {
+    if value <= threshold - CLIMATE_TRANSITION_WIDTH {
+        false
+    } else if value >= threshold + CLIMATE_TRANSITION_WIDTH {
+        true
+    } else {
+        value + domain.clamp(-1.0, 1.0) * CLIMATE_TRANSITION_WIDTH > threshold
+    }
+}
+
 impl TerrainGenerator {
     /// Build a generator from a seed plus a block registry.
     ///
@@ -606,6 +618,7 @@ impl TerrainGenerator {
             biomes,
             ores,
             geological_ores: None,
+            ore_generation_profile: "vanilla",
             structures: StructureRules::none(),
             decorations: DecorationBlocks::new(registry.as_ref()),
             worldgen_mode: WorldgenMode::VanillaLike,
@@ -619,20 +632,37 @@ impl TerrainGenerator {
         self
     }
 
-    #[must_use]
-    pub fn with_geological_deposits(mut self, registry: &BlockRegistry) -> Self {
+    /// Enable alpha3's canonical deterministic regional-deposit profile.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`TerrainGeneratorError::MissingRequiredBlock`] if any normal or
+    /// deepslate ore block required by the profile is absent.
+    pub fn try_with_realistic_deposits(
+        mut self,
+        registry: &BlockRegistry,
+    ) -> Result<Self, TerrainGeneratorError> {
         self.ores = OreRules::new(Vec::new()).expect("empty ore rules are valid");
-        self.geological_ores = Some(GeologicalOreRules::new(registry, self.stone));
-        self
+        self.geological_ores = Some(GeologicalOreRules::try_new(registry)?);
+        self.ore_generation_profile = "realistic_deposits";
+        Ok(self)
+    }
+
+    /// Enable alpha3's canonical deterministic regional-deposit profile.
+    ///
+    /// # Panics
+    ///
+    /// Panics if a required normal or deepslate ore block is absent. Use
+    /// [`TerrainGenerator::try_with_realistic_deposits`] for startup validation.
+    #[must_use]
+    pub fn with_realistic_deposits(self, registry: &BlockRegistry) -> Self {
+        self.try_with_realistic_deposits(registry)
+            .unwrap_or_else(|error| panic!("{error}"))
     }
 
     #[must_use]
     pub const fn ore_generation_profile(&self) -> &'static str {
-        if self.geological_ores.is_some() {
-            "geological_deposits"
-        } else {
-            "vanilla"
-        }
+        self.ore_generation_profile
     }
 
     #[must_use]
@@ -786,68 +816,52 @@ impl TerrainGenerator {
         sample: TerrainSample,
     ) -> Identifier {
         let continental = sample.continentalness;
-        let temperature = sample.temperature;
-        let moisture = sample.moisture;
         let ridges = sample.ridges;
         let river = sample.river;
 
         if height < SEA_LEVEL - 8 {
-            return self
-                .biomes
-                .pick_region_band(&self.biomes.deep_ocean, world_x, world_z);
+            return self.biomes.pick_region_band(
+                &self.biomes.deep_ocean,
+                world_x,
+                world_z,
+                self.seed,
+            );
         }
-        if river.abs() < RIVER_BIOME_WIDTH && continental > -0.05 && height <= SEA_LEVEL {
+        if river.abs() < RIVER_BIOME_WIDTH && continental > -0.05 && height < SEA_LEVEL {
             return self
                 .biomes
-                .pick(&self.biomes.river, world_x, world_z, 0x5249_5645);
+                .pick(&self.biomes.river, world_x, world_z, self.seed, 0x5249_5645);
         }
         if height < SEA_LEVEL - 1 {
             return self
                 .biomes
-                .pick(&self.biomes.ocean, world_x, world_z, 0x4F43_4541);
+                .pick(&self.biomes.ocean, world_x, world_z, self.seed, 0x4F43_4541);
         }
         if height <= SEA_LEVEL + BEACH_HEIGHT_ABOVE_SEA {
             return self
                 .biomes
-                .pick(&self.biomes.beach, world_x, world_z, 0x4245_4143);
+                .pick(&self.biomes.beach, world_x, world_z, self.seed, 0x4245_4143);
         }
         if height > 118 || ridges > 0.22 {
-            return self
-                .biomes
-                .pick(&self.biomes.mountain, world_x, world_z, 0x4D4F_554E);
+            return self.biomes.pick(
+                &self.biomes.mountain,
+                world_x,
+                world_z,
+                self.seed,
+                0x4D4F_554E,
+            );
         }
         if height < 18 {
             return self
                 .biomes
-                .pick(&self.biomes.cave, world_x, world_z, 0x4341_5645);
+                .pick(&self.biomes.cave, world_x, world_z, self.seed, 0x4341_5645);
         }
-        if moisture > 0.62 && height <= SEA_LEVEL + 8 {
+        if sample.moisture > 0.32 && height <= SEA_LEVEL + 8 {
             return self
                 .biomes
-                .pick(&self.biomes.swamp, world_x, world_z, 0x5357_414D);
+                .pick(&self.biomes.swamp, world_x, world_z, self.seed, 0x5357_414D);
         }
-        if temperature < -0.25 {
-            return self
-                .biomes
-                .pick(&self.biomes.cold, world_x, world_z, 0x434F_4C44);
-        }
-        if temperature > 0.38 && moisture < -0.08 {
-            return self
-                .biomes
-                .pick(&self.biomes.hot_dry, world_x, world_z, 0x484F_5444);
-        }
-        if temperature > 0.22 && moisture > 0.2 {
-            return self
-                .biomes
-                .pick(&self.biomes.jungle, world_x, world_z, 0x4A55_4E47);
-        }
-        if moisture > 0.04 {
-            self.biomes
-                .pick(&self.biomes.temperate_forest, world_x, world_z, 0x464F_5253)
-        } else {
-            self.biomes
-                .pick(&self.biomes.grassland, world_x, world_z, 0x4752_4153)
-        }
+        self.climate_biome_for(world_x, world_z, sample, 0)
     }
 
     fn tellus_biome_for(
@@ -866,69 +880,92 @@ impl TerrainGenerator {
         let river = sample.river;
 
         if settings.water_enabled {
-            if river.abs() < RIVER_BIOME_WIDTH * 0.65 && land_mask > -0.02 && height_y <= sea_y {
-                return self
-                    .biomes
-                    .pick(&self.biomes.river, world_x, world_z, 0x5452_4956);
+            if river.abs() < RIVER_BIOME_WIDTH * 0.65 && land_mask > -0.02 && height_y < sea_y {
+                return self.biomes.pick(
+                    &self.biomes.river,
+                    world_x,
+                    world_z,
+                    self.seed,
+                    0x5452_4956,
+                );
             }
             if height_y < sea_y - 18 {
-                return self
-                    .biomes
-                    .pick(&self.biomes.deep_ocean, world_x, world_z, 0x5444_4545);
+                return self.biomes.pick(
+                    &self.biomes.deep_ocean,
+                    world_x,
+                    world_z,
+                    self.seed,
+                    0x5444_4545,
+                );
             }
             if height_y < sea_y - 1 {
-                return self
-                    .biomes
-                    .pick(&self.biomes.ocean, world_x, world_z, 0x544F_434E);
+                return self.biomes.pick(
+                    &self.biomes.ocean,
+                    world_x,
+                    world_z,
+                    self.seed,
+                    0x544F_434E,
+                );
             }
         }
         let near_coast = land_mask.abs() < 0.025 && height_y <= sea_y + 6;
         if near_coast || height_y <= sea_y + i64::from(BEACH_HEIGHT_ABOVE_SEA) {
             return self
                 .biomes
-                .pick(&self.biomes.beach, world_x, world_z, 0x5442_4541);
+                .pick(&self.biomes.beach, world_x, world_z, self.seed, 0x5442_4541);
         }
         // A ridge field may cross its threshold on a low coastal shelf. Only
         // route that shelf to a rocky mountain surface once the terrain has
         // actually risen above ordinary lowland.
         if height_y > sea_y + 86 || (mountain > 0.22 && land_mask > 0.08 && height_y >= sea_y + 18)
         {
-            return self
-                .biomes
-                .pick(&self.biomes.mountain, world_x, world_z, 0x544D_4F55);
+            return self.biomes.pick(
+                &self.biomes.mountain,
+                world_x,
+                world_z,
+                self.seed,
+                0x544D_4F55,
+            );
         }
         if height < 18 {
             return self
                 .biomes
-                .pick(&self.biomes.cave, world_x, world_z, 0x5443_4156);
+                .pick(&self.biomes.cave, world_x, world_z, self.seed, 0x5443_4156);
         }
-        if sample.moisture > 0.62 && height_y <= sea_y + 8 {
+        if sample.moisture > 0.32 && height_y <= sea_y + 8 {
             return self
                 .biomes
-                .pick(&self.biomes.swamp, world_x, world_z, 0x5453_5741);
+                .pick(&self.biomes.swamp, world_x, world_z, self.seed, 0x5453_5741);
         }
-        if sample.temperature < -0.25 {
-            return self
-                .biomes
-                .pick(&self.biomes.cold, world_x, world_z, 0x5443_4F4C);
-        }
-        if sample.temperature > 0.38 && sample.moisture < -0.08 {
-            return self
-                .biomes
-                .pick(&self.biomes.hot_dry, world_x, world_z, 0x5448_4F54);
-        }
-        if sample.temperature > 0.22 && sample.moisture > 0.2 {
-            return self
-                .biomes
-                .pick(&self.biomes.jungle, world_x, world_z, 0x544A_554E);
-        }
-        if sample.moisture > 0.04 {
-            self.biomes
-                .pick(&self.biomes.temperate_forest, world_x, world_z, 0x5446_4F52)
+        self.climate_biome_for(world_x, world_z, sample, 0x5400_0000)
+    }
+
+    fn climate_biome_for(
+        &self,
+        world_x: i32,
+        world_z: i32,
+        sample: TerrainSample,
+        salt: u64,
+    ) -> Identifier {
+        let temperature = sample.temperature;
+        let moisture = sample.moisture;
+        let domain = sample.climate_domain;
+        let (bucket, bucket_salt) = if !climate_above(temperature, -0.25, domain) {
+            (&self.biomes.cold, 0x434F_4C44)
+        } else if climate_above(temperature, 0.12, domain)
+            && !climate_above(moisture, 0.08, -domain)
+        {
+            (&self.biomes.hot_dry, 0x484F_5444)
+        } else if climate_above(temperature, 0.14, domain) && climate_above(moisture, 0.12, -domain)
+        {
+            (&self.biomes.jungle, 0x4A55_4E47)
+        } else if climate_above(moisture, 0.12, -domain) {
+            (&self.biomes.temperate_forest, 0x464F_5253)
         } else {
-            self.biomes
-                .pick(&self.biomes.grassland, world_x, world_z, 0x5447_5241)
-        }
+            (&self.biomes.grassland, 0x4752_4153)
+        };
+        self.biomes
+            .pick(bucket, world_x, world_z, self.seed, bucket_salt ^ salt)
     }
 
     #[cfg(test)]
@@ -942,7 +979,7 @@ impl TerrainGenerator {
         if i64::from(y) < i64::from(surface_height) - 24 && y < 32 {
             return self
                 .biomes
-                .pick(&self.biomes.cave, world_x, world_z, 0x554E_4447);
+                .pick(&self.biomes.cave, world_x, world_z, self.seed, 0x554E_4447);
         }
         self.biome_for(world_x, world_z, surface_height)
     }
@@ -1085,8 +1122,13 @@ impl TerrainGenerator {
                             continue;
                         };
                         let biome = if i64::from(y) < i64::from(column.height) - 24 && y < 32 {
-                            self.biomes
-                                .pick(&self.biomes.cave, column.wx, column.wz, 0x554E_4447)
+                            self.biomes.pick(
+                                &self.biomes.cave,
+                                column.wx,
+                                column.wz,
+                                self.seed,
+                                0x554E_4447,
+                            )
                         } else {
                             column.biome.clone()
                         };
@@ -1720,9 +1762,9 @@ impl TerrainGenerator {
         } else if Self::is_cold_forest(&plan.biome) {
             -0.05
         } else if Self::is_savanna(&plan.biome) {
-            0.28
+            0.18
         } else if self.biomes.grassland.contains(&plan.biome) {
-            0.48
+            0.40
         } else {
             return false;
         };

@@ -51,15 +51,14 @@ The command always samples
 
 | View | Artifact | SHA-256 |
 | --- | --- | --- |
-| Surface height | [`worldgen-mosaics/seed-712816/height.png`](worldgen-mosaics/seed-712816/height.png) | `4f143aa1037dfab8788e10b0ae372078f6b1aa80e701c9e8627bd8657955674d` |
-| Biome family | [`worldgen-mosaics/seed-712816/biome.png`](worldgen-mosaics/seed-712816/biome.png) | `603d2f2f6368237548cabf868b0f7f37b18581c36c5bdb908c08c162eb447308` |
-| Vegetation density | [`worldgen-mosaics/seed-712816/vegetation.png`](worldgen-mosaics/seed-712816/vegetation.png) | `2f35196886556fd7cf92cb90f5f60efa1e27035c15c86a2d091eb3cbf6171279` |
+| Surface height | [`worldgen-mosaics/seed-712816/height.png`](worldgen-mosaics/seed-712816/height.png) | `861222d2a3fc634967e56af1f425feb998dce4687e03c31cf6e96ae47d089c4f` |
+| Biome family | [`worldgen-mosaics/seed-712816/biome.png`](worldgen-mosaics/seed-712816/biome.png) | `a5c3a964d9872c1454cb3fd120f6838be9d6f6de116dc7720914a27b2ce1f8ae` |
+| Vegetation density | [`worldgen-mosaics/seed-712816/vegetation.png`](worldgen-mosaics/seed-712816/vegetation.png) | `64c5235ec1229c01e2c4438686672e54ee4a0ddd36e5834771485dc25b01a17f` |
 
 `file` identifies all three artifacts as non-interlaced 8-bit RGB PNGs at
 `256x256`. A second complete CLI render was compared byte-for-byte with all
-three checked artifacts and matched. The retained command logs are
-`.analysis/codex-logs/worldgen-mosaic-{render,repeat}.log`; the repeat output
-directory is intentionally ignored.
+three checked artifacts and matched. The final repeat output directory is
+`.analysis/worldgen-mosaics-repeat-final` and is intentionally ignored.
 
 The mosaics visibly distinguish the large water bodies, land relief, biome
 families, and supported vegetation-density regions. They also expose a narrow,
@@ -67,23 +66,37 @@ long east-west river corridor near the southern part of the rendered extent.
 That observation is navigation context for the owner playtest, not a quality
 disposition from this renderer checkpoint.
 
+## Post-model multi-seed matrix
+
+After the coherence model change, the same `2048x2048` production sampler was
+run in parallel for seeds `0`, `34`, `712816`, and `832040`. These ignored
+artifacts in `.analysis/worldgen-matrix-final/` are a visual/fingerprint matrix,
+not a replacement for owner review:
+
+| Seed | Height SHA-256 | Biome SHA-256 | Vegetation SHA-256 |
+| --- | --- | --- | --- |
+| `0` | `4ce51d20e15d89a3f7bc55afc3d27b4828ce1846a12ddeeeb1fba13782b4e308` | `6e0f030f2376f1d7292c3dc3a43c6ca2d709bfff5d270f2944cee7cf665dbd8` | `f3d9bc3e688d95d65aa4545d83d9a27750ab91c50d176e6eacaa3df844ad7076` |
+| `34` | `250630efa594ec4ecd404e255cc0ad403fca2380f00af3cb383febcd073e12ec` | `1e248509886ff342271d3806e3312270860c64925465c4f6db965d92a61e77d8` | `c6cddc1c8372f124309f186d7cdbf5fed2fa3a0839720833a6f74e40a49215b7` |
+| `712816` | `861222d2a3fc634967e56af1f425feb998dce4687e03c31cf6e96ae47d089c4f` | `a5c3a964d9872c1454cb3fd120f6838be9d6f6de116dc7720914a27b2ce1f8ae` | `64c5235ec1229c01e2c4438686672e54ee4a0ddd36e5834771485dc25b01a17f` |
+| `832040` | `fcd142eb01bd92c4308ac349e2a1f32e984ab207b460bc2b80f2aaf3b959feba` | `4efdba8b949dbb4a8ecdd8719ecdd3e3bd23988573c4c7c8ba9538e0f388e25b` | `c6cddc1c8372f124309f186d7cdbf5fed2fa3a0839720833a6f74e40a49215b7` |
+
+
 ## Validation
 
-- `cargo test -p mc-worldgen`: `121` passed, `2` documented ignores.
+- `cargo test -p mc-worldgen --lib`: `112` passed, `5` documented ignores.
 - `cargo run -p xtask -- code-health`: `0 fail`, `KEEP`.
-- `cargo test --workspace`: PASS.
-- `cargo clippy --workspace --all-targets -- -D warnings`: PASS.
-- `cargo fmt --all -- --check` and scoped diff/link checks: PASS.
-- Independent read-only review: PASS with no findings; it rechecked the
-  authority boundary, decoded dimensions, recorded checksums, and a complete
-  byte-identical rerender.
+- `cargo clippy -p mc-worldgen --all-targets -- -D warnings`: PASS.
+- `cargo fmt --all -- --check`: PASS.
+- The fresh real-client owner-review route completed with `passed=true` on
+  seed `712816`; its final ignored artifact is
+  `.analysis/seed-owner-review/20260830T204140`, and the rendered contact-sheet
+  SHA-256 is `d3ac0c14bcc370a3fc25ecb83af9d586c29b0a5b95a1174a51990bb5251d9d8e`.
+- The owner quality disposition remains separate from this automated and
+  agent-run evidence.
 
-Manual/client gate: not run. The public plan requires the owner-observed
-seed-`712816` playtest next.
-
-Benchmark: not applicable. This checkpoint adds diagnostic sampling and
-rendering without changing generated-column decisions; the mapped release-host
-throughput comparison remains open.
+Benchmark: not run. This checkpoint changes generated-column climate and
+river decisions; the release-host throughput comparison remains open and no
+performance conclusion is claimed.
 
 ## Evidence boundary
 

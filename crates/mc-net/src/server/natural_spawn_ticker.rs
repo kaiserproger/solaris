@@ -7,18 +7,14 @@ use crate::play::{
 
 pub(super) struct NaturalSpawnTicker {
     scheduler: NaturalSpawnScheduler,
-    friendly_interval_ticks: u64,
-    hostile_interval_ticks: u64,
-    simulation_distance: i32,
+    policy: RandomTickPolicy,
 }
 
 impl NaturalSpawnTicker {
     pub(super) fn new(policy: RandomTickPolicy) -> Self {
         Self {
             scheduler: NaturalSpawnScheduler::default(),
-            friendly_interval_ticks: policy.friendly_spawn_interval_ticks,
-            hostile_interval_ticks: policy.hostile_spawn_interval_ticks,
-            simulation_distance: policy.simulation_distance,
+            policy,
         }
     }
 
@@ -35,9 +31,7 @@ impl NaturalSpawnTicker {
             &mut self.scheduler,
             NaturalSpawnTickInput {
                 tick,
-                friendly_interval: self.friendly_interval_ticks,
-                hostile_interval: self.hostile_interval_ticks,
-                simulation_distance: self.simulation_distance,
+                policy: self.policy,
                 world_read,
                 materials,
             },

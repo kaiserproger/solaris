@@ -440,6 +440,8 @@ impl RuntimeControlLimits {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct RuntimeWorkBudgets {
+    /// Pinned to the profile maximum; runtime autoscaling never reduces
+    /// entity AI pathing quality.
     pub entity_pathing_candidates: usize,
     pub random_tick_chunks: usize,
     pub scheduled_ticks: usize,
@@ -926,13 +928,9 @@ impl RuntimeControlPlane {
             && entity_us >= input.random_tick_p95_us
             && entity_us >= scheduled_us
         {
-            self.work_budgets.entity_pathing_candidates = halve_floor_usize(
-                self.work_budgets.entity_pathing_candidates,
-                self.work_bounds.min.entity_pathing_candidates,
-            );
             (
                 Some(RuntimeWorkFocus::EntitySimulation),
-                "tick p95 exceeded target; reducing entity pathing search while retaining physics correctness",
+                "tick p95 exceeded target; entity pathing candidates stay fixed at the profile maximum",
             )
         } else if input.tick_p95_us > target_tick_us && input.random_tick_p95_us >= scheduled_us {
             self.work_budgets.random_tick_chunks = halve_floor_usize(
@@ -953,10 +951,6 @@ impl RuntimeControlPlane {
                 "tick p95 exceeded target; reducing the more expensive scheduled-tick class",
             )
         } else {
-            self.work_budgets.entity_pathing_candidates = recover_toward_ceiling_usize(
-                self.work_budgets.entity_pathing_candidates,
-                self.work_bounds.max.entity_pathing_candidates,
-            );
             self.work_budgets.random_tick_chunks = recover_toward_ceiling_usize(
                 self.work_budgets.random_tick_chunks,
                 self.work_bounds.max.random_tick_chunks,
@@ -2396,7 +2390,7 @@ mod tests {
     }
 
     #[test]
-    fn work_pressure_reduces_entity_pathing_without_dropping_physics() {
+    fn work_pressure_keeps_entity_pathing_candidates_at_profile_max() {
         let mut controller = balanced_controller();
 
         let decision = controller.observe_work(RuntimeWorkInput {
@@ -2410,9 +2404,9 @@ mod tests {
             scheduled_budget_exhausted: false,
         });
 
-        assert_eq!(decision.action, AutoscaleAction::ScaleDown);
+        assert_eq!(decision.action, AutoscaleAction::Hold);
         assert_eq!(decision.focus, Some(RuntimeWorkFocus::EntitySimulation));
-        assert_eq!(decision.budgets.entity_pathing_candidates, 4);
+        assert_eq!(decision.budgets.entity_pathing_candidates, 8);
         assert_eq!(decision.budgets.random_tick_chunks, 64);
         assert_eq!(decision.budgets.scheduled_ticks, 256);
     }
@@ -2432,9 +2426,9 @@ mod tests {
             scheduled_budget_exhausted: false,
         });
 
-        assert_eq!(decision.action, AutoscaleAction::ScaleDown);
+        assert_eq!(decision.action, AutoscaleAction::Hold);
         assert_eq!(decision.focus, Some(RuntimeWorkFocus::EntitySimulation));
-        assert_eq!(decision.budgets.entity_pathing_candidates, 4);
+        assert_eq!(decision.budgets.entity_pathing_candidates, 8);
     }
 
     #[test]

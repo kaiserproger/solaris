@@ -577,6 +577,9 @@ const OUTBOUND_COMMANDS_PER_PLAYER_BURST: usize = 16;
 const ENTITY_SPAWNS_PER_WRITE_TURN: usize = 16;
 const ENTITY_MOVEMENTS_PER_WRITE_TURN: usize = 256;
 const ENTITY_MOVEMENT_TARGET_UPDATES_PER_TRACKING_TURN: usize = 512;
+// Superseded for the active simulation path, which goal-selects the full
+// population every tick; kept test-only so the rotation helper stays covered.
+#[cfg(test)]
 const ENTITY_GOAL_UPDATES_PER_TICK: usize = 512;
 const TELEPORT_RESEND_DELAY_TICKS: u64 = 20;
 
@@ -694,6 +697,7 @@ fn ordinary_entity_is_due_for_movement_tracking(
     (ordinal + entity_count - start) % entity_count < publication_budget
 }
 
+#[cfg(test)]
 fn bounded_entity_ids_due_for_tick(
     eligible_ids: &HashSet<EntityId>,
     tick: u64,
@@ -704,7 +708,7 @@ fn bounded_entity_ids_due_for_tick(
         return eligible_ids.clone();
     }
     let mut ordered = eligible_ids.iter().copied().collect::<Vec<_>>();
-    ordered.sort_unstable();
+    radix_sort_entity_ids(&mut ordered);
     let population = ordered.len();
     (0..limit)
         .map(|stratum| {
@@ -716,6 +720,62 @@ fn bounded_entity_ids_due_for_tick(
         .collect()
 }
 
+#[cfg(test)]
+const ENTITY_ID_RADIX_BUCKETS: usize = 256;
+
+#[cfg(test)]
+fn radix_sort_entity_ids(ids: &mut [EntityId]) {
+    if ids.len() < 2 {
+        return;
+    }
+    let len = ids.len();
+    let mut histograms = [[0usize; ENTITY_ID_RADIX_BUCKETS]; 4];
+    for id in ids.iter() {
+        let key = id.0 as u32;
+        histograms[0][(key & 0xFF) as usize] += 1;
+        histograms[1][((key >> 8) & 0xFF) as usize] += 1;
+        histograms[2][((key >> 16) & 0xFF) as usize] += 1;
+        // The sign-bit bias keeps signed order identical to bucket order.
+        histograms[3][((key >> 24) ^ 0x80) as usize] += 1;
+    }
+    let mut scratch = vec![EntityId(0); len];
+    let mut result_in_scratch = false;
+    for (pass, histogram) in histograms.iter_mut().enumerate() {
+        if histogram.iter().filter(|count| **count > 0).count() <= 1 {
+            // Byte is constant across the input; the permutation is identity.
+            continue;
+        }
+        let (src, dst): (&[EntityId], &mut [EntityId]) = if result_in_scratch {
+            (scratch.as_slice(), &mut *ids)
+        } else {
+            (ids, scratch.as_mut_slice())
+        };
+        let mut offsets = [0usize; ENTITY_ID_RADIX_BUCKETS];
+        let mut total = 0usize;
+        for (bucket, count) in histogram.iter().enumerate() {
+            offsets[bucket] = total;
+            total += *count;
+        }
+        debug_assert_eq!(total, len);
+        let shift = (pass as u32) * 8;
+        for id in src.iter() {
+            let key = id.0 as u32;
+            let bucket = if pass == 3 {
+                ((key >> shift) ^ 0x80) as usize
+            } else {
+                ((key >> shift) & 0xFF) as usize
+            };
+            dst[offsets[bucket]] = *id;
+            offsets[bucket] += 1;
+        }
+        result_in_scratch = !result_in_scratch;
+    }
+    if result_in_scratch {
+        ids.copy_from_slice(&scratch);
+    }
+}
+
+#[cfg(test)]
 fn entity_goal_ids_due_for_tick(
     eligible_ids: &HashSet<EntityId>,
     tick: u64,
@@ -862,6 +922,10 @@ fn survival_damage_after_equipment(
 
 /// Default chunk radius around the player when no operator override is present.
 pub const DEFAULT_VIEW_DISTANCE: i32 = 10;
+/// Upper bound for each natural-mob population cap.
+pub const MAX_NATURAL_SPAWN_CAP: usize = 256;
+/// Upper bound for chunks sampled by one natural-spawn category attempt.
+pub const MAX_NATURAL_SPAWN_CHUNK_BUDGET: usize = 64;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct RandomTickPolicy {
@@ -872,6 +936,11 @@ pub struct RandomTickPolicy {
     pub save_interval_ticks: u64,
     pub friendly_spawn_interval_ticks: u64,
     pub hostile_spawn_interval_ticks: u64,
+    pub friendly_spawn_cap: usize,
+    pub aquatic_spawn_cap: usize,
+    pub hostile_spawn_cap: usize,
+    pub friendly_spawn_chunk_budget: usize,
+    pub hostile_spawn_chunk_budget: usize,
     pub seed: u64,
 }
 
@@ -885,6 +954,11 @@ impl Default for RandomTickPolicy {
             save_interval_ticks: 20,
             friendly_spawn_interval_ticks: 400,
             hostile_spawn_interval_ticks: 20,
+            friendly_spawn_cap: 32,
+            aquatic_spawn_cap: 20,
+            hostile_spawn_cap: 70,
+            friendly_spawn_chunk_budget: 48,
+            hostile_spawn_chunk_budget: 4,
             seed: 0,
         }
     }
@@ -903,6 +977,15 @@ impl RandomTickPolicy {
             save_interval_ticks: self.save_interval_ticks.max(1),
             friendly_spawn_interval_ticks: self.friendly_spawn_interval_ticks,
             hostile_spawn_interval_ticks: self.hostile_spawn_interval_ticks,
+            friendly_spawn_cap: self.friendly_spawn_cap.min(MAX_NATURAL_SPAWN_CAP),
+            aquatic_spawn_cap: self.aquatic_spawn_cap.min(MAX_NATURAL_SPAWN_CAP),
+            hostile_spawn_cap: self.hostile_spawn_cap.min(MAX_NATURAL_SPAWN_CAP),
+            friendly_spawn_chunk_budget: self
+                .friendly_spawn_chunk_budget
+                .clamp(1, MAX_NATURAL_SPAWN_CHUNK_BUDGET),
+            hostile_spawn_chunk_budget: self
+                .hostile_spawn_chunk_budget
+                .clamp(1, MAX_NATURAL_SPAWN_CHUNK_BUDGET),
             seed: self.seed,
         }
     }
@@ -11942,17 +12025,18 @@ where
     new_pose.flags = movement.flags;
     refresh_player_water_state(interaction.as_deref(), &mut new_pose).await;
     refresh_player_fall_state(old_pose, &mut new_pose);
-    if correct_player_collision(
-        interaction.as_deref(),
-        writer,
-        compression,
-        old_pose,
-        new_pose,
-        current_tick,
-        next_teleport_id,
-        pending_teleport,
-    )
-    .await?
+    if game_mode != GameMode::Spectator
+        && correct_player_collision(
+            interaction.as_deref(),
+            writer,
+            compression,
+            old_pose,
+            new_pose,
+            current_tick,
+            next_teleport_id,
+            pending_teleport,
+        )
+        .await?
     {
         *player_pose = old_pose;
         return Ok(());

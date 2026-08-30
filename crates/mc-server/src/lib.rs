@@ -24,6 +24,12 @@ use mc_net::WorldHandle;
 use mc_world::BlockRegistry;
 use serde::{Deserialize, Serialize};
 
+pub mod dashboard;
+pub mod dashboard_stats;
+#[cfg(test)]
+#[path = "dashboard_tests.rs"]
+mod dashboard_tests;
+
 /// Crate version, exposed so other crates and the binary can report it.
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");
 
@@ -50,6 +56,8 @@ pub struct ServerConfig {
     pub autoscale: AutoscaleSection,
     #[serde(default)]
     pub plugins: PluginSection,
+    #[serde(default)]
+    pub dashboard: DashboardSection,
 }
 
 /// Identity-level server settings.
@@ -72,6 +80,52 @@ pub struct ServerSection {
 pub struct NetworkSection {
     pub bind_address: String,
     pub port: u16,
+}
+
+/// Optional first-party operator dashboard settings. Default-off and
+/// loopback-bound; exposing it beyond localhost requires an explicit
+/// acknowledgement because the dashboard is read-only and unauthenticated.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields, default)]
+pub struct DashboardSection {
+    pub enabled: bool,
+    pub bind_address: String,
+    pub port: u16,
+    pub allow_remote: bool,
+}
+
+impl Default for DashboardSection {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            bind_address: "127.0.0.1".to_owned(),
+            port: 8080,
+            allow_remote: false,
+        }
+    }
+}
+
+impl DashboardSection {
+    /// Validate and normalize the dashboard listener endpoint.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when `bind_address` is not a valid IP address or a
+    /// non-loopback bind was requested without `allow_remote = true`.
+    pub fn validate(&self) -> Result<SocketAddr, String> {
+        let ip: IpAddr = self.bind_address.parse().map_err(|_| {
+            format!(
+                "dashboard.bind_address `{}` is not a valid IP address",
+                self.bind_address
+            )
+        })?;
+        if !ip.is_loopback() && !self.allow_remote {
+            return Err(format!(
+                "dashboard.bind_address {ip} is not loopback; set dashboard.allow_remote = true to deliberately expose the unauthenticated dashboard"
+            ));
+        }
+        Ok(SocketAddr::new(ip, self.port))
+    }
 }
 
 /// `world_dir` is the on-disk world save the server reads chunks from
@@ -191,6 +245,16 @@ pub struct SimulationSection {
     pub friendly_spawn_interval_ticks: u64,
     #[serde(default = "default_hostile_spawn_interval_ticks")]
     pub hostile_spawn_interval_ticks: u64,
+    #[serde(default = "default_friendly_spawn_cap")]
+    pub friendly_spawn_cap: usize,
+    #[serde(default = "default_aquatic_spawn_cap")]
+    pub aquatic_spawn_cap: usize,
+    #[serde(default = "default_hostile_spawn_cap")]
+    pub hostile_spawn_cap: usize,
+    #[serde(default = "default_friendly_spawn_chunk_budget")]
+    pub friendly_spawn_chunk_budget: usize,
+    #[serde(default = "default_hostile_spawn_chunk_budget")]
+    pub hostile_spawn_chunk_budget: usize,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
@@ -270,6 +334,19 @@ pub struct AccessControlLoadReport {
     pub banned_identities: usize,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum OperatorFileOperation {
+    Add(String),
+    Remove(String),
+    List,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct OperatorFileResult {
+    pub changed: bool,
+    pub identities: Vec<String>,
+}
+
 #[derive(Debug, Deserialize)]
 struct AccessControlProfileEntry {
     #[serde(default)]
@@ -282,15 +359,23 @@ impl ServerConfig {
     /// Merge optional file-backed access-control profiles into the inline TOML policy.
     ///
     /// Relative paths are resolved from the directory containing `config_path`.
-    /// File entries use vanilla-style JSON objects with `name` and/or `uuid`; extra
-    /// fields such as operator level or ban metadata are ignored deliberately.
+    /// When `admin.operators_file` is omitted, an existing `ops.json` beside the
+    /// config is used for the operator profile. File entries use vanilla-style
+    /// JSON objects with `name` and/or `uuid`; extra fields such as operator level
+    /// or ban metadata are ignored deliberately.
     pub fn load_access_control_files(
         &mut self,
         config_path: &Path,
     ) -> anyhow::Result<AccessControlLoadReport> {
         let mut report = AccessControlLoadReport::default();
 
-        if let Some(path) = self.admin.operators_file.clone() {
+        let operators_file = self.admin.operators_file.clone().or_else(|| {
+            let default = Path::new("ops.json");
+            resolve_config_relative_path(config_path, default)
+                .is_file()
+                .then(|| default.to_path_buf())
+        });
+        if let Some(path) = operators_file {
             let entries = load_access_control_file(config_path, &path, "admin.operators_file")?;
             report.files_loaded += 1;
             report.operator_identities = entries.len();
@@ -311,6 +396,114 @@ impl ServerConfig {
 
         Ok(report)
     }
+
+    /// Add, remove, or list identities in the configured vanilla-style operator file.
+    ///
+    /// When `admin.operators_file` is absent, the management caller may supply
+    /// the default `ops.json` path in memory; startup auto-loads that file when
+    /// it exists beside the selected config. Add/remove preserve unknown profile
+    /// metadata and normalize duplicate identities while writing deterministic JSON.
+    pub fn manage_operator_file(
+        &self,
+        config_path: &Path,
+        operation: OperatorFileOperation,
+    ) -> anyhow::Result<OperatorFileResult> {
+        let configured_path = self.admin.operators_file.as_deref().ok_or_else(|| {
+            anyhow::anyhow!(
+                "operator management requires admin.operators_file in {}",
+                config_path.display()
+            )
+        })?;
+        let path = resolve_config_relative_path(config_path, configured_path);
+        let requested_identity = match &operation {
+            OperatorFileOperation::Add(raw) | OperatorFileOperation::Remove(raw) => {
+                Some(normalize_operator_identity(raw)?)
+            }
+            OperatorFileOperation::List => None,
+        };
+        if !path.exists() && matches!(&operation, OperatorFileOperation::Add(_)) {
+            write_operator_profiles(&path, &[])?;
+        }
+        let (_, values) =
+            read_access_control_values(config_path, configured_path, "admin.operators_file")?;
+        let (mut values, mut identities) =
+            canonicalize_operator_profiles(values, "admin.operators_file", &path)?;
+
+        match operation {
+            OperatorFileOperation::List => {
+                return Ok(OperatorFileResult {
+                    changed: false,
+                    identities: identities.into_iter().collect(),
+                });
+            }
+            OperatorFileOperation::Add(_) => {
+                let identity = requested_identity
+                    .as_deref()
+                    .expect("add operation has a normalized identity");
+                if identities.insert(identity.to_owned()) {
+                    let mut profile = serde_json::Map::new();
+                    if uuid::Uuid::parse_str(identity).is_ok() {
+                        profile.insert(
+                            "uuid".to_owned(),
+                            serde_json::Value::String(identity.to_owned()),
+                        );
+                    } else {
+                        profile.insert(
+                            "name".to_owned(),
+                            serde_json::Value::String(identity.to_owned()),
+                        );
+                    }
+                    values.push(serde_json::Value::Object(profile));
+                } else {
+                    return Ok(OperatorFileResult {
+                        changed: false,
+                        identities: identities.into_iter().collect(),
+                    });
+                }
+            }
+            OperatorFileOperation::Remove(_) => {
+                let identity = requested_identity
+                    .as_deref()
+                    .expect("remove operation has a normalized identity");
+                let mut removed = false;
+                let mut retained = Vec::with_capacity(values.len());
+                for mut value in values {
+                    let Some(profile) = value.as_object_mut() else {
+                        retained.push(value);
+                        continue;
+                    };
+                    for key in ["name", "uuid"] {
+                        let matches = profile
+                            .get(key)
+                            .and_then(serde_json::Value::as_str)
+                            .and_then(|value| normalize_profile_identity(key, value).ok())
+                            .is_some_and(|value| value == identity);
+                        if matches {
+                            profile.remove(key);
+                            removed = true;
+                        }
+                    }
+                    if profile.contains_key("name") || profile.contains_key("uuid") {
+                        retained.push(value);
+                    }
+                }
+                values = retained;
+                identities.remove(identity);
+                if !removed {
+                    return Ok(OperatorFileResult {
+                        changed: false,
+                        identities: identities.into_iter().collect(),
+                    });
+                }
+            }
+        }
+
+        write_operator_profiles(&path, &values)?;
+        Ok(OperatorFileResult {
+            changed: true,
+            identities: identities.into_iter().collect(),
+        })
+    }
 }
 
 fn load_access_control_file(
@@ -319,48 +512,10 @@ fn load_access_control_file(
     field: &'static str,
 ) -> anyhow::Result<Vec<String>> {
     let path = resolve_config_relative_path(config_path, configured_path);
-    let file = std::fs::File::open(&path)
-        .with_context(|| format!("opening {field} from {}", path.display()))?;
-    let metadata = file
-        .metadata()
-        .with_context(|| format!("reading {field} metadata from {}", path.display()))?;
-    if !metadata.is_file() {
-        bail!("{field} must point to a regular file: {}", path.display());
-    }
-    if metadata.len() > MAX_ACCESS_CONTROL_FILE_BYTES {
-        bail!(
-            "{field} exceeds the {} byte limit: {}",
-            MAX_ACCESS_CONTROL_FILE_BYTES,
-            path.display()
-        );
-    }
-
-    let mut bytes = Vec::with_capacity(
-        usize::try_from(metadata.len().min(MAX_ACCESS_CONTROL_FILE_BYTES)).unwrap_or(0),
-    );
-    file.take(MAX_ACCESS_CONTROL_FILE_BYTES + 1)
-        .read_to_end(&mut bytes)
-        .with_context(|| format!("reading bounded {field} from {}", path.display()))?;
-    if bytes.len() as u64 > MAX_ACCESS_CONTROL_FILE_BYTES {
-        bail!(
-            "{field} grew beyond the {} byte limit while reading: {}",
-            MAX_ACCESS_CONTROL_FILE_BYTES,
-            path.display()
-        );
-    }
-    let profiles: Vec<AccessControlProfileEntry> = serde_json::from_slice(&bytes)
-        .with_context(|| format!("parsing {field} JSON from {}", path.display()))?;
-    if profiles.len() > MAX_ACCESS_CONTROL_FILE_ENTRIES {
-        bail!(
-            "{field} from {} contains {} entries; maximum is {}",
-            path.display(),
-            profiles.len(),
-            MAX_ACCESS_CONTROL_FILE_ENTRIES
-        );
-    }
-
+    let values = read_access_control_values(config_path, configured_path, field)?.1;
     let mut entries = BTreeSet::new();
-    for (index, profile) in profiles.into_iter().enumerate() {
+    for (index, value) in values.into_iter().enumerate() {
+        let profile = parse_access_control_profile(value, field, &path, index)?;
         let mut populated = false;
         if let Some(name) = profile.name {
             entries.insert(validate_access_control_name(&name, field, &path, index)?);
@@ -390,8 +545,155 @@ fn load_access_control_file(
             );
         }
     }
-
     Ok(entries.into_iter().collect())
+}
+
+fn read_access_control_values(
+    config_path: &Path,
+    configured_path: &Path,
+    field: &'static str,
+) -> anyhow::Result<(PathBuf, Vec<serde_json::Value>)> {
+    let path = resolve_config_relative_path(config_path, configured_path);
+    let file = std::fs::File::open(&path)
+        .with_context(|| format!("opening {field} from {}", path.display()))?;
+    let metadata = file
+        .metadata()
+        .with_context(|| format!("reading {field} metadata from {}", path.display()))?;
+    if !metadata.is_file() {
+        bail!("{field} must point to a regular file: {}", path.display());
+    }
+    if metadata.len() > MAX_ACCESS_CONTROL_FILE_BYTES {
+        bail!(
+            "{field} exceeds the {} byte limit: {}",
+            MAX_ACCESS_CONTROL_FILE_BYTES,
+            path.display()
+        );
+    }
+    let mut bytes = Vec::with_capacity(
+        usize::try_from(metadata.len().min(MAX_ACCESS_CONTROL_FILE_BYTES)).unwrap_or(0),
+    );
+    file.take(MAX_ACCESS_CONTROL_FILE_BYTES + 1)
+        .read_to_end(&mut bytes)
+        .with_context(|| format!("reading bounded {field} from {}", path.display()))?;
+    if bytes.len() as u64 > MAX_ACCESS_CONTROL_FILE_BYTES {
+        bail!(
+            "{field} grew beyond the {} byte limit while reading: {}",
+            MAX_ACCESS_CONTROL_FILE_BYTES,
+            path.display()
+        );
+    }
+    let values: Vec<serde_json::Value> = serde_json::from_slice(&bytes)
+        .with_context(|| format!("parsing {field} JSON from {}", path.display()))?;
+    if values.len() > MAX_ACCESS_CONTROL_FILE_ENTRIES {
+        bail!(
+            "{field} from {} contains {} entries; maximum is {}",
+            path.display(),
+            values.len(),
+            MAX_ACCESS_CONTROL_FILE_ENTRIES
+        );
+    }
+    Ok((path, values))
+}
+
+fn parse_access_control_profile(
+    value: serde_json::Value,
+    field: &'static str,
+    path: &Path,
+    index: usize,
+) -> anyhow::Result<AccessControlProfileEntry> {
+    serde_json::from_value(value)
+        .with_context(|| format!("parsing {field} JSON entry {index} from {}", path.display()))
+}
+
+fn canonicalize_operator_profiles(
+    values: Vec<serde_json::Value>,
+    field: &'static str,
+    path: &Path,
+) -> anyhow::Result<(Vec<serde_json::Value>, BTreeSet<String>)> {
+    let mut identities = BTreeSet::new();
+    let mut canonical = Vec::with_capacity(values.len());
+    for (index, mut value) in values.into_iter().enumerate() {
+        let profile = parse_access_control_profile(value.clone(), field, path, index)?;
+        let mut populated = false;
+        if let Some(name) = profile.name.as_deref() {
+            let identity = validate_access_control_name(name, field, path, index)?;
+            populated = true;
+            if !identities.insert(identity) {
+                value
+                    .as_object_mut()
+                    .expect("access-control profile must be a JSON object")
+                    .remove("name");
+            }
+        }
+        if let Some(raw_uuid) = profile.uuid.as_deref() {
+            let identity = normalize_profile_identity("uuid", raw_uuid).map_err(|message| {
+                anyhow::anyhow!("{field} entry {index} from {} {message}", path.display())
+            })?;
+            populated = true;
+            if !identities.insert(identity) {
+                value
+                    .as_object_mut()
+                    .expect("access-control profile must be a JSON object")
+                    .remove("uuid");
+            }
+        }
+        if !populated {
+            bail!(
+                "{field} entry {index} from {} must contain name and/or uuid",
+                path.display()
+            );
+        }
+        let object = value
+            .as_object()
+            .expect("access-control profile must be a JSON object");
+        if object.contains_key("name") || object.contains_key("uuid") {
+            canonical.push(value);
+        }
+    }
+    Ok((canonical, identities))
+}
+
+fn normalize_profile_identity(key: &str, raw: &str) -> Result<String, String> {
+    if key == "uuid" {
+        let raw = raw.trim();
+        if raw.is_empty() {
+            return Err("contains an empty uuid".to_owned());
+        }
+        return uuid::Uuid::parse_str(raw)
+            .map(|uuid| uuid.to_string())
+            .map_err(|_| "contains an invalid uuid".to_owned());
+    }
+    let name = raw.trim();
+    if !(3..=16).contains(&name.len())
+        || !name
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || byte == b'_')
+    {
+        return Err(
+            "contains an invalid Minecraft username; expected 3..=16 ASCII letters, digits, or `_`"
+                .to_owned(),
+        );
+    }
+    Ok(name.to_ascii_lowercase())
+}
+
+fn normalize_operator_identity(raw: &str) -> anyhow::Result<String> {
+    let raw = raw.trim();
+    if raw.is_empty() {
+        bail!("operator identity cannot be empty; provide a Minecraft username or UUID");
+    }
+    if let Ok(uuid) = uuid::Uuid::parse_str(raw) {
+        return Ok(uuid.to_string());
+    }
+    normalize_profile_identity("name", raw)
+        .map_err(|message| anyhow::anyhow!("invalid operator identity `{raw}`: {message}"))
+}
+
+fn write_operator_profiles(path: &Path, values: &[serde_json::Value]) -> anyhow::Result<()> {
+    let mut rendered = serde_json::to_vec_pretty(values).context("rendering operator file JSON")?;
+    rendered.push(b'\n');
+    std::fs::write(path, rendered)
+        .with_context(|| format!("writing operator file {}", path.display()))
 }
 
 fn resolve_config_relative_path(config_path: &Path, configured_path: &Path) -> PathBuf {
@@ -411,20 +713,10 @@ fn validate_access_control_name(
     path: &Path,
     index: usize,
 ) -> anyhow::Result<String> {
-    let name = raw.trim();
-    if !(3..=16).contains(&name.len())
-        || !name
-            .bytes()
-            .all(|byte| byte.is_ascii_alphanumeric() || byte == b'_')
-    {
-        bail!(
-            "{field} entry {index} from {} contains an invalid Minecraft username; expected 3..=16 ASCII letters, digits, or `_`",
-            path.display()
-        );
-    }
-    Ok(name.to_ascii_lowercase())
+    normalize_profile_identity("name", raw).map_err(|message| {
+        anyhow::anyhow!("{field} entry {index} from {} {message}", path.display())
+    })
 }
-
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
 #[serde(rename_all = "snake_case")]
 pub enum AutoscaleProfile {
@@ -559,6 +851,11 @@ impl Default for SimulationSection {
             save_interval_ticks: policy.save_interval_ticks,
             friendly_spawn_interval_ticks: policy.friendly_spawn_interval_ticks,
             hostile_spawn_interval_ticks: policy.hostile_spawn_interval_ticks,
+            friendly_spawn_cap: policy.friendly_spawn_cap,
+            aquatic_spawn_cap: policy.aquatic_spawn_cap,
+            hostile_spawn_cap: policy.hostile_spawn_cap,
+            friendly_spawn_chunk_budget: policy.friendly_spawn_chunk_budget,
+            hostile_spawn_chunk_budget: policy.hostile_spawn_chunk_budget,
         }
     }
 }
@@ -576,8 +873,14 @@ impl SimulationSection {
             save_interval_ticks: self.save_interval_ticks.max(1),
             friendly_spawn_interval_ticks: self.friendly_spawn_interval_ticks,
             hostile_spawn_interval_ticks: self.hostile_spawn_interval_ticks,
+            friendly_spawn_cap: self.friendly_spawn_cap,
+            aquatic_spawn_cap: self.aquatic_spawn_cap,
+            hostile_spawn_cap: self.hostile_spawn_cap,
+            friendly_spawn_chunk_budget: self.friendly_spawn_chunk_budget,
+            hostile_spawn_chunk_budget: self.hostile_spawn_chunk_budget,
             seed: seed as u64,
         }
+        .normalized()
     }
 }
 
@@ -677,6 +980,26 @@ fn default_friendly_spawn_interval_ticks() -> u64 {
 
 fn default_hostile_spawn_interval_ticks() -> u64 {
     mc_net::RandomTickPolicy::default().hostile_spawn_interval_ticks
+}
+
+fn default_friendly_spawn_cap() -> usize {
+    mc_net::RandomTickPolicy::default().friendly_spawn_cap
+}
+
+fn default_aquatic_spawn_cap() -> usize {
+    mc_net::RandomTickPolicy::default().aquatic_spawn_cap
+}
+
+fn default_hostile_spawn_cap() -> usize {
+    mc_net::RandomTickPolicy::default().hostile_spawn_cap
+}
+
+fn default_friendly_spawn_chunk_budget() -> usize {
+    mc_net::RandomTickPolicy::default().friendly_spawn_chunk_budget
+}
+
+fn default_hostile_spawn_chunk_budget() -> usize {
+    mc_net::RandomTickPolicy::default().hostile_spawn_chunk_budget
 }
 
 fn default_allow_local_dev_operators() -> bool {
@@ -795,6 +1118,90 @@ mod tests {
     use super::*;
 
     #[test]
+    fn dashboard_section_is_default_off_loopback_and_optional() {
+        let config: ServerConfig = toml::from_str(
+            r#"
+            [server]
+            name = "s"
+            motd = "m"
+            [network]
+            bind_address = "127.0.0.1"
+            port = 25565
+            "#,
+        )
+        .expect("minimal config parses without a dashboard section");
+        assert!(!config.dashboard.enabled);
+        assert_eq!(config.dashboard.bind_address, "127.0.0.1");
+        assert_eq!(config.dashboard.port, 8080);
+        assert!(!config.dashboard.allow_remote);
+        let socket = config
+            .dashboard
+            .validate()
+            .expect("loopback default validates");
+        assert!(socket.ip().is_loopback());
+    }
+
+    #[test]
+    fn dashboard_section_rejects_remote_bind_without_explicit_allow() {
+        let config: ServerConfig = toml::from_str(
+            r#"
+            [server]
+            name = "s"
+            motd = "m"
+            [network]
+            bind_address = "127.0.0.1"
+            port = 25565
+            [dashboard]
+            enabled = true
+            bind_address = "0.0.0.0"
+            port = 8080
+            "#,
+        )
+        .expect("remote dashboard config parses");
+        let error = config
+            .dashboard
+            .validate()
+            .expect_err("remote bind refused");
+        assert!(error.contains("allow_remote"));
+
+        let allowed: ServerConfig = toml::from_str(
+            r#"
+            [server]
+            name = "s"
+            motd = "m"
+            [network]
+            bind_address = "127.0.0.1"
+            port = 25565
+            [dashboard]
+            enabled = true
+            bind_address = "0.0.0.0"
+            port = 8080
+            allow_remote = true
+            "#,
+        )
+        .expect("explicit remote dashboard parses");
+        assert!(allowed.dashboard.validate().is_ok());
+    }
+
+    #[test]
+    fn dashboard_section_rejects_invalid_bind_address() {
+        let config: ServerConfig = toml::from_str(
+            r#"
+            [server]
+            name = "s"
+            motd = "m"
+            [network]
+            bind_address = "127.0.0.1"
+            port = 25565
+            [dashboard]
+            bind_address = "not-an-ip"
+            "#,
+        )
+        .expect("dashboard config parses before validation");
+        assert!(config.dashboard.validate().is_err());
+    }
+
+    #[test]
     fn parses_playable_profile_as_loopback_survival_spike() {
         let cfg: ServerConfig =
             toml::from_str(include_str!("../../../playable.toml")).expect("parse playable.toml");
@@ -826,6 +1233,11 @@ mod tests {
         assert_eq!(cfg.simulation.save_interval_ticks, 1200);
         assert_eq!(cfg.simulation.friendly_spawn_interval_ticks, 400);
         assert_eq!(cfg.simulation.hostile_spawn_interval_ticks, 20);
+        assert_eq!(cfg.simulation.friendly_spawn_cap, 32);
+        assert_eq!(cfg.simulation.aquatic_spawn_cap, 20);
+        assert_eq!(cfg.simulation.hostile_spawn_cap, 70);
+        assert_eq!(cfg.simulation.friendly_spawn_chunk_budget, 48);
+        assert_eq!(cfg.simulation.hostile_spawn_chunk_budget, 4);
         assert_eq!(cfg.chunk_pipeline.chunk_send_rate, 8);
         assert_eq!(cfg.chunk_pipeline.chunk_load_rate, 16);
         assert_eq!(cfg.chunk_pipeline.chunk_generate_rate, 16);
@@ -1258,6 +1670,11 @@ mod tests {
             save_interval_ticks = 40
             friendly_spawn_interval_ticks = 800
             hostile_spawn_interval_ticks = 0
+            friendly_spawn_cap = 48
+            aquatic_spawn_cap = 24
+            hostile_spawn_cap = 64
+            friendly_spawn_chunk_budget = 20
+            hostile_spawn_chunk_budget = 6
         "#;
         let cfg: ServerConfig = toml::from_str(toml_src).expect("parse");
 
@@ -1265,6 +1682,11 @@ mod tests {
         assert_eq!(cfg.simulation.save_interval_ticks, 40);
         assert_eq!(cfg.simulation.friendly_spawn_interval_ticks, 800);
         assert_eq!(cfg.simulation.hostile_spawn_interval_ticks, 0);
+        assert_eq!(cfg.simulation.friendly_spawn_cap, 48);
+        assert_eq!(cfg.simulation.aquatic_spawn_cap, 24);
+        assert_eq!(cfg.simulation.hostile_spawn_cap, 64);
+        assert_eq!(cfg.simulation.friendly_spawn_chunk_budget, 20);
+        assert_eq!(cfg.simulation.hostile_spawn_chunk_budget, 6);
     }
 
     #[test]
@@ -1364,6 +1786,11 @@ mod tests {
             save_interval_ticks: 0,
             friendly_spawn_interval_ticks: 0,
             hostile_spawn_interval_ticks: 0,
+            friendly_spawn_cap: usize::MAX,
+            aquatic_spawn_cap: usize::MAX,
+            hostile_spawn_cap: usize::MAX,
+            friendly_spawn_chunk_budget: 0,
+            hostile_spawn_chunk_budget: usize::MAX,
         };
         let policy = section.to_network(42, 5);
 
@@ -1374,6 +1801,14 @@ mod tests {
         assert_eq!(policy.save_interval_ticks, 1);
         assert_eq!(policy.friendly_spawn_interval_ticks, 0);
         assert_eq!(policy.hostile_spawn_interval_ticks, 0);
+        assert_eq!(policy.friendly_spawn_cap, mc_net::MAX_NATURAL_SPAWN_CAP);
+        assert_eq!(policy.aquatic_spawn_cap, mc_net::MAX_NATURAL_SPAWN_CAP);
+        assert_eq!(policy.hostile_spawn_cap, mc_net::MAX_NATURAL_SPAWN_CAP);
+        assert_eq!(policy.friendly_spawn_chunk_budget, 1);
+        assert_eq!(
+            policy.hostile_spawn_chunk_budget,
+            mc_net::MAX_NATURAL_SPAWN_CHUNK_BUDGET
+        );
         assert_eq!(policy.seed, 42);
     }
 
@@ -1607,6 +2042,34 @@ mod tests {
         );
     }
 
+    #[test]
+    fn default_operator_file_loads_for_fresh_server_config() {
+        let temp = tempfile::tempdir().unwrap();
+        let config_path = temp.path().join("server.toml");
+        let config_src = r#"
+            [server]
+            name = "S"
+            motd = "M"
+
+            [network]
+            bind_address = "127.0.0.1"
+            port = 25565
+        "#;
+        let mut configured: ServerConfig = toml::from_str(config_src).unwrap();
+        configured.admin.operators_file = Some(PathBuf::from("ops.json"));
+        configured
+            .manage_operator_file(
+                &config_path,
+                OperatorFileOperation::Add("FreshOp".to_owned()),
+            )
+            .unwrap();
+
+        let mut restarted: ServerConfig = toml::from_str(config_src).unwrap();
+        let report = restarted.load_access_control_files(&config_path).unwrap();
+
+        assert_eq!(report.operator_identities, 1);
+        assert_eq!(restarted.admin.operators, vec!["freshop".to_owned()]);
+    }
     fn stub_blocks() -> Arc<BlockRegistry> {
         Arc::new(BlockRegistry::from_report(&[]).expect("empty registry builds"))
     }
@@ -1695,5 +2158,84 @@ mod tests {
             )
             .is_err()
         );
+    }
+    #[test]
+    fn operator_file_mutations_persist_and_deduplicate() {
+        let dir = tempfile::tempdir().unwrap();
+        let config_path = dir.path().join("server.toml");
+        let operator_path = dir.path().join("ops.json");
+        std::fs::write(
+            &operator_path,
+            r#"[{"name":"Builder","level":4},{"name":"builder"},{"name":"Other","note":"keep"}]"#,
+        )
+        .unwrap();
+        let config: ServerConfig = toml::from_str(
+            r#"
+                [server]
+                name = "Test"
+                motd = "Test"
+                [network]
+                bind_address = "127.0.0.1"
+                port = 25565
+                [admin]
+                operators_file = "ops.json"
+            "#,
+        )
+        .unwrap();
+
+        let listed = config
+            .manage_operator_file(&config_path, OperatorFileOperation::List)
+            .unwrap();
+        assert_eq!(listed.identities, vec!["builder", "other"]);
+        let added = config
+            .manage_operator_file(&config_path, OperatorFileOperation::Add("Alice".to_owned()))
+            .unwrap();
+        assert!(added.changed);
+        let persisted = std::fs::read_to_string(&operator_path).unwrap();
+        assert!(persisted.contains(r#""level": 4"#));
+        assert!(persisted.contains(r#""note": "keep""#));
+        let removed = config
+            .manage_operator_file(
+                &config_path,
+                OperatorFileOperation::Remove("builder".to_owned()),
+            )
+            .unwrap();
+        assert!(removed.changed);
+        assert!(
+            !std::fs::read_to_string(&operator_path)
+                .unwrap()
+                .contains("builder")
+        );
+    }
+
+    #[test]
+    fn invalid_operator_add_has_no_file_side_effect() {
+        let dir = tempfile::tempdir().unwrap();
+        let config_path = dir.path().join("server.toml");
+        let config: ServerConfig = toml::from_str(
+            r#"
+                [server]
+                name = "Test"
+                motd = "Test"
+                [network]
+                bind_address = "127.0.0.1"
+                port = 25565
+            "#,
+        )
+        .unwrap();
+        let config = ServerConfig {
+            admin: AdminSection {
+                operators_file: Some(PathBuf::from("ops.json")),
+                ..config.admin
+            },
+            ..config
+        };
+
+        let error = config
+            .manage_operator_file(&config_path, OperatorFileOperation::Add("no".to_owned()))
+            .unwrap_err();
+
+        assert!(error.to_string().contains("invalid operator identity"));
+        assert!(!dir.path().join("ops.json").exists());
     }
 }

@@ -5,4 +5,4 @@ api = "0.6.0"
 player_commands = ["geology"]
 
 [worldgen]
-ore_profile = "geological_deposits"
+ore_profile = "realistic_deposits"

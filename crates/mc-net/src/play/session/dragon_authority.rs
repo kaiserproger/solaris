@@ -163,17 +163,12 @@ impl SessionRegistry {
         }
 
         let mut dragon_ids = {
-            let entities = self.lock_entities("scan active ender dragons");
-            entities.prefetch(&active_ids);
-            active_ids
+            let inner = self.lock_inner("snapshot active ender dragon index");
+            inner
+                .ender_dragon_entities
                 .iter()
                 .copied()
-                .filter(|&id| {
-                    entities.snapshot(id).is_some_and(|snapshot| {
-                        snapshot.lifecycle == EntityLifecycle::Alive
-                            && snapshot.type_name == "minecraft:ender_dragon"
-                    })
-                })
+                .filter(|entity_id| active_ids.contains(entity_id))
                 .collect::<Vec<_>>()
         };
         if dragon_ids.is_empty() {
@@ -446,20 +441,15 @@ impl SessionRegistry {
         }
 
         // Preserve the ordinary hostile lock contract: do not acquire the combined
-        // session/entity guard unless an actual dragon cloud is active.
+        // session/entity guard unless an actual area-effect cloud is active. The
+        // retained-state check remains below after prefetching only those cloud ids.
         let mut cloud_ids = {
-            let entities = self.lock_entities("scan active dragon breath clouds");
-            entities.prefetch(&active_ids);
-            active_ids
+            let inner = self.lock_inner("snapshot active area effect cloud index");
+            inner
+                .area_effect_cloud_entities
                 .iter()
                 .copied()
-                .filter(|&id| {
-                    entities.snapshot(id).is_some_and(|snapshot| {
-                        snapshot.lifecycle == EntityLifecycle::Alive
-                            && snapshot.type_name == "minecraft:area_effect_cloud"
-                            && snapshot.retained.dragon_breath_cloud.is_some()
-                    })
-                })
+                .filter(|entity_id| active_ids.contains(entity_id))
                 .collect::<Vec<_>>()
         };
         if cloud_ids.is_empty() {

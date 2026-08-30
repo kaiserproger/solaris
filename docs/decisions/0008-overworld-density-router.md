@@ -51,9 +51,11 @@ revision fences these changed columns from revision-7 worlds.
 Worldgen revision 7 retained the revision-6 density router and added an explicit
 ore profile to the persisted world contract. The default `vanilla` profile uses
 the embedded 26.1.2 ore passes. A validated plugin manifest may instead declare
-`geological_deposits`; that disables the vanilla pass and uses large
-deterministic cross-chunk deposits. Conflicting declarations fail startup, and
-Lua receives no generator state or locks.
+the canonical `realistic_deposits` profile; that disables the vanilla pass and
+uses large deterministic cross-chunk deposits. Conflicting declarations fail
+startup, and Lua receives no generator state or locks. Earlier planning called
+this profile `geological_deposits`; the public manifest and persisted contract
+now use only the canonical `realistic_deposits` spelling.
 
 The optional `plains_village_prototype` settlement profile is an independent
 startup-only plugin declaration. It loads one fountain, one small house, and
@@ -149,10 +151,8 @@ seed coverage or owner-approved visual parity.
 - exact active-tick `InhabitedTime` accumulation through an actual Anvil
   flush/reopen, including a chunk active for only part of a batch;
 - rejection of a changed persisted ore profile;
-- manifest admission, conflicts, sidecar requirement, exact extracted-template
-  loading, and deterministic block-for-block village regeneration;
+- canonical `realistic_deposits` deposits crossing chunk boundaries while default generation stays vanilla;
 - order-independent ore placement;
-- geological deposits crossing chunk boundaries while default generation stays vanilla;
 - agent-run 26.1.2 MCP inspection with seed `918273645` and `tellus_like` mode
   over forest, coast, ocean, and high-relief terrain;
 - agent-run 26.1.2 MCP inspection of the exact shipped `playable.toml` seed-0

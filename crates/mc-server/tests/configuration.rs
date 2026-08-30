@@ -224,6 +224,15 @@ async fn read_configuration_preamble(
     compression: Compression,
 ) -> ClientboundKnownPacks {
     let mut frame = read_one_frame(stream, buf, compression).await;
+    assert_eq!(frame.id, ClientboundCustomPayload::ID);
+    let brand = ClientboundCustomPayload::decode(&mut frame.body).unwrap();
+    assert_eq!(frame.body.remaining(), 0);
+    let CustomPayload::Brand(brand) = brand.payload else {
+        panic!("the first configuration packet must publish the server brand");
+    };
+    assert!(brand.starts_with("Solaris "), "unexpected brand: {brand}");
+
+    let mut frame = read_one_frame(stream, buf, compression).await;
     assert_eq!(frame.id, UpdateEnabledFeatures::ID);
     let features = UpdateEnabledFeatures::decode(&mut frame.body).unwrap();
     assert_eq!(frame.body.remaining(), 0);

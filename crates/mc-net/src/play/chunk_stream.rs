@@ -73,6 +73,46 @@ const PRESSURE_FLUSH_STALE_REGION_RETRIES: usize = 3;
 const PREWARM_EDGE_RING_LIMIT: usize = 40;
 const PREWARM_PREPARED_CACHE_LIMIT: usize = 64;
 static PRESSURE_FLUSH_COORDINATOR: OnceLock<tokio::sync::Mutex<()>> = OnceLock::new();
+
+struct PendingLoadedChunkRetention {
+    world_read: Option<mc_world::WorldReadView>,
+    position: ChunkPos,
+    armed: bool,
+}
+
+impl PendingLoadedChunkRetention {
+    fn new(world_read: Option<&mc_world::WorldReadView>, chunk: (i32, i32)) -> Self {
+        let world_read = world_read.cloned();
+        let position = ChunkPos {
+            x: chunk.0,
+            z: chunk.1,
+        };
+        if let Some(view) = world_read.as_ref() {
+            view.retain_chunk(position);
+        }
+        Self {
+            armed: world_read.is_some(),
+            world_read,
+            position,
+        }
+    }
+
+    fn transfer_to_loaded(mut self) {
+        self.armed = false;
+    }
+}
+
+impl Drop for PendingLoadedChunkRetention {
+    fn drop(&mut self) {
+        if self.armed
+            && let Some(view) = self.world_read.as_ref()
+        {
+            let released = view.release_chunk(self.position);
+            debug_assert!(released, "pending loaded chunk retention disappeared");
+        }
+    }
+}
+
 pub(super) struct ChunkStreamState {
     world: WorldHandle,
     world_read: Option<mc_world::WorldReadView>,
@@ -607,6 +647,16 @@ impl ChunkStreamState {
                 ))
     }
 
+    fn release_loaded_world_chunk(&self, chunk: (i32, i32)) {
+        if let Some(world_read) = self.world_read.as_ref() {
+            let released = world_read.release_chunk(ChunkPos {
+                x: chunk.0,
+                z: chunk.1,
+            });
+            debug_assert!(released, "loaded chunk retention missing for {chunk:?}");
+        }
+    }
+
     pub(super) fn replan_center(
         &mut self,
         center_cx: i32,
@@ -628,7 +678,9 @@ impl ChunkStreamState {
         let desired = desired_chunk_set(center_cx, center_cz, self.view_distance);
         let unloads: Vec<_> = self.loaded.difference(&desired).copied().collect();
         for chunk in &unloads {
-            self.loaded.remove(chunk);
+            if self.loaded.remove(chunk) {
+                self.release_loaded_world_chunk(*chunk);
+            }
         }
         let mut visibility = self.sessions.replace_view(
             self.session_id,
@@ -683,7 +735,9 @@ impl ChunkStreamState {
         let desired = desired_chunk_set(self.center_cx, self.center_cz, self.view_distance);
         let unloads: Vec<_> = self.loaded.difference(&desired).copied().collect();
         for chunk in &unloads {
-            self.loaded.remove(chunk);
+            if self.loaded.remove(chunk) {
+                self.release_loaded_world_chunk(*chunk);
+            }
         }
         let mut visibility = self.sessions.replace_view(
             self.session_id,
@@ -696,7 +750,7 @@ impl ChunkStreamState {
         self.clear_ready();
         self.reset_pressure_tracking();
         self.reset_prewarm_tracking();
-        self.scheduler.replay_view(prioritized_spiral(
+        self.scheduler.replace_view(prioritized_spiral(
             self.center_cx,
             self.center_cz,
             self.view_distance,
@@ -710,6 +764,9 @@ impl ChunkStreamState {
 
     pub(super) fn replay_current_view(&mut self, direction_yaw: f32) {
         let loaded: Vec<_> = self.loaded.drain().collect();
+        for chunk in &loaded {
+            self.release_loaded_world_chunk(*chunk);
+        }
         dispatch_visibility_commands(self.sessions.mark_unloaded(self.session_id, &loaded));
 
         let desired = desired_chunk_set(self.center_cx, self.center_cz, self.view_distance);
@@ -1564,12 +1621,17 @@ impl ChunkStreamState {
                 if let Some(light) = prepared.light.clone() {
                     light_cache.insert(ChunkPos { x: cx, z: cz }, light);
                 }
+                let loaded_chunk = (cx, cz);
+                let retention =
+                    PendingLoadedChunkRetention::new(self.world_read.as_ref(), loaded_chunk);
                 let mut write_timing = prepared.write_timing;
                 let socket_write_started = Instant::now();
                 if let Err(err) = writer.write_all(&prepared.frame).await {
                     self.release_prepare_claim((cx, cz), prepare_claim);
                     return Err(err.into());
                 }
+                crate::operator_metrics::record_chunk_streamed();
+                crate::operator_metrics::record_outbound_bytes(prepared.frame.len() as u64);
                 write_timing.socket_write_ms = socket_write_started.elapsed().as_millis() as u64;
                 let visibility = if let Some(revision) = prepared_revision {
                     let Some(visibility) = self.sessions.mark_loaded_if_prepared_revision_current(
@@ -1589,7 +1651,14 @@ impl ChunkStreamState {
                 } else {
                     self.sessions.mark_loaded(self.session_id, (cx, cz))
                 };
-                self.loaded.insert((cx, cz));
+                let newly_loaded = self.loaded.insert(loaded_chunk);
+                debug_assert!(
+                    newly_loaded,
+                    "chunk emitted twice without unload: {loaded_chunk:?}"
+                );
+                if newly_loaded {
+                    retention.transfer_to_loaded();
+                }
                 for (position, cooking) in &prepared.hydrated_campfires {
                     self.sessions
                         .restore_campfire_cooking(*position, cooking.clone());
@@ -1984,6 +2053,10 @@ impl ChunkStreamState {
 
 impl Drop for ChunkStreamState {
     fn drop(&mut self) {
+        let loaded = std::mem::take(&mut self.loaded);
+        for chunk in loaded {
+            self.release_loaded_world_chunk(chunk);
+        }
         self.recover_runtime_control_sources();
         self.active_generation.store(0, Ordering::Release);
         self.generation_changed.notify_waiters();
@@ -2789,6 +2862,7 @@ async fn load_chunk_neighbourhood(
                         centre = Some(Arc::clone(&chunk));
                         neighbourhood[1][1] = Some(chunk);
                         staged.push((cx, cz));
+                        crate::operator_metrics::record_chunk_loaded();
                     }
                     Ok(None) => backpressured = true,
                     Err(err) => {
@@ -2861,7 +2935,7 @@ async fn load_chunk_neighbourhood(
                 });
             }
             match storage.try_insert_generated_chunk(ChunkPos { x: cx, z: cz }, chunk) {
-                Ok(true) => {}
+                Ok(true) => crate::operator_metrics::record_chunk_generated(),
                 Ok(false) => backpressured = true,
                 Err(err) => {
                     return Err(format!(
@@ -3269,6 +3343,33 @@ mod tests {
     use std::sync::atomic::{AtomicBool, AtomicUsize};
     use tokio::sync::{Mutex, oneshot};
 
+    #[test]
+    fn pending_loaded_chunk_retention_is_cancellation_safe_and_transferable() {
+        let registry = Arc::new(
+            mc_world::BlockRegistry::from_report(&[]).expect("empty block registry builds"),
+        );
+        let world = WorldStorage::in_memory(registry);
+        let world_read = world.read_view();
+        let chunk = (2, -3);
+        let position = ChunkPos { x: 2, z: -3 };
+
+        {
+            let _pending = PendingLoadedChunkRetention::new(Some(&world_read), chunk);
+        }
+        assert!(
+            !world_read.release_chunk(position),
+            "dropping pending write ownership must release its retention"
+        );
+
+        let pending = PendingLoadedChunkRetention::new(Some(&world_read), chunk);
+        pending.transfer_to_loaded();
+        assert!(
+            world_read.release_chunk(position),
+            "loaded-set ownership retains the chunk after transfer"
+        );
+        assert!(!world_read.release_chunk(position));
+    }
+
     fn canonical_entity_type_report() -> Vec<mc_data::entity_types::EntityTypeReport> {
         (0..mc_data::entity_types::ENTITY_TYPE_COUNT as u32)
             .map(|protocol_id| {
@@ -3674,6 +3775,63 @@ mod tests {
     }
 
     #[test]
+    fn hostile_template_plan_keeps_real_cave_opportunities() {
+        let plains = Identifier::parse("minecraft:plains").unwrap();
+        let zombie = Identifier::parse("minecraft:zombie").unwrap();
+        let rules = mc_data::biomes::BiomeSpawnRules::from_entries_with_sheep_color_climates(
+            BTreeMap::from([(
+                plains.clone(),
+                BTreeMap::from([(
+                    "monster".to_string(),
+                    vec![mc_data::biomes::BiomeSpawnEntry {
+                        entity_type: zombie,
+                        min_count: 1,
+                        max_count: 4,
+                        weight: 100,
+                    }],
+                )]),
+            )]),
+            BTreeSet::new(),
+            BTreeSet::new(),
+        );
+        let entity_types = mc_data::entity_types::EntityTypeRegistry::try_from_report_26_1_2(
+            &canonical_entity_type_report(),
+        )
+        .expect("canonical exact 26.1.2 entity type report builds");
+        let air = BlockStateId(0);
+        let stone = BlockStateId(1);
+        let grass = BlockStateId(2);
+        let mut chunk = Chunk::empty(ChunkPos { x: 0, z: 0 }, air, plains);
+        for lx in 0..16 {
+            for lz in 0..16 {
+                chunk.set_block(lx, 40, lz, stone).unwrap();
+                chunk.set_block(lx, 43, lz, stone).unwrap();
+                chunk.set_block(lx, 64, lz, grass).unwrap();
+            }
+        }
+
+        let spawns = plan_passive_herd(
+            &chunk,
+            Some(grass),
+            &[],
+            None,
+            &[air],
+            &rules,
+            &entity_types,
+        );
+        let hostiles = spawns
+            .iter()
+            .filter(|spawn| spawn.hostile)
+            .collect::<Vec<_>>();
+
+        assert_eq!(hostiles.len(), 1);
+        assert!(
+            hostiles[0].position.y < 64.0,
+            "expected the single hostile entry to retain a cave opportunity: {hostiles:?}"
+        );
+    }
+
+    #[test]
     fn prepared_cache_hit_drops_historical_cpu_and_encode_timings() {
         let prepared = PreparedChunkFrame {
             frame: Bytes::from_static(b"chunk-frame"),
@@ -3811,9 +3969,12 @@ mod tests {
             &mut scheduler,
             crate::play::NaturalSpawnTickInput {
                 tick: 1,
-                friendly_interval: 1,
-                hostile_interval: 1,
-                simulation_distance: 2,
+                policy: crate::play::RandomTickPolicy {
+                    simulation_distance: 2,
+                    friendly_spawn_interval_ticks: 1,
+                    hostile_spawn_interval_ticks: 1,
+                    ..crate::play::RandomTickPolicy::default()
+                },
                 world_read: None,
                 materials: None,
             },
@@ -6223,6 +6384,81 @@ mod tests {
         assert_eq!(stream.view_distance, 2);
         assert_eq!(sessions.ticketed_chunks_sorted().len(), 25);
         assert!(!sessions.ticketed_chunks_sorted().contains(&(3, 0)));
+    }
+
+    #[test]
+    fn view_distance_replan_does_not_requeue_retained_loaded_chunk() {
+        let registry = Arc::new(BlockRegistry::from_report(&[]).expect("empty registry builds"));
+        let world = Arc::new(Mutex::new(WorldStorage::in_memory_with_capacity(
+            Arc::clone(&registry),
+            1,
+        )));
+        let sessions = Arc::new(SessionRegistry::new());
+        let (tx, _rx) = mpsc::channel(8);
+        let profile = crate::login::LoggedInProfile {
+            uuid: uuid::Uuid::nil(),
+            name: "ViewDistanceRetainedChunkAlice".to_string(),
+        };
+        let desired = desired_chunk_set(0, 0, 3);
+        let (session_id, _) = sessions.register(
+            &profile,
+            (0, 0),
+            3,
+            desired,
+            tx,
+            PlayerPose::new(0.5, 64.0, 0.5),
+        );
+        let mut stream = ChunkStreamState::new(
+            Arc::clone(&world),
+            Arc::new(test_biome_registry()),
+            Arc::clone(&registry),
+            None,
+            Arc::new(ItemRegistry::from_report(&[])),
+            Arc::new(TagsData::default()),
+            Arc::new(Vec::new()),
+            Arc::new(mc_data::block_entity_types::BlockEntityTypeRegistry::default()),
+            None,
+            Arc::new(Vec::new()),
+            Arc::new(Vec::new()),
+            Arc::new(Vec::new()),
+            Arc::new(mc_data::biomes::BiomeSpawnRules::default()),
+            Arc::new(mc_data::entity_types::solaris_required_entity_types()),
+            Compression::Disabled,
+            Arc::clone(&sessions),
+            session_id,
+            0,
+            0,
+            0.0,
+            3,
+            ChunkPipelineResources::with_limits(1, 1),
+            ChunkPipelinePolicy::default(),
+        );
+
+        loop {
+            let request = stream
+                .scheduler
+                .poll_next()
+                .expect("center request remains queued");
+            let coord = (request.chunk_x, request.chunk_z);
+            assert!(stream.scheduler.mark_finished(request));
+            if coord == (0, 0) {
+                break;
+            }
+        }
+        stream.loaded.insert((0, 0));
+        sessions.mark_loaded(session_id, (0, 0));
+
+        stream.replan_effective_view_distance(2, 0.0);
+
+        assert!(stream.loaded.contains(&(0, 0)));
+        while let Some(request) = stream.scheduler.poll_next() {
+            assert_ne!(
+                (request.chunk_x, request.chunk_z),
+                (0, 0),
+                "retained loaded chunk must not be replayed without unload"
+            );
+            assert!(stream.scheduler.mark_finished(request));
+        }
     }
 
     #[tokio::test]

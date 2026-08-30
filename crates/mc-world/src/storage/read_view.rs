@@ -156,6 +156,7 @@ impl WorldSpawn {
 pub struct WorldReadView {
     chunks: Arc<[PublishedChunkShard; READ_VIEW_SHARD_COUNT]>,
     furnaces: Arc<[FurnaceSnapshotShard; READ_VIEW_SHARD_COUNT]>,
+    retained_chunks: Arc<RwLock<HashMap<ChunkPos, usize>>>,
     resident_chunks: Arc<AtomicUsize>,
     dirty_chunks: Arc<AtomicUsize>,
     capacity: usize,
@@ -204,6 +205,7 @@ impl WorldReadView {
         Self {
             chunks: Arc::new(std::array::from_fn(|_| RwLock::new(HashMap::new()))),
             furnaces: Arc::new(std::array::from_fn(|_| RwLock::new(HashMap::new()))),
+            retained_chunks: Arc::new(RwLock::new(HashMap::new())),
             resident_chunks: Arc::new(AtomicUsize::new(0)),
             dirty_chunks: Arc::new(AtomicUsize::new(0)),
             capacity: capacity.max(1),
@@ -216,6 +218,51 @@ impl WorldReadView {
 
     pub(crate) fn publication_state(&self) -> Arc<ResidentPublicationState> {
         Arc::clone(&self.publication)
+    }
+
+    /// Keeps one resident chunk from clean-cache eviction while an external
+    /// consumer still relies on its published state. Calls are refcounted so
+    /// multiple client views may retain the same chunk independently.
+    pub fn retain_chunk(&self, position: ChunkPos) {
+        let mut retained = self
+            .retained_chunks
+            .write()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        *retained.entry(position).or_default() += 1;
+    }
+
+    /// Releases one matching [`WorldReadView::retain_chunk`] reference.
+    /// Returns `false` when no matching retention exists.
+    pub fn release_chunk(&self, position: ChunkPos) -> bool {
+        let mut retained = self
+            .retained_chunks
+            .write()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let Some(count) = retained.get_mut(&position) else {
+            return false;
+        };
+        *count = count.saturating_sub(1);
+        if *count == 0 {
+            retained.remove(&position);
+        }
+        true
+    }
+
+    pub(crate) fn chunk_is_retained(&self, position: ChunkPos) -> bool {
+        self.retained_chunks
+            .read()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .contains_key(&position)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn retained_chunk_count(&self, position: ChunkPos) -> usize {
+        self.retained_chunks
+            .read()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .get(&position)
+            .copied()
+            .unwrap_or(0)
     }
 
     #[must_use]

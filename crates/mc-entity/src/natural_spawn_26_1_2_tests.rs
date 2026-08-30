@@ -16,15 +16,15 @@ fn scheduler_rotates_bounded_chunks_with_independent_category_cursors() {
     let mut scheduler = NaturalSpawnScheduler::default();
 
     assert_eq!(
-        scheduler.select_chunks(NaturalSpawnCategory::Friendly, &active),
+        scheduler.select_chunks(NaturalSpawnCategory::Friendly, &active, 4),
         vec![(0, 0), (1, 0), (2, 0), (3, 0)]
     );
     assert_eq!(
-        scheduler.select_chunks(NaturalSpawnCategory::Friendly, &active),
+        scheduler.select_chunks(NaturalSpawnCategory::Friendly, &active, 4),
         vec![(4, 0), (5, 0), (0, 0), (1, 0)]
     );
     assert_eq!(
-        scheduler.select_chunks(NaturalSpawnCategory::Hostile, &active),
+        scheduler.select_chunks(NaturalSpawnCategory::Hostile, &active, 4),
         vec![(0, 0), (1, 0), (2, 0), (3, 0)]
     );
 }

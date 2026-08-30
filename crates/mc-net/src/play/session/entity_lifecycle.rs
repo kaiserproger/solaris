@@ -68,15 +68,33 @@ impl SessionRegistry {
                 dispatches: Vec::new(),
             };
         }
-        let mut candidates = inner
-            .natural_hostile_mobs
-            .iter()
-            .chain(&inner.natural_ground_mobs)
-            .chain(&inner.natural_aquatic_mobs)
-            .copied()
-            .collect::<Vec<_>>();
-        candidates.sort_unstable();
-        candidates.dedup();
+        // The three natural category sets are mutually exclusive by
+        // construction: every insertion site (herd spawn commit and checkpoint
+        // restore) routes each entity id through an exclusive if/else chain,
+        // and removal clears all three sets. Direct iteration therefore needs
+        // no sort/dedup; a plain O(N) id buffer keeps the removals below safe
+        // instead of holding iterators into the category sets.
+        #[cfg(any(test, debug_assertions))]
+        debug_assert!(
+            natural_mob_category_sets_disjoint(&inner),
+            "natural mob category sets must stay mutually exclusive"
+        );
+        let mut candidates = Vec::with_capacity(
+            inner.natural_hostile_mobs.len()
+                + inner.natural_ground_mobs.len()
+                + inner.natural_aquatic_mobs.len(),
+        );
+        candidates.extend(inner.natural_hostile_mobs.iter().copied());
+        candidates.extend(inner.natural_ground_mobs.iter().copied());
+        candidates.extend(inner.natural_aquatic_mobs.iter().copied());
+        // One batched versioned read per category set refreshes the entity
+        // owner snapshot cache, so every per-candidate snapshot() below is a
+        // local cache hit instead of a cross-lane round trip. EntityView is
+        // not reachable across the regional owner boundary (channel-based),
+        // so this batched cache is the lightest existing read here.
+        inner.entities.prefetch(&inner.natural_hostile_mobs);
+        inner.entities.prefetch(&inner.natural_ground_mobs);
+        inner.entities.prefetch(&inner.natural_aquatic_mobs);
         let mut dispatches = Vec::new();
         #[cfg(test)]
         let mut removed = 0usize;
@@ -245,6 +263,23 @@ fn natural_mob_remove_when_far_away(type_name: &str) -> bool {
         type_name,
         "minecraft:sheep" | "minecraft:pig" | "minecraft:chicken" | "minecraft:cow"
     )
+}
+
+/// Debug/test fence for the despawn scan: the three natural category sets are
+/// mutually exclusive by construction (insertion is an exclusive if/else chain
+/// per spawn/restore site; removal clears all three), which lets despawn
+/// iteration skip sort/dedup entirely.
+#[cfg(any(test, debug_assertions))]
+pub(super) fn natural_mob_category_sets_disjoint(inner: &SessionRegistryInner) -> bool {
+    inner
+        .natural_hostile_mobs
+        .is_disjoint(&inner.natural_ground_mobs)
+        && inner
+            .natural_hostile_mobs
+            .is_disjoint(&inner.natural_aquatic_mobs)
+        && inner
+            .natural_ground_mobs
+            .is_disjoint(&inner.natural_aquatic_mobs)
 }
 
 fn natural_mob_despawn_seed_mix(mut value: u64) -> u64 {
@@ -506,6 +541,15 @@ pub(super) fn clear_removed_entity_tracking_locked(
     inner.natural_aquatic_mobs.remove(&entity_id);
     inner.natural_mob_no_action_since_tick.remove(&entity_id);
     inner.sheep_entities.remove(&entity_id);
+    inner.villager_entities.remove(&entity_id);
+    inner.iron_golem_entities.remove(&entity_id);
+    inner.ender_dragon_entities.remove(&entity_id);
+    inner.area_effect_cloud_entities.remove(&entity_id);
+    if inner.evoker_fang_entities.remove(&entity_id) {
+        inner
+            .evoker_fang_count
+            .fetch_sub(1, std::sync::atomic::Ordering::Release);
+    }
     update_breeding_tick_tracking_locked(inner, entity_id, None);
     inner.simulation_inputs.remove_terrain_pathing([entity_id]);
     untrack_entity_chunk_locked(inner, entity_id);

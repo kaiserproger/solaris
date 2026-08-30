@@ -134,6 +134,64 @@ async fn concurrent_pickup_tasks_conserve_item_and_xp_entities() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn item_pickup_waits_for_vanilla_touch_box_before_inventory_credit() {
+    let dirt = Identifier::parse("minecraft:dirt").unwrap();
+    let items = Arc::new(ItemRegistry::from_report(&[ItemReport {
+        id: dirt.clone(),
+        protocol_id: 10,
+    }]));
+    let dirt_id = items.id_of(&dirt).unwrap();
+    let mut state = interaction_state_for_items(items);
+    let session_id = register_interaction_player(&mut state, "PickupOverlapConnection");
+    let (simulation, stop_tx, task) = spawn_test_simulation_owner(Arc::clone(&state.sessions));
+    state.simulation = simulation.for_session(session_id);
+    state.sessions.spawn_item_drop(
+        1,
+        Vec3::new(2.0, 64.0, 0.5),
+        EntityItemStack::new(dirt_id, 1),
+    );
+    state.sessions.advance_world_time(ITEM_PICKUP_DELAY_TICKS);
+
+    let mut writer = Vec::new();
+    pickup_nearby_items(&mut state, &mut writer, PlayerPose::new(0.5, 64.0, 0.5))
+        .await
+        .unwrap();
+
+    assert!(state.inventory.slots.iter().all(ItemStack::is_empty));
+    assert!(
+        writer.is_empty(),
+        "out-of-overlap pickup wrote inventory credit"
+    );
+    assert_eq!(
+        state
+            .sessions
+            .nearby_item_entities(Vec3::new(2.0, 64.0, 0.5), 0.25)[0]
+            .item_stack,
+        Some(EntityItemStack::new(dirt_id, 1))
+    );
+
+    let overlapping_pose = PlayerPose::new(0.6, 64.0, 0.5);
+    state.sessions.update_pose(session_id, overlapping_pose);
+    pickup_nearby_items(&mut state, &mut writer, overlapping_pose)
+        .await
+        .unwrap();
+    let _ = stop_tx.send(());
+    task.await.unwrap();
+
+    assert_eq!(
+        state.inventory.slots[PlayerInventory::HOTBAR_BASE],
+        ItemStack::new(dirt_id, 1)
+    );
+    assert_eq!(decode_container_set_slot_packets(&writer).len(), 1);
+    assert!(
+        state
+            .sessions
+            .nearby_item_entities(Vec3::new(2.0, 64.0, 0.5), 0.25)
+            .is_empty()
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn grounded_arrow_pickup_credits_owner_inventory_and_writes_slot() {
     let arrow = Identifier::parse("minecraft:arrow").unwrap();
     let items = Arc::new(ItemRegistry::from_report(&[ItemReport {

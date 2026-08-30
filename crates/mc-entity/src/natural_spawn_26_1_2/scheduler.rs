@@ -1,7 +1,6 @@
 use std::collections::HashSet;
 use std::sync::Arc;
 
-pub(super) const NATURAL_SPAWN_CHUNK_BUDGET: usize = 4;
 const NATURAL_SPAWN_METRIC_LOG_INTERVAL_TICKS: u64 = 1_200;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -85,6 +84,7 @@ impl NaturalSpawnScheduler {
         &mut self,
         category: NaturalSpawnCategory,
         active_chunks: &Arc<HashSet<(i32, i32)>>,
+        chunk_budget: usize,
     ) -> Vec<(i32, i32)> {
         let unchanged = self
             .active_snapshot
@@ -110,7 +110,7 @@ impl NaturalSpawnScheduler {
             NaturalSpawnCategory::Friendly => &mut self.friendly_cursor,
             NaturalSpawnCategory::Hostile => &mut self.hostile_cursor,
         };
-        let count = self.active_ring.len().min(NATURAL_SPAWN_CHUNK_BUDGET);
+        let count = self.active_ring.len().min(chunk_budget);
         let selected = (0..count)
             .map(|offset| self.active_ring[(*cursor + offset) % self.active_ring.len()])
             .collect::<Vec<_>>();

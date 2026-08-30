@@ -4,6 +4,12 @@ const ENTITY_INDEX_SHARDS: usize = 64;
 type ChunkEntityIndex = HashMap<(i32, i32), Arc<HashSet<EntityId>>>;
 type EntityChunkIndex = HashMap<EntityId, (i32, i32)>;
 
+pub(super) type ActiveEntityCandidatesMatchingChunks = (
+    Arc<HashSet<(i32, i32)>>,
+    HashSet<(i32, i32)>,
+    HashSet<EntityId>,
+);
+
 #[derive(Debug, Clone, Copy)]
 pub(super) struct ExpectedEntityRoutingMove {
     pub(super) entity: EntityId,
@@ -215,6 +221,7 @@ impl SimulationInputPublication {
         })
     }
 
+    #[cfg(test)]
     pub(super) fn entity_candidates(
         &self,
         active_chunks: &HashSet<(i32, i32)>,
@@ -235,26 +242,50 @@ impl SimulationInputPublication {
         &self,
         chunks: &HashSet<(i32, i32)>,
     ) -> HashSet<EntityId> {
-        self.read_routing(|| {
-            let mut candidates = HashSet::new();
-            for &chunk in chunks {
-                if let Some(entities) = self.entity_chunks[entity_index_shard(chunk)]
-                    .load()
-                    .get(&chunk)
-                {
-                    candidates.extend(entities.iter().copied());
-                }
-            }
-            candidates
-        })
+        self.read_routing(|| self.entity_candidates_in_chunks_unfenced(chunks))
     }
 
     pub(super) fn active_entity_candidates(&self) -> (Arc<HashSet<(i32, i32)>>, HashSet<EntityId>) {
         self.read_routing(|| {
             let active_chunks = self.active_chunks();
-            let candidates = self.entity_candidates(active_chunks.as_ref());
+            let candidates = self.entity_candidates_in_chunks_unfenced(active_chunks.as_ref());
             (active_chunks, candidates)
         })
+    }
+
+    pub(super) fn active_entity_candidates_matching_chunks(
+        &self,
+        mut include_chunk: impl FnMut((i32, i32)) -> bool,
+    ) -> ActiveEntityCandidatesMatchingChunks {
+        self.read_routing(|| {
+            let active_chunks = self.active_chunks();
+            let simulation_chunks = active_chunks
+                .iter()
+                .copied()
+                .filter(|&chunk| include_chunk(chunk))
+                .collect::<HashSet<_>>();
+            // Query the chunk -> entity index by the small simulation-chunk set.
+            // This keeps per-tick selection proportional to the live player window,
+            // not to every retained chunk/entity in the world.
+            let candidates = self.entity_candidates_in_chunks_unfenced(&simulation_chunks);
+            (active_chunks, simulation_chunks, candidates)
+        })
+    }
+
+    fn entity_candidates_in_chunks_unfenced(
+        &self,
+        chunks: &HashSet<(i32, i32)>,
+    ) -> HashSet<EntityId> {
+        let mut candidates = HashSet::new();
+        for &chunk in chunks {
+            if let Some(entities) = self.entity_chunks[entity_index_shard(chunk)]
+                .load()
+                .get(&chunk)
+            {
+                candidates.extend(entities.iter().copied());
+            }
+        }
+        candidates
     }
 
     pub(super) fn insert_terrain_pathing(&self, entities: impl IntoIterator<Item = EntityId>) {

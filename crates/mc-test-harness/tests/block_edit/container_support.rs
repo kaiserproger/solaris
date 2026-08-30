@@ -253,6 +253,8 @@ async fn mine_block_and_wait_for_stack(
     let mut saw_break_update = false;
     let mut saw_break_ack = false;
     let mut saw_drop_stack = false;
+    let mut drop_positions = Vec::new();
+    let mut target_drop_entity_id = None;
     let mut saw_matching_slot_count = None;
     let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
     loop {
@@ -283,16 +285,77 @@ async fn mine_block_and_wait_for_stack(
             if pkt.sequence == stop_sequence {
                 saw_break_ack = true;
             }
+        } else if frame.id == AddEntity::ID {
+            let mut body = frame.body;
+            let pkt = AddEntity::decode(&mut body).expect("decode drop AddEntity");
+            drop_positions.push((pkt.entity_id, pkt.x, pkt.y, pkt.z));
+        } else if frame.id == MoveEntityPos::ID {
+            let mut body = frame.body;
+            let pkt = MoveEntityPos::decode(&mut body).expect("decode drop relative move");
+            if let Some((_, x, y, z)) = drop_positions
+                .iter_mut()
+                .find(|(entity_id, _, _, _)| *entity_id == pkt.entity_id)
+            {
+                *x += f64::from(pkt.delta_x) / 4096.0;
+                *y += f64::from(pkt.delta_y) / 4096.0;
+                *z += f64::from(pkt.delta_z) / 4096.0;
+                if target_drop_entity_id == Some(pkt.entity_id) {
+                    move_into_item_touch_box(client, *x, *y, *z).await;
+                }
+            }
+        } else if frame.id == MoveEntityPosRot::ID {
+            let mut body = frame.body;
+            let pkt = MoveEntityPosRot::decode(&mut body).expect("decode drop relative move+rot");
+            if let Some((_, x, y, z)) = drop_positions
+                .iter_mut()
+                .find(|(entity_id, _, _, _)| *entity_id == pkt.entity_id)
+            {
+                *x += f64::from(pkt.delta_x) / 4096.0;
+                *y += f64::from(pkt.delta_y) / 4096.0;
+                *z += f64::from(pkt.delta_z) / 4096.0;
+                if target_drop_entity_id == Some(pkt.entity_id) {
+                    move_into_item_touch_box(client, *x, *y, *z).await;
+                }
+            }
+        } else if frame.id == EntityPositionSync::ID {
+            let mut body = frame.body;
+            let pkt = EntityPositionSync::decode(&mut body).expect("decode drop position sync");
+            if let Some((_, x, y, z)) = drop_positions
+                .iter_mut()
+                .find(|(entity_id, _, _, _)| *entity_id == pkt.entity_id)
+            {
+                *x = pkt.values.position.x;
+                *y = pkt.values.position.y;
+                *z = pkt.values.position.z;
+                if target_drop_entity_id == Some(pkt.entity_id) {
+                    move_into_item_touch_box(client, *x, *y, *z).await;
+                }
+            }
         } else if frame.id == ClientboundSetEntityData::ID {
             let mut body = frame.body;
             let pkt = ClientboundSetEntityData::decode(&mut body).expect("decode entity data");
-            saw_drop_stack |= pkt.values.iter().any(|value| {
+            let matching_drop = pkt.values.iter().any(|value| {
                 matches!(
                     value,
                     EntityDataValue::ItemStack { stack, .. }
                         if stack.item_id == item_id && stack.count > 0
                 )
             });
+            saw_drop_stack |= matching_drop;
+            if matching_drop
+                && let Some((_, x, y, z)) = drop_positions
+                    .iter()
+                    .find(|(entity_id, _, _, _)| *entity_id == pkt.entity_id)
+                    .copied()
+            {
+                target_drop_entity_id = Some(pkt.entity_id);
+                move_into_item_touch_box(client, x, y, z).await;
+            }
+        } else if frame.id == SynchronizePlayerPosition::ID {
+            let mut body = frame.body;
+            let pkt = SynchronizePlayerPosition::decode(&mut body)
+                .expect("decode unexpected mined-drop movement correction");
+            panic!("walking into pickup range must not require correction: {pkt:?}");
         } else if frame.id == ClientboundContainerSetSlot::ID {
             let mut body = frame.body;
             let pkt = ClientboundContainerSetSlot::decode(&mut body).expect("decode SetSlot");
@@ -304,6 +367,20 @@ async fn mine_block_and_wait_for_stack(
             }
         }
     }
+}
+
+async fn move_into_item_touch_box(client: &mut Client, x: f64, y: f64, z: f64) {
+    client
+        .write_packet(&ServerboundMovePlayerPosRot {
+            x,
+            y: y + 0.7,
+            z,
+            yaw: 0.0,
+            pitch: 0.0,
+            flags: MovePlayerFlags::new(false, false),
+        })
+        .await
+        .expect("walk client into mined-item pickup range");
 }
 
 async fn move_without_position_correction(

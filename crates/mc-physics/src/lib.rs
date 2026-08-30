@@ -4,6 +4,8 @@
 //!
 //! Part of the Solaris engine.
 
+use smallvec::SmallVec;
+
 pub mod entity_collision_26_1_2;
 
 pub const TICK_SECONDS: f64 = 0.05;
@@ -23,6 +25,7 @@ const MAX_DISPLACEMENT_PER_STEP: f64 = 16.0;
 const MAX_BODY_EXTENT: f64 = 16.0;
 const MAX_COLLISION_SCAN_CELLS: usize = 8_192;
 const MAX_COLLISION_CANDIDATES: usize = 8_192;
+const COLLISION_CANDIDATES_INLINE: usize = 32;
 
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct Vec3 {
@@ -97,6 +100,98 @@ pub fn sweep_sample_count(displacement: Vec3, max_step: f64) -> Option<usize> {
         .max(displacement.z.abs());
     let steps = (max_axis / max_step).ceil().max(1.0);
     (steps <= usize::MAX as f64).then_some(steps as usize)
+}
+
+#[must_use]
+pub fn horizontal_movement_residual_within_limit(
+    requested: Vec3,
+    resolved: Vec3,
+    max_squared_residual: f64,
+) -> bool {
+    if !max_squared_residual.is_finite() || max_squared_residual < 0.0 {
+        return false;
+    }
+    if !requested.x.is_finite()
+        || !requested.z.is_finite()
+        || !resolved.x.is_finite()
+        || !resolved.z.is_finite()
+    {
+        return false;
+    }
+    let residual_x = requested.x - resolved.x;
+    let residual_z = requested.z - resolved.z;
+    residual_x.mul_add(residual_x, residual_z * residual_z) <= max_squared_residual
+}
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct CollisionResolvedDisplacement {
+    pub delta: Vec3,
+    pub grounded: bool,
+    pub stepped: bool,
+    pub collided: bool,
+}
+
+/// Resolves one already-requested entity displacement against block collision
+/// shapes without applying gravity, drag, acceleration, or jump impulses.
+///
+/// This is the collision-only primitive used when an external authority (for
+/// example the vanilla client) has already integrated movement and the server
+/// only needs to verify that the reported displacement is physically compatible
+/// with sliding/stepping collision resolution.
+#[must_use]
+pub fn resolve_collision_displacement<S: BlockSampler>(
+    sampler: &S,
+    position: Vec3,
+    aabb: Aabb,
+    desired: Vec3,
+    was_on_ground: bool,
+    step_height: f64,
+) -> Option<CollisionResolvedDisplacement> {
+    let finite = [
+        position.x,
+        position.y,
+        position.z,
+        aabb.half_width,
+        aabb.height,
+        desired.x,
+        desired.y,
+        desired.z,
+        step_height,
+    ]
+    .into_iter()
+    .all(f64::is_finite);
+    if !finite
+        || aabb.half_width <= 0.0
+        || aabb.half_width > MAX_BODY_EXTENT
+        || aabb.height <= 0.0
+        || aabb.height > MAX_BODY_EXTENT
+        || !(0.0..=MAX_BODY_EXTENT).contains(&step_height)
+        || !bounded_displacement(desired)
+    {
+        return None;
+    }
+
+    let body = EntityBody {
+        position,
+        velocity: Vec3::ZERO,
+        aabb,
+        on_ground: was_on_ground,
+    };
+    let world_box = WorldAabb::for_body(body);
+    let collision_boxes = collision_boxes_for_motion(sampler, world_box, desired, step_height)?;
+    let resolved = resolve_vanilla_collision_movement(
+        world_box,
+        desired,
+        &collision_boxes,
+        was_on_ground,
+        step_height,
+    );
+    Some(CollisionResolvedDisplacement {
+        delta: resolved.delta,
+        grounded: resolved.grounded,
+        stepped: resolved.stepped,
+        collided: resolved.collided,
+    })
 }
 
 #[must_use]
@@ -292,6 +387,28 @@ impl BlockCollisionBox {
     }
 }
 
+/// Upper bound for the dense per-state lookup table, in state ids. Real
+/// vanilla registries stay far below this; anything at or above it keeps the
+/// exact linear-scan semantics without allocating the table.
+const DENSE_CLASS_TABLE_LIMIT: u32 = 1 << 20;
+
+/// Precomputed [`BlockMaterialIds`] classification and collision height for
+/// one numeric block state id. Unlisted states are solid full blocks.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct DenseBlockClass {
+    material: BlockMaterial,
+    collision_height: Option<BlockCollisionHeight>,
+}
+
+impl Default for DenseBlockClass {
+    fn default() -> Self {
+        Self {
+            material: BlockMaterial::Solid,
+            collision_height: None,
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct BlockMaterialIds {
     pub air: u32,
@@ -299,6 +416,7 @@ pub struct BlockMaterialIds {
     pub lava: Vec<u32>,
     pub passable: Vec<u32>,
     collision_heights: Vec<(u32, BlockCollisionHeight)>,
+    dense_classes: Box<[DenseBlockClass]>,
 }
 
 impl BlockMaterialIds {
@@ -312,18 +430,22 @@ impl BlockMaterialIds {
             Some(state) => Vec::from([state]),
             None => Vec::new(),
         };
-        Self {
+        let mut ids = Self {
             air,
             water,
             lava,
             passable: Vec::new(),
             collision_heights: Vec::new(),
-        }
+            dense_classes: Box::new([]),
+        };
+        ids.rebuild_dense_classes();
+        ids
     }
 
     #[must_use]
     pub fn with_passable(mut self, passable: Vec<u32>) -> Self {
         self.passable = passable;
+        self.rebuild_dense_classes();
         self
     }
 
@@ -331,6 +453,7 @@ impl BlockMaterialIds {
     pub fn with_water_states(mut self, water: Vec<u32>) -> Self {
         if !water.is_empty() {
             self.water = water;
+            self.rebuild_dense_classes();
         }
         self
     }
@@ -339,6 +462,7 @@ impl BlockMaterialIds {
     pub fn with_lava_states(mut self, lava: Vec<u32>) -> Self {
         if !lava.is_empty() {
             self.lava = lava;
+            self.rebuild_dense_classes();
         }
         self
     }
@@ -347,11 +471,49 @@ impl BlockMaterialIds {
     pub fn with_collision_height(mut self, states: Vec<u32>, height: BlockCollisionHeight) -> Self {
         self.collision_heights
             .extend(states.into_iter().map(|state| (state, height)));
+        self.rebuild_dense_classes();
         self
     }
 
-    #[must_use]
-    pub fn classify(&self, state_id: u32) -> BlockMaterial {
+    fn rebuild_dense_classes(&mut self) {
+        let max_state = self
+            .water
+            .iter()
+            .chain(&self.lava)
+            .chain(&self.passable)
+            .copied()
+            .chain(self.collision_heights.iter().map(|&(state, _)| state))
+            .max()
+            .unwrap_or(self.air)
+            .max(self.air);
+        self.dense_classes = if max_state >= DENSE_CLASS_TABLE_LIMIT {
+            Box::new([])
+        } else {
+            let mut dense = vec![DenseBlockClass::default(); max_state as usize + 1];
+            dense[self.air as usize].material = BlockMaterial::Air;
+            for (states, material) in [
+                (&self.water, BlockMaterial::Water),
+                (&self.lava, BlockMaterial::Lava),
+                (&self.passable, BlockMaterial::Air),
+            ] {
+                for &state in states {
+                    let class = &mut dense[state as usize];
+                    if class.material == BlockMaterial::Solid {
+                        class.material = material;
+                    }
+                }
+            }
+            for &(state, height) in &self.collision_heights {
+                let class = &mut dense[state as usize];
+                if class.collision_height.is_none() {
+                    class.collision_height = Some(height);
+                }
+            }
+            dense.into_boxed_slice()
+        };
+    }
+
+    fn classify_by_scan(&self, state_id: u32) -> BlockMaterial {
         if state_id == self.air {
             BlockMaterial::Air
         } else if self.water.contains(&state_id) {
@@ -366,14 +528,33 @@ impl BlockMaterialIds {
     }
 
     #[must_use]
+    pub fn classify(&self, state_id: u32) -> BlockMaterial {
+        self.dense_classes
+            .get(state_id as usize)
+            .map_or_else(|| self.classify_by_scan(state_id), |class| class.material)
+    }
+
+    #[must_use]
     pub fn collision_height(&self, state_id: u32) -> Option<BlockCollisionHeight> {
-        if !self.classify(state_id).is_solid() {
+        let class = self
+            .dense_classes
+            .get(state_id as usize)
+            .copied()
+            .unwrap_or_else(|| DenseBlockClass {
+                material: self.classify_by_scan(state_id),
+                collision_height: self
+                    .collision_heights
+                    .iter()
+                    .find_map(|&(state, height)| (state == state_id).then_some(height)),
+            });
+        if class.material != BlockMaterial::Solid {
             return None;
         }
-        self.collision_heights
-            .iter()
-            .find_map(|&(state, height)| (state == state_id).then_some(height))
-            .or(Some(BlockCollisionHeight::FULL_BLOCK))
+        Some(
+            class
+                .collision_height
+                .unwrap_or(BlockCollisionHeight::FULL_BLOCK),
+        )
     }
 }
 
@@ -747,7 +928,7 @@ fn collision_boxes_for_motion<S: BlockSampler>(
     body: WorldAabb,
     desired: Vec3,
     step_height: f64,
-) -> Option<Vec<WorldAabb>> {
+) -> Option<SmallVec<[WorldAabb; COLLISION_CANDIDATES_INLINE]>> {
     let min_x = (body.min_x + desired.x.min(0.0)).floor() as i32;
     let max_x = (body.max_x + desired.x.max(0.0)).ceil() as i32 - 1;
     let min_z = (body.min_z + desired.z.min(0.0)).floor() as i32;
@@ -766,7 +947,7 @@ fn collision_boxes_for_motion<S: BlockSampler>(
     if scan_cells > MAX_COLLISION_SCAN_CELLS {
         return None;
     }
-    let mut boxes = Vec::with_capacity(scan_cells.min(MAX_COLLISION_CANDIDATES));
+    let mut boxes = SmallVec::<[WorldAabb; COLLISION_CANDIDATES_INLINE]>::new();
 
     for x in min_x..=max_x {
         for y in min_y..=max_y {
@@ -811,6 +992,8 @@ fn inclusive_range_len(min: i32, max: i32) -> usize {
     (i64::from(max) - i64::from(min) + 1) as usize
 }
 
+type HorizontalResolver = fn(WorldAabb, Vec3, &[WorldAabb]) -> Vec3;
+
 fn resolve_movement(
     body: WorldAabb,
     desired: Vec3,
@@ -818,7 +1001,42 @@ fn resolve_movement(
     was_on_ground: bool,
     step_height: f64,
 ) -> ResolvedMovement {
-    let base = resolve_axes(body, desired, collision_boxes);
+    resolve_movement_with(
+        body,
+        desired,
+        collision_boxes,
+        was_on_ground,
+        step_height,
+        resolve_horizontal_sweep,
+    )
+}
+
+fn resolve_vanilla_collision_movement(
+    body: WorldAabb,
+    desired: Vec3,
+    collision_boxes: &[WorldAabb],
+    was_on_ground: bool,
+    step_height: f64,
+) -> ResolvedMovement {
+    resolve_movement_with(
+        body,
+        desired,
+        collision_boxes,
+        was_on_ground,
+        step_height,
+        resolve_horizontal_axes,
+    )
+}
+
+fn resolve_movement_with(
+    body: WorldAabb,
+    desired: Vec3,
+    collision_boxes: &[WorldAabb],
+    was_on_ground: bool,
+    step_height: f64,
+    resolve_horizontal: HorizontalResolver,
+) -> ResolvedMovement {
+    let base = resolve_axes(body, desired, collision_boxes, resolve_horizontal);
     let base_grounded = desired.y < 0.0 && axis_was_clipped(desired.y, base.y);
     let horizontal_clipped =
         axis_was_clipped(desired.x, base.x) || axis_was_clipped(desired.z, base.z);
@@ -835,7 +1053,7 @@ fn resolve_movement(
 
     let raised = clip_y(body, step_height, collision_boxes);
     let raised_box = body.moved(Vec3::new(0.0, raised, 0.0));
-    let stepped_horizontal = resolve_horizontal_sweep(
+    let stepped_horizontal = resolve_horizontal(
         raised_box,
         Vec3::new(desired.x, 0.0, desired.z),
         collision_boxes,
@@ -868,10 +1086,15 @@ fn resolve_movement(
     }
 }
 
-fn resolve_axes(body: WorldAabb, desired: Vec3, collision_boxes: &[WorldAabb]) -> Vec3 {
+fn resolve_axes(
+    body: WorldAabb,
+    desired: Vec3,
+    collision_boxes: &[WorldAabb],
+    resolve_horizontal: HorizontalResolver,
+) -> Vec3 {
     let dy = clip_y(body, desired.y, collision_boxes);
     let after_y = body.moved(Vec3::new(0.0, dy, 0.0));
-    let horizontal = resolve_horizontal_sweep(
+    let horizontal = resolve_horizontal(
         after_y,
         Vec3::new(desired.x, 0.0, desired.z),
         collision_boxes,
@@ -903,6 +1126,63 @@ fn resolve_until_first_impact(
         stepped: false,
         collided: true,
     }
+}
+
+fn resolve_horizontal_axes(body: WorldAabb, desired: Vec3, collision_boxes: &[WorldAabb]) -> Vec3 {
+    // Vanilla 26.1.2 resolves the larger horizontal component first. This
+    // permits the first axis to clear a face-flush corner before the second
+    // axis is clipped, while each axis still scans the complete displacement.
+    if desired.x.abs() < desired.z.abs() {
+        let dz = clip_z(body, desired.z, collision_boxes);
+        let dx = clip_x(
+            body.moved(Vec3::new(0.0, 0.0, dz)),
+            desired.x,
+            collision_boxes,
+        );
+        Vec3::new(dx, 0.0, dz)
+    } else {
+        let dx = clip_x(body, desired.x, collision_boxes);
+        let dz = clip_z(
+            body.moved(Vec3::new(dx, 0.0, 0.0)),
+            desired.z,
+            collision_boxes,
+        );
+        Vec3::new(dx, 0.0, dz)
+    }
+}
+
+fn clip_x(body: WorldAabb, mut dx: f64, collision_boxes: &[WorldAabb]) -> f64 {
+    for obstacle in collision_boxes {
+        if body.min_y < obstacle.max_y
+            && body.max_y > obstacle.min_y
+            && body.min_z < obstacle.max_z
+            && body.max_z > obstacle.min_z
+        {
+            if dx > 0.0 && body.max_x <= obstacle.min_x {
+                dx = dx.min(obstacle.min_x - body.max_x);
+            } else if dx < 0.0 && body.min_x >= obstacle.max_x {
+                dx = dx.max(obstacle.max_x - body.min_x);
+            }
+        }
+    }
+    dx
+}
+
+fn clip_z(body: WorldAabb, mut dz: f64, collision_boxes: &[WorldAabb]) -> f64 {
+    for obstacle in collision_boxes {
+        if body.min_x < obstacle.max_x
+            && body.max_x > obstacle.min_x
+            && body.min_y < obstacle.max_y
+            && body.max_y > obstacle.min_y
+        {
+            if dz > 0.0 && body.max_z <= obstacle.min_z {
+                dz = dz.min(obstacle.min_z - body.max_z);
+            } else if dz < 0.0 && body.min_z >= obstacle.max_z {
+                dz = dz.max(obstacle.max_z - body.min_z);
+            }
+        }
+    }
+    dz
 }
 
 fn resolve_horizontal_sweep(
@@ -1063,9 +1343,19 @@ fn horizontal_distance_squared(delta: Vec3) -> f64 {
 fn body_overlaps_fluid<S: BlockSampler>(body: EntityBody, sampler: &S) -> bool {
     let min_y = body.position.y.floor() as i32;
     let max_y = (body.position.y + body.aabb.height).floor() as i32;
-    bbox_columns(body)
-        .into_iter()
-        .any(|(x, z)| (min_y..=max_y).any(|y| sampler.material_at(x, y, z).is_fluid()))
+    let half = body.aabb.half_width;
+    let x_lo = (body.position.x - half).floor() as i32;
+    let x_hi = (body.position.x + half).floor() as i32;
+    let z_lo = (body.position.z - half).floor() as i32;
+    let z_hi = (body.position.z + half).floor() as i32;
+    let xs = [x_lo, x_hi];
+    let zs = [z_lo, z_hi];
+    let xs = if x_lo == x_hi { &xs[..1] } else { &xs[..] };
+    let zs = if z_lo == z_hi { &zs[..1] } else { &zs[..] };
+    xs.iter().any(|&x| {
+        zs.iter()
+            .any(|&z| (min_y..=max_y).any(|y| sampler.material_at(x, y, z).is_fluid()))
+    })
 }
 
 fn try_start_jump(
@@ -1098,22 +1388,10 @@ fn try_start_jump(
     true
 }
 
-fn bbox_columns(body: EntityBody) -> [(i32, i32); 4] {
-    let x = body.position.x;
-    let z = body.position.z;
-    let half = body.aabb.half_width;
-    [
-        ((x - half).floor() as i32, (z - half).floor() as i32),
-        ((x - half).floor() as i32, (z + half).floor() as i32),
-        ((x + half).floor() as i32, (z - half).floor() as i32),
-        ((x + half).floor() as i32, (z + half).floor() as i32),
-    ]
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::cell::Cell;
+    use std::cell::{Cell, RefCell};
 
     fn unit_body() -> WorldAabb {
         WorldAabb {
@@ -1213,6 +1491,31 @@ mod tests {
         assert_eq!(sweep_sample_count(Vec3::new(f64::NAN, 0.0, 0.0), 0.5), None);
         assert_eq!(sweep_sample_count(Vec3::ZERO, 0.0), None);
         assert_eq!(sweep_sample_count(Vec3::ZERO, f64::INFINITY), None);
+    }
+
+    #[test]
+    fn horizontal_movement_residual_matches_vanilla_moved_wrongly_budget() {
+        let requested = Vec3::new(0.24, 0.8, -0.24);
+        assert!(horizontal_movement_residual_within_limit(
+            requested,
+            Vec3::new(0.0, -2.0, -0.24),
+            0.0625,
+        ));
+        assert!(!horizontal_movement_residual_within_limit(
+            requested,
+            Vec3::new(-0.02, 0.8, -0.24),
+            0.0625,
+        ));
+        assert!(!horizontal_movement_residual_within_limit(
+            requested,
+            Vec3::new(f64::NAN, 0.0, 0.0),
+            0.0625,
+        ));
+        assert!(!horizontal_movement_residual_within_limit(
+            requested,
+            requested,
+            f64::NAN,
+        ));
     }
 
     #[test]
@@ -1346,6 +1649,65 @@ mod tests {
         assert!((result.delta.x - 0.4).abs() < 1.0e-12);
         assert!((result.delta.z - 0.4).abs() < 1.0e-12);
         assert!(result.collided);
+    }
+
+    #[test]
+    fn vanilla_axis_order_allows_face_flush_sprint_jump_around_corner() {
+        let result = resolve_collision_displacement(
+            &IsolatedCornerWorld { x: 1, z: 1 },
+            Vec3::new(0.7, 64.0, 0.94),
+            Aabb {
+                half_width: 0.3,
+                height: 1.8,
+            },
+            Vec3::new(0.26, 0.42, -0.36),
+            true,
+            STEP_HEIGHT,
+        )
+        .expect("bounded replay resolves");
+
+        assert_eq!(result.delta, Vec3::new(0.26, 0.42, -0.36));
+        assert!(!result.collided);
+    }
+
+    #[test]
+    fn vanilla_axis_order_keeps_straight_tunnelling_blocked() {
+        let result = resolve_collision_displacement(
+            &SweptWallWorld,
+            Vec3::new(0.5, 64.0, 0.5),
+            Aabb {
+                half_width: 0.3,
+                height: 1.8,
+            },
+            Vec3::new(3.0, 0.0, 0.0),
+            true,
+            STEP_HEIGHT,
+        )
+        .expect("bounded tunnelling replay resolves");
+
+        assert!((result.delta.x - 1.2).abs() < 1.0e-12);
+        assert!(result.collided);
+    }
+
+    #[test]
+    fn vanilla_axis_order_steps_onto_half_block_terrace() {
+        let result = resolve_collision_displacement(
+            &BottomSlabEdgeWorld,
+            Vec3::new(0.5, 63.0, 0.5),
+            Aabb {
+                half_width: 0.3,
+                height: 1.8,
+            },
+            Vec3::new(0.5, 0.0, 0.0),
+            true,
+            STEP_HEIGHT,
+        )
+        .expect("bounded terrace replay resolves");
+
+        assert_eq!(result.delta.x, 0.5);
+        assert!((result.delta.y - 0.5).abs() < 1.0e-12);
+        assert_eq!(result.delta.z, 0.0);
+        assert!(result.stepped);
     }
 
     #[test]
@@ -1740,6 +2102,42 @@ mod tests {
         }
     }
 
+    struct FluidRecordingSampler {
+        calls: RefCell<Vec<(i32, i32, i32)>>,
+        fluid_at: (i32, i32, i32),
+    }
+
+    impl FluidRecordingSampler {
+        fn all_air() -> Self {
+            Self {
+                calls: RefCell::new(Vec::new()),
+                fluid_at: (i32::MAX, i32::MAX, i32::MAX),
+            }
+        }
+
+        fn with_fluid_at(x: i32, y: i32, z: i32) -> Self {
+            Self {
+                calls: RefCell::new(Vec::new()),
+                fluid_at: (x, y, z),
+            }
+        }
+
+        fn sampled(&self) -> Vec<(i32, i32, i32)> {
+            self.calls.borrow().clone()
+        }
+    }
+
+    impl BlockSampler for FluidRecordingSampler {
+        fn material_at(&self, x: i32, y: i32, z: i32) -> BlockMaterial {
+            self.calls.borrow_mut().push((x, y, z));
+            if (x, y, z) == self.fluid_at {
+                BlockMaterial::Water
+            } else {
+                BlockMaterial::Air
+            }
+        }
+    }
+
     struct DenseCollisionWorld {
         emitted: Cell<usize>,
     }
@@ -2044,6 +2442,93 @@ mod tests {
         assert_eq!(result.body.position, body.position);
         assert_eq!(result.body.velocity, Vec3::ZERO);
         assert!(world.material_samples.get() <= 100);
+    }
+
+    #[test]
+    fn body_overlaps_fluid_samples_narrow_body_once_per_column_layer() {
+        let body = EntityBody {
+            position: Vec3::new(0.5, 64.0, 0.5),
+            velocity: Vec3::ZERO,
+            aabb: Aabb {
+                half_width: 0.25,
+                height: 1.4,
+            },
+            on_ground: false,
+        };
+
+        let miss = FluidRecordingSampler::all_air();
+        assert!(!body_overlaps_fluid(body, &miss));
+        assert_eq!(miss.sampled(), vec![(0, 64, 0), (0, 65, 0)]);
+
+        let hit = FluidRecordingSampler::with_fluid_at(0, 64, 0);
+        assert!(body_overlaps_fluid(body, &hit));
+        assert_eq!(hit.sampled(), vec![(0, 64, 0)]);
+    }
+
+    #[test]
+    fn body_overlaps_fluid_samples_two_distinct_columns_in_order() {
+        let body = EntityBody {
+            position: Vec3::new(0.0, 64.0, 0.5),
+            velocity: Vec3::ZERO,
+            aabb: Aabb {
+                half_width: 0.25,
+                height: 1.4,
+            },
+            on_ground: false,
+        };
+
+        let miss = FluidRecordingSampler::all_air();
+        assert!(!body_overlaps_fluid(body, &miss));
+        assert_eq!(
+            miss.sampled(),
+            vec![(-1, 64, 0), (-1, 65, 0), (0, 64, 0), (0, 65, 0)]
+        );
+
+        let hit = FluidRecordingSampler::with_fluid_at(0, 64, 0);
+        assert!(body_overlaps_fluid(body, &hit));
+        assert_eq!(hit.sampled(), vec![(-1, 64, 0), (-1, 65, 0), (0, 64, 0)]);
+    }
+
+    #[test]
+    fn body_overlaps_fluid_samples_four_distinct_columns_without_duplicates() {
+        let body = EntityBody {
+            position: Vec3::new(0.5, 64.0, 0.5),
+            velocity: Vec3::ZERO,
+            aabb: Aabb {
+                half_width: 0.55,
+                height: 1.4,
+            },
+            on_ground: false,
+        };
+
+        let miss = FluidRecordingSampler::all_air();
+        assert!(!body_overlaps_fluid(body, &miss));
+        assert_eq!(
+            miss.sampled(),
+            vec![
+                (-1, 64, -1),
+                (-1, 65, -1),
+                (-1, 64, 1),
+                (-1, 65, 1),
+                (1, 64, -1),
+                (1, 65, -1),
+                (1, 64, 1),
+                (1, 65, 1),
+            ]
+        );
+
+        let hit = FluidRecordingSampler::with_fluid_at(1, 64, -1);
+        assert!(body_overlaps_fluid(body, &hit));
+        assert_eq!(
+            hit.sampled(),
+            vec![
+                (-1, 64, -1),
+                (-1, 65, -1),
+                (-1, 64, 1),
+                (-1, 65, 1),
+                (1, 64, -1),
+            ]
+        );
     }
 
     #[test]

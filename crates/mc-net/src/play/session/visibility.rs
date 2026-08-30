@@ -664,6 +664,7 @@ pub(super) fn publish_server_entity_snapshot_locked(
         .snapshot(entity_id)
         .filter(|entity| entity.lifecycle == EntityLifecycle::Alive)
         .map(server_entity_snapshot_from)?;
+    update_village_entity_indexes_locked(inner, &snapshot);
     inner
         .published_entity_snapshots
         .insert(entity_id, snapshot.clone());
@@ -729,6 +730,43 @@ pub(super) fn initialize_entity_wire_state_from_snapshot_locked(
     );
 }
 
+fn update_village_entity_indexes_locked(
+    inner: &mut SessionRegistryInner,
+    snapshot: &ServerEntitySnapshot,
+) {
+    if snapshot.type_name == "minecraft:villager" {
+        inner.villager_entities.insert(snapshot.id);
+    } else {
+        inner.villager_entities.remove(&snapshot.id);
+    }
+    if snapshot.type_name == "minecraft:iron_golem" {
+        inner.iron_golem_entities.insert(snapshot.id);
+    } else {
+        inner.iron_golem_entities.remove(&snapshot.id);
+    }
+    if snapshot.type_name == "minecraft:ender_dragon" {
+        inner.ender_dragon_entities.insert(snapshot.id);
+    } else {
+        inner.ender_dragon_entities.remove(&snapshot.id);
+    }
+    if snapshot.type_name == "minecraft:area_effect_cloud" {
+        inner.area_effect_cloud_entities.insert(snapshot.id);
+    } else {
+        inner.area_effect_cloud_entities.remove(&snapshot.id);
+    }
+    if snapshot.type_name == "minecraft:evoker_fangs" {
+        if inner.evoker_fang_entities.insert(snapshot.id) {
+            inner
+                .evoker_fang_count
+                .fetch_add(1, std::sync::atomic::Ordering::Release);
+        }
+    } else if inner.evoker_fang_entities.remove(&snapshot.id) {
+        inner
+            .evoker_fang_count
+            .fetch_sub(1, std::sync::atomic::Ordering::Release);
+    }
+}
+
 pub(super) fn install_committed_entity_publications_locked(
     inner: &mut SessionRegistryInner,
     snapshots: Vec<ServerEntitySnapshot>,
@@ -736,6 +774,7 @@ pub(super) fn install_committed_entity_publications_locked(
     let mut publications = Vec::with_capacity(snapshots.len());
     let mut publications_by_chunk = HashMap::<(i32, i32), Vec<usize>>::new();
     for snapshot in snapshots {
+        update_village_entity_indexes_locked(inner, &snapshot);
         let chunk = inner
             .simulation_inputs
             .entity_chunk(snapshot.id)
@@ -819,6 +858,7 @@ pub(super) fn spawn_entity_visibility_from_snapshot_locked(
     let Some(chunk) = inner.simulation_inputs.entity_chunk(entity_id) else {
         return Vec::new();
     };
+    update_village_entity_indexes_locked(inner, &snapshot);
     inner
         .published_entity_snapshots
         .insert(entity_id, snapshot.clone());
@@ -842,10 +882,30 @@ pub(super) fn refresh_entity_target_visibility_locked(
     old_chunk: (i32, i32),
     new_chunk: (i32, i32),
 ) -> Vec<VisibilityDispatch> {
+    if !inner.published_entity_snapshots.contains_key(&entity_id) {
+        return Vec::new();
+    }
+    let old_observers = visible_entity_observers_locked(inner, entity_id);
+    refresh_entity_target_visibility_with_old_observers_locked(
+        inner,
+        entity_id,
+        old_chunk,
+        new_chunk,
+        &old_observers,
+    )
+}
+
+pub(super) fn refresh_entity_target_visibility_with_old_observers_locked(
+    inner: &mut SessionRegistryInner,
+    entity_id: EntityId,
+    old_chunk: (i32, i32),
+    new_chunk: (i32, i32),
+    old_observers: &HashSet<SessionId>,
+) -> Vec<VisibilityDispatch> {
     let Some(snapshot) = inner.published_entity_snapshots.get(&entity_id).cloned() else {
         return Vec::new();
     };
-    let mut observer_ids = visible_entity_observers_locked(inner, entity_id);
+    let mut observer_ids = old_observers.clone();
     for (&observer_id, observer) in &inner.sessions {
         if observer.loaded.contains(&old_chunk) || observer.loaded.contains(&new_chunk) {
             observer_ids.insert(observer_id);

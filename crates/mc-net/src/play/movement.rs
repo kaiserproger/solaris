@@ -22,7 +22,7 @@ const POWDER_SNOW_FALL_DISTANCE: f64 = 2.5;
 const PLAYER_BODY_HALF_WIDTH: f64 = 0.3;
 const PLAYER_SURVIVAL_MOVEMENT_LIMIT: f64 = 10.0;
 const PLAYER_FLYING_MOVEMENT_LIMIT: f64 = 16.0;
-const PLAYER_SWEEP_SAMPLE_STEP: f64 = 1.0 / 32.0;
+const PLAYER_MOVED_WRONGLY_THRESHOLD_SQ: f64 = 0.0625;
 const PLAYER_EMBEDDED_ESCAPE_LIMIT: f64 = 0.5;
 const PLAYER_MOVEMENT_MAX_CHUNKS: usize = 9;
 
@@ -149,6 +149,9 @@ impl PlayerMovementAuthorityResources {
                 ));
             }
         }
+        if game_mode == GameMode::Spectator {
+            return Ok(());
+        }
 
         let context = PlayerCollisionContext::from_pose(old_pose, walks_on_powder_snow);
         let old_collides = player_pose_collides_with_solid_in_snapshot_with_context(
@@ -158,42 +161,67 @@ impl PlayerMovementAuthorityResources {
             old_pose,
             context,
         );
-        if old_collides
-            && mc_physics::displacement_within_limit(displacement, PLAYER_EMBEDDED_ESCAPE_LIMIT)
-            && !player_pose_collides_with_solid_in_snapshot_with_context(
-                &self.block_facts,
-                &self.blocks,
-                &snapshot,
-                new_pose,
-                context,
-            )
-        {
-            return Ok(());
+        let new_collides = player_pose_collides_with_solid_in_snapshot_with_context(
+            &self.block_facts,
+            &self.blocks,
+            &snapshot,
+            new_pose,
+            context,
+        );
+        if old_collides {
+            if mc_physics::displacement_within_limit(displacement, PLAYER_EMBEDDED_ESCAPE_LIMIT)
+                && !new_collides
+            {
+                return Ok(());
+            }
+            return Err(PlayerMovementAuthorityError::Rejected(
+                PlayerMovementRejection::SweptCollision,
+            ));
+        }
+        if new_collides {
+            return Err(PlayerMovementAuthorityError::Rejected(
+                PlayerMovementRejection::SweptCollision,
+            ));
         }
 
-        let Some(steps) = mc_physics::sweep_sample_count(displacement, PLAYER_SWEEP_SAMPLE_STEP)
-        else {
+        let sampler = PlayerMovementCollisionSampler {
+            facts: &self.block_facts,
+            blocks: &self.blocks,
+            snapshot: &snapshot,
+            context,
+        };
+        let Some(resolved) = mc_physics::resolve_collision_displacement(
+            &sampler,
+            mc_physics::Vec3::new(old_pose.x, old_pose.y, old_pose.z),
+            mc_physics::Aabb {
+                half_width: PLAYER_BODY_HALF_WIDTH,
+                height: old_pose.body_height(),
+            },
+            displacement,
+            old_pose.flags.on_ground,
+            mc_physics::STEP_HEIGHT,
+        ) else {
             return Err(PlayerMovementAuthorityError::Rejected(
                 PlayerMovementRejection::Displacement,
             ));
         };
-        for step in 1..=steps {
-            let t = step as f64 / steps as f64;
-            let mut sample = new_pose;
-            sample.x = old_pose.x + delta.0 * t;
-            sample.y = old_pose.y + delta.1 * t;
-            sample.z = old_pose.z + delta.2 * t;
-            if player_pose_collides_with_solid_in_snapshot_with_context(
-                &self.block_facts,
-                &self.blocks,
-                &snapshot,
-                sample,
-                context,
-            ) {
-                return Err(PlayerMovementAuthorityError::Rejected(
-                    PlayerMovementRejection::SweptCollision,
-                ));
-            }
+        // Vanilla resolves the requested movement against collision shapes and
+        // only treats a materially different horizontal result as "moved
+        // wrongly" for survival/adventure. This preserves the ordinary-player
+        // anti-tunnelling fence while allowing short client-resolved slides around
+        // corners and alongside blocks; Creative skips this residual check and
+        // Spectator returned above with no-physics semantics. Vanilla 26.1.2
+        // effectively ignores the vertical residual here.
+        if game_mode != GameMode::Creative
+            && !mc_physics::horizontal_movement_residual_within_limit(
+                displacement,
+                resolved.delta,
+                PLAYER_MOVED_WRONGLY_THRESHOLD_SQ,
+            )
+        {
+            return Err(PlayerMovementAuthorityError::Rejected(
+                PlayerMovementRejection::SweptCollision,
+            ));
         }
         Ok(())
     }
@@ -253,6 +281,68 @@ impl PlayerCollisionContext {
             descending: pose.shifting,
             walks_on_powder_snow,
         }
+    }
+}
+
+struct PlayerMovementCollisionSampler<'a> {
+    facts: &'a BlockFactsTable,
+    blocks: &'a BlockRegistry,
+    snapshot: &'a WorldReadSnapshot,
+    context: PlayerCollisionContext,
+}
+
+impl mc_physics::BlockSampler for PlayerMovementCollisionSampler<'_> {
+    fn material_at(&self, x: i32, y: i32, z: i32) -> mc_physics::BlockMaterial {
+        let Some(state_id) = self.snapshot.get_cached_block(BlockPos { x, y, z }) else {
+            return mc_physics::BlockMaterial::Air;
+        };
+        if let Some(fluid) = self.facts.fluid(state_id.0) {
+            return match fluid.kind {
+                FluidKind::Water => mc_physics::BlockMaterial::Water,
+                FluidKind::Lava => mc_physics::BlockMaterial::Lava,
+            };
+        }
+        let mut has_collision = false;
+        emit_player_collision_boxes(
+            self.facts,
+            self.blocks,
+            vanilla_collision_shapes(),
+            state_id,
+            BlockPos { x, y, z },
+            self.context,
+            &mut |_| has_collision = true,
+        );
+        if has_collision {
+            mc_physics::BlockMaterial::Solid
+        } else {
+            mc_physics::BlockMaterial::Air
+        }
+    }
+
+    fn max_collision_box_y(&self) -> u8 {
+        let max_y = vanilla_collision_shapes().max_box_y();
+        u8::try_from((max_y + 255) / 256).expect("vanilla collision height fits u8")
+    }
+
+    fn collision_boxes_at(
+        &self,
+        x: i32,
+        y: i32,
+        z: i32,
+        emit: &mut dyn FnMut(mc_physics::BlockCollisionBox),
+    ) {
+        let Some(state_id) = self.snapshot.get_cached_block(BlockPos { x, y, z }) else {
+            return;
+        };
+        emit_player_collision_boxes(
+            self.facts,
+            self.blocks,
+            vanilla_collision_shapes(),
+            state_id,
+            BlockPos { x, y, z },
+            self.context,
+            emit,
+        );
     }
 }
 
@@ -406,6 +496,81 @@ pub(super) fn player_pose_collides_with_solid_in_snapshot_with_context(
     false
 }
 
+fn emit_player_collision_boxes(
+    facts: &BlockFactsTable,
+    blocks: &BlockRegistry,
+    collision_shapes: &CollisionShapeTable,
+    state_id: BlockStateId,
+    block_pos: BlockPos,
+    context: PlayerCollisionContext,
+    emit: &mut dyn FnMut(mc_physics::BlockCollisionBox),
+) {
+    if facts.fluid(state_id.0).is_some() {
+        return;
+    }
+    let Some(block_state) = blocks.by_id(state_id) else {
+        return;
+    };
+    let block_name = block_state.block.id.as_str();
+    let exact_shape = collision_shapes.get_for_state(
+        state_id.0,
+        &block_state.block.id,
+        block_state.properties.as_slice(),
+    );
+
+    if block_name == "minecraft:powder_snow" && exact_shape.is_some() {
+        if context.fall_distance > POWDER_SNOW_FALL_DISTANCE {
+            if let Some(collision_box) = mc_physics::BlockCollisionBox::from_fixed_4096([
+                0,
+                0,
+                0,
+                4096,
+                (POWDER_SNOW_FALLING_TOP * 4096.0) as i16,
+                4096,
+            ]) {
+                emit(collision_box);
+            }
+            return;
+        }
+        let is_above = context.entity_bottom > f64::from(block_pos.y) + 1.0 - COLLISION_DEFLATION;
+        if context.walks_on_powder_snow && is_above && !context.descending {
+            emit(mc_physics::BlockCollisionBox::FULL_BLOCK);
+        }
+        return;
+    }
+
+    if let Some(boxes) = exact_shape {
+        for collision_box in boxes.iter() {
+            if let Some(collision_box) =
+                mc_physics::BlockCollisionBox::from_fixed_4096(collision_box.coordinates())
+            {
+                emit(collision_box);
+            }
+        }
+        return;
+    }
+
+    // Custom or reduced registries have no vanilla table identity. Preserve the
+    // known semantics for those fixtures instead of turning plants into cubes.
+    if is_campfire_block(blocks, state_id)
+        || (block_name != "minecraft:powder_snow" && passable_block_name(block_name))
+    {
+        return;
+    }
+
+    if collision_shapes
+        .is_exact_farmland_state(&block_state.block.id, block_state.properties.as_slice())
+    {
+        if let Some(collision_box) =
+            mc_physics::BlockCollisionBox::from_sixteenths(0, 0, 0, 16, 15, 16)
+        {
+            emit(collision_box);
+        }
+    } else {
+        emit(mc_physics::BlockCollisionBox::FULL_BLOCK);
+    }
+}
+
 fn player_collision_state_intersects(
     facts: &BlockFactsTable,
     blocks: &BlockRegistry,
@@ -415,79 +580,42 @@ fn player_collision_state_intersects(
     pose: PlayerPose,
     context: PlayerCollisionContext,
 ) -> bool {
-    if facts.fluid(state_id.0).is_some() {
-        return false;
-    }
-    let Some(block_state) = blocks.by_id(state_id) else {
-        return false;
-    };
-    let block_name = block_state.block.id.as_str();
-
     let block_min_x = f64::from(block_pos.x);
     let block_min_y = f64::from(block_pos.y);
     let block_min_z = f64::from(block_pos.z);
-    let player_half_width = 0.3;
     let body = [
-        pose.x - player_half_width,
+        pose.x - PLAYER_BODY_HALF_WIDTH,
         pose.y,
-        pose.z - player_half_width,
-        pose.x + player_half_width,
+        pose.z - PLAYER_BODY_HALF_WIDTH,
+        pose.x + PLAYER_BODY_HALF_WIDTH,
         pose.y + pose.body_height(),
-        pose.z + player_half_width,
+        pose.z + PLAYER_BODY_HALF_WIDTH,
     ];
-    let intersects = |[min_x, min_y, min_z, max_x, max_y, max_z]: [f64; 6]| {
-        mc_physics::aabb_intersects_deflated_obstacle(
-            body,
-            [
-                block_min_x + min_x,
-                block_min_y + min_y,
-                block_min_z + min_z,
-                block_min_x + max_x,
-                block_min_y + max_y,
-                block_min_z + max_z,
-            ],
-            COLLISION_DEFLATION,
-        )
-    };
-
-    let exact_shape = collision_shapes.get_for_state(
-        state_id.0,
-        &block_state.block.id,
-        block_state.properties.as_slice(),
+    let mut intersects = false;
+    emit_player_collision_boxes(
+        facts,
+        blocks,
+        collision_shapes,
+        state_id,
+        block_pos,
+        context,
+        &mut |collision_box| {
+            let [min_x, min_y, min_z, max_x, max_y, max_z] = collision_box.as_blocks();
+            intersects |= mc_physics::aabb_intersects_deflated_obstacle(
+                body,
+                [
+                    block_min_x + min_x,
+                    block_min_y + min_y,
+                    block_min_z + min_z,
+                    block_min_x + max_x,
+                    block_min_y + max_y,
+                    block_min_z + max_z,
+                ],
+                COLLISION_DEFLATION,
+            );
+        },
     );
-    if block_name == "minecraft:powder_snow" && exact_shape.is_some() {
-        if context.fall_distance > POWDER_SNOW_FALL_DISTANCE {
-            return intersects([0.0, 0.0, 0.0, 1.0, POWDER_SNOW_FALLING_TOP, 1.0]);
-        }
-        let is_above = context.entity_bottom > block_min_y + 1.0 - COLLISION_DEFLATION;
-        return context.walks_on_powder_snow
-            && is_above
-            && !context.descending
-            && intersects([0.0, 0.0, 0.0, 1.0, 1.0, 1.0]);
-    }
-
-    if let Some(boxes) = exact_shape {
-        return boxes
-            .iter()
-            .any(|collision_box| intersects(collision_box.as_blocks()));
-    }
-
-    // Custom or reduced registries have no vanilla table identity. Preserve the
-    // known semantics for those fixtures instead of turning plants into cubes.
-    if is_campfire_block(blocks, state_id)
-        || (block_name != "minecraft:powder_snow" && passable_block_name(block_name))
-    {
-        return false;
-    }
-
-    let fallback_box = if collision_shapes
-        .is_exact_farmland_state(&block_state.block.id, block_state.properties.as_slice())
-    {
-        [0.0, 0.0, 0.0, 1.0, 15.0 / 16.0, 1.0]
-    } else {
-        [0.0, 0.0, 0.0, 1.0, 1.0, 1.0]
-    };
-    intersects(fallback_box)
+    intersects
 }
 
 pub(super) fn player_touches_lit_campfire_in_snapshot(

@@ -65,6 +65,7 @@ const ENTITY_SCALE_DEFAULT_ENTITIES_PER_REGION: usize = 2_500;
 const ENTITY_SCALE_DEFAULT_WARMUP_TICKS: u64 = 200;
 const ENTITY_SCALE_DEFAULT_MEASURE_TICKS: u64 = 1_200;
 const ENTITY_SCALE_REGION_SIZE_BLOCKS: i32 = 128;
+const ENTITY_SCALE_DEFAULT_ENTITY_TYPE: &str = "minecraft:husk";
 
 fn entity_scale_env_usize(name: &str, default: usize) -> usize {
     std::env::var(name)
@@ -78,6 +79,21 @@ fn entity_scale_env_u64(name: &str, default: u64) -> u64 {
         .ok()
         .and_then(|value| value.parse().ok())
         .unwrap_or(default)
+}
+
+fn entity_scale_entity_type_name(env_value: Option<String>) -> String {
+    match env_value {
+        Some(value) if !value.is_empty() => value,
+        _ => ENTITY_SCALE_DEFAULT_ENTITY_TYPE.to_string(),
+    }
+}
+
+fn expected_entity_scale_hostiles(entity_type_name: &str, entity_count: usize) -> usize {
+    if mc_entity::natural_spawn_26_1_2::is_hostile_entity(entity_type_name) {
+        entity_count
+    } else {
+        0
+    }
 }
 
 fn parse_cpu_list(value: &str) -> Option<Vec<usize>> {
@@ -229,6 +245,14 @@ fn prompt01_workload_latency_percentiles_use_nearest_rank() {
     assert_eq!(percentiles.p95_ms, 100);
     assert_eq!(percentiles.p99_ms, 100);
     assert_eq!(percentiles.max_ms, 100);
+}
+
+#[test]
+fn prompt01_expected_entity_scale_hostiles_follow_canonical_category() {
+    assert_eq!(expected_entity_scale_hostiles("minecraft:husk", 4), 4);
+    assert_eq!(expected_entity_scale_hostiles("minecraft:zombie", 4), 4);
+    assert_eq!(expected_entity_scale_hostiles("minecraft:sheep", 4), 0);
+    assert_eq!(expected_entity_scale_hostiles("minecraft:cow", 4), 0);
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -3147,48 +3171,59 @@ async fn paused_reader_pressure_does_not_delay_healthy_observers() {
 #[tokio::test]
 #[ignore = "M37 load report; run explicitly with --ignored --nocapture"]
 async fn reports_spawn_exploration_block_entity_and_multi_client_load() {
-    let server = start_load_server().await;
+    let world_dir = tempfile::tempdir().expect("create M37 load world");
+    let server = start_load_server_with_options(LoadServerOptions {
+        disk_backed: true,
+        existing_world_path: Some(world_dir.path().to_owned()),
+        ..LoadServerOptions::default()
+    })
+    .await;
     let addr = server.addr;
 
     let started = Instant::now();
-    let mut clients = Vec::new();
-    for idx in 0..4 {
-        let (mut client, sync) = connect_to_play(addr, &format!("M37Load{idx}")).await;
-        drain_until_chunk(&mut client, (0, 0)).await;
-        clients.push((client, sync));
+    let mut parked_drainers = Vec::new();
+    for idx in 0..3 {
+        let (mut parked_client, _) = connect_to_play(addr, &format!("M37Load{idx}")).await;
+        let chunks = drain_unique_chunks(&mut parked_client, 9).await;
+        assert_eq!(chunks.len(), 9, "M37 client must finish VD1 stream");
+        parked_drainers.push(tokio::spawn(drain_client_until_shutdown(
+            parked_client,
+            server.shutdown.clone(),
+        )));
     }
+    let (mut client, sync) = connect_to_play(addr, "M37Load3").await;
+    let chunks = drain_unique_chunks(&mut client, 9).await;
+    assert_eq!(chunks.len(), 9, "M37 client must finish VD1 stream");
+    assert_eq!(parked_drainers.len() + 1, 4);
     eprintln!(
-        "M37 load spawn_login_multi_client clients={} elapsed_ms={}",
-        clients.len(),
+        "M37 load spawn_login_multi_client clients=4 elapsed_ms={}",
         started.elapsed().as_millis()
     );
 
     let started = Instant::now();
-    let (client, sync) = clients.get_mut(0).expect("first client");
-    for step in 1..=8 {
+    set_load_client_game_mode(&mut client, "gamemode spectator", GameMode::Spectator).await;
+    for step in 1..=16 {
         client
             .write_packet(&ServerboundMovePlayerPos {
-                x: 16.5 * f64::from(step),
+                x: 8.5 * f64::from(step),
                 y: sync.y,
                 z: 0.5,
                 flags: MovePlayerFlags::new(true, false),
             })
             .await
             .expect("send exploration move");
+        if step % 2 == 0 {
+            let new_chunk = (step / 2 + 1, 0);
+            drain_until_chunk(&mut client, new_chunk).await;
+        }
     }
-    drain_until_chunk(client, (8, 0)).await;
     eprintln!(
-        "M37 load exploration moves=8 elapsed_ms={}",
+        "M37 load exploration moves=16 elapsed_ms={}",
         started.elapsed().as_millis()
     );
 
     let started = Instant::now();
-    client
-        .write_packet(&ServerboundChatCommand {
-            command: "gamemode creative".to_string(),
-        })
-        .await
-        .expect("creative command");
+    set_load_client_game_mode(&mut client, "gamemode creative", GameMode::Creative).await;
     client
         .write_packet(&ServerboundChatCommand {
             command: "give minecraft:dirt 64".to_string(),
@@ -3222,7 +3257,7 @@ async fn reports_spawn_exploration_block_entity_and_multi_client_load() {
             .await
             .expect("place dirt");
     }
-    let acks = drain_counting(client, Duration::from_secs(3), BlockChangedAck::ID).await;
+    let acks = drain_counting(&mut client, Duration::from_secs(3), BlockChangedAck::ID).await;
     eprintln!(
         "M37 load block_edit_storm attempts=16 acks={} elapsed_ms={}",
         acks,
@@ -3243,7 +3278,7 @@ async fn reports_spawn_exploration_block_entity_and_multi_client_load() {
             .await
             .expect("summon zombie");
     }
-    let spawns = drain_counting(client, Duration::from_secs(5), AddEntity::ID).await;
+    let spawns = drain_counting(&mut client, Duration::from_secs(5), AddEntity::ID).await;
     eprintln!(
         "M37 load entity_crowd summons=8 add_entity_frames={} elapsed_ms={}",
         spawns,
@@ -3274,6 +3309,11 @@ async fn reports_spawn_exploration_block_entity_and_multi_client_load() {
         pressure.player_persistence.hold_us,
         pressure.player_persistence.max_hold_us,
     );
+    drop(client);
+    shutdown_load_server(server, "M37 load").await;
+    for task in parked_drainers {
+        task.await.expect("parked M37 client drain task joins");
+    }
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
@@ -3423,13 +3463,25 @@ async fn entity_scale_40k_hostiles_60_clients_profile() {
         pre_seed_readiness.desired_loaded_chunks
     );
 
-    let specs = entity_scale_entity_specs(&server, regions, region_side, entities_per_region);
+    let entity_type_name =
+        entity_scale_entity_type_name(std::env::var("SOLARIS_ENTITY_BENCH_ENTITY_TYPE").ok());
+    let expected_hostiles = expected_entity_scale_hostiles(&entity_type_name, entity_count);
+    let specs = entity_scale_entity_specs(
+        &server,
+        regions,
+        region_side,
+        entities_per_region,
+        &entity_type_name,
+    );
     assert_eq!(specs.len(), entity_count);
     let seed_started = Instant::now();
     let seed_report = server.load_bench.seed_entities(specs);
     let seed_elapsed = seed_started.elapsed();
     assert_eq!(seed_report.entities, entity_count);
-    assert_eq!(seed_report.hostile_entities, entity_count);
+    assert_eq!(
+        seed_report.hostile_entities, expected_hostiles,
+        "seeded benchmark hostiles must follow the canonical hostile category contract"
+    );
     assert_eq!(seed_report.regions, regions);
     assert!(seed_report.max_entities_per_region <= 3_000);
     eprintln!(
@@ -3447,8 +3499,8 @@ async fn entity_scale_40k_hostiles_60_clients_profile() {
         |activity| {
             activity.active_simulation_entities == entity_count
                 && activity.entity_update_active_population == entity_count
-                && activity.entity_update_selected > 0
-                && activity.active_hostile_entities == activity.entity_update_selected
+                && activity.entity_update_selected == entity_count
+                && activity.active_hostile_entities == expected_hostiles
         },
     )
     .await;
@@ -3527,8 +3579,12 @@ async fn entity_scale_40k_hostiles_60_clients_profile() {
         "the measured window must keep the complete entity population eligible"
     );
     assert_eq!(
-        final_activity.active_hostile_entities, final_activity.entity_update_selected,
-        "every selected benchmark entity must remain hostile"
+        final_activity.entity_update_selected, entity_count,
+        "the measured window must select the complete active population for entity updates"
+    );
+    assert_eq!(
+        final_activity.active_hostile_entities, expected_hostiles,
+        "active benchmark hostiles must follow the canonical hostile category contract"
     );
     assert_eq!(
         pre_seed_readiness.pending_chunks, 0,
@@ -3573,6 +3629,7 @@ async fn entity_scale_40k_hostiles_60_clients_profile() {
             "regions": regions,
             "entities": entity_count,
             "entities_per_region": entities_per_region,
+            "entity_type": entity_type_name,
             "warmup_ticks": warmup_ticks,
             "measured_ticks": measure_ticks,
             "owner_lanes": seed_report.owner_lanes,
@@ -3634,7 +3691,7 @@ async fn entity_scale_40k_hostiles_60_clients_profile() {
     );
 
     eprintln!(
-        "ENTITY_SCALE_BENCH clients={clients} regions={regions} entities={entity_count} per_region={entities_per_region} owner_lanes={} seed_ms={} tick_p50_us={} tick_p95_us={} tick_p99_us={} tick_max_us={} goals_p99_us={} physics_p99_us={} attacks_p99_us={} dispatch_p99_us={} rotation_ticks_est={} movement_budget={} memory_mb={} client_frames={} client_bytes={} report={}",
+        "ENTITY_SCALE_BENCH clients={clients} entity_type={entity_type_name} regions={regions} entities={entity_count} per_region={entities_per_region} owner_lanes={} seed_ms={} tick_p50_us={} tick_p95_us={} tick_p99_us={} tick_max_us={} goals_p99_us={} physics_p99_us={} attacks_p99_us={} dispatch_p99_us={} rotation_ticks_est={} movement_budget={} memory_mb={} client_frames={} client_bytes={} report={}",
         seed_report.owner_lanes,
         seed_elapsed.as_millis(),
         tick_profile.tick.p50_us,
@@ -3680,19 +3737,19 @@ fn entity_scale_entity_specs(
     regions: usize,
     region_side: usize,
     entities_per_region: usize,
+    entity_type_name: &str,
 ) -> Vec<mc_net::LoadBenchEntitySpec> {
-    let names = ["minecraft:husk"];
-    let types = names.map(|name| {
-        let id = mc_data::Identifier::parse(name).expect("entity-scale entity identifier");
-        let type_id = server
-            .entity_types
-            .id_of(&id)
-            .unwrap_or_else(|| panic!("missing entity type {name}"));
-        (
-            i32::try_from(type_id).expect("entity type id fits i32"),
-            name,
-        )
+    let entity_type = mc_data::Identifier::parse(entity_type_name).unwrap_or_else(|error| {
+        panic!("SOLARIS_ENTITY_BENCH_ENTITY_TYPE {entity_type_name:?} is not a valid entity identifier: {error}")
     });
+    let entity_type_id = server
+        .entity_types
+        .id_of(&entity_type)
+        .and_then(|type_id| i32::try_from(type_id).ok())
+        .unwrap_or_else(|| {
+            panic!("SOLARIS_ENTITY_BENCH_ENTITY_TYPE {entity_type_name:?} is missing from the entity type registry (default: {ENTITY_SCALE_DEFAULT_ENTITY_TYPE})")
+        });
+    let type_name = entity_type.as_str().to_string();
     let grid_side = (1..=entities_per_region)
         .find(|side| side * side >= entities_per_region)
         .expect("entity-scale grid side");
@@ -3711,8 +3768,13 @@ fn entity_scale_entity_specs(
                     .generator
                     .surface_height(x.round() as i32, z.round() as i32),
             ) + 1.0;
-            let (type_id, name) = types[(region + index) % types.len()];
-            specs.push(mc_net::LoadBenchEntitySpec::new(type_id, name, x, y, z));
+            specs.push(mc_net::LoadBenchEntitySpec::new(
+                entity_type_id,
+                type_name.clone(),
+                x,
+                y,
+                z,
+            ));
         }
     }
     specs
@@ -4330,6 +4392,7 @@ async fn start_load_server_with_options(options: LoadServerOptions) -> LoadServe
             friendly_spawn_interval_ticks: 400,
             hostile_spawn_interval_ticks: 20,
             seed: 0,
+            ..mc_net::RandomTickPolicy::default()
         },
         command_permissions: mc_net::CommandPermissionConfig::new(Vec::<String>::new(), true),
         loader_manifest: None,
@@ -4621,7 +4684,7 @@ async fn drain_until_chunk(client: &mut Client, target: (i32, i32)) {
                 deadline.saturating_duration_since(tokio::time::Instant::now()),
             )
             .await
-            .expect("drain chunk");
+            .unwrap_or_else(|error| panic!("drain chunk {target:?}: {error}"));
         if handle_keepalive(client, frame.id, &frame.body).await {
             continue;
         }

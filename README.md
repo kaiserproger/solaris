@@ -1,206 +1,170 @@
 # Solaris
 
-A custom Minecraft Java Edition 26.1-compatible server engine, written in Rust.
+Solaris is an authoritative Minecraft Java Edition server written in Rust. It
+targets the vanilla **Minecraft Java Edition 26.1.2** protocol and also supports
+optional client content through Solaris Loader.
 
-Solaris is an authoritative server implementing the vanilla 26.1 Java protocol
-plus a custom protocol extension consumed by a Fabric/NeoForge client mod. See
-[`docs/PROJECT_SPEC.md`](docs/PROJECT_SPEC.md) for the full design document.
+> **Development status:** `main` is the in-progress `v0.0.3-alpha.1` line. The
+> latest published release is **`v0.0.2-alpha.1`**. Solaris is suitable for
+> testing, plugin development, and bounded multiplayer field tests; it is not a
+> production-safe replacement for vanilla, Paper, Fabric, Forge, or NeoForge.
+> Alpha worlds, plugin APIs, and Loader contracts may change without migration.
 
-**Status:** public alpha for Minecraft Java Edition 26.1.2. Solaris is suitable
-for testing, development servers, plugin experiments, and bounded multiplayer
-sessions. It is **not** a production-safe drop-in replacement for vanilla or an
-existing server fleet. Persistence schemas, plugin APIs, and client-extension
-contracts may break between alpha releases without migration support.
+Solaris ships an optional default-off read-only web dashboard
+(`[dashboard]` in the config, see [`docs/OPERATING.md`](docs/OPERATING.md))
+and the `operator add|remove|list` CLI. The optional standard plugin pack is
+still planned. See [`docs/PUBLIC_ALPHA3_PLAN.md`](docs/PUBLIC_ALPHA3_PLAN.md).
 
-The public alpha ships Linux x86_64 and AArch64 binaries. Windows and macOS have
-no prebuilt artifacts. Validate broader compatibility and replacement-readiness
-claims against:
-[docs/REPLACEMENT_READINESS.md](docs/REPLACEMENT_READINESS.md),
-[docs/VALIDATION_LEDGER.md](docs/VALIDATION_LEDGER.md), and
-[docs/VALIDATION_COVERAGE_AUDIT.md](docs/VALIDATION_COVERAGE_AUDIT.md).
+## Install the released alpha (Linux)
 
-### Alpha boundaries
-
-- Exact target: unmodified Minecraft Java Edition `26.1.2`.
-- Ordinary survival, persistence, multiplayer, mobs, merchant trading, and Lua
-  plugins are implemented far enough for public testing, not full vanilla parity.
-- Some species-specific mob attacks, village population/defence, zombie-villager
-  curing, Hero of the Village pricing, rare redstone/vehicle behavior, and broad
-  performance envelopes remain incomplete.
-- Existing Solaris worlds and plugins may require deletion or manual adaptation
-  after an alpha update. Backward compatibility is not promised before `1.0`.
-- Report reproducible bugs with the server version, config, client version, logs,
-  and the smallest reproduction. The completed second-alpha plan is archived in
-  [`docs/PUBLIC_ALPHA_PLAN.md`](docs/PUBLIC_ALPHA_PLAN.md); current carry-over work
-  for the third alpha is tracked in [`docs/PUBLIC_ALPHA3_PLAN.md`](docs/PUBLIC_ALPHA3_PLAN.md).
-
-## Build
-
-```sh
-cargo build
-```
-
-Use debug builds for development; release builds are reserved for CI/owner-run
-checks.
-
-## Install the public alpha on Linux
-
-Tagged releases publish SHA-256-verified server archives for Linux x86_64 and
-AArch64. Prereleases are deliberately not resolved through GitHub's `latest`
-alias, so pin the alpha tag explicitly:
+Published archives are available for Linux x86_64 and AArch64. Pin the release
+because GitHub's `latest` alias does not resolve prereleases:
 
 ```sh
 curl -fsSL https://raw.githubusercontent.com/kaiserproger/solaris/main/install.sh | \
   SOLARIS_VERSION="v0.0.2-alpha.1" bash
+
+curl -fsSLo server.toml \
+  https://raw.githubusercontent.com/kaiserproger/solaris/v0.0.2-alpha.1/example.toml
+solaris --check --config server.toml
+solaris --config server.toml
 ```
 
-The installer writes `solaris` to `$HOME/.local/bin` for a regular user and to
-`/usr/local/bin` when run as root. Override the destination while keeping the
-release pinned:
+The installer verifies the published SHA-256 before replacing the binary. It
+installs to `$HOME/.local/bin` for a regular user and `/usr/local/bin` for root;
+set `SOLARIS_INSTALL_DIR` to override that destination. Windows and macOS do
+not currently have prebuilt archives.
+
+## Build and run the alpha-3 development tree
+
+Use the repository's debug profile for development:
 
 ```sh
-curl -fsSL https://raw.githubusercontent.com/kaiserproger/solaris/main/install.sh | \
-  SOLARIS_INSTALL_DIR="$HOME/bin" SOLARIS_VERSION="v0.0.2-alpha.1" bash
+cargo build --bin mc-server
+cargo run --bin mc-server -- --check --config example.toml
+cargo run --bin mc-server -- --config example.toml
 ```
 
-The script downloads the matching GitHub release archive, verifies its published
-SHA-256 checksum before extraction, rejects unsafe archive paths, and only then
-replaces the destination binary.
+`--config` selects the TOML file; without it the binary looks for
+`config.toml`. `--check` parses and validates the deployment, prints the
+effective configuration as JSON, and exits without binding a listener. Review
+`operator_warnings`, `effective_autoscale`, and `discovered_plugins` before
+serving.
 
-## Runtime Data
+## Network address and port
 
-Solaris ships its required registry/data baseline as repo-owned JSON assets
-embedded into the server binary. No external vanilla data sidecar is required
-to start the server. If `data.vanilla_data_dir` points at a local extracted
-vanilla sidecar, that sidecar is treated as authoritative: registries, tags,
-`reports/block_light.json`, and supported simple loot must be present. Generate
-it with `tools/extract-vanilla-data.sh`. Both `--check` and `serve` reject a
-missing/unusable sidecar root or a `version.json` that is missing, invalid, or
-targets a different release id, world version, or protocol. Without
-`data.vanilla_data_dir`, Solaris uses embedded repo-owned fallback data.
+The listen address and Minecraft port are ordinary, existing configuration
+settings:
 
-## Run
-
-```sh
-# Optional: copy a minimal starter config.
-# The file uses the same schema as example.toml.
-cat > server-run.toml <<'EOF'
-[server]
-name = "solaris-local"
-motd = "Solaris local server"
-view_distance = 8
-
+```toml
 [network]
+# Loopback: only this machine can connect.
 bind_address = "127.0.0.1"
+# Change this to run Solaris on another TCP port.
 port = 25565
-
-[auth]
-online_mode = false
-prevent_proxy_connections = false
-whitelist_enabled = false
-whitelist = []
-banned_players = []
-
-[admin]
-operators = []
-allow_local_dev_operators = true
-
-[plugins]
-directory = "plugins"
-# Keep permissive for local iteration. Production should set strict = true and
-# list the exact external and bundled ids in expected.
-strict = false
-expected = []
-
-[data]
-world_dir = "world"
-seed = 0
-
-[simulation]
-random_tick_speed = 5
-save_interval_ticks = 1200
-friendly_spawn_interval_ticks = 400
-hostile_spawn_interval_ticks = 20
-
-[chunk_pipeline]
-chunk_send_rate = 8
-chunk_load_rate = 16
-chunk_generate_rate = 16
-chunk_prepare_budget_ms = 0
-chunk_prepare_batch_size = 8
-chunk_result_queue_size = 64
-region_cache_size = 9
-
-[autoscale]
-enabled = true
-profile = "balanced"
-EOF
-
-# Just validate the config:
-cargo run --release --bin mc-server -- --check --config server-run.toml
-
-# Actually serve:
-cargo run --release --bin mc-server -- --config server-run.toml
 ```
 
-The `--check` JSON includes `operator_warnings`. Review every warning before
-serving. A fresh `world_dir_missing_on_disk` warning is expected when creating a
-new world and `serve` will create that directory. Public binds with offline-mode
-auth or `allow_local_dev_operators` are unsafe, while an unusable world path or
-stale `data.vanilla_data_dir` is a real persistence/data readiness blocker.
+Clients connect to `host:port` (for example, `192.168.1.20:25570`). To accept
+remote connections, choose an appropriate interface address, configure the
+host firewall/NAT for the same TCP port, and enable online authentication.
+Solaris rejects a public bind in offline mode; do not expose an offline-mode
+server to an untrusted network. Detailed examples are in
+[`docs/OPERATING.md`](docs/OPERATING.md#network-bind-and-port).
 
-Then connect a vanilla 26.1.2 PrismLauncher client to the configured address.
+## Configuration essentials
 
-Server-side plugins run as sandboxed strict Luau. External packages are loaded
-from `[plugins].directory`; server-embedded examples are enabled explicitly with
-`[plugins].bundled`. See [`docs/PLUGINS.md`](docs/PLUGINS.md) for the package
-format, bundled ids, type-checking rules, and API.
+- **Authentication:** `[auth].online_mode = true` uses Mojang session
+  authentication. Offline mode is for trusted loopback/private testing only and
+  does not prove a player's identity.
+- **World:** `[data].world_dir` is required. A missing directory is created as a
+  fresh Solaris world. Solaris persists a world contract covering generation
+  revision, seed, mode, geometry, and plugin worldgen profiles; incompatible
+  changes require a new world directory. Back up alpha worlds before updating.
+- **Operators:** configure identities with `[admin].operators` or
+  `operators_file`. Use `mc-server --config server.toml operator
+  {add|remove|list} <name-or-uuid>` to manage the persisted file without
+  enabling local-dev operators or editing JSON. Keep
+  `allow_local_dev_operators = false` outside throwaway loopback development.
+- **Autoscale:** `[autoscale]` is enabled by default with the `balanced` profile.
+  It adapts bounded view distance and chunk work budgets to runtime pressure;
+  `--check` prints the normalized limits and policy.
+- **Plugins:** external Luau packages are discovered below
+  `[plugins].directory` (normally `plugins/`). Bundled examples are disabled
+  unless named in `[plugins].bundled`. Use strict deployment and an exact
+  `expected` list for a controlled server.
+- **Vanilla data:** required baseline data is embedded. Setting
+  `[data].vanilla_data_dir` opts into an authoritative extracted sidecar, which
+  must be complete and exactly match 26.1.2.
 
-For agent-driven real-client checks, the reusable NeoForge client mod embeds a
-loopback MCP server with structured world observation and input controls. See
-[`client-mod/solaris-client-agent/README.md`](client-mod/solaris-client-agent/README.md)
-and start it with `tools/run-minecraft-client-mcp.sh`.
+See [`example.toml`](example.toml) for the complete commented starter profile
+and [`docs/OPERATING.md`](docs/OPERATING.md) for network, authentication,
+world, operator, autoscale, and check-output guidance.
+
+## Plugins and Solaris Loader
+
+Solaris runs sandboxed, strict Luau plugins under current API `0.6.0`. Plugins
+without a `[client]` bundle are `server_only` and accept an ordinary vanilla
+26.1.2 client. A plugin with client bundles is `server_and_client`; connecting
+players must install the matching Solaris Loader adapter and approve the
+requested permissions.
+
+- Operator and author guide: [`docs/PLUGINS.md`](docs/PLUGINS.md)
+- Fabric/NeoForge/Forge client installation: [`docs/SOLARIS_LOADER.md`](docs/SOLARIS_LOADER.md)
+- Inspectable examples: [`examples/plugins/`](examples/plugins/)
+
+Solaris Loader is not needed for a server whose selected plugins are all
+`server_only`. `solaris --check --config server.toml` reports each discovered
+plugin's deployment, supported loaders, requested permissions, bundle identity,
+and artifact size.
+
+## Current alpha boundaries
+
+Ordinary survival, persistence, multiplayer, entities, trading, and plugins are
+implemented far enough for active field testing, not full vanilla parity. Rare
+redstone/vehicle behavior, species-specific behavior, broad production
+performance envelopes, and parts of village behavior remain incomplete. The
+latest field test also identified movement/collision and item-pickup issues
+tracked as alpha-3 blockers.
+
+Do not assume an existing Solaris world will remain compatible with a newer
+alpha. Solaris can read supported vanilla Anvil data, but unversioned imports
+have stricter generation constraints and are not a promise of complete vanilla
+server replacement.
 
 ## Test
 
+The full repository gates are:
+
 ```sh
+cargo run -p xtask -- code-health
 cargo test --workspace
 cargo clippy --workspace --all-targets -- -D warnings
 cargo fmt --all -- --check
 ```
 
-## Current performance evidence
+Debug builds are the normal development loop. Release and real-client gates are
+run only for their documented release/checkpoint scopes.
 
-The latest bounded debug/release matrix is recorded in
-[`docs/performance/2026-07-27-benchmark-matrix.md`](docs/performance/2026-07-27-benchmark-matrix.md).
-The focused 20-client VD8 gate passes in both builds on the calibration host, but
-the frozen low/balanced/high duration and cgroup envelopes are still incomplete.
-The current O3 explosion-authority benchmark remains over its 50 ms p99 budget;
-see the matrix before making performance or readiness claims.
+## More documentation
 
-## Layout
+- [`docs/PROJECT_SPEC.md`](docs/PROJECT_SPEC.md) — design and compatibility scope
+- [`docs/releases/v0.0.2-alpha.1.md`](docs/releases/v0.0.2-alpha.1.md) — latest released alpha
+- [`docs/PUBLIC_ALPHA3_PLAN.md`](docs/PUBLIC_ALPHA3_PLAN.md) — current development work
+- [`docs/REPLACEMENT_READINESS.md`](docs/REPLACEMENT_READINESS.md) — replacement-readiness limits
+- [`docs/VALIDATION_LEDGER.md`](docs/VALIDATION_LEDGER.md) — recorded evidence
 
-```
-crates/
-├── mc-protocol/     wire protocol: packets, codec, encryption
-├── mc-nbt/          NBT helpers
-├── mc-world/        block states, chunk format, world storage
-├── mc-worldgen/     generation pipeline, biomes, structures
-├── mc-physics/      block physics, collisions, fluids
-├── mc-entity/       entity system, AI, pathfinding
-├── mc-net/          connection management, session lifecycle
-├── mc-data/         data pack loader, registries, recipes
-├── mc-extension/    custom protocol extension (for the client mod)
-├── mc-script/       plugin API and sandboxed Lua host
-├── mc-server/       main binary
-└── mc-test-harness/ diff testing infrastructure
+## Repository layout
+
+```text
+crates/                              Rust workspace
+client-mod/solaris-client-agent/     Loader adapters and real-client tooling
+examples/plugins/                    Luau plugin examples
+examples/loader-live-gate/           Loader-required integration fixture
+docs/                                contracts, guides, ADRs, and evidence
+tools/                               extraction and validation tools
 ```
 
 ## License
 
-Dual-licensed under either of
-
-- Apache License, Version 2.0 ([LICENSE-APACHE](LICENSE-APACHE))
-- MIT license ([LICENSE-MIT](LICENSE-MIT))
-
-at your option.
+Dual-licensed under either Apache-2.0 ([`LICENSE-APACHE`](LICENSE-APACHE)) or MIT
+([`LICENSE-MIT`](LICENSE-MIT)), at your option.

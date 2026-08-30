@@ -453,7 +453,12 @@ where
     let mut body = BytesMut::new();
     packet.encode(&mut body)?;
     let framed = encode_frame(P::ID, &body, compression)?;
-    write_with_stall_timeout(writer.write_all(&framed), OUTBOUND_WRITE_STALL_TIMEOUT).await
+    let result =
+        write_with_stall_timeout(writer.write_all(&framed), OUTBOUND_WRITE_STALL_TIMEOUT).await;
+    if result.is_ok() {
+        crate::operator_metrics::record_outbound_bytes(framed.len() as u64);
+    }
+    result
 }
 
 #[cfg(test)]

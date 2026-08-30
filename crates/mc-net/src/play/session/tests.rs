@@ -4158,6 +4158,125 @@ fn empty_entity_goal_tick_skips_regional_owner_request() {
     assert_eq!(registry.entities.owner_requests_for_test(), 0);
 }
 
+#[test]
+fn landing_detection_skips_entity_snapshots_for_living_batches_without_falling_blocks() {
+    let registry = SessionRegistry::new();
+    let alice = register_test_session(&registry, "LandingPrefilterAlice");
+    assert!(registry.mark_loaded(alice, (0, 0)).is_empty());
+    for index in 0..64 {
+        registry.spawn_command_entity(
+            &SimulationAuthority::for_test(),
+            4,
+            "minecraft:cow".to_owned(),
+            Vec3::new(0.5 + index as f64 * 0.01, 64.0, 0.5),
+        );
+    }
+
+    // The per-tick goal budget rotates entity queries, so collect until every
+    // spawned cow has been seen at least once.
+    let mut queries_by_id = HashMap::new();
+    for tick in 1..=16 {
+        for query in registry.tick_entities_and_collect_physics_queries(tick) {
+            queries_by_id.insert(query.id, query);
+        }
+    }
+    let queries = queries_by_id.into_values().collect::<Vec<_>>();
+    assert_eq!(queries.len(), 64);
+    assert!(
+        queries
+            .iter()
+            .all(|query| query.kind != EntityPhysicsKind::FallingBlock)
+    );
+    let steps = queries
+        .iter()
+        .map(|query| EntityPhysicsStep {
+            id: query.id,
+            position: query.position,
+            velocity: query.velocity,
+            on_ground: true,
+            horizontal_collision: false,
+        })
+        .collect::<Vec<_>>();
+
+    registry.entities.reset_owner_requests_for_test();
+    let landed = registry.landed_falling_blocks(&queries, &steps);
+    assert!(landed.is_empty());
+    assert_eq!(
+        registry.entities.owner_requests_for_test(),
+        0,
+        "landing detection must not touch entity snapshots without falling-block queries"
+    );
+}
+
+#[test]
+fn landed_falling_blocks_keeps_collecting_landed_falling_blocks() {
+    let registry = SessionRegistry::new();
+    let alice = register_test_session(&registry, "LandingPrefilterBob");
+    assert!(registry.mark_loaded(alice, (0, 0)).is_empty());
+    registry.spawn_falling_block(70, Vec3::new(4.5, 65.0, 4.5), mc_world::BlockStateId(16));
+    registry.spawn_command_entity(
+        &SimulationAuthority::for_test(),
+        4,
+        "minecraft:cow".to_owned(),
+        Vec3::new(8.5, 64.0, 0.5),
+    );
+    let falling_id = {
+        let entities = registry.lock_entities("inspect spawned falling block");
+        entities
+            .snapshots()
+            .find(|snapshot| snapshot.type_name == "minecraft:falling_block")
+            .expect("spawned falling block")
+            .id
+    };
+
+    let queries = registry.tick_entities_and_collect_physics_queries(1);
+    assert!(
+        queries
+            .iter()
+            .any(|query| query.id == falling_id && query.kind == EntityPhysicsKind::FallingBlock)
+    );
+
+    let steps = queries
+        .iter()
+        .map(|query| EntityPhysicsStep {
+            id: query.id,
+            position: query.position,
+            velocity: query.velocity,
+            on_ground: true,
+            horizontal_collision: false,
+        })
+        .collect::<Vec<_>>();
+    let landed = registry.landed_falling_blocks(&queries, &steps);
+    assert_eq!(landed.len(), 1);
+    assert_eq!(landed[0].id, falling_id);
+    assert_eq!(landed[0].state, mc_world::BlockStateId(16));
+    let landed_step = steps
+        .iter()
+        .find(|step| step.id == falling_id)
+        .expect("falling block step");
+    assert_eq!(
+        landed[0].pos,
+        mc_world::BlockPos {
+            x: landed_step.position.x.floor() as i32,
+            y: landed_step.position.y.floor() as i32,
+            z: landed_step.position.z.floor() as i32,
+        }
+    );
+
+    let airborne_steps = steps
+        .iter()
+        .map(|step| EntityPhysicsStep {
+            on_ground: false,
+            ..*step
+        })
+        .collect::<Vec<_>>();
+    assert!(
+        registry
+            .landed_falling_blocks(&queries, &airborne_steps)
+            .is_empty()
+    );
+}
+
 #[tokio::test]
 async fn last_session_unregister_pushes_empty_event() {
     let registry = SessionRegistry::new();
@@ -4431,7 +4550,7 @@ fn unloaded_entities_do_not_run_goal_ticks() {
 }
 
 #[test]
-fn dense_simulation_cohort_keeps_the_full_active_breeding_population() {
+fn overloaded_dense_simulation_keeps_full_active_entity_cadence() {
     let registry = SessionRegistry::new();
     let player = register_test_session(&registry, "DenseBreedingPopulationAlice");
     assert!(registry.mark_loaded(player, (0, 0)).is_empty());
@@ -4454,18 +4573,36 @@ fn dense_simulation_cohort_keeps_the_full_active_breeding_population() {
         &resources,
         20,
         EntitySimulationTickPolicy {
-            entity_updates_per_lane: 256,
             pathing_candidates_per_entity: 8,
             simulation_distance: DEFAULT_VIEW_DISTANCE,
         },
         EntitySimulationWorldContext::empty(),
     );
 
-    assert_eq!(queries.len(), 256);
+    assert_eq!(
+        queries.len(),
+        300,
+        "dense active populations must keep full per-tick physics/AI activity"
+    );
+    let next_queries = registry.tick_entities_and_collect_physics_queries_owned(
+        &SimulationAuthority::for_test(),
+        &resources,
+        21,
+        EntitySimulationTickPolicy {
+            pathing_candidates_per_entity: 1,
+            simulation_distance: DEFAULT_VIEW_DISTANCE,
+        },
+        EntitySimulationWorldContext::empty(),
+    );
+    assert_eq!(
+        next_queries.len(),
+        300,
+        "every active entity must retain consecutive-tick simulation cadence"
+    );
     assert_eq!(
         registry.active_simulation_entities.load().len(),
         300,
-        "breeding must see the full active population even when physics uses a cohort"
+        "breeding and physics must see the same full active population"
     );
     registry.entities.reset_owner_requests_for_test();
     let (births, dispatches) = registry.tick_animal_breeding(&SimulationAuthority::for_test(), 20);
@@ -4476,6 +4613,30 @@ fn dense_simulation_cohort_keeps_the_full_active_breeding_population() {
         0,
         "idle adult animals must not trigger a dense owner snapshot"
     );
+}
+
+#[test]
+#[ignore = "manual microbenchmark for full active-entity selection"]
+fn full_active_entity_selection_borrow_benchmark() {
+    use std::hint::black_box;
+    use std::time::Instant;
+
+    let active = (0..40_000).map(EntityId).collect::<HashSet<_>>();
+    let iterations = 2_000;
+    let started = Instant::now();
+    for _ in 0..iterations {
+        black_box(active.clone());
+    }
+    let cloned_ns = started.elapsed().as_nanos() / iterations;
+
+    let started = Instant::now();
+    for _ in 0..iterations {
+        black_box(&active);
+    }
+    let borrowed_ns = started.elapsed().as_nanos() / iterations;
+
+    println!("full active selection (40k): clone={cloned_ns} ns borrow={borrowed_ns} ns");
+    assert_eq!(black_box(&active).len(), 40_000);
 }
 
 #[test]
@@ -11758,6 +11919,171 @@ fn stale_entity_physics_result_does_not_overwrite_newer_kinematics() {
 }
 
 #[test]
+fn physics_preflight_rejects_stale_missing_and_non_finite_but_keeps_test_path_steps() {
+    let registry = SessionRegistry::new();
+    let (tx, _rx) = mpsc::channel(8);
+    let (alice, _) = registry.register(
+        &profile("PreflightPhysicsAlice"),
+        (0, 0),
+        2,
+        HashSet::from([(0, 0)]),
+        tx,
+        PlayerPose::new(0.5, 64.0, 0.5),
+    );
+    assert!(registry.mark_loaded(alice, (0, 0)).is_empty());
+    registry.spawn_command_entity(
+        &SimulationAuthority::for_test(),
+        1,
+        "minecraft:zombie".to_string(),
+        Vec3::new(0.5, 64.0, 0.5),
+    );
+    registry.spawn_command_entity(
+        &SimulationAuthority::for_test(),
+        2,
+        "minecraft:zombie".to_string(),
+        Vec3::new(3.5, 64.0, 0.5),
+    );
+    let snapshots = registry
+        .lock_entities("read preflight physics entities")
+        .snapshots()
+        .collect::<Vec<_>>();
+    let current = snapshots
+        .iter()
+        .find(|snapshot| snapshot.position.x < 2.0)
+        .expect("spawned current entity");
+    let stale = snapshots
+        .iter()
+        .find(|snapshot| snapshot.position.x > 2.0)
+        .expect("spawned stale entity");
+    let ghost_query_id = mc_entity::EntityId(stale.id.0 + 1_000);
+    let ghost_step_id = mc_entity::EntityId(stale.id.0 + 2_000);
+    let moved_position = Vec3::new(1.5, 64.0, 1.5);
+    let expected = [
+        EntityPhysicsQuery {
+            id: current.id,
+            position: current.position,
+            velocity: current.velocity,
+            aabb: mc_physics::Aabb::COW,
+            on_ground: current.on_ground,
+            fall_distance: 0.0,
+            goal_fence: mc_entity::EntityGoalFence::from_goal(&current.goal),
+            kind: EntityPhysicsKind::Living,
+        },
+        EntityPhysicsQuery {
+            id: stale.id,
+            position: Vec3::new(30.5, 64.0, 30.5),
+            velocity: stale.velocity,
+            aabb: mc_physics::Aabb::COW,
+            on_ground: stale.on_ground,
+            fall_distance: 0.0,
+            goal_fence: mc_entity::EntityGoalFence::from_goal(&stale.goal),
+            kind: EntityPhysicsKind::Living,
+        },
+        EntityPhysicsQuery {
+            id: ghost_query_id,
+            position: Vec3::new(5.5, 64.0, 5.5),
+            velocity: Vec3::ZERO,
+            aabb: mc_physics::Aabb::COW,
+            on_ground: true,
+            fall_distance: 0.0,
+            goal_fence: mc_entity::EntityGoalFence::from_goal(&stale.goal),
+            kind: EntityPhysicsKind::Living,
+        },
+    ];
+    registry.apply_entity_physics_if_current_and_dispatch(
+        1,
+        &expected,
+        &[
+            EntityPhysicsStep {
+                id: current.id,
+                position: moved_position,
+                velocity: Vec3::new(0.1, 0.0, 0.0),
+                on_ground: true,
+                horizontal_collision: false,
+            },
+            EntityPhysicsStep {
+                id: stale.id,
+                position: Vec3::new(4.5, 64.0, 4.5),
+                velocity: Vec3::ZERO,
+                on_ground: true,
+                horizontal_collision: false,
+            },
+            EntityPhysicsStep {
+                id: ghost_query_id,
+                position: Vec3::new(5.5, 64.0, 5.5),
+                velocity: Vec3::ZERO,
+                on_ground: true,
+                horizontal_collision: false,
+            },
+            EntityPhysicsStep {
+                id: ghost_step_id,
+                position: Vec3::new(6.5, 64.0, 6.5),
+                velocity: Vec3::ZERO,
+                on_ground: true,
+                horizontal_collision: false,
+            },
+            EntityPhysicsStep {
+                id: current.id,
+                position: Vec3::new(f64::NAN, 64.0, 1.5),
+                velocity: Vec3::new(f64::INFINITY, 0.0, 0.0),
+                on_ground: true,
+                horizontal_collision: false,
+            },
+        ],
+    );
+    let current_after = registry
+        .server_entity_snapshot(current.id)
+        .expect("current entity survives");
+    let stale_after = registry
+        .server_entity_snapshot(stale.id)
+        .expect("stale entity keeps its state");
+    assert_eq!(current_after.position, moved_position);
+    assert_eq!(current_after.velocity, Vec3::new(0.1, 0.0, 0.0));
+    assert_eq!(stale_after.position, stale.position);
+    assert!(registry.server_entity_snapshot(ghost_query_id).is_none());
+    assert!(registry.server_entity_snapshot(ghost_step_id).is_none());
+
+    // Without expected queries every finite step stays effective even when
+    // motion is missing, while non-finite steps stay rejected.
+    let test_path_position = Vec3::new(4.25, 64.0, 4.25);
+    registry.apply_entity_physics_and_dispatch(
+        2,
+        &[
+            EntityPhysicsStep {
+                id: stale.id,
+                position: test_path_position,
+                velocity: Vec3::ZERO,
+                on_ground: true,
+                horizontal_collision: false,
+            },
+            EntityPhysicsStep {
+                id: ghost_step_id,
+                position: Vec3::new(7.5, 64.0, 7.5),
+                velocity: Vec3::ZERO,
+                on_ground: true,
+                horizontal_collision: false,
+            },
+            EntityPhysicsStep {
+                id: current.id,
+                position: Vec3::new(f64::NAN, 64.0, 1.5),
+                velocity: Vec3::ZERO,
+                on_ground: true,
+                horizontal_collision: false,
+            },
+        ],
+    );
+    let current_final = registry
+        .server_entity_snapshot(current.id)
+        .expect("current entity survives test-path batch");
+    let stale_final = registry
+        .server_entity_snapshot(stale.id)
+        .expect("stale entity moves under test-path batch");
+    assert_eq!(current_final.position, moved_position);
+    assert_eq!(stale_final.position, test_path_position);
+    assert!(registry.server_entity_snapshot(ghost_step_id).is_none());
+}
+
+#[test]
 fn stale_entity_physics_result_does_not_cross_goal_change() {
     let registry = SessionRegistry::new();
     let (tx, _rx) = mpsc::channel(8);
@@ -12590,6 +12916,144 @@ fn natural_mob_soft_despawn_idle_clock_resets_near_player_and_after_damage() {
 }
 
 #[test]
+fn natural_mob_category_sets_stay_mutually_exclusive_for_the_despawn_scan() {
+    let registry = SessionRegistry::new();
+    let mut inner = registry.lock_inner("fence natural category disjointness");
+    assert!(super::entity_lifecycle::natural_mob_category_sets_disjoint(
+        &inner
+    ));
+    let overlap = EntityId(4_242_424);
+    inner.natural_hostile_mobs.insert(overlap);
+    inner.natural_ground_mobs.insert(overlap);
+    assert!(!super::entity_lifecycle::natural_mob_category_sets_disjoint(&inner));
+}
+
+#[test]
+fn natural_mob_despawn_clears_idle_clock_for_stale_category_ids() {
+    let registry = SessionRegistry::new();
+    let (tx, _rx) = mpsc::channel(8);
+    let (player, _) = registry.register(
+        &profile("StaleDespawnObserver"),
+        (0, 0),
+        2,
+        HashSet::from([(0, 0)]),
+        tx,
+        PlayerPose::new(0.5, 64.0, 0.5),
+    );
+    assert!(registry.mark_loaded(player, (0, 0)).is_empty());
+    let stale = EntityId(9_876_543);
+    {
+        let mut inner = registry.lock_inner("mark stale natural fixture");
+        inner.natural_hostile_mobs.insert(stale);
+        inner.natural_mob_no_action_since_tick.insert(stale, 0);
+    }
+
+    assert_eq!(registry.tick_natural_mob_despawn(20).removed(), 0);
+    let inner = registry.lock_inner("verify stale natural idle clock cleanup");
+    assert!(inner.natural_hostile_mobs.contains(&stale));
+    assert!(!inner.natural_mob_no_action_since_tick.contains_key(&stale));
+}
+
+#[test]
+fn natural_mob_despawn_outcome_is_independent_of_category_iteration_order() {
+    const REMOTE_ZOMBIE_X: f64 = 240.5;
+    const REMOTE_SALMON_X: f64 = 90.5;
+    fn seeded(name: &str) -> (SessionRegistry, Vec<EntityId>) {
+        let registry = SessionRegistry::new();
+        let (tx, _rx) = mpsc::channel(8);
+        let (player, _) = registry.register(
+            &profile(name),
+            (0, 0),
+            2,
+            HashSet::from([(0, 0)]),
+            tx,
+            PlayerPose::new(0.5, 64.0, 0.5),
+        );
+        assert!(registry.mark_loaded(player, (0, 0)).is_empty());
+        let mut ids = Vec::new();
+        for (type_id, type_name, x) in [
+            (150, "minecraft:zombie", 20.5),
+            (150, "minecraft:zombie", 40.5),
+            (150, "minecraft:zombie", 100.5),
+            (150, "minecraft:zombie", REMOTE_ZOMBIE_X),
+            (26, "minecraft:chicken", 31.5),
+            (26, "minecraft:chicken", 100.5),
+            (110, "minecraft:salmon", 32.5),
+            (110, "minecraft:salmon", 64.5),
+            (110, "minecraft:salmon", REMOTE_SALMON_X),
+        ] {
+            registry.spawn_command_entity(
+                &SimulationAuthority::for_test(),
+                type_id,
+                type_name.to_owned(),
+                Vec3::new(x, 64.0, 0.5),
+            );
+        }
+        {
+            let entities = registry.lock_entities("read natural despawn fixtures");
+            for (type_name, x) in [
+                ("minecraft:zombie", 20.5),
+                ("minecraft:zombie", 40.5),
+                ("minecraft:zombie", 100.5),
+                ("minecraft:zombie", REMOTE_ZOMBIE_X),
+                ("minecraft:chicken", 31.5),
+                ("minecraft:chicken", 100.5),
+                ("minecraft:salmon", 32.5),
+                ("minecraft:salmon", 64.5),
+                ("minecraft:salmon", REMOTE_SALMON_X),
+            ] {
+                ids.push(
+                    entities
+                        .snapshots()
+                        .find(|entity| {
+                            entity.type_name == type_name && (entity.position.x - x).abs() < 1.0e-9
+                        })
+                        .map(|entity| entity.id)
+                        .unwrap_or_else(|| panic!("missing {type_name} fixture at {x}")),
+                );
+            }
+        }
+        (registry, ids)
+    }
+    let (first, first_ids) = seeded("DespawnOrderAlice");
+    let (second, second_ids) = seeded("DespawnOrderBob");
+    for (registry, ids) in [(&first, &first_ids), (&second, &second_ids)] {
+        let mut inner = registry.lock_inner("mark natural category fixtures");
+        for (index, id) in ids.iter().enumerate() {
+            match index {
+                0..=3 => {
+                    inner.natural_hostile_mobs.insert(*id);
+                }
+                4..=5 => {
+                    inner.natural_ground_mobs.insert(*id);
+                }
+                6..=8 => {
+                    inner.natural_aquatic_mobs.insert(*id);
+                }
+                _ => unreachable!("unexpected natural despawn fixture index"),
+            }
+        }
+        assert!(super::entity_lifecycle::natural_mob_category_sets_disjoint(
+            &inner
+        ));
+    }
+
+    assert_eq!(first.tick_natural_mob_despawn(20).removed(), 2);
+    assert_eq!(second.tick_natural_mob_despawn(20).removed(), 2);
+    let alive_flags = |registry: &SessionRegistry, ids: &[EntityId]| {
+        ids.iter()
+            .map(|id| registry.server_entity_snapshot(*id).is_some())
+            .collect::<Vec<_>>()
+    };
+    // Zombies hard-despawn only beyond 128 blocks, chickens are the
+    // persistent category, salmon hard-despawns beyond 64 blocks with the
+    // exact boundary surviving.
+    let expected_alive = [true, true, true, false, true, true, true, true, false];
+    assert_eq!(alive_flags(&first, &first_ids), expected_alive);
+    assert_eq!(alive_flags(&second, &second_ids), expected_alive);
+}
+
+#[test]
 fn bounded_natural_hostiles_publish_changed_movement_every_tick() {
     let registry = SessionRegistry::new();
     let (tx, mut rx) = mpsc::channel(8);
@@ -12637,6 +13101,81 @@ fn bounded_natural_hostiles_publish_changed_movement_every_tick() {
         rx.try_recv(),
         Ok(OutboundCommand::MoveEntityRelative(movement)) if movement.id == entity_id
     ));
+}
+
+#[test]
+fn natural_hostiles_publish_full_population_under_low_publication_budget() {
+    let registry = SessionRegistry::new();
+    let (tx, mut rx) = mpsc::channel(64);
+    let (observer, _) = registry.register(
+        &profile("NaturalHostileBudgetObserver"),
+        (0, 0),
+        2,
+        HashSet::from([(0, 0)]),
+        tx,
+        PlayerPose::new(0.5, 64.0, 0.5),
+    );
+    assert!(registry.mark_loaded(observer, (0, 0)).is_empty());
+
+    let entity_count = 4;
+    let mut entity_ids = Vec::with_capacity(entity_count);
+    for _ in 0..entity_count {
+        let dispatches = registry.spawn_command_entity(
+            &SimulationAuthority::for_test(),
+            54,
+            "minecraft:zombie".to_owned(),
+            Vec3::new(0.5, 64.0, 0.5),
+        );
+        entity_ids.push(
+            dispatches
+                .iter()
+                .find_map(|dispatch| match &dispatch.command {
+                    OutboundCommand::SpawnEntity(entity) => Some(entity.id),
+                    _ => None,
+                })
+                .expect("spawned zombie is visible"),
+        );
+        dispatch_visibility_commands(dispatches);
+        assert!(matches!(rx.try_recv(), Ok(OutboundCommand::SpawnEntity(_))));
+    }
+    registry
+        .lock_inner("mark natural hostile budget entities")
+        .natural_hostile_mobs
+        .extend(entity_ids.iter().copied());
+    registry.set_entity_movement_publication_budget(1);
+
+    let steps = entity_ids
+        .iter()
+        .enumerate()
+        .map(|(index, &id)| EntityPhysicsStep {
+            id,
+            position: Vec3::new(0.75 + index as f64 * 0.25, 64.0, 0.5),
+            velocity: Vec3::ZERO,
+            on_ground: true,
+            horizontal_collision: false,
+        })
+        .collect::<Vec<_>>();
+    registry.apply_entity_physics_and_dispatch(1, &steps);
+
+    let mut published = HashSet::new();
+    while let Ok(command) = rx.try_recv() {
+        match command {
+            OutboundCommand::MoveEntityRelative(movement) => {
+                assert!(published.insert(movement.id));
+            }
+            OutboundCommand::MoveEntitiesRelative(movements) => {
+                for movement in movements {
+                    assert!(published.insert(movement.id));
+                }
+            }
+            _ => {}
+        }
+    }
+    assert_eq!(
+        published,
+        entity_ids.iter().copied().collect::<HashSet<_>>(),
+        "every natural hostile publishes changed movement in the same tick          despite a movement publication budget of 1"
+    );
 }
 
 #[test]

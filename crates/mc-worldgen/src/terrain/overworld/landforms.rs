@@ -15,6 +15,23 @@ const MOUNTAIN_SCALE_A: f64 = 2_200.0;
 const MOUNTAIN_SCALE_B: f64 = 1_550.0;
 const MOUNTAIN_DETAIL_LONG_SCALE: f64 = 520.0;
 const MOUNTAIN_DETAIL_CROSS_SCALE: f64 = 210.0;
+// Climate is evaluated in three spatial bands. The macro band keeps a family
+// coherent over a region, the regional band bends its boundary, and the local
+// band is deliberately capped so it can only add variation inside transition
+// margins rather than fragmenting the family domain.
+const CLIMATE_MACRO_SCALE: f64 = 12_000.0;
+const CLIMATE_DOMAIN_SCALE: f64 = 3_600.0;
+const CLIMATE_LOCAL_SCALE: f64 = 1_600.0;
+// Preserve cold and hot reachability by widening the centered climate range
+// instead of shifting every region toward one family.
+const CLIMATE_TEMPERATURE_RANGE: f64 = 1.15;
+const CLIMATE_TEMPERATURE_BIAS: f64 = 0.04;
+const CLIMATE_WARP_SCALE: f64 = 4_200.0;
+const CLIMATE_WARP_STRENGTH: f64 = 760.0;
+const CLIMATE_MACRO_WEIGHT: f64 = 0.50;
+const CLIMATE_REGIONAL_WEIGHT: f64 = 0.40;
+const CLIMATE_LOCAL_WEIGHT: f64 = 0.06;
+const CLIMATE_DOMAIN_WEIGHT: f64 = 0.04;
 
 pub(super) fn sample(router: OverworldRouter, block_x: i32, block_z: i32) -> TerrainSample {
     let settings = router.settings();
@@ -146,18 +163,12 @@ pub(super) fn sample(router: OverworldRouter, block_x: i32, block_z: i32) -> Ter
     let low_relief = 1.0 - smootherstep(remap(ridges, 0.025, 0.16));
     let coast_connection = 1.0 - smootherstep(remap(-continentalness, 0.18, 0.48));
     let river_weight = drainage.channel_weight * coast_connection * low_relief;
-    let channel_depth = (2.4 + drainage.accumulation * 0.12).clamp(2.4, 4.4);
+    let channel_depth = (2.4 + drainage.accumulation * 0.10).clamp(2.4, 3.6);
     let river_floor = sea - channel_depth + detail.abs() * 0.45;
     height = lerp(height, river_floor, river_weight);
 
-    let temperature = temperature(router, x, height, z);
-    let moisture = fbm_2d(
-        wx / (1_700.0 * scale),
-        wz / (1_700.0 * scale),
-        router.seed ^ 0x4D4F_4953,
-        3,
-        0.52,
-    );
+    let (base_temperature, moisture, climate_domain) = climate(router, x, z, scale);
+    let temperature = temperature_with_influence(router, base_temperature, height, z);
 
     TerrainSample {
         surface_y: router.clamp_height(height),
@@ -168,6 +179,7 @@ pub(super) fn sample(router: OverworldRouter, block_x: i32, block_z: i32) -> Ter
         river: drainage.river_distance.max((1.0 - river_weight) * 0.10),
         temperature,
         moisture,
+        climate_domain,
     }
 }
 
@@ -183,10 +195,136 @@ pub(super) fn rolling_hills(router: OverworldRouter, x: f64, z: f64, scale: f64)
     )
 }
 
+#[cfg(test)]
 pub(super) fn temperature(router: OverworldRouter, x: f64, height: f64, z: f64) -> f64 {
-    let local = fbm_2d(x / 2_100.0, z / 2_100.0, router.seed ^ 0x5445_4D50, 3, 0.5);
+    let scale = router
+        .settings()
+        .map(|settings| (settings.world_scale_meters_per_block / 30.0).clamp(0.25, 8.0))
+        .unwrap_or(1.0);
+    let (base_temperature, _, _) = climate(router, x, z, scale);
+    temperature_with_influence(router, base_temperature, height, z)
+}
+
+fn climate(router: OverworldRouter, x: f64, z: f64, scale: f64) -> (f64, f64, f64) {
+    // The warp is lower-frequency than local detail and is shared by every
+    // climate band. It curves otherwise smooth boundaries without making an
+    // independent per-axis stripe field.
+    let warp_x = fbm_2d(
+        (x + z * 0.31) / (CLIMATE_WARP_SCALE * scale),
+        (z - x * 0.19) / (CLIMATE_WARP_SCALE * scale),
+        router.seed ^ 0x434C_5758,
+        3,
+        0.5,
+    ) * CLIMATE_WARP_STRENGTH
+        * scale;
+    let warp_z = fbm_2d(
+        (x - z * 0.27) / (CLIMATE_WARP_SCALE * scale),
+        (z + x * 0.23) / (CLIMATE_WARP_SCALE * scale),
+        router.seed ^ 0x434C_575A,
+        3,
+        0.5,
+    ) * CLIMATE_WARP_STRENGTH
+        * scale;
+    let climate_x = x + warp_x;
+    let climate_z = z + warp_z;
+
+    // Macro fields establish the shared regional tendency. Separate stable
+    // salts keep temperature and moisture independent while the common warp
+    // gives their boundaries compatible, non-axis-aligned geometry.
+    let macro_temperature = fbm_2d(
+        (climate_x + climate_z * 0.37) / (CLIMATE_MACRO_SCALE * scale),
+        (climate_z - climate_x * 0.21) / (CLIMATE_MACRO_SCALE * scale),
+        router.seed ^ 0x434C_4D54,
+        4,
+        0.52,
+    );
+    let macro_moisture = fbm_2d(
+        (climate_x - climate_z * 0.29) / (CLIMATE_MACRO_SCALE * scale),
+        (climate_z + climate_x * 0.17) / (CLIMATE_MACRO_SCALE * scale),
+        router.seed ^ 0x434C_4D4D,
+        4,
+        0.52,
+    );
+
+    // Regional fields supply broad transition bands without reducing the
+    // macro field to a single directional gradient.
+    let regional_temperature = fbm_2d(
+        (climate_x + climate_z * 0.43) / (CLIMATE_DOMAIN_SCALE * scale),
+        (climate_z - climate_x * 0.33) / (CLIMATE_DOMAIN_SCALE * scale),
+        router.seed ^ 0x434C_4254,
+        4,
+        0.52,
+    );
+    let regional_moisture = fbm_2d(
+        (climate_x - climate_z * 0.35) / (CLIMATE_DOMAIN_SCALE * scale),
+        (climate_z + climate_x * 0.25) / (CLIMATE_DOMAIN_SCALE * scale),
+        router.seed ^ 0x434C_424D,
+        4,
+        0.52,
+    );
+
+    // Domain identity intentionally omits local noise. Its fixed 0.68/0.32
+    // macro/regional blend keeps neighboring samples in one family over
+    // thousands of blocks, while the selector's existing transition width
+    // still receives gradual, seed-specific boundaries.
+    let macro_domain = fbm_2d(
+        (climate_x + climate_z * 0.19) / (CLIMATE_MACRO_SCALE * 1.12 * scale),
+        (climate_z - climate_x * 0.41) / (CLIMATE_MACRO_SCALE * 1.12 * scale),
+        router.seed ^ 0x434C_444D,
+        3,
+        0.5,
+    );
+    let regional_domain = fbm_2d(
+        (climate_x - climate_z * 0.23) / (CLIMATE_DOMAIN_SCALE * 0.88 * scale),
+        (climate_z + climate_x * 0.31) / (CLIMATE_DOMAIN_SCALE * 0.88 * scale),
+        router.seed ^ 0x434C_444F,
+        3,
+        0.5,
+    );
+    let climate_domain = (macro_domain * 0.68 + regional_domain * 0.32).clamp(-1.0, 1.0);
+
+    // Local variation is bounded explicitly. It breaks up monotony inside a
+    // region, but its 0.06 contribution stays inside the selector margin.
+    let local_temperature = fbm_2d(
+        (climate_x + climate_z * 0.11) / (CLIMATE_LOCAL_SCALE * scale),
+        (climate_z - climate_x * 0.07) / (CLIMATE_LOCAL_SCALE * scale),
+        router.seed ^ 0x434C_4C54,
+        3,
+        0.5,
+    );
+    let local_moisture = fbm_2d(
+        (climate_x + climate_z * 0.18) / (CLIMATE_LOCAL_SCALE * scale),
+        (climate_z - climate_x * 0.14) / (CLIMATE_LOCAL_SCALE * scale),
+        router.seed ^ 0x434C_4C4D,
+        3,
+        0.52,
+    );
+
+    (
+        ((macro_temperature * CLIMATE_MACRO_WEIGHT
+            + regional_temperature * CLIMATE_REGIONAL_WEIGHT
+            + local_temperature * CLIMATE_LOCAL_WEIGHT)
+            * CLIMATE_TEMPERATURE_RANGE
+            + climate_domain * CLIMATE_DOMAIN_WEIGHT
+            + CLIMATE_TEMPERATURE_BIAS)
+            .clamp(-1.0, 1.0),
+        (macro_moisture * CLIMATE_MACRO_WEIGHT
+            + regional_moisture * CLIMATE_REGIONAL_WEIGHT
+            + local_moisture * CLIMATE_LOCAL_WEIGHT
+            - climate_domain * CLIMATE_DOMAIN_WEIGHT)
+            .clamp(-1.0, 1.0),
+        climate_domain,
+    )
+}
+
+fn temperature_with_influence(
+    router: OverworldRouter,
+    base_temperature: f64,
+    height: f64,
+    z: f64,
+) -> f64 {
     let Some(settings) = router.settings() else {
-        return local;
+        return base_temperature;
     };
     let blocks_per_degree =
         111_319.491_666_666_67 / settings.world_scale_meters_per_block.max(0.001);
@@ -195,10 +333,10 @@ pub(super) fn temperature(router: OverworldRouter, x: f64, height: f64, z: f64) 
         .sinh()
         .atan()
         .to_degrees();
-    let latitude_cooling = (latitude.abs() / 85.051_128_78).clamp(0.0, 1.0) * 2.0 - 1.0;
+    let latitude_cooling = (latitude.abs() / 85.051_128_78).clamp(0.0, 1.0);
     let altitude_cooling =
         ((height - f64::from(settings.sea_level)).max(0.0) / 128.0).min(1.0) * 0.85;
-    (local - latitude_cooling * settings.climate_strength.max(0.0) - altitude_cooling)
+    (base_temperature - latitude_cooling * settings.climate_strength.max(0.0) - altitude_cooling)
         .clamp(-1.0, 1.0)
 }
 

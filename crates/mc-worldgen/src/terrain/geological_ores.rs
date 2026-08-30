@@ -1,7 +1,7 @@
 use mc_world::chunk::Chunk;
 use mc_world::{BlockRegistry, BlockStateId};
 
-use super::{TerrainGenerator, feature_hash, resolve_block_or};
+use super::{TerrainGenerator, TerrainGeneratorError, feature_hash, try_resolve_block};
 
 #[derive(Debug, Clone)]
 pub(super) struct GeologicalOreRules {
@@ -116,23 +116,25 @@ const GEOLOGICAL_ORES: &[OreNames] = &[
 ];
 
 impl GeologicalOreRules {
-    pub(super) fn new(registry: &BlockRegistry, fallback: BlockStateId) -> Self {
+    pub(super) fn try_new(registry: &BlockRegistry) -> Result<Self, TerrainGeneratorError> {
         let rules = GEOLOGICAL_ORES
             .iter()
             .enumerate()
-            .map(|(index, rule)| GeologicalOreRule {
-                normal: resolve_block_or(registry, rule.normal, fallback),
-                deepslate: resolve_block_or(registry, rule.deepslate, fallback),
-                min_y: rule.min_y,
-                max_y: rule.max_y,
-                cell_size: rule.cell_size,
-                long_radius: rule.long_radius,
-                short_radius: rule.short_radius,
-                vertical_radius: rule.vertical_radius,
-                salt: 0x6E0_10A1_u64 ^ index as u64,
+            .map(|(index, rule)| {
+                Ok(GeologicalOreRule {
+                    normal: try_resolve_block(registry, rule.normal)?,
+                    deepslate: try_resolve_block(registry, rule.deepslate)?,
+                    min_y: rule.min_y,
+                    max_y: rule.max_y,
+                    cell_size: rule.cell_size,
+                    long_radius: rule.long_radius,
+                    short_radius: rule.short_radius,
+                    vertical_radius: rule.vertical_radius,
+                    salt: 0x6E0_10A1_u64 ^ index as u64,
+                })
             })
-            .collect();
-        Self { rules }
+            .collect::<Result<Vec<_>, TerrainGeneratorError>>()?;
+        Ok(Self { rules })
     }
 
     pub(super) fn apply(&self, generator: &TerrainGenerator, chunk: &mut Chunk) {

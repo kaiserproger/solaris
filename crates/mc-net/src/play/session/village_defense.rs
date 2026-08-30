@@ -77,6 +77,20 @@ impl SessionRegistry {
         if active_ids.is_empty() {
             return (VillageDefenseReport::default(), Vec::new());
         }
+        {
+            let inner = self.lock_inner("check active village defence actors");
+            if !inner
+                .villager_entities
+                .iter()
+                .any(|entity_id| active_ids.contains(entity_id))
+                && !inner
+                    .iron_golem_entities
+                    .iter()
+                    .any(|entity_id| active_ids.contains(entity_id))
+            {
+                return (VillageDefenseReport::default(), Vec::new());
+            }
+        }
 
         let projections = self
             .lock_entities("project village defence candidates")
@@ -140,7 +154,8 @@ fn plan_golem_spawns(
     let golems = projections
         .iter()
         .filter(|entity| {
-            entity.lifecycle == EntityLifecycle::Alive && entity.type_name == "minecraft:iron_golem"
+            entity.lifecycle == EntityLifecycle::Alive
+                && &*entity.type_name == "minecraft:iron_golem"
         })
         .collect::<Vec<_>>();
     let threats = projections
@@ -297,7 +312,8 @@ fn plan_golem_combat(
     let golems = projections
         .iter()
         .filter(|entity| {
-            entity.lifecycle == EntityLifecycle::Alive && entity.type_name == "minecraft:iron_golem"
+            entity.lifecycle == EntityLifecycle::Alive
+                && &*entity.type_name == "minecraft:iron_golem"
         })
         .collect::<Vec<_>>();
     let hostiles = projections
@@ -305,7 +321,7 @@ fn plan_golem_combat(
         .filter(|entity| {
             entity.lifecycle == EntityLifecycle::Alive
                 && is_hostile_entity(&entity.type_name)
-                && entity.type_name != "minecraft:creeper"
+                && &*entity.type_name != "minecraft:creeper"
         })
         .collect::<Vec<_>>();
 
@@ -417,7 +433,8 @@ fn villagers_detecting_nearby_golems(projections: &[EntitySimulationProjection])
     let golems = projections
         .iter()
         .filter(|entity| {
-            entity.lifecycle == EntityLifecycle::Alive && entity.type_name == "minecraft:iron_golem"
+            entity.lifecycle == EntityLifecycle::Alive
+                && &*entity.type_name == "minecraft:iron_golem"
         })
         .collect::<Vec<_>>();
     projections
@@ -435,7 +452,7 @@ fn villagers_detecting_nearby_golems(projections: &[EntitySimulationProjection])
 
 fn is_adult_villager(entity: &EntitySimulationProjection) -> bool {
     entity.lifecycle == EntityLifecycle::Alive
-        && entity.type_name == "minecraft:villager"
+        && &*entity.type_name == "minecraft:villager"
         && entity.villager.is_some()
         && entity.villager_schedule == Some(mc_entity::villager_26_1_2::VillagerScheduleKind::Adult)
 }

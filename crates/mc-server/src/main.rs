@@ -9,8 +9,8 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, bail};
-use clap::Parser;
-use mc_server::ServerConfig;
+use clap::{Parser, Subcommand};
+use mc_server::{OperatorFileOperation, ServerConfig};
 
 mod startup_validation;
 
@@ -43,6 +43,28 @@ struct Cli {
     /// starting the network listener. Useful for CI sanity checks.
     #[arg(long)]
     check: bool,
+
+    #[command(subcommand)]
+    command: Option<Command>,
+}
+
+#[derive(Debug, Subcommand)]
+enum Command {
+    /// Manage identities in the configured persisted operator file.
+    Operator {
+        #[command(subcommand)]
+        command: OperatorCommand,
+    },
+}
+
+#[derive(Debug, Subcommand)]
+enum OperatorCommand {
+    /// Add a Minecraft username or UUID.
+    Add { identity: String },
+    /// Remove a Minecraft username or UUID.
+    Remove { identity: String },
+    /// List all persisted operator identities in deterministic order.
+    List,
 }
 
 fn load_config(path: &Path) -> Result<ServerConfig> {
@@ -181,6 +203,7 @@ fn check_config(path: &Path) -> Result<()> {
             cfg.network.bind_address
         )
     })?;
+    cfg.dashboard.validate().map_err(anyhow::Error::msg)?;
     validate_runtime_config(&cfg)?;
     let prepared_plugins = prepare_configured_luau_plugins(&cfg)?;
     let effective = EffectiveConfig::with_plugins(&cfg, prepared_plugins.as_ref());
@@ -598,7 +621,10 @@ impl From<mc_net::AutoscalePolicy> for EffectiveAutoscalePolicy {
     }
 }
 
-async fn serve(path: &Path) -> Result<()> {
+async fn serve(
+    path: &Path,
+    warning_ring: Arc<mc_server::dashboard_stats::WarningRing>,
+) -> Result<()> {
     let mut cfg = load_config(path)?;
     let access_control = cfg.load_access_control_files(path)?;
     if access_control.files_loaded > 0 {
@@ -615,11 +641,13 @@ async fn serve(path: &Path) -> Result<()> {
     let world_dir = required_world_dir(&cfg)?;
     let worldgen_mode = cfg.data.worldgen_mode.to_worldgen();
     let mut prepared_plugins = prepare_configured_luau_plugins(&cfg)?;
+    let mut dashboard_plugin_ids = Vec::new();
     for plugin in prepared_plugins
         .as_ref()
         .into_iter()
         .flat_map(mc_script::PreparedLuaPlugins::discovered_plugins)
     {
+        dashboard_plugin_ids.push(plugin.id().to_owned());
         tracing::info!(
             plugin_id = plugin.id(),
             deployment = plugin.deployment().contract_name(),
@@ -978,6 +1006,26 @@ async fn serve(path: &Path) -> Result<()> {
     } else {
         (mc_net::bind(net).await.context("network bind")?, None)
     };
+    let dashboard_task = if cfg.dashboard.enabled {
+        let socket = cfg.dashboard.validate().map_err(anyhow::Error::msg)?;
+        let stats = Arc::new(mc_server::dashboard_stats::ServerDashboardStats::new(
+            &bound,
+            &cfg,
+            std::time::Instant::now(),
+            warning_ring,
+            dashboard_plugin_ids,
+        ));
+        tracing::info!(endpoint = %socket, "operator dashboard listening");
+        Some(mc_server::dashboard::spawn_dashboard(
+            mc_server::dashboard::DashboardListenConfig {
+                bind_address: socket.ip(),
+                port: socket.port(),
+            },
+            stats,
+        ))
+    } else {
+        None
+    };
     let result = run_bound_server(
         bound,
         shutdown_handle,
@@ -986,6 +1034,9 @@ async fn serve(path: &Path) -> Result<()> {
         cfg.plugins.strict,
     )
     .await;
+    if let Some(task) = dashboard_task {
+        task.abort();
+    }
     if let Some(host) = lua_host {
         join_lua_host(host).await?;
     }
@@ -1193,9 +1244,9 @@ fn build_terrain_generator(
             .with_structures(structure_rules);
     if matches!(
         ore_profile,
-        Some(mc_script::LuaWorldgenOreProfile::GeologicalDeposits)
+        Some(mc_script::LuaWorldgenOreProfile::RealisticDeposits)
     ) {
-        generator = generator.with_geological_deposits(blocks.as_ref());
+        generator = generator.with_realistic_deposits(blocks.as_ref());
     }
     Ok(Arc::new(generator))
 }
@@ -2086,23 +2137,76 @@ fn ensure_world_region_root(world_dir: &Path) -> Result<()> {
         .with_context(|| format!("creating empty world region directory {}", legacy.display()))
 }
 
-fn init_tracing() {
-    tracing_subscriber::fmt()
-        .with_env_filter(
-            tracing_subscriber::EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info")),
-        )
+fn init_tracing() -> Arc<mc_server::dashboard_stats::WarningRing> {
+    use tracing_subscriber::filter::LevelFilter;
+    use tracing_subscriber::prelude::*;
+
+    let ring = mc_server::dashboard_stats::warning_ring();
+    let ring_layer = tracing_subscriber::fmt::layer()
+        .with_writer(mc_server::dashboard_stats::WarningRingSink(Arc::clone(
+            &ring,
+        )))
+        .with_ansi(false);
+    let filter = tracing_subscriber::EnvFilter::try_from_default_env()
+        .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info"));
+    tracing_subscriber::registry()
+        .with(tracing_subscriber::fmt::layer())
+        .with(ring_layer.with_filter(LevelFilter::WARN))
+        .with(filter)
         .init();
+    ring
+}
+
+fn manage_operators(config_path: &Path, command: OperatorCommand) -> Result<()> {
+    let mut config = load_config(config_path)?;
+    if config.admin.operators_file.is_none() {
+        config.admin.operators_file = Some(PathBuf::from("ops.json"));
+    }
+    let operation = match command {
+        OperatorCommand::Add { identity } => OperatorFileOperation::Add(identity),
+        OperatorCommand::Remove { identity } => OperatorFileOperation::Remove(identity),
+        OperatorCommand::List => OperatorFileOperation::List,
+    };
+    let result = config.manage_operator_file(config_path, operation.clone())?;
+    match operation {
+        OperatorFileOperation::Add(identity) => println!(
+            "operator {} {}",
+            identity.trim(),
+            if result.changed {
+                "added"
+            } else {
+                "already present"
+            }
+        ),
+        OperatorFileOperation::Remove(identity) => println!(
+            "{} operator {}",
+            if result.changed {
+                "removed"
+            } else {
+                "not found:"
+            },
+            identity.trim()
+        ),
+        OperatorFileOperation::List => {
+            for identity in result.identities {
+                println!("{identity}");
+            }
+        }
+    }
+    Ok(())
 }
 
 #[tokio::main]
 async fn main() -> ExitCode {
-    init_tracing();
+    let warning_ring = init_tracing();
     let cli = Cli::parse();
-    let result = if cli.check {
-        check_config(&cli.config)
-    } else {
-        serve(&cli.config).await
+    let result = match (cli.check, cli.command) {
+        (true, None) => check_config(&cli.config),
+        (false, None) => serve(&cli.config, warning_ring).await,
+        (false, Some(Command::Operator { command })) => manage_operators(&cli.config, command),
+        (true, Some(_)) => Err(anyhow::anyhow!(
+            "--check cannot be combined with the operator subcommand"
+        )),
     };
     match result {
         Ok(()) => ExitCode::SUCCESS,
@@ -2116,6 +2220,28 @@ async fn main() -> ExitCode {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn parses_operator_management_commands() {
+        let cli = Cli::try_parse_from([
+            "mc-server",
+            "--config",
+            "server.toml",
+            "operator",
+            "add",
+            "Alice",
+        ])
+        .unwrap();
+        assert_eq!(cli.config, PathBuf::from("server.toml"));
+        assert!(!cli.check);
+        assert!(matches!(
+            cli.command,
+            Some(Command::Operator {
+                command: OperatorCommand::Add { identity }
+            }) if identity == "Alice"
+        ));
+    }
+
     use std::collections::BTreeMap;
 
     use mc_data::Identifier;
@@ -2168,7 +2294,7 @@ mod tests {
             .expect("bundled plugins should prepare a host");
         assert_eq!(
             prepared.worldgen_ore_profile(),
-            Some(mc_script::LuaWorldgenOreProfile::GeologicalDeposits)
+            Some(mc_script::LuaWorldgenOreProfile::RealisticDeposits)
         );
         assert_eq!(
             prepared.worldgen_settlement_profile(),
@@ -2493,6 +2619,24 @@ mod tests {
         );
         config.simulation.random_tick_speed = 3;
 
+        config.simulation.friendly_spawn_cap = mc_net::MAX_NATURAL_SPAWN_CAP + 1;
+        let error = validate_runtime_config(&config).unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("simulation.friendly_spawn_cap=257")
+        );
+        config.simulation.friendly_spawn_cap = 32;
+
+        config.simulation.friendly_spawn_chunk_budget = 0;
+        let error = validate_runtime_config(&config).unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("simulation.friendly_spawn_chunk_budget=0")
+        );
+        config.simulation.friendly_spawn_chunk_budget = 48;
+
         config.chunk_pipeline.compression_level = Some(10);
         let error = validate_runtime_config(&config).unwrap_err();
         assert!(error.to_string().contains("compression_level"));
@@ -2517,6 +2661,11 @@ mod tests {
         config.simulation.save_interval_ticks = 1_728_000;
         config.simulation.friendly_spawn_interval_ticks = 1_728_000;
         config.simulation.hostile_spawn_interval_ticks = 1_728_000;
+        config.simulation.friendly_spawn_cap = mc_net::MAX_NATURAL_SPAWN_CAP;
+        config.simulation.aquatic_spawn_cap = mc_net::MAX_NATURAL_SPAWN_CAP;
+        config.simulation.hostile_spawn_cap = mc_net::MAX_NATURAL_SPAWN_CAP;
+        config.simulation.friendly_spawn_chunk_budget = mc_net::MAX_NATURAL_SPAWN_CHUNK_BUDGET;
+        config.simulation.hostile_spawn_chunk_budget = mc_net::MAX_NATURAL_SPAWN_CHUNK_BUDGET;
 
         validate_runtime_config(&config).unwrap();
     }
@@ -2743,7 +2892,7 @@ mod tests {
             mc_world::OVERWORLD_GEOMETRY,
             0,
             "vanilla_like",
-            "geological_deposits",
+            "realistic_deposits",
             "vanilla",
         )
         .unwrap_err();
@@ -2827,7 +2976,7 @@ mod tests {
             geometry,
             11,
             "vanilla_like",
-            "geological_deposits",
+            "realistic_deposits",
             "vanilla",
         )
         .unwrap_err();
@@ -2835,7 +2984,7 @@ mod tests {
         assert!(
             profile_error
                 .to_string()
-                .contains("ore_profile=geological_deposits")
+                .contains("ore_profile=realistic_deposits")
         );
 
         let settlement_error = ensure_world_contract(
@@ -2951,11 +3100,11 @@ mod tests {
             mc_world::OVERWORLD_GEOMETRY,
             blocks,
             mc_worldgen::StructureRules::none(),
-            Some(mc_script::LuaWorldgenOreProfile::GeologicalDeposits),
+            Some(mc_script::LuaWorldgenOreProfile::RealisticDeposits),
         )
         .unwrap();
 
-        assert_eq!(generator.ore_generation_profile(), "geological_deposits");
+        assert_eq!(generator.ore_generation_profile(), "realistic_deposits");
     }
 
     #[test]
@@ -4360,7 +4509,13 @@ mod tests {
         let rendered = serde_json::to_value(EffectiveConfig::from(&cfg)).expect("serialize");
         let autoscale = &rendered["effective_autoscale"];
         let policy = &autoscale["policy"];
+        let simulation = &rendered["simulation"];
 
+        assert_eq!(simulation["friendly_spawn_cap"], 32);
+        assert_eq!(simulation["aquatic_spawn_cap"], 20);
+        assert_eq!(simulation["hostile_spawn_cap"], 70);
+        assert_eq!(simulation["friendly_spawn_chunk_budget"], 48);
+        assert_eq!(simulation["hostile_spawn_chunk_budget"], 4);
         assert_eq!(autoscale["enabled"], Value::Bool(true));
         assert_eq!(autoscale["runtime_mode"], "live_adaptive_work_budgets");
         assert_eq!(policy["min_view_distance"], 2);

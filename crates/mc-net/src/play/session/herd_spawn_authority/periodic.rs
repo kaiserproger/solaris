@@ -9,7 +9,7 @@ use mc_physics::{Aabb, BlockMaterialIds};
 use mc_world::{ChunkPos, WorldReadView};
 
 use crate::play::spawn::chunk_pos_from_coords;
-use crate::play::{HerdSpawn, is_hostile_entity, world_time_is_night};
+use crate::play::{HerdSpawn, RandomTickPolicy, is_hostile_entity};
 
 use super::super::SessionRegistry;
 use super::super::outbound::{VisibilityDispatch, dispatch_visibility_commands};
@@ -18,9 +18,7 @@ use super::commit::install_committed_herd_spawns_locked;
 #[derive(Clone, Copy)]
 pub(crate) struct NaturalSpawnTickInput<'a> {
     pub(crate) tick: u64,
-    pub(crate) friendly_interval: u64,
-    pub(crate) hostile_interval: u64,
-    pub(crate) simulation_distance: i32,
+    pub(crate) policy: RandomTickPolicy,
     pub(crate) world_read: Option<&'a WorldReadView>,
     pub(crate) materials: Option<&'a BlockMaterialIds>,
 }
@@ -51,14 +49,14 @@ impl SessionRegistry {
     ) -> (NaturalSpawnReport, Vec<VisibilityDispatch>) {
         let NaturalSpawnTickInput {
             tick,
-            friendly_interval,
-            hostile_interval,
-            simulation_distance,
+            policy,
             world_read,
             materials,
         } = input;
-        let friendly_due = friendly_interval != 0 && tick.is_multiple_of(friendly_interval);
-        let hostile_due = hostile_interval != 0 && tick.is_multiple_of(hostile_interval);
+        let friendly_due = policy.friendly_spawn_interval_ticks != 0
+            && tick.is_multiple_of(policy.friendly_spawn_interval_ticks);
+        let hostile_due = policy.hostile_spawn_interval_ticks != 0
+            && tick.is_multiple_of(policy.hostile_spawn_interval_ticks);
         if !friendly_due && !hostile_due {
             return (NaturalSpawnReport::default(), Vec::new());
         }
@@ -81,23 +79,33 @@ impl SessionRegistry {
                 .collect::<Vec<_>>()
         };
         if player_positions.is_empty() {
-            record_natural_spawn_report(scheduler, tick, report);
+            record_natural_spawn_report(self, scheduler, tick, report);
             return (report, Vec::new());
         }
 
-        let simulation_distance =
-            simulation_distance.clamp(crate::MIN_VIEW_DISTANCE, crate::MAX_VIEW_DISTANCE) as u32;
+        let simulation_distance = policy
+            .simulation_distance
+            .clamp(crate::MIN_VIEW_DISTANCE, crate::MAX_VIEW_DISTANCE)
+            as u32;
         let player_chunks = player_positions
             .iter()
             .map(|position| chunk_pos_from_coords(position.x, position.z))
             .collect::<Vec<_>>();
         let mut friendly_chunks = if friendly_due {
-            scheduler.select_chunks(NaturalSpawnCategory::Friendly, &active_chunks)
+            scheduler.select_chunks(
+                NaturalSpawnCategory::Friendly,
+                &active_chunks,
+                policy.friendly_spawn_chunk_budget,
+            )
         } else {
             Vec::new()
         };
         let mut hostile_chunks = if hostile_due {
-            scheduler.select_chunks(NaturalSpawnCategory::Hostile, &active_chunks)
+            scheduler.select_chunks(
+                NaturalSpawnCategory::Hostile,
+                &active_chunks,
+                policy.hostile_spawn_chunk_budget,
+            )
         } else {
             Vec::new()
         };
@@ -115,7 +123,7 @@ impl SessionRegistry {
             .copied()
             .collect::<HashSet<_>>();
         if selected_chunks.is_empty() {
-            record_natural_spawn_report(scheduler, tick, report);
+            record_natural_spawn_report(self, scheduler, tick, report);
             return (report, Vec::new());
         }
 
@@ -149,15 +157,22 @@ impl SessionRegistry {
         let projections = self
             .lock_entities("project periodic natural spawn collisions")
             .simulation_projections_for_ids(&active_entity_ids);
-        let mut capacities =
-            NaturalSpawnCapacities::from_counts(natural_hostiles, natural_ground, natural_aquatic);
+        let mut capacities = NaturalSpawnCapacities::from_counts_and_caps(
+            natural_hostiles,
+            natural_ground,
+            natural_aquatic,
+            policy.hostile_spawn_cap,
+            policy.friendly_spawn_cap,
+            policy.aquatic_spawn_cap,
+        );
 
         let chunk_positions = selected_chunks
             .iter()
             .map(|&(x, z)| ChunkPos { x, z })
             .collect::<Vec<_>>();
         let world_snapshot = world_read.map(|world| world.snapshot_chunks(&chunk_positions));
-        let nighttime = world_time_is_night(self.world_time());
+        let world_time = self.world_time();
+        let thundering = self.weather().thunder_level() > 0.9;
         let mob_behaviors = self.mob_behavior_table();
         let mut planned = Vec::<SpawnEntity>::new();
         let mut accepted_boxes = Vec::<(Vec3, Aabb)>::new();
@@ -174,7 +189,8 @@ impl SessionRegistry {
                 &mut accepted_boxes,
                 &mut capacities,
                 tick,
-                nighttime,
+                world_time,
+                thundering,
                 &mob_behaviors,
             );
             report.friendly.merge(category_report);
@@ -192,7 +208,8 @@ impl SessionRegistry {
                 &mut accepted_boxes,
                 &mut capacities,
                 tick,
-                nighttime,
+                world_time,
+                thundering,
                 &mob_behaviors,
             );
             report.hostile.merge(category_report);
@@ -200,7 +217,7 @@ impl SessionRegistry {
         }
 
         if planned.is_empty() {
-            record_natural_spawn_report(scheduler, tick, report);
+            record_natural_spawn_report(self, scheduler, tick, report);
             return (report, Vec::new());
         }
         let active_before_commit = self.simulation_inputs.active_chunks();
@@ -216,7 +233,7 @@ impl SessionRegistry {
             .count();
         let planned_hostile = planned.len().saturating_sub(planned_friendly);
         if planned.is_empty() {
-            record_natural_spawn_report(scheduler, tick, report);
+            record_natural_spawn_report(self, scheduler, tick, report);
             return (report, Vec::new());
         }
 
@@ -231,7 +248,7 @@ impl SessionRegistry {
                     .hostile
                     .rejected_duplicate_or_stale
                     .saturating_add(planned_hostile as u64);
-                record_natural_spawn_report(scheduler, tick, report);
+                record_natural_spawn_report(self, scheduler, tick, report);
                 return (report, Vec::new());
             }
         };
@@ -270,7 +287,7 @@ impl SessionRegistry {
             let mut inner = self.lock_inner("publish periodic natural spawns");
             install_committed_herd_spawns_locked(&mut inner, stable, tick)
         };
-        record_natural_spawn_report(scheduler, tick, report);
+        record_natural_spawn_report(self, scheduler, tick, report);
         (report, dispatches)
     }
 
@@ -286,6 +303,7 @@ impl SessionRegistry {
 }
 
 fn record_natural_spawn_report(
+    registry: &SessionRegistry,
     scheduler: &mut NaturalSpawnScheduler,
     tick: u64,
     report: NaturalSpawnReport,
@@ -293,6 +311,7 @@ fn record_natural_spawn_report(
     let Some(cumulative) = scheduler.record(tick, report) else {
         return;
     };
+    registry.retain_natural_spawn_report(tick, cumulative);
     tracing::info!(
         tick,
         friendly_attempts = cumulative.friendly.attempts,

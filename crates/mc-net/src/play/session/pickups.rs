@@ -30,6 +30,10 @@ use std::time::Instant;
 
 pub(in crate::play) const ENTITY_PICKUP_RADIUS: f64 = 2.25;
 pub(in crate::play) const ITEM_PICKUP_DELAY_TICKS: u64 = 4;
+const PLAYER_PICKUP_HALF_WIDTH: f64 = 0.3;
+const PLAYER_PICKUP_HEIGHT: f64 = 1.8;
+const PLAYER_PICKUP_TOUCH_HORIZONTAL_INFLATION: f64 = 1.0;
+const PLAYER_PICKUP_TOUCH_VERTICAL_INFLATION: f64 = 0.5;
 const ITEM_MERGE_RADIUS: f64 = 0.5;
 const PLAYER_ITEM_OWNER_PICKUP_BLOCK_TICKS: u64 = 100;
 static NEXT_ITEM_PICKUP_CLAIM: AtomicU64 = AtomicU64::new(1);
@@ -61,7 +65,6 @@ struct ClaimedPickupParts {
 struct ItemEntityClaim {
     entity_id: EntityId,
     claim: u64,
-    position: Vec3,
     original_stack: EntityItemStack,
     remaining_stack: Option<EntityItemStack>,
     picked: EntityItemStack,
@@ -147,14 +150,18 @@ impl SessionRegistry {
                             .filter(|entity_id| {
                                 inner.published_entity_snapshots.get(entity_id).is_some_and(
                                     |entity| {
-                                        distance_sq(entity.position, position) <= radius_sq
-                                            && (entity.item_stack.is_some()
-                                                || entity
-                                                    .experience_value
-                                                    .is_some_and(|value| value > 0)
-                                                || (entity.type_name == "minecraft:arrow"
-                                                    && entity.on_ground
-                                                    && entity.velocity == Vec3::ZERO))
+                                        pickup_candidate_reaches_player(
+                                            entity.item_stack.is_some(),
+                                            entity.position,
+                                            position,
+                                            radius_sq,
+                                        ) && (entity.item_stack.is_some()
+                                            || entity
+                                                .experience_value
+                                                .is_some_and(|value| value > 0)
+                                            || (entity.type_name == "minecraft:arrow"
+                                                && entity.on_ground
+                                                && entity.velocity == Vec3::ZERO))
                                     },
                                 )
                             })
@@ -179,7 +186,14 @@ impl SessionRegistry {
                         .into_iter()
                         .filter_map(|id| entities.snapshot(id))
                         .filter(|entity| entity.lifecycle == EntityLifecycle::Alive)
-                        .filter(|entity| distance_sq(entity.position, position) <= radius_sq)
+                        .filter(|entity| {
+                            pickup_candidate_reaches_player(
+                                entity.item_stack.is_some(),
+                                entity.position,
+                                position,
+                                radius_sq,
+                            )
+                        })
                         .filter(|entity| {
                             entity.item_stack.is_some()
                                 || entity.experience_value.is_some_and(|value| value > 0)
@@ -224,7 +238,14 @@ impl SessionRegistry {
                 );
                 let candidates = candidates
                     .into_iter()
-                    .filter(|entity| distance_sq(entity.position, current_position) <= radius_sq)
+                    .filter(|entity| {
+                        pickup_candidate_reaches_player(
+                            entity.item_stack.is_some(),
+                            entity.position,
+                            current_position,
+                            radius_sq,
+                        )
+                    })
                     .collect::<Vec<_>>();
                 (!candidates.is_empty()).then_some(VisibilityDispatch {
                     recipient,
@@ -697,9 +718,7 @@ impl SessionRegistry {
                 Vec3::new(session.pose.x, session.pose.y, session.pose.z),
             )
         };
-        if distance_sq(snapshot.position, planned_player_position)
-            > ENTITY_PICKUP_RADIUS * ENTITY_PICKUP_RADIUS
-        {
+        if !item_reaches_player_touch_box(snapshot.position, planned_player_position) {
             return None;
         }
         let (
@@ -774,66 +793,85 @@ impl SessionRegistry {
         #[cfg(test)]
         self.pause_after_item_pickup_claim_for_test();
         let owner_claim_us = owner_started.elapsed().as_micros() as u64;
-        let session_started = Instant::now();
-        let session_valid = {
-            let inner = self.lock_inner("validate item pickup session");
-            let current_player_state = inner.player_persistence.get(&collector_session);
-            inner
-                .sessions
-                .get(&collector_session)
-                .is_some_and(|session| {
-                    let current = Vec3::new(session.pose.x, session.pose.y, session.pose.z);
-                    distance_sq(claim.position, current)
-                        <= ENTITY_PICKUP_RADIUS * ENTITY_PICKUP_RADIUS
-                })
-                && current_player_state
-                    .is_some_and(|current| Arc::ptr_eq(current, &plan.player_state))
-        };
-        let session_validate_us = session_started.elapsed().as_micros() as u64;
-        if !session_valid {
-            let rolled_back = {
-                let mut entities = self.lock_entities("rollback rejected item pickup claim");
-                entities.resolve_item_pickup_claim(
-                    claim.entity_id,
-                    claim.claim,
-                    Some(claim.original_stack.clone()),
-                )
-            };
-            assert!(
-                matches!(
-                    rolled_back,
-                    Some(mc_entity::ItemPickupClaimResolution::Updated(_))
-                ),
-                "item pickup claim rollback must resolve the exact token"
-            );
-            return None;
-        }
         let committed_inventory = plan.updated_inventory.clone();
-        let player_started = Instant::now();
-        let player_committed = {
-            let wait_started = Instant::now();
-            let guard = crate::lock_policy::lock_authoritative_mutex(
-                &plan.player_state,
-                "play.player_persistence",
-            );
-            let mut player = crate::lock_metrics::timed_guard(
-                crate::lock_metrics::LockMetricKind::PlayerPersistence,
-                "credit item pickup",
-                wait_started,
-                guard,
-            );
-            if player.game_mode != plan.expected_game_mode
-                || player.survival != plan.expected_survival
-                || player.inventory.slots != plan.expected_inventory.slots
-                || player.selected_hotbar_slot != plan.expected_selected_hotbar_slot
-            {
-                false
+        let session_started = Instant::now();
+        let (
+            player_committed,
+            resolution,
+            session_validate_us,
+            player_commit_us,
+            owner_finalize_us,
+        ) = {
+            // Use the established entity -> session -> player-state order. Holding the
+            // session lock through both the final overlap check and inventory commit
+            // prevents movement from changing the collector pose in between.
+            let mut inner = self.lock_session_entities("validate and credit item pickup");
+            let current_claim = inner.entities.snapshot(claim.entity_id);
+            let current_player_state = inner.player_persistence.get(&collector_session);
+            let session_valid = current_claim.as_ref().is_some_and(|current| {
+                current.lifecycle == EntityLifecycle::Alive
+                    && current.retained.item_pickup_claim == Some(claim.claim)
+                    && current.item_stack.as_ref() == Some(&claim.original_stack)
+                    && inner
+                        .sessions
+                        .get(&collector_session)
+                        .is_some_and(|session| {
+                            let player_position =
+                                Vec3::new(session.pose.x, session.pose.y, session.pose.z);
+                            item_reaches_player_touch_box(current.position, player_position)
+                        })
+            }) && current_player_state
+                .is_some_and(|current| Arc::ptr_eq(current, &plan.player_state));
+            let session_validate_us = session_started.elapsed().as_micros() as u64;
+            if !session_valid {
+                (false, None, session_validate_us, 0, 0)
             } else {
-                player.replace_inventory(committed_inventory);
-                true
+                let player_started = Instant::now();
+                let wait_started = Instant::now();
+                let guard = crate::lock_policy::lock_authoritative_mutex(
+                    &plan.player_state,
+                    "play.player_persistence",
+                );
+                let mut player = crate::lock_metrics::timed_guard(
+                    crate::lock_metrics::LockMetricKind::PlayerPersistence,
+                    "credit item pickup",
+                    wait_started,
+                    guard,
+                );
+                if player.game_mode != plan.expected_game_mode
+                    || player.survival != plan.expected_survival
+                    || player.inventory.slots != plan.expected_inventory.slots
+                    || player.selected_hotbar_slot != plan.expected_selected_hotbar_slot
+                {
+                    (
+                        false,
+                        None,
+                        session_validate_us,
+                        player_started.elapsed().as_micros() as u64,
+                        0,
+                    )
+                } else {
+                    player.replace_inventory(committed_inventory);
+                    let player_commit_us = player_started.elapsed().as_micros() as u64;
+                    let finalize_started = Instant::now();
+                    let resolution = inner
+                        .entities
+                        .resolve_item_pickup_claim(
+                            claim.entity_id,
+                            claim.claim,
+                            claim.remaining_stack.clone(),
+                        )
+                        .expect("committed player credit must retain its exact item claim");
+                    (
+                        true,
+                        Some(resolution),
+                        session_validate_us,
+                        player_commit_us,
+                        finalize_started.elapsed().as_micros() as u64,
+                    )
+                }
             }
         };
-        let player_commit_us = player_started.elapsed().as_micros() as u64;
         if !player_committed {
             let rolled_back = {
                 let mut entities = self.lock_entities("rollback rejected item pickup claim");
@@ -852,17 +890,7 @@ impl SessionRegistry {
             );
             return None;
         }
-        let finalize_started = Instant::now();
-        let resolution = {
-            let mut entities = self.lock_entities("finalize item pickup claim");
-            entities.resolve_item_pickup_claim(
-                claim.entity_id,
-                claim.claim,
-                claim.remaining_stack.clone(),
-            )
-        }
-        .expect("committed player credit must retain its exact item claim");
-        let owner_finalize_us = finalize_started.elapsed().as_micros() as u64;
+        let resolution = resolution.expect("committed item pickup has an entity resolution");
         let publish_started = Instant::now();
         let parts = {
             let mut inner = self.lock_inner("publish item pickup");
@@ -1017,7 +1045,7 @@ impl SessionRegistry {
     }
 
     #[cfg(test)]
-    pub(in crate::play) fn move_claimed_item_for_test(
+    pub(in crate::play) fn relocate_claimed_item_for_test(
         &self,
         entity_id: EntityId,
         position: Vec3,
@@ -1028,12 +1056,39 @@ impl SessionRegistry {
         ) else {
             return false;
         };
-        if snapshot.retained.item_pickup_claim.is_none() {
+        let Some(claim) = snapshot.retained.item_pickup_claim else {
             return false;
-        }
-        super::entity_owner::owner_result(
+        };
+        let Some(stack) = snapshot.item_stack.clone() else {
+            return false;
+        };
+        if !matches!(
+            super::entity_owner::owner_result(
+                &self.entities,
+                self.entities
+                    .handle
+                    .resolve_item_pickup_claim_deferred_journal(entity_id, claim, Some(stack),),
+            ),
+            Some(mc_entity::ItemPickupClaimResolution::Updated(_))
+        ) || !super::entity_owner::owner_result(
             &self.entities,
             self.entities.handle.set_position(entity_id, position),
+        ) {
+            return false;
+        }
+        let Some(moved) = super::entity_owner::owner_result(
+            &self.entities,
+            self.entities.handle.snapshot(entity_id),
+        ) else {
+            return false;
+        };
+        let mut reclaimed = moved.clone();
+        reclaimed.retained.item_pickup_claim = Some(claim);
+        super::entity_owner::owner_result(
+            &self.entities,
+            self.entities
+                .handle
+                .replace_snapshot_if_current_deferred_journal(moved, reclaimed),
         )
     }
 
@@ -1545,6 +1600,32 @@ pub(super) fn spawn_xp_orb_locked(
     spawn_entity_visibility_locked(inner, id)
 }
 
+fn pickup_candidate_reaches_player(
+    is_item: bool,
+    entity_position: Vec3,
+    player_position: Vec3,
+    radius_sq: f64,
+) -> bool {
+    if is_item {
+        item_reaches_player_touch_box(entity_position, player_position)
+    } else {
+        distance_sq(entity_position, player_position) <= radius_sq
+    }
+}
+
+fn item_reaches_player_touch_box(item_position: Vec3, player_position: Vec3) -> bool {
+    let item_aabb = entity_aabb("minecraft:item");
+    let horizontal_reach =
+        PLAYER_PICKUP_HALF_WIDTH + PLAYER_PICKUP_TOUCH_HORIZONTAL_INFLATION + item_aabb.half_width;
+    let player_min_y = player_position.y - PLAYER_PICKUP_TOUCH_VERTICAL_INFLATION;
+    let player_max_y =
+        player_position.y + PLAYER_PICKUP_HEIGHT + PLAYER_PICKUP_TOUCH_VERTICAL_INFLATION;
+    (player_position.x - item_position.x).abs() < horizontal_reach
+        && player_min_y < item_position.y + item_aabb.height
+        && player_max_y > item_position.y
+        && (player_position.z - item_position.z).abs() < horizontal_reach
+}
+
 fn collector_within_pickup_radius_locked(
     inner: &SessionRegistryInner,
     collector_session: SessionId,
@@ -1555,6 +1636,21 @@ fn collector_within_pickup_radius_locked(
     };
     let player_position = Vec3::new(session.pose.x, session.pose.y, session.pose.z);
     distance_sq(entity_position, player_position) <= ENTITY_PICKUP_RADIUS * ENTITY_PICKUP_RADIUS
+}
+
+#[cfg(test)]
+fn collector_reaches_item_touch_box_locked(
+    inner: &SessionRegistryInner,
+    collector_session: SessionId,
+    item_position: Vec3,
+) -> bool {
+    let Some(session) = inner.sessions.get(&collector_session) else {
+        return false;
+    };
+    item_reaches_player_touch_box(
+        item_position,
+        Vec3::new(session.pose.x, session.pose.y, session.pose.z),
+    )
 }
 
 fn claim_item_entity(
@@ -1596,7 +1692,6 @@ fn claim_item_entity(
     Some(ItemEntityClaim {
         entity_id: original.id,
         claim,
-        position: original.position,
         original_stack,
         remaining_stack,
         picked,
@@ -1658,7 +1753,7 @@ fn claim_item_pickup_locked(
     if snapshot.lifecycle != EntityLifecycle::Alive {
         return None;
     }
-    if !collector_within_pickup_radius_locked(inner, collector_session, snapshot.position) {
+    if !collector_reaches_item_touch_box_locked(inner, collector_session, snapshot.position) {
         return None;
     }
     if !item_pickup_ready_locked(inner, entity_id, inner.entity_lifecycle_tick) {

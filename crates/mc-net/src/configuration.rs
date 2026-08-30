@@ -193,6 +193,13 @@ fn server_known_pack() -> KnownPackEntry {
     }
 }
 
+fn server_brand() -> String {
+    format!(
+        "Solaris {} (MC {TARGET_RELEASE})",
+        env!("CARGO_PKG_VERSION")
+    )
+}
+
 pub(crate) async fn handle<R, W>(
     reader: &mut R,
     writer: &mut W,
@@ -207,6 +214,17 @@ where
     W: AsyncWriteExt + Unpin,
 {
     debug!(player = %profile.name, uuid = %profile.uuid, "entering Configuration state");
+    // Vanilla publishes its server brand in Configuration. The ordinary client
+    // surfaces this in F3 without requiring Solaris Loader or a custom resource.
+    write_packet(
+        writer,
+        &ClientboundCustomPayload {
+            payload: CustomPayload::Brand(server_brand()),
+        },
+        compression,
+    )
+    .await?;
+
     // Vanilla publishes feature flags before registry/known-pack negotiation.
     write_packet(
         writer,
@@ -904,6 +922,17 @@ mod tests {
         packet.encode(&mut body).unwrap();
         body.push(0xff);
         Bytes::from(body)
+    }
+
+    #[test]
+    fn server_brand_identifies_solaris_and_target_release_for_vanilla_f3() {
+        assert_eq!(
+            server_brand(),
+            format!(
+                "Solaris {} (MC {TARGET_RELEASE})",
+                env!("CARGO_PKG_VERSION")
+            )
+        );
     }
 
     #[test]

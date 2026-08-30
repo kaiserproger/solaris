@@ -1,15 +1,29 @@
 use std::cmp::Ordering;
 
+use crate::noise::fbm_2d;
+
 const BASE_CELL_BLOCKS: f64 = 128.0;
 const MIN_CELL_BLOCKS: f64 = 32.0;
-const ACCUMULATION_DEPTH: u8 = 3;
-const MIN_CHANNEL_ACCUMULATION: f64 = 2.0;
-const FULL_CHANNEL_ACCUMULATION: f64 = 8.5;
-const BASIN_SPACING_CELLS: i64 = 12;
-const BASIN_CORE_CELLS: f64 = 0.6;
-const BASIN_EDGE_CELLS: f64 = 2.4;
-const MIN_CHANNEL_WIDTH_BLOCKS: f64 = 5.0;
-const MAX_CHANNEL_WIDTH_BLOCKS: f64 = 22.0;
+const ACCUMULATION_DEPTH: u8 = 1;
+const MIN_CHANNEL_ACCUMULATION: f64 = 0.7;
+const FULL_CHANNEL_ACCUMULATION: f64 = 2.5;
+const MIN_CHANNEL_WIDTH_BLOCKS: f64 = 16.0;
+const MAX_CHANNEL_WIDTH_BLOCKS: f64 = 32.0;
+const FLOW_POTENTIAL_CENTER_RADIUS_CELLS: f64 = 24.0;
+const FLOW_POTENTIAL_NORMALIZATION: f64 = 13_824.0;
+const BASIN_FIELD_SCALE_CELLS: f64 = 11.0;
+const BASIN_WARP_SCALE_CELLS: f64 = 23.0;
+const BASIN_WARP_CELLS: f64 = 2.5;
+const NEIGHBOR_OFFSETS: [(i32, i32); 8] = [
+    (-1, -1),
+    (0, -1),
+    (1, -1),
+    (-1, 0),
+    (1, 0),
+    (-1, 1),
+    (0, 1),
+    (1, 1),
+];
 
 #[derive(Clone, Copy, Debug, Default)]
 pub(super) struct DrainageSample {
@@ -35,35 +49,15 @@ pub(super) fn sample(seed: i64, block_x: i32, block_z: i32, scale: f64) -> Drain
         accumulation: 0.0,
     };
 
-    let upstream = upstream_candidates(seed, cell);
-    let mandatory = [cell, upstream[0], upstream[1], upstream[2]];
-    for source in mandatory {
-        evaluate_segment(
-            seed,
-            source,
-            point_x,
-            point_z,
-            cell_blocks,
-            ACCUMULATION_DEPTH,
-            &mut best,
-        );
-    }
-
-    let maximum_reach = MAX_CHANNEL_WIDTH_BLOCKS * (cell_blocks / BASE_CELL_BLOCKS).sqrt();
+    // The nearest segment can originate in any immediately adjacent cell.
     for dz in -1..=1 {
         for dx in -1..=1 {
-            let source = DrainageCell {
-                x: cell.x.saturating_add(dx),
-                z: cell.z.saturating_add(dz),
-            };
-            if mandatory.contains(&source)
-                || point_cell_distance(point_x, point_z, source, cell_blocks) > maximum_reach
-            {
-                continue;
-            }
             evaluate_segment(
                 seed,
-                source,
+                DrainageCell {
+                    x: cell.x.saturating_add(dx),
+                    z: cell.z.saturating_add(dz),
+                },
                 point_x,
                 point_z,
                 cell_blocks,
@@ -84,13 +78,8 @@ fn evaluate_segment(
     accumulation_depth: u8,
     best: &mut DrainageSample,
 ) {
-    let basin = basin_weight(seed, from);
-    if basin <= 0.0 {
-        return;
-    }
-
-    let to = downstream(seed, from);
     let (from_x, from_z) = cell_center(from, cell_blocks);
+    let to = downstream(seed, from);
     let (to_x, to_z) = cell_center(to, cell_blocks);
     let distance = point_segment_distance(point_x, point_z, from_x, from_z, to_x, to_z);
     let width_scale = (cell_blocks / BASE_CELL_BLOCKS).sqrt();
@@ -99,7 +88,7 @@ fn evaluate_segment(
     }
 
     let accumulation = accumulation(seed, from, accumulation_depth);
-    let strength = accumulation_strength(accumulation) * basin;
+    let strength = accumulation_strength(accumulation) * basin_weight(seed, from);
     if strength <= 0.0 {
         return;
     }
@@ -134,14 +123,14 @@ pub(super) fn cell_center(cell: DrainageCell, cell_blocks: f64) -> (f64, f64) {
 }
 
 pub(super) fn downstream(seed: i64, cell: DrainageCell) -> DrainageCell {
-    let offsets = forward_offsets(flow_direction(seed));
-    offsets
+    let elevation = hydraulic_elevation(seed, cell);
+    NEIGHBOR_OFFSETS
         .into_iter()
         .map(|(dx, dz)| DrainageCell {
             x: cell.x.saturating_add(dx),
             z: cell.z.saturating_add(dz),
         })
-        .filter(|candidate| hydraulic_elevation(seed, *candidate) < hydraulic_elevation(seed, cell))
+        .filter(|candidate| hydraulic_elevation(seed, *candidate) < elevation)
         .min_by(|left, right| {
             branch_score(seed, cell, *left)
                 .partial_cmp(&branch_score(seed, cell, *right))
@@ -149,7 +138,7 @@ pub(super) fn downstream(seed: i64, cell: DrainageCell) -> DrainageCell {
                 .then_with(|| left.x.cmp(&right.x))
                 .then_with(|| left.z.cmp(&right.z))
         })
-        .expect("drainage has three downhill candidates")
+        .expect("radial drainage potential always exposes a downhill neighbour")
 }
 
 pub(super) fn accumulation(seed: i64, cell: DrainageCell, depth: u8) -> f64 {
@@ -157,7 +146,7 @@ pub(super) fn accumulation(seed: i64, cell: DrainageCell, depth: u8) -> f64 {
     if depth == 0 {
         return total;
     }
-    for upstream in upstream_candidates(seed, cell) {
+    for upstream in upstream_candidates(cell) {
         if downstream(seed, upstream) == cell {
             total += accumulation(seed, upstream, depth - 1);
         }
@@ -166,14 +155,12 @@ pub(super) fn accumulation(seed: i64, cell: DrainageCell, depth: u8) -> f64 {
 }
 
 pub(super) fn hydraulic_elevation(seed: i64, cell: DrainageCell) -> f64 {
-    let (dx, dz) = flow_direction(seed);
-    let rank = i64::from(cell.x) * i64::from(dx) + i64::from(cell.z) * i64::from(dz);
-    let local_relief = signed_unit(cell_hash(seed, cell.x, cell.z, 0x4859_4452_4155_4C49)) * 0.08;
-    // The basin term bends neighbouring branches toward the same collector.
-    // Its one-cell delta plus the bounded local relief remains below the
-    // mandatory rank drop, so every selected edge still descends.
-    let basin_relief = basin_distance_cells(seed, cell) * 0.82;
-    -(rank as f64) + local_relief + basin_relief
+    let (center_x, center_z, phase) = flow_potential_identity(seed);
+    let x = f64::from(cell.x) + 0.5 - center_x;
+    let z = f64::from(cell.z) + 0.5 - center_z;
+    let real = x * x * x - 3.0 * x * z * z;
+    let imaginary = 3.0 * x * x * z - z * z * z;
+    (real * phase.cos() + imaginary * phase.sin()) / FLOW_POTENTIAL_NORMALIZATION
 }
 
 #[cfg(test)]
@@ -181,33 +168,20 @@ pub(super) fn configured_cell_blocks(scale: f64) -> f64 {
     cell_blocks(scale)
 }
 
-fn upstream_candidates(seed: i64, cell: DrainageCell) -> [DrainageCell; 3] {
-    forward_offsets(flow_direction(seed)).map(|(dx, dz)| DrainageCell {
-        x: cell.x.saturating_sub(dx),
-        z: cell.z.saturating_sub(dz),
+fn upstream_candidates(cell: DrainageCell) -> [DrainageCell; 8] {
+    NEIGHBOR_OFFSETS.map(|(dx, dz)| DrainageCell {
+        x: cell.x.saturating_add(dx),
+        z: cell.z.saturating_add(dz),
     })
 }
 
-fn flow_direction(seed: i64) -> (i32, i32) {
-    const DIRECTIONS: [(i32, i32); 8] = [
-        (1, 0),
-        (1, 1),
-        (0, 1),
-        (-1, 1),
-        (-1, 0),
-        (-1, -1),
-        (0, -1),
-        (1, -1),
-    ];
-    DIRECTIONS[(mix64(seed as u64 ^ 0x4452_4149_4E41_4745) & 7) as usize]
-}
-
-fn forward_offsets((dx, dz): (i32, i32)) -> [(i32, i32); 3] {
-    match (dx, dz) {
-        (0, dz) => [(0, dz), (1, dz), (-1, dz)],
-        (dx, 0) => [(dx, 0), (dx, 1), (dx, -1)],
-        (dx, dz) => [(dx, dz), (dx, 0), (0, dz)],
-    }
+fn flow_potential_identity(seed: i64) -> (f64, f64, f64) {
+    let x = signed_unit(mix64(seed as u64 ^ 0x4452_4149_4E58_5352))
+        * FLOW_POTENTIAL_CENTER_RADIUS_CELLS;
+    let z = signed_unit(mix64(seed as u64 ^ 0x4452_4149_4E5A_5352))
+        * FLOW_POTENTIAL_CENTER_RADIUS_CELLS;
+    let phase = unit(mix64(seed as u64 ^ 0x4452_4149_4E50_4841)) * std::f64::consts::TAU;
+    (x, z, phase)
 }
 
 fn branch_score(seed: i64, from: DrainageCell, to: DrainageCell) -> f64 {
@@ -217,15 +191,34 @@ fn branch_score(seed: i64, from: DrainageCell, to: DrainageCell) -> f64 {
         to.z,
         0x4252_414E ^ (from.x as u64).rotate_left(17) ^ (from.z as u64).rotate_left(41),
     );
-    basin_distance_cells(seed, to) * 0.82 + signed_unit(hash) * 0.36
+    hydraulic_elevation(seed, to) + signed_unit(hash) * 0.01
 }
 
 fn basin_weight(seed: i64, cell: DrainageCell) -> f64 {
-    1.0 - smootherstep(remap(
-        basin_distance_cells(seed, cell),
-        BASIN_CORE_CELLS,
-        BASIN_EDGE_CELLS,
-    ))
+    let x = f64::from(cell.x);
+    let z = f64::from(cell.z);
+    let warp_x = fbm_2d(
+        x / BASIN_WARP_SCALE_CELLS,
+        z / BASIN_WARP_SCALE_CELLS,
+        seed ^ 0x4241_5357_4152_5058,
+        2,
+        0.5,
+    ) * BASIN_WARP_CELLS;
+    let warp_z = fbm_2d(
+        x / BASIN_WARP_SCALE_CELLS,
+        z / BASIN_WARP_SCALE_CELLS,
+        seed ^ 0x4241_5357_4152_505A,
+        2,
+        0.5,
+    ) * BASIN_WARP_CELLS;
+    let value = fbm_2d(
+        (x + warp_x + z * 0.37) / BASIN_FIELD_SCALE_CELLS,
+        (z + warp_z - x * 0.23) / BASIN_FIELD_SCALE_CELLS,
+        seed ^ 0x4241_5349_4E32_4446,
+        3,
+        0.52,
+    );
+    0.72 + smootherstep(remap(value, -0.45, 0.45)) * 0.28
 }
 
 fn accumulation_strength(accumulation: f64) -> f64 {
@@ -239,19 +232,12 @@ fn accumulation_strength(accumulation: f64) -> f64 {
 #[cfg(test)]
 pub(super) fn active_cell(seed: i64, cell: DrainageCell) -> bool {
     let accumulation = accumulation(seed, cell, ACCUMULATION_DEPTH);
-    accumulation_strength(accumulation) * basin_weight(seed, cell) >= 0.55
-}
-
-fn basin_distance_cells(seed: i64, cell: DrainageCell) -> f64 {
-    let (dx, dz) = flow_direction(seed);
-    let cross = i64::from(cell.x) * -i64::from(dz) + i64::from(cell.z) * i64::from(dx);
-    let offset = (mix64(seed as u64 ^ 0x4241_5349_4E4F_4646) % BASIN_SPACING_CELLS as u64) as i64;
-    let wrapped = (cross - offset).rem_euclid(BASIN_SPACING_CELLS);
-    wrapped.min(BASIN_SPACING_CELLS - wrapped) as f64
+    accumulation_strength(accumulation) * basin_weight(seed, cell) >= 0.10
 }
 
 fn local_runoff(seed: i64, cell: DrainageCell) -> f64 {
-    0.72 + unit(cell_hash(seed, cell.x, cell.z, 0x5255_4E4F_4646)) * 0.56
+    // Keep runoff slowly varying so channel depth does not jump at cell joins.
+    0.88 + basin_weight(seed, cell) * 0.20
 }
 
 fn cell_hash(seed: i64, x: i32, z: i32, salt: u64) -> u64 {
@@ -277,28 +263,6 @@ fn unit(value: u64) -> f64 {
 
 fn signed_unit(value: u64) -> f64 {
     unit(value) * 2.0 - 1.0
-}
-
-fn point_cell_distance(px: f64, pz: f64, cell: DrainageCell, cell_blocks: f64) -> f64 {
-    let min_x = f64::from(cell.x) * cell_blocks;
-    let max_x = min_x + cell_blocks;
-    let min_z = f64::from(cell.z) * cell_blocks;
-    let max_z = min_z + cell_blocks;
-    let dx = if px < min_x {
-        min_x - px
-    } else if px > max_x {
-        px - max_x
-    } else {
-        0.0
-    };
-    let dz = if pz < min_z {
-        min_z - pz
-    } else if pz > max_z {
-        pz - max_z
-    } else {
-        0.0
-    };
-    dx.hypot(dz)
 }
 
 fn point_segment_distance(px: f64, pz: f64, ax: f64, az: f64, bx: f64, bz: f64) -> f64 {
@@ -329,19 +293,9 @@ mod tests {
     #[test]
     fn downstream_strictly_decreases_hydraulic_elevation() {
         for seed in [-17, 0, 712_816, i64::MAX] {
-            for z in -32..=32 {
-                for x in -32..=32 {
+            for z in -64..=64 {
+                for x in -64..=64 {
                     let cell = DrainageCell { x, z };
-                    for (dx, dz) in forward_offsets(flow_direction(seed)) {
-                        let candidate = DrainageCell {
-                            x: cell.x.saturating_add(dx),
-                            z: cell.z.saturating_add(dz),
-                        };
-                        assert!(
-                            hydraulic_elevation(seed, candidate) < hydraulic_elevation(seed, cell),
-                            "{cell:?} has non-downhill forward candidate {candidate:?}"
-                        );
-                    }
                     let next = downstream(seed, cell);
                     assert!(
                         hydraulic_elevation(seed, next) < hydraulic_elevation(seed, cell),
@@ -393,7 +347,7 @@ mod tests {
         for z in -32..=32 {
             for x in -32..=32 {
                 let cell = DrainageCell { x, z };
-                let incoming = upstream_candidates(seed, cell)
+                let incoming = upstream_candidates(cell)
                     .into_iter()
                     .filter(|upstream| downstream(seed, *upstream) == cell)
                     .count();
@@ -419,7 +373,7 @@ mod tests {
                     let first = accumulation(seed, cell, ACCUMULATION_DEPTH);
                     let second = accumulation(seed, cell, ACCUMULATION_DEPTH);
                     assert_eq!(first.to_bits(), second.to_bits());
-                    assert!((0.72..=51.2).contains(&first), "{first}");
+                    assert!((0.72..=11.52).contains(&first), "{first}");
                 }
             }
         }

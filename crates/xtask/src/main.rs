@@ -1924,6 +1924,15 @@ fn scan_movement_rules_boundary(path: &Path, lines: &[&str], findings: &mut Vec<
                 message: "movement sweep sampling rule left mc-physics".into(),
             });
         }
+        if !source.contains("pub fn resolve_collision_displacement")
+            || !source.contains("pub fn horizontal_movement_residual_within_limit(")
+        {
+            findings.push(Finding {
+                path: path.to_path_buf(),
+                line: 1,
+                message: "movement collision-resolution rule left mc-physics".into(),
+            });
+        }
         if !source.contains("pub fn rotation_is_finite(")
             || !source.contains("pub fn clamp_world_position(")
         {
@@ -1966,11 +1975,14 @@ fn scan_movement_rules_boundary(path: &Path, lines: &[&str], findings: &mut Vec<
             message: "mc-net movement adapter bypasses mc-physics pose validation rule".into(),
         });
     }
-    if !source.contains("mc_physics::sweep_sample_count") {
+    if !source.contains("mc_physics::resolve_collision_displacement")
+        || !source.contains("mc_physics::horizontal_movement_residual_within_limit")
+    {
         findings.push(Finding {
             path: path.to_path_buf(),
             line: 1,
-            message: "mc-net movement adapter bypasses mc-physics sweep sampling rule".into(),
+            message: "mc-net movement adapter bypasses mc-physics collision-resolution rules"
+                .into(),
         });
     }
     if !source.contains("mc_physics::rotation_is_finite")

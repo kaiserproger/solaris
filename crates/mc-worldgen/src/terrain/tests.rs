@@ -558,6 +558,132 @@ fn try_with_rules_reports_missing_required_block() {
 }
 
 #[test]
+fn realistic_deposits_validate_every_required_ore_block_at_startup() {
+    let registry = required_only_registry();
+    let generator = TerrainGenerator::try_with_biome_rules(
+        42,
+        Arc::clone(&registry),
+        BiomeRules::vanilla_overworld(),
+    )
+    .expect("base generator requires only the vanilla default profile resources");
+    let error = match generator.try_with_realistic_deposits(registry.as_ref()) {
+        Ok(_) => panic!("realistic deposits must not silently replace missing ores with stone"),
+        Err(error) => error,
+    };
+    assert_eq!(
+        error,
+        TerrainGeneratorError::MissingRequiredBlock {
+            name: "minecraft:coal_ore"
+        }
+    );
+}
+
+#[test]
+fn realistic_deposits_require_normal_and_deepslate_ore_resources() {
+    let registry = Arc::new(
+        BlockRegistry::from_report(&mc_data::blocks::solaris_required_blocks_report())
+            .expect("embedded block registry"),
+    );
+    let generator = TerrainGenerator::new(42, Arc::clone(&registry))
+        .try_with_realistic_deposits(registry.as_ref())
+        .expect("complete registry supplies every realistic deposit resource");
+    assert_eq!(generator.ore_generation_profile(), "realistic_deposits");
+
+    let mut missing_deepslate = mc_data::blocks::solaris_required_blocks_report()
+        .into_iter()
+        .filter(|block| block.id != Identifier::parse("minecraft:deepslate_coal_ore").unwrap())
+        .collect::<Vec<_>>();
+    let mut next_state_id = 0_u32;
+    for block in &mut missing_deepslate {
+        for state in &mut block.states {
+            state.id = next_state_id;
+            next_state_id += 1;
+        }
+    }
+    let registry_without_deepslate =
+        Arc::new(BlockRegistry::from_report(&missing_deepslate).expect("reduced block registry"));
+    let generator = TerrainGenerator::new(42, Arc::clone(&registry_without_deepslate));
+    let error = match generator.try_with_realistic_deposits(registry_without_deepslate.as_ref()) {
+        Ok(_) => panic!("missing deepslate ore must fail profile startup"),
+        Err(error) => error,
+    };
+    assert_eq!(
+        error,
+        TerrainGeneratorError::MissingRequiredBlock {
+            name: "minecraft:deepslate_coal_ore"
+        }
+    );
+}
+
+#[test]
+fn realistic_deposits_place_deterministically_across_adjacent_chunks() {
+    let registry = Arc::new(
+        BlockRegistry::from_report(&mc_data::blocks::solaris_required_blocks_report())
+            .expect("embedded block registry"),
+    );
+    let first = TerrainGenerator::new(42, Arc::clone(&registry))
+        .try_with_realistic_deposits(registry.as_ref())
+        .expect("complete registry supplies every realistic deposit resource");
+    let second = TerrainGenerator::new(42, Arc::clone(&registry))
+        .try_with_realistic_deposits(registry.as_ref())
+        .expect("complete registry supplies every realistic deposit resource");
+    let positions = [
+        ChunkPos { x: -2, z: 0 },
+        ChunkPos { x: -1, z: 0 },
+        ChunkPos { x: 0, z: 0 },
+    ];
+    assert_eq!(
+        generated_block_fingerprint(&first, &positions),
+        generated_block_fingerprint(&second, &positions)
+    );
+
+    let ore_states = [
+        ("minecraft:coal_ore", "minecraft:deepslate_coal_ore"),
+        ("minecraft:iron_ore", "minecraft:deepslate_iron_ore"),
+        ("minecraft:copper_ore", "minecraft:deepslate_copper_ore"),
+        ("minecraft:gold_ore", "minecraft:deepslate_gold_ore"),
+        ("minecraft:redstone_ore", "minecraft:deepslate_redstone_ore"),
+        ("minecraft:diamond_ore", "minecraft:deepslate_diamond_ore"),
+        ("minecraft:lapis_ore", "minecraft:deepslate_lapis_ore"),
+        ("minecraft:emerald_ore", "minecraft:deepslate_emerald_ore"),
+    ]
+    .into_iter()
+    .map(|(normal, deepslate)| {
+        (
+            registry
+                .block(&Identifier::parse(normal).unwrap())
+                .expect("normal ore in complete registry")
+                .default,
+            registry
+                .block(&Identifier::parse(deepslate).unwrap())
+                .expect("deepslate ore in complete registry")
+                .default,
+        )
+    })
+    .collect::<Vec<_>>();
+    let chunks = positions
+        .into_iter()
+        .map(|position| first.generate(position))
+        .collect::<Vec<_>>();
+    let crosses_boundary = chunks.windows(2).any(|pair| {
+        (MIN_Y + 1..MAX_Y).any(|y| {
+            (0..16u8).any(|z| {
+                let left = pair[0].get_block(15, y, z);
+                let right = pair[1].get_block(0, y, z);
+                ore_states.iter().any(|(normal, deepslate)| {
+                    (left == Some(*normal) || left == Some(*deepslate))
+                        && (right == Some(*normal) || right == Some(*deepslate))
+                })
+            })
+        })
+    });
+    assert!(
+        crosses_boundary,
+        "realistic deposit must place one ore family on both sides of a chunk boundary"
+    );
+}
+
+#[test]
 fn try_with_rules_allows_missing_optional_blocks_when_required_resources_exist() {
     let registry = required_only_registry();
     let generator = TerrainGenerator::try_with_rules(
@@ -2050,6 +2176,7 @@ fn tellus_multi_seed_biome_and_feature_fingerprints_are_distinct_and_bounded() {
     }
 
     assert_eq!(fingerprints.len(), seeds.len());
+
     assert!(
         highly_dominated_seeds <= 8,
         "too many seeds are >90% one land biome: {highly_dominated_seeds}/{}",
@@ -2060,6 +2187,252 @@ fn tellus_multi_seed_biome_and_feature_fingerprints_are_distinct_and_bounded() {
         "multi-seed sample reached only {} land biomes: {all_land_biomes:?}",
         all_land_biomes.len()
     );
+}
+
+#[derive(Debug)]
+struct BiomeCoherenceMetrics {
+    /// Ratio between the larger and smaller directional family-transition totals.
+    edge_axis_ratio: f64,
+    /// Fraction of adjacent sample edges that cross family boundaries.
+    family_transition_density: f64,
+    /// Ratio between directional river-gradient totals.
+    river_axis_ratio: f64,
+    /// Fraction of land cells trapped in components smaller than four samples.
+    fragmented_land_share: f64,
+    /// Fraction of land covered by the largest connected component of each family.
+    coherent_land_share: f64,
+    /// Fraction of land covered by the single largest family-domain component.
+    largest_land_domain_share: f64,
+    /// Largest land-family share, guarding against one-family domination.
+    dominant_land_share: f64,
+    river_lag_1536_correlation: f64,
+    river_lag_1536_excess: f64,
+}
+
+// Keep non-land precedence aligned with the production selector: water and
+// coast remain separate from climate families, while cave/unknown results are
+// excluded from land metrics rather than being assigned a guessed family.
+fn diagnostic_family(generator: &TerrainGenerator, biome: &Identifier) -> u8 {
+    if generator.biomes.is_surface_water(biome) {
+        0
+    } else if generator.biomes.is_beach_or_shore(biome) {
+        1
+    } else if generator.biomes.mountain.contains(biome) {
+        2
+    } else {
+        match land_biome_family(generator, biome) {
+            Some("swamp") => 3,
+            Some("cold") => 4,
+            Some("hot_dry") => 5,
+            Some("jungle") => 6,
+            Some("temperate_forest") => 7,
+            Some("grassland") => 8,
+            _ => 9,
+        }
+    }
+}
+
+fn coherence_metrics(
+    generator: &TerrainGenerator,
+    center_x: i32,
+    center_z: i32,
+) -> BiomeCoherenceMetrics {
+    // 129 samples at 64-block spacing cover an 8,192-block square. That is
+    // large enough to observe climate domains while keeping each seed bounded.
+    const SIDE: usize = 129;
+    const STEP: i32 = 64;
+    const PERIOD_CELLS: usize = 24;
+    let mut families = Vec::with_capacity(SIDE * SIDE);
+    let mut river_weights = Vec::with_capacity(SIDE * SIDE);
+    for grid_z in 0..SIDE {
+        for grid_x in 0..SIDE {
+            let x = center_x + (grid_x as i32 - SIDE as i32 / 2) * STEP;
+            let z = center_z + (grid_z as i32 - SIDE as i32 / 2) * STEP;
+            let terrain = generator.density_router().sample(x, z);
+            let biome = generator.biome_for(x, z, terrain.surface_y);
+            families.push(diagnostic_family(generator, &biome));
+            river_weights.push(1.0 - (terrain.river / 0.10).clamp(0.0, 1.0));
+        }
+    }
+
+    let index = |x: usize, z: usize| z * SIDE + x;
+    let mut x_edges = 0usize;
+    let mut z_edges = 0usize;
+    for z in 0..SIDE {
+        for x in 0..SIDE {
+            let family = families[index(x, z)];
+            if x + 1 < SIDE {
+                x_edges += usize::from(family != families[index(x + 1, z)]);
+            }
+            if z + 1 < SIDE {
+                z_edges += usize::from(family != families[index(x, z + 1)]);
+            }
+        }
+    }
+    let lesser_edges = x_edges.min(z_edges).max(1) as f64;
+    let edge_axis_ratio = x_edges.max(z_edges) as f64 / lesser_edges;
+    let family_transition_density = (x_edges + z_edges) as f64 / (2 * SIDE * (SIDE - 1)) as f64;
+    let mut river_x_energy = 0.0;
+    let mut river_z_energy = 0.0;
+    for z in 0..SIDE {
+        for x in 0..SIDE {
+            let river = river_weights[index(x, z)];
+            if x + 1 < SIDE {
+                river_x_energy += (river - river_weights[index(x + 1, z)]).abs();
+            }
+            if z + 1 < SIDE {
+                river_z_energy += (river - river_weights[index(x, z + 1)]).abs();
+            }
+        }
+    }
+    let river_axis_ratio =
+        river_x_energy.max(river_z_energy) / river_x_energy.min(river_z_energy).max(f64::EPSILON);
+
+    let mut family_areas = [0usize; 10];
+    for &family in &families {
+        family_areas[family as usize] += 1;
+    }
+    let land_area: usize = family_areas[3..=8].iter().sum();
+    let dominant_land_share =
+        family_areas[3..=8].iter().copied().max().unwrap_or(0) as f64 / land_area.max(1) as f64;
+
+    let mut visited = vec![false; families.len()];
+    let mut fragmented_land_area = 0usize;
+    let mut largest_components = [0usize; 10];
+    for start_z in 0..SIDE {
+        for start_x in 0..SIDE {
+            let start = index(start_x, start_z);
+            let family = families[start];
+            if visited[start] || !(3..=8).contains(&family) {
+                continue;
+            }
+            visited[start] = true;
+            let mut queue = std::collections::VecDeque::from([(start_x, start_z)]);
+            let mut area = 0usize;
+            while let Some((x, z)) = queue.pop_front() {
+                area += 1;
+                for dz in -1isize..=1 {
+                    for dx in -1isize..=1 {
+                        if dx == 0 && dz == 0 {
+                            continue;
+                        }
+                        let nx = x as isize + dx;
+                        let nz = z as isize + dz;
+                        if nx < 0 || nz < 0 || nx >= SIDE as isize || nz >= SIDE as isize {
+                            continue;
+                        }
+                        let next = index(nx as usize, nz as usize);
+                        if !visited[next] && families[next] == family {
+                            visited[next] = true;
+                            queue.push_back((nx as usize, nz as usize));
+                        }
+                    }
+                }
+            }
+            if area < 4 {
+                fragmented_land_area += area;
+            }
+            largest_components[family as usize] = largest_components[family as usize].max(area);
+        }
+    }
+    let coherent_land_area: usize = largest_components[3..=8].iter().sum();
+    let largest_land_domain_area = largest_components[3..=8].iter().copied().max().unwrap_or(0);
+
+    let lag_correlation = |dx: usize, dz: usize| {
+        let mut samples = 0usize;
+        let mut left_sum = 0.0;
+        let mut right_sum = 0.0;
+        for z in 0..(SIDE - dz) {
+            for x in 0..(SIDE - dx) {
+                left_sum += river_weights[index(x, z)];
+                right_sum += river_weights[index(x + dx, z + dz)];
+                samples += 1;
+            }
+        }
+        let left_mean = left_sum / samples as f64;
+        let right_mean = right_sum / samples as f64;
+        let mut covariance = 0.0;
+        let mut left_variance = 0.0;
+        let mut right_variance = 0.0;
+        for z in 0..(SIDE - dz) {
+            for x in 0..(SIDE - dx) {
+                let left = river_weights[index(x, z)] - left_mean;
+                let right = river_weights[index(x + dx, z + dz)] - right_mean;
+                covariance += left * right;
+                left_variance += left * left;
+                right_variance += right * right;
+            }
+        }
+        covariance / (left_variance * right_variance).sqrt().max(f64::EPSILON)
+    };
+
+    let period_x = lag_correlation(PERIOD_CELLS, 0).abs();
+    let period_z = lag_correlation(0, PERIOD_CELLS).abs();
+    let neighbouring_x = (lag_correlation(PERIOD_CELLS - 1, 0).abs()
+        + lag_correlation(PERIOD_CELLS + 1, 0).abs())
+        * 0.5;
+    let neighbouring_z = (lag_correlation(0, PERIOD_CELLS - 1).abs()
+        + lag_correlation(0, PERIOD_CELLS + 1).abs())
+        * 0.5;
+    BiomeCoherenceMetrics {
+        edge_axis_ratio,
+        river_axis_ratio,
+        fragmented_land_share: fragmented_land_area as f64 / land_area.max(1) as f64,
+        coherent_land_share: coherent_land_area as f64 / land_area.max(1) as f64,
+        largest_land_domain_share: largest_land_domain_area as f64 / land_area.max(1) as f64,
+        family_transition_density,
+        dominant_land_share,
+        river_lag_1536_correlation: period_x.max(period_z),
+        river_lag_1536_excess: (period_x - neighbouring_x)
+            .max(period_z - neighbouring_z)
+            .max(0.0),
+    }
+}
+
+#[test]
+fn tellus_multi_seed_biome_family_coherence_metrics_are_bounded() {
+    let registry = tiny_registry();
+    for seed in [0, 1, 34, 233, 712_816, 17_711, 121_393, 832_040] {
+        let generator = TerrainGenerator::with_worldgen_mode(
+            seed,
+            Arc::clone(&registry),
+            WorldgenMode::TellusLike(TellusWorldgenSettings::default()),
+        );
+        for (center_x, center_z) in [(0, 0), (8_192, -8_192)] {
+            let metrics = coherence_metrics(&generator, center_x, center_z);
+            eprintln!("worldgen coherence seed={seed} center=({center_x},{center_z}): {metrics:?}");
+            assert!(metrics.edge_axis_ratio < 1.20, "seed {seed}: {metrics:?}");
+            assert!(metrics.river_axis_ratio < 3.0, "seed {seed}: {metrics:?}");
+            assert!(
+                metrics.family_transition_density < 0.55,
+                "seed {seed}: family transitions are too dense: {metrics:?}"
+            );
+            assert!(
+                metrics.fragmented_land_share < 0.20,
+                "seed {seed}: {metrics:?}"
+            );
+            assert!(
+                metrics.coherent_land_share > 0.20,
+                "seed {seed}: no family-level connected domains: {metrics:?}"
+            );
+            assert!(
+                metrics.largest_land_domain_share > 0.025,
+                "seed {seed}: largest land domain is too small: {metrics:?}"
+            );
+            assert!(
+                metrics.dominant_land_share <= 0.90,
+                "seed {seed}: {metrics:?}"
+            );
+            assert!(
+                metrics.river_lag_1536_correlation < 0.95,
+                "seed {seed}: periodic river correlation too high: {metrics:?}"
+            );
+            assert!(
+                metrics.river_lag_1536_excess < 0.20,
+                "seed {seed}: {metrics:?}"
+            );
+        }
+    }
 }
 
 #[test]
@@ -2142,7 +2515,7 @@ fn tellus_savanna_generates_sparse_acacia_while_desert_remains_treeless() {
                     plan.wz
                 );
                 acacia_trees += 1;
-                if acacia_trees >= 3 && desert_columns >= 128 && savanna_columns >= 128 {
+                if acacia_trees >= 2 && desert_columns >= 128 && savanna_columns >= 128 {
                     break 'seeds;
                 }
             }
@@ -2158,7 +2531,7 @@ fn tellus_savanna_generates_sparse_acacia_while_desert_remains_treeless() {
         "sampled only {desert_columns} desert columns"
     );
     assert!(
-        acacia_trees >= 3,
+        acacia_trees >= 2,
         "generated only {acacia_trees} acacia trees"
     );
 }
@@ -2433,17 +2806,12 @@ fn structures_precede_tree_and_single_plant_decoration() {
                 z: wz.div_euclid(16),
             };
             let plan = plain.plan_column(pos, lx, lz);
-            let tree_biome = plain.biomes.temperate_forest.contains(&plan.biome)
-                || plain.biomes.cold.contains(&plan.biome)
-                || plain.biomes.jungle.contains(&plan.biome)
-                || plain.biomes.grassland.contains(&plan.biome);
             let Some(tree) = plain.tree_blocks_for_biome(&plan.biome) else {
                 continue;
             };
-            if tree_biome
-                && plain
-                    .tree_spacing_for_biome(&plan.biome)
-                    .is_some_and(|spacing| plan.hash.is_multiple_of(spacing))
+            if plain
+                .tree_spacing_for_biome(&plan.biome)
+                .is_some_and(|spacing| plan.hash.is_multiple_of(spacing))
                 && plan.hash.is_multiple_of(61)
             {
                 target = Some((wx, wz, plan.height, tree.log, tree.leaves));

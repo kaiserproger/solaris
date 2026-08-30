@@ -37,6 +37,33 @@ fn every_overworld_biome_is_reachable_by_selector() {
 }
 
 #[test]
+fn subtype_and_region_pickers_include_world_seed_identity() {
+    let rules = BiomeRules::vanilla_overworld();
+    let subtype_fingerprint = |seed| {
+        (-4_096..=4_096)
+            .step_by(256)
+            .map(|x| {
+                rules
+                    .pick(&rules.hot_dry, x, x / 3, seed, 0x484F_5444)
+                    .to_string()
+            })
+            .collect::<Vec<_>>()
+    };
+    let region_fingerprint = |seed| {
+        (-4_096..=4_096)
+            .step_by(128)
+            .map(|z| {
+                rules
+                    .pick_region_band(&rules.deep_ocean, z / 2, z, seed)
+                    .to_string()
+            })
+            .collect::<Vec<_>>()
+    };
+    assert_ne!(subtype_fingerprint(0), subtype_fingerprint(712_816));
+    assert_ne!(region_fingerprint(0), region_fingerprint(712_816));
+}
+
+#[test]
 fn biome_rules_can_use_sidecar_tags() {
     let data = BiomeWorldgenData::from_parts(
         BTreeMap::from([

@@ -22,6 +22,8 @@ pub(in crate::terrain) struct TerrainSample {
     pub(in crate::terrain) river: f64,
     pub(in crate::terrain) temperature: f64,
     pub(in crate::terrain) moisture: f64,
+    /// Broad, warped climate-domain identity used only inside transition margins.
+    pub(in crate::terrain) climate_domain: f64,
 }
 
 /// Stateless world-coordinate authority for newly generated overworld chunks.

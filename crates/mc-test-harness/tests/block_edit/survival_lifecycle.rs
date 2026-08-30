@@ -1079,6 +1079,181 @@ async fn selected_item_drop_debits_slot_and_spawns_exact_stack_inner() {
         .expect("selected item drop server serve");
 }
 
+#[test]
+fn dropped_item_inside_legacy_radius_waits_for_vanilla_touch_box() {
+    let test = std::thread::Builder::new()
+        .name("dropped_item_inside_legacy_radius_waits_for_vanilla_touch_box".to_owned())
+        .stack_size(4 * 1024 * 1024)
+        .spawn(|| {
+            tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .expect("build pickup overlap runtime")
+                .block_on(dropped_item_inside_legacy_radius_waits_for_vanilla_touch_box_inner());
+        })
+        .expect("spawn pickup overlap thread");
+    if let Err(panic) = test.join() {
+        std::panic::resume_unwind(panic);
+    }
+}
+
+async fn dropped_item_inside_legacy_radius_waits_for_vanilla_touch_box_inner() {
+    let data = embedded_play_data();
+    let world = embedded_world(&data);
+    let item_id = data
+        .items
+        .id_of(&mc_data::Identifier::parse("minecraft:birch_log").unwrap())
+        .expect("birch log item");
+    let item_entity_type = mc_data::entity_types::solaris_required_entity_types()
+        .id_of(&mc_data::Identifier::parse("minecraft:item").unwrap())
+        .and_then(|id| i32::try_from(id).ok())
+        .expect("item entity type");
+    let shutdown = mc_net::ShutdownHandle::default();
+    let mut cfg = embedded_playable_config(&data, world, "alpha3 item pickup overlap");
+    cfg.shutdown = shutdown.clone();
+    let bound = mc_net::bind(cfg).await.expect("bind pickup overlap server");
+    let addr = bound.local_addr().expect("pickup overlap local_addr");
+    let serve = tokio::spawn(async move { bound.serve().await });
+
+    let (mut client, sync) = connect_to_play(addr, "PickupOverlap").await;
+    drain_until_chunk(&mut client, (0, 0)).await;
+    client
+        .write_packet(&ServerboundChatCommand {
+            command: "debug give minecraft:birch_log 1 0".into(),
+        })
+        .await
+        .expect("give pickup overlap fixture");
+    wait_for_slot_stack(&mut client, item_id, 1).await;
+    client
+        .write_packet(&ServerboundPlayerAction {
+            action: PlayerActionKind::DropItem,
+            position: 0,
+            direction: Direction::Down,
+            sequence: 94,
+        })
+        .await
+        .expect("drop pickup overlap fixture");
+
+    let mut dropped_id = None;
+    let mut dropped_position = None;
+    let mut saw_stack = false;
+    let mut saw_debit = false;
+    let mut saw_ack = false;
+    let drop_deadline = tokio::time::Instant::now() + Duration::from_secs(30);
+    while !(dropped_id.is_some() && saw_stack && saw_debit && saw_ack) {
+        let frame = client
+            .read_frame_with_timeout(
+                drop_deadline.saturating_duration_since(tokio::time::Instant::now()),
+            )
+            .await
+            .expect("pickup overlap drop response");
+        if handle_keepalive(&mut client, frame.id, &frame.body).await {
+            continue;
+        }
+        if frame.id == AddEntity::ID {
+            let mut body = frame.body;
+            let packet = AddEntity::decode(&mut body).expect("decode overlap item AddEntity");
+            if packet.entity_type_id == item_entity_type {
+                dropped_id = Some(packet.entity_id);
+                dropped_position = Some((packet.x, packet.y, packet.z));
+            }
+        } else if frame.id == ClientboundSetEntityData::ID {
+            let mut body = frame.body;
+            let packet = ClientboundSetEntityData::decode(&mut body)
+                .expect("decode overlap item metadata");
+            if Some(packet.entity_id) == dropped_id {
+                saw_stack |= packet.values.iter().any(|value| {
+                    matches!(
+                        value,
+                        EntityDataValue::ItemStack { index, stack }
+                            if *index == ITEM_ENTITY_DATA_ITEM_INDEX
+                                && stack.item_id == item_id
+                                && stack.count == 1
+                    )
+                });
+            }
+        } else if frame.id == ClientboundContainerSetSlot::ID {
+            let mut body = frame.body;
+            let packet = ClientboundContainerSetSlot::decode(&mut body)
+                .expect("decode overlap drop debit");
+            saw_debit |= packet.slot == 36 && packet.item_stack.is_empty();
+        } else if frame.id == BlockChangedAck::ID {
+            let mut body = frame.body;
+            let packet = BlockChangedAck::decode(&mut body).expect("decode overlap drop ack");
+            saw_ack |= packet.sequence == 94;
+        }
+    }
+
+    let dropped_id = dropped_id.expect("dropped item id");
+    let (drop_x, _drop_y, drop_z) = dropped_position.expect("dropped item position");
+    client
+        .write_packet(&ServerboundMovePlayerPosRot {
+            x: drop_x + 1.75,
+            y: sync.y,
+            z: drop_z,
+            yaw: sync.yaw,
+            pitch: sync.pitch,
+            flags: MovePlayerFlags::new(true, false),
+        })
+        .await
+        .expect("move inside legacy radius but outside vanilla pickup touch box");
+
+    let mut baseline_time = None;
+    let observation_deadline = tokio::time::Instant::now() + Duration::from_secs(30);
+    loop {
+        let frame = client
+            .read_frame_with_timeout(
+                observation_deadline.saturating_duration_since(tokio::time::Instant::now()),
+            )
+            .await
+            .expect("observe pickup overlap cooldown");
+        if handle_keepalive(&mut client, frame.id, &frame.body).await {
+            continue;
+        }
+        if frame.id == ClientboundContainerSetSlot::ID {
+            let mut body = frame.body;
+            let packet = ClientboundContainerSetSlot::decode(&mut body)
+                .expect("decode forbidden early pickup slot");
+            assert!(
+                packet.item_stack.item_id != item_id || packet.item_stack.count <= 0,
+                "item credited while player was outside vanilla pickup touch box: {packet:?}"
+            );
+        } else if frame.id == ClientboundTakeItemEntity::ID {
+            let mut body = frame.body;
+            let packet = ClientboundTakeItemEntity::decode(&mut body)
+                .expect("decode forbidden early TakeItem");
+            assert_ne!(
+                packet.item_entity_id, dropped_id,
+                "item pickup animation arrived outside vanilla pickup touch box"
+            );
+        } else if frame.id == RemoveEntities::ID {
+            let mut body = frame.body;
+            let packet = RemoveEntities::decode(&mut body)
+                .expect("decode forbidden early item removal");
+            assert!(
+                !packet.entity_ids.contains(&dropped_id),
+                "dropped item disappeared outside vanilla pickup touch box"
+            );
+        } else if frame.id == SynchronizePlayerPosition::ID {
+            panic!("ordinary one-block move was unexpectedly corrected");
+        } else if frame.id == ClientboundSetTime::ID {
+            let mut body = frame.body;
+            let packet = ClientboundSetTime::decode(&mut body).expect("decode overlap SetTime");
+            let start = *baseline_time.get_or_insert(packet.game_time);
+            if packet.game_time.saturating_sub(start) >= 120 {
+                break;
+            }
+        }
+    }
+
+    shutdown.request();
+    tokio::time::timeout(Duration::from_secs(5), serve)
+        .await
+        .expect("pickup overlap server shutdown")
+        .expect("pickup overlap server join")
+        .expect("pickup overlap server serve");
+}
+
 async fn drop_one_selected_item_wire(
     client: &mut Client,
     item_entity_type: i32,

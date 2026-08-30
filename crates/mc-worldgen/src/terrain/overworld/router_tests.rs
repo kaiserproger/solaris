@@ -19,13 +19,15 @@ fn terrain_is_deterministic_bounded_and_continuous() {
         let router = OverworldRouter::new(seed, OVERWORLD_GEOMETRY, WorldgenMode::VanillaLike);
         for z in (-2_048..=2_048).step_by(97) {
             for x in (-2_048..=2_048).step_by(31) {
-                let current = router.sample(x, z).surface_y;
+                let current_sample = router.sample(x, z);
+                let current = current_sample.surface_y;
                 assert_eq!(current, router.sample(x, z).surface_y);
                 for (nx, nz) in [(x + 1, z), (x, z + 1)] {
-                    let next = router.sample(nx, nz).surface_y;
+                    let next_sample = router.sample(nx, nz);
+                    let next = next_sample.surface_y;
                     assert!(
                         (current - next).abs() <= 3,
-                        "terrain step for seed {seed} at ({x},{z}): {current} -> {next}"
+                        "terrain step for seed {seed} at ({x},{z}): {current_sample:?} -> {next_sample:?}"
                     );
                 }
             }
@@ -175,8 +177,10 @@ fn accumulated_drainage_paths_stay_downhill_and_reach_coast() {
                 seed_starts += 1;
                 let mut current = start;
                 let mut active_steps = 0usize;
+                let mut path_steps = 0usize;
                 let mut reached_coast = false;
                 for _ in 0..128 {
+                    path_steps += 1;
                     active_steps += usize::from(drainage::active_cell(seed, current));
                     let (block_x, block_z) = drainage::cell_center(current, cell_blocks);
                     let terrain = router.sample(block_x as i32, block_z as i32);
@@ -194,7 +198,7 @@ fn accumulated_drainage_paths_stay_downhill_and_reach_coast() {
                 }
                 if reached_coast {
                     coast_connections += 1;
-                    persistent_connections += usize::from(active_steps >= 8);
+                    persistent_connections += usize::from(active_steps == path_steps);
                 }
                 if seed_starts >= 4 {
                     break 'cells;
@@ -214,7 +218,7 @@ fn accumulated_drainage_paths_stay_downhill_and_reach_coast() {
     );
     assert!(
         persistent_connections * 4 >= coast_connections * 3,
-        "coast paths lost their active channel too early: {persistent_connections}/{coast_connections}"
+        "coast paths lost their active channel before reaching water: {persistent_connections}/{coast_connections}"
     );
 }
 

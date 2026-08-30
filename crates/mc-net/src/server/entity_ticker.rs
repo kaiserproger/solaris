@@ -1,4 +1,5 @@
 use super::*;
+use crate::runtime_tick_metrics::RuntimeTickMetricsObservation;
 
 pub(super) struct EntityTickerContext {
     pub(super) prewarmed_entity_pathing_states: std::num::NonZeroUsize,
@@ -29,6 +30,56 @@ fn inline_projectile_facts(
     snapshot.map_or_else(Default::default, |snapshot| {
         entity_projectile_physics_facts_from_steps(tick, queries, &snapshot, steps)
     })
+}
+
+fn apply_runtime_tick_metrics_observation(
+    tick: u64,
+    observation: RuntimeTickMetricsObservation,
+    runtime_control: Option<&RuntimeControlHandle>,
+    chunk_pipeline_resources: &ChunkPipelineResources,
+    sessions: &play::SessionRegistry,
+    shutdown: &ShutdownHandle,
+) {
+    let Some(control) = runtime_control else {
+        return;
+    };
+    let outcome = apply_runtime_control_operation(
+        control,
+        chunk_pipeline_resources,
+        sessions,
+        shutdown,
+        RuntimeControlOperation::ObserveWork(runtime_work_input(
+            &observation.percentiles,
+            observation.scheduled_budget_exhausted,
+        )),
+    );
+    if let Some(RuntimeControlOutcome::Work(decision)) = outcome.as_ref()
+        && decision.action == crate::AutoscaleAction::ScaleDown
+    {
+        info!(
+            tick,
+            source_tick = observation.percentiles.source_tick,
+            action = ?decision.action,
+            focus = ?decision.focus,
+            entity_pathing_candidates = decision.budgets.entity_pathing_candidates,
+            random_tick_chunk_budget = decision.budgets.random_tick_chunks,
+            scheduled_tick_budget = decision.budgets.scheduled_ticks,
+            reason = %decision.reason,
+            "runtime work budgets changed"
+        );
+    } else if let Some(RuntimeControlOutcome::Work(decision)) = outcome.as_ref()
+        && decision.action == crate::AutoscaleAction::ScaleUp
+    {
+        debug!(
+            tick,
+            source_tick = observation.percentiles.source_tick,
+            entity_pathing_candidates = decision.budgets.entity_pathing_candidates,
+            random_tick_chunk_budget = decision.budgets.random_tick_chunks,
+            scheduled_tick_budget = decision.budgets.scheduled_ticks,
+            reason = %decision.reason,
+            "runtime work budgets recovering"
+        );
+    }
 }
 
 pub(super) async fn run_entity_ticker(context: EntityTickerContext) {
@@ -79,8 +130,6 @@ pub(super) async fn run_entity_ticker(context: EntityTickerContext) {
     let mut simulation_command_gate = SimulationCommandGate::default();
     let mut pushed_simulation_lane_attribution = Vec::new();
     let mut entity_physics_job = None;
-    let mut entity_update_budget =
-        crate::runtime_entity_budget::EntityUpdateBudgetController::default();
     let mut movement_publication_budget =
         crate::runtime_entity_budget::MovementPublicationBudgetController::default();
     let mut entity_budget_last_reliable_drops = 0_u64;
@@ -180,45 +229,14 @@ pub(super) async fn run_entity_ticker(context: EntityTickerContext) {
                 let Some(observation) = observation else {
                     continue;
                 };
-                if let Some(control) = entity_runtime_control.as_ref() {
-                    let outcome = apply_runtime_control_operation(
-                        control,
-                        &entity_chunk_pipeline_resources,
-                        &entity_sessions,
-                        &entity_config.shutdown,
-                        RuntimeControlOperation::ObserveWork(runtime_work_input(
-                            &observation.percentiles,
-                            observation.scheduled_budget_exhausted,
-                        )),
-                    );
-                    if let Some(RuntimeControlOutcome::Work(decision)) = outcome.as_ref()
-                        && decision.action == crate::AutoscaleAction::ScaleDown
-                    {
-                        info!(
-                            tick,
-                            source_tick = observation.percentiles.source_tick,
-                            action = ?decision.action,
-                            focus = ?decision.focus,
-                            entity_pathing_candidates = decision.budgets.entity_pathing_candidates,
-                            random_tick_chunk_budget = decision.budgets.random_tick_chunks,
-                            scheduled_tick_budget = decision.budgets.scheduled_ticks,
-                            reason = %decision.reason,
-                            "runtime work budgets changed"
-                        );
-                    } else if let Some(RuntimeControlOutcome::Work(decision)) = outcome.as_ref()
-                        && decision.action == crate::AutoscaleAction::ScaleUp
-                    {
-                        debug!(
-                            tick,
-                            source_tick = observation.percentiles.source_tick,
-                            entity_pathing_candidates = decision.budgets.entity_pathing_candidates,
-                            random_tick_chunk_budget = decision.budgets.random_tick_chunks,
-                            scheduled_tick_budget = decision.budgets.scheduled_ticks,
-                            reason = %decision.reason,
-                            "runtime work budgets recovering"
-                        );
-                    }
-                }
+                apply_runtime_tick_metrics_observation(
+                    tick,
+                    observation,
+                    entity_runtime_control.as_ref(),
+                    &entity_chunk_pipeline_resources,
+                    &entity_sessions,
+                    &entity_config.shutdown,
+                );
                 continue;
             }
             signal = recv_runtime_control_signal(&mut entity_runtime_control_signals) => {
@@ -365,29 +383,75 @@ pub(super) async fn run_entity_ticker(context: EntityTickerContext) {
             .await;
         let sheep_grazing_us = elapsed_us(started);
         let mut animal_breeding_us = 0;
-        let physics_was_in_flight = entity_physics_job.is_some();
         simulation_owner.tick_dragon_authority(&entity_sessions, tick);
-        let started = Instant::now();
-        let queries = if physics_was_in_flight {
-            Vec::new()
-        } else {
-            simulation_owner.collect_entity_physics_queries(
+        // A previous tick's async entity physics job may still be in flight.
+        // Wait for it here and apply its result with the off-tick completion
+        // semantics (including the primed-TNT completion behavior) instead of
+        // skipping this tick's entity batch: every tick must run the normal
+        // entity goal and physics work; overload must never hide as skipped
+        // simulation ticks.
+        if let Some(job) = entity_physics_job.take() {
+            #[cfg(feature = "load-bench")]
+            let prev_job_wait_started = Instant::now();
+            let prev_job_result = job.await;
+            #[cfg(feature = "load-bench")]
+            let prev_job_wait_us = elapsed_us(prev_job_wait_started);
+            #[cfg(feature = "load-bench")]
+            let prev_job_apply_started = Instant::now();
+            apply_entity_physics_job_result(
+                prev_job_result,
+                &simulation_owner,
+                &entity_config,
                 &entity_sessions,
                 &entity_chunk_pipeline_resources,
-                tick,
-                play::EntitySimulationTickPolicy {
-                    entity_updates_per_lane: entity_update_budget.configured_per_lane(),
-                    pathing_candidates_per_entity: work_budgets.entity_pathing_candidates,
-                    simulation_distance: simulation_policy.simulation_distance,
-                },
-                simulation_owner.entity_world_context(
-                    entity_world_read.as_ref(),
-                    entity_pathing_materials.as_deref(),
-                    entity_config.blocks.as_ref(),
-                    entity_config.items.as_ref(),
-                ),
+                entity_world_read.as_ref(),
             )
-        };
+            .await;
+            #[cfg(feature = "load-bench")]
+            eprintln!(
+                "PHYSICS_PREV_JOB tick={} wait_us={} apply_us={}",
+                tick,
+                prev_job_wait_us,
+                elapsed_us(prev_job_apply_started)
+            );
+            simulation_owner
+                .tick_primed_tnt(
+                    &entity_sessions,
+                    entity_config.world.as_ref(),
+                    entity_config.block_light.as_deref(),
+                    &entity_config.block_facts,
+                    play::ExplosionRegistries::from_config(&entity_config),
+                    entity_pathing_materials.as_deref(),
+                    || {
+                        entity_script_zones.as_ref().map(|zones| {
+                            zones.protection_snapshot().unwrap_or_else(|error| {
+                                warn!(
+                                    ?error,
+                                    "zone protection snapshot unavailable; denying explosion block damage"
+                                );
+                                crate::script::ZoneProtectionSnapshot::unavailable()
+                            })
+                        })
+                    },
+                )
+                .await;
+        }
+        let started = Instant::now();
+        let queries = simulation_owner.collect_entity_physics_queries(
+            &entity_sessions,
+            &entity_chunk_pipeline_resources,
+            tick,
+            play::EntitySimulationTickPolicy {
+                pathing_candidates_per_entity: work_budgets.entity_pathing_candidates,
+                simulation_distance: simulation_policy.simulation_distance,
+            },
+            simulation_owner.entity_world_context(
+                entity_world_read.as_ref(),
+                entity_pathing_materials.as_deref(),
+                entity_config.blocks.as_ref(),
+                entity_config.items.as_ref(),
+            ),
+        );
         let entity_goals_us = elapsed_us(started);
         let started = Instant::now();
         simulation_owner.tick_hostile_attacks(
@@ -422,9 +486,7 @@ pub(super) async fn run_entity_ticker(context: EntityTickerContext) {
             );
         }
         let entity_query_count = queries.len();
-        let (steps, entity_physics_us, entity_dispatch_us) = if physics_was_in_flight {
-            (Vec::new(), 0, 0)
-        } else {
+        let (steps, entity_physics_us, entity_dispatch_us) = {
             let started = Instant::now();
             let inputs =
                 prepare_entity_physics_inputs(&entity_config, entity_world_read.as_ref(), &queries);
@@ -467,7 +529,7 @@ pub(super) async fn run_entity_ticker(context: EntityTickerContext) {
                     );
                     let entity_dispatch_us = elapsed_us(started);
                     let landed_falling_blocks =
-                        entity_sessions.landed_falling_blocks(&accepted_steps);
+                        entity_sessions.landed_falling_blocks(&queries, &accepted_steps);
                     if !landed_falling_blocks.is_empty() {
                         simulation_owner
                             .land_falling_blocks(
@@ -721,17 +783,11 @@ pub(super) async fn run_entity_ticker(context: EntityTickerContext) {
             reliable_retries_in_flight: outbound_pressure.reliable_command_retries_in_flight,
             simulation_queue_depth: simulation_commands.remaining_depth,
         };
-        let entity_update_budget_snapshot = entity_update_budget.observe(
-            crate::runtime_entity_budget::EntityUpdateBudgetObservation {
-                tick_us,
-                entity_goals_us,
-                selected: selected_entity_updates,
-                active_population: active_entity_population,
-                lane_count: entity_chunk_pipeline_resources.cpu_limit().max(1),
-                target_tick_us,
-                pressure: entity_pressure,
-            },
-        );
+        let entity_update_budget_total = selected_entity_updates;
+        let entity_update_budget_per_lane =
+            selected_entity_updates.div_ceil(entity_chunk_pipeline_resources.cpu_limit().max(1));
+        let entity_update_rotation_ticks =
+            active_entity_population.div_ceil(selected_entity_updates.max(1));
         let movement_budget =
             movement_publication_budget.observe(tick_us, target_tick_us, entity_pressure);
         entity_sessions.set_entity_movement_publication_budget(movement_budget);
@@ -884,14 +940,11 @@ pub(super) async fn run_entity_ticker(context: EntityTickerContext) {
                     simulation_command_post_admission_us,
                     entity_queries = entity_query_count,
                     entity_steps = entity_step_count,
-                    entity_update_budget_per_lane =
-                        entity_update_budget_snapshot.configured_per_lane,
-                    entity_update_budget_total = entity_update_budget_snapshot.effective_total,
-                    entity_update_selected = entity_update_budget_snapshot.selected,
-                    entity_update_active_population =
-                        entity_update_budget_snapshot.active_population,
-                    entity_update_rotation_ticks =
-                        entity_update_budget_snapshot.estimated_rotation_ticks,
+                    entity_update_budget_per_lane = entity_update_budget_per_lane,
+                    entity_update_budget_total,
+                    entity_update_selected = selected_entity_updates,
+                    entity_update_active_population = active_entity_population,
+                    entity_update_rotation_ticks,
                     entity_physics_in_flight = entity_physics_job.is_some(),
                     campfire_persisted = campfire_tick.persisted,
                     campfire_completed = campfire_tick.completed,
@@ -1008,14 +1061,11 @@ pub(super) async fn run_entity_ticker(context: EntityTickerContext) {
                     simulation_command_post_admission_us,
                     entity_queries = entity_query_count,
                     entity_steps = entity_step_count,
-                    entity_update_budget_per_lane =
-                        entity_update_budget_snapshot.configured_per_lane,
-                    entity_update_budget_total = entity_update_budget_snapshot.effective_total,
-                    entity_update_selected = entity_update_budget_snapshot.selected,
-                    entity_update_active_population =
-                        entity_update_budget_snapshot.active_population,
-                    entity_update_rotation_ticks =
-                        entity_update_budget_snapshot.estimated_rotation_ticks,
+                    entity_update_budget_per_lane = entity_update_budget_per_lane,
+                    entity_update_budget_total,
+                    entity_update_selected = selected_entity_updates,
+                    entity_update_active_population = active_entity_population,
+                    entity_update_rotation_ticks,
                     entity_physics_in_flight = entity_physics_job.is_some(),
                     campfire_persisted = campfire_tick.persisted,
                     campfire_completed = campfire_tick.completed,

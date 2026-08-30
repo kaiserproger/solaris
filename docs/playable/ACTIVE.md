@@ -22,22 +22,27 @@ replacement-readiness claims.
 
 ## Active Checkpoint
 
-Phase 1 is complete. The earliest incomplete public-alpha checkpoint is now
-Phase 4 item 1: finish the exact seed-`712816` owner traversal/disposition row.
-The automated portion is already green: a real 26.1.2 client traversed the fresh
-`tellus_like` world, gathered natural acacia, crafted tools/table, restarted the
-server and rejoined with position, inventory, and marker persistence intact.
-Evidence is in
-[`../evidence/phase4-seed-712816-restart-rejoin-2026-08-21.md`](../evidence/phase4-seed-712816-restart-rejoin-2026-08-21.md).
+The alpha-3 operator/deposits checkpoint is complete. `mc-server operator
+add|remove|list` manages a restart-stable configured operator profile, or the
+default `ops.json` beside the config when no path is configured; startup
+auto-loads that default file when it exists. Invalid identities/files fail
+closed without mutating config or creating a file on invalid `add`.
+`realistic_deposits` is the canonical optional worldgen profile; startup
+resource validation, deterministic adjacent-chunk placement, and large
+cross-chunk component coverage are green. Evidence:
+[`../evidence/alpha3-operator-deposits-2026-08-30.md`](../evidence/alpha3-operator-deposits-2026-08-30.md).
 
-The only remaining acceptance boundary is deliberately subjective: the owner
-must accept or reject the seed's terrain/playability. An agent may prepare the
-exact screenshots, mosaics, traversal coordinates, and optional additional
-multi-angle graphical evidence, but must not substitute its own aesthetic
-judgement for the owner disposition. If the owner accepts it, close Phase 4 item
-1 and the two duplicate seed-`712816` acceptance rows in
-`PUBLIC_ALPHA_PLAN.md`; if the owner rejects it, record the concrete terrain or
-playability defect and make that defect the next focused worldgen checkpoint.
+The bounded natural-spawn policy and vanilla Configuration brand are also
+implemented and covered by prior evidence. The optional dashboard and standard
+plugin pack remain open product work; final alpha release still requires the
+release-host/full-workspace gates and owner-run survival review.
+
+Phase 1's pre-model seed-`712816` quality disposition remains `REJECT`:
+repeated/banded endless savanna and weak large-scale biome cohesion were
+unacceptable for the playable target. The coherence follow-up is implemented
+and measured, but fresh agent screenshots and metrics do not silently convert
+the earlier owner `REJECT` into an `ACCEPT`. The next terrain action is explicit
+owner review of `.analysis/seed-owner-review/20260830T204140`.
 
 The complete dense entity-simulation cohort test has moved to
 `crates/mc-net/src/play/tests/dense_entity_simulation_cohorts.rs`. Its
@@ -837,7 +842,7 @@ hardening. An already-open lower-priority diff does not override this order.
   returning to zero.
 
 - The optional `examples/plugins/geological-mines` plugin declares the
-  `geological_deposits` startup ore profile. Prepared plugin discovery runs once
+  `realistic_deposits` startup ore profile. Prepared plugin discovery runs once
   before world validation and is reused to start Lua later. The profile removes
   the vanilla ore rules and generates deterministic elongated deposits larger
   than 512 connected blocks across chunk boundaries. World contract schema 2

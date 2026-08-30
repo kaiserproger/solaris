@@ -373,6 +373,146 @@ async fn authority_movement_sweep_rejects_tunneling_between_clear_endpoints() {
 }
 
 #[tokio::test]
+async fn authority_movement_respects_creative_and_spectator_collision_modes() {
+    let blocks = Arc::new(
+        mc_world::BlockRegistry::from_report(&solaris_required_blocks_report())
+            .expect("embedded vanilla registry builds"),
+    );
+    let mut state = interaction_state_for_blocks(Arc::clone(&blocks));
+    state.block_facts = Arc::new(fluid_test_facts());
+    insert_fluid_test_chunk(&state).await;
+    let stone = blocks
+        .block(&Identifier::parse("minecraft:stone").unwrap())
+        .unwrap()
+        .default;
+    state
+        .world
+        .lock()
+        .await
+        .set_block_at(BlockPos { x: 1, y: 64, z: 0 }, stone)
+        .unwrap();
+    let authority = PlayerMovementAuthorityResources::new(
+        state.world_read.clone(),
+        Arc::clone(&blocks),
+        Arc::clone(&state.block_facts),
+    );
+    let old = PlayerPose::new(0.5, 64.0, 0.5);
+    let beyond_wall = PlayerPose::new(2.5, 64.0, 0.5);
+    let inside_wall = PlayerPose::new(1.5, 64.0, 0.5);
+    let loaded = HashSet::from([(0, 0)]);
+
+    assert_eq!(
+        authority.validate_movement(&loaded, old, beyond_wall, GameMode::Creative, false),
+        Ok(())
+    );
+    assert_eq!(
+        authority.validate_movement(&loaded, old, inside_wall, GameMode::Spectator, false),
+        Ok(())
+    );
+}
+
+#[tokio::test]
+async fn authority_movement_accepts_short_client_resolved_slide_around_block_corner() {
+    let blocks = Arc::new(
+        mc_world::BlockRegistry::from_report(&solaris_required_blocks_report())
+            .expect("embedded vanilla registry builds"),
+    );
+    let mut state = interaction_state_for_blocks(Arc::clone(&blocks));
+    state.block_facts = Arc::new(fluid_test_facts());
+    insert_fluid_test_chunk(&state).await;
+    let stone = blocks
+        .block(&Identifier::parse("minecraft:stone").unwrap())
+        .unwrap()
+        .default;
+    state
+        .world
+        .lock()
+        .await
+        .set_block_at(BlockPos { x: 1, y: 64, z: 1 }, stone)
+        .unwrap();
+    let authority = PlayerMovementAuthorityResources::new(
+        state.world_read.clone(),
+        Arc::clone(&blocks),
+        Arc::clone(&state.block_facts),
+    );
+    // Both poses are clear and touch different faces of the same corner. The
+    // straight chord intersects the block, but vanilla client movement reaches
+    // this result by clipping one horizontal axis and sliding along the other.
+    let old = PlayerPose::new(0.7, 64.0, 0.94);
+    let destination = PlayerPose::new(0.94, 64.0, 0.7);
+
+    assert!(!player_pose_collides_with_solid(Some(&state), old).await);
+    assert!(!player_pose_collides_with_solid(Some(&state), destination).await);
+    assert_eq!(
+        authority.validate_movement(
+            &HashSet::from([(0, 0)]),
+            old,
+            destination,
+            GameMode::Survival,
+            false,
+        ),
+        Ok(())
+    );
+}
+
+#[tokio::test]
+async fn authority_accepts_face_flush_sprint_jump_with_vanilla_corner_axis_order() {
+    let blocks = Arc::new(
+        mc_world::BlockRegistry::from_report(&solaris_required_blocks_report())
+            .expect("embedded vanilla registry builds"),
+    );
+    let mut state = interaction_state_for_blocks(Arc::clone(&blocks));
+    state.block_facts = Arc::new(fluid_test_facts());
+    insert_fluid_test_chunk(&state).await;
+    let stone = blocks
+        .block(&Identifier::parse("minecraft:stone").unwrap())
+        .unwrap()
+        .default;
+    state
+        .world
+        .lock()
+        .await
+        .set_block_at(BlockPos { x: 1, y: 64, z: 1 }, stone)
+        .unwrap();
+    let authority = PlayerMovementAuthorityResources::new(
+        state.world_read.clone(),
+        Arc::clone(&blocks),
+        Arc::clone(&state.block_facts),
+    );
+
+    // Oracle-backed ordinary sprint+jump packet at a face-flush corner. The
+    // original graphical QA trace did not retain packet coordinates, so this is
+    // a deterministic regression for the verified 26.1.2 axis-order mismatch,
+    // not a claim that these exact coordinates were captured from that run.
+    // Vanilla resolves Y, then the larger horizontal Z axis, which clears the
+    // corner before X is applied.
+    let mut old = PlayerPose::new(0.7, 64.0, 0.94);
+    old.yaw = -36.0;
+    old.pitch = 4.0;
+    old.sprinting = true;
+    old.flags = MovePlayerFlags::new(true, false);
+    let mut destination = PlayerPose::new(0.96, 64.42, 0.58);
+    destination.yaw = -36.0;
+    destination.pitch = 4.0;
+    destination.sprinting = true;
+    destination.input.jump = true;
+    destination.flags = MovePlayerFlags::new(false, false);
+
+    assert!(!player_pose_collides_with_solid(Some(&state), old).await);
+    assert!(!player_pose_collides_with_solid(Some(&state), destination).await);
+    assert_eq!(
+        authority.validate_movement(
+            &HashSet::from([(0, 0)]),
+            old,
+            destination,
+            GameMode::Survival,
+            false,
+        ),
+        Ok(())
+    );
+}
+
+#[tokio::test]
 async fn authority_movement_does_not_turn_embedded_escape_into_collision_bypass() {
     let blocks = Arc::new(
         mc_world::BlockRegistry::from_report(&solaris_required_blocks_report())
@@ -413,6 +553,99 @@ async fn authority_movement_does_not_turn_embedded_escape_into_collision_bypass(
             PlayerMovementRejection::SweptCollision
         ))
     );
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn spectator_ingress_keeps_no_physics_collision_semantics() {
+    let blocks = Arc::new(
+        mc_world::BlockRegistry::from_report(&solaris_required_blocks_report())
+            .expect("embedded vanilla registry builds"),
+    );
+    let mut world = interaction_state_for_blocks(Arc::clone(&blocks));
+    world.block_facts = Arc::new(fluid_test_facts());
+    insert_fluid_test_chunk(&world).await;
+    let stone = blocks
+        .block(&Identifier::parse("minecraft:stone").unwrap())
+        .unwrap()
+        .default;
+    world
+        .world
+        .lock()
+        .await
+        .set_block_at(BlockPos { x: 1, y: 64, z: 0 }, stone)
+        .unwrap();
+
+    let registry = SessionRegistry::new();
+    let profile = crate::login::LoggedInProfile {
+        uuid: crate::login::offline_uuid("SpectatorCollisionAlice"),
+        name: "SpectatorCollisionAlice".to_owned(),
+    };
+    let old_pose = PlayerPose::new(0.5, 64.0, 0.5);
+    let (outbound_tx, _outbound_rx) = tokio::sync::mpsc::channel(8);
+    let (session_id, _) = registry.register(
+        &profile,
+        (0, 0),
+        2,
+        HashSet::from([(0, 0)]),
+        outbound_tx,
+        old_pose,
+    );
+    registry.mark_loaded(session_id, (0, 0));
+    let mut persisted = PlayerPersistedState::new_default(old_pose);
+    persisted.game_mode = GameMode::Spectator;
+    registry.register_player_persistence(session_id, Arc::new(Mutex::new(persisted)));
+
+    let (handle, mut owner) = simulation_channel_with_capacity(1);
+    owner.configure_player_movement_authority(
+        world.world_read.clone(),
+        Arc::clone(&blocks),
+        Arc::clone(&world.block_facts),
+    );
+    let simulation = handle.for_session(session_id);
+    let (mut writer, _reader) = tokio::io::duplex(4096);
+    let mut chunk_stream = None;
+    let mut zone_observer = None;
+    let mut survival = SurvivalState::FULL;
+    let mut xp = XpState::default();
+    let mut player_pose = old_pose;
+    let mut next_teleport_id = 0;
+    let mut pending_teleport = None;
+    let mut movement = Box::pin(handle_accepted_absolute_movement(
+        PlayerMovementIngressContext {
+            writer: &mut writer,
+            compression: Compression::Disabled,
+            interaction: Some(&mut world),
+            chunk_stream: &mut chunk_stream,
+            simulation: &simulation,
+            script_zone_observer: &mut zone_observer,
+            survival_state: &mut survival,
+            xp_state: &mut xp,
+            game_mode: GameMode::Spectator,
+            player_pose: &mut player_pose,
+            current_tick: 7,
+            next_teleport_id: &mut next_teleport_id,
+            pending_teleport: &mut pending_teleport,
+        },
+        AcceptedAbsoluteMovement {
+            x: 1.5,
+            y: 64.0,
+            z: 0.5,
+            yaw_pitch: None,
+            flags: MovePlayerFlags::new(false, false),
+        },
+    ));
+    std::future::poll_fn(|context| {
+        assert!(movement.as_mut().poll(context).is_pending());
+        Poll::Ready(())
+    })
+    .await;
+
+    assert_eq!(owner.process_tick(&registry, 1).processed, 1);
+    movement.await.expect("spectator movement commits");
+    assert_eq!(player_pose.x, 1.5);
+    assert_eq!(player_pose.y, 64.0);
+    assert_eq!(player_pose.z, 0.5);
+    assert!(pending_teleport.is_none());
 }
 
 #[tokio::test(flavor = "current_thread")]

@@ -99,47 +99,16 @@ async fn near_full_inventory_partially_picks_up_and_preserves_remainder_identity
             .await
             .expect("drop bounded dirt filler entity");
         let _ = wait_for_container_slot(&mut dropper, 0, 36, |stack| stack.is_empty()).await;
+        collect_full_item_drop_into_inventory(
+            &mut client,
+            item_entity_type,
+            dirt_id,
+            &mut target_inventory,
+            255,
+        )
+        .await;
     }
 
-    let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
-    loop {
-        let full_main = target_inventory[9..=35]
-            .iter()
-            .all(|stack| stack.item_id == dirt_id && stack.count == 64);
-        let full_other_hotbar = target_inventory[37..=44]
-            .iter()
-            .all(|stack| stack.item_id == dirt_id && stack.count == 64);
-        if full_main && full_other_hotbar {
-            break;
-        }
-        let frame = client
-            .read_frame_with_timeout(
-                deadline.saturating_duration_since(tokio::time::Instant::now()),
-            )
-            .await
-            .expect("bounded dirt filler pickup completion");
-        if handle_keepalive(&mut client, frame.id, &frame.body).await {
-            continue;
-        }
-        if frame.id == ClientboundContainerSetSlot::ID {
-            let mut body = frame.body;
-            let packet = ClientboundContainerSetSlot::decode(&mut body)
-                .expect("decode bounded dirt filler slot update");
-            if packet.container_id == 0
-                && let Ok(slot) = usize::try_from(packet.slot)
-                && let Some(target) = target_inventory.get_mut(slot)
-            {
-                *target = packet.item_stack;
-            }
-        } else if frame.id == ClientboundContainerSetContent::ID {
-            let mut body = frame.body;
-            let packet = ClientboundContainerSetContent::decode(&mut body)
-                .expect("decode bounded dirt filler content update");
-            if packet.container_id == 0 {
-                target_inventory = packet.items;
-            }
-        }
-    }
     assert_eq!(target_inventory[36].item_id, cobblestone_id);
     assert_eq!(target_inventory[36].count, 63);
     dropper
@@ -161,8 +130,10 @@ async fn near_full_inventory_partially_picks_up_and_preserves_remainder_identity
         })
         .await
         .expect("drop complete partial pickup fixture");
+    let _ = wait_for_container_slot(&mut dropper, 0, 36, |stack| stack.is_empty()).await;
 
     let mut item_entity_id = None;
+    let mut item_position = None;
     let mut saw_stack = false;
     let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
     while !saw_stack {
@@ -180,7 +151,46 @@ async fn near_full_inventory_partially_picks_up_and_preserves_remainder_identity
             let packet = AddEntity::decode(&mut body).expect("decode partial pickup AddEntity");
             if packet.entity_type_id == item_entity_type {
                 item_entity_id = Some(packet.entity_id);
+                item_position = Some((packet.x, packet.y, packet.z));
+                move_into_item_touch_box(&mut client, packet.x, packet.y, packet.z).await;
             }
+        } else if frame.id == MoveEntityPos::ID {
+            let mut body = frame.body;
+            let packet = MoveEntityPos::decode(&mut body).expect("decode partial pickup relative move");
+            if Some(packet.entity_id) == item_entity_id
+                && let Some((x, y, z)) = item_position.as_mut()
+            {
+                *x += f64::from(packet.delta_x) / 4096.0;
+                *y += f64::from(packet.delta_y) / 4096.0;
+                *z += f64::from(packet.delta_z) / 4096.0;
+                move_into_item_touch_box(&mut client, *x, *y, *z).await;
+            }
+        } else if frame.id == MoveEntityPosRot::ID {
+            let mut body = frame.body;
+            let packet =
+                MoveEntityPosRot::decode(&mut body).expect("decode partial pickup relative move+rot");
+            if Some(packet.entity_id) == item_entity_id
+                && let Some((x, y, z)) = item_position.as_mut()
+            {
+                *x += f64::from(packet.delta_x) / 4096.0;
+                *y += f64::from(packet.delta_y) / 4096.0;
+                *z += f64::from(packet.delta_z) / 4096.0;
+                move_into_item_touch_box(&mut client, *x, *y, *z).await;
+            }
+        } else if frame.id == EntityPositionSync::ID {
+            let mut body = frame.body;
+            let packet =
+                EntityPositionSync::decode(&mut body).expect("decode partial pickup position sync");
+            if Some(packet.entity_id) == item_entity_id {
+                let position = packet.values.position;
+                item_position = Some((position.x, position.y, position.z));
+                move_into_item_touch_box(&mut client, position.x, position.y, position.z).await;
+            }
+        } else if frame.id == SynchronizePlayerPosition::ID {
+            let mut body = frame.body;
+            let packet = SynchronizePlayerPosition::decode(&mut body)
+                .expect("decode unexpected partial pickup movement correction");
+            panic!("walking into partial pickup range was corrected: {packet:?}");
         } else if frame.id == ClientboundSetEntityData::ID {
             let mut body = frame.body;
             let packet = ClientboundSetEntityData::decode(&mut body)
@@ -215,7 +225,44 @@ async fn near_full_inventory_partially_picks_up_and_preserves_remainder_identity
         if handle_keepalive(&mut client, frame.id, &frame.body).await {
             continue;
         }
-        if frame.id == ClientboundSetTime::ID {
+        if frame.id == MoveEntityPos::ID {
+            let mut body = frame.body;
+            let packet = MoveEntityPos::decode(&mut body).expect("decode partial remainder move");
+            if packet.entity_id == item_entity_id
+                && let Some((x, y, z)) = item_position.as_mut()
+            {
+                *x += f64::from(packet.delta_x) / 4096.0;
+                *y += f64::from(packet.delta_y) / 4096.0;
+                *z += f64::from(packet.delta_z) / 4096.0;
+                move_into_item_touch_box(&mut client, *x, *y, *z).await;
+            }
+        } else if frame.id == MoveEntityPosRot::ID {
+            let mut body = frame.body;
+            let packet =
+                MoveEntityPosRot::decode(&mut body).expect("decode partial remainder move+rot");
+            if packet.entity_id == item_entity_id
+                && let Some((x, y, z)) = item_position.as_mut()
+            {
+                *x += f64::from(packet.delta_x) / 4096.0;
+                *y += f64::from(packet.delta_y) / 4096.0;
+                *z += f64::from(packet.delta_z) / 4096.0;
+                move_into_item_touch_box(&mut client, *x, *y, *z).await;
+            }
+        } else if frame.id == EntityPositionSync::ID {
+            let mut body = frame.body;
+            let packet =
+                EntityPositionSync::decode(&mut body).expect("decode partial remainder position sync");
+            if packet.entity_id == item_entity_id {
+                let position = packet.values.position;
+                item_position = Some((position.x, position.y, position.z));
+                move_into_item_touch_box(&mut client, position.x, position.y, position.z).await;
+            }
+        } else if frame.id == SynchronizePlayerPosition::ID {
+            let mut body = frame.body;
+            let packet = SynchronizePlayerPosition::decode(&mut body)
+                .expect("decode unexpected partial remainder movement correction");
+            panic!("walking after partial item was corrected: {packet:?}");
+        } else if frame.id == ClientboundSetTime::ID {
             let mut body = frame.body;
             let packet = ClientboundSetTime::decode(&mut body)
                 .expect("decode partial pickup tick fence");
@@ -270,4 +317,131 @@ async fn near_full_inventory_partially_picks_up_and_preserves_remainder_identity
         .expect("partial pickup server shutdown")
         .expect("partial pickup server join")
         .expect("partial pickup server serve");
+}
+
+fn inventory_item_count(items: &[ItemStack], item_id: u32) -> i32 {
+    items[9..=44]
+        .iter()
+        .filter(|stack| stack.item_id == item_id)
+        .map(|stack| stack.count)
+        .sum()
+}
+
+async fn collect_full_item_drop_into_inventory(
+    client: &mut Client,
+    item_entity_type: i32,
+    item_id: u32,
+    target_inventory: &mut Vec<ItemStack>,
+    expected_added: i32,
+) {
+    let before = inventory_item_count(target_inventory, item_id);
+    let expected_total = before + expected_added;
+    let mut item_entity_id = None;
+    let mut item_position = None;
+    let mut saw_matching_stack = false;
+    let mut saw_take_or_remove = false;
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
+    loop {
+        if saw_matching_stack
+            && saw_take_or_remove
+            && inventory_item_count(target_inventory, item_id) == expected_total
+        {
+            return;
+        }
+        let frame = client
+            .read_frame_with_timeout(
+                deadline.saturating_duration_since(tokio::time::Instant::now()),
+            )
+            .await
+            .expect("full filler item pickup completion");
+        if handle_keepalive(client, frame.id, &frame.body).await {
+            continue;
+        }
+        if frame.id == AddEntity::ID {
+            let mut body = frame.body;
+            let packet = AddEntity::decode(&mut body).expect("decode filler AddEntity");
+            if packet.entity_type_id == item_entity_type && item_entity_id.is_none() {
+                item_entity_id = Some(packet.entity_id);
+                item_position = Some((packet.x, packet.y, packet.z));
+                move_into_item_touch_box(client, packet.x, packet.y, packet.z).await;
+            }
+        } else if frame.id == MoveEntityPos::ID {
+            let mut body = frame.body;
+            let packet = MoveEntityPos::decode(&mut body).expect("decode filler relative move");
+            if Some(packet.entity_id) == item_entity_id
+                && let Some((x, y, z)) = item_position.as_mut()
+            {
+                *x += f64::from(packet.delta_x) / 4096.0;
+                *y += f64::from(packet.delta_y) / 4096.0;
+                *z += f64::from(packet.delta_z) / 4096.0;
+                move_into_item_touch_box(client, *x, *y, *z).await;
+            }
+        } else if frame.id == MoveEntityPosRot::ID {
+            let mut body = frame.body;
+            let packet = MoveEntityPosRot::decode(&mut body).expect("decode filler relative move+rot");
+            if Some(packet.entity_id) == item_entity_id
+                && let Some((x, y, z)) = item_position.as_mut()
+            {
+                *x += f64::from(packet.delta_x) / 4096.0;
+                *y += f64::from(packet.delta_y) / 4096.0;
+                *z += f64::from(packet.delta_z) / 4096.0;
+                move_into_item_touch_box(client, *x, *y, *z).await;
+            }
+        } else if frame.id == EntityPositionSync::ID {
+            let mut body = frame.body;
+            let packet = EntityPositionSync::decode(&mut body).expect("decode filler position sync");
+            if Some(packet.entity_id) == item_entity_id {
+                let position = packet.values.position;
+                item_position = Some((position.x, position.y, position.z));
+                move_into_item_touch_box(client, position.x, position.y, position.z).await;
+            }
+        } else if frame.id == ClientboundSetEntityData::ID {
+            let mut body = frame.body;
+            let packet = ClientboundSetEntityData::decode(&mut body)
+                .expect("decode filler item metadata");
+            if Some(packet.entity_id) == item_entity_id {
+                saw_matching_stack |= packet.values.iter().any(|value| {
+                    matches!(
+                        value,
+                        EntityDataValue::ItemStack { index, stack }
+                            if *index == ITEM_ENTITY_DATA_ITEM_INDEX
+                                && stack.item_id == item_id
+                                && stack.count == expected_added
+                    )
+                });
+            }
+        } else if frame.id == ClientboundContainerSetSlot::ID {
+            let mut body = frame.body;
+            let packet = ClientboundContainerSetSlot::decode(&mut body)
+                .expect("decode filler inventory slot");
+            if packet.container_id == 0
+                && let Ok(slot) = usize::try_from(packet.slot)
+                && let Some(target) = target_inventory.get_mut(slot)
+            {
+                *target = packet.item_stack;
+            }
+        } else if frame.id == ClientboundContainerSetContent::ID {
+            let mut body = frame.body;
+            let packet = ClientboundContainerSetContent::decode(&mut body)
+                .expect("decode filler inventory content");
+            if packet.container_id == 0 {
+                *target_inventory = packet.items;
+            }
+        } else if frame.id == ClientboundTakeItemEntity::ID {
+            let mut body = frame.body;
+            let packet = ClientboundTakeItemEntity::decode(&mut body)
+                .expect("decode filler TakeItem");
+            saw_take_or_remove |= Some(packet.item_entity_id) == item_entity_id;
+        } else if frame.id == RemoveEntities::ID {
+            let mut body = frame.body;
+            let packet = RemoveEntities::decode(&mut body).expect("decode filler removal");
+            saw_take_or_remove |= item_entity_id
+                .is_some_and(|entity_id| packet.entity_ids.contains(&entity_id));
+        } else if frame.id == SynchronizePlayerPosition::ID {
+            let mut body = frame.body;
+            let packet = SynchronizePlayerPosition::decode(&mut body)
+                .expect("decode unexpected filler movement correction");
+            panic!("walking into filler pickup range was corrected: {packet:?}");
+        }
+    }
 }

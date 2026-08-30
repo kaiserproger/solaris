@@ -231,7 +231,14 @@ impl BiomeRules {
         })
     }
 
-    pub(super) fn pick(&self, bucket: &[Identifier], x: i32, z: i32, salt: u64) -> Identifier {
+    pub(super) fn pick(
+        &self,
+        bucket: &[Identifier],
+        x: i32,
+        z: i32,
+        world_seed: i64,
+        salt: u64,
+    ) -> Identifier {
         if bucket.is_empty() {
             return self.default.clone();
         }
@@ -239,24 +246,25 @@ impl BiomeRules {
             return bucket[0].clone();
         }
 
+        let picker_seed = (world_seed as u64 ^ salt) as i64;
         let warp_x = fbm_2d(
             x as f64 / BIOME_PICK_WARP_SCALE,
             z as f64 / BIOME_PICK_WARP_SCALE,
-            (salt ^ 0x4257_4152_5058) as i64,
+            picker_seed ^ 0x4257_4152_5058,
             2,
             0.5,
         ) * BIOME_PICK_WARP_AMPLITUDE;
         let warp_z = fbm_2d(
             x as f64 / BIOME_PICK_WARP_SCALE,
             z as f64 / BIOME_PICK_WARP_SCALE,
-            (salt ^ 0x4257_4152_505A) as i64,
+            picker_seed ^ 0x4257_4152_505A,
             2,
             0.5,
         ) * BIOME_PICK_WARP_AMPLITUDE;
         let value = fbm_2d(
             (x as f64 + warp_x) / BIOME_PICK_NOISE_SCALE,
             (z as f64 + warp_z) / BIOME_PICK_NOISE_SCALE,
-            salt as i64,
+            picker_seed,
             3,
             0.55,
         );
@@ -264,14 +272,20 @@ impl BiomeRules {
         bucket[band].clone()
     }
 
-    pub(super) fn pick_region_band(&self, bucket: &[Identifier], x: i32, z: i32) -> Identifier {
+    pub(super) fn pick_region_band(
+        &self,
+        bucket: &[Identifier],
+        x: i32,
+        z: i32,
+        world_seed: i64,
+    ) -> Identifier {
         if bucket.is_empty() {
             return self.default.clone();
         }
         let value = fbm_2d(
             x as f64 / 180.0,
             z as f64 / 180.0,
-            0x4445_4550_4F43,
+            world_seed ^ 0x4445_4550_4F43,
             4,
             0.55,
         );

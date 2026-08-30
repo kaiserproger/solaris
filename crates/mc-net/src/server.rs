@@ -70,6 +70,10 @@ type PhysicsMaterialCache = HashMap<
 >;
 
 static PHYSICS_MATERIAL_CACHE: OnceLock<std::sync::Mutex<PhysicsMaterialCache>> = OnceLock::new();
+type CollisionDirectLookupCache = HashMap<usize, (std::sync::Weak<BlockRegistry>, bool)>;
+
+static COLLISION_DIRECT_LOOKUP_CACHE: OnceLock<std::sync::Mutex<CollisionDirectLookupCache>> =
+    OnceLock::new();
 const CONNECTION_DRAIN_TIMEOUT: Duration = Duration::from_secs(5);
 const MIN_CONNECTION_TASKS: usize = 32;
 const MAX_CONNECTION_TASKS: usize = 512;
@@ -1308,6 +1312,40 @@ impl OutboundPressureHandle {
     }
 }
 
+/// Read-only operator-facing session facts for the optional dashboard.
+#[derive(Clone)]
+pub struct OperatorFactsHandle {
+    sessions: Arc<play::SessionRegistry>,
+}
+
+impl OperatorFactsHandle {
+    /// Bounded point-in-time online player names and truncation flag.
+    #[must_use]
+    pub fn online_player_names(&self, limit: usize) -> (Vec<String>, bool) {
+        self.sessions.online_player_names(limit)
+    }
+
+    /// Server entity counts by tracked category.
+    #[must_use]
+    pub fn entity_category_counts(&self) -> std::collections::BTreeMap<String, u64> {
+        self.sessions.entity_category_counts()
+    }
+
+    /// Most recently completed save report, when one exists.
+    #[must_use]
+    pub fn last_save_report(&self) -> Option<crate::operator_metrics::RetainedSaveReport> {
+        self.sessions.retained_save_report()
+    }
+
+    /// Most recently surfaced cumulative natural-spawn report, when one exists.
+    #[must_use]
+    pub fn natural_spawn_report(
+        &self,
+    ) -> Option<crate::operator_metrics::RetainedNaturalSpawnReport> {
+        self.sessions.retained_natural_spawn_report()
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct SaveAllReport {
     pub players_saved: usize,
@@ -1517,6 +1555,12 @@ impl BoundServer {
         self.runtime_control.clone()
     }
 
+    #[must_use]
+    pub fn operator_facts_handle(&self) -> OperatorFactsHandle {
+        OperatorFactsHandle {
+            sessions: Arc::clone(&self.sessions),
+        }
+    }
     #[must_use]
     pub fn runtime_telemetry_handle(&self) -> RuntimeTelemetryHandle {
         RuntimeTelemetryHandle {
@@ -3061,6 +3105,8 @@ fn prepare_entity_physics_inputs(
     }
     let materials = cached_material_ids(config);
     let plans = entity_physics_sample_plans(queries);
+    #[cfg(feature = "load-bench")]
+    log_physics_sample_reuse(&plans);
     let chunk_positions = entity_physics_chunk_positions(&plans);
     let world_snapshot = world_read.snapshot_chunks(&chunk_positions);
     let chunks = chunk_positions
@@ -3071,8 +3117,70 @@ fn prepare_entity_physics_inputs(
         chunks,
         materials,
         blocks: Some(Arc::clone(&config.blocks)),
+        powder_snow_states: powder_snow_state_ids(&config.blocks),
+        collision_direct_lookup_compatible: cached_collision_direct_lookup_compatible(config),
     });
     entity_physics_inputs_from_snapshot(plans, snapshot)
+}
+
+#[cfg(feature = "load-bench")]
+fn log_physics_sample_reuse(plans: &[EntityPhysicsSamplePlan]) {
+    if plans.len() <= ENTITY_PHYSICS_INLINE_LIMIT {
+        return;
+    }
+    const WORDS_PER_COLUMN: usize = (MAX_Y - MIN_Y) as usize / 64;
+    const CHUNK_WORDS: usize = mc_world::SECTION_DIM * mc_world::SECTION_DIM * WORDS_PER_COLUMN;
+    let mut bound_cell_volume: u64 = 0;
+    let mut chunk_cells: HashMap<mc_world::ChunkPos, Box<[u64; CHUNK_WORDS]>> = HashMap::new();
+    for plan in plans {
+        let bounds = plan.bounds;
+        let min_y = bounds.min_y.max(MIN_Y);
+        let max_y = bounds.max_y.min(MAX_Y - 1);
+        if max_y < min_y {
+            continue;
+        }
+        bound_cell_volume = bound_cell_volume.saturating_add(
+            (i64::from(bounds.max_x) - i64::from(bounds.min_x) + 1)
+                .saturating_mul(i64::from(max_y) - i64::from(min_y) + 1)
+                .saturating_mul(i64::from(bounds.max_z) - i64::from(bounds.min_z) + 1)
+                .max(0) as u64,
+        );
+        let mut y_mask = [0u64; WORDS_PER_COLUMN];
+        for y in min_y..=max_y {
+            let bit = (y - MIN_Y) as usize;
+            y_mask[bit / 64] |= 1 << (bit % 64);
+        }
+        let section = mc_world::SECTION_DIM as i32;
+        for x in bounds.min_x..=bounds.max_x {
+            for z in bounds.min_z..=bounds.max_z {
+                let cpos = mc_world::ChunkPos {
+                    x: x.div_euclid(section),
+                    z: z.div_euclid(section),
+                };
+                let bits = chunk_cells
+                    .entry(cpos)
+                    .or_insert_with(|| Box::new([0; CHUNK_WORDS]));
+                let column = x.rem_euclid(section) as usize * mc_world::SECTION_DIM
+                    + z.rem_euclid(section) as usize;
+                let base = column * WORDS_PER_COLUMN;
+                for (word, mask) in y_mask.iter().enumerate() {
+                    bits[base + word] |= mask;
+                }
+            }
+        }
+    }
+    let unique_sample_cells = chunk_cells
+        .values()
+        .flat_map(|bits| bits.iter())
+        .map(|word| u64::from(word.count_ones()))
+        .sum::<u64>();
+    info!(
+        queries = plans.len(),
+        bound_cell_volume,
+        unique_sample_cells,
+        unique_chunks = chunk_cells.len(),
+        "PHYSICS_SAMPLE_REUSE"
+    );
 }
 
 struct CompletedScheduledBlockTicks {
@@ -3258,7 +3366,8 @@ async fn apply_entity_physics_job_result(
             "discarded stale entity physics results"
         );
     }
-    let landed_falling_blocks = sessions.landed_falling_blocks(&accepted_steps);
+    let landed_falling_blocks =
+        sessions.landed_falling_blocks(&completed.expected, &accepted_steps);
     if !landed_falling_blocks.is_empty() {
         simulation_owner
             .land_falling_blocks(config, sessions, world_read, &landed_falling_blocks)
@@ -3295,15 +3404,28 @@ async fn step_entity_physics_inputs(
         return inputs.into_iter().map(step_sampled_entity).collect();
     }
 
-    let workers = entity_physics_worker_count(&cpu_resources, inputs.len());
-    let batch_size = inputs.len().div_ceil(workers);
+    let input_count = inputs.len();
+    #[cfg(feature = "load-bench")]
+    let started = Instant::now();
+    #[cfg(feature = "load-bench")]
+    let kind_counts = entity_physics_kind_counts(&inputs);
+    let workers = entity_physics_worker_count(&cpu_resources, input_count);
+    let batch_size = input_count.div_ceil(workers);
     let mut batches = Vec::with_capacity(workers);
     let mut inputs = inputs.into_iter();
+    #[cfg(feature = "load-bench")]
+    let mut admission_wait_total_us: u64 = 0;
+    #[cfg(feature = "load-bench")]
+    let mut admission_wait_max_us: u64 = 0;
+    #[cfg(feature = "load-bench")]
+    let worker_us = std::sync::Arc::new(std::sync::Mutex::new(Vec::with_capacity(workers)));
     for _ in 0..workers {
         let batch = inputs.by_ref().take(batch_size).collect::<Vec<_>>();
         if batch.is_empty() {
             break;
         }
+        #[cfg(feature = "load-bench")]
+        let admission_started = Instant::now();
         let permit = match cpu_resources.acquire_cpu().await {
             Ok(permit) => permit,
             Err(error) => {
@@ -3311,12 +3433,27 @@ async fn step_entity_physics_inputs(
                 break;
             }
         };
+        #[cfg(feature = "load-bench")]
+        {
+            let waited_us = elapsed_us(admission_started);
+            admission_wait_total_us = admission_wait_total_us.saturating_add(waited_us);
+            admission_wait_max_us = admission_wait_max_us.max(waited_us);
+        }
+        #[cfg(feature = "load-bench")]
+        let worker_us = std::sync::Arc::clone(&worker_us);
         batches.push(tokio::task::spawn_blocking(move || {
             let _permit = permit;
-            batch
+            #[cfg(feature = "load-bench")]
+            let worker_started = Instant::now();
+            let steps = batch
                 .into_iter()
                 .map(step_sampled_entity)
-                .collect::<Vec<_>>()
+                .collect::<Vec<_>>();
+            #[cfg(feature = "load-bench")]
+            if let Ok(mut samples) = worker_us.lock() {
+                samples.push(elapsed_us(worker_started));
+            }
+            steps
         }));
     }
 
@@ -3328,6 +3465,18 @@ async fn step_entity_physics_inputs(
             Err(err) => warn!(error = %err, "entity physics worker failed"),
         }
     }
+
+    #[cfg(feature = "load-bench")]
+    log_entity_physics_batch_profile(
+        input_count,
+        workers,
+        batch_size,
+        elapsed_us(started),
+        admission_wait_total_us,
+        admission_wait_max_us,
+        &worker_us,
+        &kind_counts,
+    );
     steps
 }
 
@@ -3349,6 +3498,95 @@ fn entity_physics_worker_count(
         .max(1)
 }
 
+#[cfg(feature = "load-bench")]
+const ENTITY_PHYSICS_BATCH_KIND_BUCKETS: [&str; 7] = [
+    "living",
+    "aquatic",
+    "immobile",
+    "flight",
+    "falling_block",
+    "projectile",
+    "default",
+];
+
+#[cfg(feature = "load-bench")]
+fn entity_physics_kind_counts(inputs: &[EntityPhysicsInput]) -> [usize; 7] {
+    let mut counts = [0usize; 7];
+    for input in inputs {
+        let bucket = match input.query.kind {
+            play::EntityPhysicsKind::Living | play::EntityPhysicsKind::PowderSnowWalkableLiving => {
+                0
+            }
+            play::EntityPhysicsKind::AquaticLiving => 1,
+            play::EntityPhysicsKind::Immobile => 2,
+            play::EntityPhysicsKind::ExternalFlight => 3,
+            play::EntityPhysicsKind::FallingBlock => 4,
+            play::EntityPhysicsKind::ArrowProjectile { .. }
+            | play::EntityPhysicsKind::ShulkerBullet { .. }
+            | play::EntityPhysicsKind::HurtingProjectile { .. }
+            | play::EntityPhysicsKind::ThrowableProjectile { .. } => 5,
+            play::EntityPhysicsKind::Default => 6,
+        };
+        counts[bucket] += 1;
+    }
+    counts
+}
+
+/// Returns `(min_us, median_us, max_us)`; even sample counts use the lower
+/// median.
+#[cfg(feature = "load-bench")]
+fn entity_physics_batch_us_summary(samples_us: &[u64]) -> (u64, u64, u64) {
+    let mut sorted = samples_us.to_vec();
+    sorted.sort_unstable();
+    let min_us = sorted.first().copied().unwrap_or(0);
+    let max_us = sorted.last().copied().unwrap_or(0);
+    let median_us = sorted
+        .get(sorted.len().saturating_sub(1) / 2)
+        .copied()
+        .unwrap_or(0);
+    (min_us, median_us, max_us)
+}
+
+#[cfg(feature = "load-bench")]
+fn log_entity_physics_batch_profile(
+    input_count: usize,
+    workers: usize,
+    batch_size: usize,
+    total_us: u64,
+    admission_wait_total_us: u64,
+    admission_wait_max_us: u64,
+    worker_us: &std::sync::Mutex<Vec<u64>>,
+    kind_counts: &[usize; 7],
+) {
+    let samples_us = worker_us
+        .lock()
+        .map(|samples| samples.clone())
+        .unwrap_or_default();
+    let (min_us, median_us, max_us) = entity_physics_batch_us_summary(&samples_us);
+    let kinds = ENTITY_PHYSICS_BATCH_KIND_BUCKETS
+        .iter()
+        .zip(kind_counts.iter())
+        .filter(|&(_, &count)| count > 0)
+        .map(|(bucket, count)| format!("{bucket}={count}"))
+        .collect::<Vec<_>>()
+        .join(",");
+    eprintln!(
+        "PHYSICS_BATCH_PROFILE input_count={input_count} workers={workers} \
+         batch_size={batch_size} total_us={total_us} \
+         cpu_wait_total_us={admission_wait_total_us} cpu_wait_max_us={admission_wait_max_us} \
+         worker_us_min/median/max={min_us}/{median_us}/{max_us} kinds=[{kinds}]"
+    );
+}
+
+#[cfg(all(test, feature = "load-bench"))]
+#[test]
+fn entity_physics_batch_us_summary_is_min_lower_median_max() {
+    assert_eq!(entity_physics_batch_us_summary(&[]), (0, 0, 0));
+    assert_eq!(entity_physics_batch_us_summary(&[5]), (5, 5, 5));
+    assert_eq!(entity_physics_batch_us_summary(&[7, 3, 9]), (3, 7, 9));
+    assert_eq!(entity_physics_batch_us_summary(&[7, 3, 9, 5]), (3, 5, 9));
+}
+
 struct EntityPhysicsInput {
     query: play::EntityPhysicsQuery,
     snapshot: Arc<EntityPhysicsSnapshot>,
@@ -3364,6 +3602,14 @@ struct EntityPhysicsSnapshot {
     chunks: HashMap<mc_world::ChunkPos, Option<mc_world::ChunkSnapshot>>,
     materials: Arc<BlockMaterialIds>,
     blocks: Option<Arc<BlockRegistry>>,
+    /// Registry state ids of `minecraft:powder_snow`, precomputed once per
+    /// snapshot: the vanilla collision table records powder snow as empty,
+    /// so these states must always take the exact entity-dependent route.
+    powder_snow_states: Box<[u32]>,
+    /// Proven once per registry at snapshot construction: when true, every
+    /// state covered by the vanilla collision table resolves identically via
+    /// direct `get(state_id)` and via the fingerprinted `get_for_state` route.
+    collision_direct_lookup_compatible: bool,
 }
 
 struct SampledPhysicsWorld {
@@ -3700,15 +3946,39 @@ impl BlockSampler for SampledPhysicsWorld {
         let Some(state) = self.state_id_at(x, y, z) else {
             return;
         };
+        // Direct-lookup-compatible registries resolve the dominant vanilla
+        // cells in O(1): empty shapes emit nothing and full-cube shapes are
+        // exactly `BlockCollisionBox::FULL_BLOCK`, so the registry lookup,
+        // string compare, and table decode below only run for Complex and
+        // Missing states. Powder snow's vanilla shape is entity-dependent
+        // (recorded empty), so its precomputed state ids divert it to the
+        // exact entity-dependent route below.
+        if self.snapshot.collision_direct_lookup_compatible
+            && !self.snapshot.powder_snow_states.contains(&state)
+        {
+            match mc_data::collision_shapes::vanilla_collision_class(state) {
+                mc_data::collision_shapes::CollisionClass::Empty => return,
+                mc_data::collision_shapes::CollisionClass::FullCube => {
+                    emit(BlockCollisionBox::FULL_BLOCK);
+                    return;
+                }
+                mc_data::collision_shapes::CollisionClass::Complex
+                | mc_data::collision_shapes::CollisionClass::Missing => {}
+            }
+        }
         let exact_shape = self
             .snapshot
             .blocks
             .as_ref()
             .and_then(|blocks| blocks.by_id(mc_world::BlockStateId(state)))
             .and_then(|block| {
-                mc_data::collision_shapes::vanilla_collision_shapes()
-                    .get_for_state(state, &block.block.id, &block.properties)
-                    .map(|shape| (block.block.id.as_str(), shape))
+                let table = mc_data::collision_shapes::vanilla_collision_shapes();
+                let shape = if self.snapshot.collision_direct_lookup_compatible {
+                    table.get(state)
+                } else {
+                    table.get_for_state(state, &block.block.id, &block.properties)
+                };
+                shape.map(|shape| (block.block.id.as_str(), shape))
             });
         if let Some(("minecraft:powder_snow", _)) = exact_shape {
             if self.fall_distance > 2.5 {
@@ -3764,10 +4034,13 @@ fn sample_entity_physics_input(
 ) -> EntityPhysicsInput {
     let mut plans = entity_physics_sample_plans(&[query]);
     let chunks = entity_physics_chunk_snapshots(&plans, |cpos| storage.cached_chunk_snapshot(cpos));
+    let registry = storage.registry_arc();
     let snapshot = Arc::new(EntityPhysicsSnapshot {
         chunks,
         materials: Arc::new(materials.clone()),
-        blocks: Some(storage.registry_arc()),
+        powder_snow_states: powder_snow_state_ids(&registry),
+        collision_direct_lookup_compatible: collision_direct_lookup_compatible(&registry),
+        blocks: Some(registry),
     });
     entity_physics_inputs_from_snapshot(std::mem::take(&mut plans), snapshot)
         .pop()
@@ -4077,6 +4350,53 @@ fn cached_material_ids(config: &ServerConfig) -> Arc<BlockMaterialIds> {
         ),
     );
     materials
+}
+
+/// Whether every state covered by the vanilla collision table resolves to the
+/// same shape through the registry fingerprint route (`by_id` +
+/// `get_for_state`) as through the direct state-id route (`get`). Proven once
+/// per registry; the hot sampler path only reads the resulting bool.
+fn collision_direct_lookup_compatible(blocks: &BlockRegistry) -> bool {
+    let table = mc_data::collision_shapes::vanilla_collision_shapes();
+    (0..table.covered_state_count()).all(|state| {
+        let state = u32::try_from(state).expect("covered state id fits u32");
+        blocks
+            .by_id(mc_world::BlockStateId(state))
+            .is_some_and(|block| {
+                table.get_for_state(state, &block.block.id, &block.properties) == table.get(state)
+            })
+    })
+}
+
+/// Snapshot-local registry state ids of `minecraft:powder_snow`, computed
+/// once per snapshot so the hot sampler path never string-compares block
+/// names per sampled cell.
+fn powder_snow_state_ids(blocks: &BlockRegistry) -> Box<[u32]> {
+    let Some(block) =
+        blocks.block(&Identifier::parse("minecraft:powder_snow").expect("static identifier"))
+    else {
+        return Box::default();
+    };
+    block.states.iter().map(|state| state.0).collect()
+}
+
+fn cached_collision_direct_lookup_compatible(config: &ServerConfig) -> bool {
+    let key = Arc::as_ptr(&config.blocks) as usize;
+    let cache_lock =
+        COLLISION_DIRECT_LOOKUP_CACHE.get_or_init(|| std::sync::Mutex::new(HashMap::new()));
+    let mut cache =
+        crate::lock_policy::lock_benign_mutex(cache_lock, "server.collision_direct_lookup_cache");
+    if let Some((blocks, compatible)) = cache.get(&key)
+        && blocks
+            .upgrade()
+            .is_some_and(|blocks| Arc::ptr_eq(&blocks, &config.blocks))
+    {
+        return *compatible;
+    }
+
+    let compatible = collision_direct_lookup_compatible(&config.blocks);
+    cache.insert(key, (Arc::downgrade(&config.blocks), compatible));
+    compatible
 }
 
 fn material_ids(blocks: &BlockRegistry, facts: &BlockFactsTable) -> BlockMaterialIds {
@@ -4632,6 +4952,29 @@ async fn save_all_with_context_snapshot(
 }
 
 async fn save_all_with_context_snapshot_locked(
+    context: &'static str,
+    config: &ServerConfig,
+    sessions: &play::SessionRegistry,
+    snapshot: Option<play::SimulationSaveSnapshot>,
+    require_clean_dirty_flush: bool,
+    queued_us: u64,
+    total_started: Instant,
+) -> SaveAllReport {
+    let report = save_all_with_context_snapshot_locked_impl(
+        context,
+        config,
+        sessions,
+        snapshot,
+        require_clean_dirty_flush,
+        queued_us,
+        total_started,
+    )
+    .await;
+    sessions.retain_save_report(&report);
+    report
+}
+
+async fn save_all_with_context_snapshot_locked_impl(
     context: &'static str,
     config: &ServerConfig,
     sessions: &play::SessionRegistry,
@@ -5700,6 +6043,8 @@ mod tests {
             chunks: HashMap::new(),
             materials: Arc::new(BlockMaterialIds::new(0, None, None)),
             blocks: None,
+            powder_snow_states: Box::default(),
+            collision_direct_lookup_compatible: false,
         });
         let inputs = (0..198)
             .map(|id| EntityPhysicsInput {
@@ -5744,6 +6089,8 @@ mod tests {
                 chunks: HashMap::new(),
                 materials: Arc::new(BlockMaterialIds::new(0, None, None)),
                 blocks: None,
+                powder_snow_states: Box::default(),
+                collision_direct_lookup_compatible: false,
             }),
             complete_samples: false,
         }];
@@ -5768,6 +6115,8 @@ mod tests {
             chunks: HashMap::new(),
             materials: Arc::new(BlockMaterialIds::new(0, None, None)),
             blocks: None,
+            powder_snow_states: Box::default(),
+            collision_direct_lookup_compatible: false,
         });
         let inputs = (0..257)
             .map(|id| EntityPhysicsInput {
@@ -5821,6 +6170,8 @@ mod tests {
             chunks: HashMap::new(),
             materials: Arc::new(BlockMaterialIds::new(0, None, None)),
             blocks: None,
+            powder_snow_states: Box::default(),
+            collision_direct_lookup_compatible: false,
         });
         let queries = (0..257)
             .map(|id| play::EntityPhysicsQuery {
@@ -6042,6 +6393,8 @@ mod tests {
             chunks: HashMap::from([(chunk, captured.chunk(chunk))]),
             materials: Arc::new(BlockMaterialIds::new(0, None, None)),
             blocks: None,
+            powder_snow_states: Box::default(),
+            collision_direct_lookup_compatible: false,
         };
 
         assert!(entity_physics_snapshot_is_current(&world_read, &snapshot));
@@ -6343,6 +6696,8 @@ mod tests {
             chunks: HashMap::from([(chunk, captured.chunk(chunk))]),
             materials: Arc::new(BlockMaterialIds::new(0, None, None)),
             blocks: None,
+            powder_snow_states: Box::default(),
+            collision_direct_lookup_compatible: false,
         });
         let query = play::EntityPhysicsQuery {
             id: mc_entity::EntityId(73),
@@ -6833,6 +7188,8 @@ mod tests {
                 chunks: HashMap::new(),
                 materials: Arc::new(BlockMaterialIds::new(0, None, None)),
                 blocks: None,
+                powder_snow_states: Box::default(),
+                collision_direct_lookup_compatible: false,
             }),
             complete_samples: false,
         });
@@ -7145,10 +7502,13 @@ mod tests {
         let plans = entity_physics_sample_plans(&queries);
         let chunks =
             entity_physics_chunk_snapshots(&plans, |cpos| storage.cached_chunk_snapshot(cpos));
+        let registry = storage.registry_arc();
         let snapshot = Arc::new(EntityPhysicsSnapshot {
             chunks,
             materials: Arc::new(materials),
-            blocks: Some(storage.registry_arc()),
+            powder_snow_states: powder_snow_state_ids(&registry),
+            collision_direct_lookup_compatible: collision_direct_lookup_compatible(&registry),
+            blocks: Some(registry),
         });
         let inputs = entity_physics_inputs_from_snapshot(plans, snapshot);
 
@@ -7156,6 +7516,250 @@ mod tests {
         assert!(inputs.iter().all(|input| input.complete_samples));
         assert!(Arc::ptr_eq(&inputs[0].snapshot, &inputs[1].snapshot));
         assert_eq!(inputs[0].snapshot.chunks.len(), 1);
+    }
+
+    #[test]
+    fn vanilla_registry_collision_direct_lookup_matches_all_table_states() {
+        let registry =
+            BlockRegistry::from_report(&mc_data::blocks::solaris_required_blocks_report())
+                .expect("embedded vanilla report builds a registry");
+        let table = mc_data::collision_shapes::vanilla_collision_shapes();
+
+        for state in 0..table.covered_state_count() {
+            let state = u32::try_from(state).expect("covered state id fits u32");
+            let block = registry
+                .by_id(mc_world::BlockStateId(state))
+                .expect("vanilla registry covers every collision table state");
+            assert_eq!(
+                table.get_for_state(state, &block.block.id, &block.properties),
+                table.get(state),
+                "state {state} diverges between fingerprint and direct lookup"
+            );
+        }
+
+        assert!(collision_direct_lookup_compatible(&registry));
+    }
+
+    #[test]
+    fn synthetic_registry_keeps_fingerprint_collision_fallback() {
+        let empty = BlockRegistry::from_report(&[]).unwrap();
+        assert!(!collision_direct_lookup_compatible(&empty));
+
+        let reports = vec![report("solaris:test_block", &[], &[(0, true, &[])])];
+        let synthetic = BlockRegistry::from_report(&reports).unwrap();
+        assert!(!collision_direct_lookup_compatible(&synthetic));
+    }
+
+    fn collect_collision_boxes(
+        sampler: &SampledPhysicsWorld,
+        x: i32,
+        y: i32,
+        z: i32,
+    ) -> Vec<BlockCollisionBox> {
+        let mut boxes = Vec::new();
+        sampler.collision_boxes_at(x, y, z, &mut |collision_box| boxes.push(collision_box));
+        boxes
+    }
+
+    fn collision_route_samplers(
+        storage: &WorldStorage,
+        blocks: &Arc<BlockRegistry>,
+        materials: &BlockMaterialIds,
+        chunk_pos: mc_world::ChunkPos,
+    ) -> (SampledPhysicsWorld, SampledPhysicsWorld) {
+        let chunks = HashMap::from([(chunk_pos, storage.cached_chunk_snapshot(chunk_pos))]);
+        let make_sampler = |compatible: bool| {
+            SampledPhysicsWorld::without_entity_context(Arc::new(EntityPhysicsSnapshot {
+                chunks: chunks.clone(),
+                materials: Arc::new(materials.clone()),
+                blocks: Some(Arc::clone(blocks)),
+                powder_snow_states: powder_snow_state_ids(blocks),
+                collision_direct_lookup_compatible: compatible,
+            }))
+        };
+        (make_sampler(true), make_sampler(false))
+    }
+
+    #[test]
+    fn physics_collision_class_fast_path_matches_fingerprint_route() {
+        let reports = mc_data::blocks::solaris_required_blocks_report();
+        let air = state_id(&reports, "minecraft:air", &[]);
+        let stone = state_id(&reports, "minecraft:stone", &[]);
+        let slab = state_id(
+            &reports,
+            "minecraft:oak_slab",
+            &[("type", "bottom"), ("waterlogged", "false")],
+        );
+        let blocks = Arc::new(BlockRegistry::from_report(&reports).unwrap());
+        let facts = BlockFactsTable::from_blocks_report(&reports);
+        let materials = material_ids(&blocks, &facts);
+        let chunk_pos = mc_world::ChunkPos { x: 0, z: 0 };
+        let mut chunk = mc_world::Chunk::empty(
+            chunk_pos,
+            mc_world::BlockStateId(air),
+            Identifier::parse("minecraft:plains").unwrap(),
+        );
+        let covered = u32::try_from(
+            mc_data::collision_shapes::vanilla_collision_shapes().covered_state_count(),
+        )
+        .expect("covered state count fits u32");
+        for state in 0..covered {
+            let x = (state % 16) as u8;
+            let z = ((state / 16) % 16) as u8;
+            let y = 64 + i32::try_from(state / 256).expect("cell y fits i32");
+            let _ = chunk.set_block(x, y, z, mc_world::BlockStateId(state));
+        }
+        let _ = chunk.set_block(3, 64, 3, mc_world::BlockStateId(stone));
+        let _ = chunk.set_block(5, 64, 5, mc_world::BlockStateId(slab));
+        let mut storage = WorldStorage::in_memory(Arc::clone(&blocks));
+        storage.insert_generated_chunk(chunk_pos, chunk).unwrap();
+        let (fast, legacy) = collision_route_samplers(&storage, &blocks, &materials, chunk_pos);
+
+        assert_eq!(collect_collision_boxes(&fast, 1, 63, 1), Vec::new());
+        assert_eq!(collect_collision_boxes(&legacy, 1, 63, 1), Vec::new());
+        assert_eq!(
+            collect_collision_boxes(&fast, 3, 64, 3),
+            vec![BlockCollisionBox::FULL_BLOCK]
+        );
+        assert_eq!(
+            collect_collision_boxes(&legacy, 3, 64, 3),
+            vec![BlockCollisionBox::FULL_BLOCK]
+        );
+        let slab_boxes = collect_collision_boxes(&legacy, 5, 64, 5);
+        assert_eq!(slab_boxes.len(), 1);
+        assert_ne!(slab_boxes[0], BlockCollisionBox::FULL_BLOCK);
+        assert_eq!(collect_collision_boxes(&fast, 5, 64, 5), slab_boxes);
+
+        for state in 0..covered {
+            let x = i32::from((state % 16) as u8);
+            let z = i32::from(((state / 16) % 16) as u8);
+            let y = 64 + i32::try_from(state / 256).expect("cell y fits i32");
+            assert_eq!(
+                collect_collision_boxes(&fast, x, y, z),
+                collect_collision_boxes(&legacy, x, y, z),
+                "state {state} diverges between collision-class fast path and fingerprint route"
+            );
+        }
+    }
+
+    #[test]
+    fn physics_powder_snow_entity_contexts_match_between_collision_routes() {
+        let reports = mc_data::blocks::solaris_required_blocks_report();
+        let air = state_id(&reports, "minecraft:air", &[]);
+        let powder_snow = state_id(&reports, "minecraft:powder_snow", &[]);
+        let blocks = Arc::new(BlockRegistry::from_report(&reports).unwrap());
+        let facts = BlockFactsTable::from_blocks_report(&reports);
+        let materials = material_ids(&blocks, &facts);
+        let chunk_pos = mc_world::ChunkPos { x: 0, z: 0 };
+        let mut chunk = mc_world::Chunk::empty(
+            chunk_pos,
+            mc_world::BlockStateId(air),
+            Identifier::parse("minecraft:plains").unwrap(),
+        );
+        let _ = chunk.set_block(8, 64, 8, mc_world::BlockStateId(powder_snow));
+        let mut storage = WorldStorage::in_memory(Arc::clone(&blocks));
+        storage.insert_generated_chunk(chunk_pos, chunk).unwrap();
+        let chunks = HashMap::from([(chunk_pos, storage.cached_chunk_snapshot(chunk_pos))]);
+        let make_sampler = |compatible: bool,
+                            entity_bottom: f64,
+                            fall_distance: f64,
+                            powder_snow_collision: PowderSnowCollision| {
+            SampledPhysicsWorld {
+                snapshot: Arc::new(EntityPhysicsSnapshot {
+                    chunks: chunks.clone(),
+                    materials: Arc::new(materials.clone()),
+                    blocks: Some(Arc::clone(&blocks)),
+                    powder_snow_states: powder_snow_state_ids(&blocks),
+                    collision_direct_lookup_compatible: compatible,
+                }),
+                entity_bottom,
+                fall_distance,
+                powder_snow_collision,
+            }
+        };
+
+        let contexts = [
+            ("none-resting", 64.5, 0.0, PowderSnowCollision::None),
+            ("none-falling", 64.5, 3.0, PowderSnowCollision::None),
+            (
+                "falling-block",
+                64.5,
+                0.0,
+                PowderSnowCollision::FallingBlock,
+            ),
+            (
+                "walkable-on-crust",
+                65.5,
+                0.0,
+                PowderSnowCollision::WalkableMob,
+            ),
+            (
+                "walkable-sinking",
+                64.5,
+                0.0,
+                PowderSnowCollision::WalkableMob,
+            ),
+        ];
+        for (label, entity_bottom, fall_distance, powder_snow_collision) in contexts {
+            let fast = make_sampler(true, entity_bottom, fall_distance, powder_snow_collision);
+            let legacy = make_sampler(false, entity_bottom, fall_distance, powder_snow_collision);
+            assert_eq!(
+                collect_collision_boxes(&fast, 8, 64, 8),
+                collect_collision_boxes(&legacy, 8, 64, 8),
+                "powder snow context {label} diverges between routes"
+            );
+        }
+
+        let crust =
+            BlockCollisionBox::from_fixed_4096([0, 0, 0, 4096, (0.9_f32 * 4096.0) as i16, 4096])
+                .expect("powder snow crust box is valid");
+        assert_eq!(
+            collect_collision_boxes(
+                &make_sampler(true, 64.5, 3.0, PowderSnowCollision::None),
+                8,
+                64,
+                8
+            ),
+            vec![crust]
+        );
+        assert_eq!(
+            collect_collision_boxes(
+                &make_sampler(true, 64.5, 0.0, PowderSnowCollision::FallingBlock),
+                8,
+                64,
+                8
+            ),
+            vec![BlockCollisionBox::FULL_BLOCK]
+        );
+        assert_eq!(
+            collect_collision_boxes(
+                &make_sampler(true, 65.5, 0.0, PowderSnowCollision::WalkableMob),
+                8,
+                64,
+                8
+            ),
+            vec![BlockCollisionBox::FULL_BLOCK]
+        );
+        assert!(
+            collect_collision_boxes(
+                &make_sampler(true, 64.5, 0.0, PowderSnowCollision::None),
+                8,
+                64,
+                8
+            )
+            .is_empty(),
+            "ordinary entities sink: recorded powder snow shape stays empty"
+        );
+        assert!(
+            collect_collision_boxes(
+                &make_sampler(true, 64.5, 0.0, PowderSnowCollision::WalkableMob),
+                8,
+                64,
+                8
+            )
+            .is_empty(),
+            "tagged mobs inside powder snow keep sinking"
+        );
     }
 
     #[test]

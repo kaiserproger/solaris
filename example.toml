@@ -5,6 +5,8 @@ view_distance = 8
 simulation_distance = 8
 
 [network]
+# Listener IP and TCP port. Use 127.0.0.1 for same-machine testing; remote
+# clients connect to host:port. Public binds require online_mode = true.
 bind_address = "127.0.0.1"
 port = 25565
 
@@ -31,6 +33,19 @@ operators = []
 # operators_file = "ops.json"
 # allow_local_dev_operators = true only for throwaway loopback development.
 allow_local_dev_operators = false
+
+[dashboard]
+# Optional first-party read-only operator dashboard: uptime/version, players,
+# TPS/tick latency, memory, autoscale, chunk/entity/spawn counters, save state,
+# network pressure, plugin status, and recent warnings. It polls existing
+# telemetry and never touches the simulation hot path.
+# Disabled by default; binds loopback only. A non-loopback bind additionally
+# requires allow_remote = true and stays unauthenticated — prefer a trusted
+# reverse proxy for remote access.
+enabled = false
+bind_address = "127.0.0.1"
+port = 8080
+# allow_remote = false
 
 [plugins]
 # Optional external plugin root. Each child directory contains plugin.toml and
@@ -73,6 +88,16 @@ friendly_spawn_interval_ticks = 400
 # Natural hostile-mob attempts: 20 ticks = once per second. Set to 0 to
 # disable only hostile natural spawning.
 hostile_spawn_interval_ticks = 20
+# Population ceilings. Friendly covers land animals; aquatic and hostile are
+# counted independently. Eligibility checks still apply before these caps.
+friendly_spawn_cap = 32
+aquatic_spawn_cap = 20
+hostile_spawn_cap = 70
+# Chunks sampled per due attempt. Friendly sampling is intentionally broader
+# than hostile sampling so ordinary fauna fills in without multiplying the
+# once-per-second hostile workload.
+friendly_spawn_chunk_budget = 48
+hostile_spawn_chunk_budget = 4
 
 [chunk_pipeline]
 # Chunk stream policy. Worker capacity is derived automatically from the

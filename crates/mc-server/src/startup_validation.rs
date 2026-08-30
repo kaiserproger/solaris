@@ -205,6 +205,44 @@ pub(crate) fn validate_runtime_config(config: &ServerConfig) -> Result<()> {
             bail!("{field}={value} exceeds safe maximum {MAX_SIMULATION_INTERVAL_TICKS}");
         }
     }
+    for (field, value) in [
+        (
+            "simulation.friendly_spawn_cap",
+            config.simulation.friendly_spawn_cap,
+        ),
+        (
+            "simulation.aquatic_spawn_cap",
+            config.simulation.aquatic_spawn_cap,
+        ),
+        (
+            "simulation.hostile_spawn_cap",
+            config.simulation.hostile_spawn_cap,
+        ),
+    ] {
+        if value > mc_net::MAX_NATURAL_SPAWN_CAP {
+            bail!(
+                "{field}={value} exceeds safe maximum {}",
+                mc_net::MAX_NATURAL_SPAWN_CAP
+            );
+        }
+    }
+    for (field, value) in [
+        (
+            "simulation.friendly_spawn_chunk_budget",
+            config.simulation.friendly_spawn_chunk_budget,
+        ),
+        (
+            "simulation.hostile_spawn_chunk_budget",
+            config.simulation.hostile_spawn_chunk_budget,
+        ),
+    ] {
+        if !(1..=mc_net::MAX_NATURAL_SPAWN_CHUNK_BUDGET).contains(&value) {
+            bail!(
+                "{field}={value} must be between 1 and {}",
+                mc_net::MAX_NATURAL_SPAWN_CHUNK_BUDGET
+            );
+        }
+    }
     let player_burst = usize::try_from(config.server.max_players)
         .ok()
         .and_then(|players| players.checked_mul(OUTBOUND_COMMANDS_PER_PLAYER_BURST))

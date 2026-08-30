@@ -72,29 +72,41 @@ impl SessionRegistry {
         }
 
         let mut inner = self.lock_session_entities("tick villager population");
+        if inner.villager_entities.is_empty() {
+            return (0, Vec::new());
+        }
+        let active_villager_ids = inner
+            .villager_entities
+            .iter()
+            .copied()
+            .filter(|entity_id| active_ids.contains(entity_id))
+            .collect::<HashSet<_>>();
+        if active_villager_ids.is_empty() {
+            return (0, Vec::new());
+        }
         let mut dispatches = Vec::new();
         dispatches.extend(advance_active_villager_ages_locked(
             &mut inner,
-            &active_ids,
+            &active_villager_ids,
             elapsed_ticks,
         ));
-        cleanup_orphaned_active_courtships_locked(&mut inner, &active_ids);
+        cleanup_orphaned_active_courtships_locked(&mut inner, &active_villager_ids);
         dispatches.extend(pick_up_villager_food_locked(
             &mut inner,
-            &active_ids,
+            &active_villager_ids,
             current_tick,
             food_items,
         ));
         dispatches.extend(share_one_villager_food_stack_locked(
             &mut inner,
-            &active_ids,
+            &active_villager_ids,
             current_tick,
             food_items,
             item_type_id,
         ));
         dispatches.extend(start_one_villager_courtship_locked(
             &mut inner,
-            &active_ids,
+            &active_villager_ids,
             current_tick,
             food_items,
         ));

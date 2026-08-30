@@ -64,6 +64,10 @@ mod interaction_geometry_tests;
 #[cfg(feature = "load-bench")]
 mod load_bench;
 mod movement_publication;
+mod operator_facts;
+#[cfg(test)]
+#[path = "session/operator_facts_tests.rs"]
+mod operator_facts_tests;
 mod outbound;
 #[cfg(test)]
 mod outbound_backpressure_tests;
@@ -268,10 +272,10 @@ use visibility::{
     entity_event_dispatches_locked, entity_velocity_changed,
     initialize_entity_wire_state_from_snapshot_locked, initialize_entity_wire_state_locked,
     ordered_session_recipient, packed_rotation_changed, plan_entity_position_update,
-    publish_server_entity_snapshot_locked, refresh_entity_target_visibility_locked,
-    session_recipients, spawn_entity_visibility_from_snapshot_locked,
-    spawn_entity_visibility_locked, spawned_xp_observer_ids, visibility_dispatches,
-    visible_entity_observers_locked, visible_observers_locked,
+    publish_server_entity_snapshot_locked, session_recipients,
+    spawn_entity_visibility_from_snapshot_locked, spawn_entity_visibility_locked,
+    spawned_xp_observer_ids, visibility_dispatches, visible_entity_observers_locked,
+    visible_observers_locked,
 };
 
 pub(super) type SessionId = u64;
@@ -423,6 +427,12 @@ struct SessionRegistryInner {
     natural_aquatic_mobs: HashSet<EntityId>,
     natural_mob_no_action_since_tick: HashMap<EntityId, u64>,
     sheep_entities: HashSet<EntityId>,
+    villager_entities: HashSet<EntityId>,
+    iron_golem_entities: HashSet<EntityId>,
+    ender_dragon_entities: HashSet<EntityId>,
+    area_effect_cloud_entities: HashSet<EntityId>,
+    evoker_fang_entities: HashSet<EntityId>,
+    evoker_fang_count: Arc<AtomicUsize>,
     published_entity_snapshots: HashMap<EntityId, ServerEntitySnapshot>,
     entity_type_aabbs: HashMap<i32, mc_physics::Aabb>,
     simulation_inputs: Arc<SimulationInputPublication>,
@@ -549,6 +559,7 @@ pub(crate) struct SessionRegistry {
     movement_recipients: arc_swap::ArcSwap<MovementRecipientIndex>,
     active_simulation_entities: arc_swap::ArcSwap<HashSet<EntityId>>,
     active_hostile_entities: arc_swap::ArcSwap<HashSet<EntityId>>,
+    evoker_fang_count: Arc<AtomicUsize>,
     entity_update_budget_per_lane: AtomicUsize,
     entity_update_budget_total: AtomicUsize,
     entity_update_selected: AtomicUsize,
@@ -597,6 +608,8 @@ pub(crate) struct SessionRegistry {
     player_save_requested: tokio::sync::Notify,
     prepared_change_generation: AtomicU64,
     prepared_changed: tokio::sync::Notify,
+    last_save_report: Mutex<Option<crate::operator_metrics::RetainedSaveReport>>,
+    natural_spawn_report: Mutex<Option<crate::operator_metrics::RetainedNaturalSpawnReport>>,
     #[cfg(test)]
     entity_owner_reconfiguration_calls: AtomicU64,
     #[cfg(test)]
@@ -685,6 +698,8 @@ pub(crate) struct SessionRegistry {
     hostile_attack_candidates: AtomicU64,
     #[cfg(test)]
     hostile_entity_scan_visits: AtomicU64,
+    #[cfg(feature = "load-bench")]
+    hostile_attack_phase_metrics: hostile_authority::HostileAttackPhaseMetrics,
 }
 
 #[cfg(test)]
@@ -890,17 +905,20 @@ impl SessionRegistry {
         let (active_session_sender, _) = tokio::sync::watch::channel(0);
         let pressure_observation = Arc::new(SessionPressureObservation::default());
         let simulation_inputs = Arc::new(SimulationInputPublication::default());
+        let evoker_fang_count = Arc::new(AtomicUsize::new(0));
         let entities =
             SessionEntityOwners::try_new(Arc::clone(&pressure_observation), lane_count, journal)?;
         Ok(Self {
             inner: Mutex::new(SessionRegistryInner {
                 simulation_inputs: Arc::clone(&simulation_inputs),
+                evoker_fang_count: Arc::clone(&evoker_fang_count),
                 ..SessionRegistryInner::default()
             }),
             simulation_inputs,
             movement_recipients: arc_swap::ArcSwap::from_pointee(MovementRecipientIndex::new()),
             active_simulation_entities: arc_swap::ArcSwap::from_pointee(HashSet::new()),
             active_hostile_entities: arc_swap::ArcSwap::from_pointee(HashSet::new()),
+            evoker_fang_count,
             entity_update_budget_per_lane: AtomicUsize::new(0),
             entity_update_budget_total: AtomicUsize::new(0),
             entity_update_selected: AtomicUsize::new(0),
@@ -955,6 +973,8 @@ impl SessionRegistry {
             player_save_requested: tokio::sync::Notify::new(),
             prepared_change_generation: AtomicU64::new(0),
             prepared_changed: tokio::sync::Notify::new(),
+            last_save_report: Mutex::new(None),
+            natural_spawn_report: Mutex::new(None),
             #[cfg(test)]
             entity_owner_reconfiguration_calls: AtomicU64::new(0),
             #[cfg(test)]
@@ -1043,6 +1063,8 @@ impl SessionRegistry {
             hostile_attack_candidates: AtomicU64::new(0),
             #[cfg(test)]
             hostile_entity_scan_visits: AtomicU64::new(0),
+            #[cfg(feature = "load-bench")]
+            hostile_attack_phase_metrics: hostile_authority::HostileAttackPhaseMetrics::default(),
         })
     }
 
@@ -1387,6 +1409,7 @@ impl SessionRegistry {
     ) {
         let entities = entities.into_iter().collect::<HashSet<_>>();
         self.refresh_breeding_tick_entities_for_test(entities.iter().copied());
+        self.refresh_special_entity_indexes_for_test(entities.iter().copied());
         self.publish_active_entity_selection(
             self.live_session_generation.load(Ordering::Acquire),
             entities,
@@ -1405,6 +1428,40 @@ impl SessionRegistry {
                 entity_id,
                 owner.snapshot(entity_id).and_then(|entity| entity.animal),
             );
+        }
+    }
+
+    #[cfg(test)]
+    fn refresh_special_entity_indexes_for_test(
+        &self,
+        entities: impl IntoIterator<Item = EntityId>,
+    ) {
+        let ids = entities.into_iter().collect::<HashSet<_>>();
+        let owner = self.lock_entities("publish test special entity indexes");
+        let snapshots = ids
+            .iter()
+            .filter_map(|entity_id| owner.snapshot(*entity_id))
+            .map(|snapshot| (snapshot.id, snapshot.type_name.clone()))
+            .collect::<Vec<_>>();
+        drop(owner);
+        let mut inner = self.lock_inner("publish test special entity indexes");
+        for (entity_id, type_name) in snapshots {
+            if type_name == "minecraft:villager" {
+                inner.villager_entities.insert(entity_id);
+            }
+            if type_name == "minecraft:iron_golem" {
+                inner.iron_golem_entities.insert(entity_id);
+            }
+            if type_name == "minecraft:ender_dragon" {
+                inner.ender_dragon_entities.insert(entity_id);
+            }
+            if type_name == "minecraft:area_effect_cloud" {
+                inner.area_effect_cloud_entities.insert(entity_id);
+            }
+            if type_name == "minecraft:evoker_fangs" && inner.evoker_fang_entities.insert(entity_id)
+            {
+                inner.evoker_fang_count.fetch_add(1, Ordering::Release);
+            }
         }
     }
 

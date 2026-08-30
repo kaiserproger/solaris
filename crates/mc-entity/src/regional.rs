@@ -1148,6 +1148,39 @@ fn cached_mutation_expected_snapshots<'a>(
     }
 }
 
+fn kinematics_direct_mutations(
+    states: &[(EntitySnapshot, EntityKinematics)],
+) -> Result<Vec<(EntitySnapshot, RegionOwnerMutation)>, RegionOwnerLaneError> {
+    if states.len() == 1 {
+        let (expected, state) = &states[0];
+        return Ok(vec![(
+            expected.clone(),
+            RegionOwnerMutation::SetKinematicsIfCurrent {
+                expected: Box::new(expected.clone()),
+                state: *state,
+            },
+        )]);
+    }
+    let mut states_by_region =
+        BTreeMap::<RegionKey, (Vec<EntitySnapshot>, Vec<EntityKinematics>)>::new();
+    for (expected, state) in states {
+        let source = RegionKey::from_position(expected.position)
+            .ok_or(RegionOwnerLaneError::InvalidMutation)?;
+        let (expected_batch, state_batch) = states_by_region.entry(source).or_default();
+        expected_batch.push(expected.clone());
+        state_batch.push(*state);
+    }
+    Ok(states_by_region
+        .into_values()
+        .map(|(expected, states)| {
+            (
+                expected[0].clone(),
+                RegionOwnerMutation::SetKinematicsBatchIfCurrent { expected, states },
+            )
+        })
+        .collect())
+}
+
 impl DirectSelectedReadPermit {
     fn try_acquire(active: Arc<AtomicUsize>) -> Option<Self> {
         active
@@ -1190,6 +1223,34 @@ pub struct VersionedEntitySnapshots {
     authority: RegionalAuthorityId,
     fence: RegionalVersionFence,
     snapshots: Vec<EntitySnapshot>,
+}
+
+#[derive(Debug, Clone)]
+/// Opaque one-use post-goal batch consumed only by the following physics apply.
+pub struct VersionedEntityKinematics {
+    authority: RegionalAuthorityId,
+    fence: RegionalVersionFence,
+    expected: Vec<CompactEntityKinematicsFence>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+/// Compact internal identity and motion fence; fields intentionally stay opaque.
+pub struct CompactEntityKinematicsFence {
+    id: EntityId,
+    uuid: Uuid,
+    lifecycle: crate::EntityLifecycle,
+    expected: EntityKinematics,
+    pickup_claimed: bool,
+    vehicle_attached: bool,
+}
+
+impl CompactEntityKinematicsFence {
+    fn eligible(self) -> bool {
+        self.lifecycle == crate::EntityLifecycle::Alive
+            && !self.pickup_claimed
+            && !self.vehicle_attached
+            && self.id == self.expected.id
+    }
 }
 
 impl VersionedEntitySnapshots {
@@ -1268,8 +1329,14 @@ pub enum RegionalOwnerRuntimeShutdownError {
     Owner(RegionalOwnerShutdownError),
 }
 
-type GoalApplyKinematicsResult =
-    Result<Option<(GoalTickStats, Vec<EntityKinematics>)>, RegionOwnerLaneError>;
+type GoalApplyKinematicsResult = Result<
+    Option<(
+        GoalTickStats,
+        Vec<EntityKinematics>,
+        Option<VersionedEntityKinematics>,
+    )>,
+    RegionOwnerLaneError,
+>;
 
 enum RegionalOwnerCommand {
     Snapshot {
@@ -1432,6 +1499,11 @@ enum RegionalOwnerCommand {
         defer_journal: bool,
         reply: std::sync::mpsc::Sender<Result<Vec<EntityKinematics>, RegionOwnerLaneError>>,
     },
+    ApplyKinematicsIfVersioned {
+        expected: VersionedEntityKinematics,
+        states: Vec<EntityKinematics>,
+        reply: std::sync::mpsc::Sender<Result<Option<Vec<EntityKinematics>>, RegionOwnerLaneError>>,
+    },
     DamageIfCurrent {
         expected: Box<EntitySnapshot>,
         request: EntityDamageRequest,
@@ -1533,6 +1605,11 @@ impl RegionalOwnerCommand {
             Self::SetVelocities { velocities, .. } => Some(RegionalOwnerLaneScope::Entities(
                 velocities.iter().map(|(entity, _)| *entity).collect(),
             )),
+            Self::ApplyKinematicsIfVersioned { expected, .. } => {
+                Some(RegionalOwnerLaneScope::Entities(
+                    expected.expected.iter().map(|entry| entry.id).collect(),
+                ))
+            }
             Self::PrepareGoalTick { .. } => Some(RegionalOwnerLaneScope::TopologyOnly),
             Self::ApplyPreparedGoalTick { resolved, .. } => {
                 Some(goal_apply_lane_scope(resolved, std::iter::empty()))
@@ -1570,6 +1647,7 @@ impl RegionalOwnerCommand {
                 | Self::SetPosition { .. }
                 | Self::SetVelocities { .. }
                 | Self::ApplyKinematicsIfCurrent { .. }
+                | Self::ApplyKinematicsIfVersioned { .. }
                 | Self::DamageIfCurrent { .. }
                 | Self::ApplyEffectIfCurrent { .. }
                 | Self::Damage { .. }
@@ -1815,6 +1893,42 @@ impl RegionalOwnerHandle {
             fence: selected.fence,
             snapshots: selected.snapshots,
         })
+    }
+
+    /// Cheaply reports whether `selected`'s captured version fence is still
+    /// current for this owner: authority must match, every fenced lease must
+    /// still route to its captured lane, and every fenced lane's current
+    /// state version must equal the captured one. Never fetches or clones
+    /// entity snapshots.
+    pub fn versioned_snapshots_are_current(
+        &self,
+        selected: &VersionedEntitySnapshots,
+    ) -> Result<bool, RegionOwnerLaneError> {
+        self.ensure_operational()?;
+        if selected.authority != self.authority {
+            return Err(RegionOwnerLaneError::StaleLease);
+        }
+        let routes =
+            read_benign_rwlock(&self.selected_read_routes, "regional.selected_read_routes");
+        let mut owners = BTreeMap::<usize, RegionalOwnerLaneReader>::new();
+        for (entity, lease) in &selected.fence.leases {
+            let Some(route) = routes.get(entity) else {
+                return Ok(false);
+            };
+            if route.lease != *lease {
+                return Ok(false);
+            }
+            owners.insert(lease.lane, route.owner.clone());
+        }
+        if owners.len() != selected.fence.lane_versions.len() {
+            return Ok(false);
+        }
+        drop(routes);
+        Ok(selected.fence.lane_versions.iter().all(|(lane, version)| {
+            owners
+                .get(lane)
+                .is_some_and(|owner| owner.state_version() == *version)
+        }))
     }
 
     fn read_cached_selected_entities(
@@ -2676,6 +2790,12 @@ impl RegionalOwnerHandle {
         let mut mutation_leases = Vec::with_capacity(expected_mutations.len());
         let mut selected_lane = None;
         for (fallback, mutation) in &expected_mutations {
+            if matches!(
+                mutation,
+                RegionOwnerMutation::SetKinematicsBatchIfVersion { .. }
+            ) {
+                return None;
+            }
             let expected = cached_mutation_expected_snapshots(fallback, mutation);
             if expected.first() != Some(fallback) {
                 return Some(Err(RegionOwnerLaneError::InvalidMutation));
@@ -2818,6 +2938,415 @@ impl RegionalOwnerHandle {
         })())
     }
 
+    fn rollback_multi_lane_commits(
+        &self,
+        committed_lanes: &[(RegionalOwnerLaneReader, RegionPhase)],
+    ) -> Result<(), RegionOwnerLaneError> {
+        let mut rollback_failed = false;
+        for (owner, phase) in committed_lanes {
+            rollback_failed |= owner.rollback_committed(*phase).is_err();
+        }
+        if rollback_failed {
+            self.commit_state.mark_outcome_unknown();
+            Err(RegionOwnerLaneError::OutcomeUnknown)
+        } else {
+            Ok(())
+        }
+    }
+
+    /// Two-phase commit of cached standalone owner-lane mutations across
+    /// multiple lanes. Lane admissions are acquired in ascending lane order
+    /// and held across prepare, validate, and finalize. Every lane prepares
+    /// first; only after every lane prepared and validated its post state do
+    /// the phases finalize. Normal stale or failed preparation rolls every
+    /// prepared phase back before admissions release. A rollback or finalize
+    /// failure makes the transaction outcome indeterminate and fail-stops the
+    /// owner runtime instead of permitting fallback or retry. Deferred-journal:
+    /// no decision journal write is recorded. Returns `None` when cached routes
+    /// no longer match, so the caller can fall back to the serial path.
+    fn try_commit_multi_lane_cached_standalone_snapshot_mutations_deferred_journal(
+        &self,
+        lane_mutations: Vec<(usize, Vec<(EntitySnapshot, RegionOwnerMutation)>)>,
+        max_workers: usize,
+    ) -> Option<Result<VersionedEntitySnapshots, RegionOwnerLaneError>> {
+        struct LaneResolution {
+            owner: RegionalOwnerLaneReader,
+            entities: Vec<EntityId>,
+            expected_mutations: Vec<(EntitySnapshot, RegionOwnerMutation)>,
+            mutation_leases: Vec<RegionLease>,
+        }
+        struct LaneCommit {
+            owner: RegionalOwnerLaneReader,
+            phase: RegionPhase,
+            batch: RegionOwnerBatch,
+            requested: Vec<(RegionLease, EntityId)>,
+            expected_post: BTreeMap<EntityId, (RegionLease, Uuid)>,
+        }
+        enum LanePrepareOutcome {
+            Prepared(RegionalOwnerLaneReader, RegionPhase),
+            Rejected(RegionOwnerLaneError),
+            Indeterminate(RegionalOwnerLaneReader, RegionPhase),
+        }
+        let _mutation_gate =
+            read_authoritative_rwlock(&self.mutation_gate, "regional.mutation_gate");
+        let cached =
+            read_benign_rwlock(&self.selected_read_routes, "regional.selected_read_routes");
+        let mut routes = BTreeMap::<EntityId, CachedEntityReadRoute>::new();
+        let mut lanes = Vec::<LaneResolution>::with_capacity(lane_mutations.len());
+        for (_, expected_mutations) in lane_mutations {
+            let mut mutation_leases = Vec::with_capacity(expected_mutations.len());
+            let mut entities = Vec::with_capacity(expected_mutations.len());
+            let mut lane = None;
+            let mut lane_owner = None;
+            for (fallback, mutation) in &expected_mutations {
+                if matches!(
+                    mutation,
+                    RegionOwnerMutation::SetKinematicsBatchIfVersion { .. }
+                ) {
+                    return None;
+                }
+                let expected = cached_mutation_expected_snapshots(fallback, mutation);
+                if expected.first() != Some(fallback) {
+                    return Some(Err(RegionOwnerLaneError::InvalidMutation));
+                }
+                let mut mutation_lease = None;
+                for snapshot in expected {
+                    let Some(key) = RegionKey::from_position(snapshot.position) else {
+                        return Some(Err(RegionOwnerLaneError::InvalidMutation));
+                    };
+                    let route = cached.get(&snapshot.id)?;
+                    if route.lease.key != key
+                        || route.uuid != snapshot.uuid
+                        || !route.standalone
+                        || lane.is_some_and(|group_lane| group_lane != route.lease.lane)
+                    {
+                        return None;
+                    }
+                    if mutation_lease.is_some_and(|lease| lease != route.lease) {
+                        return Some(Err(RegionOwnerLaneError::InvalidMutation));
+                    }
+                    if routes.insert(snapshot.id, route.clone()).is_some() {
+                        return Some(Err(RegionOwnerLaneError::InvalidMutation));
+                    }
+                    lane = Some(route.lease.lane);
+                    mutation_lease = Some(route.lease);
+                    entities.push(snapshot.id);
+                    lane_owner.get_or_insert_with(|| route.owner.clone());
+                }
+                let Some(mutation_lease) = mutation_lease else {
+                    return Some(Err(RegionOwnerLaneError::InvalidMutation));
+                };
+                mutation_leases.push(mutation_lease);
+            }
+            let Some(owner) = lane_owner else {
+                return Some(Err(RegionOwnerLaneError::InvalidMutation));
+            };
+            lanes.push(LaneResolution {
+                owner,
+                entities,
+                expected_mutations,
+                mutation_leases,
+            });
+        }
+        drop(cached);
+
+        // Lane admissions are acquired in ascending lane order and held
+        // across prepare, validate, and finalize so no other direct mutation
+        // interleaves on any lane of this batch.
+        let _lane_admissions = lanes
+            .iter()
+            .map(|lane| {
+                #[cfg(test)]
+                self.notify_direct_mutation_admission_probe(&lane.owner);
+                lock_authoritative_mutex(lane.owner.admission(), "regional.owner_lane_admission")
+            })
+            .collect::<Vec<_>>();
+
+        let mut commits = Vec::<LaneCommit>::with_capacity(lanes.len());
+        for lane in &lanes {
+            let (first_sequence, sequence) = match self
+                .commit_state
+                .reserve_sequences(lane.expected_mutations.len())
+            {
+                Ok(reserved) => reserved,
+                Err(error) => return Some(Err(error)),
+            };
+            let phase = match self.commit_state.reserve_phase() {
+                Ok(phase) => phase,
+                Err(error) => return Some(Err(error)),
+            };
+            let expected_post = lane
+                .entities
+                .iter()
+                .map(|entity| {
+                    let route = &routes[entity];
+                    (*entity, (route.lease, route.uuid))
+                })
+                .collect::<BTreeMap<_, _>>();
+            let requested = expected_post
+                .iter()
+                .map(|(&entity, &(lease, _))| (lease, entity))
+                .collect::<Vec<_>>();
+            let batch = RegionOwnerBatch {
+                phase,
+                sequence_watermark: sequence,
+                mutations: lane
+                    .expected_mutations
+                    .iter()
+                    .zip(&lane.mutation_leases)
+                    .enumerate()
+                    .map(|(offset, ((_, mutation), lease))| SequencedRegionMutation {
+                        sequence: first_sequence + offset as u64 + 1,
+                        lease: *lease,
+                        mutation: mutation.clone(),
+                    })
+                    .collect(),
+            };
+            commits.push(LaneCommit {
+                owner: lane.owner.clone(),
+                phase,
+                batch,
+                requested,
+                expected_post,
+            });
+        }
+
+        let mut committed_lanes =
+            Vec::<(RegionalOwnerLaneReader, RegionPhase)>::with_capacity(commits.len());
+        let mut prepare_lanes = Vec::with_capacity(commits.len());
+        let mut validate_lanes = Vec::with_capacity(commits.len());
+        for commit in commits {
+            committed_lanes.push((commit.owner.clone(), commit.phase));
+            prepare_lanes.push((commit.owner.clone(), commit.batch, commit.phase));
+            validate_lanes.push((
+                commit.owner,
+                commit.phase,
+                commit.requested,
+                commit.expected_post,
+            ));
+        }
+
+        // Phase 1: prepare every lane. Nothing is finalized yet, so any
+        // stale, failed, or errored lane rolls the whole batch back to its
+        // pre-call state.
+        let prepare_outcomes = self.run_deferred_lane_wave(
+            prepare_lanes,
+            max_workers,
+            |_handle, (owner, batch, phase)| match owner.prepare_and_commit(batch) {
+                Ok(committed) => match committed.recv() {
+                    Ok(Ok(completion)) if completion.phase == phase => {
+                        LanePrepareOutcome::Prepared(owner, phase)
+                    }
+                    Ok(Ok(_)) | Err(_) => LanePrepareOutcome::Indeterminate(owner, phase),
+                    Ok(Err(error)) => LanePrepareOutcome::Rejected(error),
+                },
+                Err(error) => LanePrepareOutcome::Rejected(error),
+            },
+        );
+        let mut prepared_lanes = Vec::with_capacity(committed_lanes.len());
+        let mut hard_error = None;
+        let mut stale_expected = false;
+        let mut wave_outcome_unknown = false;
+        for chunk in prepare_outcomes {
+            match chunk {
+                Ok(results) => {
+                    for result in results {
+                        match result {
+                            LanePrepareOutcome::Prepared(owner, phase) => {
+                                prepared_lanes.push((owner, phase));
+                            }
+                            LanePrepareOutcome::Rejected(RegionOwnerLaneError::InvalidMutation) => {
+                                stale_expected = true
+                            }
+                            LanePrepareOutcome::Rejected(error) => {
+                                hard_error.get_or_insert(error);
+                            }
+                            LanePrepareOutcome::Indeterminate(owner, phase) => {
+                                prepared_lanes.push((owner, phase));
+                                wave_outcome_unknown = true;
+                            }
+                        }
+                    }
+                }
+                Err(_) => wave_outcome_unknown = true,
+            }
+        }
+        if stale_expected || hard_error.is_some() || wave_outcome_unknown {
+            if let Err(error) = self.rollback_multi_lane_commits(&prepared_lanes) {
+                return Some(Err(error));
+            }
+            if wave_outcome_unknown {
+                self.commit_state.mark_outcome_unknown();
+                return Some(Err(RegionOwnerLaneError::OutcomeUnknown));
+            }
+            return Some(match hard_error {
+                Some(error) => Err(error),
+                None => Ok(VersionedEntitySnapshots {
+                    authority: self.authority,
+                    fence: RegionalVersionFence {
+                        leases: BTreeMap::new(),
+                        lane_versions: BTreeMap::new(),
+                    },
+                    snapshots: Vec::new(),
+                }),
+            });
+        }
+
+        // Phase 2: validate every lane's post state while nothing is
+        // finalized, so a mismatch still rolls the whole batch back.
+        let validate_outcomes = self.run_deferred_lane_wave(
+            validate_lanes,
+            max_workers,
+            |handle, (owner, _, requested, expected_post)| {
+                let post_state = owner.request_existing_snapshots_for_ids(requested);
+                match post_state {
+                    Ok(snapshots) => match snapshots.recv() {
+                        Ok(Ok(upserts))
+                            if upserts.len() == expected_post.len()
+                                && upserts.iter().all(|snapshot| {
+                                    expected_post
+                                        .get(&snapshot.id)
+                                        .is_some_and(|(lease, uuid)| {
+                                            snapshot.uuid == *uuid
+                                                && RegionKey::from_position(snapshot.position)
+                                                    == Some(lease.key)
+                                        })
+                                }) =>
+                        {
+                            Ok(upserts)
+                        }
+                        Ok(Ok(_)) => Err(RegionOwnerLaneError::InvalidMutation),
+                        Ok(Err(error)) => Err(error),
+                        Err(_) => Err(handle.unavailable_error()),
+                    },
+                    Err(error) => Err(error),
+                }
+            },
+        );
+        let mut upserts = Vec::new();
+        let mut validate_error = None;
+        for chunk in validate_outcomes {
+            match chunk {
+                Ok(results) => {
+                    for result in results {
+                        match result {
+                            Ok(lane_upserts) => upserts.extend(lane_upserts),
+                            Err(error) => {
+                                validate_error.get_or_insert(error);
+                            }
+                        }
+                    }
+                }
+                Err(error) => {
+                    validate_error.get_or_insert(error);
+                }
+            }
+        }
+        if let Some(error) = validate_error {
+            if let Err(rollback_error) = self.rollback_multi_lane_commits(&prepared_lanes) {
+                return Some(Err(rollback_error));
+            }
+            return Some(Err(error));
+        }
+
+        // Phase 3: every lane prepared and validated, so finalize all phases.
+        let finalize_outcomes =
+            self.run_deferred_lane_wave(prepared_lanes, max_workers, |handle, (owner, phase)| {
+                match owner.finalize(phase) {
+                    Ok(finalized) => match finalized.recv() {
+                        Ok(Ok(finalized)) if finalized == phase => Ok(()),
+                        Ok(Ok(_)) => Err(RegionOwnerLaneError::StalePhase),
+                        Ok(Err(error)) => Err(error),
+                        Err(_) => Err(handle.unavailable_error()),
+                    },
+                    Err(error) => Err(error),
+                }
+            });
+        let mut finalize_error = None;
+        for chunk in finalize_outcomes {
+            match chunk {
+                Ok(results) => {
+                    for result in results {
+                        if let Err(error) = result {
+                            finalize_error.get_or_insert(error);
+                        }
+                    }
+                }
+                Err(error) => {
+                    finalize_error.get_or_insert(error);
+                }
+            }
+        }
+        if finalize_error.is_some() {
+            // Some lanes may already be irreversible. Fence every later read,
+            // mutation, fallback, and retry until controlled recovery.
+            self.commit_state.mark_outcome_unknown();
+            return Some(Err(RegionOwnerLaneError::OutcomeUnknown));
+        }
+        upserts.sort_unstable_by_key(|snapshot| snapshot.id);
+        let mut leases = BTreeMap::new();
+        let mut lane_versions = BTreeMap::new();
+        for snapshot in &upserts {
+            let route = &routes[&snapshot.id];
+            leases.insert(snapshot.id, route.lease);
+            lane_versions
+                .entry(route.lease.lane)
+                .or_insert_with(|| route.owner.state_version());
+        }
+        Some(Ok(VersionedEntitySnapshots {
+            authority: self.authority,
+            fence: RegionalVersionFence {
+                leases,
+                lane_versions,
+            },
+            snapshots: upserts,
+        }))
+    }
+
+    /// Runs one phase of the multi-lane commit as at most `max_workers`
+    /// scoped workers over lane chunks. Returns per-chunk results in input
+    /// order; a panicked worker reports `Err` for its chunk while the other
+    /// chunks still complete.
+    fn run_deferred_lane_wave<T, R>(
+        &self,
+        items: Vec<T>,
+        max_workers: usize,
+        work: impl Fn(&RegionalOwnerHandle, T) -> R + Send + Sync,
+    ) -> Vec<Result<Vec<R>, RegionOwnerLaneError>>
+    where
+        T: Send,
+        R: Send,
+    {
+        if items.is_empty() {
+            return Vec::new();
+        }
+        let worker_count = max_workers.min(items.len()).max(1);
+        let chunk_size = items.len().div_ceil(worker_count);
+        let mut chunks = Vec::with_capacity(worker_count);
+        let mut remaining = items;
+        while !remaining.is_empty() {
+            let split_at = chunk_size.min(remaining.len());
+            chunks.push(remaining.drain(..split_at).collect::<Vec<_>>());
+        }
+        std::thread::scope(|scope| {
+            let work = &work;
+            let mut workers = Vec::with_capacity(chunks.len());
+            for chunk in chunks {
+                let handle = self.clone();
+                workers.push(scope.spawn(move || {
+                    chunk
+                        .into_iter()
+                        .map(|item| work(&handle, item))
+                        .collect::<Vec<R>>()
+                }));
+            }
+            workers
+                .into_iter()
+                .map(|worker| worker.join().map_err(|_| self.unavailable_error()))
+                .collect()
+        })
+    }
+
     pub fn set_position(
         &self,
         entity: EntityId,
@@ -2876,38 +3405,14 @@ impl RegionalOwnerHandle {
             if expected.id != state.id || !state.is_finite() || !ids.insert(expected.id) {
                 return Err(RegionOwnerLaneError::InvalidMutation);
             }
+            if expected.retained.item_pickup_claim.is_some() && state.position != expected.position
+            {
+                return Ok(Vec::new());
+            }
             direct_eligible &= RegionKey::from_position(state.position) == Some(source);
         }
         if direct_eligible {
-            let direct = if expected_count == 1 {
-                let (expected, state) = &states[0];
-                vec![(
-                    expected.clone(),
-                    RegionOwnerMutation::SetKinematicsIfCurrent {
-                        expected: Box::new(expected.clone()),
-                        state: *state,
-                    },
-                )]
-            } else {
-                let mut states_by_region =
-                    BTreeMap::<RegionKey, (Vec<EntitySnapshot>, Vec<EntityKinematics>)>::new();
-                for (expected, state) in &states {
-                    let source = RegionKey::from_position(expected.position)
-                        .ok_or(RegionOwnerLaneError::InvalidMutation)?;
-                    let (expected_batch, state_batch) = states_by_region.entry(source).or_default();
-                    expected_batch.push(expected.clone());
-                    state_batch.push(*state);
-                }
-                states_by_region
-                    .into_values()
-                    .map(|(expected, states)| {
-                        (
-                            expected[0].clone(),
-                            RegionOwnerMutation::SetKinematicsBatchIfCurrent { expected, states },
-                        )
-                    })
-                    .collect()
-            };
+            let direct = kinematics_direct_mutations(&states)?;
             if let Some(result) = self.try_commit_cached_standalone_snapshot_mutations_with_journal(
                 direct,
                 journal_commit,
@@ -2937,6 +3442,131 @@ impl RegionalOwnerHandle {
         &self,
         states: impl IntoIterator<Item = (EntitySnapshot, EntityKinematics)>,
     ) -> Result<Vec<EntityKinematics>, RegionOwnerLaneError> {
+        self.apply_kinematics_if_current_inner(states, false)
+    }
+
+    pub fn try_apply_kinematics_if_versioned_deferred_journal(
+        &self,
+        expected: VersionedEntityKinematics,
+        states: Vec<EntityKinematics>,
+    ) -> Result<Option<Vec<EntityKinematics>>, RegionOwnerLaneError> {
+        let (reply, result) = channel();
+        self.sender
+            .send(RegionalOwnerCommand::ApplyKinematicsIfVersioned {
+                expected,
+                states,
+                reply,
+            })
+            .map_err(|_| self.unavailable_error())?;
+        result.recv().map_err(|_| self.unavailable_error())?
+    }
+
+    /// Attempts the cached multi-lane deferred-journal kinematics fast path and
+    /// returns its committed snapshots with a version fence. This never falls
+    /// back or fetches snapshots: region crossings, incomplete cached routes,
+    /// and `max_workers <= 1` return `Ok(None)`.
+    pub fn try_apply_kinematics_if_current_parallel_deferred_journal_versioned(
+        &self,
+        states: &[(EntitySnapshot, EntityKinematics)],
+        max_workers: usize,
+    ) -> Result<Option<VersionedEntitySnapshots>, RegionOwnerLaneError> {
+        if max_workers <= 1 {
+            return Ok(None);
+        }
+        if states.is_empty() {
+            return Ok(Some(VersionedEntitySnapshots {
+                authority: self.authority,
+                fence: RegionalVersionFence {
+                    leases: BTreeMap::new(),
+                    lane_versions: BTreeMap::new(),
+                },
+                snapshots: Vec::new(),
+            }));
+        }
+        let mut ids = HashSet::with_capacity(states.len());
+        let mut direct_eligible = true;
+        for (expected, state) in states {
+            let source = RegionKey::from_position(expected.position)
+                .ok_or(RegionOwnerLaneError::InvalidMutation)?;
+            if expected.id != state.id || !state.is_finite() || !ids.insert(expected.id) {
+                return Err(RegionOwnerLaneError::InvalidMutation);
+            }
+            if expected.retained.item_pickup_claim.is_some() && state.position != expected.position
+            {
+                return Ok(Some(VersionedEntitySnapshots {
+                    authority: self.authority,
+                    fence: RegionalVersionFence {
+                        leases: BTreeMap::new(),
+                        lane_versions: BTreeMap::new(),
+                    },
+                    snapshots: Vec::new(),
+                }));
+            }
+            direct_eligible &= RegionKey::from_position(state.position) == Some(source);
+        }
+        if !direct_eligible {
+            return Ok(None);
+        }
+        let cached =
+            read_benign_rwlock(&self.selected_read_routes, "regional.selected_read_routes");
+        let mut groups = BTreeMap::<usize, Vec<(EntitySnapshot, EntityKinematics)>>::new();
+        let mut routes_complete = true;
+        for (expected, state) in states {
+            let source = RegionKey::from_position(expected.position);
+            let Some(route) = cached.get(&expected.id).filter(|route| {
+                route.uuid == expected.uuid
+                    && route.standalone
+                    && source == Some(route.lease.key)
+                    && RegionKey::from_position(state.position) == source
+            }) else {
+                routes_complete = false;
+                break;
+            };
+            groups
+                .entry(route.lease.lane)
+                .or_default()
+                .push((expected.clone(), *state));
+        }
+        drop(cached);
+        if !routes_complete {
+            return Ok(None);
+        }
+
+        let mut lane_mutations = Vec::with_capacity(groups.len());
+        for (lane, group) in groups {
+            lane_mutations.push((lane, kinematics_direct_mutations(&group)?));
+        }
+        match self.try_commit_multi_lane_cached_standalone_snapshot_mutations_deferred_journal(
+            lane_mutations,
+            max_workers,
+        ) {
+            Some(result) => result.map(Some),
+            None => Ok(None),
+        }
+    }
+
+    /// Conditional kinematics batch committed through cached owner-lane routes
+    /// with lane work spread over at most `max_workers` scoped workers. Fast
+    /// path semantics match the versioned method above; unavailable fast-path
+    /// cases fall back to the existing serial deferred-journal path.
+    pub fn apply_kinematics_if_current_parallel_deferred_journal_committed(
+        &self,
+        states: impl IntoIterator<Item = (EntitySnapshot, EntityKinematics)>,
+        max_workers: usize,
+    ) -> Result<Vec<EntityKinematics>, RegionOwnerLaneError> {
+        let states = states.into_iter().collect::<Vec<_>>();
+        if let Some(selected) = self
+            .try_apply_kinematics_if_current_parallel_deferred_journal_versioned(
+                &states,
+                max_workers,
+            )?
+        {
+            return Ok(selected
+                .into_snapshots()
+                .into_iter()
+                .map(snapshot_kinematics)
+                .collect());
+        }
         self.apply_kinematics_if_current_inner(states, false)
     }
 
@@ -3167,7 +3797,7 @@ impl RegionalOwnerHandle {
         &self,
         resolved: RegionalResolvedGoalTick,
         entities: &HashSet<EntityId>,
-    ) -> Result<Option<(GoalTickStats, Vec<EntityKinematics>)>, RegionOwnerLaneError> {
+    ) -> GoalApplyKinematicsResult {
         let (reply, result) = channel();
         self.sender
             .send(RegionalOwnerCommand::ApplyPreparedGoalTickAndKinematics {
@@ -3184,7 +3814,7 @@ impl RegionalOwnerHandle {
         &self,
         resolved: RegionalResolvedGoalTick,
         entities: &HashSet<EntityId>,
-    ) -> Result<Option<(GoalTickStats, Vec<EntityKinematics>)>, RegionOwnerLaneError> {
+    ) -> GoalApplyKinematicsResult {
         let (reply, result) = channel();
         self.sender
             .send(RegionalOwnerCommand::ApplyPreparedGoalTickAndKinematics {
@@ -3783,6 +4413,14 @@ fn run_regional_owner_runtime(
                         .clear();
                 }
                 let _ = reply.send(result);
+            }
+            RegionalOwnerCommand::ApplyKinematicsIfVersioned {
+                expected,
+                states,
+                reply,
+            } => {
+                let _ = reply
+                    .send(coordinator.apply_kinematics_if_versioned_inner(expected, states, false));
             }
             RegionalOwnerCommand::DamageIfCurrent {
                 expected,
@@ -4645,7 +5283,8 @@ impl RegionalOwnerCoordinator {
     fn alive_kinematics_for_ids(
         &self,
         entities: &HashSet<EntityId>,
-    ) -> Result<Vec<EntityKinematics>, RegionOwnerLaneError> {
+    ) -> Result<(Vec<EntityKinematics>, Option<VersionedEntityKinematics>), RegionOwnerLaneError>
+    {
         self.commit_state.ensure_committed_state()?;
         let mut ordered = entities.iter().copied().collect::<Vec<_>>();
         ordered.sort_unstable();
@@ -4669,16 +5308,31 @@ impl RegionalOwnerCoordinator {
                 .lanes
                 .get(&lane)
                 .ok_or(RegionOwnerLaneError::WrongLane)?;
-            pending.push(owner.reader().request_alive_kinematics_for_ids(entities)?);
+            pending.push((
+                lane,
+                owner.reader().request_alive_kinematics_for_ids(entities)?,
+            ));
         }
-        let mut states = Vec::with_capacity(entities.len());
-        for completion in pending {
-            states.extend(
-                completion
-                    .recv()
-                    .map_err(|_| RegionOwnerLaneError::Closed)??,
-            );
+        let mut candidates = Vec::with_capacity(entities.len());
+        let mut lane_versions = BTreeMap::new();
+        for (expected_lane, completion) in pending {
+            let read = completion
+                .recv()
+                .map_err(|_| RegionOwnerLaneError::Closed)??;
+            if read.lane != expected_lane
+                || lane_versions
+                    .insert(read.lane, read.state_version)
+                    .is_some()
+            {
+                return Err(RegionOwnerLaneError::InvalidMutation);
+            }
+            candidates.extend(read.candidates);
         }
+        candidates.sort_unstable_by_key(|candidate| candidate.expected.id);
+        let mut states = candidates
+            .iter()
+            .map(|candidate| candidate.expected.expected)
+            .collect::<Vec<_>>();
         states.sort_unstable_by_key(|state| state.id);
         if states.iter().any(|state| {
             !entities.contains(&state.id)
@@ -4687,7 +5341,53 @@ impl RegionalOwnerCoordinator {
         }) {
             return Err(RegionOwnerLaneError::InvalidMutation);
         }
-        Ok(states)
+        let eligible = candidates
+            .iter()
+            .all(|candidate| candidate.expected.eligible())
+            && states.iter().all(|state| {
+                !self.vehicle_passengers.contains_key(&state.id)
+                    && !self.passenger_vehicles.contains_key(&state.id)
+            });
+        let versioned = if eligible {
+            let mut leases = BTreeMap::new();
+            for state in &states {
+                let key = self
+                    .locations
+                    .get(&state.id)
+                    .copied()
+                    .ok_or(RegionOwnerLaneError::UnknownEntity)?;
+                let lease = self
+                    .ownership
+                    .lease(key)
+                    .ok_or(RegionOwnerLaneError::StaleLease)?;
+                if !lane_versions.contains_key(&lease.lane) {
+                    return Err(RegionOwnerLaneError::InvalidMutation);
+                }
+                leases.insert(state.id, lease);
+            }
+            let selected_lanes = leases
+                .values()
+                .map(|lease| lease.lane)
+                .collect::<BTreeSet<_>>();
+            lane_versions.retain(|lane, _| selected_lanes.contains(lane));
+            if !selected_lanes.iter().eq(lane_versions.keys()) {
+                return Err(RegionOwnerLaneError::InvalidMutation);
+            }
+            Some(VersionedEntityKinematics {
+                authority: self.authority,
+                fence: RegionalVersionFence {
+                    leases,
+                    lane_versions,
+                },
+                expected: candidates
+                    .into_iter()
+                    .map(|candidate| candidate.expected)
+                    .collect(),
+            })
+        } else {
+            None
+        };
+        Ok((states, versioned))
     }
 
     #[must_use]
@@ -5233,7 +5933,8 @@ impl RegionalOwnerCoordinator {
                 || next.item_stack != expected.item_stack
                 || next.lifecycle != expected.lifecycle
                 || next.type_id != expected.type_id
-                || next.type_name != expected.type_name)
+                || next.type_name != expected.type_name
+                || next.position != expected.position)
         {
             return Ok(false);
         }
@@ -6237,7 +6938,8 @@ impl RegionalOwnerCoordinator {
                     || next.item_stack != expected.item_stack
                     || next.lifecycle != expected.lifecycle
                     || next.type_id != expected.type_id
-                    || next.type_name != expected.type_name)
+                    || next.type_name != expected.type_name
+                    || next.position != expected.position)
             {
                 return Ok(false);
             }
@@ -6805,6 +7507,78 @@ impl RegionalOwnerCoordinator {
         self.apply_kinematics_if_current_inner(states, true)
     }
 
+    fn apply_kinematics_if_versioned_inner(
+        &mut self,
+        expected: VersionedEntityKinematics,
+        states: Vec<EntityKinematics>,
+        journal_commit: bool,
+    ) -> Result<Option<Vec<EntityKinematics>>, RegionOwnerLaneError> {
+        if expected.authority != self.authority
+            || expected.expected.is_empty()
+            || expected.expected.len() != states.len()
+            || expected.fence.leases.len() != expected.expected.len()
+        {
+            return Ok(None);
+        }
+        let mut ids = HashSet::with_capacity(states.len());
+        let mut by_region =
+            BTreeMap::<RegionKey, (Vec<CompactEntityKinematicsFence>, Vec<EntityKinematics>)>::new(
+            );
+        for (previous, state) in expected.expected.iter().zip(&states) {
+            let Some(lease) = expected.fence.leases.get(&previous.id).copied() else {
+                return Ok(None);
+            };
+            if !previous.eligible()
+                || previous.id != state.id
+                || !state.is_finite()
+                || !ids.insert(state.id)
+                || self.locations.get(&state.id).copied() != Some(lease.key)
+                || self.ownership.lease(lease.key) != Some(lease)
+                || RegionKey::from_position(previous.expected.position) != Some(lease.key)
+                || RegionKey::from_position(state.position) != Some(lease.key)
+                || self.vehicle_passengers.contains_key(&state.id)
+                || self.passenger_vehicles.contains_key(&state.id)
+            {
+                return Ok(None);
+            }
+            let (previous_states, next_states) = by_region.entry(lease.key).or_default();
+            previous_states.push(*previous);
+            next_states.push(*state);
+        }
+        let lanes = expected
+            .fence
+            .leases
+            .values()
+            .map(|lease| lease.lane)
+            .collect::<BTreeSet<_>>();
+        if !lanes.iter().eq(expected.fence.lane_versions.keys()) {
+            return Ok(None);
+        }
+        let (first_sequence, next_sequence) =
+            self.commit_state.reserve_sequences(by_region.len())?;
+        let mut mutations = BTreeMap::<usize, Vec<SequencedRegionMutation>>::new();
+        for (offset, (_key, (previous, states))) in by_region.into_iter().enumerate() {
+            let lease = expected.fence.leases[&previous[0].id];
+            mutations
+                .entry(lease.lane)
+                .or_default()
+                .push(SequencedRegionMutation {
+                    sequence: first_sequence + offset as u64 + 1,
+                    lease,
+                    mutation: RegionOwnerMutation::SetKinematicsBatchIfVersion {
+                        expected_state_version: expected.fence.lane_versions[&lease.lane],
+                        previous,
+                        states,
+                    },
+                });
+        }
+        match self.execute_mutations_with_stats(mutations, next_sequence, journal_commit) {
+            Ok(_) => Ok(Some(states)),
+            Err(RegionOwnerLaneError::InvalidMutation) => Ok(None),
+            Err(error) => Err(error),
+        }
+    }
+
     fn apply_kinematics_if_current_inner(
         &mut self,
         states: impl IntoIterator<Item = (EntitySnapshot, EntityKinematics)>,
@@ -6823,6 +7597,10 @@ impl RegionalOwnerCoordinator {
                 || !ids.insert(expected.id)
             {
                 return Err(RegionOwnerLaneError::InvalidMutation);
+            }
+            if expected.retained.item_pickup_claim.is_some() && state.position != expected.position
+            {
+                return Ok(false);
             }
         }
         if ids.iter().any(|id| !self.locations.contains_key(id)) {
@@ -7432,12 +8210,12 @@ impl RegionalOwnerCoordinator {
         resolved: RegionalResolvedGoalTick,
         entities: &HashSet<EntityId>,
         journal_commit: bool,
-    ) -> Result<Option<(GoalTickStats, Vec<EntityKinematics>)>, RegionOwnerLaneError> {
+    ) -> GoalApplyKinematicsResult {
         let Some(stats) = self.try_apply_prepared_goal_tick_inner(resolved, journal_commit)? else {
             return Ok(None);
         };
-        let states = self.alive_kinematics_for_ids(entities)?;
-        Ok(Some((stats, states)))
+        let (states, versioned) = self.alive_kinematics_for_ids(entities)?;
+        Ok(Some((stats, states, versioned)))
     }
 
     fn try_apply_prepared_goal_tick_inner(
@@ -7906,6 +8684,9 @@ fn mutation_entity_ids(mutation: &RegionOwnerMutation) -> Vec<EntityId> {
         | RegionOwnerMutation::InsertSnapshots(expected)
         | RegionOwnerMutation::RemoveSnapshotsIfCurrent(expected) => {
             expected.iter().map(|snapshot| snapshot.id).collect()
+        }
+        RegionOwnerMutation::SetKinematicsBatchIfVersion { previous, .. } => {
+            previous.iter().map(|entry| entry.id).collect()
         }
     }
 }
@@ -9919,6 +10700,223 @@ mod tests {
         }
     }
 
+    // Combat target density is far higher than chunk-publication density; a
+    // four-block cell keeps exact nearest-neighbour buckets small without
+    // sampling or capping candidates.
+    const BATTLE_SPATIAL_CELL_SIZE: f64 = 4.0;
+
+    struct BattleSpatialGrid {
+        cells: HashMap<(i32, i32), Vec<EntityId>>,
+        bounds: Option<(i32, i32, i32, i32)>,
+    }
+
+    impl BattleSpatialGrid {
+        fn from_ids(
+            ids: impl IntoIterator<Item = EntityId>,
+            positions: &HashMap<EntityId, Vec3>,
+        ) -> Self {
+            let mut cells = HashMap::<(i32, i32), Vec<EntityId>>::new();
+            let mut bounds: Option<(i32, i32, i32, i32)> = None;
+            for id in ids {
+                let position = positions
+                    .get(&id)
+                    .expect("battle spatial entity must have a position");
+                let cell = battle_spatial_cell(*position);
+                cells.entry(cell).or_default().push(id);
+                bounds = Some(match bounds {
+                    None => (cell.0, cell.0, cell.1, cell.1),
+                    Some((min_x, max_x, min_z, max_z)) => (
+                        min_x.min(cell.0),
+                        max_x.max(cell.0),
+                        min_z.min(cell.1),
+                        max_z.max(cell.1),
+                    ),
+                });
+            }
+            Self { cells, bounds }
+        }
+
+        fn choose_target(
+            &self,
+            actor: EntityId,
+            positions: &HashMap<EntityId, Vec3>,
+        ) -> Option<EntityId> {
+            let actor_position = *positions.get(&actor)?;
+            let actor_cell = battle_spatial_cell(actor_position);
+            let (min_x, max_x, min_z, max_z) = self.bounds?;
+            let max_ring = i64::from(actor_cell.0)
+                .abs_diff(i64::from(min_x))
+                .max(i64::from(actor_cell.0).abs_diff(i64::from(max_x)))
+                .max(i64::from(actor_cell.1).abs_diff(i64::from(min_z)))
+                .max(i64::from(actor_cell.1).abs_diff(i64::from(max_z)));
+            let mut best = None::<(f64, EntityId)>;
+
+            for ring in 0..=max_ring {
+                let ring = i32::try_from(ring).expect("battle spatial ring fits i32");
+                let low_x = actor_cell.0 - ring;
+                let high_x = actor_cell.0 + ring;
+                let low_z = actor_cell.1 - ring;
+                let high_z = actor_cell.1 + ring;
+                for cell_x in low_x..=high_x {
+                    battle_spatial_consider_cell(
+                        &self.cells,
+                        (cell_x, low_z),
+                        actor,
+                        actor_position,
+                        positions,
+                        &mut best,
+                    );
+                    if high_z != low_z {
+                        battle_spatial_consider_cell(
+                            &self.cells,
+                            (cell_x, high_z),
+                            actor,
+                            actor_position,
+                            positions,
+                            &mut best,
+                        );
+                    }
+                }
+                for cell_z in (low_z + 1)..high_z {
+                    battle_spatial_consider_cell(
+                        &self.cells,
+                        (low_x, cell_z),
+                        actor,
+                        actor_position,
+                        positions,
+                        &mut best,
+                    );
+                    if high_x != low_x {
+                        battle_spatial_consider_cell(
+                            &self.cells,
+                            (high_x, cell_z),
+                            actor,
+                            actor_position,
+                            positions,
+                            &mut best,
+                        );
+                    }
+                }
+
+                if let Some((best_distance_squared, _)) = best {
+                    let covered_min_x = f64::from(low_x) * BATTLE_SPATIAL_CELL_SIZE;
+                    let covered_max_x = f64::from(high_x + 1) * BATTLE_SPATIAL_CELL_SIZE;
+                    let covered_min_z = f64::from(low_z) * BATTLE_SPATIAL_CELL_SIZE;
+                    let covered_max_z = f64::from(high_z + 1) * BATTLE_SPATIAL_CELL_SIZE;
+                    let unvisited_distance = (actor_position.x - covered_min_x)
+                        .min(covered_max_x - actor_position.x)
+                        .min(actor_position.z - covered_min_z)
+                        .min(covered_max_z - actor_position.z);
+                    // Strict inequality is required: an unvisited candidate at
+                    // exactly the lower bound could win the EntityId tie-break.
+                    if best_distance_squared < unvisited_distance * unvisited_distance {
+                        return best.map(|(_, id)| id);
+                    }
+                }
+            }
+            best.map(|(_, id)| id)
+        }
+    }
+
+    fn battle_spatial_cell(position: Vec3) -> (i32, i32) {
+        assert!(position.x.is_finite() && position.z.is_finite());
+        (
+            (position.x / BATTLE_SPATIAL_CELL_SIZE).floor() as i32,
+            (position.z / BATTLE_SPATIAL_CELL_SIZE).floor() as i32,
+        )
+    }
+
+    fn battle_spatial_consider_cell(
+        cells: &HashMap<(i32, i32), Vec<EntityId>>,
+        cell: (i32, i32),
+        actor: EntityId,
+        actor_position: Vec3,
+        positions: &HashMap<EntityId, Vec3>,
+        best: &mut Option<(f64, EntityId)>,
+    ) {
+        let Some(candidates) = cells.get(&cell) else {
+            return;
+        };
+        for &candidate in candidates {
+            if candidate == actor {
+                continue;
+            }
+            let candidate_position = positions[&candidate];
+            let dx = candidate_position.x - actor_position.x;
+            let dz = candidate_position.z - actor_position.z;
+            let candidate_key = (dx * dx + dz * dz, candidate);
+            if best.is_none_or(|current| {
+                candidate_key.0.total_cmp(&current.0).is_lt()
+                    || (candidate_key.0 == current.0 && candidate_key.1 < current.1)
+            }) {
+                *best = Some(candidate_key);
+            }
+        }
+    }
+
+    fn exhaustive_battle_target(
+        actor: EntityId,
+        candidates: impl IntoIterator<Item = EntityId>,
+        positions: &HashMap<EntityId, Vec3>,
+    ) -> Option<EntityId> {
+        let actor_position = positions.get(&actor)?;
+        candidates
+            .into_iter()
+            .filter(|candidate| *candidate != actor)
+            .map(|candidate| {
+                let position = positions[&candidate];
+                let dx = position.x - actor_position.x;
+                let dz = position.z - actor_position.z;
+                (dx * dx + dz * dz, candidate)
+            })
+            .min_by(|left, right| {
+                left.0
+                    .total_cmp(&right.0)
+                    .then_with(|| left.1.cmp(&right.1))
+            })
+            .map(|(_, candidate)| candidate)
+    }
+
+    #[test]
+    fn battle_spatial_target_matches_exhaustive_nearest_with_deterministic_ties() {
+        let mut state = 0xA11C_E5EED_u64;
+        let mut positions = HashMap::new();
+        for raw_id in 0..257 {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            let x = (state as i32 % 20_001) as f64 / 10.0;
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            let z = (state as i32 % 20_001) as f64 / 10.0;
+            positions.insert(EntityId(raw_id), Vec3::new(x, 64.0, z));
+        }
+        let ids = positions.keys().copied().collect::<HashSet<_>>();
+        let grid = BattleSpatialGrid::from_ids(ids.iter().copied(), &positions);
+        for actor in 0..64 {
+            let actor = EntityId(actor);
+            assert_eq!(
+                grid.choose_target(actor, &positions),
+                exhaustive_battle_target(actor, ids.iter().copied(), &positions)
+            );
+        }
+
+        let actor = EntityId(1_000);
+        let lower_id = EntityId(1_001);
+        let higher_id = EntityId(1_002);
+        let tied_positions = HashMap::from([
+            (actor, Vec3::new(0.0, 64.0, 0.0)),
+            (lower_id, Vec3::new(-32.0, 64.0, 0.0)),
+            (higher_id, Vec3::new(32.0, 64.0, 0.0)),
+        ]);
+        let tied_grid = BattleSpatialGrid::from_ids([higher_id, lower_id], &tied_positions);
+        assert_eq!(
+            tied_grid.choose_target(actor, &tied_positions),
+            Some(lower_id)
+        );
+    }
+
     fn parse_linux_cpu_list(value: &str) -> Option<Vec<usize>> {
         let mut cpus = std::collections::BTreeSet::new();
         for part in value.trim().split(',') {
@@ -10103,6 +11101,391 @@ mod tests {
             velocity: Vec3::new(0.4, 0.1, -0.2),
             on_ground: false,
         }
+    }
+
+    fn fenced_kinematics(
+        coordinator: &super::RegionalOwnerCoordinator,
+        ids: &HashSet<EntityId>,
+    ) -> super::VersionedEntityKinematics {
+        coordinator
+            .alive_kinematics_for_ids(ids)
+            .expect("fenced kinematics read")
+            .1
+            .expect("standalone unclaimed entities are fence eligible")
+    }
+
+    #[test]
+    fn versioned_kinematics_dense_same_region_matches_snapshot_cas() {
+        let mut fast = super::RegionalOwnerCoordinator::from_store(RegionalEntityStore::new(), 1)
+            .expect("fast coordinator");
+        let mut cas = super::RegionalOwnerCoordinator::from_store(RegionalEntityStore::new(), 1)
+            .expect("CAS coordinator");
+        let spawns = (0..32)
+            .map(|index| cow(Vec3::new(0.5 + f64::from(index), 64.0, 0.5)))
+            .collect::<Vec<_>>();
+        let fast_ids = fast.spawn_batch(spawns.clone()).expect("fast entities");
+        let cas_ids = cas.spawn_batch(spawns).expect("CAS entities");
+        assert_eq!(fast_ids, cas_ids);
+        let ids = fast_ids.iter().copied().collect::<HashSet<_>>();
+        let fence = fenced_kinematics(&fast, &ids);
+        let targets = fence
+            .expected
+            .iter()
+            .map(|entry| {
+                movement(
+                    entry.id,
+                    Vec3::new(entry.expected.position.x + 0.25, 64.0, 0.5),
+                )
+            })
+            .collect::<Vec<_>>();
+        let expected = cas
+            .snapshots_for_ids(&ids)
+            .expect("CAS expected snapshots")
+            .into_iter()
+            .zip(targets.iter().copied())
+            .collect::<Vec<_>>();
+
+        assert_eq!(
+            fast.apply_kinematics_if_versioned_inner(fence, targets.clone(), false)
+                .expect("fast apply"),
+            Some(targets.clone())
+        );
+        assert!(
+            cas.apply_kinematics_if_current(expected)
+                .expect("CAS apply")
+        );
+        let fast_states = fast.alive_kinematics_for_ids(&ids).expect("fast states").0;
+        let cas_states = cas.alive_kinematics_for_ids(&ids).expect("CAS states").0;
+        assert_eq!(fast_states, cas_states);
+    }
+
+    #[test]
+    fn versioned_kinematics_rejects_stale_lane_after_intervening_mutation() {
+        let mut coordinator =
+            super::RegionalOwnerCoordinator::from_store(RegionalEntityStore::new(), 1)
+                .expect("coordinator");
+        let id = coordinator
+            .spawn(cow(Vec3::new(0.5, 64.0, 0.5)))
+            .expect("cow");
+        let ids = HashSet::from([id]);
+        let fence = fenced_kinematics(&coordinator, &ids);
+        coordinator
+            .set_velocities([(id, Vec3::new(0.1, 0.0, 0.0))])
+            .expect("intervening velocity mutation");
+        assert_eq!(
+            coordinator
+                .apply_kinematics_if_versioned_inner(
+                    fence,
+                    vec![movement(id, Vec3::new(1.5, 64.0, 0.5))],
+                    false,
+                )
+                .expect("stale compare"),
+            None
+        );
+        assert_eq!(
+            coordinator.snapshot(id).unwrap().unwrap().position,
+            Vec3::new(0.5, 64.0, 0.5)
+        );
+    }
+
+    #[test]
+    fn versioned_kinematics_rejects_changed_motion_even_with_current_version() {
+        let mut coordinator =
+            super::RegionalOwnerCoordinator::from_store(RegionalEntityStore::new(), 1)
+                .expect("coordinator");
+        let id = coordinator
+            .spawn(cow(Vec3::new(0.5, 64.0, 0.5)))
+            .expect("cow");
+        let mut fence = fenced_kinematics(&coordinator, &HashSet::from([id]));
+        let changed_velocity = Vec3::new(0.25, 0.0, 0.0);
+        coordinator
+            .set_velocities([(id, changed_velocity)])
+            .expect("changed-motion mutation");
+        let lane = fence.fence.leases[&id].lane;
+        fence
+            .fence
+            .lane_versions
+            .insert(lane, coordinator.lanes[&lane].reader().state_version());
+
+        assert_eq!(
+            coordinator
+                .apply_kinematics_if_versioned_inner(
+                    fence,
+                    vec![movement(id, Vec3::new(1.5, 64.0, 0.5))],
+                    false,
+                )
+                .expect("compact compare"),
+            None
+        );
+        assert_eq!(
+            coordinator.snapshot(id).unwrap().unwrap().velocity,
+            changed_velocity,
+            "the intervening motion remains authoritative after compact rejection"
+        );
+    }
+
+    #[test]
+    fn versioned_kinematics_rejects_reused_id_uuid_mismatch() {
+        let mut coordinator =
+            super::RegionalOwnerCoordinator::from_store(RegionalEntityStore::new(), 1)
+                .expect("coordinator");
+        let id = coordinator
+            .spawn(cow(Vec3::new(0.5, 64.0, 0.5)))
+            .expect("cow");
+        let mut fence = fenced_kinematics(&coordinator, &HashSet::from([id]));
+        let original_uuid = fence.expected[0].uuid;
+        fence.expected[0].uuid = if original_uuid == Uuid::nil() {
+            Uuid::max()
+        } else {
+            Uuid::nil()
+        };
+
+        assert_eq!(
+            coordinator
+                .apply_kinematics_if_versioned_inner(
+                    fence,
+                    vec![movement(id, Vec3::new(1.5, 64.0, 0.5))],
+                    false,
+                )
+                .expect("identity compare"),
+            None
+        );
+        assert_eq!(
+            coordinator.snapshot(id).unwrap().unwrap().position,
+            Vec3::new(0.5, 64.0, 0.5)
+        );
+    }
+
+    #[test]
+    fn versioned_kinematics_one_stale_lane_rejects_whole_batch() {
+        let mut coordinator =
+            super::RegionalOwnerCoordinator::from_store(RegionalEntityStore::new(), 2)
+                .expect("coordinator");
+        let ids = coordinator
+            .spawn_batch([
+                cow(Vec3::new(0.5, 64.0, 0.5)),
+                cow(Vec3::new(128.5, 64.0, 0.5)),
+            ])
+            .expect("two-lane cows");
+        let selected = ids.iter().copied().collect::<HashSet<_>>();
+        let fence = fenced_kinematics(&coordinator, &selected);
+        coordinator
+            .set_velocities([(ids[1], Vec3::new(0.25, 0.0, 0.0))])
+            .expect("stale-lane mutation");
+        let targets = vec![
+            movement(ids[0], Vec3::new(1.5, 64.0, 0.5)),
+            movement(ids[1], Vec3::new(129.5, 64.0, 0.5)),
+        ];
+
+        assert_eq!(
+            coordinator
+                .apply_kinematics_if_versioned_inner(fence, targets, false)
+                .expect("multi-lane compact compare"),
+            None
+        );
+        assert_eq!(
+            coordinator.snapshot(ids[0]).unwrap().unwrap().position,
+            Vec3::new(0.5, 64.0, 0.5)
+        );
+        assert_eq!(
+            coordinator.snapshot(ids[1]).unwrap().unwrap().position,
+            Vec3::new(128.5, 64.0, 0.5)
+        );
+    }
+
+    #[test]
+    fn concurrent_duplicate_compact_submission_exactly_one_succeeds() {
+        let runtime = super::RegionalOwnerRuntime::from_store(RegionalEntityStore::new(), 1)
+            .expect("runtime");
+        let handle = runtime.handle();
+        let id = handle.spawn(cow(Vec3::new(0.5, 64.0, 0.5))).expect("cow");
+        let ids = HashSet::from([id]);
+        let resolved = handle
+            .prepare_goal_tick_with_pathing_for_ids(1, &ids)
+            .expect("goal prepare")
+            .resolve(&WalkablePathing, PathingBudget::DEFAULT);
+        let (_, _, versioned) = handle
+            .apply_prepared_goal_tick_and_kinematics_for_ids_deferred_journal(resolved, &ids)
+            .expect("goal apply")
+            .expect("fresh goal apply");
+        let fence = versioned.expect("compact fence");
+        let target = movement(id, Vec3::new(1.5, 64.0, 0.5));
+        let barrier = Arc::new(std::sync::Barrier::new(3));
+        let submissions = (0..2)
+            .map(|_| {
+                let handle = handle.clone();
+                let fence = fence.clone();
+                let barrier = Arc::clone(&barrier);
+                std::thread::spawn(move || {
+                    barrier.wait();
+                    handle
+                        .try_apply_kinematics_if_versioned_deferred_journal(fence, vec![target])
+                        .expect("compact submission")
+                })
+            })
+            .collect::<Vec<_>>();
+        barrier.wait();
+        let succeeded = submissions
+            .into_iter()
+            .filter_map(|submission| submission.join().expect("submission thread"))
+            .count();
+
+        assert_eq!(succeeded, 1);
+        drop(handle);
+        runtime.shutdown().expect("runtime shutdown");
+    }
+
+    #[test]
+    fn route_invalidation_cannot_commit_old_compact_batch() {
+        let mut coordinator =
+            super::RegionalOwnerCoordinator::from_store(RegionalEntityStore::new(), 2)
+                .expect("coordinator");
+        let id = coordinator
+            .spawn(cow(Vec3::new(0.5, 64.0, 0.5)))
+            .expect("cow");
+        let fence = fenced_kinematics(&coordinator, &HashSet::from([id]));
+        assert!(
+            coordinator
+                .set_position(id, Vec3::new(128.5, 64.0, 0.5))
+                .expect("route mutation")
+        );
+
+        assert_eq!(
+            coordinator
+                .apply_kinematics_if_versioned_inner(
+                    fence,
+                    vec![movement(id, Vec3::new(1.5, 64.0, 0.5))],
+                    false,
+                )
+                .expect("old route compare"),
+            None
+        );
+        assert_eq!(
+            coordinator.snapshot(id).unwrap().unwrap().position,
+            Vec3::new(128.5, 64.0, 0.5)
+        );
+    }
+
+    #[test]
+    fn fenced_kinematics_lane_reply_keeps_pre_mutation_version() {
+        let mut coordinator =
+            super::RegionalOwnerCoordinator::from_store(RegionalEntityStore::new(), 1)
+                .expect("coordinator");
+        let id = coordinator
+            .spawn(cow(Vec3::new(0.5, 64.0, 0.5)))
+            .expect("cow");
+        let key = coordinator.locations[&id];
+        let lease = coordinator.ownership.lease(key).expect("cow lease");
+        let reader = coordinator.lanes[&lease.lane].reader();
+        let completion = reader
+            .request_alive_kinematics_for_ids(vec![(lease, id)])
+            .expect("lane kinematics request");
+        let read = completion.recv().expect("lane reply").expect("lane read");
+        let previous = read.candidates[0].expected;
+
+        coordinator
+            .set_velocities([(id, Vec3::new(0.25, 0.0, 0.0))])
+            .expect("post-read mutation");
+
+        assert_ne!(
+            read.state_version,
+            reader.state_version(),
+            "the reply keeps the version captured with its old candidate batch"
+        );
+        let mutation = super::RegionOwnerMutation::SetKinematicsBatchIfVersion {
+            expected_state_version: read.state_version,
+            previous: vec![previous],
+            states: vec![movement(id, Vec3::new(1.5, 64.0, 0.5))],
+        };
+        assert_eq!(super::mutation_entity_ids(&mutation), vec![id]);
+    }
+
+    #[test]
+    fn versioned_kinematics_region_crossing_falls_back_without_commit() {
+        let mut coordinator =
+            super::RegionalOwnerCoordinator::from_store(RegionalEntityStore::new(), 1)
+                .expect("coordinator");
+        let id = coordinator
+            .spawn(cow(Vec3::new(0.5, 64.0, 0.5)))
+            .expect("cow");
+        let fence = fenced_kinematics(&coordinator, &HashSet::from([id]));
+        assert_eq!(
+            coordinator
+                .apply_kinematics_if_versioned_inner(
+                    fence,
+                    vec![movement(id, Vec3::new(128.5, 64.0, 0.5))],
+                    false,
+                )
+                .expect("crossing compare"),
+            None
+        );
+        assert_eq!(
+            coordinator.snapshot(id).unwrap().unwrap().position,
+            Vec3::new(0.5, 64.0, 0.5)
+        );
+    }
+
+    #[test]
+    fn versioned_kinematics_incomplete_route_falls_back_without_commit() {
+        let mut coordinator =
+            super::RegionalOwnerCoordinator::from_store(RegionalEntityStore::new(), 1)
+                .expect("coordinator");
+        let id = coordinator
+            .spawn(cow(Vec3::new(0.5, 64.0, 0.5)))
+            .expect("cow");
+        let mut fence = fenced_kinematics(&coordinator, &HashSet::from([id]));
+        fence.fence.leases.remove(&id);
+        assert_eq!(
+            coordinator
+                .apply_kinematics_if_versioned_inner(
+                    fence,
+                    vec![movement(id, Vec3::new(1.5, 64.0, 0.5))],
+                    false,
+                )
+                .expect("incomplete route compare"),
+            None
+        );
+        assert_eq!(
+            coordinator.snapshot(id).unwrap().unwrap().position,
+            Vec3::new(0.5, 64.0, 0.5)
+        );
+    }
+
+    #[test]
+    fn post_goal_fence_excludes_vehicle_groups_and_pickup_claims() {
+        let mut coordinator =
+            super::RegionalOwnerCoordinator::from_store(RegionalEntityStore::new(), 1)
+                .expect("coordinator");
+        let mut boat = SpawnEntity::vehicle(
+            VehicleKind::Boat,
+            1,
+            "minecraft:boat",
+            Vec3::new(0.5, 64.0, 0.5),
+        );
+        boat.vehicle.as_mut().expect("boat state").passenger = Some(EntityId(2));
+        let vehicle_ids = coordinator
+            .spawn_batch([boat, cow(Vec3::new(1.5, 64.0, 0.5))])
+            .expect("vehicle and passenger batch");
+        let boat = vehicle_ids[0];
+        let passenger = vehicle_ids[1];
+        let mut claimed = cow(Vec3::new(2.5, 64.0, 0.5));
+        claimed.retained.item_pickup_claim = Some(77);
+        let claimed = coordinator.spawn(claimed).expect("claimed entity");
+
+        assert!(
+            coordinator
+                .alive_kinematics_for_ids(&HashSet::from([boat, passenger]))
+                .expect("vehicle read")
+                .1
+                .is_none()
+        );
+        assert!(
+            coordinator
+                .alive_kinematics_for_ids(&HashSet::from([claimed]))
+                .expect("claimed read")
+                .1
+                .is_none()
+        );
     }
 
     struct WalkablePathing;
@@ -12555,7 +13938,7 @@ mod tests {
             lane.reset_snapshot_batch_request_count();
         }
 
-        let (stats, projection) = coordinator
+        let (stats, projection, versioned) = coordinator
             .apply_prepared_goal_tick_and_kinematics_for_ids(resolved, &active, true)
             .expect("apply goals and project kinematics")
             .expect("fresh goals apply");
@@ -12566,6 +13949,7 @@ mod tests {
             vec![west, east]
         );
         assert!(projection.iter().all(|state| state.velocity != Vec3::ZERO));
+        assert!(versioned.is_some());
         assert!(
             coordinator
                 .lanes
@@ -14092,6 +15476,299 @@ mod tests {
 
         drop(handle);
         runtime.shutdown().expect("runtime shutdown");
+    }
+
+    #[test]
+    fn parallel_deferred_kinematics_versioned_fast_path_returns_current_fence() {
+        let runtime = super::RegionalOwnerRuntime::from_store(RegionalEntityStore::new(), 2)
+            .expect("two-lane owner runtime");
+        let handle = runtime.handle();
+        let ids = handle
+            .spawn_batch([
+                cow(Vec3::new(0.5, 64.0, 0.5)),
+                cow(Vec3::new(128.5, 64.0, 0.5)),
+            ])
+            .expect("versioned fast-path entities");
+        let selected = ids.iter().copied().collect::<HashSet<_>>();
+        let snapshots = handle
+            .snapshots_for_ids(&selected)
+            .expect("warm versioned fast-path routes");
+        let states = snapshots
+            .iter()
+            .map(|snapshot| {
+                let next = Vec3::new(
+                    snapshot.position.x + 1.0,
+                    snapshot.position.y,
+                    snapshot.position.z,
+                );
+                (snapshot.clone(), movement(snapshot.id, next))
+            })
+            .collect::<Vec<_>>();
+
+        let committed = handle
+            .try_apply_kinematics_if_current_parallel_deferred_journal_versioned(&states, 2)
+            .expect("versioned fast-path commit")
+            .expect("cached multi-lane fast path");
+        assert_eq!(committed.snapshots().len(), states.len());
+        for snapshot in committed.snapshots() {
+            let target = states
+                .iter()
+                .find(|(_, state)| state.id == snapshot.id)
+                .map(|(_, state)| state.position)
+                .expect("committed target");
+            assert_eq!(snapshot.position, target);
+        }
+        assert!(
+            handle
+                .versioned_snapshots_are_current(&committed)
+                .expect("current version fence"),
+            "freshly committed fast-path snapshots must be current"
+        );
+
+        let changed = committed.snapshots()[0].id;
+        handle
+            .set_velocities([(changed, Vec3::new(0.25, 0.0, 0.0))])
+            .expect("mutate one fenced lane");
+        assert!(
+            !handle
+                .versioned_snapshots_are_current(&committed)
+                .expect("stale version fence"),
+            "a later mutation on a returned entity must stale the fence"
+        );
+        drop(handle);
+        runtime.shutdown().expect("versioned fast-path shutdown");
+    }
+
+    #[test]
+    fn parallel_deferred_kinematics_commits_multi_lane_batch() {
+        let journal = Arc::new(Mutex::new(TestDecisionJournalState::default()));
+        let runtime = super::RegionalOwnerRuntime::from_store_with_journal(
+            RegionalEntityStore::new(),
+            2,
+            Box::new(TestDecisionJournal(Arc::clone(&journal))),
+        )
+        .expect("two-lane owner runtime");
+        let handle = runtime.handle();
+        let ids = handle
+            .spawn_batch([
+                cow(Vec3::new(0.5, 64.0, 0.5)),
+                cow(Vec3::new(128.5, 64.0, 0.5)),
+            ])
+            .expect("multi-lane kinematics entities");
+        let selected = ids.iter().copied().collect::<HashSet<_>>();
+        let snapshots = handle
+            .snapshots_for_ids(&selected)
+            .expect("warm cross-lane kinematics routes");
+        let states = snapshots
+            .iter()
+            .map(|snapshot| {
+                let next = Vec3::new(
+                    snapshot.position.x + 1.0,
+                    snapshot.position.y,
+                    snapshot.position.z,
+                );
+                (snapshot.clone(), movement(snapshot.id, next))
+            })
+            .collect::<Vec<_>>();
+        let commit_count = journal.lock().expect("journal state").commits.len();
+
+        let committed = handle
+            .apply_kinematics_if_current_parallel_deferred_journal_committed(states.clone(), 2)
+            .expect("parallel multi-lane kinematics batch");
+
+        assert_eq!(
+            committed,
+            states.iter().map(|(_, state)| *state).collect::<Vec<_>>()
+        );
+        assert_eq!(
+            journal.lock().expect("journal state").commits.len(),
+            commit_count,
+            "deferred journal commits must stay unwritten"
+        );
+        drop(handle);
+        runtime.shutdown().expect("multi-lane parallel shutdown");
+    }
+
+    #[test]
+    fn parallel_deferred_kinematics_stale_lane_rolls_back_fresh_lane() {
+        let runtime = super::RegionalOwnerRuntime::from_store(RegionalEntityStore::new(), 2)
+            .expect("two-lane owner runtime");
+        let handle = runtime.handle();
+        let ids = handle
+            .spawn_batch([
+                cow(Vec3::new(0.5, 64.0, 0.5)),
+                cow(Vec3::new(128.5, 64.0, 0.5)),
+            ])
+            .expect("stale lane kinematics entities");
+        let selected = ids.iter().copied().collect::<HashSet<_>>();
+        let snapshots = handle
+            .snapshots_for_ids(&selected)
+            .expect("warm cross-lane kinematics routes");
+        let stale = snapshots[0].clone();
+        let fresh = snapshots[1].clone();
+        let stale_next = Vec3::new(stale.position.x + 2.0, stale.position.y, stale.position.z);
+        let moved = handle
+            .apply_kinematics_if_current_deferred_journal_committed([(
+                stale.clone(),
+                movement(stale.id, stale_next),
+            )])
+            .expect("serial stale-making move");
+        assert_eq!(moved.len(), 1);
+
+        let stale_staler = Vec3::new(stale.position.x + 3.0, stale.position.y, stale.position.z);
+        let fresh_next = Vec3::new(fresh.position.x + 1.0, fresh.position.y, fresh.position.z);
+        let committed = handle
+            .apply_kinematics_if_current_parallel_deferred_journal_committed(
+                [
+                    (stale.clone(), movement(stale.id, stale_staler)),
+                    (fresh.clone(), movement(fresh.id, fresh_next)),
+                ],
+                2,
+            )
+            .expect("parallel batch with one stale lane");
+
+        assert!(
+            committed.is_empty(),
+            "one stale lane must keep the whole batch from committing"
+        );
+        assert_eq!(
+            handle
+                .snapshot(stale.id)
+                .expect("stale lane read")
+                .expect("stale cow")
+                .position,
+            stale_next,
+            "stale entity must stay at its pre-call position"
+        );
+        assert_eq!(
+            handle
+                .snapshot(fresh.id)
+                .expect("fresh lane read")
+                .expect("fresh cow")
+                .position,
+            fresh.position,
+            "fresh entity on a batch with a stale lane must not move"
+        );
+        drop(handle);
+        runtime.shutdown().expect("stale lane shutdown");
+    }
+
+    #[test]
+    fn parallel_deferred_kinematics_more_lanes_than_workers_commits_all() {
+        let journal = Arc::new(Mutex::new(TestDecisionJournalState::default()));
+        let runtime = super::RegionalOwnerRuntime::from_store_with_journal(
+            RegionalEntityStore::new(),
+            3,
+            Box::new(TestDecisionJournal(Arc::clone(&journal))),
+        )
+        .expect("three-lane owner runtime");
+        let handle = runtime.handle();
+        let ids = handle
+            .spawn_batch([
+                cow(Vec3::new(0.5, 64.0, 0.5)),
+                cow(Vec3::new(128.5, 64.0, 0.5)),
+                cow(Vec3::new(256.5, 64.0, 0.5)),
+            ])
+            .expect("three-lane kinematics entities");
+        let selected = ids.iter().copied().collect::<HashSet<_>>();
+        let snapshots = handle
+            .snapshots_for_ids(&selected)
+            .expect("warm three-lane kinematics routes");
+        let states = snapshots
+            .iter()
+            .map(|snapshot| {
+                let next = Vec3::new(
+                    snapshot.position.x + 1.0,
+                    snapshot.position.y,
+                    snapshot.position.z,
+                );
+                (snapshot.clone(), movement(snapshot.id, next))
+            })
+            .collect::<Vec<_>>();
+        let commit_count = journal.lock().expect("journal state").commits.len();
+
+        let committed = handle
+            .apply_kinematics_if_current_parallel_deferred_journal_committed(states.clone(), 2)
+            .expect("three-lane batch with two workers");
+
+        let mut expected = states.iter().map(|(_, state)| *state).collect::<Vec<_>>();
+        expected.sort_unstable_by_key(|kinematics| kinematics.id);
+        assert_eq!(committed, expected, "every lane must commit, sorted by id");
+        assert_eq!(
+            journal.lock().expect("journal state").commits.len(),
+            commit_count,
+            "deferred journal commits must stay unwritten"
+        );
+        for (_, state) in &states {
+            assert_eq!(
+                handle
+                    .snapshot(state.id)
+                    .expect("three-lane read")
+                    .expect("three-lane cow")
+                    .position,
+                state.position
+            );
+        }
+        drop(handle);
+        runtime.shutdown().expect("three-lane parallel shutdown");
+    }
+
+    #[test]
+    fn parallel_deferred_kinematics_single_worker_matches_serial_path() {
+        let seed = || {
+            let runtime = super::RegionalOwnerRuntime::from_store(RegionalEntityStore::new(), 2)
+                .expect("owner runtime");
+            let handle = runtime.handle();
+            let ids = handle
+                .spawn_batch([
+                    cow(Vec3::new(0.5, 64.0, 0.5)),
+                    cow(Vec3::new(128.5, 64.0, 0.5)),
+                ])
+                .expect("single worker kinematics entities");
+            let selected = ids.iter().copied().collect::<HashSet<_>>();
+            let snapshots = handle
+                .snapshots_for_ids(&selected)
+                .expect("warm cross-lane kinematics routes");
+            let states = snapshots
+                .iter()
+                .map(|snapshot| {
+                    let next = Vec3::new(
+                        snapshot.position.x + 1.0,
+                        snapshot.position.y,
+                        snapshot.position.z,
+                    );
+                    (snapshot.clone(), movement(snapshot.id, next))
+                })
+                .collect::<Vec<_>>();
+            (runtime, handle, states)
+        };
+        let (serial_runtime, serial_handle, serial_states) = seed();
+        let (parallel_runtime, parallel_handle, parallel_states) = seed();
+
+        let serial = serial_handle
+            .apply_kinematics_if_current_deferred_journal_committed(serial_states)
+            .expect("serial kinematics batch");
+        let parallel = parallel_handle
+            .apply_kinematics_if_current_parallel_deferred_journal_committed(parallel_states, 1)
+            .expect("single-worker kinematics batch");
+
+        assert_eq!(parallel, serial);
+        for (serial_kinematics, parallel_kinematics) in serial.iter().zip(&parallel) {
+            assert_eq!(serial_kinematics.id, parallel_kinematics.id);
+            let serial_snapshot = serial_handle
+                .snapshot(serial_kinematics.id)
+                .expect("serial read")
+                .expect("serial cow");
+            let parallel_snapshot = parallel_handle
+                .snapshot(parallel_kinematics.id)
+                .expect("parallel read")
+                .expect("parallel cow");
+            assert_eq!(parallel_snapshot, serial_snapshot);
+        }
+        drop(serial_handle);
+        serial_runtime.shutdown().expect("serial shutdown");
+        drop(parallel_handle);
+        parallel_runtime.shutdown().expect("parallel shutdown");
     }
 
     #[test]
@@ -16462,6 +18139,7 @@ mod tests {
             .snapshot(item)
             .expect("claimed item read")
             .expect("claimed item snapshot");
+        let claimed_position = claimed_item.position;
         let mut forged_claim_resolution = claimed_item.clone();
         forged_claim_resolution.item_stack = Some(crate::EntityItemStack::new(7, 1));
         assert!(
@@ -16471,9 +18149,9 @@ mod tests {
         );
         let moved_position = Vec3::new(2.75, 64.25, 0.5);
         assert!(
-            handle
+            !handle
                 .set_position(item, moved_position)
-                .expect("move claimed item")
+                .expect("claimed item motion is rejected")
         );
         let resolved = handle
             .resolve_item_pickup_claim(item, 77, Some(crate::EntityItemStack::new(7, 4)))
@@ -16482,7 +18160,7 @@ mod tests {
         let super::ItemPickupClaimResolution::Updated(resolved) = resolved else {
             panic!("partial item pickup claim must update the entity");
         };
-        assert_eq!(resolved.position, moved_position);
+        assert_eq!(resolved.position, claimed_position);
         assert_eq!(resolved.item_stack, Some(crate::EntityItemStack::new(7, 4)));
         assert_eq!(resolved.retained.item_pickup_claim, None);
 
@@ -16579,12 +18257,10 @@ mod tests {
         const TEAM_SIZE: usize = 1_500;
         const TOTAL_ENTITIES: usize = TEAM_SIZE * 2;
         const FORMATION_WIDTH: usize = 50;
-        const ACTOR_BUDGET: usize = 1_000;
         const MAX_TICKS: u64 = 320;
         const MELEE_RANGE: f64 = 1.75;
         const ATTACK_PERIOD_TICKS: u64 = 10;
         const DEATH_REMOVE_DELAY_TICKS: u64 = 20;
-        const TARGET_SEARCH_CANDIDATES: usize = 64;
 
         fn percentile(samples: &[u128], percentile: usize) -> u128 {
             samples[(samples.len() * percentile).div_ceil(100).saturating_sub(1)]
@@ -16614,35 +18290,6 @@ mod tests {
             let x = if side_a { -6.0 - depth } else { 6.0 + depth };
             let z = (file as f64 - (FORMATION_WIDTH as f64 - 1.0) * 0.5) * 0.9;
             Vec3::new(x, 64.0, z)
-        }
-
-        fn choose_target(
-            actor: EntityId,
-            candidates: &[EntityId],
-            positions: &HashMap<EntityId, Vec3>,
-            tick: u64,
-        ) -> Option<EntityId> {
-            if candidates.is_empty() {
-                return None;
-            }
-            let actor_position = positions.get(&actor)?;
-            let sample_count = candidates.len().min(TARGET_SEARCH_CANDIDATES);
-            let start = (usize::try_from(actor.0.unsigned_abs())
-                .unwrap_or_default()
-                .wrapping_mul(1_103_515_245)
-                .wrapping_add(usize::try_from(tick).unwrap_or_default()))
-                % candidates.len();
-            let stride = 37usize.min(candidates.len().saturating_sub(1).max(1));
-            (0..sample_count)
-                .map(|offset| candidates[(start + offset * stride) % candidates.len()])
-                .filter_map(|candidate| {
-                    let position = positions.get(&candidate)?;
-                    let dx = position.x - actor_position.x;
-                    let dz = position.z - actor_position.z;
-                    Some((candidate, dx * dx + dz * dz))
-                })
-                .min_by(|left, right| left.1.total_cmp(&right.1))
-                .map(|(candidate, _)| candidate)
         }
 
         let lanes = std::env::var("SOLARIS_BATTLE_OWNER_LANES")
@@ -16687,10 +18334,14 @@ mod tests {
             positions.insert(entity, formation_position(false, index));
         }
         let mut alive = ids.iter().copied().collect::<HashSet<_>>();
+        let mut grid_a = BattleSpatialGrid::from_ids(team_a.iter().copied(), &positions);
+        let mut grid_b = BattleSpatialGrid::from_ids(team_b.iter().copied(), &positions);
         let mut targets = HashMap::with_capacity(TOTAL_ENTITIES);
         let mut initial_goals = Vec::with_capacity(TOTAL_ENTITIES);
         for &actor in &team_a {
-            let target = choose_target(actor, &team_b, &positions, 0).expect("team B target");
+            let target = grid_b
+                .choose_target(actor, &positions)
+                .expect("team B target");
             targets.insert(actor, target);
             initial_goals.push((
                 actor,
@@ -16701,7 +18352,9 @@ mod tests {
             ));
         }
         for &actor in &team_b {
-            let target = choose_target(actor, &team_a, &positions, 0).expect("team A target");
+            let target = grid_a
+                .choose_target(actor, &positions)
+                .expect("team A target");
             targets.insert(actor, target);
             initial_goals.push((
                 actor,
@@ -16725,21 +18378,21 @@ mod tests {
             next_attack_tick.insert(team_b[index], phase);
         }
         let mut removals = BTreeMap::<u64, Vec<EntityId>>::new();
-        let mut rotation_cursor_a = 0usize;
-        let mut rotation_cursor_b = 0usize;
         let mut ticks_executed = 0_u64;
         let mut attacks_planned = 0_u64;
         let mut attacks_applied = 0_u64;
         let mut retargets = 0_u64;
         let mut deaths_a = 0_u64;
         let mut deaths_b = 0_u64;
-        let mut targets_outside_actor_cohort = 0_u64;
         let mut missing_follow_targets = 0_u64;
         let mut tick_samples = Vec::<u128>::new();
         let mut goal_samples = Vec::<u128>::new();
         let mut movement_samples = Vec::<u128>::new();
         let mut attack_samples = Vec::<u128>::new();
         let mut retarget_samples = Vec::<u128>::new();
+        let mut retarget_grid_samples = Vec::<u128>::new();
+        let mut retarget_query_samples = Vec::<u128>::new();
+        let mut retarget_commit_samples = Vec::<u128>::new();
         let battle_started = Instant::now();
 
         for tick in 1..=MAX_TICKS {
@@ -16752,70 +18405,46 @@ mod tests {
                     let _ = handle.remove(entity).expect("remove dead battle entity");
                 }
             }
-            let alive_a_order = order_a
-                .iter()
-                .copied()
-                .filter(|entity| alive.contains(entity))
-                .collect::<Vec<_>>();
-            let alive_b_order = order_b
-                .iter()
-                .copied()
-                .filter(|entity| alive.contains(entity))
-                .collect::<Vec<_>>();
-            if alive_a_order.is_empty() || alive_b_order.is_empty() {
+            if !team_a.iter().any(|entity| alive.contains(entity))
+                || !team_b.iter().any(|entity| alive.contains(entity))
+            {
                 break;
             }
-
-            let side_budget = ACTOR_BUDGET / 2;
-            let actor_count_a = alive_a_order.len().min(side_budget);
-            let actor_count_b = alive_b_order.len().min(side_budget);
-            let start_a = rotation_cursor_a % alive_a_order.len();
-            let start_b = rotation_cursor_b % alive_b_order.len();
-            let mut active = (0..actor_count_a)
-                .map(|offset| alive_a_order[(start_a + offset) % alive_a_order.len()])
-                .collect::<HashSet<_>>();
-            active.extend(
-                (0..actor_count_b)
-                    .map(|offset| alive_b_order[(start_b + offset) % alive_b_order.len()]),
-            );
-            rotation_cursor_a = (start_a + actor_count_a) % alive_a_order.len();
-            rotation_cursor_b = (start_b + actor_count_b) % alive_b_order.len();
-            targets_outside_actor_cohort += active
-                .iter()
-                .filter_map(|actor| targets.get(actor))
-                .filter(|target| alive.contains(target) && !active.contains(target))
-                .count() as u64;
+            let active = &alive;
 
             let tick_started = Instant::now();
             let goal_started = Instant::now();
             let prepared = handle
-                .prepare_goal_tick_with_pathing_for_ids(tick, &active)
+                .prepare_goal_tick_with_pathing_for_ids(tick, active)
                 .expect("prepare battle goal tick");
             let resolved = prepared.resolve(&WalkablePathing, PathingBudget::DEFAULT);
-            let stats = handle
-                .apply_prepared_goal_tick(resolved)
-                .expect("apply battle goal tick");
+            let (stats, selected, versioned) = handle
+                .apply_prepared_goal_tick_and_kinematics_for_ids_deferred_journal(resolved, active)
+                .expect("apply battle goal tick and capture kinematics")
+                .expect("fresh battle goal tick");
             missing_follow_targets += stats.missing_follow_targets as u64;
             goal_samples.push(goal_started.elapsed().as_micros());
 
             let movement_started = Instant::now();
-            let selected = handle
-                .snapshots_for_ids(&active)
-                .expect("battle actor snapshots");
+            assert_eq!(
+                selected.len(),
+                alive.len(),
+                "every live battle actor must be processed on every tick"
+            );
             let mut movement_states = Vec::with_capacity(selected.len());
             let mut staged_positions = Vec::with_capacity(selected.len());
-            for snapshot in &selected {
-                if !alive.contains(&snapshot.id) {
+            for current in &selected {
+                if !alive.contains(&current.id) {
                     continue;
                 }
-                let Some(&target) = targets.get(&snapshot.id) else {
+                let Some(&target) = targets.get(&current.id) else {
                     continue;
                 };
                 let Some(&target_position) = positions.get(&target) else {
                     continue;
                 };
-                let dx = target_position.x - snapshot.position.x;
-                let dz = target_position.z - snapshot.position.z;
+                let dx = target_position.x - current.position.x;
+                let dz = target_position.z - current.position.z;
                 let distance = dx.hypot(dz);
                 let max_step = 0.27;
                 let step = (distance - MELEE_RANGE * 0.82).clamp(0.0, max_step);
@@ -16825,44 +18454,45 @@ mod tests {
                     (0.0, 0.0)
                 };
                 let position = Vec3::new(
-                    snapshot.position.x
+                    current.position.x
                         + if distance > f64::EPSILON {
                             dx / distance * step
                         } else {
                             0.0
                         },
-                    snapshot.position.y,
-                    snapshot.position.z
+                    current.position.y,
+                    current.position.z
                         + if distance > f64::EPSILON {
                             dz / distance * step
                         } else {
                             0.0
                         },
                 );
-                movement_states.push((
-                    snapshot.clone(),
-                    EntityKinematics {
-                        id: snapshot.id,
-                        position,
-                        rotation: snapshot.rotation,
-                        velocity: Vec3::new(vx, 0.0, vz),
-                        on_ground: true,
-                    },
-                ));
-                staged_positions.push((snapshot.id, position));
+                movement_states.push(EntityKinematics {
+                    id: current.id,
+                    position,
+                    rotation: current.rotation,
+                    velocity: Vec3::new(vx, 0.0, vz),
+                    on_ground: true,
+                });
+                staged_positions.push((current.id, position));
             }
-            assert!(
-                handle
-                    .apply_kinematics_if_current(movement_states)
-                    .expect("apply battle movement"),
-                "battle movement batch must commit atomically"
+            let versioned = versioned.expect("battle actor batch must be compact-fence eligible");
+            let committed = handle
+                .try_apply_kinematics_if_versioned_deferred_journal(versioned, movement_states)
+                .expect("apply battle movement through compact fence")
+                .expect("battle compact fence must remain current");
+            assert_eq!(
+                committed.len(),
+                alive.len(),
+                "battle movement batch must commit every live actor atomically"
             );
             positions.extend(staged_positions);
             movement_samples.push(movement_started.elapsed().as_micros());
 
             let attack_started = Instant::now();
             let mut damage_by_target = HashMap::<EntityId, f32>::new();
-            for &attacker in &active {
+            for &attacker in active {
                 if !alive.contains(&attacker)
                     || tick < next_attack_tick.get(&attacker).copied().unwrap_or(1)
                 {
@@ -16929,17 +18559,28 @@ mod tests {
             attack_samples.push(attack_started.elapsed().as_micros());
 
             let retarget_started = Instant::now();
+            let mut retarget_grid_us = 0;
+            let mut retarget_query_us = 0;
+            let mut retarget_commit_us = 0;
             if !killed.is_empty() {
-                let alive_a_ids = team_a
-                    .iter()
-                    .copied()
-                    .filter(|entity| alive.contains(entity))
-                    .collect::<Vec<_>>();
-                let alive_b_ids = team_b
-                    .iter()
-                    .copied()
-                    .filter(|entity| alive.contains(entity))
-                    .collect::<Vec<_>>();
+                let grid_started = Instant::now();
+                grid_a = BattleSpatialGrid::from_ids(
+                    team_a
+                        .iter()
+                        .copied()
+                        .filter(|entity| alive.contains(entity)),
+                    &positions,
+                );
+                grid_b = BattleSpatialGrid::from_ids(
+                    team_b
+                        .iter()
+                        .copied()
+                        .filter(|entity| alive.contains(entity)),
+                    &positions,
+                );
+                retarget_grid_us = grid_started.elapsed().as_micros();
+
+                let query_started = Instant::now();
                 let mut goal_updates = Vec::new();
                 for &actor in &order {
                     if !alive.contains(&actor)
@@ -16949,12 +18590,12 @@ mod tests {
                     {
                         continue;
                     }
-                    let candidates = if team_a_set.contains(&actor) {
-                        &alive_b_ids
+                    let target = if team_a_set.contains(&actor) {
+                        grid_b.choose_target(actor, &positions)
                     } else {
-                        &alive_a_ids
+                        grid_a.choose_target(actor, &positions)
                     };
-                    match choose_target(actor, candidates, &positions, tick) {
+                    match target {
                         Some(target) => {
                             targets.insert(actor, target);
                             goal_updates.push((
@@ -16972,21 +18613,27 @@ mod tests {
                     }
                     retargets += 1;
                 }
+                retarget_query_us = query_started.elapsed().as_micros();
                 if !goal_updates.is_empty() {
+                    let commit_started = Instant::now();
+                    let goal_update_count = goal_updates.len();
                     assert_eq!(
                         handle
-                            .set_goals_deferred_journal(goal_updates.clone())
+                            .set_goals_deferred_journal(goal_updates)
                             .expect("retarget battle entities"),
-                        goal_updates.len()
+                        goal_update_count
                     );
+                    retarget_commit_us = commit_started.elapsed().as_micros();
                 }
             }
+            retarget_grid_samples.push(retarget_grid_us);
+            retarget_query_samples.push(retarget_query_us);
+            retarget_commit_samples.push(retarget_commit_us);
             retarget_samples.push(retarget_started.elapsed().as_micros());
             tick_samples.push(tick_started.elapsed().as_micros());
             ticks_executed = tick;
         }
 
-        assert!(targets_outside_actor_cohort > 0);
         assert_eq!(missing_follow_targets, 0);
         assert!(attacks_planned > 0);
         assert!(attacks_applied > 0);
@@ -16998,6 +18645,9 @@ mod tests {
         movement_samples.sort_unstable();
         attack_samples.sort_unstable();
         retarget_samples.sort_unstable();
+        retarget_grid_samples.sort_unstable();
+        retarget_query_samples.sort_unstable();
+        retarget_commit_samples.sort_unstable();
         let alive_a = team_a
             .iter()
             .filter(|entity| alive.contains(entity))
@@ -17008,10 +18658,10 @@ mod tests {
             .count();
         let elapsed_ms = battle_started.elapsed().as_millis();
         let report = format!(
-            "{{\n  \"team_size\": {},\n  \"lanes\": {},\n  \"actor_budget\": {},\n  \"ticks\": {},\n  \"elapsed_ms\": {},\n  \"alive_a\": {},\n  \"alive_b\": {},\n  \"deaths_a\": {},\n  \"deaths_b\": {},\n  \"attacks_planned\": {},\n  \"attacks_applied\": {},\n  \"retargets\": {},\n  \"targets_outside_actor_cohort\": {},\n  \"missing_follow_targets\": {},\n  \"tick_p50_us\": {},\n  \"tick_p95_us\": {},\n  \"tick_p99_us\": {},\n  \"tick_max_us\": {},\n  \"goal_p99_us\": {},\n  \"movement_p99_us\": {},\n  \"attack_p99_us\": {},\n  \"retarget_p99_us\": {}\n}}\n",
+            "{{\n  \"team_size\": {},\n  \"lanes\": {},\n  \"initial_actor_population\": {},\n  \"full_live_population_each_tick\": true,\n  \"ticks\": {},\n  \"elapsed_ms\": {},\n  \"alive_a\": {},\n  \"alive_b\": {},\n  \"deaths_a\": {},\n  \"deaths_b\": {},\n  \"attacks_planned\": {},\n  \"attacks_applied\": {},\n  \"retargets\": {},\n  \"missing_follow_targets\": {},\n  \"tick_p50_us\": {},\n  \"tick_p95_us\": {},\n  \"tick_p99_us\": {},\n  \"tick_max_us\": {},\n  \"goal_p99_us\": {},\n  \"movement_p99_us\": {},\n  \"attack_p99_us\": {},\n  \"retarget_p99_us\": {}\n}}\n",
             TEAM_SIZE,
             lanes,
-            ACTOR_BUDGET,
+            TOTAL_ENTITIES,
             ticks_executed,
             elapsed_ms,
             alive_a,
@@ -17021,7 +18671,6 @@ mod tests {
             attacks_planned,
             attacks_applied,
             retargets,
-            targets_outside_actor_cohort,
             missing_follow_targets,
             percentile(&tick_samples, 50),
             percentile(&tick_samples, 95),
@@ -17043,7 +18692,7 @@ mod tests {
         std::fs::write(&report_path, report).expect("write battle report");
         let tick_p99_us = percentile(&tick_samples, 99);
         println!(
-            "ENTITY_BATTLE_BENCH team_size={TEAM_SIZE} lanes={lanes} actor_budget={ACTOR_BUDGET} ticks={ticks_executed} elapsed_ms={elapsed_ms} alive_a={alive_a} alive_b={alive_b} deaths_a={deaths_a} deaths_b={deaths_b} attacks_planned={attacks_planned} attacks_applied={attacks_applied} retargets={retargets} outside_cohort_targets={targets_outside_actor_cohort} tick_p50_us={} tick_p95_us={} tick_p99_us={tick_p99_us} tick_max_us={} goal_p99_us={} movement_p99_us={} attack_p99_us={} retarget_p99_us={} report={}",
+            "ENTITY_BATTLE_BENCH team_size={TEAM_SIZE} lanes={lanes} initial_actor_population={TOTAL_ENTITIES} full_live_population_each_tick=true ticks={ticks_executed} elapsed_ms={elapsed_ms} alive_a={alive_a} alive_b={alive_b} deaths_a={deaths_a} deaths_b={deaths_b} attacks_planned={attacks_planned} attacks_applied={attacks_applied} retargets={retargets} tick_p50_us={} tick_p95_us={} tick_p99_us={tick_p99_us} tick_max_us={} goal_p99_us={} movement_p99_us={} attack_p99_us={} retarget_p99_us={} report={}",
             percentile(&tick_samples, 50),
             percentile(&tick_samples, 95),
             tick_samples.last().copied().unwrap_or_default(),
@@ -17052,6 +18701,12 @@ mod tests {
             percentile(&attack_samples, 99),
             percentile(&retarget_samples, 99),
             report_path.display(),
+        );
+        println!(
+            "ENTITY_BATTLE_RETARGET_PROFILE grid_p99_us={} query_p99_us={} commit_p99_us={}",
+            percentile(&retarget_grid_samples, 99),
+            percentile(&retarget_query_samples, 99),
+            percentile(&retarget_commit_samples, 99),
         );
         assert!(
             tick_p99_us <= 50_000,

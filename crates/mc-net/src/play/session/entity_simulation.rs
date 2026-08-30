@@ -14,6 +14,7 @@ use super::simulation_input_publication::ExpectedEntityRoutingMove;
 use super::visibility::{
     LastSentEntityState, entity_wire_move_for_kind, packed_head_yaw_changed,
     publish_server_entity_motion_locked,
+    refresh_entity_target_visibility_with_old_observers_locked,
 };
 use super::*;
 
@@ -758,6 +759,154 @@ fn splitmix64(mut value: u64) -> u64 {
     value ^ (value >> 31)
 }
 
+// load-bench-only coarse phase profiler for apply_entity_physics_and_dispatch_core.
+// Emits one PHYSICS_APPLY_PROFILE line per large apply (input steps > 256) when the
+// profiler guard drops at function return (covers every return path).
+#[cfg(feature = "load-bench")]
+struct PhysicsApplyProfile {
+    tick: u64,
+    total_started: std::time::Instant,
+    phase_started: std::time::Instant,
+    publication_refresh_started: Option<std::time::Instant>,
+    preflight_us: u64,
+    owner_apply_us: u64,
+    publication_refresh_us: u64,
+    locked_publish_us: u64,
+    movement_plan_started: bool,
+    input_steps: usize,
+    filtered_steps: usize,
+    effective_steps: usize,
+    applied_kinematics: usize,
+    applied_steps: usize,
+    tracker_inputs: usize,
+    movements: usize,
+    chunk_crossings: usize,
+    publication_retries: u64,
+}
+
+#[cfg(feature = "load-bench")]
+impl PhysicsApplyProfile {
+    fn new(tick: u64, input_steps: usize) -> Self {
+        let now = std::time::Instant::now();
+        Self {
+            tick,
+            total_started: now,
+            phase_started: now,
+            publication_refresh_started: None,
+            preflight_us: 0,
+            owner_apply_us: 0,
+            publication_refresh_us: 0,
+            locked_publish_us: 0,
+            movement_plan_started: false,
+            input_steps,
+            filtered_steps: input_steps,
+            effective_steps: input_steps,
+            applied_kinematics: 0,
+            applied_steps: 0,
+            tracker_inputs: 0,
+            movements: 0,
+            chunk_crossings: 0,
+            publication_retries: 0,
+        }
+    }
+
+    fn elapsed_us(started: std::time::Instant) -> u64 {
+        u64::try_from(started.elapsed().as_micros()).unwrap_or(u64::MAX)
+    }
+
+    fn finish_preflight(&mut self) {
+        self.preflight_us = Self::elapsed_us(self.phase_started);
+        self.phase_started = std::time::Instant::now();
+    }
+
+    fn finish_owner_apply(&mut self, applied_kinematics: usize) {
+        self.owner_apply_us = Self::elapsed_us(self.phase_started);
+        self.applied_kinematics = applied_kinematics;
+    }
+
+    fn begin_publication_refresh(&mut self) {
+        self.publication_refresh_started = Some(std::time::Instant::now());
+    }
+
+    fn finish_publication_refresh(&mut self) {
+        if let Some(started) = self.publication_refresh_started.take() {
+            self.publication_refresh_us = self
+                .publication_refresh_us
+                .saturating_add(Self::elapsed_us(started));
+        }
+    }
+
+    fn record_publication_retry(&mut self) {
+        self.publication_retries = self.publication_retries.saturating_add(1);
+    }
+
+    fn begin_locked_publish(&mut self) {
+        self.phase_started = std::time::Instant::now();
+    }
+
+    fn finish_locked_publish(&mut self) {
+        self.locked_publish_us = Self::elapsed_us(self.phase_started);
+        self.phase_started = std::time::Instant::now();
+        self.movement_plan_started = true;
+    }
+
+    fn record_filtered(&mut self, filtered_steps: usize) {
+        self.filtered_steps = filtered_steps;
+    }
+
+    fn record_effective(&mut self, effective_steps: usize) {
+        self.effective_steps = effective_steps;
+    }
+
+    fn record_applied_steps(&mut self, applied_steps: usize) {
+        self.applied_steps = applied_steps;
+    }
+
+    fn record_tracker_inputs(&mut self, tracker_inputs: usize) {
+        self.tracker_inputs = tracker_inputs;
+    }
+
+    fn record_chunk_crossings(&mut self, chunk_crossings: usize) {
+        self.chunk_crossings = chunk_crossings;
+    }
+
+    fn record_movements(&mut self, movements: usize) {
+        self.movements = movements;
+    }
+}
+
+#[cfg(feature = "load-bench")]
+impl Drop for PhysicsApplyProfile {
+    fn drop(&mut self) {
+        if self.input_steps <= 256 {
+            return;
+        }
+        let movement_plan_us = self
+            .movement_plan_started
+            .then(|| Self::elapsed_us(self.phase_started))
+            .unwrap_or(0);
+        let total_us = Self::elapsed_us(self.total_started);
+        eprintln!(
+            "PHYSICS_APPLY_PROFILE tick={} total_us={total_us} preflight_us={} owner_apply_us={} publication_refresh_us={} locked_publish_us={} movement_plan_us={} input_steps={} filtered={} effective={} applied_kinematics={} applied_steps={} tracker_inputs={} movements={} chunk_crossings={} publication_retries={}",
+            self.tick,
+            self.preflight_us,
+            self.owner_apply_us,
+            self.publication_refresh_us,
+            self.locked_publish_us,
+            movement_plan_us,
+            self.input_steps,
+            self.filtered_steps,
+            self.effective_steps,
+            self.applied_kinematics,
+            self.applied_steps,
+            self.tracker_inputs,
+            self.movements,
+            self.chunk_crossings,
+            self.publication_retries,
+        );
+    }
+}
+
 impl SessionRegistry {
     fn publish_villager_metadata_updates(&self, expected: Vec<EntitySnapshot>) {
         if expected.is_empty() {
@@ -840,7 +989,6 @@ impl SessionRegistry {
             None,
             tick,
             EntitySimulationTickPolicy {
-                entity_updates_per_lane: usize::MAX,
                 pathing_candidates_per_entity: PathingBudget::DEFAULT.max_candidates_per_entity,
                 simulation_distance: DEFAULT_VIEW_DISTANCE,
             },
@@ -859,7 +1007,6 @@ impl SessionRegistry {
             None,
             tick,
             EntitySimulationTickPolicy {
-                entity_updates_per_lane: usize::MAX,
                 pathing_candidates_per_entity: PathingBudget::DEFAULT.max_candidates_per_entity,
                 simulation_distance,
             },
@@ -878,7 +1025,6 @@ impl SessionRegistry {
             None,
             tick,
             EntitySimulationTickPolicy {
-                entity_updates_per_lane: usize::MAX,
                 pathing_candidates_per_entity,
                 simulation_distance: DEFAULT_VIEW_DISTANCE,
             },
@@ -898,7 +1044,6 @@ impl SessionRegistry {
             None,
             tick,
             EntitySimulationTickPolicy {
-                entity_updates_per_lane: usize::MAX,
                 pathing_candidates_per_entity: PathingBudget::DEFAULT.max_candidates_per_entity,
                 simulation_distance: DEFAULT_VIEW_DISTANCE,
             },
@@ -919,7 +1064,6 @@ impl SessionRegistry {
             None,
             tick,
             EntitySimulationTickPolicy {
-                entity_updates_per_lane: usize::MAX,
                 pathing_candidates_per_entity: PathingBudget::DEFAULT.max_candidates_per_entity,
                 simulation_distance: DEFAULT_VIEW_DISTANCE,
             },
@@ -941,7 +1085,6 @@ impl SessionRegistry {
         )>,
     ) -> Vec<EntityPhysicsQuery> {
         let EntitySimulationTickPolicy {
-            entity_updates_per_lane,
             pathing_candidates_per_entity,
             simulation_distance,
         } = policy;
@@ -959,8 +1102,6 @@ impl SessionRegistry {
                 blocks,
                 items,
             });
-        let (active_chunks, active_entity_candidates) =
-            self.simulation_inputs.active_entity_candidates();
         let recipients = self.movement_recipients.load_full();
         let mut player_positions = Vec::new();
         let mut hostile_target_positions = Vec::new();
@@ -979,22 +1120,12 @@ impl SessionRegistry {
                 );
             }
         }
+        let (active_chunks, simulation_chunks, active_population_ids) = self
+            .simulation_inputs
+            .active_entity_candidates_matching_chunks(|chunk| {
+                entity_is_near_player_chunk(chunk, &player_positions, simulation_distance)
+            });
         let terrain_pathing_entities = self.simulation_inputs.terrain_pathing_entities();
-        let active_population_ids = active_entity_candidates
-            .into_iter()
-            .filter(|&entity| {
-                self.simulation_inputs
-                    .entity_chunk(entity)
-                    .is_some_and(|chunk| {
-                        active_chunks.contains(&chunk)
-                            && entity_is_near_player_chunk(
-                                chunk,
-                                &player_positions,
-                                simulation_distance,
-                            )
-                    })
-            })
-            .collect::<HashSet<_>>();
         let villager_day_time = i64::try_from(self.world_time()).unwrap_or(i64::MAX);
         let villager_profile = self.villager_brain_profile();
         let overridden_villagers = self.overridden_villager_entities();
@@ -1005,29 +1136,19 @@ impl SessionRegistry {
             villager_day_time,
             &villager_profile,
         );
-        let lane_count = cpu_resources.map_or(1, |cpu| cpu.cpu_limit().max(1));
-        let configured_budget = lane_count.saturating_mul(entity_updates_per_lane.max(1));
-        let freshness_budget =
-            crate::runtime_entity_budget::freshness_budget(active_population_ids.len());
-        let simulation_budget = if cpu_resources.is_some() {
-            configured_budget.max(freshness_budget)
-        } else {
-            usize::MAX
-        };
-        let simulation_overloaded = active_population_ids.len() > simulation_budget;
-        let active_entity_candidates = if simulation_overloaded {
-            bounded_entity_ids_due_for_tick(&active_population_ids, tick, simulation_budget)
-        } else {
-            active_population_ids.clone()
-        };
-        self.entity_update_budget_per_lane
-            .store(entity_updates_per_lane.max(1), Ordering::Relaxed);
-        self.entity_update_budget_total.store(
-            simulation_budget.min(active_population_ids.len()),
+        // Performance work must never reduce entity/AI activity: every entity
+        // in the active population is simulated every tick, so selection is
+        // the full population and this path never rotates simulation cohorts.
+        let active_entity_candidates = &active_population_ids;
+        let lane_count = cpu_resources.map_or(1, |resources| resources.cpu_limit().max(1));
+        self.entity_update_budget_per_lane.store(
+            active_population_ids.len().div_ceil(lane_count),
             Ordering::Relaxed,
         );
+        self.entity_update_budget_total
+            .store(active_population_ids.len(), Ordering::Relaxed);
         self.entity_update_selected
-            .store(active_entity_candidates.len(), Ordering::Relaxed);
+            .store(active_population_ids.len(), Ordering::Relaxed);
         self.entity_update_active_population
             .store(active_population_ids.len(), Ordering::Relaxed);
         #[cfg(feature = "load-bench")]
@@ -1066,7 +1187,7 @@ impl SessionRegistry {
                 if entity.lifecycle == EntityLifecycle::Alive {
                     let chunk = chunk_pos_from_coords(entity.position.x, entity.position.z);
                     if active_chunks.contains(&chunk) {
-                        let type_name = entity.type_name.as_str();
+                        let type_name = &*entity.type_name;
                         active_entity_ids.insert(entity.id);
                         if type_name == "minecraft:shulker_bullet" {
                             active_shulker_bullet_ids.insert(entity.id);
@@ -1143,7 +1264,7 @@ impl SessionRegistry {
             }
             if villager_brain_probe_ids.contains(&entity.id)
                 && entity.lifecycle == EntityLifecycle::Alive
-                && entity.type_name == "minecraft:villager"
+                && &*entity.type_name == "minecraft:villager"
                 && entity.villager.is_some()
                 && villager_brain_due_for_tick(
                     entity.id,
@@ -1220,13 +1341,14 @@ impl SessionRegistry {
         let targets_us = u64::try_from(targets_started.elapsed().as_micros()).unwrap_or(u64::MAX);
         #[cfg(feature = "load-bench")]
         let prepare_started = std::time::Instant::now();
-        let eligible_goal_entity_ids = active_entity_ids
+        // Every eligible goal entity (sheep grazing and exclusive-flight
+        // exclusions preserved) is goal-selected every tick; the legacy
+        // ENTITY_GOAL_UPDATES_PER_TICK cohort cap never applies here.
+        let goal_entity_ids = active_entity_ids
             .difference(&sheep_grazing_entities)
             .copied()
             .filter(|entity_id| !active_exclusive_flight_ids.contains(entity_id))
             .collect::<HashSet<_>>();
-        let goal_entity_ids =
-            entity_goal_ids_due_for_tick(&eligible_goal_entity_ids, tick, simulation_overloaded);
         let unprojected_entity_ids = active_entity_ids
             .difference(&goal_entity_ids)
             .copied()
@@ -1360,12 +1482,10 @@ impl SessionRegistry {
                 continue;
             }
             let chunk = chunk_pos_from_coords(entity.position.x, entity.position.z);
-            if !active_chunks.contains(&chunk)
-                || !entity_is_near_player_chunk(chunk, &player_positions, simulation_distance)
-            {
+            if !simulation_chunks.contains(&chunk) {
                 continue;
             }
-            let type_name = entity.type_name.as_str();
+            let type_name = &*entity.type_name;
             active_entity_aabbs.insert(entity.id, entity_geometry(type_name, entity.animal).aabb);
             active_entity_kinds.insert(
                 entity.id,
@@ -1733,6 +1853,8 @@ impl SessionRegistry {
         steps: &[EntityPhysicsStep],
         projectile_physics_facts: &EntityProjectilePhysicsFacts,
     ) -> Vec<EntityPhysicsStep> {
+        #[cfg(feature = "load-bench")]
+        let mut profile = PhysicsApplyProfile::new(tick, steps.len());
         let mut scheduled_tracker_ids = steps.iter().map(|step| step.id).collect::<Vec<_>>();
         scheduled_tracker_ids.sort_unstable();
         scheduled_tracker_ids.dedup();
@@ -1749,76 +1871,62 @@ impl SessionRegistry {
                 .map(|query| (query.id, *query))
                 .collect::<HashMap<_, _>>()
         });
-        let needs_filter = steps.iter().any(|step| {
+        // Single validation/state-capture pass: reject non-finite steps and
+        // steps that fail expected-snapshot validation while capturing the
+        // old chunk, old motion (at most one motion_state lookup per step,
+        // reused for validation and capture), and accepted kinematics.
+        let mut accepted_steps = Vec::with_capacity(steps.len());
+        let mut old_chunks: HashMap<_, _> = HashMap::with_capacity(steps.len());
+        let mut old_motion: HashMap<_, _> = HashMap::with_capacity(steps.len());
+        let mut kinematics = Vec::new();
+        for step in steps {
             if !step.position.is_finite() || !step.velocity.is_finite() {
-                return true;
+                continue;
             }
-            let Some(expected_by_id) = expected_by_id.as_ref() else {
-                return false;
-            };
-            let Some(expected) = expected_by_id.get(&step.id) else {
-                return true;
-            };
-            !entities
-                .motion_state(step.id)
-                .is_some_and(|current| entity_physics_query_matches(current, expected))
-        });
-        let filtered_steps = needs_filter.then(|| {
-            steps
-                .iter()
-                .copied()
-                .filter(|step| {
-                    if !step.position.is_finite() || !step.velocity.is_finite() {
-                        return false;
-                    }
-                    let Some(expected_by_id) = expected_by_id.as_ref() else {
-                        return true;
-                    };
-                    let Some(expected) = expected_by_id.get(&step.id) else {
-                        return false;
-                    };
-                    entities
-                        .motion_state(step.id)
-                        .is_some_and(|current| entity_physics_query_matches(current, expected))
-                })
-                .collect::<Vec<_>>()
-        });
-        let steps = filtered_steps.as_deref().unwrap_or(steps);
-        let old_chunks: HashMap<_, _> = steps
-            .iter()
-            .filter_map(|step| {
-                self.simulation_inputs
-                    .entity_chunk(step.id)
-                    .map(|chunk| (step.id, chunk))
-            })
-            .collect();
-        let old_motion: HashMap<_, _> = steps
-            .iter()
-            .filter_map(|step| entities.motion_state(step.id).map(|state| (step.id, state)))
-            .collect();
-        let kinematics = steps
-            .iter()
-            .filter_map(|step| {
-                old_motion
-                    .get(&step.id)
-                    .filter(|motion| {
-                        !motion.is_arrow
-                            && !motion.is_hurting_projectile
-                            && !motion.is_throwable_projectile
-                    })
-                    .map(|motion| EntityKinematics {
+            let expected = expected_by_id
+                .as_ref()
+                .and_then(|by_id| by_id.get(&step.id));
+            if expected_by_id.is_some() && expected.is_none() {
+                continue;
+            }
+            let current_motion = entities.motion_state(step.id);
+            if let Some(expected) = expected {
+                let Some(current) = current_motion else {
+                    continue;
+                };
+                if !entity_physics_query_matches(current, expected) {
+                    continue;
+                }
+            }
+            accepted_steps.push(*step);
+            if let Some(chunk) = self.simulation_inputs.entity_chunk(step.id) {
+                old_chunks.insert(step.id, chunk);
+            }
+            if let Some(motion) = current_motion {
+                old_motion.insert(step.id, motion);
+                if !motion.is_arrow
+                    && !motion.is_hurting_projectile
+                    && !motion.is_throwable_projectile
+                {
+                    kinematics.push(EntityKinematics {
                         id: step.id,
                         position: step.position,
                         rotation: motion.rotation,
                         velocity: step.velocity,
                         on_ground: step.on_ground,
-                    })
-            })
-            .collect::<Vec<_>>();
+                    });
+                }
+            }
+        }
+        let steps = accepted_steps.as_slice();
+        #[cfg(feature = "load-bench")]
+        profile.record_filtered(steps.len());
         let regional_batch_count = entities.parallel_kinematics_batch_count(&kinematics);
         let regional_worker_permits = cpu_resources
             .map(|resources| acquire_regional_worker_permits(resources, regional_batch_count))
             .unwrap_or_default();
+        #[cfg(feature = "load-bench")]
+        profile.finish_preflight();
         #[cfg(test)]
         self.pause_before_physics_owner_apply_for_test();
         let applied_kinematics = if regional_worker_permits.is_empty() {
@@ -1830,14 +1938,39 @@ impl SessionRegistry {
             )
         };
         drop(regional_worker_permits);
-        let session_inner = self.lock_inner("publish entity physics");
-        // Re-read under the publication lock. Regional owner mutation does not
-        // require this lock, so a snapshot taken while waiting for it is not a
-        // valid publication fence.
-        for id in &step_ids {
-            entities.invalidate(*id);
-        }
-        entities.prefetch(&step_ids);
+        #[cfg(feature = "load-bench")]
+        profile.finish_owner_apply(applied_kinematics.len());
+        // Re-read the owner state before taking the publication lock:
+        // regional owner mutation does not require this lock, so snapshots
+        // fetched before it is acquired are only a valid publication view
+        // while their versioned fence stays current. The fence is validated
+        // cheaply under the lock; a stale fence drops the lock and refetches
+        // outside it instead of reading the owner under the session registry
+        // mutex.
+        #[cfg(feature = "load-bench")]
+        profile.begin_publication_refresh();
+        let mut publication_snapshots = entities.refresh_publication_snapshots(&step_ids);
+        #[cfg(feature = "load-bench")]
+        profile.finish_publication_refresh();
+        #[cfg(feature = "load-bench")]
+        profile.begin_locked_publish();
+        let session_inner = loop {
+            let session_inner = self.lock_inner("publish entity physics");
+            let publication_current = publication_snapshots
+                .as_ref()
+                .is_none_or(|fence| entities.versioned_snapshots_are_current(fence));
+            if publication_current {
+                break session_inner;
+            }
+            drop(session_inner);
+            #[cfg(feature = "load-bench")]
+            profile.record_publication_retry();
+            #[cfg(feature = "load-bench")]
+            profile.begin_publication_refresh();
+            publication_snapshots = entities.refresh_publication_snapshots(&step_ids);
+            #[cfg(feature = "load-bench")]
+            profile.finish_publication_refresh();
+        };
         let mut inner = SessionEntityGuards {
             inner: session_inner,
             entities,
@@ -1915,6 +2048,8 @@ impl SessionRegistry {
                     .get(&step.id)
                     .is_some_and(|motion| motion.is_arrow)
         }));
+        #[cfg(feature = "load-bench")]
+        profile.record_applied_steps(applied_steps.len());
         let effective_steps = applied_steps
             .iter()
             .filter(|step| !rejected_arrows.contains(&step.id))
@@ -1933,6 +2068,8 @@ impl SessionRegistry {
         inner.arrow_tick_scratch.rejected = rejected_arrows;
         processed_arrows.clear();
         inner.arrow_tick_scratch.processed = processed_arrows;
+        #[cfg(feature = "load-bench")]
+        profile.record_effective(effective_steps.len());
         let steps = effective_steps.as_slice();
         let terrain_pathing_additions = steps
             .iter()
@@ -1992,6 +2129,8 @@ impl SessionRegistry {
                 entity_lifecycle_tick,
             };
         }
+        #[cfg(feature = "load-bench")]
+        profile.record_chunk_crossings(chunk_crossings.len());
         let old_observers_by_entity = chunk_crossings
             .iter()
             .map(|&(entity_id, _, _)| {
@@ -2014,8 +2153,15 @@ impl SessionRegistry {
             debug_assert_ne!(old_chunk, new_chunk);
         }
         for &(entity_id, old_chunk, new_chunk) in &chunk_crossings {
-            dispatches.extend(refresh_entity_target_visibility_locked(
-                &mut inner, entity_id, old_chunk, new_chunk,
+            let Some(old_observers) = old_observers_by_entity.get(&entity_id) else {
+                continue;
+            };
+            dispatches.extend(refresh_entity_target_visibility_with_old_observers_locked(
+                &mut inner,
+                entity_id,
+                old_chunk,
+                new_chunk,
+                old_observers,
             ));
         }
         let item_ids = steps
@@ -2029,21 +2175,7 @@ impl SessionRegistry {
             .collect::<Vec<_>>();
         dispatches.extend(merge_item_entities_locked(&mut inner, &item_ids));
         let ordinary_tracking_turn = tick.is_multiple_of(ENTITY_MOVE_SEND_INTERVAL_TICKS);
-        let natural_tracker_ids = steps
-            .iter()
-            .filter(|step| {
-                inner.natural_hostile_mobs.contains(&step.id)
-                    || inner.natural_ground_mobs.contains(&step.id)
-                    || inner.natural_aquatic_mobs.contains(&step.id)
-            })
-            .map(|step| step.id)
-            .collect::<HashSet<_>>();
         let movement_publication_budget = self.entity_movement_publication_budget();
-        let natural_tracker_ids_due = bounded_entity_ids_due_for_tick(
-            &natural_tracker_ids,
-            tick,
-            movement_publication_budget,
-        );
         let mut tracker_inputs = Vec::with_capacity(steps.len());
         for step in steps {
             let Some(motion) = inner.entities.motion_state(step.id) else {
@@ -2053,9 +2185,6 @@ impl SessionRegistry {
             let smooth_natural_mob = inner.natural_hostile_mobs.contains(&step.id)
                 || inner.natural_ground_mobs.contains(&step.id)
                 || inner.natural_aquatic_mobs.contains(&step.id);
-            if smooth_natural_mob && !natural_tracker_ids_due.contains(&step.id) {
-                continue;
-            }
             if !ordinary_tracking_turn && !latency_sensitive && !smooth_natural_mob {
                 continue;
             }
@@ -2072,6 +2201,8 @@ impl SessionRegistry {
             );
             tracker_inputs.push((motion, last_sent, smooth_natural_mob));
         }
+        #[cfg(feature = "load-bench")]
+        profile.record_tracker_inputs(tracker_inputs.len());
         let lifecycle_tick = inner.entity_lifecycle_tick;
         let pickup_ready_items = steps
             .iter()
@@ -2107,6 +2238,8 @@ impl SessionRegistry {
         } = inner;
         drop(entities);
         drop(session_inner);
+        #[cfg(feature = "load-bench")]
+        profile.finish_locked_publish();
         #[cfg(test)]
         self.pause_before_session_movement_plan_for_test();
         let pickup_positions = steps
@@ -2211,6 +2344,8 @@ impl SessionRegistry {
             ));
         }
 
+        #[cfg(feature = "load-bench")]
+        profile.record_movements(movements.len());
         if movements.is_empty() {
             entity_movement_trackers.compare_exchange_many(tracker_commits);
             dispatch_visibility_commands(dispatches);
@@ -2371,12 +2506,21 @@ impl SessionRegistry {
 
     pub(crate) fn landed_falling_blocks(
         &self,
+        expected: &[EntityPhysicsQuery],
         steps: &[EntityPhysicsStep],
     ) -> Vec<LandedFallingBlock> {
+        let falling_block_ids = expected
+            .iter()
+            .filter(|query| query.kind == EntityPhysicsKind::FallingBlock)
+            .map(|query| query.id)
+            .collect::<HashSet<_>>();
+        if falling_block_ids.is_empty() {
+            return Vec::new();
+        }
         let entities = self.lock_entities("collect landed falling blocks");
         steps
             .iter()
-            .filter(|step| step.on_ground)
+            .filter(|step| step.on_ground && falling_block_ids.contains(&step.id))
             .filter_map(|step| {
                 let entity = entities.snapshot(step.id)?;
                 if entity.lifecycle != EntityLifecycle::Alive

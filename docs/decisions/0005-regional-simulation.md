@@ -304,6 +304,9 @@ entity while retaining the single-entity low-latency path and the batch CAS
 fence. Deterministic tests count one physics schedule run for 76 same-region
 entities, one per region for same-lane and multi-lane updates, zero on stale
 rejection, and prove journal-failure rollback restores the complete batch.
+If any multi-lane rollback cannot be confirmed, or if finalization succeeds on
+only a subset, the coordinator marks the outcome unknown and fail-stops later
+reads, mutations, fallback, and retries until controlled recovery.
 Collision-backed canonical pathing facts are initialized synchronously before
 the entity ticker is spawned. The prewarm returns a non-zero readiness value
 that is moved into the ticker task, so first-use table construction cannot land
@@ -628,8 +631,10 @@ registry, so this is a removed global read fence rather than a claim that item
 lifecycle is fully regional.
 Prepared-goal apply uses shared topology plus the admissions resolved from its
 active goal inputs, follow-target sources, lease/batch regions, and any requested
-post-apply kinematics IDs. Its multi-lane prepare/commit/finalize remains atomic
-across participating lanes, while direct mutations in unrelated lanes continue
+post-apply kinematics IDs. Its multi-lane prepare/commit/finalize is atomic
+across participating lanes in normal operation; an unconfirmed rollback or
+partial finalization is explicitly outcome-unknown and fail-stops instead of
+falling back or retrying. Direct mutations in unrelated lanes continue
 independently.
 Hostile goal planning now compares the computed goal with the goal already in
 the simulation view. Equal wander, follow-position, or idle goals are removed

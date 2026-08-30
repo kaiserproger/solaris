@@ -1,23 +1,138 @@
 # Luau Plugins
 
-Solaris exposes one production Luau plugin contract: API `0.6.0`. A manifest
-requesting any other version is rejected. There is no legacy manifest or Luau
-API compatibility path.
+Solaris exposes one current Luau plugin contract: API `0.6.0`. A manifest
+requesting any other version is rejected; there is no legacy API or manifest
+compatibility path. Plugin packages run on the server in sandboxed strict Luau.
+They are not Fabric, NeoForge, Forge, Bukkit, or Paper server mods.
+
+This guide has two layers:
+
+- **Operators:** use [deployment](#operator-deployment),
+  [client requirements](#deployment-server-only-or-loader-required), and
+  [check/debugging](#check-and-debugging) first.
+- **Authors:** start with [package and manifest](#package-and-manifest),
+  [capabilities](#permissions-and-capabilities), [events](#events), and
+  [commands](#commands). Storage, menus, transactions, zones, and lifecycle
+  details remain in the corresponding reference sections below.
+- **Players:** follow
+  [Solaris Loader installation](SOLARIS_LOADER.md) only when the operator's
+  selected plugins require client bundles.
 
 The future full server/client addon platform is specified separately in
 [`LUAU_ADDON_API_1_0_SPEC.md`](LUAU_ADDON_API_1_0_SPEC.md), with its parked
 implementation backlog in
-[`LUAU_ADDON_API_1_0_TASKS.md`](LUAU_ADDON_API_1_0_TASKS.md). Those tasks are
-blocked until the scoped vanilla 26.1.2 parity gate is closed and the owner
-explicitly activates the first addon-platform milestone; they do not describe
-current API `0.6.0` behavior.
+[`LUAU_ADDON_API_1_0_TASKS.md`](LUAU_ADDON_API_1_0_TASKS.md). It does not
+represent current API `0.6.0` behavior.
 
-`mc-net` provides the `0.6.0` plugin-storage, zone, inventory-menu,
-inventory/storage transaction, player-inventory transaction, player-teleport,
-connected-player query, generic villager-binding, and bounded villager-goal
-adapters. It also publishes committed player block breaks and owner-targeted
-zone membership transitions. Colony identity, roles, orders, and persistence
-remain plugin-owned Luau policy rather than Rust API concepts.
+`mc-net` currently provides plugin storage, zones, server-owned inventory menus,
+inventory/storage and player-inventory transactions, same-dimension teleports,
+connected-player queries, generic villager binding/goals, bounded world/entity
+mutations, and committed gameplay events. Domain policy remains in Luau. For
+example, colony identities, roles, orders, and persistence are plugin-owned;
+plugins do not receive Rust world, entity, region, lock, socket, or scheduler
+handles.
+
+## Operator deployment
+
+An external plugin is one child directory below `[plugins].directory`. Copy the
+complete package, then validate it before startup:
+
+```toml
+[plugins]
+directory = "plugins"
+strict = true
+expected = ["my-plugin"]
+```
+
+```sh
+solaris --check --config server.toml
+solaris --config server.toml
+```
+
+When running from source, use `cargo run --bin mc-server --` in place of
+`solaris`. `strict = true` is the production-shaped mode: every filesystem entry
+must be a valid package, every selected plugin must pass compile/startup, and
+`expected` must exactly match the final external-plus-bundled id set. Keep
+`strict = false` only for local authoring where skipping an ordinary broken
+package is intentional.
+
+Bundled examples are disabled until selected explicitly:
+
+```toml
+[plugins]
+directory = "plugins"
+bundled = ["basic-economy", "online-roster"]
+strict = true
+expected = ["basic-economy", "online-roster", "my-plugin"]
+```
+
+The shipped examples are demonstrations, not an installed standard plugin pack.
+Read their `plugin.toml`, `config.toml`, `main.lua`, and README under
+[`../examples/plugins/`](../examples/plugins/) before enabling them.
+
+### Deployment: server-only or Loader-required
+
+Deployment is derived from the validated manifest; there is no separate flag:
+
+- **`server_only`:** no `[client].bundles` are declared. An ordinary vanilla
+  Minecraft 26.1.2 client can connect.
+- **`server_and_client`:** at least one client bundle is declared. Every joining
+  player needs the Solaris Loader adapter for a supported platform and must
+  approve the exact requested permission set. A client without the required
+  handshake is disconnected during Configuration rather than shown substituted
+  content.
+
+Run `--check` to see each plugin's derived `deployment`, `supported_loaders`,
+`permissions`, `client_bundles`, and `total_artifact_bytes`. Give affected
+players [`SOLARIS_LOADER.md`](SOLARIS_LOADER.md); do not tell all players to
+install Loader when the selected set is entirely server-only.
+
+### Lifecycle and reload boundary
+
+Discovery, manifest validation, command ownership, worldgen selection, and
+client bundle selection occur at startup. API `0.6.0` has no filesystem watcher.
+On Unix, `SIGHUP` prepares and atomically replaces Luau generations only when
+the server started and remains configured with `plugins.strict = true`.
+
+A safe reload requires the same ordered plugin identities and player command
+roots, worldgen contributions, and client bundle contracts. Changing any of
+those requires a full server restart; changing a worldgen contribution also
+requires a fresh world directory under the persisted world contract. A reload
+re-reads package `config.toml`, constructs every candidate VM, runs candidate
+`server.started` handlers with staged output, and swaps only after the whole
+candidate is admitted. A rejected reload leaves the current generation active.
+Runtime-local timers/state start fresh after a successful reload; durable plugin
+storage does not.
+
+### Check and debugging
+
+A successful check emits JSON without binding the server. A useful focused view
+is:
+
+```sh
+solaris --check --config server.toml |
+  jq '{operator_warnings, discovered_plugins}'
+```
+
+For every discovered plugin, confirm the id, deployment, supported loaders,
+permissions, bundle hashes/sizes, and expected-set membership. In strict mode,
+malformed packages, stray entries, duplicate ids or command roots, unknown API
+versions/capabilities/events, Luau diagnostics, startup traps, missing client
+artifacts, and expected-set drift fail check/startup.
+
+At runtime, inspect the server log for `Luau plugin discovered`, reload reports,
+handler/batch rejection diagnostics, and the final host exit report. A handler
+trap or budget/admission failure disables only that plugin and unregisters its
+command roots; it is not a successful degraded state to ignore. Reproduce author
+issues with the smallest package and run the focused host tests when developing:
+
+```sh
+cargo test -p mc-script
+cargo test -p mc-test-harness --test plugin_examples
+```
+
+The Loader-required fixture and real-client commands are documented in
+[`../examples/loader-live-gate/README.md`](../examples/loader-live-gate/README.md).
 
 ## Package And Manifest
 
@@ -95,7 +210,7 @@ Optional startup-only worldgen declarations are also available:
 
 ```toml
 [worldgen]
-ore_profile = "geological_deposits"
+ore_profile = "realistic_deposits"
 settlement_profile = "plains_village_prototype"
 
 [[worldgen.settlement_buildings]]
@@ -115,8 +230,10 @@ building = "smithy"
 ```
 
 Installing `examples/plugins/geological-mines` selects large deterministic
-cross-chunk deposits and disables the vanilla ore pass for that world. Without
-a declaration the ore profile remains `vanilla`.
+cross-chunk deposits under the canonical `realistic_deposits` profile and
+disables the vanilla ore pass for that world. Without a declaration the ore
+profile remains `vanilla`. Manifests must use the canonical `realistic_deposits`
+name; changing the ore profile changes the persisted world contract.
 
 Installing `examples/plugins/settlement-prototype` selects one bounded plains
 village prototype. Solaris loads the vanilla fountain, small-house, and
@@ -126,6 +243,7 @@ spacing/separation/salt. Omitting `settlement_buildings` selects all three
 prototype parts. Seed zero fixes the prototype near spawn; other seeds use
 deterministic grassland placement. Missing template data fails startup instead
 of substituting a Solaris-authored building.
+
 
 Settlement descriptors are startup-only, immutable, and owned by the plugin
 that declares the settlement profile. A plan has at most three uniquely
@@ -358,6 +476,16 @@ and times are rejected. The file is capped at 64 KiB; nesting at 8 container
 levels; every table or array at 128 entries; keys at 128 UTF-8 bytes; and
 strings at 4096 UTF-8 bytes. Validation is eager and recursive. An invalid
 configuration skips only that plugin before it can claim command roots.
+
+### Permissions and capabilities
+
+Server-side `capabilities` authorize privileged Luau host calls. They are
+separate from Loader bundle `permissions`, which a player approves for client
+content. Declaring `storage`, for example, does not grant client filesystem or
+network access; declaring `load_assets` in a client bundle does not let Luau
+read arbitrary server files. Both lists are closed, duplicate-free, and checked
+before activation. An undeclared server capability makes its privileged call
+fail synchronously; an unknown capability rejects discovery.
 
 `capabilities` is an exact, duplicate-free list:
 

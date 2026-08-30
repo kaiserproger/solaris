@@ -109,6 +109,74 @@ fn bounded_chunk_candidate_projection_excludes_unselected_chunks() {
 }
 
 #[test]
+fn active_entity_candidate_projection_filters_chunks_before_entities() {
+    let inputs = SimulationInputPublication::default();
+    let near_chunk = (2, 0);
+    let far_chunk = (20, 0);
+    let near_entity = EntityId(7);
+    let far_entity = EntityId(9);
+    inputs.insert_active_chunk(near_chunk);
+    inputs.insert_active_chunk(far_chunk);
+    inputs.track_entity(near_chunk, near_entity);
+    inputs.track_entity(far_chunk, far_entity);
+
+    let (active, simulation, candidates) =
+        inputs.active_entity_candidates_matching_chunks(|chunk| chunk.0 < 10);
+
+    assert_eq!(active.as_ref(), &HashSet::from([near_chunk, far_chunk]));
+    assert_eq!(simulation, HashSet::from([near_chunk]));
+    assert_eq!(candidates, HashSet::from([near_entity]));
+}
+
+#[test]
+#[ignore = "local microbenchmark for active entity candidate lookup"]
+fn active_entity_candidate_lookup_avoids_full_world_chunk_scan_benchmark() {
+    use std::time::Instant;
+
+    const TRACKED_CHUNKS: i32 = 20_000;
+    const ACTIVE_RADIUS: i32 = 4;
+    const ITERATIONS: usize = 500;
+
+    let inputs = SimulationInputPublication::default();
+    for x in 0..TRACKED_CHUNKS {
+        let chunk = (x, 0);
+        inputs.insert_chunk_candidate_for_test(chunk, EntityId(x));
+    }
+    let active = (-ACTIVE_RADIUS..=ACTIVE_RADIUS)
+        .flat_map(|x| (-ACTIVE_RADIUS..=ACTIVE_RADIUS).map(move |z| (x, z)))
+        .collect::<HashSet<_>>();
+    for &chunk in &active {
+        inputs.insert_active_chunk(chunk);
+    }
+
+    let old_started = Instant::now();
+    let mut old = HashSet::new();
+    for _ in 0..ITERATIONS {
+        old = inputs.entity_candidates(&active);
+    }
+    let old_elapsed = old_started.elapsed();
+
+    let new_started = Instant::now();
+    let mut new = HashSet::new();
+    for _ in 0..ITERATIONS {
+        let (_, candidates) = inputs.active_entity_candidates();
+        new = candidates;
+    }
+    let new_elapsed = new_started.elapsed();
+
+    assert_eq!(new, old);
+    let old_ns = old_elapsed.as_nanos().max(1);
+    let new_ns = new_elapsed.as_nanos().max(1);
+    eprintln!(
+        "active entity candidate lookup tracked_chunks={TRACKED_CHUNKS} active_chunks={} iterations={ITERATIONS} old_ms={:.3} new_ms={:.3} speedup={:.2}x",
+        active.len(),
+        old_elapsed.as_secs_f64() * 1_000.0,
+        new_elapsed.as_secs_f64() * 1_000.0,
+        old_ns as f64 / new_ns as f64,
+    );
+}
+
+#[test]
 fn terrain_pathing_publication_applies_batched_add_and_remove() {
     let inputs = SimulationInputPublication::default();
     let first = EntityId(3);

@@ -1,0 +1,142 @@
+--- a/dist/server.js
++++ b/dist/server.js
+@@ -483,7 +483,7 @@
+             : config.bashSessionId
+                 ? `8. Bash session label for this server is "${config.bashSessionId}".`
+                 : "",
+-        "9. When the owner authorizes Pi delegation, use spawn_pi_detached/spawn_pi_qa_detached and wait_pi_agent. These tools own h5i, forum, detached tmux, receipts and result plumbing; do not recreate that lifecycle with bash polling.",
++        "9. When the owner authorizes Pi delegation, use spawn_pi_detached/spawn_pi_qa_detached and wait_pi_agent. For a custom or nested repository, pass repo_root plus optional repo_subdir directly to every Pi spawn/wait call instead of relying on workspace_id surviving another MCP request. These tools own h5i, forum, detached tmux, receipts and result plumbing; do not recreate that lifecycle with bash polling.",
+         "",
+         `Current modes: tool=${config.toolMode}, bash=${config.bashMode}, write=${config.writeMode}.`
+     ].filter(Boolean).join("\n");
+@@ -501,6 +501,24 @@
+         return fallback;
+     return ["1", "true", "yes", "y"].includes(String(value).toLowerCase());
+ }
++function resolvePiWorkspace(workspaces, args) {
++    const repoRoot = typeof args.repo_root === "string" ? args.repo_root.trim() : "";
++    const repoSubdir = typeof args.repo_subdir === "string" ? args.repo_subdir.trim() : "";
++    if (repoRoot && args.workspace_id) {
++        throw new CodexProError("Pi tools accept workspace_id or repo_root, not both.");
++    }
++    if (repoSubdir && !repoRoot) {
++        throw new CodexProError("repo_subdir requires repo_root.");
++    }
++    if (!repoRoot) {
++        return workspaces.getWorkspace(args.workspace_id);
++    }
++    if (path.isAbsolute(repoSubdir) || repoSubdir.split(/[\\/]+/).includes("..")) {
++        throw new CodexProError("repo_subdir must be a relative path that stays inside repo_root.");
++    }
++    const requestedRoot = repoSubdir ? path.join(repoRoot, repoSubdir) : repoRoot;
++    return workspaces.openWorkspace(requestedRoot, { select: false });
++}
+ function diffBlock(diff) {
+     return `\n\n\`\`\`diff\n${diff}\n\`\`\``;
+ }
+@@ -1843,11 +1861,13 @@
+ 
+     registerCodexTool(config, server, "spawn_pi_detached", {
+         title: "Spawn Pi Detached",
+-        description: "Launch a detached Pi subagent in an isolated h5i workspace box. The run is detached from the MCP request, records h5i provenance, seeds the current dirty worktree by default, and returns a run_id for wait_pi_agent. Development defaults to GPT-5.6 Sol; QA/reviewer defaults to GPT-5.6 Luna.",
++        description: "Launch a detached Pi subagent in an isolated h5i workspace box. Address the repository either by workspace_id or directly with repo_root plus optional repo_subdir, so callers do not depend on cross-request workspace selection. The run records h5i provenance, seeds the current dirty worktree by default, and returns a run_id for wait_pi_agent. Pi defaults to zai/glm-5.3-flash.",
+         inputSchema: {
+-            workspace_id: z.string().optional().describe("Workspace id from open_workspace. Omit to use the workspace selected for this MCP session."),
++            workspace_id: z.string().optional().describe("Workspace id from open_workspace. Do not combine with repo_root."),
++            repo_root: z.string().optional().describe("Repository root or allowed parent directory. Use with repo_subdir to target a nested git repository in the same call, avoiding ephemeral workspace_id state."),
++            repo_subdir: z.string().optional().describe("Optional relative repository path inside repo_root, for example delivery-service. Requires repo_root and cannot contain '..'."),
+             prompt: z.string().min(1).describe("Task for the Pi subagent."),
+-            model: z.string().optional().describe("Pi model id. Defaults to GPT-5.6 Sol for development/planning and GPT-5.6 Luna for QA/review."),
++            model: z.string().optional().describe("Pi model id. Default: zai/glm-5.3-flash."),
+             role: z.enum(["dev", "qa", "reviewer", "planner", "audit"]).optional().describe("Agent role. Default: dev."),
+             thinking: z.enum(["low", "medium", "high"]).optional().describe("Pi thinking level. Default: high."),
+             name: z.string().optional().describe("Optional short run/box name."),
+@@ -1860,7 +1880,7 @@
+             "openai/toolInvocation/invoked": "Detached Pi agent started"
+         }
+     }, async (args) => {
+-        const workspace = workspaces.getWorkspace(args.workspace_id);
++        const workspace = resolvePiWorkspace(workspaces, args);
+         const result = await spawnPiDetached(workspace, {
+             prompt: String(args.prompt ?? ""),
+             model: args.model,
+@@ -1884,18 +1904,20 @@
+             `Seed commit: ${result.seed_commit}`,
+             `Metadata: ${result.metadata_path}`,
+             "",
+-            "Use wait_pi_agent with this run_id. Do not poll with shell/tmux commands."
++            "Use wait_pi_agent with this run_id and the same repo_root/repo_subdir when path routing was used. Do not poll with shell/tmux commands."
+         ].join("\n");
+         return textResult(text, result);
+     });
+ 
+     registerCodexTool(config, server, "spawn_pi_qa_detached", {
+         title: "Spawn Pi QA Detached",
+-        description: "Launch the standardized Solaris graphical QA agent detached in an h5i box. Uses GPT-5.6 Luna by default and mandates a real graphical Minecraft client in Xvfb, the requested scenario, evidence capture, then an adversarial exploratory pass with severity-ranked criticism.",
++        description: "Launch the standardized graphical QA agent detached in an h5i box. Address the repository either by workspace_id or directly with repo_root plus optional repo_subdir, so QA can target nested repositories without relying on cross-request workspace state. Uses zai/glm-5.3-flash by default and mandates the requested real-client/evidence protocol when the task requires it.",
+         inputSchema: {
+-            workspace_id: z.string().optional().describe("Workspace id from open_workspace. Omit to use the workspace selected for this MCP session."),
++            workspace_id: z.string().optional().describe("Workspace id from open_workspace. Do not combine with repo_root."),
++            repo_root: z.string().optional().describe("Repository root or allowed parent directory. Use with repo_subdir to target a nested git repository in the same call."),
++            repo_subdir: z.string().optional().describe("Optional relative repository path inside repo_root. Requires repo_root and cannot contain '..'."),
+             prompt: z.string().min(1).describe("Exact feature/scenario to validate plus any acceptance criteria."),
+-            model: z.string().optional().describe("Pi QA model id. Default: openai-codex/gpt-5.6-luna."),
++            model: z.string().optional().describe("Pi QA model id. Default: zai/glm-5.3-flash."),
+             thinking: z.enum(["low", "medium", "high"]).optional().describe("Pi thinking level. Default: high."),
+             name: z.string().optional().describe("Optional short run/box name."),
+             seed_dirty: z.boolean().optional().describe("Seed the current tracked and untracked worktree into the h5i box before QA. Default: true.")
+@@ -1907,10 +1929,10 @@
+             "openai/toolInvocation/invoked": "Detached graphical Pi QA started"
+         }
+     }, async (args) => {
+-        const workspace = workspaces.getWorkspace(args.workspace_id);
++        const workspace = resolvePiWorkspace(workspaces, args);
+         const result = await spawnPiDetached(workspace, {
+             prompt: String(args.prompt ?? ""),
+-            model: args.model ?? "openai-codex/gpt-5.6-luna",
++            model: args.model ?? "zai/glm-5.3-flash",
+             role: "qa",
+             thinking: args.thinking ?? "high",
+             name: args.name,
+@@ -1926,7 +1948,7 @@
+             "Protocol: graphical Minecraft client under Xvfb -> exact requested scenario -> evidence -> bounded adversarial exploration.",
+             `h5i forum: ${result.h5i_forum_available ? "available" : `unavailable (${result.h5i_forum_reason})`}`,
+             "",
+-            "Use wait_pi_agent with this run_id. Do not poll with shell/tmux commands."
++            "Use wait_pi_agent with this run_id and the same repo_root/repo_subdir when path routing was used. Do not poll with shell/tmux commands."
+         ].join("\n");
+         return textResult(text, result);
+     });
+@@ -1935,7 +1957,9 @@
+         title: "Wait Pi Agent",
+         description: "Read or event-wait for a detached Pi run created by spawn_pi_detached/spawn_pi_qa_detached. Returns terminal exit codes, h5i export/receipt paths, the agent-only patch size, and bounded log tails. With max_wait_seconds, one call waits on the done-file event instead of tmux/ps/tail polling.",
+         inputSchema: {
+-            workspace_id: z.string().optional().describe("Workspace id from open_workspace. Omit to use the workspace selected for this MCP session."),
++            workspace_id: z.string().optional().describe("Workspace id from open_workspace. Do not combine with repo_root."),
++            repo_root: z.string().optional().describe("Repository root or allowed parent directory used for the Pi run. Use with repo_subdir when the run belongs to a nested repository."),
++            repo_subdir: z.string().optional().describe("Optional relative repository path inside repo_root. Requires repo_root and cannot contain '..'."),
+             run_id: z.string().min(1).describe("Run id returned by a Pi spawn tool."),
+             log_tail_bytes: z.number().int().min(1000).max(100000).optional().describe("Maximum agent log tail bytes. Default: 16000."),
+             max_wait_seconds: z.number().int().min(1).max(60).optional().describe("Event-driven wait for the terminal done marker before returning. Maximum: 60 seconds.")
+@@ -1947,7 +1971,7 @@
+             "openai/toolInvocation/invoked": "Detached Pi state ready"
+         }
+     }, async (args) => {
+-        const workspace = workspaces.getWorkspace(args.workspace_id);
++        const workspace = resolvePiWorkspace(workspaces, args);
+         const result = await waitPiAgent(workspace, {
+             run_id: String(args.run_id ?? ""),
+             log_tail_bytes: args.log_tail_bytes,
+--- a/dist/piAgentOps.js
++++ b/dist/piAgentOps.js
+@@ -341,9 +341,7 @@
+   run("pi", ["--help"], { cwd: workspace.root });
+ 
+   const role = safeSlug(options.role ?? "developer", "developer");
+-  const model = String(options.model ?? (role === "qa" || role === "reviewer"
+-    ? "openai-codex/gpt-5.6-luna"
+-    : "openai-codex/gpt-5.6-sol"));
++  const model = String(options.model ?? "zai/glm-5.3-flash");
+   const thinking = String(options.thinking ?? "high");
+   const userPrompt = String(options.prompt ?? "").trim();
+   if (!userPrompt) throw new CodexProError("Pi prompt must not be empty.");

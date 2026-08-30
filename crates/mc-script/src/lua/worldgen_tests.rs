@@ -76,14 +76,15 @@ api = "0.6.0"
 }
 
 #[test]
-fn shipped_geological_plugin_selects_the_startup_ore_profile() {
+fn shipped_realistic_deposits_plugin_selects_the_startup_ore_profile() {
     let plugins = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../examples/plugins");
     let prepared = prepare_lua_plugins(LuaHostConfig::new(plugins)).unwrap();
 
-    assert_eq!(
-        prepared.worldgen_ore_profile(),
-        Some(LuaWorldgenOreProfile::GeologicalDeposits)
-    );
+    let profile = prepared
+        .worldgen_ore_profile()
+        .expect("shipped geological-mines plugin declares an ore profile");
+    assert_eq!(profile, LuaWorldgenOreProfile::RealisticDeposits);
+    assert_eq!(profile.contract_name(), "realistic_deposits");
 }
 
 #[test]
@@ -175,7 +176,7 @@ fn ordinary_plugin_set_keeps_vanilla_ore_generation() {
 #[test]
 fn two_worldgen_profiles_are_rejected_instead_of_using_load_order() {
     let plugins = TempPlugins::new();
-    let declaration = "[worldgen]\nore_profile = \"geological_deposits\"";
+    let declaration = "[worldgen]\nore_profile = \"realistic_deposits\"";
     write_plugin(plugins.path(), "first", declaration);
     write_plugin(plugins.path(), "second", declaration);
 
@@ -212,7 +213,7 @@ fn ore_and_settlement_profiles_can_have_different_plugin_owners() {
     write_plugin(
         plugins.path(),
         "ores",
-        "[worldgen]\nore_profile = \"geological_deposits\"",
+        "[worldgen]\nore_profile = \"realistic_deposits\"",
     );
     write_plugin(
         plugins.path(),
@@ -224,7 +225,7 @@ fn ore_and_settlement_profiles_can_have_different_plugin_owners() {
 
     assert_eq!(
         prepared.worldgen_ore_profile(),
-        Some(LuaWorldgenOreProfile::GeologicalDeposits)
+        Some(LuaWorldgenOreProfile::RealisticDeposits)
     );
     assert_eq!(
         prepared.worldgen_settlement_profile(),
@@ -348,7 +349,7 @@ fn missing_worldgen_plugin_source_fails_startup_instead_of_falling_back_to_vanil
     write_plugin(
         plugins.path(),
         "missing-source",
-        "[worldgen]\nore_profile = \"geological_deposits\"",
+        "[worldgen]\nore_profile = \"realistic_deposits\"",
     );
     fs::remove_file(plugins.path().join("missing-source/main.lua")).unwrap();
 

@@ -7,6 +7,7 @@
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::f64::consts::TAU;
 use std::ops::Range;
+use std::sync::Arc;
 
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use uuid::Uuid;
@@ -52,17 +53,19 @@ pub use lock_policy::{
 };
 pub use regional::VillagerBindingClaim;
 pub use regional::{
-    ItemPickupClaimResolution, REGION_SIZE_CHUNKS, RegionEntityStoreError, RegionEpoch, RegionKey,
-    RegionLease, RegionOwnerBatch, RegionOwnerCompletion, RegionOwnerLaneError,
-    RegionOwnerLaneStartError, RegionOwnerMutation, RegionOwnership, RegionOwnershipError,
-    RegionPhase, RegionalCommitDecision, RegionalDecisionJournal, RegionalDecisionJournalError,
-    RegionalEntityAuthority, RegionalEntityStore, RegionalKinematicsApply,
-    RegionalOwnerCoordinator, RegionalOwnerCutoverError, RegionalOwnerHandle, RegionalOwnerLane,
-    RegionalOwnerRuntime, RegionalOwnerRuntimeShutdownError, RegionalOwnerSaveSnapshot,
-    RegionalOwnerShutdownError, RegionalOwnerStatus, RegionalPreparedGoalTick,
-    RegionalResolvedGoalTick, SequencedRegionMutation, TransferApply, TransferDecision, TransferId,
-    VersionedEntitySnapshots, VillagerBirthCommit, VillagerCourtshipCommit,
-    VillagerFoodShareCommit, VillagerInventoryPickupCommit, VillagerNoBedCommit,
+    CompactEntityKinematicsFence, ItemPickupClaimResolution, REGION_SIZE_CHUNKS,
+    RegionEntityStoreError, RegionEpoch, RegionKey, RegionLease, RegionOwnerBatch,
+    RegionOwnerCompletion, RegionOwnerLaneError, RegionOwnerLaneStartError, RegionOwnerMutation,
+    RegionOwnership, RegionOwnershipError, RegionPhase, RegionalCommitDecision,
+    RegionalDecisionJournal, RegionalDecisionJournalError, RegionalEntityAuthority,
+    RegionalEntityStore, RegionalKinematicsApply, RegionalOwnerCoordinator,
+    RegionalOwnerCutoverError, RegionalOwnerHandle, RegionalOwnerLane, RegionalOwnerRuntime,
+    RegionalOwnerRuntimeShutdownError, RegionalOwnerSaveSnapshot, RegionalOwnerShutdownError,
+    RegionalOwnerStatus, RegionalPreparedGoalTick, RegionalResolvedGoalTick,
+    SequencedRegionMutation, TransferApply, TransferDecision, TransferId,
+    VersionedEntityKinematics, VersionedEntitySnapshots, VillagerBirthCommit,
+    VillagerCourtshipCommit, VillagerFoodShareCommit, VillagerInventoryPickupCommit,
+    VillagerNoBedCommit,
 };
 
 pub use runtime::{
@@ -988,7 +991,7 @@ pub struct EntityGoalCheckpoint {
 #[derive(Debug, Clone, PartialEq)]
 pub struct EntitySimulationProjection {
     pub id: EntityId,
-    pub type_name: String,
+    pub type_name: Arc<str>,
     pub position: Vec3,
     pub rotation: Rotation,
     pub velocity: Vec3,
@@ -1014,6 +1017,15 @@ pub struct EntitySimulationProjection {
     pub throwable_projectile_revision: Option<u64>,
     pub shulker_bullet_target_entity_id: Option<i32>,
     pub sheep_grazing_ticks: Option<u8>,
+    pub crossbow_attack: Option<EntityCrossbowAttackState>,
+    pub blaze_attack: Option<EntityBlazeAttackState>,
+    pub ghast_attack: Option<EntityGhastAttackState>,
+    pub breeze_attack: Option<EntityBreezeAttackState>,
+    pub guardian_beam: Option<EntityGuardianBeamState>,
+    pub warden_sonic_boom: Option<EntityWardenSonicBoomState>,
+    pub shulker_attack: Option<EntityShulkerAttackState>,
+    pub evoker_attack: Option<EntityEvokerAttackState>,
+    pub witch_attack: Option<EntityWitchAttackState>,
     pub villager: Option<VillagerData>,
     pub villager_schedule: Option<villager_26_1_2::VillagerScheduleKind>,
     pub villager_last_slept_tick: Option<u64>,
@@ -3270,7 +3282,7 @@ mod tests {
             .expect("simulation projection");
 
         assert_eq!(projection.id, id);
-        assert_eq!(projection.type_name, "minecraft:cow");
+        assert_eq!(projection.type_name.as_ref(), "minecraft:cow");
         assert_eq!(projection.position, Vec3::new(2.5, 64.0, 0.5));
         assert_eq!(projection.lifecycle, EntityLifecycle::Alive);
         assert_eq!(projection.follow_range, 16.0);
