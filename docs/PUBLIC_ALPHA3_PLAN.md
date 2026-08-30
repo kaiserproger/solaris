@@ -123,20 +123,25 @@ legacy plugins wholesale.
 
 Initial candidates:
 
-1. [ ] `solaris-essentials` — lightweight homes/warps/spawn/back/tpa/admin utility
-   subset with permission-aware commands; UI may be used when Loader is present but
-   ordinary commands must remain usable server-only where possible.
-2. [ ] `solaris-economy` — simple durable balances, pay/admin balance commands and a
-   small shop/menu example; reuse the existing economy API/example rather than
-   creating a second money authority.
-3. [ ] `solaris-towns` — deliberately small Towny-like claims/towns/members/roles and
-   protection rules, not a grand-strategy rewrite of the core.
-4. [ ] `solaris-audit` — CoreProtect-like bounded block/container/player-action
-   history with lookup/inspect/rollback primitives. Keep storage append-oriented and
-   bounded/indexed; do not put a heavyweight analytics service on the hot path.
-5. [ ] Decide whether other common pack components are worth alpha-3 scope only
-   after current Bukkit/Paper ecosystem research (permissions/chat/moderation/
-   protection/teleport/QoL), and document what is intentionally omitted.
+1. [x] `solaris-essentials` — lightweight homes/warps/spawn/back/tpa/admin utility
+   subset with permission-aware commands; ordinary commands remain usable
+   server-only (no Loader requirement).
+2. [x] `solaris-economy` — simple durable balances, pay/admin balance commands and
+   idempotent transfer tokens with a bounded ledger; single money authority.
+3. [x] `solaris-towns` — deliberately small Towny-like claims/towns/members/roles
+   and leader protection rules.
+4. [x] `solaris-audit` — CoreProtect-like bounded block/container/player-action
+   history with lookup/inspect primitives; storage stays append-oriented and
+   bounded, off the hot path.
+5. [x] Scope decision recorded after Bukkit/Paper ecosystem research: the pack
+   ships `solaris-permissions` plus the four plugins above as independent
+   external-directory API 0.6 packages with no bundled-selection wiring;
+   intentionally omitted components (giant command catalogs, multiworld
+   teleport, auctions, nations/war, bulk editing, WorldGuard-style regions,
+   unbounded logs, guessed rollback) and rationale live in
+   `examples/plugins/standard-pack/README.md`.
+   Evidence: `docs/evidence/alpha3-plugin-pack-005-2026-08-30.md`
+   (integration coverage: `crates/mc-test-harness/tests/plugin_standard_pack.rs`).
 
 ## Release-3 closeout rule
 

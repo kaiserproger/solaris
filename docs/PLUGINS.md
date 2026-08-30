@@ -66,9 +66,20 @@ strict = true
 expected = ["basic-economy", "online-roster", "my-plugin"]
 ```
 
-The shipped examples are demonstrations, not an installed standard plugin pack.
-Read their `plugin.toml`, `config.toml`, `main.lua`, and README under
-[`../examples/plugins/`](../examples/plugins/) before enabling them.
+### Standard plugin pack
+
+Beyond the demonstration examples, Solaris ships an optional first-party
+**standard plugin pack** under
+[`../examples/plugins/`](../examples/plugins/): `solaris-permissions`,
+`solaris-essentials`, `solaris-economy`, `solaris-towns`, and `solaris-audit`.
+All five are independent server-only API 0.6 packages; copy their directories
+into `[plugins].directory` to install, and list them under `plugins.strict`
+`expected` when running strict. Integration coverage lives in
+`crates/mc-test-harness/tests/plugin_standard_pack.rs`. Scope decisions and
+intentional omissions are recorded in
+[`../examples/plugins/standard-pack/README.md`](../examples/plugins/standard-pack/README.md).
+The remaining shipped examples are demonstrations; read their `plugin.toml`,
+`config.toml`, `main.lua`, and README before enabling them.
 
 ### Deployment: server-only or Loader-required
 
