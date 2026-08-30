@@ -5,7 +5,7 @@
 use std::collections::VecDeque;
 use std::io;
 use std::sync::{Arc, Mutex};
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use crate::ServerConfig;
 use crate::dashboard::{
@@ -95,6 +95,7 @@ pub struct ServerDashboardStats {
     plugins: crate::dashboard::PluginsView,
     warnings: Arc<WarningRing>,
     tps_sample: Mutex<Option<(u64, Instant)>>,
+    cached_payload: Mutex<Option<(Instant, StatsPayload)>>,
 }
 
 impl ServerDashboardStats {
@@ -133,6 +134,7 @@ impl ServerDashboardStats {
             },
             warnings,
             tps_sample: Mutex::new(None),
+            cached_payload: Mutex::new(None),
         }
     }
 
@@ -166,6 +168,28 @@ fn latency(value: mc_net::RuntimeLatencyPercentiles) -> LatencyUs {
 
 impl DashboardStats for ServerDashboardStats {
     fn stats(&self) -> StatsPayload {
+        if let Some((at, payload)) = self
+            .cached_payload
+            .lock()
+            .expect("cached payload lock poisoned")
+            .as_ref()
+            && at.elapsed() < ServerDashboardStats::STATS_MIN_INTERVAL
+        {
+            return payload.clone();
+        }
+        let payload = self.compute_stats();
+        *self
+            .cached_payload
+            .lock()
+            .expect("cached payload lock poisoned") = Some((Instant::now(), payload.clone()));
+        payload
+    }
+}
+
+impl ServerDashboardStats {
+    const STATS_MIN_INTERVAL: Duration = Duration::from_millis(1_000);
+
+    fn compute_stats(&self) -> StatsPayload {
         let now = Instant::now();
         let telemetry = self.telemetry.snapshot();
         let counters = mc_net::operator_counter_snapshot();

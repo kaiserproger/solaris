@@ -196,6 +196,8 @@ pub fn spawn_dashboard(
 pub(crate) const MAX_HEAD_BYTES: usize = 8 * 1024;
 /// How long a connection may take to deliver a complete request head.
 const READ_TIMEOUT: Duration = Duration::from_secs(5);
+/// How long a connection may take to consume a response.
+const WRITE_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// Bind and serve. Binding failure is logged and the task returns.
 async fn run_dashboard(cfg: DashboardListenConfig, provider: Arc<dyn DashboardStats>) {
@@ -254,8 +256,11 @@ where
         Some(request) => route(&request, provider),
         None => text_response("400 Bad Request", b"empty or malformed request\n"),
     };
-    let _ = stream.write_all(&response).await;
-    let _ = stream.flush().await;
+    let _ = tokio::time::timeout(WRITE_TIMEOUT, async {
+        stream.write_all(&response).await?;
+        stream.flush().await
+    })
+    .await;
 }
 
 /// Reads bytes until the CRLFCRLF head terminator, bounded by

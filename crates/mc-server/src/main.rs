@@ -203,7 +203,9 @@ fn check_config(path: &Path) -> Result<()> {
             cfg.network.bind_address
         )
     })?;
-    cfg.dashboard.validate().map_err(anyhow::Error::msg)?;
+    if cfg.dashboard.enabled {
+        cfg.dashboard.validate().map_err(anyhow::Error::msg)?;
+    }
     validate_runtime_config(&cfg)?;
     let prepared_plugins = prepare_configured_luau_plugins(&cfg)?;
     let effective = EffectiveConfig::with_plugins(&cfg, prepared_plugins.as_ref());
@@ -1015,7 +1017,7 @@ async fn serve(
             warning_ring,
             dashboard_plugin_ids,
         ));
-        tracing::info!(endpoint = %socket, "operator dashboard listening");
+        tracing::info!(endpoint = %socket, "operator dashboard enabled; binding in background");
         Some(mc_server::dashboard::spawn_dashboard(
             mc_server::dashboard::DashboardListenConfig {
                 bind_address: socket.ip(),

@@ -1966,7 +1966,7 @@ pub(crate) async fn save_periodic_checkpoint(
         Ok(snapshot) => snapshot,
         Err(error) => {
             let elapsed = elapsed_us(total_started);
-            return Some(SaveAllReport {
+            let report = SaveAllReport {
                 players_saved: 0,
                 entities_saved: 0,
                 chunks_flushed: 0,
@@ -1977,7 +1977,9 @@ pub(crate) async fn save_periodic_checkpoint(
                     ..SaveAllTimings::default()
                 },
                 errors: vec![format!("simulation barrier failed: {error:?}")],
-            });
+            };
+            sessions.retain_save_report(&report);
+            return Some(report);
         }
     };
     let barrier_us = elapsed_us(barrier_started);
