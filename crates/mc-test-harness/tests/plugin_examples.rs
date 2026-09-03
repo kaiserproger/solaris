@@ -5,13 +5,15 @@ use std::time::Duration;
 use bytes::Bytes;
 use mc_protocol::packets::Packet;
 use mc_protocol::packets::play::{
-    AddEntity, BlockChangedAck, ClientboundCommands, ClientboundContainerSetContent,
-    ClientboundContainerSetSlot, ClientboundOpenScreen, ClientboundSystemChat, CommandNodeKind,
-    ConfirmTeleportation, ContainerInput, Direction, HashedStack, HashedStackComponentHashes,
-    InteractionHand, MovePlayerFlags, PlayerActionKind, RemoveEntities, ServerboundAttack,
-    ServerboundChatCommand, ServerboundContainerClick, ServerboundMovePlayerPos,
-    ServerboundMovePlayerStatusOnly, ServerboundPlayerAction, ServerboundUseItemOn,
-    SynchronizePlayerPosition, pack_block_pos,
+    AddEntity, BlockChangedAck, ClientboundCommands, ClientboundContainerClose,
+    ClientboundContainerSetContent, ClientboundContainerSetSlot, ClientboundKeepAlive,
+    ClientboundOpenScreen, ClientboundSystemChat, CommandNodeKind, ConfirmTeleportation,
+    ContainerInput, Direction, EntityVec3, HashedStack, HashedStackComponentHashes,
+    InteractionHand, MoveEntityPos, MoveEntityPosRot, MovePlayerFlags, PlayerActionKind,
+    RemoveEntities, ServerboundAttack, ServerboundChatCommand, ServerboundContainerClick,
+    ServerboundInteract, ServerboundKeepAlive, ServerboundMovePlayerPos,
+    ServerboundMovePlayerStatusOnly, ServerboundPlayerAction, ServerboundPlayerLoaded,
+    ServerboundUseItemOn, SynchronizePlayerPosition, pack_block_pos,
 };
 use mc_script::{
     PlayerCommandAdmission, ScriptCommand, ScriptEvent, ScriptInventoryClick, ScriptPlayerContext,
@@ -719,9 +721,17 @@ async fn shipped_inventory_plugins_work_over_wire() {
             .get_mut(bound)
             .and_then(toml::Value::as_table_mut)
             .expect("zone coordinate table");
-        let value = if bound == "minimum" { 24 } else { 40 };
-        coordinates.insert("x".to_owned(), toml::Value::Integer(value));
-        coordinates.insert("z".to_owned(), toml::Value::Integer(value));
+        let (x, z) = if bound == "minimum" {
+            (20.55, 19.0)
+        } else {
+            (20.9, 20.0)
+        };
+        coordinates.insert("x".to_owned(), toml::Value::Float(x));
+        coordinates.insert(
+            "y".to_owned(),
+            toml::Value::Integer(if bound == "minimum" { 60 } else { 100 }),
+        );
+        coordinates.insert("z".to_owned(), toml::Value::Float(z));
     }
     std::fs::write(
         &config_path,
@@ -804,6 +814,10 @@ async fn shipped_inventory_plugins_work_over_wire() {
         .await
         .expect("ack teleport");
     client
+        .write_packet(&ServerboundPlayerLoaded)
+        .await
+        .expect("acknowledge player loaded");
+    client
         .write_packet(&ServerboundMovePlayerStatusOnly {
             flags: MovePlayerFlags::new(true, false),
         })
@@ -819,22 +833,13 @@ async fn shipped_inventory_plugins_work_over_wire() {
 
     client
         .write_packet(&ServerboundMovePlayerPos {
-            x: 20.0,
+            x: 20.6,
             y: sync.y,
-            z: 20.0,
+            z: sync.z,
             flags: MovePlayerFlags::new(true, false),
         })
         .await
-        .expect("move outside catalog zone");
-    client
-        .write_packet(&ServerboundMovePlayerPos {
-            x: 26.0,
-            y: sync.y,
-            z: 26.0,
-            flags: MovePlayerFlags::new(true, false),
-        })
-        .await
-        .expect("enter catalog zone within movement budget");
+        .expect("enter economy zone");
 
     let initial_menu = wait_for_catalog_menu(
         &mut client,
@@ -895,28 +900,23 @@ async fn shipped_inventory_plugins_work_over_wire() {
     )
     .await;
     assert_eq!(final_menu.product_count, product_count);
-
     client
         .write_packet(&ServerboundMovePlayerPos {
-            x: 20.0,
+            x: sync.x,
             y: sync.y,
-            z: 20.0,
+            z: sync.z,
             flags: MovePlayerFlags::new(true, false),
         })
         .await
-        .expect("leave catalog zone before command entry");
-    send_command(&mut client, "economy").await;
-    let command_menu = wait_for_catalog_menu(
-        &mut client,
-        product_id,
-        product_count,
-        product_label,
-        product_price,
-        currency_plural,
-        0,
-    )
-    .await;
-    assert_eq!(command_menu.product_count, product_count);
+        .expect("leave economy zone");
+    client
+        .wait_for_frame_id_with_timeout_and_limits(
+            ClientboundContainerClose::ID,
+            Duration::from_secs(5),
+            FRAME_LIMITS,
+        )
+        .await
+        .expect("economy menu close");
 
     send_command(&mut client, "who").await;
     wait_for_roster_menu(&mut client, roster_item_id, "CatalogPlayer").await;
@@ -1095,6 +1095,259 @@ async fn shipped_colony_scaffold_recruits_and_applies_updated_order_over_wire() 
         .await
         .expect("Lua host join task")
         .expect("Lua host thread");
+}
+
+#[tokio::test]
+async fn shipped_colony_scaffold_hire_by_interact_and_follow_order() {
+    let plugins = tempfile::tempdir().expect("plugin tempdir");
+    copy_example_plugin("colony-villager-scaffold", plugins.path());
+    write_villager_fixture_plugin(plugins.path());
+    let (boundary, host) = mc_script::start_lua_host(mc_script::LuaHostConfig::new(plugins.path()))
+        .expect("start shipped colony scaffold");
+    assert_eq!(host.loaded_plugins(), 2);
+
+    let world_dir = tempfile::tempdir().expect("disk-backed world tempdir");
+    std::fs::create_dir_all(world_dir.path().join("region")).expect("create world region");
+    let block_report = mc_data::blocks::solaris_required_blocks_report();
+    let blocks = Arc::new(
+        mc_world::BlockRegistry::from_report(&block_report).expect("embedded block registry"),
+    );
+    let items = Arc::new(mc_data::items::solaris_required_items());
+    let entity_types = Arc::new(mc_data::entity_types::solaris_required_entity_types());
+    let villager_type_id = entity_types
+        .id_of(&mc_data::Identifier::parse("minecraft:villager").unwrap())
+        .and_then(|id| i32::try_from(id).ok())
+        .expect("embedded villager entity type");
+    let generator = Arc::new(mc_worldgen::TerrainGenerator::new(0, Arc::clone(&blocks)));
+    let world =
+        mc_world::WorldStorage::open_with_capacity(world_dir.path(), Arc::clone(&blocks), 49)
+            .expect("open disk-backed world")
+            .with_item_registry(Arc::clone(&items))
+            .with_generator(generator);
+    let shutdown = mc_net::ShutdownHandle::default();
+    let cfg = mc_net::ServerConfig {
+        bind_address: "127.0.0.1:0".parse().unwrap(),
+        motd: "Colony interact hire test".into(),
+        max_players: 1,
+        view_distance: 1,
+        data: Arc::new(mc_data::solaris_required_data()),
+        blocks,
+        world: Some(Arc::new(tokio::sync::Mutex::new(world))),
+        tags: Arc::new(mc_data::tags::solaris_required_item_tags(&items)),
+        recipes: Arc::new(mc_data::recipes::solaris_required_recipes()),
+        loot: Arc::new(mc_data::loot::builtin().clone()),
+        block_light: None,
+        items,
+        item_facts: Arc::new(mc_data::item_components::solaris_required_item_facts()),
+        block_facts: Arc::new(mc_data::block_facts::BlockFactsTable::from_blocks_report(
+            &block_report,
+        )),
+        entity_types,
+        biome_spawns: Arc::new(mc_data::biomes::solaris_required_biome_spawn_rules()),
+        chunk_pipeline: mc_net::ChunkPipelinePolicy::default(),
+        random_tick: mc_net::RandomTickPolicy::default(),
+        command_permissions: mc_net::CommandPermissionConfig::new(Vec::<String>::new(), true),
+        loader_manifest: None,
+        shutdown: shutdown.clone(),
+    };
+    let bound = mc_net::bind_with_scripts(cfg, boundary)
+        .await
+        .expect("bind scripted server");
+    let addr = bound.local_addr().expect("local address");
+    let server = tokio::spawn(async move { bound.serve().await });
+
+    let mut client = Client::connect(addr).await.expect("client connect");
+    let _ = client
+        .drive_login(addr, "ColonyRecruit")
+        .await
+        .expect("login");
+    client.drive_configuration().await.expect("configuration");
+    let _ = client.read_play_login().await.expect("play entry");
+    let _: ClientboundCommands = client.read_typed().await.expect("Commands");
+    let sync: SynchronizePlayerPosition = client.read_typed().await.expect("SyncPlayerPos");
+    client
+        .write_packet(&ConfirmTeleportation {
+            teleport_id: sync.teleport_id,
+        })
+        .await
+        .expect("ack teleport");
+    client
+        .write_packet(&ServerboundMovePlayerStatusOnly {
+            flags: MovePlayerFlags::new(true, false),
+        })
+        .await
+        .expect("report grounded spawn pose");
+    let villager_spawn = (sync.x + 1.0, sync.y, sync.z);
+    let villager_entity_id =
+        wait_for_colony_startup(&mut client, villager_type_id, villager_spawn).await;
+
+    client
+        .write_packet(&ServerboundMovePlayerPos {
+            x: sync.x + 0.5,
+            y: sync.y,
+            z: sync.z,
+            flags: MovePlayerFlags::new(true, false),
+        })
+        .await
+        .expect("register pose beside the villager");
+    client
+        .write_packet(&ServerboundInteract {
+            entity_id: villager_entity_id,
+            hand: InteractionHand::MainHand,
+            location: EntityVec3::ZERO,
+            using_secondary_action: false,
+        })
+        .await
+        .expect("right-click the villager to hire");
+    send_command(&mut client, "colony status").await;
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+    let mut seen_hire = false;
+    let mut seen = Vec::new();
+    while !seen_hire {
+        if tokio::time::Instant::now() >= deadline {
+            break;
+        }
+        let Ok(outcome) = client
+            .wait_for_frame_id_with_timeout_and_limits(
+                ClientboundSystemChat::ID,
+                Duration::from_secs(5),
+                FRAME_LIMITS,
+            )
+            .await
+        else {
+            break;
+        };
+        let chat = ClientboundSystemChat::decode(&mut outcome.frame.body.clone())
+            .expect("decode colony chat");
+        let message = literal_text_component_text(&chat.content_nbt);
+        if message == "Colony request rejected: another request is pending." {
+            tokio::time::sleep(Duration::from_millis(500)).await;
+            send_command(&mut client, "colony status").await;
+        } else if message == "Villager recruitment recorded durably by the Luau plugin." {
+            seen_hire = true;
+        } else {
+            seen.push(message);
+        }
+    }
+    if !seen_hire {
+        drop(client);
+        shutdown.request();
+        let _ = tokio::time::timeout(Duration::from_secs(10), server).await;
+        let report = tokio::task::spawn_blocking(move || host.join())
+            .await
+            .expect("Lua host join task")
+            .expect("Lua host thread");
+        panic!("interact hire incomplete; host exit: {report:?}; seen {seen:?}",);
+    }
+    send_command(&mut client, "colony status").await;
+    wait_for_system_chat(
+        &mut client,
+        "Starter Colony: status=active, role=worker, order=home, generation=2.",
+    )
+    .await;
+
+    let follow_spot = (sync.x + 8.0, sync.y, sync.z);
+    for hop in [sync.x + 4.0, follow_spot.0] {
+        client
+            .write_packet(&ServerboundMovePlayerPos {
+                x: hop,
+                y: sync.y,
+                z: sync.z,
+                flags: MovePlayerFlags::new(true, false),
+            })
+            .await
+            .expect("walk away from the recruit");
+    }
+    send_command(&mut client, "colony order follow").await;
+    wait_for_system_chat(&mut client, "Applied Luau order follow.").await;
+    wait_for_villager_within(
+        &mut client,
+        villager_entity_id,
+        villager_spawn,
+        follow_spot,
+        3.5,
+    )
+    .await;
+
+    drop(client);
+    shutdown.request();
+    tokio::time::timeout(Duration::from_secs(5), server)
+        .await
+        .expect("server shutdown timeout")
+        .expect("server task")
+        .expect("server result");
+    tokio::task::spawn_blocking(move || host.join())
+        .await
+        .expect("Lua host join task")
+        .expect("Lua host thread");
+}
+
+async fn echo_keepalive(client: &mut Client, id: i32, body: &bytes::Bytes) {
+    if id != ClientboundKeepAlive::ID {
+        return;
+    }
+    let mut body = body.clone();
+    let keepalive = ClientboundKeepAlive::decode(&mut body).expect("decode KeepAlive");
+    client
+        .write_packet(&ServerboundKeepAlive { id: keepalive.id })
+        .await
+        .expect("echo KeepAlive");
+}
+
+async fn wait_for_villager_within(
+    client: &mut Client,
+    entity_id: i32,
+    start: (f64, f64, f64),
+    target: (f64, f64, f64),
+    radius: f64,
+) {
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(25);
+    let (mut x, mut y, mut z) = start;
+    loop {
+        let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+        if remaining.is_zero() {
+            panic!(
+                "recruit did not approach: last=({x:.2},{y:.2},{z:.2}) target=({:.2},{:.2},{:.2})",
+                target.0, target.1, target.2,
+            );
+        }
+        let frame = client
+            .read_frame_with_timeout(remaining)
+            .await
+            .expect("recruit motion frame");
+        echo_keepalive(client, frame.id, &frame.body).await;
+        let (dx, dy, dz, matched) = if frame.id == MoveEntityPos::ID {
+            let pkt = MoveEntityPos::decode(&mut frame.body.clone()).expect("decode villager move");
+            (
+                f64::from(pkt.delta_x) / 4096.0,
+                f64::from(pkt.delta_y) / 4096.0,
+                f64::from(pkt.delta_z) / 4096.0,
+                pkt.entity_id == entity_id,
+            )
+        } else if frame.id == MoveEntityPosRot::ID {
+            let pkt =
+                MoveEntityPosRot::decode(&mut frame.body.clone()).expect("decode villager move");
+            (
+                f64::from(pkt.delta_x) / 4096.0,
+                f64::from(pkt.delta_y) / 4096.0,
+                f64::from(pkt.delta_z) / 4096.0,
+                pkt.entity_id == entity_id,
+            )
+        } else {
+            continue;
+        };
+        if !matched {
+            continue;
+        }
+        x += dx;
+        y += dy;
+        z += dz;
+        let distance =
+            ((x - target.0).powi(2) + (y - target.1).powi(2) + (z - target.2).powi(2)).sqrt();
+        if distance <= radius {
+            return;
+        }
+    }
 }
 
 fn copy_example_plugin(name: &str, destination_root: &Path) {

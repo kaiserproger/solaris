@@ -97,8 +97,8 @@ for _, role in ipairs(config.roles) do
     role_allowed[role] = true
 end
 for _, order in ipairs(config.orders) do
-    if order ~= "home" and order ~= "hold" then
-        error("configured orders must be home or hold")
+    if order ~= "home" and order ~= "hold" and order ~= "follow" then
+        error("configured orders must be home, hold, or follow")
     end
     order_allowed[order] = true
 end
@@ -295,7 +295,10 @@ local function queue_binding(pending: any): boolean
 end
 
 local function expected_goal(order: string): string
-    return order == "home" and "follow_position" or "idle"
+    if order == "home" or order == "follow" then
+        return "follow_position"
+    end
+    return "idle"
 end
 
 local function queue_goal(pending: any, lease_id: string): boolean
@@ -310,6 +313,8 @@ local function queue_goal(pending: any, lease_id: string): boolean
     if pending.record.order == "home" then
         local home = config.colony.home
         solaris.move_villager_to(id, lease_id, home.x, home.y, home.z, config.home_speed)
+    elseif pending.record.order == "follow" then
+        solaris.move_villager_to(id, lease_id, pending.x, pending.y, pending.z, config.home_speed)
     else
         solaris.set_villager_idle(id, lease_id)
     end
@@ -325,6 +330,66 @@ local function split_arguments(arguments: string): any
         values[#values + 1] = value
     end
     return values
+end
+
+local function player_busy(player_id: number): boolean
+    for _, pending in pairs(pending_cas) do
+        if pending.player_id == player_id then
+            return true
+        end
+    end
+    for _, pending in pairs(pending_bindings) do
+        if pending.player_id == player_id then
+            return true
+        end
+    end
+    for _, pending in pairs(pending_goals) do
+        if pending.player_id == player_id then
+            return true
+        end
+    end
+    return false
+end
+
+local function refresh_follow_goal(player_id: number, uuid: string, x: number, y: number, z: number)
+    local binding = active_bindings[player_id]
+    if binding == nil then
+        return
+    end
+    local entry = records[player_id]
+    if entry == nil then
+        return
+    end
+    if pending_count() >= config.max_pending_requests then
+        return
+    end
+    local id = request_id("goal", player_id, entry.version)
+    pending_goals[id] = {
+        player_id = player_id,
+        uuid = uuid,
+        key = entry.key,
+        version = entry.version,
+        record = entry.value,
+        purpose = "refresh_follow",
+        binding_expires_at_tick = binding.expires_at_tick,
+        retry_binding = true,
+        x = x,
+        y = y,
+        z = z,
+    }
+    last_batch = { kind = "goal", request_id = id, player_id = player_id }
+    solaris.move_villager_to(id, binding.lease_id, x, y, z, config.home_speed)
+end
+
+local function refresh_follow_for_position_event(player_id: number, uuid: string, x: number, y: number, z: number)
+    local entry = records[player_id]
+    if entry == nil or entry.value == nil or entry.value.status ~= "active" or entry.value.order ~= "follow" then
+        return
+    end
+    if player_busy(player_id) then
+        return
+    end
+    refresh_follow_goal(player_id, uuid, x, y, z)
 end
 
 local function status_message(record: any): string
@@ -486,7 +551,7 @@ function on_player_zone_entered(event: any)
     end
     zone_seen[event.player_id] = event.uuid
     send_notice(event.player_id)
-    send_message(event.player_id, config.colony.name .. ": use /colony status or /colony recruit [role].")
+    send_message(event.player_id, config.colony.name .. ": use /colony status, /colony recruit [role], or right-click a villager to recruit it. /colony order follow makes it follow you.")
 end
 
 function on_player_command(event: any)
@@ -526,7 +591,7 @@ function on_player_command(event: any)
 
     local arguments = split_arguments(event.arguments)
     if arguments == nil or #arguments > 2 then
-        send_message(event.player_id, "Usage: /colony status|recruit [role]|role <role>|order <home|hold>.")
+        send_message(event.player_id, "Usage: /colony status|recruit [role]|role <role>|order <home|hold|follow>.")
         return
     end
     local action = arguments[1] or "status"
@@ -717,6 +782,9 @@ function on_villager_binding_result(event: any)
             queue_binding(pending)
             return
         end
+        if pending.purpose == "refresh_follow" then
+            return
+        end
         if pending.purpose == "apply_order" then
             send_message(pending.player_id, "Stored order intent, but binding failed: " .. failure .. ".")
             return
@@ -754,6 +822,9 @@ function on_villager_goal_result(event: any)
     end
 
     if event.accepted then
+        if pending.purpose == "refresh_follow" then
+            return
+        end
         active_bindings[pending.player_id] = {
             lease_id = pending.lease_id,
             expires_at_tick = pending.binding_expires_at_tick,
@@ -774,6 +845,15 @@ function on_villager_goal_result(event: any)
             )
         else
             send_message(pending.player_id, "Applied Luau order " .. pending.record.order .. ".")
+        end
+        return
+    end
+
+    if pending.purpose == "refresh_follow" then
+        local refresh_failure = event.failure or "binding_unavailable"
+        if refresh_failure == "binding_unavailable" and pending.retry_binding then
+            pending.retry_binding = false
+            queue_binding(pending)
         end
         return
     end
@@ -802,6 +882,51 @@ function on_villager_goal_result(event: any)
     else
         send_message(pending.player_id, "Stored order intent, but goal failed: " .. failure .. ".")
     end
+end
+
+function on_player_entity_interacted(event: any)
+    last_batch = nil
+    if event.entity_type ~= "minecraft:villager" then
+        return
+    end
+    if player_busy(event.player_id) then
+        return
+    end
+    local entry = records[event.player_id]
+    local record = nil
+    if entry ~= nil then
+        record = entry.value
+    end
+    if record ~= nil and record.status == "active" then
+        if record.order ~= "follow" then
+            return
+        end
+        refresh_follow_goal(event.player_id, event.uuid, event.x, event.y, event.z)
+        return
+    end
+    if record ~= nil then
+        return
+    end
+    if table_size(records) + table_size(pending_gets) >= config.max_active_players then
+        return
+    end
+    local id = "state-" .. tostring(event.player_id)
+    if queue_get(event.player_id, event.uuid, "recruit", nil, id, member_key(event.uuid)) then
+        local pending = pending_gets[id]
+        pending.x = event.x
+        pending.y = event.y
+        pending.z = event.z
+    end
+end
+
+function on_player_block_broken(event: any)
+    last_batch = nil
+    refresh_follow_for_position_event(event.player_id, event.uuid, event.player_x, event.player_y, event.player_z)
+end
+
+function on_player_block_placed(event: any)
+    last_batch = nil
+    refresh_follow_for_position_event(event.player_id, event.uuid, event.player_x, event.player_y, event.player_z)
 end
 
 function on_player_left(event: any)

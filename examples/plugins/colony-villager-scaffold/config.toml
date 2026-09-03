@@ -23,7 +23,7 @@ home_speed = 0.3
 default_role = "worker"
 default_order = "home"
 roles = ["worker", "guard", "farmer"]
-orders = ["home", "hold"]
+orders = ["home", "hold", "follow"]
 
 [limits]
 max_pending_requests = 32
