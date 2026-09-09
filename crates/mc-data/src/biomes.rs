@@ -8,6 +8,9 @@ use thiserror::Error;
 
 use crate::{Identifier, read_json_file, sorted_json_files, visit_json_files};
 
+mod spawn_placement;
+pub use spawn_placement::SpawnPlacement;
+
 const REQUIRED_BIOME_SPAWNS: &str = include_str!("../data/required_biome_spawns.json");
 const WARM_SHEEP_COLOR_BIOMES: &[&str] = &[
     "minecraft:desert",
@@ -150,9 +153,26 @@ pub struct BiomeSpawnRules {
     default_water_biome: Option<Identifier>,
     warm_sheep_color_biomes: BTreeSet<Identifier>,
     cold_sheep_color_biomes: BTreeSet<Identifier>,
+    placement: SpawnPlacement,
 }
 
 impl BiomeSpawnRules {
+    pub fn placement(&self) -> SpawnPlacement {
+        self.placement
+    }
+
+    pub fn set_placement(&mut self, placement: SpawnPlacement) {
+        self.placement = placement;
+    }
+
+    pub fn define_biome_spawns(
+        &mut self,
+        biome: Identifier,
+        groups: BTreeMap<String, Vec<BiomeSpawnEntry>>,
+    ) {
+        self.by_biome.entry(biome).or_default().extend(groups);
+    }
+
     #[must_use]
     pub fn from_entries(
         entries: BTreeMap<Identifier, BTreeMap<String, Vec<BiomeSpawnEntry>>>,
@@ -172,6 +192,7 @@ impl BiomeSpawnRules {
             default_water_biome: None,
             warm_sheep_color_biomes,
             cold_sheep_color_biomes,
+            placement: SpawnPlacement::default(),
         }
     }
 

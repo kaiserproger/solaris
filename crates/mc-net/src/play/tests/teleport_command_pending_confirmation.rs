@@ -24,7 +24,7 @@ async fn teleport_command_waits_for_pending_confirmation_before_repositioning_pl
         &mut writer,
         Compression::Disabled,
         "/tp 10 70 -5",
-        CommandPermissions::CONSOLE,
+        CommandPermissions::from_op(true),
         &mut game_mode,
         &mut survival_state,
         &mut xp_state,

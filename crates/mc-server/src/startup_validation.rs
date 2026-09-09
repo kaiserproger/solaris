@@ -6,7 +6,7 @@ use anyhow::{Context, Result, bail};
 use mc_server::ServerConfig;
 use mc_server::startup_data::validate_vanilla_sidecar_version;
 
-pub(crate) const WORLD_CONTRACT_SCHEMA: u32 = 3;
+pub(crate) const WORLD_CONTRACT_SCHEMA: u32 = 4;
 const WORLD_CONTRACT_FILE: &str = "world.json";
 
 const MAX_PLAYERS: u32 = 4_096;
@@ -31,6 +31,7 @@ pub(crate) struct PersistedWorldContract {
     pub(crate) ore_profile: String,
     #[serde(default = "vanilla_profile")]
     pub(crate) settlement_profile: String,
+    pub(crate) gameplay_rules: Option<String>,
     pub(crate) min_y: i32,
     pub(crate) height: i32,
     #[serde(default)]
@@ -265,6 +266,7 @@ pub(crate) fn ensure_world_contract(
         ore_profile,
         settlement_profile,
         mc_world::WorldSpawn::default(),
+        None,
     )
 }
 
@@ -284,6 +286,7 @@ pub(crate) fn world_requires_solaris_spawn(world_dir: &Path) -> Result<bool> {
     Ok(!world_contains_anvil_data(world_dir)?)
 }
 
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn ensure_world_contract_with_spawn(
     world_dir: &Path,
     configured: mc_world::ChunkGeometry,
@@ -292,6 +295,7 @@ pub(crate) fn ensure_world_contract_with_spawn(
     ore_profile: &str,
     settlement_profile: &str,
     spawn: mc_world::WorldSpawn,
+    gameplay_rules: Option<&str>,
 ) -> Result<WorldSource> {
     let path = world_contract_path(world_dir);
     match std::fs::read(&path) {
@@ -304,6 +308,12 @@ pub(crate) fn ensure_world_contract_with_spawn(
                     persisted.schema,
                     path.display(),
                     WORLD_CONTRACT_SCHEMA,
+                );
+            }
+            if persisted.gameplay_rules.as_deref() != gameplay_rules {
+                bail!(
+                    "startup gameplay rules changed in {}; use a fresh world_dir",
+                    path.display()
                 );
             }
             if persisted.worldgen_revision != mc_worldgen::WORLDGEN_REVISION
@@ -356,7 +366,10 @@ pub(crate) fn ensure_world_contract_with_spawn(
         }
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
             if world_contains_anvil_data(world_dir)? {
-                if ore_profile != "vanilla" || settlement_profile != "vanilla" {
+                if ore_profile != "vanilla"
+                    || settlement_profile != "vanilla"
+                    || gameplay_rules.is_some()
+                {
                     bail!(
                         "worldgen profiles ore={ore_profile} settlement={settlement_profile} cannot be applied to an unversioned Anvil import; use a fresh world_dir"
                     );
@@ -371,6 +384,7 @@ pub(crate) fn ensure_world_contract_with_spawn(
                 ore_profile,
                 settlement_profile,
                 spawn,
+                gameplay_rules,
             )?;
             Ok(WorldSource::SolarisGenerated)
         }
@@ -413,6 +427,7 @@ fn world_contains_anvil_data(world_dir: &Path) -> Result<bool> {
     Ok(false)
 }
 
+#[allow(clippy::too_many_arguments)]
 fn write_world_contract(
     path: &Path,
     geometry: mc_world::ChunkGeometry,
@@ -421,6 +436,7 @@ fn write_world_contract(
     ore_profile: &str,
     settlement_profile: &str,
     spawn: mc_world::WorldSpawn,
+    gameplay_rules: Option<&str>,
 ) -> Result<()> {
     let parent = path
         .parent()
@@ -434,6 +450,7 @@ fn write_world_contract(
         mode: mode.to_owned(),
         ore_profile: ore_profile.to_owned(),
         settlement_profile: settlement_profile.to_owned(),
+        gameplay_rules: gameplay_rules.map(str::to_owned),
         min_y: geometry.min_y(),
         height: geometry.height(),
         spawn_block_x: spawn.block_x,

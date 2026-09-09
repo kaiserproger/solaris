@@ -10,8 +10,6 @@ pub(crate) struct CommandPermissions {
 }
 
 impl CommandPermissions {
-    pub(crate) const CONSOLE: Self = Self { op: true };
-
     pub(crate) const fn from_op(op: bool) -> Self {
         Self { op }
     }

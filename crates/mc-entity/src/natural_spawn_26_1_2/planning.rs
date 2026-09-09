@@ -12,6 +12,10 @@ use crate::{
 };
 
 #[cfg(test)]
+#[path = "planning_tests.rs"]
+mod tests;
+
+#[cfg(test)]
 mod hostile_template_tests {
     use mc_data::Identifier;
     use mc_world::{BlockStateId, Chunk, ChunkPos};
@@ -42,7 +46,6 @@ mod hostile_template_tests {
             0x4341_5645_5F51_4100,
         );
 
-        assert_eq!(positions.len(), 3);
         assert!(
             positions.iter().any(|(_, y, _)| *y < 64),
             "expected an underground hostile template position: {positions:?}"
@@ -215,39 +218,59 @@ fn plan_hostile_spawns(
     }
     let slot_base = out.len() as u8;
     let h = herd_hash(chunk_pos, slot_base, 0x5A4F_4D42_4945_0000);
-    for (hostile_index, (lx, spawn_y, lz)) in hostile_spawn_positions(chunk, surfaces, passable, h)
-        .into_iter()
-        .enumerate()
-    {
-        let Some(biome) = chunk_biome_at(chunk, lx, spawn_y, lz) else {
+    let positions = hostile_spawn_positions(chunk, surfaces, passable, h);
+    let Some(&(lx, spawn_y, lz)) = positions.first() else {
+        return;
+    };
+    let Some(biome) = chunk_biome_at(chunk, lx, spawn_y, lz) else {
+        return;
+    };
+    let Some(entry) = choose_biome_spawn(rules.entries(biome, "monster"), chunk_pos, slot_base)
+    else {
+        return;
+    };
+    if !entity_type_is_hostile(entity_types, &entry.entity_type) {
+        return;
+    }
+    let Some(entity_type_id) = entity_types
+        .id_of(&entry.entity_type)
+        .and_then(|id| i32::try_from(id).ok())
+    else {
+        return;
+    };
+    let count = herd_entry_count(entry, chunk_pos, slot_base).min(6);
+    let initial_len = out.len();
+    let bounds = entity_aabb(entry.entity_type.as_str());
+    for (lx, spawn_y, lz) in positions {
+        if out.len() - initial_len >= count {
+            break;
+        }
+        if chunk_biome_at(chunk, lx, spawn_y, lz) != Some(biome) {
             continue;
-        };
-        let slot = slot_base + hostile_index as u8;
-        let Some(entry) = rules
-            .entries(biome, "monster")
-            .iter()
-            .filter(|entry| entity_type_is_hostile(entity_types, &entry.entity_type))
-            .nth(hostile_index)
-        else {
-            continue;
-        };
-        let Some(entity_type_id) = entity_types
-            .id_of(&entry.entity_type)
-            .and_then(|id| i32::try_from(id).ok())
-        else {
-            continue;
-        };
+        }
+        let slot = out.len() as u8;
         let offset = herd_hash(chunk_pos, slot, 0x484F_5354_494C_4500);
+        let position = Vec3::new(
+            f64::from(chunk_pos.0 * 16 + i32::from(lx)) + safe_land_spawn_offset(offset),
+            f64::from(spawn_y),
+            f64::from(chunk_pos.1 * 16 + i32::from(lz)) + safe_land_spawn_offset(offset >> 2),
+        );
+        if out.iter().any(|member| {
+            entity_aabbs_intersect(
+                position,
+                bounds,
+                member.position,
+                entity_aabb(&member.entity_type_name),
+            )
+        }) {
+            continue;
+        }
         out.push(HerdSpawn {
             chunk: chunk_pos,
             slot,
             entity_type_id,
             entity_type_name: entry.entity_type.as_str().to_string(),
-            position: Vec3::new(
-                f64::from(chunk.pos.x * 16 + i32::from(lx)) + safe_land_spawn_offset(offset),
-                f64::from(spawn_y),
-                f64::from(chunk.pos.z * 16 + i32::from(lz)) + safe_land_spawn_offset(offset >> 2),
-            ),
+            position,
             hostile: true,
             sheep_color: None,
         });
@@ -260,7 +283,7 @@ fn hostile_spawn_positions(
     passable: &[BlockStateId],
     seed: u64,
 ) -> Vec<(u8, i32, u8)> {
-    const MAX_POSITIONS: usize = 3;
+    const MAX_POSITIONS: usize = 6;
     const MAX_CAVE_POSITIONS: usize = 2;
     const CAVE_COLUMN_PROBES: u64 = 12;
 
@@ -376,14 +399,30 @@ fn plan_group_spawns(
         return;
     };
     let count = herd_entry_count(entry, chunk_pos, slot_base).min(6);
-    // Probe a compact pack around the leader, not another 200-column surface
-    // search for every member. Each local support probe visits at most 9 blocks.
-    for (dx, dz) in [(0, 0), (2, 0), (-2, 0), (0, 2), (0, -2), (2, 2)]
-        .into_iter()
-        .take(count)
-    {
-        let member_x = (i32::from(lx) + dx) as u8;
-        let member_z = (i32::from(lz) + dz) as u8;
+    // Leave room between herd members while keeping support probes local.
+    // Extra candidates replace members rejected at shorelines and chunk edges.
+    let initial_len = out.len();
+    let spacing = rules.placement().land_spacing() as i8;
+    for (dx, dz) in [
+        (0_i8, 0_i8),
+        (1, 0),
+        (-1, 0),
+        (0, 1),
+        (0, -1),
+        (1, 1),
+        (-1, 1),
+        (1, -1),
+        (-1, -1),
+    ] {
+        if out.len() - initial_len >= count {
+            break;
+        }
+        let Some(member_x) = lx.checked_add_signed(dx * spacing).filter(|x| *x < 16) else {
+            continue;
+        };
+        let Some(member_z) = lz.checked_add_signed(dz * spacing).filter(|z| *z < 16) else {
+            continue;
+        };
         let Some((member_y, actual_surface)) = (y - 4..=y + 4).rev().find_map(|candidate_y| {
             let state = chunk.get_block(member_x, candidate_y, member_z)?;
             (state == surfaces.preferred || surfaces.fallbacks.contains(&state))
@@ -444,13 +483,17 @@ fn plan_water_group_spawns(
 ) {
     let chunk_pos = (chunk.pos.x, chunk.pos.z);
     let slot_base = out.len() as u8;
-    let h = herd_hash(chunk_pos, slot_base, 0x5741_5445_5200_0000);
-    let lx = 3 + (h as u8 % 10);
-    let lz = 3 + ((h >> 8) as u8 % 10);
-    let Some(spawn_y) = water_spawn_y(chunk, lx, lz, water, sea_level) else {
+    let placement = rules.placement();
+    let mut positions = (0..u64::from(placement.water_attempts())).filter_map(|attempt| {
+        let hash = herd_hash(chunk_pos, slot_base, 0x5741_5445_5200_0000 ^ attempt);
+        let x = hash as u8 % 16;
+        let z = (hash >> 8) as u8 % 16;
+        water_spawn_y(chunk, x, z, water, sea_level, placement.water_depth()).map(|y| (x, y, z))
+    });
+    let Some(leader @ (lx, y, lz)) = positions.next() else {
         return;
     };
-    let Some(biome) = chunk_biome_at(chunk, lx, spawn_y, lz) else {
+    let Some(biome) = chunk_biome_at(chunk, lx, y, lz) else {
         return;
     };
     let Some(entry) = choose_biome_spawn(rules.entries(biome, group), chunk_pos, slot_base) else {
@@ -463,18 +506,36 @@ fn plan_water_group_spawns(
         return;
     };
     let count = herd_entry_count(entry, chunk_pos, slot_base).min(6);
-    for i in 0..count {
-        let slot = slot_base + i as u8;
+    let bounds = entity_aabb(entry.entity_type.as_str());
+    let initial_len = out.len();
+    for (x, y, z) in std::iter::once(leader).chain(positions) {
+        if out.len() - initial_len >= count {
+            break;
+        }
+        if chunk_biome_at(chunk, x, y, z) != Some(biome) {
+            continue;
+        }
+        let position = Vec3::new(
+            f64::from(chunk.pos.x * 16 + i32::from(x)) + 0.5,
+            f64::from(y),
+            f64::from(chunk.pos.z * 16 + i32::from(z)) + 0.5,
+        );
+        if out.iter().any(|member| {
+            entity_aabbs_intersect(
+                position,
+                bounds,
+                member.position,
+                entity_aabb(&member.entity_type_name),
+            )
+        }) {
+            continue;
+        }
         out.push(HerdSpawn {
             chunk: chunk_pos,
-            slot,
+            slot: out.len() as u8,
             entity_type_id,
             entity_type_name: entry.entity_type.as_str().to_string(),
-            position: Vec3::new(
-                f64::from(chunk.pos.x * 16 + i32::from(lx)) + 0.5,
-                f64::from(spawn_y),
-                f64::from(chunk.pos.z * 16 + i32::from(lz)) + 0.5,
-            ),
+            position,
             hostile: false,
             sheep_color: None,
         });
@@ -487,35 +548,23 @@ fn water_spawn_y(
     lz: u8,
     water: &[BlockStateId],
     sea_level: i32,
+    depth: u8,
 ) -> Option<i32> {
-    let mut best_run = None;
-    let mut current_start = None;
-    for y in mc_world::MIN_Y..=sea_level {
-        if chunk
+    let is_water = |y| {
+        chunk
             .get_block(lx, y, lz)
             .is_some_and(|state| water.contains(&state))
-        {
-            current_start.get_or_insert(y);
-            continue;
+    };
+    let top = (mc_world::MIN_Y..=sea_level).rev().find(|&y| is_water(y))?;
+    let mut spawn_y = top;
+    // The startup rule selects the initial water band; execution stays native.
+    for y in (top - i32::from(depth)..top).rev() {
+        if !is_water(y) {
+            break;
         }
-        if let Some(start) = current_start.take() {
-            remember_water_run(&mut best_run, start, y - 1);
-        }
+        spawn_y = y;
     }
-    if let Some(start) = current_start.take() {
-        remember_water_run(&mut best_run, start, sea_level);
-    }
-    best_run.map(|(start, end)| start + (end - start) / 2)
-}
-
-fn remember_water_run(best_run: &mut Option<(i32, i32)>, start: i32, end: i32) {
-    let len = end - start;
-    if best_run
-        .map(|(best_start, best_end)| len > best_end - best_start)
-        .unwrap_or(true)
-    {
-        *best_run = Some((start, end));
-    }
+    Some(spawn_y)
 }
 
 pub fn chunk_biome_at(chunk: &Chunk, lx: u8, y: i32, lz: u8) -> Option<&mc_data::Identifier> {

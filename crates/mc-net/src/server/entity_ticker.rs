@@ -56,7 +56,8 @@ fn apply_runtime_tick_metrics_observation(
     if let Some(RuntimeControlOutcome::Work(decision)) = outcome.as_ref()
         && decision.action == crate::AutoscaleAction::ScaleDown
     {
-        info!(
+        debug!(
+            target: "solaris::profile",
             tick,
             source_tick = observation.percentiles.source_tick,
             action = ?decision.action,
@@ -71,6 +72,7 @@ fn apply_runtime_tick_metrics_observation(
         && decision.action == crate::AutoscaleAction::ScaleUp
     {
         debug!(
+            target: "solaris::profile",
             tick,
             source_tick = observation.percentiles.source_tick,
             entity_pathing_candidates = decision.budgets.entity_pathing_candidates,
@@ -91,10 +93,11 @@ fn log_runtime_tick_percentiles(
     let Some(percentiles) = metrics.snapshot() else {
         return;
     };
-    if !tracing::enabled!(tracing::Level::DEBUG) {
+    if !tracing::enabled!(target: "solaris::profile", tracing::Level::DEBUG) {
         return;
     }
     debug!(
+        target: "solaris::profile",
         tick,
         world_time,
         tick_window_source_tick = percentiles.source_tick,
@@ -948,11 +951,14 @@ pub(super) async fn run_entity_ticker(context: EntityTickerContext) {
                 &entity_tick_metrics,
             );
         }
-        if metrics_log_gate.should_log(tick, tick_us, metrics_policy) {
+        if metrics_log_gate.should_log(tick, tick_us, metrics_policy)
+            && tracing::enabled!(target: "solaris::profile", tracing::Level::DEBUG)
+        {
             let pressure = entity_sessions.pressure_snapshot();
             let lock_pressure = crate::lock_metrics::snapshot();
             if is_slow_tick(tick_us, metrics_policy) {
-                warn!(
+                debug!(
+                    target: "solaris::profile",
                     tick,
                     world_time,
                     tick_us,
@@ -1067,7 +1073,8 @@ pub(super) async fn run_entity_ticker(context: EntityTickerContext) {
                 let omitted_commands =
                     attributed_command_count.saturating_sub(attributed_commands.len());
                 if !attributed_lane_waits.is_empty() || !attributed_commands.is_empty() {
-                    warn!(
+                    debug!(
+                        target: "solaris::profile",
                         tick,
                         simulation_command_scope,
                         cpu_admission_wait_us_by_lane = ?attributed_lane_waits,
@@ -1079,6 +1086,7 @@ pub(super) async fn run_entity_ticker(context: EntityTickerContext) {
                 }
             } else {
                 debug!(
+                    target: "solaris::profile",
                     tick,
                     world_time,
                     tick_us,

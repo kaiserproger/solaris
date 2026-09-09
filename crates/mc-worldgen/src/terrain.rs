@@ -29,13 +29,16 @@ use crate::structures::{StructureRules, StructureTemplate};
 
 mod biome_routing;
 mod biome_rules;
+mod gameplay_rules;
 mod geological_ores;
 mod ore_rules;
 mod overworld;
+mod sediments;
 mod trees;
 
 use biome_routing::BEACH_HEIGHT_ABOVE_SEA;
 pub use biome_rules::BiomeRules;
+pub use gameplay_rules::{ClayRule, TreeRule};
 use geological_ores::GeologicalOreRules;
 pub use ore_rules::{
     BiomeScope, MAX_ORE_RULES, MAX_ORE_WORK_UNITS_PER_CHUNK, OreRule, OreRules, OreRulesError,
@@ -214,6 +217,8 @@ pub struct TerrainGenerator {
     ore_generation_profile: &'static str,
     structures: StructureRules,
     decorations: DecorationBlocks,
+    tree_rules: HashMap<Identifier, TreeRule>,
+    clay_rule: ClayRule,
     worldgen_mode: WorldgenMode,
     diagnostic_cache: DiagnosticCache,
 }
@@ -382,6 +387,7 @@ struct DecorationBlocks {
     sugar_cane: Option<BlockStateId>,
     cactus: Option<BlockStateId>,
     seagrass: Option<BlockStateId>,
+    clay: Option<BlockStateId>,
     kelp_plant: Option<BlockStateId>,
     kelp: Option<BlockStateId>,
     leaf_distances: [Option<[BlockStateId; 7]>; 6],
@@ -423,6 +429,7 @@ impl DecorationBlocks {
             sugar_cane: optional_block(registry, "minecraft:sugar_cane"),
             cactus: optional_block(registry, "minecraft:cactus"),
             seagrass: optional_block(registry, "minecraft:seagrass"),
+            clay: optional_block(registry, "minecraft:clay"),
             kelp_plant: optional_block(registry, "minecraft:kelp_plant"),
             kelp: optional_block(registry, "minecraft:kelp"),
             leaf_distances: [None; 6],
@@ -668,6 +675,8 @@ impl TerrainGenerator {
             ore_generation_profile: "vanilla",
             structures: StructureRules::none(),
             decorations: DecorationBlocks::new(registry.as_ref()),
+            tree_rules: HashMap::new(),
+            clay_rule: ClayRule::default(),
             worldgen_mode: WorldgenMode::VanillaLike,
             diagnostic_cache: DiagnosticCache::default(),
         })
@@ -1624,6 +1633,7 @@ impl TerrainGenerator {
             }
         }
         self.initialize_leaf_distances(chunk, &mut leaves);
+        self.apply_sediments(chunk, columns);
         for lz in 0..16u8 {
             for lx in 0..16u8 {
                 if let Some(top) = touched[lz as usize * 16 + lx as usize] {
@@ -1729,6 +1739,9 @@ impl TerrainGenerator {
     }
 
     fn tree_density_allows(&self, plan: &ColumnPlan) -> bool {
+        if let Some(rule) = self.tree_rules.get(&plan.biome) {
+            return plan.vegetation_density >= rule.density_threshold;
+        }
         let threshold = if self.biomes.jungle.contains(&plan.biome) {
             -0.55
         } else if self.biomes.temperate_forest.contains(&plan.biome) {
@@ -1741,7 +1754,7 @@ impl TerrainGenerator {
         } else if Self::is_cold_forest(&plan.biome) || Self::is_savanna(&plan.biome) {
             -0.05
         } else if self.biomes.grassland.contains(&plan.biome) {
-            0.40
+            0.0
         } else {
             return false;
         };
@@ -1766,6 +1779,9 @@ impl TerrainGenerator {
     }
 
     fn tree_spacing_for_biome(&self, biome: &Identifier) -> Option<u64> {
+        if let Some(rule) = self.tree_rules.get(biome) {
+            return Some(rule.spacing);
+        }
         if self.biomes.jungle.contains(biome) {
             // Vanilla jungle vegetation makes about 50 attempts per chunk,
             // mixing trees with a low bush layer rather than sparse trunks.

@@ -391,3 +391,80 @@ fn missing_worldgen_plugin_source_fails_startup_instead_of_falling_back_to_vanil
 
     assert!(matches!(error, LuaHostError::InvalidStartupPlugin { .. }));
 }
+
+#[test]
+fn startup_rule_reload_fences_resolved_values_not_source_formatting() {
+    let plugins = TempPlugins::new();
+    write_plugin(plugins.path(), "rules", "");
+    let package = plugins.path().join("rules");
+    let source = "return { trees = {{ biomes = {\"minecraft:plains\"}, spacing = config.spacing, density_threshold = 0.0 }} }";
+    fs::write(package.join("rules.lua"), source).unwrap();
+    fs::write(package.join("config.toml"), "spacing = 97").unwrap();
+    let initial = prepare_lua_plugins(LuaHostConfig::new(plugins.path())).unwrap();
+    let contract = super::LuaReloadContract::from_prepared(&initial);
+    fs::write(
+        package.join("rules.lua"),
+        format!("{source}\n-- formatting only"),
+    )
+    .unwrap();
+    let equivalent = prepare_lua_plugins(LuaHostConfig::new(plugins.path())).unwrap();
+    assert_eq!(
+        contract.incompatibility(&super::LuaReloadContract::from_prepared(&equivalent)),
+        None
+    );
+    fs::write(package.join("config.toml"), "spacing = 113").unwrap();
+    let changed = prepare_lua_plugins(LuaHostConfig::new(plugins.path())).unwrap();
+    assert_eq!(
+        contract.incompatibility(&super::LuaReloadContract::from_prepared(&changed)),
+        Some("worldgen")
+    );
+}
+
+#[test]
+fn unbounded_startup_rule_execution_fails_even_in_permissive_mode() {
+    let plugins = TempPlugins::new();
+    write_plugin(plugins.path(), "rules", "");
+    fs::write(plugins.path().join("rules/rules.lua"), "while true do end").unwrap();
+    let error = prepare_lua_plugins(LuaHostConfig::new(plugins.path())).unwrap_err();
+    assert!(matches!(error, LuaHostError::InvalidStartupPlugin { .. }));
+    assert!(error.to_string().contains("budget"), "{error}");
+}
+
+#[test]
+fn multiple_gameplay_rule_owners_fail_before_world_creation() {
+    let plugins = TempPlugins::new();
+    for id in ["first", "second"] {
+        write_plugin(plugins.path(), id, "");
+        fs::write(
+            plugins.path().join(id).join("rules.lua"),
+            "return { placement = { land_spacing = 4, water_attempts = 16, water_depth = 2 } }",
+        )
+        .unwrap();
+    }
+    assert!(matches!(
+        prepare_lua_plugins(LuaHostConfig::new(plugins.path())),
+        Err(LuaHostError::WorldgenConflict { .. })
+    ));
+}
+
+#[test]
+fn startup_rules_remain_authoritative_when_the_manifest_is_broken_or_missing() {
+    let plugins = TempPlugins::new();
+    write_plugin(plugins.path(), "rules", "");
+    let package = plugins.path().join("rules");
+    fs::write(
+        package.join("rules.lua"),
+        "return { placement = { land_spacing = 4, water_attempts = 16, water_depth = 2 } }",
+    )
+    .unwrap();
+    fs::write(package.join("plugin.toml"), "not a valid manifest = [").unwrap();
+    assert!(matches!(
+        prepare_lua_plugins(LuaHostConfig::new(plugins.path())),
+        Err(LuaHostError::InvalidStartupPlugin { .. })
+    ));
+    fs::remove_file(package.join("plugin.toml")).unwrap();
+    assert!(matches!(
+        prepare_lua_plugins(LuaHostConfig::new(plugins.path())),
+        Err(LuaHostError::InvalidStartupPlugin { .. })
+    ));
+}

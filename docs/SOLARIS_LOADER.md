@@ -26,15 +26,21 @@ loader major 64 within the 26.1 line. The exact versions in the table are the
 field-tested development matrix; other newer compatible loader builds are not a
 Solaris alpha release claim.
 
-## Build the client jars
+## Download or build the client jars
 
-Prebuilt Loader publishing is not yet part of the released-alpha installer.
-Build compatible sources from
-[`solaris-loader`](https://github.com/kaiserproger/solaris-loader), checked out
-beside the server repository. Their Git histories are independent: a server
-tag or commit is not a Loader revision. Alpha protocol and bundle contracts
-can change between revisions. Current Loader wire protocol is **2**, with no
-protocol-1 compatibility path; plugin API is still `0.6.0`.
+Download the matching platform JAR and `SHA256SUMS` from
+[Solaris Loader releases](https://github.com/kaiserproger/solaris-loader/releases).
+The server's curl installer does not install client mods. Select the release
+required by your server, not GitHub's source-code ZIP, and keep only one Solaris
+Loader adapter in the instance. Verify the selected JAR's SHA-256 against
+`SHA256SUMS` before installation.
+
+To build instead, use
+[`solaris-loader`](https://github.com/kaiserproger/solaris-loader). Its Git
+history and release version are independent of core: a server tag is not a
+Loader revision. Alpha protocol and bundle contracts can change between
+revisions. Current Loader wire protocol is **2**, with no protocol-1
+compatibility path; plugin API is still `0.6.0`.
 Declared keyboard actions leave vanilla movement, menus, screenshots and
 fullscreen handling intact. They are suppressed in menus/overlays or without
 window focus; bindings reset on reconnect. Rebinding, chords and mouse/gamepad
@@ -62,6 +68,26 @@ loader-forge/build/libs/loader-forge-0.1.0.jar
 
 These are client mods, not Solaris server plugins. Do not put them in the
 server's `[plugins].directory`.
+
+## Choose the correct launcher instance
+
+Solaris Loader is installed like another mod for the chosen platform. It does
+not require an MCP token or the development client agent.
+
+| Launcher | Destination |
+| --- | --- |
+| PrismLauncher | Instance → Edit → Mods → add the JAR; choose its loader under Version. |
+| MultiMC | Instance → Edit → Loader mods → add the JAR; use a loader/version the launcher actually supports. |
+| Official Minecraft Launcher | Install the selected platform's client profile, then use that installation's configured Game Directory and its `mods/` folder. |
+| Modrinth App | Open the matching instance folder and use `mods/`. |
+| CurseForge App | Open the matching custom profile folder and use `mods/`; preserve the modpack's platform/version. |
+
+Close Minecraft before replacing a JAR. Do not unzip it. For any other launcher,
+open the launched profile's game directory rather than guessing an operating
+system-wide `.minecraft` path. If the launcher lacks the required 26.1.2/Java
+25/platform combination, use a compatible launcher, not a near-match version.
+These are manual installation instructions, not graphical validation claims
+for every launcher.
 
 ## Install in Fabric
 

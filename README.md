@@ -4,7 +4,7 @@ Solaris is an authoritative Minecraft Java Edition server written in Rust. It
 targets the vanilla **Minecraft Java Edition 26.1.2** protocol and also supports
 optional client content through Solaris Loader.
 
-> **Development status:** this is the **`v0.0.3-alpha.1`** prerelease line.
+> **Development status:** this is the **`v0.0.4-alpha.1`** prerelease line.
 > Maturity remains **draft**, not release-ready. Solaris is suitable for
 > testing, plugin development, and bounded multiplayer field tests; it is not a
 > production-safe replacement for vanilla, Paper, Fabric, Forge, or NeoForge.
@@ -12,8 +12,8 @@ optional client content through Solaris Loader.
 
 Solaris ships an optional default-off read-only web dashboard
 (`[dashboard]` in the config, see [`docs/OPERATING.md`](docs/OPERATING.md))
-and the `operator add|remove|list` CLI. The optional standard plugin pack is
-still planned. See [`docs/PUBLIC_ALPHA3_PLAN.md`](docs/PUBLIC_ALPHA3_PLAN.md).
+and the `operator add|remove|list` CLI. The standard plugin pack is explicitly
+opt-in; see [plugin installation](docs/PLUGINS.md#standard-plugin-pack).
 
 ## Install the released alpha (Linux)
 
@@ -21,11 +21,11 @@ Published archives are available for Linux x86_64 and AArch64. Pin the release
 because GitHub's `latest` alias does not resolve prereleases:
 
 ```sh
-curl -fsSL https://raw.githubusercontent.com/kaiserproger/solaris/v0.0.3-alpha.1/install.sh | \
-  SOLARIS_VERSION="v0.0.3-alpha.1" bash
+curl -fsSL https://raw.githubusercontent.com/kaiserproger/solaris/v0.0.4-alpha.1/install.sh | \
+  SOLARIS_VERSION="v0.0.4-alpha.1" bash
 
 curl -fsSLo server.toml \
-  https://raw.githubusercontent.com/kaiserproger/solaris/v0.0.3-alpha.1/example.toml
+  https://raw.githubusercontent.com/kaiserproger/solaris/v0.0.4-alpha.1/example.toml
 solaris --check --config server.toml
 solaris --config server.toml
 ```
@@ -35,7 +35,14 @@ installs to `$HOME/.local/bin` for a regular user and `/usr/local/bin` for root;
 set `SOLARIS_INSTALL_DIR` to override that destination. Windows and macOS do
 not currently have prebuilt archives.
 
-## Build and run the alpha-3 development tree
+**Upgrading from alpha-3:** back up the existing world and configuration first.
+Alpha-4 uses Solaris world-contract schema 4 and worldgen revision 19; an older
+Solaris world contract is rejected rather than silently mixing generation.
+Use a fresh `[data].world_dir`. Do not delete or hand-edit the old world's
+contract to bypass the check. Changing an effective startup `rules.lua` plan
+also requires a fresh world directory.
+
+## Build and run the alpha-4 development tree
 
 Use the repository's debug profile for development:
 
@@ -62,6 +69,22 @@ That is `cargo build --locked --release --workspace`. Full harness
 interaction — profiles, preparation versus execution, credentials, artifact
 lookup, and current limits — is documented in
 [`docs/AGENT_TOOLING.md`](docs/AGENT_TOOLING.md#validation-harness).
+
+### Interactive server console
+
+When attached to a terminal, the server opens a status dashboard with a separate
+command line and automatically following logs. Commands are parsed independently of the UI.
+Use `help` to list commands; examples include `status`, `list`, `save-all`,
+`time set night`, `weather rain`, `gamerule doDaylightCycle false`, and
+`operator list`. Use `stop` for the normal save-and-drain shutdown.
+
+Enter submits a command; Up/Down recall command history; Backspace deletes the
+last character; Ctrl+U clears the line. Ctrl+C/Ctrl+D also request shutdown.
+
+Pass `--no-console` for ordinary log output and stdin commands, including
+supervised or redirected deployments. The foreground server owns the console;
+do not run a second stdin reader alongside it. High-frequency profiling details
+are under the `solaris::profile` debug tracing target rather than normal logs.
 
 ## Network address and port
 
@@ -144,13 +167,13 @@ first, followed by varied-seed graphical exploration with seeds recorded for
 reproduction. The frozen load matrix remains 20 PASS / 22 FAIL with no owner
 terrain `ACCEPT`; the full core redesign is incomplete.
 
-The local field-test archive was built and its isolated startup was verified:
-`.analysis/releases/v0.0.3-alpha.1/solaris-x86_64-unknown-linux-gnu.tar.gz`.
-SHA-256: `925a825b709e5e44d8ad17957d741e3751ed955dba3e510ee4baa8ee78ed6b36`.
-It is frozen before the repository split, not published and not a full-survival
-acceptance. Extract it, run `./solaris --config example.toml`, and connect a
-Minecraft Java 26.1.2 client to `127.0.0.1:25565`. Choose `[data].seed` before
-first startup; use a new world directory to test another seed.
+Alpha-4's reported-seed graphical survey confirmed natural cod/squid, separated
+herds, nearby trees, forest and mountain terrain, and natural clay in two
+water sites. It used operator travel and does not close the blocked no-debug
+survival scenario above. Startup Luau gameplay rules and the interactive server
+console are documented in the [plugin guide](docs/PLUGINS.md) and console
+section above. [Solaris Loader v0.1.0](https://github.com/kaiserproger/solaris-loader/releases/tag/v0.1.0)
+provides matching protocol-2 player adapters.
 
 Do not assume an existing Solaris world will remain compatible with a newer
 alpha. Solaris can read supported vanilla Anvil data, but unversioned imports
@@ -179,8 +202,8 @@ launching a graphical or twenty-minute profile.
 ## More documentation
 
 - [`docs/PROJECT_SPEC.md`](docs/PROJECT_SPEC.md) — design and compatibility scope
-- [Current alpha release](https://github.com/kaiserproger/solaris/releases/tag/v0.0.3-alpha.1) — binaries, checksums and release notes
-- [`docs/PUBLIC_ALPHA3_PLAN.md`](docs/PUBLIC_ALPHA3_PLAN.md) — current development work
+- [Current alpha release](https://github.com/kaiserproger/solaris/releases/tag/v0.0.4-alpha.1) — binaries, checksums and release notes
+- [`docs/MEMORY.md`](docs/MEMORY.md) — current work and evidence cursor
 - [`docs/REPLACEMENT_READINESS.md`](docs/REPLACEMENT_READINESS.md) — replacement-readiness limits
 - [`docs/VALIDATION_LEDGER.md`](docs/VALIDATION_LEDGER.md) — recorded evidence
 

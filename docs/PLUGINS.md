@@ -50,7 +50,7 @@ solaris --config server.toml
 When running from source, use `cargo run --bin mc-server --` in place of
 `solaris`. `strict = true` is the production-shaped mode: every filesystem entry
 must be a valid package, every selected plugin must pass compile/startup, and
-`expected` must exactly match the final external-plus-bundled id set. Keep
+`expected` must exactly match the final deployed plugin id set. Keep
 `strict = false` only for local authoring where skipping an ordinary broken
 package is intentional.
 
@@ -69,11 +69,26 @@ Beyond the demonstration examples, Solaris ships an optional first-party
 **standard plugin pack** under
 [`../../solaris-default-plugins/`](../../solaris-default-plugins/): `solaris-permissions`,
 `solaris-essentials`, `solaris-economy`, `solaris-towns`, and `solaris-audit`.
-All five are independent server-only API 0.6 packages; copy their directories
-into `[plugins].directory` to install, and list them under `plugins.strict`
-`expected` when running strict. Integration coverage lives in
-`crates/mc-test-harness/tests/plugin_standard_pack.rs`. Scope decisions and
-intentional omissions are recorded in
+All five are independent server-only API 0.6 packages. Installation is explicit;
+the core server installer never enables them automatically. On Linux:
+
+```sh
+git clone https://github.com/kaiserproger/solaris-default-plugins.git
+git -C solaris-default-plugins checkout 2d51ae5559cdd5b7cbab32888ef2b11d931e3e6e
+bash solaris-default-plugins/install.sh --directory "$PWD/plugins"
+```
+
+Pass package names after the directory to select a subset. Stop the server
+first; the script refuses existing packages and never edits `server.toml` or
+overwrites configuration. Set `[plugins].directory` to the destination, enable
+`strict`, include every deployed id in `expected`, then run
+`solaris --check --config server.toml`. The pinned revision above is the
+compatible alpha-4 package snapshot; review changes before selecting another. The script needs
+Bash 4+ and GNU coreutils; manual package copying works on other platforms.
+
+Integration coverage lives in
+`crates/mc-test-harness/tests/plugin_standard_pack.rs`. Scope decisions,
+limitations, and intentional omissions are recorded in
 [`../../solaris-default-plugins/standard-pack/README.md`](../../solaris-default-plugins/standard-pack/README.md).
 The remaining shipped examples are demonstrations; read their `plugin.toml`,
 `config.toml`, `main.lua`, and README before enabling them.
@@ -142,6 +157,84 @@ cargo test -p mc-test-harness --test plugin_examples
 The Loader-required fixture and real-client commands are documented in
 [`../examples/loader-live-gate/README.md`](../examples/loader-live-gate/README.md).
 
+## Author quickstart
+
+Create `plugins/hello/plugin.toml`:
+
+```toml
+id = "hello"
+name = "Hello"
+version = "0.1.0"
+api = "0.6.0"
+events = []
+capabilities = []
+player_commands = ["hello"]
+```
+
+Create `plugins/hello/main.lua`:
+
+```luau
+--!strict
+function on_player_command(event: any)
+    solaris.send_message(event.player_id, "Hello, " .. event.username .. "!")
+end
+```
+
+For this isolated development deployment, set `plugins.directory = "plugins"`,
+`plugins.strict = true`, and `plugins.expected = ["hello"]` in `server.toml`.
+Run `solaris --check --config server.toml`, start the server, join with a vanilla
+client, and run `/hello`. The reply must name that player. No Loader or
+capability is needed for this bounded message command.
+
+Use explicit local types for your own state and validate operator configuration
+once at load. The current type-check-only prelude declares `solaris` as `any`;
+strict checking catches errors in your Luau, but does **not** statically prove
+host method names, argument shapes, or event DTO fields. The host validates
+those at invocation. `--check` executes loading/startup, not every future
+handler: exercise commands, rejected inputs, result callbacks, and restart
+recovery against the server.
+
+Declare only events and capabilities actually needed. Correlate asynchronous
+results by `request_id`; returning from a host call means submission, not
+successful world mutation. Use the matching result event before reporting
+success. Keep durable domain state in plugin storage rather than globals;
+globals and timers disappear on restart or replacement. Use simulation timers
+and events instead of per-tick scans or polling.
+
+After changing only reloadable source/configuration, a strict Unix deployment
+can use the documented SIGHUP replacement. New command roots, plugin identity,
+client content, or startup worldgen/rules require restart; see
+[lifecycle](#runtime-lifecycle-and-diagnostics). Back up data and review schema
+changes before deployment. Do not copy fixture or documentation directories
+into the strict plugin root.
+
+## Complete host API index
+
+These are the functions currently registered on `solaris` for API `0.6.0`.
+Signatures, bounded record fields, result events, and failure semantics follow
+in the linked sections. The [event table](#events) lists callbacks; callbacks
+are not additional callable host functions.
+
+| Area | Functions | Contract |
+| --- | --- | --- |
+| Configuration | `config` | [Configuration](#plugin-configuration) |
+| Timers | `schedule_timer`, `cancel_timer` | [Simulation timers](#simulation-timers) |
+| Messaging | `send_message`, `broadcast`, `disconnect`, `send_custom_payload` | [Commands](#commands) |
+| Entity mutations | `spawn_entity`, `damage_entity` | [Commands](#commands) |
+| Storage | `storage_get`, `storage_cas`, `storage_delete` | [Commands](#commands) |
+| Menus | `open_inventory_menu`, `close_inventory_menu` | [Commands](#commands) |
+| Inventory | `inventory_transaction`, `inventory_storage_transaction` | [Commands](#commands) |
+| World and players | `set_world_time`, `set_block`, `list_online_players` | [Commands](#commands) |
+| Zones and teleport | `upsert_zone`, `upsert_protected_zone`, `remove_zone`, `teleport_player` | [Gameplay adapters](#shipped-economy-and-claims) |
+| Villager bindings | `bind_nearest_villager`, `set_villager_idle`, `move_villager_to`, `release_villager_binding` | [Gameplay adapters](#shipped-economy-and-claims) |
+| Loader presentation | `present_client_ui`, `play_client_sound`, `stop_client_sound` | [Client content](#client-content-manifest) |
+| Loader blocks | `place_loader_block`, `grant_loader_block_item` | [Commands](#commands) |
+
+`rules.lua` is a separate startup data contract, not another runtime host
+namespace. No durable resident handle, physical worker/order API, schema-2
+declarative view API, or settlement-contract operation is available merely
+because it appears in a proposal.
+
 ## Package And Manifest
 
 The configured plugin directory contains one directory per plugin:
@@ -151,6 +244,7 @@ plugins/
 `-- basic-economy/
     |-- config.toml     # optional operator configuration
     |-- plugin.toml
+    |-- rules.lua       # optional startup-only native rule plan
     `-- main.lua        # strict Luau source
 ```
 
@@ -280,6 +374,69 @@ chunk is installed, a dedicated system-owned simulation command materializes
 the villagers with plains type, declared profession, and level-one metadata.
 The per-inhabitant claim is durable and independent of ambient-herd admission,
 so a reload or later chunk installation cannot duplicate the planned resident.
+
+### Startup rules written in Luau
+
+An optional `rules.lua` is executed during plugin preparation, separately from
+`main.lua`. It receives the package's `config.toml` as `config` and returns one
+table. It has no `solaris` runtime API, filesystem, chunk, or worker access.
+The validated result is materialized into native spawning and terrain rules
+before spawn generation. Luau is not called per entity tick or generated block.
+Only one installed plugin may own this plan.
+
+```lua
+--!strict
+return {
+    placement = {
+        land_spacing = 4,
+        water_attempts = 16,
+        water_depth = 2,
+    },
+    trees = {{
+        biomes = {"minecraft:plains", "minecraft:sunflower_plains"},
+        spacing = 97,
+        density_threshold = 0.0,
+    }},
+    clay = {
+        rarity = 3,
+        radius_min = 2,
+        radius_max = 3,
+        max_water_depth = 8,
+    },
+}
+```
+
+- `placement`: land candidate separation is 1–4 blocks; water placement tries
+  1–32 candidate columns and selects a position at most 1–16 blocks below the
+  column's highest water block at or below sea level, stopping at a water gap.
+- `trees`: at most 64 declarations, each naming 1–64 biomes. `spacing` is a
+  positive deterministic candidate-selection divisor, not a distance in blocks;
+  smaller values admit more candidates. `density_threshold` is finite and
+  between −1 and 1. Existing support, biome, and tree-shape checks still apply.
+- `clay`: positive candidate `rarity` divisor; disk radii satisfy
+  `1 <= radius_min <= radius_max <= 3`; water depth is bounded to 1–32 blocks.
+  Deposits replace supported shallow underwater sediment, not arbitrary blocks.
+- Optional `spawning` contains at most 64 `{biome, groups}` declarations.
+  Listed groups replace the corresponding groups for that biome; omitted groups
+  and unlisted biomes retain their existing rules. Group names are `creature`,
+  `monster`, `water_ambient`, and `water_creature`. Each group accepts at most
+  32 entries shaped as `{entity = "minecraft:cow", min = 2, max = 4, weight = 8}`;
+  counts satisfy `1 <= min <= max <= 6`, weights are 1–10,000, and duplicate
+  biome/entity declarations and unknown fields are rejected.
+  Counts are requested pack sizes, not permission to bypass admission: physical
+  placement and existing runtime caps still apply (at most six passive and three
+  hostile admissions per chunk in the current herd-candidate consumer).
+
+At least one rule category is required. Type checking, the existing plugin
+memory limit, instruction fuel, and host-event deadline also apply to this
+startup VM. Invalid startup scripts fail even in permissive deployment mode.
+Native materialization additionally validates available entities, tree biomes,
+and required clay blocks.
+
+The resolved plan's fingerprint is stored in `solaris/world.json`. Changing,
+adding, or removing rules requires a fresh Solaris world; Anvil imports reject
+them. `SIGHUP` refuses a changed resolved plan, while source formatting alone
+does not change its fingerprint. There is no live rule mutation API.
 
 ### Client Content Manifest
 
@@ -648,7 +805,7 @@ the host-owned attempt.
 On Unix, `mc-server` uses `SIGHUP` as the explicit production reload trigger. It
 re-reads the configured TOML on a blocking worker, requires that the server originally
 started with `plugins.strict = true` and that the current file still has strict mode,
-then reruns the normal external/bundled discovery and `plugins.expected` validation
+then reruns the normal external-package discovery and `plugins.expected` validation
 before calling `LuaHost::reload`. File preparation and the host replacement are awaited
 without pausing the network server future. Other server configuration fields remain the
 startup snapshot: SIGHUP applies only the validated plugin replacement. A server with no
@@ -863,6 +1020,7 @@ not roll those timer changes back.
 
 The existing bounded presentation commands remain available:
 
+```luau
 solaris.send_custom_payload(player_id, channel, payload)
 solaris.send_message(player_id, text)
 solaris.broadcast(text)
@@ -1332,6 +1490,27 @@ saturation or closure, the host calls `on_command_batch_rejected(result)`
 directly with `reason = "queue_full"` or `reason = "queue_closed"` and the
 exact `command_count`; that callback cannot emit another command. A failed
 handler disables only that plugin.
+
+Event dispatch has one aggregate 50 ms wall deadline, divided fairly among
+remaining plugins with a maximum 10 ms slice per plugin. Interrupt checks
+enforce the slice alongside instruction fuel; this is not a hard real-time
+OS scheduling guarantee. All VMs share one host thread, so expensive handlers
+can still consume its bounded event budget and delay other plugin work.
+The 16 MiB limit covers Luau-managed memory, not total process RSS or every
+native DTO allocation. A large plugin count multiplies per-VM memory.
+
+This is language/authority isolation **inside the server process**, not a
+process sandbox. Separate VMs, restricted libraries, declared capabilities,
+plugin-owned result routing, and one-shot command admission protect ordinary
+script boundaries. They do not contain a defect in the embedded VM/native
+runtime or guarantee zero CPU contention with the kernel.
+
+For low overhead, subscribe only to needed events, cache validated
+`solaris.config()` data at load, prefer simulation timers over `server.tick`
+handlers, and issue bounded queries/mutations only when gameplay needs them.
+Startup rules are materialized once and introduce no Luau callback per block
+or entity tick. None of these limits establishes an unmeasured whole-server
+latency or memory percentage; profile the actual selected packages and load.
 
 Shutdown publishes `server.stopping` before closing event admission. Calls that
 start after that fence receive `ScriptQueueError::Closed`; events admitted

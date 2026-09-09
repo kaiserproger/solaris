@@ -79,10 +79,10 @@ pub use play::{
 pub use runtime_tick_metrics::{RuntimeLatencyPercentiles, RuntimeTickPercentiles};
 pub use script::PluginStorageStartError;
 pub use server::{
-    BoundServer, CommandPermissionConfig, EntityBehaviorHandle, OperatorFactsHandle,
-    OutboundPressureHandle, OutboundPressureSnapshot, RuntimeTelemetryHandle,
-    RuntimeTelemetrySnapshot, SaveAllReport, SaveAllTimings, SaveHandle, ServerConfig,
-    ShutdownHandle, WorldHandle, bind, bind_with_scripts, run,
+    BoundServer, CommandPermissionConfig, EntityBehaviorHandle, OperatorControlHandle,
+    OperatorFactsHandle, OperatorWeather, OutboundPressureHandle, OutboundPressureSnapshot,
+    RuntimeTelemetryHandle, RuntimeTelemetrySnapshot, SaveAllReport, SaveAllTimings, SaveHandle,
+    ServerConfig, ShutdownHandle, WorldHandle, bind, bind_with_scripts, run,
 };
 #[cfg(feature = "load-bench")]
 pub use server::{

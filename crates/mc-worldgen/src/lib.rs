@@ -20,13 +20,13 @@ pub use structures::{
     StructureTemplate, TemplateBlock, TemplateChest,
 };
 pub use terrain::{
-    BiomeRules, BiomeScope, OreRule, OreRules, OreRulesError, OreSpacing, SpawnLocation,
+    BiomeRules, BiomeScope, ClayRule, OreRule, OreRules, OreRulesError, OreSpacing, SpawnLocation,
     TellusWorldgenSettings, TerrainDiagnosticSample, TerrainGenerator, TerrainGeneratorError,
-    WorldgenMode, YRange,
+    TreeRule, WorldgenMode, YRange,
 };
 
 /// Changes whenever Solaris intentionally changes newly generated terrain.
-pub const WORLDGEN_REVISION: u32 = 18;
+pub const WORLDGEN_REVISION: u32 = 19;
 
 /// Crate version, exposed so other crates and the binary can report it.
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");

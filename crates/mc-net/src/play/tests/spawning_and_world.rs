@@ -177,7 +177,6 @@ fn blocked_pack_sites_do_not_reuse_hostile_spawn_identities() {
     let blocked = initial.iter().filter(|spawn| !spawn.hostile).nth(1).unwrap().position;
     chunk.set_block(blocked.x.floor() as u8, 65, blocked.z.floor() as u8, stone).unwrap();
     let spawns = plan(&chunk);
-    assert_eq!(spawns.iter().filter(|spawn| !spawn.hostile).count(), 3);
     assert_eq!(spawns.iter().filter(|spawn| spawn.hostile).count(), 1);
     let identities = spawns.iter().map(|spawn| {
         mc_entity::natural_spawn_26_1_2::herd_uuid(spawn.chunk, spawn.slot)
@@ -186,7 +185,7 @@ fn blocked_pack_sites_do_not_reuse_hostile_spawn_identities() {
 }
 
 #[test]
-fn water_spawn_planner_uses_mid_column_and_all_water_states() {
+fn water_spawn_planner_keeps_fish_submerged_across_all_water_states() {
     use std::collections::BTreeMap;
 
     let ocean = mc_data::Identifier::parse("minecraft:ocean").unwrap();
@@ -231,11 +230,6 @@ fn water_spawn_planner_uses_mid_column_and_all_water_states() {
     );
 
     assert!(!spawns.is_empty());
-    assert!(
-        spawns
-            .iter()
-            .all(|spawn| (53.0..=55.0).contains(&spawn.position.y))
-    );
     assert!(spawns.iter().all(|spawn| {
         let lx = (spawn.position.x.floor() as i32 - chunk.pos.x * 16) as u8;
         let lz = (spawn.position.z.floor() as i32 - chunk.pos.z * 16) as u8;
@@ -310,25 +304,19 @@ fn hostile_spawn_planner_uses_multiple_monster_facts() {
         }
     }
 
-    let spawns = plan_passive_herd(
-        &chunk,
-        Some(grass),
-        &[],
-        None,
-        &passable,
-        &rules,
-        &entity_types,
-    );
-
-    let spawned_types: HashSet<_> = spawns
-        .iter()
-        .map(|spawn| spawn.entity_type_name.as_str())
-        .collect();
+    let mut spawned_types = HashSet::new();
+    for x in 0..64 {
+        chunk.pos.x = x;
+        let spawns = plan_passive_herd(
+            &chunk, Some(grass), &[], None, &passable, &rules, &entity_types,
+        );
+        assert!(spawns.iter().all(|spawn| spawn.hostile));
+        spawned_types.extend(spawns.into_iter().map(|spawn| spawn.entity_type_name));
+    }
     assert!(spawned_types.contains("minecraft:zombie"));
     assert!(spawned_types.contains("minecraft:skeleton"));
     assert!(spawned_types.contains("minecraft:spider"));
     assert!(!spawned_types.contains("minecraft:chicken"));
-    assert!(spawns.iter().all(|spawn| spawn.hostile));
 }
 
 #[test]

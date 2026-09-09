@@ -57,6 +57,89 @@ checkpoint stops. Evidence snapshots and validation are internal milestones,
 not permission gates or reasons to yield. Continue into the next bounded area
 unless a real blocker or material owner decision prevents progress.
 
+## Current checkpoint: downloadable Loader preview
+
+[Solaris Loader v0.1.0](https://github.com/kaiserproger/solaris-loader/releases/tag/v0.1.0)
+is published as a prerelease from
+`3aaa92663ce8bc3e7de2859ad40ed357aacf3382`, with the three player adapter
+JARs and `SHA256SUMS`. Downloaded release assets passed checksum verification.
+The README now starts with player installation and permissions, including
+instance-local instructions for common launchers; developer/MCP material is
+retained below. Forge metadata now fences Minecraft exactly to 26.1.2.
+
+Java tests and real graphical Fabric, NeoForge and Forge Loader gates passed.
+Visual review confirmed visible modal assets/buttons, two-owner HUD updates,
+owner-local hiding and reconnect cleanup. Vanilla notification overlays
+obscure some modal description text. These gates use Gradle client adapters,
+not packaged-JAR installation in every launcher; no broader claim is made.
+
+Evidence and release source/assets:
+`.analysis/releases/loader-v0.1.0/receipt.json`.
+Core remains unpublished alpha-4 work. Next outcome: publish the requested
+core alpha-4 with its compatible plugin installation workflow and verify the
+public installer, without treating diagnostic field checks as full survival
+acceptance. Settlement upstream implementation remains queued.
+
+## Previous checkpoint: explicit plugin installation and author workflow
+
+The owner selected explicit opt-in installation. The package repository now
+owns `install.sh`: it installs the standard five packages or named selections,
+refuses existing package paths, and does not edit server configuration. Core
+builds and ordinary core installation remain independent and plugin-free.
+
+The plugin guide now indexes all 32 registered host functions, includes an
+executable `/hello` author workflow, and distinguishes dynamic host argument
+validation from strict checking of Luau itself. Isolation documentation records
+separate VMs on one host thread, 16 MiB per-VM memory, aggregate 50 ms event
+budget and maximum 10 ms plugin slices; none is a process-isolation or
+whole-server performance claim.
+
+Real-package installation and strict server admission passed. Refused updates
+preserved operator configuration; invalid batches, duplicate names, traversal
+and dangling destination symlinks were rejected. A real graphical client
+received the documented greeting and sandbox checks before and after an
+infinite handler disabled only its owning plugin. One independent read-only
+review returned no findings.
+
+Evidence: `.analysis/codex-logs/alpha4-plugin-install/receipt.json` and
+`.analysis/validation/20260909T230228-regression-w8ebweft/result.json`.
+No runtime Rust changed in this slice; prior native gates were not rerun.
+Next outcome: player-first Loader documentation and downloadable platform
+JARs, verified through the supported launch/install paths.
+
+## Previous checkpoint: alpha-4 field findings and startup rules
+
+On seed `1785772562805887200`, native herd placement now separates pack
+members, suitable water supports fish and squid, and generated shallow
+sediments include clay. The field probe found a nearby plains tree; a real
+graphical client visited that tree, birch forest, and a snowy mountain.
+The stricter graphical survey also observed natural cod and squid close up
+and raycast natural clay at both the spawn-side pool and river.
+
+Startup `rules.lua` compiles bounded, validated gameplay data once into native
+spawn and terrain rules. Its effective identity is persisted with the world;
+changed rules reject a restart before listening. Broken manifests cannot hide
+a rules owner in permissive discovery. Weighted monster plans consume the
+declared entries and counts within native admission caps.
+
+The server now has a typed interactive console and an explicit `--no-console`
+mode. Normal logs omit repeated profiling detail. TUI/plain-console and
+startup/restart-rejection smokes passed. Workspace tests, formatter,
+code-health and strict workspace Clippy passed; one independent read-only
+review found two issues, both corrected and covered by focused regressions.
+
+Exact receipts, source snapshot and the failed diagnostic driver attempts:
+`.analysis/codex-logs/alpha4-field-1785772562805887200/receipt.json`.
+Final graphical gate:
+`.analysis/validation/20260909T162959-regression-_fak5g95/result.json`.
+This is operator-assisted field diagnosis, not no-debug survival or release
+acceptance. Maturity remains `draft`; alpha-4 has not been published.
+
+Next outcome: install selected default plugin packages without bundling their
+source into core, with a documented, executable author/deployment workflow.
+The supplied settlement overhaul contract remains a proposal; its upstream
+capabilities and acceptance matrix are not implemented by this checkpoint.
+
 ## Baseline and evidence
 
 - Base HEAD before the authorized publication:

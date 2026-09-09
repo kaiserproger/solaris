@@ -1832,7 +1832,8 @@ impl ChunkStreamState {
                     );
                     return Ok(EmitReadyResult::Blocked);
                 }
-                info!(
+                debug!(
+                    target: "solaris::profile",
                     cx,
                     cz,
                     retry = *retries,
@@ -1975,7 +1976,8 @@ impl ChunkStreamState {
             return;
         }
         self.summary_logged = true;
-        info!(
+        debug!(
+            target: "solaris::profile",
             center_cx = self.center_cx,
             center_cz = self.center_cz,
             direction_yaw = self.direction_yaw,
@@ -2626,7 +2628,8 @@ async fn flush_dirty_chunks_for_pressure(
         timing.runs += 1;
         timing.flushed_chunks += flushed;
         timing.commit_ms += commit_ms;
-        info!(
+        debug!(
+            target: "solaris::profile",
             cx = request.chunk_x,
             cz = request.chunk_z,
             planned_chunks,
@@ -3731,7 +3734,7 @@ mod tests {
                     vec![mc_data::biomes::BiomeSpawnEntry {
                         entity_type: zombie,
                         min_count: 1,
-                        max_count: 4,
+                        max_count: 1,
                         weight: 100,
                     }],
                 )]),
@@ -3771,8 +3774,8 @@ mod tests {
 
         assert_eq!(hostiles.len(), 1);
         assert!(
-            hostiles[0].position.y < 64.0,
-            "expected the single hostile entry to retain a cave opportunity: {hostiles:?}"
+            hostiles.iter().any(|spawn| spawn.position.y < 64.0),
+            "expected the hostile pack to retain a cave opportunity: {hostiles:?}"
         );
     }
 

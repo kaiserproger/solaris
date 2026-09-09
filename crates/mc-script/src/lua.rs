@@ -14,6 +14,11 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use tracing::{info, warn};
 
+mod gameplay_rules;
+pub use gameplay_rules::{
+    LuaBiomeSpawns, LuaClayRule, LuaGameplayRules, LuaSpawnEntry, LuaSpawnPlacement, LuaTreeRule,
+};
+
 #[cfg(test)]
 mod loader_tests;
 #[cfg(test)]
@@ -419,6 +424,7 @@ struct LuaReloadContract {
     plugins: Vec<LuaReloadPluginContract>,
     worldgen_ore_profile: Option<LuaWorldgenOreProfile>,
     worldgen_settlement_contract: Option<String>,
+    gameplay_rules_contract: Option<String>,
     client_bundles: Vec<LuaReloadClientBundleContract>,
 }
 
@@ -463,6 +469,9 @@ impl LuaReloadContract {
                 .worldgen_settlement_plan
                 .as_ref()
                 .map(LuaSettlementPlan::contract_name),
+            gameplay_rules_contract: prepared
+                .gameplay_rules()
+                .map(LuaGameplayRules::contract_name),
             client_bundles,
         }
     }
@@ -473,6 +482,7 @@ impl LuaReloadContract {
         }
         if self.worldgen_ore_profile != candidate.worldgen_ore_profile
             || self.worldgen_settlement_contract != candidate.worldgen_settlement_contract
+            || self.gameplay_rules_contract != candidate.gameplay_rules_contract
         {
             return Some("worldgen");
         }
@@ -1015,11 +1025,17 @@ pub struct PreparedLuaPlugins {
     sources: Vec<PluginSource>,
     worldgen_ore_profile: Option<LuaWorldgenOreProfile>,
     worldgen_settlement_plan: Option<LuaSettlementPlan>,
+    gameplay_rules: Option<Arc<LuaGameplayRules>>,
     client_bundles: Vec<LuaClientBundle>,
     strict_startup: bool,
 }
 
 impl PreparedLuaPlugins {
+    #[must_use]
+    pub fn gameplay_rules(&self) -> Option<&LuaGameplayRules> {
+        self.gameplay_rules.as_deref()
+    }
+
     #[must_use]
     pub const fn worldgen_ore_profile(&self) -> Option<LuaWorldgenOreProfile> {
         self.worldgen_ore_profile
@@ -1187,6 +1203,8 @@ fn prepare_plugin_sources(sources: Vec<PluginSource>) -> Result<PreparedLuaPlugi
     let mut ore_owner = None;
     let mut selected_settlement = None;
     let mut settlement_owner = None;
+    let mut selected_rules = None;
+    let mut rules_owner = None;
     let mut client_bundles = Vec::new();
     let mut plugin_ids = HashSet::new();
     for source in &sources {
@@ -1195,6 +1213,17 @@ fn prepare_plugin_sources(sources: Vec<PluginSource>) -> Result<PreparedLuaPlugi
             return Err(LuaHostError::PluginIdConflict {
                 id: plugin_id.to_owned(),
             });
+        }
+        if let Some(rules) = &source.gameplay_rules {
+            if let Some(first) = rules_owner {
+                return Err(LuaHostError::WorldgenConflict {
+                    kind: "gameplay rules",
+                    first,
+                    second: plugin_id.to_owned(),
+                });
+            }
+            selected_rules = Some(Arc::clone(rules));
+            rules_owner = Some(plugin_id.to_owned());
         }
         if let Some(profile) = source.worldgen_ore_profile {
             if let Some(first) = ore_owner {
@@ -1224,6 +1253,7 @@ fn prepare_plugin_sources(sources: Vec<PluginSource>) -> Result<PreparedLuaPlugi
         sources,
         worldgen_ore_profile: selected_ore,
         worldgen_settlement_plan: selected_settlement,
+        gameplay_rules: selected_rules,
         client_bundles,
         strict_startup: false,
     })
@@ -1276,6 +1306,7 @@ struct PluginSource {
     source_path: PathBuf,
     worldgen_ore_profile: Option<LuaWorldgenOreProfile>,
     worldgen_settlement_plan: Option<LuaSettlementPlan>,
+    gameplay_rules: Option<Arc<LuaGameplayRules>>,
     client_bundles: Vec<LuaClientBundle>,
 }
 
@@ -1670,13 +1701,19 @@ fn discover_plugins(
 }
 
 fn read_plugin_source(directory: &Path) -> Result<PluginSource, PluginSourceError> {
+    let rules_declared = directory
+        .join("rules.lua")
+        .try_exists()
+        .map_err(|error| PluginSourceError::new(error.to_string(), true))?;
     let manifest_path = directory.join("plugin.toml");
     let raw_manifest = read_utf8_file_limited(&manifest_path, MAX_PLUGIN_MANIFEST_BYTES)
-        .map_err(|error| PluginSourceError::new(error, false))?;
-    let raw_manifest: toml::Value = toml::from_str(&raw_manifest)
-        .map_err(|error| PluginSourceError::new(format!("parsing manifest: {error}"), false))?;
-    let startup_contract_declared =
-        raw_manifest.get("worldgen").is_some() || raw_manifest.get("client").is_some();
+        .map_err(|error| PluginSourceError::new(error, rules_declared))?;
+    let raw_manifest: toml::Value = toml::from_str(&raw_manifest).map_err(|error| {
+        PluginSourceError::new(format!("parsing manifest: {error}"), rules_declared)
+    })?;
+    let startup_contract_declared = rules_declared
+        || raw_manifest.get("worldgen").is_some()
+        || raw_manifest.get("client").is_some();
     let disk: DiskManifest = raw_manifest.try_into().map_err(|error| {
         PluginSourceError::new(
             format!("parsing manifest: {error}"),
@@ -1778,6 +1815,8 @@ fn read_plugin_source(directory: &Path) -> Result<PluginSource, PluginSourceErro
             .map_err(|error| PluginSourceError::new(error, startup_contract_declared))?;
     let config = read_plugin_config(directory)
         .map_err(|error| PluginSourceError::new(error, startup_contract_declared))?;
+    let gameplay_rules = gameplay_rules::read_gameplay_rules(directory, &config)
+        .map_err(|error| PluginSourceError::new(error, true))?;
     let source_path = directory.join("main.lua");
     let source = read_utf8_file_limited(&source_path, MAX_PLUGIN_SOURCE_BYTES)
         .map_err(|error| PluginSourceError::new(error, startup_contract_declared))?;
@@ -1795,6 +1834,7 @@ fn read_plugin_source(directory: &Path) -> Result<PluginSource, PluginSourceErro
         source_path,
         worldgen_ore_profile,
         worldgen_settlement_plan,
+        gameplay_rules,
         client_bundles,
     })
 }
@@ -4968,6 +5008,7 @@ mod tests {
             source_path: PathBuf::from(path),
             worldgen_ore_profile: None,
             worldgen_settlement_plan: None,
+            gameplay_rules: None,
             client_bundles: Vec::new(),
         }
     }
@@ -6476,6 +6517,7 @@ capabilities = ["entity_damage"]
             source_path: PathBuf::from(format!("{id}/main.lua")),
             worldgen_ore_profile: None,
             worldgen_settlement_plan: None,
+            gameplay_rules: None,
             client_bundles: Vec::new(),
         };
         let (boundary, endpoint) = script_boundary_pair(
@@ -6584,23 +6626,24 @@ capabilities = ["entity_damage"]
                 .unwrap(),
             config: toml::Table::new(),
             source: r#"
-                rejection = "missing"
-                function on_command_batch_rejected(result)
-                    rejection = result.reason .. ":" .. result.command_count
+            rejection = "missing"
+            function on_command_batch_rejected(result)
+                rejection = result.reason .. ":" .. result.command_count
+            end
+            function on_server_tick(event)
+                if event.tick == 1 then
+                    solaris.broadcast("batch-first")
+                    solaris.broadcast("batch-second")
+                else
+                    solaris.broadcast(rejection)
                 end
-                function on_server_tick(event)
-                    if event.tick == 1 then
-                        solaris.broadcast("batch-first")
-                        solaris.broadcast("batch-second")
-                    else
-                        solaris.broadcast(rejection)
-                    end
-                end
-            "#
+            end
+        "#
             .to_owned(),
             source_path: PathBuf::from("atomic/main.lua"),
             worldgen_ore_profile: None,
             worldgen_settlement_plan: None,
+            gameplay_rules: None,
             client_bundles: Vec::new(),
         };
         let (boundary, endpoint) =
@@ -7111,14 +7154,15 @@ capabilities = ["entity_damage"]
             manifest: manifest(&["server.tick"]),
             config: toml::Table::new(),
             source: r#"
-                function on_server_tick(_event)
-                    error("broken plugin")
-                end
-            "#
+            function on_server_tick(_event)
+                error("broken plugin")
+            end
+        "#
             .to_owned(),
             source_path: PathBuf::from("bad/main.lua"),
             worldgen_ore_profile: None,
             worldgen_settlement_plan: None,
+            gameplay_rules: None,
             client_bundles: Vec::new(),
         };
         let good_manifest =
@@ -7130,14 +7174,15 @@ capabilities = ["entity_damage"]
             manifest: good_manifest,
             config: toml::Table::new(),
             source: r#"
-                function on_server_tick(event)
-                    solaris.broadcast("tick " .. event.tick)
-                end
-            "#
+            function on_server_tick(event)
+                solaris.broadcast("tick " .. event.tick)
+            end
+        "#
             .to_owned(),
             source_path: PathBuf::from("good/main.lua"),
             worldgen_ore_profile: None,
             worldgen_settlement_plan: None,
+            gameplay_rules: None,
             client_bundles: Vec::new(),
         };
         let (boundary, endpoint) =
@@ -7219,14 +7264,15 @@ capabilities = ["entity_damage"]
             manifest: manifest(&["server.tick"]),
             config: toml::Table::new(),
             source: r#"
-                function on_server_tick(_event)
-                    solaris.broadcast("queued")
-                end
-            "#
+            function on_server_tick(_event)
+                solaris.broadcast("queued")
+            end
+        "#
             .to_owned(),
             source_path: PathBuf::from("queue-closed/main.lua"),
             worldgen_ore_profile: None,
             worldgen_settlement_plan: None,
+            gameplay_rules: None,
             client_bundles: Vec::new(),
         };
         let (boundary, endpoint) =
@@ -7255,6 +7301,7 @@ capabilities = ["entity_damage"]
             source_path: PathBuf::from("authority-unavailable/main.lua"),
             worldgen_ore_profile: None,
             worldgen_settlement_plan: None,
+            gameplay_rules: None,
             client_bundles: Vec::new(),
         };
         let (boundary, endpoint) =
@@ -7284,18 +7331,19 @@ capabilities = ["entity_damage"]
             manifest: manifest(&["server.tick"]),
             config: toml::Table::new(),
             source: r#"
-                function on_server_tick(_event)
-                    solaris.broadcast("would overflow")
-                end
-
-                function on_command_batch_rejected(_event)
-                    error("broken rejection callback")
-                end
-            "#
+            function on_server_tick(_event)
+                solaris.broadcast("would overflow")
+            end
+        
+            function on_command_batch_rejected(_event)
+                error("broken rejection callback")
+            end
+        "#
             .to_owned(),
             source_path: PathBuf::from("batch-rejection/main.lua"),
             worldgen_ore_profile: None,
             worldgen_settlement_plan: None,
+            gameplay_rules: None,
             client_bundles: Vec::new(),
         };
         let (boundary, mut endpoint) =
@@ -7353,14 +7401,15 @@ capabilities = ["entity_damage"]
             manifest: manifest(&["server.tick"]),
             config: toml::Table::new(),
             source: r#"
-                function on_server_tick(_event)
-                    solaris.broadcast("requires admission")
-                end
-            "#
+            function on_server_tick(_event)
+                solaris.broadcast("requires admission")
+            end
+        "#
             .to_owned(),
             source_path: PathBuf::from("command-admission/main.lua"),
             worldgen_ore_profile: None,
             worldgen_settlement_plan: None,
+            gameplay_rules: None,
             client_bundles: Vec::new(),
         };
         let (boundary, mut endpoint) =
@@ -7802,6 +7851,7 @@ capabilities = ["entity_damage"]
             source_path: PathBuf::from(path),
             worldgen_ore_profile: None,
             worldgen_settlement_plan: None,
+            gameplay_rules: None,
             client_bundles: Vec::new(),
         };
         let (boundary, endpoint) =
@@ -7854,6 +7904,7 @@ capabilities = ["entity_damage"]
             source_path: PathBuf::from(path),
             worldgen_ore_profile: None,
             worldgen_settlement_plan: None,
+            gameplay_rules: None,
             client_bundles: Vec::new(),
         };
         let (boundary, endpoint) =
@@ -7885,14 +7936,15 @@ capabilities = ["entity_damage"]
             config: toml::Table::new(),
             source: format!(
                 r#"
-                    function on_player_command(_event)
-                        solaris.broadcast("{id}")
-                    end
-                "#
+                function on_player_command(_event)
+                    solaris.broadcast("{id}")
+                end
+            "#
             ),
             source_path: PathBuf::from(format!("{id}/main.lua")),
             worldgen_ore_profile: None,
             worldgen_settlement_plan: None,
+            gameplay_rules: None,
             client_bundles: Vec::new(),
         };
         let (boundary, endpoint) =
@@ -7940,14 +7992,15 @@ capabilities = ["entity_damage"]
             manifest: command_manifest("bad", "hello"),
             config: toml::Table::new(),
             source: r#"
-                function on_player_command(_event)
-                    error("broken plugin")
-                end
-            "#
+            function on_player_command(_event)
+                error("broken plugin")
+            end
+        "#
             .to_owned(),
             source_path: PathBuf::from("bad/main.lua"),
             worldgen_ore_profile: None,
             worldgen_settlement_plan: None,
+            gameplay_rules: None,
             client_bundles: Vec::new(),
         };
         let good = PluginSource {
@@ -7957,14 +8010,15 @@ capabilities = ["entity_damage"]
                 .unwrap(),
             config: toml::Table::new(),
             source: r#"
-                function on_server_tick(_event)
-                    solaris.broadcast("progressed")
-                end
-            "#
+            function on_server_tick(_event)
+                solaris.broadcast("progressed")
+            end
+        "#
             .to_owned(),
             source_path: PathBuf::from("good/main.lua"),
             worldgen_ore_profile: None,
             worldgen_settlement_plan: None,
+            gameplay_rules: None,
             client_bundles: Vec::new(),
         };
         let (boundary, endpoint) =
@@ -8289,15 +8343,16 @@ capabilities = ["entity_damage"]
             config: toml::Table::new(),
             source: format!(
                 r#"
-                    local claimed_plugin_id = "forged-plugin"
-                    function on_plugin_storage_get_result(_event)
-                        solaris.broadcast("{id}:" .. claimed_plugin_id)
-                    end
-                "#
+                local claimed_plugin_id = "forged-plugin"
+                function on_plugin_storage_get_result(_event)
+                    solaris.broadcast("{id}:" .. claimed_plugin_id)
+                end
+            "#
             ),
             source_path: PathBuf::from(format!("{id}/main.lua")),
             worldgen_ore_profile: None,
             worldgen_settlement_plan: None,
+            gameplay_rules: None,
             client_bundles: Vec::new(),
         };
         let (boundary, endpoint) =
@@ -8522,6 +8577,7 @@ capabilities = ["entity_damage"]
             source_path: PathBuf::from("broken/main.lua"),
             worldgen_ore_profile: None,
             worldgen_settlement_plan: None,
+            gameplay_rules: None,
             client_bundles: Vec::new(),
         };
 

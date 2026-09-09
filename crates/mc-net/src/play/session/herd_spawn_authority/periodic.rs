@@ -309,7 +309,8 @@ fn record_natural_spawn_report(
         return;
     };
     registry.retain_natural_spawn_report(tick, cumulative);
-    tracing::info!(
+    tracing::debug!(
+        target: "solaris::profile",
         tick,
         friendly_attempts = cumulative.friendly.attempts,
         friendly_chunks = cumulative.friendly.chunks_sampled,

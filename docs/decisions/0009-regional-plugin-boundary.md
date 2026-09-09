@@ -72,6 +72,17 @@ persisted villager type, profession, and level state. Its durable
 per-inhabitant claim does not reuse ambient-herd admission, whose chunk-level
 claim and payload have different semantics.
 
+Startup gameplay rules (2026-09-09) extend that immutable boundary with an
+optional package `rules.lua`. A separate sandbox evaluates it once against
+package configuration under the existing source, memory, instruction, and
+host-event budgets. Its bounded result defines native spawn groups and
+placement, tree selection, and clay deposits; it supplies no callbacks to
+entity ticks or chunk generation. A single plugin owns the plan. Startup
+materializes it before generation and persists its resolved fingerprint in
+the world contract. Adding, removing, or changing that plan requires a fresh
+Solaris world and is rejected by live reload. Script formatting alone does
+not change the resolved contract.
+
 If an uncommon custom decision later needs synchronous-looking admission, its
 adapter may suspend only the initiating action while the host processes it.
 The region must continue ticking and may resume the action only from an exact

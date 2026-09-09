@@ -33,6 +33,9 @@ const SHUTDOWN_DRAIN_TIMEOUT: Duration = Duration::from_secs(6);
 const STARTUP_LIGHT_BAKE_WORKER_CAP: usize = 16;
 const STARTUP_GENERATION_QUEUE_BATCHES: usize = 8;
 
+mod console;
+mod startup_rules;
+
 #[derive(Debug, Parser)]
 #[command(
     name = "mc-server",
@@ -48,6 +51,10 @@ struct Cli {
     /// starting the network listener. Useful for CI sanity checks.
     #[arg(long)]
     check: bool,
+
+    /// Keep plain text logs instead of the interactive terminal console.
+    #[arg(long)]
+    no_console: bool,
 
     #[command(subcommand)]
     command: Option<Command>,
@@ -572,6 +579,7 @@ impl From<mc_net::AutoscalePolicy> for EffectiveAutoscalePolicy {
 async fn serve(
     path: &Path,
     warning_ring: Arc<mc_server::dashboard_stats::WarningRing>,
+    console_output: Option<(console::ConsoleOutput, bool)>,
 ) -> Result<()> {
     let mut cfg = load_config(path)?;
     let access_control = cfg.load_access_control_files(path)?;
@@ -646,7 +654,7 @@ async fn serve(
         loot,
         block_facts,
         entity_types,
-        biome_spawns,
+        mut biome_spawns,
     } = StartupData::load(
         cfg.data.vanilla_data_dir.as_deref(),
         loader_manifest.as_deref(),
@@ -660,7 +668,7 @@ async fn serve(
         plugin_settlement_plan.as_ref(),
     )?;
     let chunk_pipeline = cfg.chunk_pipeline.to_network();
-    let terrain_generator = build_terrain_generator(
+    let mut terrain_generator = build_terrain_generator(
         cfg.data.seed,
         worldgen_mode,
         configured_geometry,
@@ -668,6 +676,19 @@ async fn serve(
         structure_rules,
         plugin_ore_profile,
     )?;
+    let gameplay_rules = prepared_plugins
+        .as_ref()
+        .and_then(mc_script::PreparedLuaPlugins::gameplay_rules);
+    if let Some(rules) = gameplay_rules {
+        startup_rules::apply(
+            rules,
+            Arc::get_mut(&mut terrain_generator).expect("terrain is unpublished during startup"),
+            Arc::make_mut(&mut biome_spawns),
+            &entity_types,
+        )
+        .context("materializing startup Luau rules")?;
+    }
+    let gameplay_rules_contract = gameplay_rules.map(mc_script::LuaGameplayRules::contract_name);
     let configured_spawn = if world_requires_solaris_spawn(world_dir)? {
         let located = terrain_generator
             .locate_safe_spawn()
@@ -684,6 +705,7 @@ async fn serve(
         ore_profile_name,
         &settlement_contract,
         configured_spawn,
+        gameplay_rules_contract.as_deref(),
     )?;
     let world_spawn = match world_source {
         WorldSource::SolarisGenerated => configured_spawn,
@@ -844,32 +866,54 @@ async fn serve(
     } else {
         (mc_net::bind(net).await.context("network bind")?, None)
     };
-    let dashboard_task = if cfg.dashboard.enabled {
-        let socket = cfg.dashboard.validate().map_err(anyhow::Error::msg)?;
-        let stats = Arc::new(mc_server::dashboard_stats::ServerDashboardStats::new(
+    let stats = (cfg.dashboard.enabled || console_output.is_some()).then(|| {
+        Arc::new(mc_server::dashboard_stats::ServerDashboardStats::new(
             &bound,
             &cfg,
             std::time::Instant::now(),
             warning_ring,
             dashboard_plugin_ids,
-        ));
+        ))
+    });
+    let dashboard_task = if let Some(stats) = stats.as_ref().filter(|_| cfg.dashboard.enabled) {
+        let socket = cfg.dashboard.validate().map_err(anyhow::Error::msg)?;
         tracing::info!(endpoint = %socket, "operator dashboard enabled; binding in background");
         Some(mc_server::dashboard::spawn_dashboard(
             mc_server::dashboard::DashboardListenConfig {
                 bind_address: socket.ip(),
                 port: socket.port(),
             },
-            stats,
+            Arc::clone(stats) as Arc<dyn mc_server::dashboard::DashboardStats>,
         ))
     } else {
         None
     };
+    let terminal_console = console_output
+        .zip(stats)
+        .map(|((output, interactive), stats)| {
+            let stats: Arc<dyn mc_server::dashboard::DashboardStats> = stats;
+            console::Console {
+                handler: console::server_commands::ServerCommands {
+                    stats: Arc::clone(&stats),
+                    save: bound.save_handle(),
+                    control: bound.operator_control_handle(),
+                    config_path: path.to_path_buf(),
+                },
+                stats,
+                ticks: bound
+                    .runtime_telemetry_handle()
+                    .subscribe_simulation_ticks(),
+                output,
+                interactive,
+            }
+        });
     let result = run_bound_server(
         bound,
         shutdown_handle,
         path,
         lua_host.as_ref(),
         cfg.plugins.strict,
+        terminal_console,
     )
     .await;
     if let Some(task) = dashboard_task {
@@ -946,16 +990,21 @@ async fn run_bound_server(
     config_path: &Path,
     lua_host: Option<&mc_script::LuaHost>,
     startup_plugin_strict: bool,
+    terminal_console: Option<console::Console<console::server_commands::ServerCommands>>,
 ) -> Result<()> {
     // Every exit path drains admitted work and performs exactly one final save.
     // Ctrl-C only requests shutdown; it then waits for that same lifecycle. SIGHUP
     // prepares/reloads plugins without pausing the network future while files are read.
     let mut run_fut = std::pin::pin!(bound.serve_and_save());
     let mut shutdown = Box::pin(async {
-        if let Err(err) = tokio::signal::ctrl_c().await {
-            tracing::warn!(error = %err, "ctrl_c handler failed; running without graceful shutdown");
-            // Never resolve — let the listener own the lifetime.
-            std::future::pending::<()>().await;
+        tokio::select! {
+            result = tokio::signal::ctrl_c() => result.context("installing shutdown signal handler"),
+            result = async {
+                match terminal_console {
+                    Some(console) => console.run().await,
+                    None => std::future::pending().await,
+                }
+            } => result,
         }
     });
     let mut plugin_reload = PluginReloadSignal::new()?;
@@ -964,13 +1013,15 @@ async fn run_bound_server(
             result = run_fut.as_mut() => {
                 return result.context("network listener");
             }
-            () = shutdown.as_mut() => {
-                tracing::info!("shutdown signal received");
+            console_result = shutdown.as_mut() => {
+                tracing::info!("shutdown requested");
                 shutdown_handle.request();
-                return match tokio::time::timeout(SHUTDOWN_DRAIN_TIMEOUT, run_fut.as_mut()).await {
+                let result = match tokio::time::timeout(SHUTDOWN_DRAIN_TIMEOUT, run_fut.as_mut()).await {
                     Ok(result) => result.context("network listener"),
-                    Err(_) => anyhow::bail!("shutdown drain and final save timed out"),
+                    Err(_) => Err(anyhow::anyhow!("shutdown drain and final save timed out")),
                 };
+                console_result?;
+                return result;
             }
             () = plugin_reload.recv() => {
                 let Some(host) = lua_host else {
@@ -993,18 +1044,20 @@ async fn run_bound_server(
                     result = run_fut.as_mut() => {
                         return result.context("network listener");
                     }
-                    () = shutdown.as_mut() => {
-                        tracing::info!("shutdown signal received during Luau reload");
+                    console_result = shutdown.as_mut() => {
+                        tracing::info!("shutdown requested during Luau reload");
                         shutdown_handle.request();
-                        return match tokio::time::timeout(
+                        let result = match tokio::time::timeout(
                             SHUTDOWN_DRAIN_TIMEOUT,
                             run_fut.as_mut(),
                         )
                         .await
                         {
                             Ok(result) => result.context("network listener"),
-                            Err(_) => anyhow::bail!("shutdown drain and final save timed out"),
+                            Err(_) => Err(anyhow::anyhow!("shutdown drain and final save timed out")),
                         };
+                        console_result?;
+                        return result;
                     }
                     result = reload.as_mut() => result,
                 };
@@ -1636,7 +1689,7 @@ fn ensure_world_region_root(world_dir: &Path) -> Result<()> {
         .with_context(|| format!("creating empty world region directory {}", legacy.display()))
 }
 
-fn init_tracing() -> Arc<mc_server::dashboard_stats::WarningRing> {
+fn init_tracing(output: console::ConsoleOutput) -> Arc<mc_server::dashboard_stats::WarningRing> {
     use tracing_subscriber::filter::LevelFilter;
     use tracing_subscriber::prelude::*;
 
@@ -1649,7 +1702,13 @@ fn init_tracing() -> Arc<mc_server::dashboard_stats::WarningRing> {
     let filter = tracing_subscriber::EnvFilter::try_from_default_env()
         .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info"));
     tracing_subscriber::registry()
-        .with(tracing_subscriber::fmt::layer())
+        .with(
+            tracing_subscriber::fmt::layer()
+                .compact()
+                .with_target(false)
+                .with_ansi(false)
+                .with_writer(output),
+        )
         .with(ring_layer.with_filter(LevelFilter::WARN))
         .with(filter)
         .init();
@@ -1697,11 +1756,18 @@ fn manage_operators(config_path: &Path, command: OperatorCommand) -> Result<()> 
 
 #[tokio::main]
 async fn main() -> ExitCode {
-    let warning_ring = init_tracing();
     let cli = Cli::parse();
+    let output = console::ConsoleOutput::new();
+    let terminal_console = (!cli.check && cli.command.is_none()).then(|| {
+        (
+            output.clone(),
+            !cli.no_console && console::ConsoleOutput::supported(),
+        )
+    });
+    let warning_ring = init_tracing(output);
     let result = match (cli.check, cli.command) {
         (true, None) => check_config(&cli.config),
-        (false, None) => serve(&cli.config, warning_ring).await,
+        (false, None) => serve(&cli.config, warning_ring, terminal_console).await,
         (false, Some(Command::Operator { command })) => manage_operators(&cli.config, command),
         (true, Some(_)) => Err(anyhow::anyhow!(
             "--check cannot be combined with the operator subcommand"
@@ -2320,6 +2386,7 @@ mod tests {
             "vanilla",
             "vanilla",
             mc_world::WorldSpawn::new(320, -192),
+            None,
         )
         .unwrap_err();
         let message = error.to_string();
@@ -2342,6 +2409,7 @@ mod tests {
                 "vanilla",
                 "vanilla",
                 spawn,
+                None,
             )
             .unwrap(),
             WorldSource::SolarisGenerated,
@@ -2359,6 +2427,7 @@ mod tests {
             "vanilla",
             "vanilla",
             mc_world::WorldSpawn::new(384, -192),
+            None,
         )
         .unwrap_err();
         assert!(error.to_string().contains("spawn=(320, -192)"));
@@ -2879,7 +2948,7 @@ mod tests {
         let metadata = tmp.path().join("solaris").join("world.dat");
         shutdown.request();
         let config_path = tmp.path().join("unused-config.toml");
-        run_bound_server(bound, shutdown, &config_path, None, false)
+        run_bound_server(bound, shutdown, &config_path, None, false, None)
             .await
             .expect("production entrypoint drains and performs its sole final save");
         assert!(metadata.exists());

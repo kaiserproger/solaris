@@ -59,14 +59,15 @@ mod tick_delivery_tests;
 
 #[cfg(feature = "lua-runtime")]
 pub use lua::{
-    LuaClientBundle, LuaClientBundleDiscovery, LuaClientContentKind, LuaClientLoader,
-    LuaClientPermission, LuaHost, LuaHostConfig, LuaHostError, LuaHostExitReason,
-    LuaHostExitReport, LuaPluginDeployment, LuaPluginDisableDiagnostic, LuaPluginDisableStage,
-    LuaPluginDiscovery, LuaReloadError, LuaReloadReport, LuaSettlementBuilding,
-    LuaSettlementBuildingRole, LuaSettlementBuildingTemplate, LuaSettlementExtension,
-    LuaSettlementInhabitant, LuaSettlementInhabitantKind, LuaSettlementJob, LuaSettlementPlan,
-    LuaWorldgenOreProfile, LuaWorldgenSettlementProfile, PreparedLuaPlugins, prepare_lua_plugins,
-    start_lua_host, start_prepared_lua_host,
+    LuaBiomeSpawns, LuaClayRule, LuaClientBundle, LuaClientBundleDiscovery, LuaClientContentKind,
+    LuaClientLoader, LuaClientPermission, LuaGameplayRules, LuaHost, LuaHostConfig, LuaHostError,
+    LuaHostExitReason, LuaHostExitReport, LuaPluginDeployment, LuaPluginDisableDiagnostic,
+    LuaPluginDisableStage, LuaPluginDiscovery, LuaReloadError, LuaReloadReport,
+    LuaSettlementBuilding, LuaSettlementBuildingRole, LuaSettlementBuildingTemplate,
+    LuaSettlementExtension, LuaSettlementInhabitant, LuaSettlementInhabitantKind, LuaSettlementJob,
+    LuaSettlementPlan, LuaSpawnEntry, LuaSpawnPlacement, LuaTreeRule, LuaWorldgenOreProfile,
+    LuaWorldgenSettlementProfile, PreparedLuaPlugins, prepare_lua_plugins, start_lua_host,
+    start_prepared_lua_host,
 };
 
 /// Crate version, exposed so other crates and the binary can report it.

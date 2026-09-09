@@ -2,7 +2,7 @@
 
 use std::collections::{BTreeSet, HashMap, HashSet};
 use std::future::Future;
-use std::io::{BufRead, ErrorKind};
+use std::io::ErrorKind;
 use std::net::SocketAddr;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, OnceLock};
@@ -29,7 +29,7 @@ use mc_script::{
 };
 use mc_world::{BlockRegistry, ChunkGeometry, MAX_Y, MIN_Y, OVERWORLD_GEOMETRY, WorldStorage};
 use tokio::net::TcpListener;
-use tokio::sync::{Mutex, Notify, Semaphore, broadcast};
+use tokio::sync::{Mutex, Notify, Semaphore};
 use tracing::{debug, info, warn};
 
 use crate::admission::PreAuthAdmission;
@@ -53,11 +53,13 @@ use crate::{login, play};
 
 mod entity_ticker;
 mod natural_spawn_ticker;
+mod operator_control;
 mod runtime_control;
+
+pub use operator_control::{OperatorControlHandle, OperatorWeather};
 
 use runtime_control::apply_runtime_control_decision;
 
-static CONSOLE_LINES: OnceLock<broadcast::Sender<String>> = OnceLock::new();
 type PhysicsMaterialCache = HashMap<
     (usize, usize),
     (
@@ -1610,7 +1612,6 @@ impl BoundServer {
             sessions: Arc::clone(&sessions),
             runtime_control: runtime_control.clone(),
             simulation: simulation.clone(),
-            chunk_pipeline_resources: chunk_pipeline_resources.clone(),
             scripts: scripts.clone(),
             script_storage,
             script_zones: script_zones.clone(),
@@ -2078,7 +2079,6 @@ struct RuntimeCommandTaskContext {
     sessions: Arc<play::SessionRegistry>,
     runtime_control: Option<RuntimeControlHandle>,
     simulation: play::SimulationHandle,
-    chunk_pipeline_resources: ChunkPipelineResources,
     scripts: Option<ScriptEventSink>,
     script_storage: Option<PluginStorageHandle>,
     script_zones: Option<PluginZoneAdapter>,
@@ -2096,7 +2096,6 @@ fn spawn_runtime_command_tasks(context: RuntimeCommandTaskContext) -> RuntimeCom
         sessions,
         runtime_control,
         simulation,
-        chunk_pipeline_resources,
         scripts,
         script_storage,
         script_zones,
@@ -2132,17 +2131,6 @@ fn spawn_runtime_command_tasks(context: RuntimeCommandTaskContext) -> RuntimeCom
             "script command"
         });
     }
-    command_tasks.spawn(async move {
-        run_console_commands(
-            config,
-            sessions,
-            runtime_control,
-            simulation,
-            chunk_pipeline_resources,
-        )
-        .await;
-        "console command"
-    });
     RuntimeCommandTasks {
         command_tasks,
         runtime_control_signal_watcher,
@@ -2646,169 +2634,6 @@ fn runtime_attributed_tick_us(
     .fold(0, u64::saturating_add)
 }
 
-async fn run_console_commands(
-    config: Arc<ServerConfig>,
-    sessions: Arc<play::SessionRegistry>,
-    runtime_control: Option<RuntimeControlHandle>,
-    simulation: play::SimulationHandle,
-    chunk_pipeline_resources: ChunkPipelineResources,
-) {
-    let mut lines = console_line_receiver();
-    loop {
-        let line = tokio::select! {
-            line = lines.recv() => {
-                match line {
-                    Ok(line) => line,
-                    Err(broadcast::error::RecvError::Lagged(skipped)) => {
-                        warn!(skipped, "console command input lagged; dropping old lines");
-                        continue;
-                    }
-                    Err(broadcast::error::RecvError::Closed) => return,
-                }
-            }
-            () = config.shutdown.notified() => {
-                info!("shutdown requested; console task stopping");
-                return;
-            }
-        };
-        let raw = line.trim();
-        if raw.is_empty() {
-            continue;
-        }
-        if execute_console_command(
-            raw,
-            "console save-all",
-            "console stop",
-            &config,
-            &sessions,
-            runtime_control.as_ref(),
-            &simulation,
-            &chunk_pipeline_resources,
-        )
-        .await
-        {
-            return;
-        }
-    }
-}
-
-#[allow(clippy::too_many_arguments)]
-pub(crate) async fn execute_console_command(
-    raw: &str,
-    save_context: &'static str,
-    stop_context: &'static str,
-    config: &ServerConfig,
-    sessions: &play::SessionRegistry,
-    runtime_control: Option<&RuntimeControlHandle>,
-    simulation: &play::SimulationHandle,
-    chunk_pipeline_resources: &ChunkPipelineResources,
-) -> bool {
-    match play::commands::parse_admin_command(raw, play::commands::CommandPermissions::CONSOLE) {
-        Ok(play::commands::AdminCommand::SaveAll) => {
-            let report =
-                save_all_after_simulation_barrier(save_context, config, sessions, simulation).await;
-            log_save_report(save_context, &report);
-            false
-        }
-        Ok(play::commands::AdminCommand::Stop) => {
-            request_stop(
-                &config.shutdown,
-                runtime_control,
-                chunk_pipeline_resources,
-                sessions,
-            );
-            info!(
-                context = stop_context,
-                "console stop requested runtime drain"
-            );
-            true
-        }
-        Ok(play::commands::AdminCommand::TimeSet(time)) => {
-            match simulation.set_world_time_server_owned(time).await {
-                Ok(()) => info!(time, "console set world time"),
-                Err(error) => warn!(?error, time, "console failed to set world time"),
-            }
-            false
-        }
-        Ok(play::commands::AdminCommand::DaylightCycle(value)) => {
-            if let Some(value) = value {
-                sessions.set_daylight_cycle_enabled(value);
-            }
-            info!(
-                value = sessions.daylight_cycle_enabled(),
-                "console read daylight cycle"
-            );
-            false
-        }
-        Ok(play::commands::AdminCommand::Weather(command)) => {
-            let weather = match command {
-                play::commands::WeatherCommand::Clear => play::WeatherKind::Clear,
-                play::commands::WeatherCommand::Rain => play::WeatherKind::Rain,
-                play::commands::WeatherCommand::Thunder => play::WeatherKind::Thunder,
-            };
-            sessions.set_weather(weather);
-            info!(?weather, "console set weather");
-            false
-        }
-        Ok(play::commands::AdminCommand::PlayersSleepingPercentage(value)) => {
-            if let Some(value) = value {
-                sessions.set_players_sleeping_percentage(value);
-            }
-            info!(
-                value = sessions.players_sleeping_percentage(),
-                "console read players sleeping percentage"
-            );
-            false
-        }
-        Ok(command) => {
-            warn!(
-                ?command,
-                "console command requires a player source in this M35 slice"
-            );
-            false
-        }
-        Err(error) => {
-            warn!(
-                error = console_command_error(error),
-                "console command rejected"
-            );
-            false
-        }
-    }
-}
-
-fn console_line_receiver() -> broadcast::Receiver<String> {
-    CONSOLE_LINES
-        .get_or_init(|| {
-            let (sender, _) = broadcast::channel(32);
-            let reader_sender = sender.clone();
-            if let Err(err) = std::thread::Builder::new()
-                .name("solaris-console-input".to_owned())
-                .spawn(move || {
-                    let stdin = std::io::stdin();
-                    let mut stdin = stdin.lock();
-                    loop {
-                        let mut line = String::new();
-                        match stdin.read_line(&mut line) {
-                            Ok(0) => return,
-                            Ok(_) => {
-                                let _ = reader_sender.send(line);
-                            }
-                            Err(err) => {
-                                warn!(error = %err, "console command input failed");
-                                return;
-                            }
-                        }
-                    }
-                })
-            {
-                warn!(error = %err, "console command input thread failed to start");
-            }
-            sender
-        })
-        .subscribe()
-}
-
 pub(crate) fn request_stop(
     shutdown: &ShutdownHandle,
     runtime_control: Option<&RuntimeControlHandle>,
@@ -2840,14 +2665,6 @@ fn log_save_report(context: &'static str, report: &SaveAllReport) {
         for error in &report.errors {
             warn!(%context, %error, "save-all error");
         }
-    }
-}
-
-fn console_command_error(error: play::commands::CommandError) -> &'static str {
-    match error {
-        play::commands::CommandError::Unknown => "unknown command",
-        play::commands::CommandError::PermissionDenied => "permission denied",
-        play::commands::CommandError::Usage(usage) => usage,
     }
 }
 
@@ -5356,19 +5173,17 @@ mod tests {
             loader_manifest: None,
             shutdown: ShutdownHandle::default(),
         };
-        let sessions = play::SessionRegistry::new();
+        let sessions = Arc::new(play::SessionRegistry::new());
         let chunk_pipeline_resources = ChunkPipelineResources::with_limits(1, 1);
         let (simulation, mut owner) = play::simulation_channel();
-        let mut command = Box::pin(execute_console_command(
-            "time set night",
-            "test save",
-            "test stop",
-            &config,
-            &sessions,
-            None,
-            &simulation,
-            &chunk_pipeline_resources,
-        ));
+        let control = OperatorControlHandle {
+            sessions: Arc::clone(&sessions),
+            simulation: simulation.clone(),
+            shutdown: config.shutdown.clone(),
+            runtime_control: None,
+            resources: chunk_pipeline_resources,
+        };
+        let mut command = Box::pin(control.set_world_time(13_000));
 
         std::future::poll_fn(|cx| {
             assert!(
@@ -5382,7 +5197,7 @@ mod tests {
         assert_eq!(simulation.snapshot().depth, 1);
 
         assert_eq!(owner.process_tick(&sessions, 1).processed, 1);
-        assert!(!command.await);
+        command.await.expect("owner accepted time change");
         assert_eq!(sessions.world_time(), 13_000);
     }
 
@@ -7777,40 +7592,16 @@ mod tests {
             },
         });
         let resources = ChunkPipelineResources::with_limits(1, 4);
-        let sessions = play::SessionRegistry::new();
+        let sessions = Arc::new(play::SessionRegistry::new());
         let (simulation, mut owner) = play::simulation_channel();
-        let mut stop = std::pin::pin!(execute_console_command(
-            "stop",
-            "test save",
-            "test stop",
-            &config,
-            &sessions,
-            Some(&runtime_control),
-            &simulation,
-            &resources,
-        ));
-
-        let stopped = tokio::select! {
-            biased;
-            stopped = &mut stop => stopped,
-            ready = owner.wait_for_command() => {
-                assert!(ready, "simulation command channel remains open");
-                assert_eq!(
-                    owner
-                        .process_tick_with_world(
-                            &sessions,
-                            config.world.as_ref(),
-                            config.block_light.as_deref(),
-                            1,
-                        )
-                        .processed,
-                    1,
-                );
-                stop.await
-            }
+        let control = OperatorControlHandle {
+            sessions: Arc::clone(&sessions),
+            simulation,
+            shutdown: config.shutdown.clone(),
+            runtime_control: Some(runtime_control.clone()),
+            resources,
         };
-
-        assert!(stopped);
+        control.request_stop();
         assert!(config.shutdown.is_requested());
         assert!(runtime_control.snapshot().draining);
         let metadata = tmp.path().join("solaris").join("world.dat");
@@ -8273,6 +8064,15 @@ mod tests {
         let restored = bound.sessions.persisted_entity_save_snapshot().0.records;
         assert_eq!(restored.len(), 1);
         assert_eq!(restored[0].snapshot, snapshot);
+        // Bind publishes recovery to RAM; fence the asynchronous writer before
+        // inspecting its durable records through a separate reader.
+        bound
+            .sessions
+            .world_chunk_journal()
+            .unwrap()
+            .writer
+            .flush()
+            .unwrap();
         let (_, pending) =
             play::persistence::FileRegionalDecisionJournal::open_for_test(tmp.path()).unwrap();
         assert_eq!(pending.len(), 2);
