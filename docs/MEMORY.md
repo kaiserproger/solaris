@@ -29,6 +29,18 @@ creating/publishing the public `solaris-loader` and `solaris-default-plugins`
 repositories first so hosted CI can resolve them. No tags, release publication,
 or frozen-archive replacement is authorized.
 
+Publication completed on `main`: core `f6e9426b`, Loader `6a383c2d`, default
+plugins `d71ce84d`. The owner then prioritized the hosted CI failures in
+[run 34353147695](https://github.com/kaiserproger/solaris/actions/runs/34353147695).
+The Loader fixture required missing `ffmpeg`; a fresh Java build also lacked
+the external Minecraft client jar. CI now provisions both, verifies Mojang's
+client checksum, and retains failed test/Loader receipts. Three fresh public
+checkouts pass 4,462 Rust tests and the full Java profile after prerequisites.
+The original hosted Cargo failure's detailed log was not retained, so its cause
+is not established and no test or assertion was weakened.
+Exact reproduction, correction and hosted follow-up evidence:
+`.analysis/codex-logs/ci-fixture-34353147695/receipt.json`.
+
 Owner explicitly requires continuous autonomous execution, without mandatory
 checkpoint stops. Evidence snapshots and validation are internal milestones,
 not permission gates or reasons to yield. Continue into the next bounded area
@@ -721,7 +733,8 @@ the earlier NPC, movement/pickup, inventory and world-commit evidence.
 
 ## Next outcome
 
-After the authorized three-repository publication, attribute and reduce the
+First require the correction's hosted `test` and `loader` jobs to pass; local
+clean-checkout passes do not clear a hosted failure. Then attribute and reduce the
 remaining dispatch tail on retained seed -17711, with the owner jungle route
 as a comparison. Separate computation, admission and owner-response waits before
 choosing another narrow change; do not reduce selected entities or reorder

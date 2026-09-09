@@ -55,8 +55,8 @@ python3 -m tools.harness mcp [--server-address host:port] [--exercise-input] [--
 | `fmt`, `clippy`, `code-health`, `test` | The individual Rust gates; CI uses the same profiles. |
 | `harness-check` | Fail-closed receipt/process lifecycle regressions plus private shell-engine syntax (`bash -n` over every backend). `python3 -m tools.harness run harness-check` |
 | `build` | Debug server build (`cargo build --bin mc-server`); `--release` explicitly selects the locked release workspace build (`cargo build --locked --release --workspace`). `python3 -m tools.harness run build --release` |
-| `java` | Gradle bridge/agent/Loader module tests (`:bridge-core`, `:java-agent`, `:loader-core`, `:loader-fabric`, `:loader-neoforge`, `:loader-forge`). `python3 -m tools.harness run java` |
-| `fixture-check` | Reproducible Loader fixture verification (`tools/build-loader-live-gate-fixture.sh --check`). |
+| `java` | Gradle bridge/agent/Loader module tests (`:bridge-core`, `:java-agent`, `:loader-core`, `:loader-fabric`, `:loader-neoforge`, `:loader-forge`). Requires a Minecraft client jar via `SOLARIS_CLIENT_JAR` or the Loader's documented local path. CI downloads the version declared in Loader `gradle.properties` and verifies Mojang's SHA-1 before testing. `python3 -m tools.harness run java` |
+| `fixture-check` | Reproducible Loader fixture verification (`tools/build-loader-live-gate-fixture.sh --check`); requires `ffmpeg` with `libvorbis`, plus ZIP and coreutils commands. CI installs the audio encoder explicitly. |
 | `installer` | Installer self-test backend. |
 | `core-client` | Real no-Loader client: natural currency mining, plugin purchase and required-Loader rejection (direct `compatibility.run`, no inventory path). `python3 -m tools.harness run core-client` |
 | `inventory` | Inventory-path gate: crafting, cursor round-trip and held-item selection in an isolated operator fixture, on top of the core loop. `python3 -m tools.harness run inventory` |
@@ -198,6 +198,10 @@ log, and client-state events.
 - Start from `result.json`: take the nonzero entry in `exits`, read the matching
   `commands` argv and `logs` file. `details.error` names the failing backend;
   `details.mode` tells preparation (`prepared`) from execution (`run`).
+- Hosted `test` and `loader` jobs upload their failed receipts as
+  `test-failure-receipts` and `loader-failure-receipts` (seven-day retention).
+  Download the artifact to read the actual command error; the console's
+  `[harness] ... see .../test.log` line alone is not the underlying failure.
 - Failing backends fail closed: nonzero commands raise with the log path, and
   `loader-live`/`core-client`/`inventory` additionally raise when the scenario
   report is not `passed`. `--check`/`--prepare` never produce a gameplay pass,
