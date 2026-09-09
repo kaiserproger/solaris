@@ -242,8 +242,14 @@ log, and client-state events.
   under test (Main investigates; never mark green). The frozen load matrix
   remains 20 PASS / 22 FAIL with no owner terrain `ACCEPT`, and the full core
   redesign is incomplete.
-- Workspace version is `0.0.3-alpha.1`; the latest **published** release remains
-  `v0.0.2-alpha.1`. The frozen local field-test archive is
+- Workspace version and latest published prerelease are `v0.0.3-alpha.1`
+  (workspace version without the `v`). Tag workflow
+  [34356580571](https://github.com/kaiserproger/solaris/actions/runs/34356580571)
+  passed, including both native Linux release builds and archive checks.
+  Public curl installation, configuration validation and isolated startup passed
+  on Linux x86_64; this is not full survival acceptance. Evidence:
+  `.analysis/releases/public-v0.0.3-alpha.1/receipt.json`.
+  The older frozen local field-test archive remains
   `.analysis/releases/v0.0.3-alpha.1/solaris-x86_64-unknown-linux-gnu.tar.gz`.
   It passed isolated version/config/startup checks, not full survival acceptance.
   SHA-256: `925a825b709e5e44d8ad17957d741e3751ed955dba3e510ee4baa8ee78ed6b36`.

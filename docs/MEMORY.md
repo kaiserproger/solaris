@@ -43,6 +43,15 @@ is not established and no test or assertion was weakened.
 Exact reproduction, correction and hosted follow-up evidence:
 `.analysis/codex-logs/ci-fixture-34353147695/receipt.json`.
 
+The owner-authorized public prerelease `v0.0.3-alpha.1` is now published from
+`571f53834f33a4f60c430b293dc901e9b1f4f5f7`.
+[Tag workflow 34356580571](https://github.com/kaiserproger/solaris/actions/runs/34356580571)
+passed all required gates and published Linux x86_64/AArch64 archives and SHA-256
+files. The pinned public curl installer, version/config checks, fresh standalone
+startup on `127.0.0.1:25565` and clean SIGINT shutdown passed on x86_64.
+One independent release review passed; full survival acceptance remains open.
+Receipt: `.analysis/releases/public-v0.0.3-alpha.1/receipt.json`.
+
 Owner explicitly requires continuous autonomous execution, without mandatory
 checkpoint stops. Evidence snapshots and validation are internal milestones,
 not permission gates or reasons to yield. Continue into the next bounded area

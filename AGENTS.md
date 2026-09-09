@@ -264,9 +264,10 @@ close, not after each micro-edit. One closed checkpoint produces one local,
 revertible Conventional Commit when authorized. Never push, merge to `main`, or
 tag unless explicitly instructed. Do not skip hooks/signing flags.
 
-Workspace version is `0.0.3-alpha.1`; the latest published release remains
-`v0.0.2-alpha.1`. Never claim v0.0.3 public links or tags. The local field-test
-archive under `.analysis/releases/v0.0.3-alpha.1/` was delivered and is frozen
+Workspace version is `0.0.3-alpha.1`; the latest published prerelease is
+`v0.0.3-alpha.1`, built from tag commit `571f5383`. Public release evidence lives
+under `.analysis/releases/public-v0.0.3-alpha.1/`; maturity remains draft.
+The older local field-test archive under `.analysis/releases/v0.0.3-alpha.1/` is frozen
 before repository separation; do not overwrite it with later source builds.
 Its isolated startup passed, not full survival acceptance.
 
